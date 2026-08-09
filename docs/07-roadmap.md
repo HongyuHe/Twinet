@@ -4,6 +4,14 @@ Milestones are ordered so that each one ends in something demonstrable, and so
 that the riskiest assumptions are tested early (M3, the cluster fabric, is
 deliberately not left to the end — its core primitive is already validated).
 
+> **Optimisation target.** Development cost — in time or money — is explicitly
+> *not* a constraint on this project. The sole objective is the best possible
+> outcome: correctness, clarity, maintainability, and scale. Where a cheap
+> shortcut and a thorough solution disagree, take the thorough one. Build the
+> test, write the doc, generate the schema, measure the benchmark, and delete
+> the special case. Day estimates below are for sequencing only, never as a
+> reason to cut scope.
+
 Effort is given in working days of focused implementation.
 
 ---

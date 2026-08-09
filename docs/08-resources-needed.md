@@ -10,12 +10,24 @@ default I will proceed with if I do not hear otherwise.
 |---|---|
 | Cluster | `node-0`, `node-1`, `node-2` — each 56 cores, 251 GiB RAM, 917 GB free disk, Ubuntu 24.04, kernel 6.8 |
 | Networking | `eno1` 1 GbE public, `eno2` **10 GbE** private on `10.0.1.0/24` |
-| Privileges | passwordless `sudo` on node-0; passwordless root SSH from node-0 to node-1 and node-2 |
-| Docker | 29.7.2 on node-0; Docker Hub pull verified; push login present as `hyhe` |
+| Privileges | passwordless `sudo` on node-0; passwordless root SSH from node-0 to node-1 and node-2; permission to install anything needed |
+| Docker | 29.7.2 on **all three nodes**, logged in to Docker Hub as `hyhe` |
 | Cross-node VXLAN | **verified working**, 0.154–0.321 ms RTT (see doc 04 §1.2) |
 | Git remote | `https://github.com/HongyuHe/Twinet` reachable, credentials stored |
 
-So M0–M2 are unblocked today, and M3 is unblocked apart from item 2.1.
+All milestones are unblocked.
+
+## 1a. Answers received
+
+| # | Question | Answer |
+|---|---|---|
+| 2.1 | Docker on node-1/node-2 | **Done** — installed and logged in; free rein to install anything else |
+| 2.2 | Cluster lifetime / size | Available indefinitely |
+| 2.3 | Jumbo frames on `eno2` | **Approved** |
+| 2.4 | Docker Hub namespace | `hyhe/twinet-*` approved |
+| 2.5 | Real submissions for grader validation | Approved — to be supplied |
+| — | Budget / schedule | **Not a constraint.** Optimise solely for the best outcome. |
+
 
 ## 2. Things I need
 
