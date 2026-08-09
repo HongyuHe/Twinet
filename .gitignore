@@ -1,0 +1,13 @@
+# Build artifacts
+/bin/
+/dist/
+*.test
+*.out
+
+# Lab runtime state
+/labs/*/state/
+*.twinetlab
+
+# Local overrides
+.env
+*.local.yaml

@@ -1,0 +1,218 @@
+# 06 — Autograding
+
+## 1. The problem with the current approach
+
+Both existing generations grade **against the live, shared class network**:
+
+- Legacy (`platform/utils/autograder/bgp/`): `ovs-vsctl del-port` a student's AS
+  out of the running mini-Internet, splice in an ExaBGP container, probe, then
+  reconnect. Parallel (Go runner, N workers) but destructive and root-heavy.
+- Current (`autograder-25/grader.py`, 1,747 lines): builds a "shadow AS" of
+  containers and veths next to the live network, one AS at a time, in a plain
+  `for` loop, with `BGP_CONV_WAIT = 20` invoked more than eight times per AS
+  plus per-AS bootstrap sleeps. Realistically **hours** for one class.
+
+Both share four defects:
+
+1. **Serial or coarsely parallel**, bounded by wall-clock sleeps.
+2. **Destructive**: grading perturbs the network other students are using.
+3. **Not reproducible**: the result depends on the state of the live class
+   network at that moment. Regrades and appeals cannot be replayed.
+4. **Unstructured output**: text logs or raw SQLite blobs, with no rubric,
+   aggregation, or export.
+
+## 2. The core idea: grade in an ephemeral private lab
+
+Twinet grades a submission, not a running AS.
+
+```
+submission (configs_*.tar.gz, the save_configs layout)
+        │
+        ▼
+  twinet grade --rubric rubric/cos461.yaml --submissions ./subs --parallel 24
+        │
+        ├─ for each student, on any cluster node, in parallel:
+        │     1. synthesize a *grading lab*: the student's AS
+        │        + synthetic neighbours generated from the class manifest
+        │        + a scriptable BGP speaker at each external port
+        │        + a Routinator seeded with a fixed RPKI snapshot
+        │     2. restore the student's saved config into it
+        │     3. wait for convergence (predicate, not sleep)
+        │     4. run the rubric's checks
+        │     5. tear the lab down
+        │
+        ▼
+  reports/  <netid>.json  <netid>.html   summary.csv   summary.html
+```
+
+Why this is strictly better:
+
+- **Embarrassingly parallel.** A grading lab is ~10 routers plus a handful of
+  synthetic peers — roughly 20 containers. At 600 containers/node that is ~30
+  concurrent students per node, ~90 across the cluster. A 100-student class
+  becomes two waves.
+- **Non-destructive.** The class network is never touched; grading can run
+  during the assignment, nightly, for formative feedback.
+- **Reproducible.** A grading lab is a pure function of (submission, class
+  manifest, rubric, RPKI snapshot). Regrades and appeals replay bit-for-bit,
+  and a student can be handed the exact lab that failed.
+- **Runs without the class network at all** — including after the semester, on
+  a laptop, in CI.
+
+The live-network mode is kept as `twinet grade --live` for spot checks and for
+checks that are inherently about the real class (e.g. "did you actually peer
+with your real neighbour during the hackathon"), but it is no longer the
+primary path.
+
+## 3. Convergence detection instead of sleeps
+
+The single biggest speedup. Every wait is a predicate polled at 250 ms with a
+deadline:
+
+| Predicate | Definition |
+|---|---|
+| `bgp.sessions_established(as)` | every configured neighbour in `show bgp summary json` is `Established` |
+| `bgp.rib_stable(as, 3)` | the RIB hash is unchanged for 3 consecutive polls |
+| `ospf.adjacencies_full(as)` | every OSPF neighbour is `Full` |
+| `route.present(dev, prefix, via)` | a specific route exists with a given next hop / AS path |
+| `probe.reachable(src, dst)` | ping succeeds |
+
+`BGP_CONV_WAIT = 20` seconds × 8 per AS = 160 s of pure sleeping becomes
+typically 2–6 s of actual convergence. Combined with parallelism, expected
+class-wide grading time goes from hours to **single-digit minutes**.
+
+## 4. Test doubles
+
+The reusable primitive both existing generations converged on — *attach a
+scriptable BGP speaker where a real neighbour would be, inject benign and
+adversarial routes, then observe both the control plane and the data plane* —
+is promoted to a first-class Twinet object.
+
+```yaml
+doubles:
+  peer:                          # attaches at an external_port
+    kind: bgp-speaker            # GoBGP-based; scriptable over gRPC
+    asn: "{{ .Neighbor.asn }}"
+    relationship: "{{ .Neighbor.rel }}"
+  ixp:
+    kind: ixp-route-server
+    community_gated: true
+```
+
+Capabilities: announce/withdraw arbitrary prefixes with crafted AS-paths,
+communities and origins (valid / invalid / not-found under the seeded RPKI
+snapshot); read the RIB-in (what the student exported); measure export/import
+timing; and emit marker packets for data-plane verification.
+
+Using **GoBGP as a library** rather than ExaBGP + `exabgpcli` + Scapy removes a
+Python runtime, a CLI-scraping layer and a packet-crafting dependency from the
+grading path, and makes announcements synchronous and assertable.
+
+## 5. Checks
+
+Checks are typed Go functions registered by name, each returning a structured
+`Result{Pass, Score, Evidence, Detail}`. `Evidence` is machine-readable (the
+RIB entry, the traceroute, the parsed config stanza) so feedback can quote
+exactly what was observed.
+
+Library, mapped to the COS-461 questions:
+
+| Check | Verifies |
+|---|---|
+| `l2.vlan_isolation` | admin↔admin and patient↔patient reachable; admin↔patient only via the L3 gateway (assert the traceroute has the gateway hop) |
+| `l2.gateway_configured` | hosts' default gateway is the prescribed router |
+| `l3.addressing_matches_plan` | every interface matches the manifest's `expected` addressing (Q1.2) |
+| `ospf.full_adjacency` | all OSPF neighbours `Full` |
+| `ospf.subnets_advertised` | every required subnet, incl. DNS/measurement/matrix, in the OSPF LSDB |
+| `ospf.ecmp_paths` | compute the shortest-path DAG from `show ip ospf … json` **and** confirm empirically (repeated traceroutes / marker packets) that exactly the three prescribed `ATL`↔`BOS` paths carry traffic (Q1.3) |
+| `tunnel.sixin4` | IPv6 DCN↔DCS reachability *and* that it traverses the 6in4 tunnel, not native routing (Q1.4) |
+| `bgp.ibgp_full_mesh` | a session between every router pair, sourced from loopbacks |
+| `bgp.next_hop_self` | eBGP-learned routes carry a reachable next hop internally |
+| `bgp.own_prefix_only` | the AS originates exactly its /8 |
+| `policy.gao_rexford` | inject from each relationship class via doubles; assert local-pref ordering and that provider/peer routes are not re-exported to provider/peer (Q2.3) |
+| `policy.ixp_communities` | announcements are relayed only to out-of-region members and in-region announcements from the IXP are filtered (Q2.4) |
+| `policy.traffic_engineering` | the slow provider/customer is deprioritised outbound (local-pref) and made less attractive inbound (AS-path prepend), **without** any deny (Q2.5) |
+| `rpki.roa_published` | the AS's ROA exists in the RPKI snapshot and covers its /8 |
+| `rpki.invalid_rejected` | an invalid-origin announcement from a double is not selected |
+| `rpki.notfound_preserved` | not-found routes are still usable (no over-filtering) |
+| `dataplane.reachability_matrix` | pairwise reachability with correct paths |
+| `config.no_forbidden` | e.g. `179.*`/`180.*` not in OSPF; `ATL-L2` (no suffix) untouched |
+
+Each check is independent and has a timeout, so a broken AS produces a partial
+score rather than aborting the run — a defect in both current generations.
+
+## 6. Rubrics
+
+```yaml
+apiVersion: twinet.dev/v1
+kind: Rubric
+metadata: {name: cos461-routing, total: 10}
+questions:
+  - id: q1.1
+    title: L2 connectivity and VLANs
+    points: 1
+    checks:
+      - {check: l2.vlan_isolation,     weight: 0.6}
+      - {check: l2.gateway_configured, weight: 0.4}
+  - id: q1.3
+    title: OSPF load balancing
+    points: 1
+    checks:
+      - {check: ospf.ecmp_paths, weight: 1.0,
+         args: {a: ATL, b: BOS,
+                paths: [[ATL,BOS], [ATL,PHY,NYC,BOS], [ATL,PHY,BOS]],
+                exclusive: true}}
+  - id: q2.5
+    title: Traffic engineering
+    points: 1
+    depends_on: [q2.3]
+    checks:
+      - {check: policy.traffic_engineering, weight: 1.0}
+```
+
+Rubrics are versioned with the course material, are diffable, and — importantly
+— **the point weights live in one place** instead of being scattered as
+`points += check_rpki_invalid(asn) * 0.5` across a 1,747-line script.
+
+`depends_on` lets the engine skip (and explain) checks that cannot meaningfully
+run, instead of reporting cascading failures.
+
+## 7. Output
+
+- `reports/<id>.json` — every check, score, evidence, timings, lab fingerprint.
+- `reports/<id>.html` — human-readable feedback with the evidence inline
+  (the RIB entry that was wrong, the traceroute that took the wrong path).
+- `summary.csv` — one row per student, one column per question; drops straight
+  into Canvas/Gradescope.
+- `summary.html` — class-wide dashboard: distribution per question, the most
+  common failure modes, which check is failing for the most students (directly
+  useful for deciding what to re-teach).
+- `reports/<id>.twinetlab` — the exact grading lab, replayable with
+  `twinet grade replay <file>` for appeals.
+
+## 8. Formative use
+
+Because grading is non-destructive and fast, the same engine powers a
+**self-check** students can run themselves:
+
+```
+group12@gateway$ check q1.3
+q1.3 OSPF load balancing ......................... FAIL (0.0 / 1.0)
+  ✗ ospf.ecmp_paths: expected 3 equal-cost paths ATL→BOS, observed 2.
+      observed: ATL→BOS, ATL→PHY→BOS
+      missing:  ATL→PHY→NYC→BOS
+      hint: cost(PHY→NYC) + cost(NYC→BOS) must equal cost(PHY→BOS).
+```
+
+This is the highest-leverage pedagogical addition in the whole redesign: it
+turns the connectivity matrix (a coarse red/green signal, updated every few
+minutes) into precise, immediate, per-question feedback — while the rubric
+still keeps hidden checks for the graded run.
+
+## 9. Integrity
+
+- Every submission's `manifest.json` is checked against the class manifest hash.
+- Config dumps are compared across groups for near-duplicate detection
+  (normalised token similarity), replacing the anecdotal use of the history GIF.
+- The event log records whether the graded AS's config matches what was live in
+  the class network at the deadline.
