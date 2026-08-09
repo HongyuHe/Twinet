@@ -1,0 +1,275 @@
+package plan
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+func step(id string, stage Stage, needs ...string) *Step {
+	return &Step{ID: id, Stage: stage, Describe: id, Needs: needs, Run: func(context.Context) error { return nil }}
+}
+
+func TestValidateDanglingDependency(t *testing.T) {
+	p := New()
+	p.Add(step("a", StageCreate, "nope"))
+	err := p.Validate()
+	if err == nil {
+		t.Fatal("expected a dangling dependency error")
+	}
+	if got := err.Error(); !contains(got, "nope") {
+		t.Errorf("error should name the missing step: %s", got)
+	}
+}
+
+func TestValidateCycle(t *testing.T) {
+	p := New()
+	p.Add(step("a", StageCreate, "c"))
+	p.Add(step("b", StageCreate, "a"))
+	p.Add(step("c", StageCreate, "b"))
+	err := p.Validate()
+	if err == nil {
+		t.Fatal("expected a cycle error")
+	}
+	if !contains(err.Error(), "cycle") {
+		t.Errorf("error should mention a cycle: %s", err)
+	}
+}
+
+// A step must never depend on one in a later stage: the stage model could not
+// honour it, and the plan would deadlock at run time.
+func TestValidateRejectsBackwardStageDependency(t *testing.T) {
+	p := New()
+	p.Add(step("early", StageCreate, "late"))
+	p.Add(step("late", StageReady))
+	if err := p.Validate(); err == nil {
+		t.Fatal("expected a stage-ordering error")
+	}
+}
+
+func TestExecuteRespectsStagesAndDependencies(t *testing.T) {
+	var mu sync.Mutex
+	var order []string
+	mk := func(id string, stage Stage, needs ...string) *Step {
+		return &Step{ID: id, Stage: stage, Describe: id, Needs: needs,
+			Run: func(context.Context) error {
+				mu.Lock()
+				order = append(order, id)
+				mu.Unlock()
+				return nil
+			}}
+	}
+	p := New()
+	p.Add(mk("img", StageImage))
+	p.Add(mk("c1", StageCreate, "img"))
+	p.Add(mk("c2", StageCreate, "img"))
+	p.Add(mk("wire", StageWire, "c1", "c2"))
+	p.Add(mk("ready", StageReady, "wire"))
+
+	rep, err := p.Execute(context.Background(), Options{Workers: 4})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if rep.Failed() {
+		t.Fatalf("unexpected failures: %v", rep.Err())
+	}
+	if len(order) != 5 {
+		t.Fatalf("expected 5 steps to run, got %d: %v", len(order), order)
+	}
+	pos := map[string]int{}
+	for i, id := range order {
+		pos[id] = i
+	}
+	if pos["img"] != 0 {
+		t.Errorf("image stage must run first, got order %v", order)
+	}
+	if pos["wire"] < pos["c1"] || pos["wire"] < pos["c2"] {
+		t.Errorf("wire ran before its dependencies: %v", order)
+	}
+	if pos["ready"] != 4 {
+		t.Errorf("ready stage must run last, got order %v", order)
+	}
+}
+
+// Independent steps must actually run concurrently, or a class-scale deployment
+// degenerates into the serial pipeline this design replaces.
+func TestExecuteRunsIndependentStepsConcurrently(t *testing.T) {
+	const n = 32
+	var running, peak int64
+	p := New()
+	for i := 0; i < n; i++ {
+		p.Add(&Step{
+			ID: fmt.Sprintf("s%d", i), Stage: StageCreate, Describe: "s",
+			Run: func(context.Context) error {
+				cur := atomic.AddInt64(&running, 1)
+				for {
+					old := atomic.LoadInt64(&peak)
+					if cur <= old || atomic.CompareAndSwapInt64(&peak, old, cur) {
+						break
+					}
+				}
+				time.Sleep(20 * time.Millisecond)
+				atomic.AddInt64(&running, -1)
+				return nil
+			}})
+	}
+	start := time.Now()
+	if _, err := p.Execute(context.Background(), Options{Workers: 16}); err != nil {
+		t.Fatal(err)
+	}
+	if peak < 8 {
+		t.Errorf("peak concurrency was %d, expected the worker pool to be used", peak)
+	}
+	if elapsed := time.Since(start); elapsed > 400*time.Millisecond {
+		t.Errorf("took %s; steps do not appear to be running in parallel", elapsed)
+	}
+}
+
+// One broken AS must not stop a class-wide deployment. This is the single
+// biggest operational difference from the legacy platform, whose only remedy
+// for a partial failure was a full teardown and rebuild.
+func TestFailureIsolatedToScope(t *testing.T) {
+	var ran sync.Map
+	mk := func(id, scope string, stage Stage, fail bool, needs ...string) *Step {
+		return &Step{ID: id, Scope: scope, Stage: stage, Describe: id, Needs: needs,
+			Run: func(context.Context) error {
+				ran.Store(id, true)
+				if fail {
+					return errors.New("boom")
+				}
+				return nil
+			}}
+	}
+	p := New()
+	p.Add(mk("as1-create", "as1", StageCreate, true))
+	p.Add(mk("as1-wire", "as1", StageWire, false, "as1-create"))
+	p.Add(mk("as2-create", "as2", StageCreate, false))
+	p.Add(mk("as2-wire", "as2", StageWire, false, "as2-create"))
+
+	rep, err := p.Execute(context.Background(), Options{Workers: 4, ContinueOnError: true})
+	if err != nil {
+		t.Fatalf("execute returned a hard error: %v", err)
+	}
+	if !rep.Failed() {
+		t.Fatal("expected the report to record a failure")
+	}
+	if got := rep.FailedScopes(); len(got) != 1 || got[0] != "as1" {
+		t.Errorf("failed scopes = %v, want [as1]", got)
+	}
+	if _, ok := ran.Load("as1-wire"); ok {
+		t.Error("as1-wire should have been skipped after its scope failed")
+	}
+	if _, ok := ran.Load("as2-wire"); !ok {
+		t.Error("as2 should have completed despite as1 failing")
+	}
+}
+
+func TestExecuteStopsOnErrorWhenAsked(t *testing.T) {
+	p := New()
+	p.Add(&Step{ID: "boom", Stage: StageCreate, Describe: "boom",
+		Run: func(context.Context) error { return errors.New("nope") }})
+	if _, err := p.Execute(context.Background(), Options{ContinueOnError: false}); err == nil {
+		t.Fatal("expected execute to fail")
+	}
+}
+
+func TestDryRunRunsNothing(t *testing.T) {
+	var called bool
+	p := New()
+	p.Add(&Step{ID: "a", Stage: StageCreate, Describe: "a",
+		Run: func(context.Context) error { called = true; return nil }})
+	if _, err := p.Execute(context.Background(), Options{DryRun: true}); err != nil {
+		t.Fatal(err)
+	}
+	if called {
+		t.Error("dry run executed a step")
+	}
+}
+
+func TestWaitSucceedsAfterStabilising(t *testing.T) {
+	n := 0
+	err := Wait(context.Background(), Waiter{
+		Describe:  "a counter to reach 3",
+		Interval:  time.Millisecond,
+		Timeout:   2 * time.Second,
+		StableFor: 2,
+		Check: func(context.Context) (bool, error) {
+			n++
+			return n >= 3, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("wait: %v", err)
+	}
+	if n < 4 {
+		t.Errorf("StableFor=2 should require two consecutive successes, checked %d times", n)
+	}
+}
+
+// A predicate that flaps must not be mistaken for a converged one. This is what
+// makes convergence detection trustworthy enough to replace fixed sleeps.
+func TestWaitRejectsFlapping(t *testing.T) {
+	n := 0
+	err := Wait(context.Background(), Waiter{
+		Describe:  "a flapping condition",
+		Interval:  time.Millisecond,
+		Timeout:   150 * time.Millisecond,
+		StableFor: 3,
+		Check: func(context.Context) (bool, error) {
+			n++
+			return n%2 == 0, nil // alternates, never three in a row
+		},
+	})
+	if err == nil {
+		t.Fatal("expected a timeout, since the condition never held three times running")
+	}
+}
+
+func TestWaitReportsLastError(t *testing.T) {
+	err := Wait(context.Background(), Waiter{
+		Describe: "BGP sessions to establish",
+		Interval: time.Millisecond,
+		Timeout:  30 * time.Millisecond,
+		Check: func(context.Context) (bool, error) {
+			return false, errors.New("2 of 7 sessions are Idle")
+		},
+	})
+	if err == nil {
+		t.Fatal("expected a timeout")
+	}
+	if !contains(err.Error(), "2 of 7 sessions are Idle") {
+		t.Errorf("timeout should quote the last check result, got: %v", err)
+	}
+	if !contains(err.Error(), "BGP sessions to establish") {
+		t.Errorf("timeout should say what it waited for, got: %v", err)
+	}
+}
+
+func TestWaitHonoursContextCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := Wait(ctx, Waiter{
+		Describe: "anything",
+		Interval: time.Millisecond,
+		Timeout:  5 * time.Second,
+		Check:    func(context.Context) (bool, error) { return false, nil },
+	})
+	if err == nil {
+		t.Fatal("expected cancellation to abort the wait")
+	}
+}
+
+func contains(hay, needle string) bool {
+	return len(hay) >= len(needle) && (func() bool {
+		for i := 0; i+len(needle) <= len(hay); i++ {
+			if hay[i:i+len(needle)] == needle {
+				return true
+			}
+		}
+		return false
+	})()
+}
