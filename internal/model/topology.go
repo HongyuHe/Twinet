@@ -175,6 +175,8 @@ const (
 	LinkVeth LinkKind = "veth"
 	// LinkService is a point-to-point link to a lab-global service container.
 	LinkService LinkKind = "service"
+	// LinkFabric is a cable into a shared L2 fabric such as an IXP.
+	LinkFabric LinkKind = "fabric"
 )
 
 // Link is a point-to-point layer-2 segment between exactly two interfaces.
@@ -200,6 +202,15 @@ type Link struct {
 	Rel Relationship
 	// InterAS is true when A and B are in different ASes.
 	InterAS bool
+	// Segment names the shared broadcast domain this link belongs to, empty
+	// for an ordinary point-to-point link.
+	//
+	// Twinet has no multi-access link type: a shared LAN is modelled as a real
+	// switch with a cable to each participant, which is both what the hardware
+	// actually is and what keeps cross-node wiring a simple two-ended tunnel.
+	// Segment records the logical grouping so that addressing and validation
+	// can treat those cables as one subnet.
+	Segment string
 	// VNI is the VXLAN network identifier used when the endpoints land on
 	// different nodes. Deterministically derived from ID.
 	VNI uint32

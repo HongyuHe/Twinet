@@ -18,7 +18,7 @@ import (
 // load reads, validates and expands the manifest. Validation errors are
 // reported in full rather than one at a time, because a course author editing a
 // hundred-AS lab should see every problem in a single pass.
-func load(opts *Options) (*model.Topology, error) {
+func load(opts *Options) (*model.Topology, error) { //nolint:revive
 	l, err := manifest.Load(opts.Manifest)
 	if err != nil {
 		return nil, err

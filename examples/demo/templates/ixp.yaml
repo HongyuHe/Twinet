@@ -1,0 +1,23 @@
+apiVersion: twinet.dev/v1
+kind: ASTemplate
+metadata:
+  name: ixp
+  description: >
+    An internet exchange point: a single FRR route server that relays a peer's
+    announcement only when it carries the community <IXP>:<target>, which is
+    what assignment question 2.4 is built around.
+
+ixp: true
+
+routers:
+  RS: {id: 1}
+
+hosts:
+  per_router: false
+
+external_ports:
+  peer_a: {router: RS}
+
+provisioning:
+  provisioned:
+    - scope: all

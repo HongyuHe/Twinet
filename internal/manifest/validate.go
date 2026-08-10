@@ -11,6 +11,7 @@ import (
 
 	"github.com/HongyuHe/twinet/internal/ipam"
 	"github.com/HongyuHe/twinet/internal/model"
+	"github.com/HongyuHe/twinet/internal/runtime"
 )
 
 // ifaceNameMax is IFNAMSIZ-1. Exceeding it makes link creation fail at deploy
@@ -32,6 +33,7 @@ func (l *Loaded) Validate() *Diagnostics {
 	l.validateASes(d, file)
 	l.validatePeerings(d, file)
 	l.validateServices(d, file)
+	l.validateResources(d, file)
 	l.validatePlacement(d, file)
 	l.validateAccess(d, file)
 	_ = lab
@@ -380,6 +382,64 @@ func (l *Loaded) validateServices(d *Diagnostics, file string) {
 			}
 		}
 	}
+}
+
+// validateResources checks that resource quantities are well formed before a
+// deployment discovers them one container at a time.
+func (l *Loaded) validateResources(d *Diagnostics, file string) {
+	root := l.Nodes[file]
+	check := func(path string, dd model.DeviceDefaults, node *yaml.Node) {
+		if dd.Memory != "" {
+			if _, err := runtime.ParseMemory(dd.Memory); err != nil {
+				d.AddHint(file, path+".memory", node, err.Error(),
+					"use Kubernetes-style quantities such as 512Mi or 2Gi")
+			}
+		}
+		if dd.CPUs != nil && *dd.CPUs <= 0 {
+			d.Addf(file, path+".cpus", node, "cpus must be positive, got %v", *dd.CPUs)
+		}
+		if dd.Pids != nil && *dd.Pids < 16 {
+			d.Addf(file, path+".pids", node,
+				"a pids limit of %d is too low for a container running a routing daemon", *dd.Pids)
+		}
+	}
+	check("defaults", l.Lab.Defaults, nodeAt(root, "defaults"))
+	for _, k := range sortedMapKeys(mapKeysAsStrings(l.Lab.Kinds)) {
+		kind := model.DeviceKind(k)
+		check("kinds."+k, l.Lab.Kinds[kind], nodeAt(root, "kinds."+k))
+	}
+	for _, name := range sortedMapKeys(l.Lab.Services) {
+		check("services."+name, l.Lab.Services[name].DeviceDefaults, nodeAt(root, "services."+name))
+	}
+	for _, tn := range l.Lab.SortedTemplateNames() {
+		tpl := l.Lab.Templates[tn]
+		tf := l.Files["template:"+tn]
+		if tf == "" {
+			tf = file
+		}
+		troot := l.Nodes[tf]
+		for _, rn := range sortedMapKeys(tpl.Routers) {
+			checkIn(d, tf, "routers."+rn, tpl.Routers[rn].DeviceDefaults, nodeAt(troot, "routers."+rn))
+		}
+	}
+}
+
+func checkIn(d *Diagnostics, file, path string, dd model.DeviceDefaults, node *yaml.Node) {
+	if dd.Memory != "" {
+		if _, err := runtime.ParseMemory(dd.Memory); err != nil {
+			d.AddHint(file, path+".memory", node, err.Error(),
+				"use Kubernetes-style quantities such as 512Mi or 2Gi")
+		}
+	}
+}
+
+// mapKeysAsStrings adapts a DeviceKind-keyed map for the string helpers.
+func mapKeysAsStrings(m map[model.DeviceKind]model.DeviceDefaults) map[string]struct{} {
+	out := make(map[string]struct{}, len(m))
+	for k := range m {
+		out[string(k)] = struct{}{}
+	}
+	return out
 }
 
 func (l *Loaded) validatePlacement(d *Diagnostics, file string) {

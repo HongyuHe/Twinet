@@ -718,3 +718,8 @@ func (l *Lab) String() string {
 	}
 	return b.String()
 }
+
+// Empty reports whether no shaping is configured.
+func (p LinkProps) Empty() bool {
+	return p.Bandwidth == "" && p.Delay == "" && p.Queue == "" && p.Loss == ""
+}

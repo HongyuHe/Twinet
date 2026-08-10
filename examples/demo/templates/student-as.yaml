@@ -1,0 +1,92 @@
+apiVersion: twinet.dev/v1
+kind: ASTemplate
+metadata:
+  name: student-as
+  description: >
+    The full eight-router AS operated by a student group, spanning US cities and
+    connecting two datacenters. Mirrors the COS-461 routing project topology.
+
+routers:
+  MSP: {id: 1, services: [dns]}
+  NYC: {id: 2}
+  BOS: {id: 3, l2_gateway: DCN}
+  PHY: {id: 4, services: [routinator]}
+  CHI: {id: 5}
+  ATL: {id: 6, l2_gateway: DCS, services: [matrix]}
+  SFO: {id: 7}
+  HOU: {id: 8, services: [measurement]}
+
+hosts:
+  per_router: true
+  name: host
+  iface: "{{ .Router }}router"
+
+# Subnets are pinned to match the published L3 topology figure, so the platform
+# and the assignment text cannot drift apart.
+internal_links:
+  - {a: MSP, b: NYC, subnet: "{{ .AS }}.0.1.0/24"}
+  - {a: MSP, b: CHI, subnet: "{{ .AS }}.0.2.0/24"}
+  - {a: MSP, b: SFO, subnet: "{{ .AS }}.0.3.0/24"}
+  - {a: NYC, b: PHY, subnet: "{{ .AS }}.0.4.0/24"}
+  - {a: NYC, b: BOS, subnet: "{{ .AS }}.0.5.0/24"}
+  - {a: CHI, b: HOU, subnet: "{{ .AS }}.0.6.0/24"}
+  - {a: CHI, b: PHY, subnet: "{{ .AS }}.0.7.0/24"}
+  - {a: PHY, b: ATL, subnet: "{{ .AS }}.0.8.0/24"}
+  - {a: PHY, b: BOS, subnet: "{{ .AS }}.0.9.0/24"}
+  - {a: BOS, b: ATL, subnet: "{{ .AS }}.0.10.0/24"}
+  - {a: ATL, b: HOU, subnet: "{{ .AS }}.0.11.0/24"}
+  - {a: SFO, b: HOU, subnet: "{{ .AS }}.0.12.0/24"}
+
+l2_domains:
+  DCN:
+    id: 2
+    gateway: BOS
+    vlans: {10: admin, 20: patient}
+    switches:
+      S1: {mac: "11:11:11:11:11:11"}
+    hosts:
+      A_MGH: {switch: S1, vlan: 10, bandwidth: 10mbit, delay: 1ms}
+      P_MGH: {switch: S1, vlan: 20, bandwidth: 10mbit, delay: 1ms}
+  DCS:
+    id: 1
+    gateway: ATL
+    vlans: {10: admin, 20: patient}
+    switches:
+      S2: {mac: "22:22:22:22:22:22", uplink: true}
+      S3: {mac: "33:33:33:33:33:33"}
+    switch_links:
+      - [S2, S3]
+    hosts:
+      A_EUH: {switch: S2, vlan: 10, bandwidth: 10mbit, delay: 1ms}
+      P_EUH: {switch: S2, vlan: 20, bandwidth: 10mbit, delay: 1ms}
+      A_CHA: {switch: S3, vlan: 10, bandwidth: 10mbit, delay: 1ms}
+      P_CHA: {switch: S3, vlan: 20, bandwidth: 10mbit, delay: 1ms}
+
+external_ports:
+  provider_a: {router: MSP}
+  provider_b: {router: NYC}
+  customer_a: {router: SFO}
+  customer_b: {router: HOU}
+  peer_a:     {router: BOS}
+  ixp:        {router: CHI}
+
+# The provisioning contract. Everything not listed under `provisioned` is left
+# deliberately unconfigured for the student, while Twinet still records the
+# expected value so the grader and `twinet solve` agree with the assignment.
+provisioning:
+  provisioned:
+    - iface: {router: MSP, name: dns}
+    - iface: {router: ATL, name: matrix}
+    - iface: {router: HOU, name: measurement}
+    - iface: {router: PHY, name: routinator}
+  student:
+    - router_interfaces
+    - loopbacks
+    - host_addressing
+    - ospf
+    - ibgp
+    - ebgp
+    - bgp_policy
+    - l2_vlans
+    - ipv6
+    - rpki

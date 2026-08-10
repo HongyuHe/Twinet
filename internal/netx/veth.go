@@ -333,3 +333,18 @@ func DeleteVeth(spec VethSpec) error {
 	}
 	return deleteEndpoint(spec.B)
 }
+
+// DeleteHostLink removes an interface from the root namespace, ignoring absence.
+func DeleteHostLink(name string) error {
+	l, err := netlink.LinkByName(name)
+	if err != nil {
+		if IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("look up %s: %w", name, err)
+	}
+	if err := netlink.LinkDel(l); err != nil {
+		return fmt.Errorf("delete %s: %w", name, err)
+	}
+	return nil
+}

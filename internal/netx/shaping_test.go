@@ -7,15 +7,15 @@ import "testing"
 // way to produce a link that is secretly 8x faster than the course intends.
 func TestParseRate(t *testing.T) {
 	cases := map[string]uint64{
-		"1mbit":   125_000,     // 1e6 bits/s = 125,000 bytes/s
+		"1mbit":   125_000, // 1e6 bits/s = 125,000 bytes/s
 		"10mbit":  1_250_000,
 		"100kbit": 12_500,
 		"1gbit":   125_000_000,
-		"1bit":    0,           // sub-byte rounds down
+		"1bit":    0, // sub-byte rounds down
 		"8bit":    1,
-		"1mbps":   1_000_000,   // bytes per second
+		"1mbps":   1_000_000, // bytes per second
 		"1kbps":   1_000,
-		"1kibit":  128,         // 1024 bits/s
+		"1kibit":  128, // 1024 bits/s
 		"2.5mbit": 312_500,
 	}
 	for in, want := range cases {

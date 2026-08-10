@@ -56,10 +56,14 @@ func Expand(lab *model.Lab) (*Result, error) {
 	if err := e.expandServices(); err != nil {
 		return nil, err
 	}
+	e.uniquifyIfaceNames()
 	e.assignVNIs()
 	e.stampLabels()
 	e.computeHash()
 
+	if err := e.verify(); err != nil {
+		return nil, err
+	}
 	return &Result{Topology: e.top, Warnings: e.warnings}, nil
 }
 
@@ -483,6 +487,27 @@ func (e *expander) expandOnePeering(pl model.PeeringLink) error {
 	if !ok {
 		return fmt.Errorf("AS %d is not declared", pl.B)
 	}
+
+	// A peering with an exchange is not a cable between two routers: the
+	// member plugs into the exchange's shared fabric.
+	if aAS.Role == model.RoleIXP && bAS.Role == model.RoleIXP {
+		return fmt.Errorf("cannot peer two IXPs (%d and %d) directly", pl.A, pl.B)
+	}
+	if bAS.Role == model.RoleIXP {
+		r, err := e.resolveEndpoint(aAS, pl.APort, pl.ARouter)
+		if err != nil {
+			return fmt.Errorf("side a: %w", err)
+		}
+		return e.connectToIXP(aAS, r, bAS)
+	}
+	if aAS.Role == model.RoleIXP {
+		r, err := e.resolveEndpoint(bAS, pl.BPort, pl.BRouter)
+		if err != nil {
+			return fmt.Errorf("side b: %w", err)
+		}
+		return e.connectToIXP(bAS, r, aAS)
+	}
+
 	aR, err := e.resolveEndpoint(aAS, pl.APort, pl.ARouter)
 	if err != nil {
 		return fmt.Errorf("side a: %w", err)
@@ -495,46 +520,26 @@ func (e *expander) expandOnePeering(pl model.PeeringLink) error {
 	idx := e.interASIndex[pl.Key()]
 	subnet := pl.Subnet
 	if subnet == "" {
-		field := ipam.FieldInterAS
-		ctx := ipam.Ctx{AS: pl.A, PeerAS: pl.B, LinkIndex: idx}
-		if bAS.Role == model.RoleIXP && e.plan.Has(ipam.FieldIXPPeering) {
-			field, ctx = ipam.FieldIXPPeering, ipam.Ctx{AS: pl.A, IXP: pl.B, LinkIndex: idx}
-		} else if aAS.Role == model.RoleIXP && e.plan.Has(ipam.FieldIXPPeering) {
-			field, ctx = ipam.FieldIXPPeering, ipam.Ctx{AS: pl.B, IXP: pl.A, LinkIndex: idx}
-		}
-		s, err := e.plan.Eval(field, ctx)
+		s, err := e.plan.Eval(ipam.FieldInterAS, ipam.Ctx{AS: pl.A, PeerAS: pl.B, LinkIndex: idx})
 		if err != nil {
 			return err
 		}
 		subnet = s
 	}
+	aAddr, bAddr := hostPair(subnet)
 
-	// At an IXP the addresses are prescribed (180.Z.0.<ASN>), because the
-	// course text tells students the exact address to configure. On ordinary
-	// inter-AS links the two groups must agree between themselves, so Twinet
-	// records the expected .1/.2 convention but leaves it to the students.
-	var aAddr, bAddr string
-	if aAS.Role == model.RoleIXP || bAS.Role == model.RoleIXP {
-		aAddr = hostInSubnet(subnet, pl.A)
-		bAddr = hostInSubnet(subnet, pl.B)
-	} else {
-		aAddr, bAddr = hostPair(subnet)
-	}
-
+	// Two staff-run ASes configure themselves; anything touching a student AS
+	// is left for the student, because agreeing on the addresses with their
+	// neighbour is part of the exercise.
 	owner := model.OwnerStudent
 	if aAS.Role != model.RoleStudent && bAS.Role != model.RoleStudent {
 		owner = model.OwnerPlatform
 	}
 
-	role := model.RoleInterAS
-	if aAS.Role == model.RoleIXP || bAS.Role == model.RoleIXP {
-		role = model.RoleIXPLink
-	}
-
-	aName := extIfaceName(bAS, pl.B)
-	bName := extIfaceName(aAS, pl.A)
-	aIf := &model.Iface{Device: aR, Name: aName, Role: role, Addr4: aAddr, Owner: ownerOf(aAS, owner)}
-	bIf := &model.Iface{Device: bR, Name: bName, Role: role, Addr4: bAddr, Owner: ownerOf(bAS, owner)}
+	aName := extIfaceName(bAS, pl.B, bR.Name)
+	bName := extIfaceName(aAS, pl.A, aR.Name)
+	aIf := &model.Iface{Device: aR, Name: aName, Role: model.RoleInterAS, Addr4: aAddr, Owner: ownerOf(aAS, owner)}
+	bIf := &model.Iface{Device: bR, Name: bName, Role: model.RoleInterAS, Addr4: bAddr, Owner: ownerOf(bAS, owner)}
 	aR.AddIface(aIf)
 	bR.AddIface(bIf)
 
@@ -551,11 +556,21 @@ func ownerOf(as *model.AS, def model.ConfigOwner) model.ConfigOwner {
 	return model.OwnerPlatform
 }
 
-func extIfaceName(peer *model.AS, asn int) string {
+// extIfaceName names the interface facing a peer AS.
+//
+// The peer's router is part of the name because a reduced staff-run AS carries
+// every external port on one router, so "the link to AS 3" is ambiguous there
+// while "the link to AS 3's MSP" is not. Names are truncated, never silently
+// collided; uniquifyIfaceNames resolves anything that still clashes.
+func extIfaceName(peer *model.AS, asn int, peerRouter string) string {
 	if peer.Role == model.RoleIXP {
 		return fmt.Sprintf("ixp_%d", asn)
 	}
-	return fmt.Sprintf("ext_%d", asn)
+	n := fmt.Sprintf("ext_%d_%s", asn, peerRouter)
+	if len(n) > ifaceNameMax {
+		n = n[:ifaceNameMax]
+	}
+	return n
 }
 
 func (e *expander) resolveEndpoint(as *model.AS, port, router string) (*model.Device, error) {

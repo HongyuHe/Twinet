@@ -1,0 +1,29 @@
+apiVersion: twinet.dev/v1
+kind: ASTemplate
+metadata:
+  name: transit-as
+  description: >
+    A reduced, staff-operated transit AS. It has a single router carrying every
+    external port, which keeps the resource cost of the backdrop ASes low while
+    still presenting a realistic BGP neighbour to the students. This mirrors the
+    mini-Internet's l3_routers_tier1_and_stub.txt simplification.
+
+routers:
+  ALL: {id: 1}
+
+hosts:
+  per_router: true
+  name: host
+  iface: "{{ .Router }}router"
+
+external_ports:
+  provider_a: {router: ALL}
+  provider_b: {router: ALL}
+  customer_a: {router: ALL}
+  customer_b: {router: ALL}
+  peer_a:     {router: ALL}
+  ixp:        {router: ALL}
+
+provisioning:
+  provisioned:
+    - scope: all

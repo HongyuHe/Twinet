@@ -126,7 +126,11 @@ func (d *Docker) Create(ctx context.Context, s *Spec) (string, error) {
 		args = append(args, "--cpus", strconv.FormatFloat(s.CPUs, 'f', -1, 64))
 	}
 	if s.Memory != "" {
-		args = append(args, "--memory", s.Memory)
+		b, err := ParseMemory(s.Memory)
+		if err != nil {
+			return "", fmt.Errorf("container %s: memory: %w", s.Name, err)
+		}
+		args = append(args, "--memory", FormatMemory(b))
 	}
 	if s.PidsLimit > 0 {
 		args = append(args, "--pids-limit", strconv.FormatInt(s.PidsLimit, 10))
