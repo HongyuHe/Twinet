@@ -12,8 +12,10 @@ LDFLAGS := -s -w \
 IMAGES  := router host switch svc
 REGISTRY?= hyhe
 TAG     ?= 0.1
+# Must match .github/workflows/ci.yml, or local lint and CI can disagree.
+GOLANGCI_VERSION ?= v2.5.0
 
-.PHONY: all build test lint fmt vet images push clean install e2e
+.PHONY: all build test lint fmt vet images push clean install e2e ci
 
 all: build
 
@@ -30,9 +32,24 @@ fmt:
 vet:
 	$(GO) vet ./...
 
+# Mirrors the CI lint job exactly, including the config schema check that the
+# GitHub action performs but `golangci-lint run` does not. Skipping it once cost
+# a red build for a config that ran perfectly well locally.
 lint: fmt vet
-	@command -v golangci-lint >/dev/null 2>&1 && golangci-lint run || \
-		echo "golangci-lint not installed; ran go vet only"
+	@if command -v golangci-lint >/dev/null 2>&1; then \
+		golangci-lint config verify && golangci-lint run --timeout=5m; \
+	else \
+		echo "golangci-lint not installed; ran go vet only. Install $(GOLANGCI_VERSION) to match CI."; \
+	fi
+
+# Everything CI checks, runnable before pushing.
+ci: lint test build
+	./bin/twinet validate -m examples/demo
+	./bin/twinet validate -m examples/cos461
+	./bin/twinet grade validate examples/cos461/rubric/cos461.yaml
+	@command -v shellcheck >/dev/null 2>&1 && shellcheck scripts/*.sh || \
+		echo "shellcheck not installed; skipped"
+	@echo "all CI gates passed"
 
 images:
 	@for i in $(IMAGES); do \
