@@ -11,3 +11,6 @@
 # Local overrides
 .env
 *.local.yaml
+
+# Injected-fault records carry ground truth and must never be committed.
+.twinet/

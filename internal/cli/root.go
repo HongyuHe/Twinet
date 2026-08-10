@@ -49,6 +49,7 @@ across a cluster and graded automatically.`,
 		newGraphCmd(opts),
 		newNodeCmd(opts),
 		newGradeCmd(opts),
+		newFaultCmd(opts),
 		newVersionCmd(),
 	)
 	return root
