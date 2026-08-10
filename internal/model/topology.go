@@ -66,7 +66,11 @@ type Device struct {
 	Kind DeviceKind
 	ASN  int // 0 for lab-global services
 
-	Image        string
+	Image string
+	// ImageID is the digest the reference resolved to when the lab was
+	// planned. It is part of a container's identity: a tag rebuilt in place is
+	// different software under an unchanged name.
+	ImageID      string
 	CPUs         float64
 	Memory       string
 	Pids         int64

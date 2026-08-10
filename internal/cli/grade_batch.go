@@ -238,6 +238,11 @@ func gradeOne(ctx context.Context, class *model.Topology, rubric *grade.Rubric,
 		grade.RunOptions{ConvergeTimeout: o.converge, Parallel: 4})
 	rep.Submission = s.Group
 	rep.Lab = h.Name
+	// Provenance, so a mark can be traced to exact software. An image tag is
+	// not an identity: rebuilt later it is different software, and a regrade
+	// against it is not comparable with the first.
+	rep.Images = imageDigests(ctx, c, h)
+	rep.Controller = Version
 
 	// A reduced harness can fail a correct submission for a reason the student
 	// cannot see: a check that names a peer, or a route from a particular
@@ -252,6 +257,25 @@ func gradeOne(ctx context.Context, class *model.Topology, rubric *grade.Rubric,
 				"(--depth 0) before releasing this mark", joinInts(missing)))
 	}
 	return rep
+}
+
+// imageDigests resolves every image the lab uses to the digest in use.
+func imageDigests(ctx context.Context, c *client.Cluster, top *model.Topology) map[string]string {
+	seen := map[string]bool{}
+	var refs []string
+	for _, d := range top.Devices {
+		if d.Image != "" && !seen[d.Image] {
+			seen[d.Image] = true
+			refs = append(refs, d.Image)
+		}
+	}
+	sort.Strings(refs)
+	for _, n := range c.Nodes {
+		if got, err := n.ImageDigests(ctx, refs); err == nil && len(got) > 0 {
+			return got
+		}
+	}
+	return nil
 }
 
 // missingASes reports which ASes of the class topology a harness left out.

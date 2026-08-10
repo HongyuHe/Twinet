@@ -25,6 +25,10 @@ type Zone struct {
 	Origin  string
 	Serial  uint32
 	Records []Record
+	// NS is the address the authoritative server actually answers on. A zone
+	// whose authority record names an address nobody holds fails as a name
+	// that intermittently does not resolve, rather than as a broken zone.
+	NS string
 }
 
 // Record is one resource record.
@@ -56,10 +60,15 @@ func BuildDNS(top *model.Topology, serial uint32) *DNSPlan {
 	p := &DNSPlan{Hosts: map[string]string{}}
 	rev := map[string][]Record{} // reverse zone origin -> records
 
+	// The address the resolver itself answers on, per AS. It is the service
+	// device's own address on that AS's service link, so the NS glue names
+	// something that genuinely responds.
+	nsFor := resolverAddrs(top)
+
 	for _, asn := range top.SortedASNs() {
 		as := top.ASes[asn]
 		origin := fmt.Sprintf("group%d.", asn)
-		zone := Zone{Origin: origin, Serial: serial}
+		zone := Zone{Origin: origin, Serial: serial, NS: nsFor[asn]}
 
 		for _, d := range as.Devices {
 			for _, i := range d.Ifaces {
@@ -115,6 +124,38 @@ func BuildDNS(top *model.Topology, serial uint32) *DNSPlan {
 	return p
 }
 
+// resolverAddrs maps each AS to the address the DNS service holds on that AS's
+// service link, which is the address that AS's devices can reach it at.
+func resolverAddrs(top *model.Topology) map[int]string {
+	out := map[int]string{}
+	for _, d := range top.Devices {
+		if d.Kind != model.KindService || !strings.Contains(strings.ToLower(d.Name), "dns") {
+			continue
+		}
+		for _, i := range d.Ifaces {
+			if i.Addr4 == "" {
+				continue
+			}
+			a, err := netip.ParsePrefix(i.Addr4)
+			if err != nil {
+				continue
+			}
+			// The interface is named after the AS it faces.
+			var asn int
+			if _, err := fmt.Sscanf(i.Name, "as%d", &asn); err == nil && asn > 0 {
+				out[asn] = a.Addr().String()
+			}
+		}
+	}
+	return out
+}
+
+// ResolverFor returns the address devices in an AS should use as their
+// nameserver, or empty if the lab has no DNS service reaching that AS.
+func ResolverFor(top *model.Topology, asn int) string {
+	return resolverAddrs(top)[asn]
+}
+
 // reverseRecord builds the PTR for an address, in the /24 reverse zone.
 func reverseRecord(ip, fqdn string) (origin string, r Record, ok bool) {
 	a, err := netip.ParseAddr(ip)
@@ -127,12 +168,21 @@ func reverseRecord(ip, fqdn string) (origin string, r Record, ok bool) {
 }
 
 // ZoneFile renders a zone in BIND master-file format.
+//
+// The NS glue points at an address the server genuinely holds. A zone whose
+// authority record names an address nobody answers on is not merely untidy: a
+// resolver following the delegation gets nothing, and the failure appears as a
+// name that intermittently does not resolve rather than as a broken zone.
 func (z Zone) ZoneFile() string {
 	var b strings.Builder
+	ns := z.NS
+	if ns == "" {
+		ns = "198.0.0.100"
+	}
 	fmt.Fprintf(&b, "$TTL 60\n")
 	fmt.Fprintf(&b, "@ IN SOA ns.%s root.%s (%d 60 60 300 60)\n", z.Origin, z.Origin, z.Serial)
 	fmt.Fprintf(&b, "@ IN NS ns.%s\n", z.Origin)
-	fmt.Fprintf(&b, "ns IN A 198.0.0.100\n")
+	fmt.Fprintf(&b, "ns IN A %s\n", ns)
 	for _, r := range z.Records {
 		fmt.Fprintf(&b, "%s IN %s %s\n", r.Name, r.Type, r.Data)
 	}

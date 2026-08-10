@@ -84,6 +84,10 @@ func (r *Renderer) Files(d *model.Device) (map[string]deploy.FileSpec, error) {
 			Content: []byte(cfg.Platform + cfg.Expected), Mode: 0o600}
 	case model.KindSwitch:
 		out["/etc/twinet/vlans"] = deploy.FileSpec{Content: []byte(vlanList(d)), Mode: 0o644}
+	case model.KindService:
+		for path, spec := range r.serviceFiles(d) {
+			out[path] = spec
+		}
 	}
 	out["/etc/twinet/device.json"] = deploy.FileSpec{Content: deviceFacts(r.Top, d), Mode: 0o644}
 	return out, nil
@@ -96,14 +100,16 @@ func (r *Renderer) Commands(d *model.Device) ([]deploy.Command, error) {
 		return r.routerCommands(d), nil
 	case model.KindSwitch:
 		return r.switchCommands(d), nil
-	case model.KindHost, model.KindService:
-		return r.hostCommands(d), nil
+	case model.KindHost:
+		return append(r.hostCommands(d), r.resolverCommands(d)...), nil
+	case model.KindService:
+		return append(r.hostCommands(d), r.serviceCommands(d)...), nil
 	}
 	return nil, nil
 }
 
 func (r *Renderer) routerCommands(d *model.Device) []deploy.Command {
-	var cmds []deploy.Command
+	cmds := r.resolverCommands(d)
 
 	// VLAN sub-interfaces on an L2 gateway must exist before the student can
 	// configure them: the assignment tells students they will see ATL-L2.10

@@ -27,6 +27,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"hash/fnv"
 	"sort"
 	"strings"
 
@@ -451,7 +452,16 @@ func harnessName(lab string, asn int, suffix string) string {
 	if suffix == "" {
 		return base
 	}
-	return base + "-" + sanitise(suffix)
+	// The readable part is sanitised and truncated, which on its own is a
+	// collision waiting to happen: "group 7 (late)" and "group-7-late" reduce
+	// to the same thing, and so does anything sharing a 24-byte prefix. Two
+	// submissions with the same harness name share container names and overlay
+	// identifiers, so one deployment reconfigures the other's routers and the
+	// marks are meaningless. The digest is of the raw identity, so distinct
+	// submissions stay distinct however they are written.
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(suffix))
+	return fmt.Sprintf("%s-%s%x", base, sanitise(suffix), h.Sum64()&0xffff)
 }
 
 func sanitise(s string) string {

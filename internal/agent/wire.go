@@ -36,6 +36,7 @@ type WireDev struct {
 	RouterID     int               `json:"router_id,omitempty"`
 	Node         string            `json:"node"`
 	Image        string            `json:"image"`
+	ImageID      string            `json:"image_id,omitempty"`
 	Container    string            `json:"container"`
 	Hostname     string            `json:"hostname"`
 	Owner        string            `json:"owner,omitempty"`
@@ -131,7 +132,7 @@ func Serialise(top *model.Topology) *Wire {
 	for _, d := range top.SortedDevices() {
 		wd := WireDev{
 			ID: d.ID, Name: d.Name, Kind: string(d.Kind), AS: d.ASN,
-			RouterID: d.RouterID, Node: d.Node, Image: d.Image,
+			RouterID: d.RouterID, Node: d.Node, Image: d.Image, ImageID: d.ImageID,
 			Container: d.Container, Hostname: d.Hostname, Owner: d.Owner,
 			CPUs: d.CPUs, Memory: d.Memory, Pids: d.Pids, Restart: d.Restart,
 			Privileged: d.Privileged, Env: d.Env, Sysctls: d.Sysctls,
@@ -223,7 +224,7 @@ func (w *Wire) Rehydrate() (*model.Topology, error) {
 		wd := &w.Devices[i]
 		d := &model.Device{
 			ID: wd.ID, Name: wd.Name, Kind: model.DeviceKind(wd.Kind), ASN: wd.AS,
-			RouterID: wd.RouterID, Node: wd.Node, Image: wd.Image,
+			RouterID: wd.RouterID, Node: wd.Node, Image: wd.Image, ImageID: wd.ImageID,
 			Container: wd.Container, Hostname: wd.Hostname, Owner: wd.Owner,
 			CPUs: wd.CPUs, Memory: wd.Memory, Pids: wd.Pids, Restart: wd.Restart,
 			Privileged: wd.Privileged, Env: wd.Env, Sysctls: wd.Sysctls,

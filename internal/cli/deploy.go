@@ -45,6 +45,7 @@ after a partial failure, a reboot, or a topology edit.`,
 			if err != nil {
 				return err
 			}
+			resolveImageIDs(cmd.Context(), top)
 			scope, err := parseScope(only)
 			if err != nil {
 				return err
@@ -378,6 +379,34 @@ func newExecCmd(opts *Options) *cobra.Command {
 }
 
 // loadAndPlace loads, validates, expands and places the topology.
+// resolveImageIDs stamps each device with the digest its image reference
+// currently resolves to.
+//
+// A tag rebuilt in place is different software under an unchanged name. Without
+// this the spec hash never moves, so the new image is never deployed: the lab
+// keeps running the old one while every report says it is up to date.
+func resolveImageIDs(ctx context.Context, top *model.Topology) {
+	rt := runtime.NewDocker()
+	seen := map[string]string{}
+	for _, d := range top.SortedDevices() {
+		if d.Image == "" {
+			continue
+		}
+		id, ok := seen[d.Image]
+		if !ok {
+			var err error
+			if id, err = rt.ImageDigest(ctx, d.Image); err != nil {
+				// An image that is not here yet will be pulled, and the
+				// deployment that pulls it stamps the identity next time.
+				// Refusing here would make a first deploy impossible.
+				id = ""
+			}
+			seen[d.Image] = id
+		}
+		d.ImageID = id
+	}
+}
+
 func loadAndPlace(opts *Options) (*model.Topology, error) {
 	top, err := load(opts)
 	if err != nil {

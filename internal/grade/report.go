@@ -135,6 +135,16 @@ type Report struct {
 	// NeedsReview marks a report that must not be released without a human
 	// looking at it, because some part of the grading did not run correctly.
 	NeedsReview bool `json:"needs_review,omitempty"`
+	// Images records the exact image digests the lab ran on.
+	//
+	// A mark is only defensible if it can be reproduced, and an image tag does
+	// not identify software: the same tag rebuilt months later can move FRR by
+	// a minor version, change a JSON field a check parses, and regrade a class
+	// differently with the manifest and the rubric unchanged. The digest is
+	// what makes a regrade comparable, and a dispute answerable.
+	Images map[string]string `json:"images,omitempty"`
+	// Controller is the build of the grader that produced this report.
+	Controller string `json:"controller,omitempty"`
 }
 
 // Percent returns the score as a percentage.

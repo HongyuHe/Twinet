@@ -141,6 +141,11 @@ type Env struct {
 	// so that undoing a traffic-control fault cannot leave a link subtly
 	// different from the one the lab describes.
 	Reshape func(ctx context.Context, deviceID, iface string) error
+	// NodeState reports a device container's run state: running, paused,
+	// exited. A fault that freezes a machine can only be verified by asking
+	// the platform, because the frozen machine cannot answer for itself and
+	// its silence is equally consistent with an unreachable node.
+	NodeState func(ctx context.Context, deviceID string) (string, error)
 	// Seed makes a time-varying fault replay exactly rather than differing run
 	// to run.
 	Seed int64
@@ -398,6 +403,14 @@ func Resolve(ctx context.Context, env *Env, inj *Injection) error {
 			inj.Fault, ev.Detail)
 	}
 	return nil
+}
+
+// State reports a device container's run state.
+func (e *Env) State(ctx context.Context, deviceID string) (string, error) {
+	if e.NodeState == nil {
+		return "", fmt.Errorf("this environment cannot inspect container state")
+	}
+	return e.NodeState(ctx, deviceID)
 }
 
 // reachable reports whether a device can be asked anything at all.

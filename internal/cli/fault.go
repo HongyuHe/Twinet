@@ -295,7 +295,14 @@ func faultEnv(cmd *cobra.Command, top *model.Topology, token string) (*fault.Env
 	if err != nil {
 		return nil, err
 	}
-	return &fault.Env{Topology: top, Exec: exec, Lifecycle: life, Reshape: reshape}, nil
+	nodeState, err := nodeStateFunc(top, token)
+	if err != nil {
+		return nil, err
+	}
+	return &fault.Env{
+		Topology: top, Exec: exec, Lifecycle: life,
+		Reshape: reshape, NodeState: nodeState,
+	}, nil
 }
 
 func parseKV(in []string) map[string]string {

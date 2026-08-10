@@ -192,16 +192,35 @@ func TestNeighboursAreNeverGradedAsStudents(t *testing.T) {
 }
 
 func TestHarnessNameIsSafeAndUnique(t *testing.T) {
-	cases := []struct{ suffix, want string }{
-		{"", "cos461-g3"},
-		{"attempt 2", "cos461-g3-attempt2"},
-		{"Group/../etc", "cos461-g3-groupetc"},
-		{strings.Repeat("x", 80), "cos461-g3-" + strings.Repeat("x", 24)},
+	if got := harnessName("cos461", 3, ""); got != "cos461-g3" {
+		t.Errorf("harnessName with no suffix = %q", got)
 	}
-	for _, c := range cases {
-		if got := harnessName("cos461", 3, c.suffix); got != c.want {
-			t.Errorf("harnessName(%q) = %q, want %q", c.suffix, got, c.want)
+	// A name must be safe to use as a container name and an overlay prefix.
+	for _, suffix := range []string{"attempt 2", "Group/../etc", strings.Repeat("x", 80)} {
+		got := harnessName("cos461", 3, suffix)
+		for _, bad := range []string{"/", "..", " ", ":"} {
+			if strings.Contains(got, bad) {
+				t.Errorf("harnessName(%q) = %q contains %q", suffix, got, bad)
+			}
 		}
+	}
+
+	// Distinct submissions must stay distinct however they are written.
+	// Sanitising and truncating alone collapses these onto one another, and
+	// two submissions sharing a harness name share container names and overlay
+	// identifiers, so one deployment reconfigures the other's routers.
+	colliding := []string{
+		"group 7 (late)", "group-7-late", "group_7_late",
+		strings.Repeat("x", 30) + "a", strings.Repeat("x", 30) + "b",
+		"Ann", "ann", "a.n.n",
+	}
+	seen := map[string]string{}
+	for _, s := range colliding {
+		got := harnessName("cos461", 3, s)
+		if prev, ok := seen[got]; ok {
+			t.Errorf("submissions %q and %q both produce harness %q", prev, s, got)
+		}
+		seen[got] = s
 	}
 }
 

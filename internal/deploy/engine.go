@@ -465,10 +465,17 @@ func (e *Engine) PruneOverlays(top *model.Topology) ([]string, error) {
 // shaping or an address on an interface. Deliberately included: image, command,
 // resource limits, capabilities, sysctls, binds, environment and placement,
 // because none of those can be altered on a running container.
+//
+// The image *identity* is included, not only its reference. A tag rebuilt in
+// place is different software under an unchanged name, and hashing the name
+// alone means the new image is never deployed: the lab keeps running the old
+// one while every report says it is up to date. That was not hypothetical --
+// it cost a debugging session here, where a fixed image sat on the host and the
+// containers kept the broken one.
 func SpecHash(d *model.Device) string {
 	h := sha256.New()
-	fmt.Fprintf(h, "id=%s\nkind=%s\nimage=%s\nhost=%s\nnode=%s\n",
-		d.ID, d.Kind, d.Image, d.Hostname, d.Node)
+	fmt.Fprintf(h, "id=%s\nkind=%s\nimage=%s\nimageid=%s\nhost=%s\nnode=%s\n",
+		d.ID, d.Kind, d.Image, d.ImageID, d.Hostname, d.Node)
 	fmt.Fprintf(h, "cpus=%v\nmem=%s\npids=%d\nrestart=%s\npriv=%v\n",
 		d.CPUs, d.Memory, d.Pids, d.Restart, d.Privileged)
 	fmt.Fprintf(h, "cmd=%s\ncaps=%s\nbinds=%s\n",

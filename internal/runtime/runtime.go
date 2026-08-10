@@ -196,6 +196,9 @@ type Runtime interface {
 	Pause(ctx context.Context, nameOrID string) error
 	// Unpause resumes a paused container.
 	Unpause(ctx context.Context, nameOrID string) error
+	// ImageDigest resolves an image reference to the digest actually in use,
+	// so a grade can be traced to exact software rather than to a mutable tag.
+	ImageDigest(ctx context.Context, ref string) (string, error)
 	// Remove deletes a container, stopping it first if necessary.
 	Remove(ctx context.Context, nameOrID string, force bool) error
 	// Inspect returns one container, or StateAbsent if it does not exist.

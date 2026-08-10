@@ -305,3 +305,41 @@ func TestRedeployDoesNotOverwriteStudentConfiguration(t *testing.T) {
 		t.Errorf("solve mode did not install the reference solution over what was there:\n%s", out)
 	}
 }
+
+// Generating a zone and serving it are different things, and the gap between
+// them is invisible from the control plane: the zone files are correct, the
+// unit tests that check them pass, and inside the lab no name resolves. A
+// service that is deployed, wired, addressed and running `sleep infinity` looks
+// healthy from every angle except the only one that matters.
+func TestNamesResolveInsideTheLab(t *testing.T) {
+	dir := labDir(t)
+
+	// Forward: the name the assignment tells students to expect.
+	out, err := twinet(t, "exec", "-m", dir, "as3/MSP", "--", "dig", "+short", "msp.group3")
+	if err != nil {
+		t.Fatalf("resolving a lab name: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "3.") {
+		t.Errorf("msp.group3 did not resolve to an address in AS 3:\n%s", out)
+	}
+
+	// Reverse, which is what makes a traceroute render names rather than
+	// numbers -- the entire reason the zone exists.
+	out, err = twinet(t, "exec", "-m", dir, "as3/MSP", "--", "dig", "+short", "-x", "3.101.0.1")
+	if err != nil {
+		t.Fatalf("reverse lookup: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "group3") {
+		t.Errorf("3.101.0.1 did not reverse to a name in group3:\n%s", out)
+	}
+
+	// The resolver must be the lab's own, not whatever the container engine
+	// supplied, or the names work only by accident of the outside world.
+	out, err = twinet(t, "exec", "-m", dir, "as3/CHI_host", "--", "cat", "/etc/resolv.conf")
+	if err != nil {
+		t.Fatalf("reading resolv.conf: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "198.3.0.") {
+		t.Errorf("a host is not pointed at the lab's resolver:\n%s", out)
+	}
+}

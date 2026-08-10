@@ -214,6 +214,20 @@ func (d *Docker) Start(ctx context.Context, name string) error {
 }
 
 // Stop stops a running container.
+// ImageDigest resolves an image reference to the digest actually in use.
+//
+// A tag is not an identity. The same tag rebuilt later is different software,
+// and a grade produced against it cannot be compared with an earlier one. The
+// digest is what makes a regrade reproducible and a dispute answerable.
+func (d *Docker) ImageDigest(ctx context.Context, ref string) (string, error) {
+	out, _, err := d.run(ctx, nil, "image", "inspect", ref,
+		"--format", "{{if .RepoDigests}}{{index .RepoDigests 0}}{{else}}{{.Id}}{{end}}")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out), nil
+}
+
 // Pause freezes every process in a container without stopping it.
 //
 // This is what a crashed machine looks like from the network: the interfaces

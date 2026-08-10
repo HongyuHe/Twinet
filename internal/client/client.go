@@ -172,6 +172,27 @@ func (n *Node) Lifecycle(ctx context.Context, req agent.LifecycleRequest) error 
 	return n.do(ctx, http.MethodPost, "/v1/lifecycle", req, nil)
 }
 
+// ImageDigests resolves image references to the digests in use on this node.
+func (n *Node) ImageDigests(ctx context.Context, refs []string) (map[string]string, error) {
+	q := url.Values{}
+	for _, r := range refs {
+		q.Add("ref", r)
+	}
+	var out map[string]string
+	err := n.do(ctx, http.MethodGet, "/v1/images?"+q.Encode(), nil, &out)
+	return out, err
+}
+
+// ContainerState reports a container's run state on this node.
+func (n *Node) ContainerState(ctx context.Context, container string) (string, error) {
+	var resp struct {
+		State string `json:"state"`
+	}
+	err := n.do(ctx, http.MethodPost, "/v1/lifecycle",
+		agent.LifecycleRequest{Container: container, Action: "state"}, &resp)
+	return resp.State, err
+}
+
 // OverlaysInUse maps every VXLAN identifier deployed anywhere in the cluster to
 // the lab that owns it. A node that cannot be reached contributes nothing,
 // which is deliberate: refusing to deploy because one node is down would be a

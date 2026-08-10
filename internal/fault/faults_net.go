@@ -55,22 +55,43 @@ func init() {
 			// exactly; a benchmark whose fault differs run to run is not one.
 			down := t.Param("down_seconds", "5")
 			up := t.Param("up_seconds", "10")
+			// One pidfile per interface, not per device. A device with two
+			// flapping links would otherwise overwrite the first record with
+			// the second, and resolving would leave the first loop running
+			// forever: an unattributable fault, on a lab everyone believes is
+			// clean, that no later episode can explain.
+			pidfile := "/run/twinet_flap_" + safeFileName(iface) + ".pid"
+			if out, code := e.Try(ctx, t.DeviceID(),
+				fmt.Sprintf("test -f %s && kill -0 $(cat %s) 2>/dev/null && echo running", pidfile, pidfile)); code == 0 &&
+				strings.Contains(out, "running") {
+				return nil, fmt.Errorf("%s is already being flapped; resolve that first", iface)
+			}
 			script := fmt.Sprintf(
 				"while true; do ip link set %s down; sleep %s; ip link set %s up; sleep %s; done",
 				iface, down, iface, up)
 			if _, err := e.Sh(ctx, t.DeviceID(),
-				fmt.Sprintf("nohup sh -c %q >/dev/null 2>&1 & echo $! > /run/twinet_flap.pid", script)); err != nil {
+				fmt.Sprintf("nohup sh -c %q >/dev/null 2>&1 & echo $! > %s", script, pidfile)); err != nil {
 				return nil, err
 			}
-			return State{"iface": iface, "pidfile": "/run/twinet_flap.pid"}, nil
+			return State{"iface": iface, "pidfile": pidfile}, nil
 		},
 		Verify: func(ctx context.Context, e *Env, t Target, s State) (Evidence, error) {
-			out, _ := e.Try(ctx, t.DeviceID(),
-				"test -f /run/twinet_flap.pid && kill -0 $(cat /run/twinet_flap.pid) 2>/dev/null && echo running || echo stopped")
+			pidfile := s["pidfile"]
+			if pidfile == "" {
+				return Evidence{}, fmt.Errorf("no flap loop was recorded for this fault")
+			}
+			out, _, err := e.TryE(ctx, t.DeviceID(), fmt.Sprintf(
+				"test -f %s && kill -0 $(cat %s) 2>/dev/null && echo running || echo stopped", pidfile, pidfile))
+			if err != nil {
+				return Evidence{}, err
+			}
 			return Evidence{Verified: strings.Contains(out, "running"),
 				Expected: "the flap loop running", Observed: strings.TrimSpace(out)}, nil
 		},
 		Resolve: func(ctx context.Context, e *Env, t Target, s State) error {
+			if s["pidfile"] == "" || s["iface"] == "" {
+				return fmt.Errorf("no flap loop was recorded, so it cannot be stopped")
+			}
 			_, err := e.Sh(ctx, t.DeviceID(), fmt.Sprintf(
 				"if [ -f %s ]; then kill $(cat %s) 2>/dev/null; rm -f %s; fi; ip link set %s up 2>/dev/null || true",
 				s["pidfile"], s["pidfile"], s["pidfile"], s["iface"]))
@@ -181,13 +202,19 @@ func init() {
 			return State{"paused": "true"}, nil
 		},
 		Verify: func(ctx context.Context, e *Env, t Target, s State) (Evidence, error) {
-			// A paused container cannot run a command, so the failure that
-			// would normally be a problem is the evidence.
-			_, code := e.Try(ctx, t.DeviceID(), "true")
+			// The platform is asked, not the device. A frozen machine cannot
+			// answer for itself, and its silence is equally consistent with an
+			// unreachable node -- so reading a failed command as proof of the
+			// fault would report success on an outage, and report the fault
+			// resolved on one too.
+			st, err := e.State(ctx, t.DeviceID())
+			if err != nil {
+				return Evidence{}, err
+			}
 			return Evidence{
-				Verified: code != 0,
-				Observed: "the device does not respond to any command",
-				Expected: "a crashed machine executes nothing",
+				Verified: st == "paused",
+				Observed: "the container is " + st,
+				Expected: "the container is paused",
 			}, nil
 		},
 		Resolve: func(ctx context.Context, e *Env, t Target, s State) error {
@@ -335,19 +362,26 @@ func init() {
 			if s["asn"] == "" {
 				return fmt.Errorf("no original AS number was recorded")
 			}
-			// Restoring the number alone would leave a router with an empty
-			// BGP configuration, which is a different fault rather than a
-			// repair, and FRR will not accept a second instance while the
-			// wrong one exists. Restarting the daemons onto the configuration
-			// on disk is the only undo that is certain to land, whatever state
-			// the injection left behind.
-			if _, err := e.Sh(ctx, t.DeviceID(), strings.Join([]string{
-				"for p in $(ps -ef | awk '/watchfrr/ && !/awk/ {print $1}'); do kill $p 2>/dev/null || true; done",
-				"/usr/lib/frr/frrinit.sh stop >/dev/null 2>&1 || true",
-				"rm -f /var/run/frr/*.pid /var/run/frr/*.vty 2>/dev/null || true",
-				"/usr/lib/frr/frrinit.sh start",
-			}, "\n")); err != nil {
+			// The undo is scoped to what the injection did: remove the wrong
+			// instance and replay only the BGP section of the configuration on
+			// disk. Restarting FRR would be simpler and is what an earlier
+			// version did, but it also discards every unrelated edit a student
+			// or another fault has made since -- a repair that silently
+			// destroys state it was never asked about.
+			if err := e.VtyshConfig(ctx, t.DeviceID(), "configure terminal",
+				fmt.Sprintf("no router bgp %s", s["wrong"]), "end"); err != nil {
 				return err
+			}
+			_, err := e.Sh(ctx, t.DeviceID(), strings.Join([]string{
+				"set -e",
+				// Extract just "router bgp <n>" and its indented body.
+				fmt.Sprintf("awk '/^router bgp %s$/{f=1} f{print} f&&/^exit$/{f=0}' /etc/frr/frr.conf > /tmp/twinet_bgp.conf", s["asn"]),
+				"test -s /tmp/twinet_bgp.conf",
+				"vtysh -f /tmp/twinet_bgp.conf",
+				"rm -f /tmp/twinet_bgp.conf",
+			}, "\n"))
+			if err != nil {
+				return fmt.Errorf("replaying the router's own BGP configuration: %w", err)
 			}
 			return nil
 		},
@@ -650,6 +684,20 @@ func localASN(ctx context.Context, e *Env, t Target) (int, error) {
 		return t.AS, nil
 	}
 	return 0, fmt.Errorf("%s is not running BGP, so its AS number cannot be changed", t.DeviceID())
+}
+
+// safeFileName makes an interface name usable in a path.
+func safeFileName(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_', r == '-':
+			b.WriteRune(r)
+		default:
+			b.WriteRune('_')
+		}
+	}
+	return b.String()
 }
 
 func faultIface(e *Env, t Target) (string, error) {

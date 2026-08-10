@@ -275,6 +275,43 @@ func lifecycleFunc(top *model.Topology, token string) (
 	}, nil
 }
 
+// nodeStateFunc returns a function that reports a device container's run state.
+func nodeStateFunc(top *model.Topology, token string) (
+	func(context.Context, string) (string, error), error) {
+
+	if !clustered(top) {
+		rt := runtime.NewDocker()
+		return func(ctx context.Context, deviceID string) (string, error) {
+			d, ok := top.Device(deviceID)
+			if !ok {
+				return "", fmt.Errorf("no device %q", deviceID)
+			}
+			c, err := rt.Inspect(ctx, d.Container)
+			if err != nil {
+				return "", err
+			}
+			return string(c.State), nil
+		}, nil
+	}
+
+	tok, err := tokenFor(token)
+	if err != nil {
+		return nil, err
+	}
+	cl := client.NewCluster(top.Lab, tok)
+	return func(ctx context.Context, deviceID string) (string, error) {
+		d, ok := top.Device(deviceID)
+		if !ok {
+			return "", fmt.Errorf("no device %q", deviceID)
+		}
+		n, ok := cl.Node(d.Node)
+		if !ok {
+			return "", fmt.Errorf("device %s is on unknown node %q", deviceID, d.Node)
+		}
+		return n.ContainerState(ctx, d.Container)
+	}, nil
+}
+
 // reshapeFunc returns a function that puts an interface back to the shaping
 // the topology declares, wherever in the cluster the device lives.
 func reshapeFunc(top *model.Topology, token string) (

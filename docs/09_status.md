@@ -33,7 +33,7 @@ plan but not yet implemented; it is milestone M8.
 | Fault injection engine | partial | 21 types across all six NIKA categories, out of the 47 that are in-substrate; **21/21 inject, verify and resolve** on the live cluster, re-checked by `make e2e` in 25 seconds |
 | Incident runner | done | `twinet incident run`; a two-fault scenario injects, holds and unwinds in 798 ms |
 | Ground-truth isolation | verified | audited: 0 hits for the fault name, root cause or ground truth anywhere in a target container's files, environment or labels |
-| DNS zone generation | partial | zones are generated from the model and are correct by construction; **no server yet answers them**, so nothing in a lab can resolve a name |
+| DNS | done | zones are generated from the model, served by BIND in the service container, and every device points at the lab own resolver; verified end to end for forward and reverse lookups |
 | Matrix, looking glass, policy analyzer | partial | the collectors and the analysis are implemented and tested, but nothing yet serves their output, so a student cannot open a looking glass |
 | _(collectors)_ | done | control-plane collectors; the analyzer reads structured paths and the declared relationships rather than scraping text |
 | CI, Makefile, lint config | done | `.github/workflows/ci.yml` |

@@ -248,6 +248,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	mux.HandleFunc("POST /v1/exec", s.auth(s.handleExec))
 	mux.HandleFunc("POST /v1/lifecycle", s.auth(s.handleLifecycle))
 	mux.HandleFunc("POST /v1/reshape", s.auth(s.handleReshape))
+	mux.HandleFunc("GET /v1/images", s.auth(s.handleImages))
 	mux.HandleFunc("GET /v1/underlay", s.auth(s.handleUnderlay))
 
 	srv := &http.Server{
@@ -683,6 +684,19 @@ type ExecResponse struct {
 	Stderr   string `json:"stderr"`
 }
 
+// handleImages reports the digest behind every image this node has, so a
+// grading report can name the exact software a mark was produced against.
+func (s *Server) handleImages(w http.ResponseWriter, r *http.Request) {
+	refs := r.URL.Query()["ref"]
+	out := map[string]string{}
+	for _, ref := range refs {
+		if d, err := s.rt.ImageDigest(r.Context(), ref); err == nil {
+			out[ref] = d
+		}
+	}
+	writeJSON(w, out)
+}
+
 // ReshapeRequest asks the agent to put an interface back to a declared shaping.
 //
 // It exists so that undoing a traffic-control fault produces byte-identical
@@ -736,7 +750,7 @@ func (s *Server) handleReshape(w http.ResponseWriter, r *http.Request) {
 // LifecycleRequest asks the agent to change a container's run state.
 type LifecycleRequest struct {
 	Container string `json:"container"`
-	// Action is one of pause, unpause, stop, start or restart.
+	// Action is one of state, pause, unpause, stop, start or restart.
 	Action string `json:"action"`
 	Owner  string `json:"owner,omitempty"`
 }
@@ -773,6 +787,9 @@ func (s *Server) handleLifecycle(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch req.Action {
+	case "state":
+		writeJSON(w, map[string]string{"status": "ok", "state": string(c.State)})
+		return
 	case "pause":
 		err = s.rt.Pause(r.Context(), req.Container)
 	case "unpause":
