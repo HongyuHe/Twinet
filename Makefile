@@ -10,13 +10,22 @@ LDFLAGS := -s -w \
 	-X github.com/HongyuHe/twinet/internal/cli.Date=$(DATE) \
 	-X github.com/HongyuHe/twinet/internal/agent.Version=$(VERSION)
 
+# Docker may need privilege depending on how the host is set up; overriding one
+# variable is better than every recipe guessing.
+DOCKER  ?= docker
 IMAGES  := router host switch svc
 REGISTRY?= hyhe
 TAG     ?= 0.1
+# Every image is also published under the commit it was built from. The moving
+# tag is what a manifest refers to day to day; the immutable one is what makes a
+# grade reproducible, because "0.1" rebuilt in three months is different
+# software under an unchanged name and a regrade against it is not comparable
+# with the first.
+BUILD_TAG ?= $(TAG)-$(COMMIT)
 # Must match .github/workflows/ci.yml, or local lint and CI can disagree.
 GOLANGCI_VERSION ?= v2.5.0
 
-.PHONY: all build test lint fmt vet images push clean install e2e ci naming
+.PHONY: all build test lint fmt vet images push digests clean install e2e ci naming
 
 all: build
 
@@ -64,11 +73,27 @@ images: build
 	@cp $(BIN)/twinet-rtr images/svc/twinet-rtr
 	@for i in $(IMAGES); do \
 		echo "building $(REGISTRY)/twinet-$$i:$(TAG)"; \
-		docker build -q -t $(REGISTRY)/twinet-$$i:$(TAG) images/$$i || exit 1; \
+		$(DOCKER) build -q -t $(REGISTRY)/twinet-$$i:$(TAG) images/$$i || exit 1; \
 	done
 
 push: images
-	@for i in $(IMAGES); do docker push $(REGISTRY)/twinet-$$i:$(TAG) || exit 1; done
+	@for i in $(IMAGES); do \
+		$(DOCKER) tag $(REGISTRY)/twinet-$$i:$(TAG) $(REGISTRY)/twinet-$$i:$(BUILD_TAG); \
+		echo "pushing $(REGISTRY)/twinet-$$i:$(TAG) and :$(BUILD_TAG)"; \
+		$(DOCKER) push -q $(REGISTRY)/twinet-$$i:$(TAG) >/dev/null || exit 1; \
+		$(DOCKER) push -q $(REGISTRY)/twinet-$$i:$(BUILD_TAG) >/dev/null || exit 1; \
+	done
+	@$(MAKE) --no-print-directory digests
+
+# digests records what was actually published, so a report naming an image can
+# be traced to the exact bytes rather than to a tag that has since moved.
+digests:
+	@echo "# published $(shell date -u +%Y-%m-%dT%H:%M:%SZ) from $(COMMIT)" > images/published.txt
+	@for i in $(IMAGES); do \
+		d=$$($(DOCKER) image inspect $(REGISTRY)/twinet-$$i:$(TAG) --format '{{if .RepoDigests}}{{index .RepoDigests 0}}{{else}}{{.Id}}{{end}}'); \
+		echo "$(REGISTRY)/twinet-$$i:$(TAG) $$d" >> images/published.txt; \
+	done
+	@cat images/published.txt
 
 install: build
 	install -m 0755 $(BIN)/twinet /usr/local/bin/twinet

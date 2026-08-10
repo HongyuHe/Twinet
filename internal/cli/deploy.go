@@ -45,7 +45,7 @@ after a partial failure, a reboot, or a topology edit.`,
 			if err != nil {
 				return err
 			}
-			resolveImageIDs(cmd.Context(), top)
+			resolveImageIDs(cmd.Context(), top, token)
 			scope, err := parseScope(only)
 			if err != nil {
 				return err
@@ -385,25 +385,58 @@ func newExecCmd(opts *Options) *cobra.Command {
 // A tag rebuilt in place is different software under an unchanged name. Without
 // this the spec hash never moves, so the new image is never deployed: the lab
 // keeps running the old one while every report says it is up to date.
-func resolveImageIDs(ctx context.Context, top *model.Topology) {
-	rt := runtime.NewDocker()
+func resolveImageIDs(ctx context.Context, top *model.Topology, token string) {
+	refs := map[string]bool{}
+	for _, d := range top.Devices {
+		if d.Image != "" {
+			refs[d.Image] = true
+		}
+	}
+	list := make([]string, 0, len(refs))
+	for r := range refs {
+		list = append(list, r)
+	}
+	sort.Strings(list)
+
+	// The agents are asked, not the local machine. The controller need not run
+	// containers at all, and here it could not even talk to the daemon -- so
+	// resolving locally returned nothing for every image, the spec hash never
+	// moved, and a rebuilt image was never deployed. The symptom was a fix that
+	// simply did not appear in the lab, with every report saying the deployment
+	// was current.
 	seen := map[string]string{}
-	for _, d := range top.SortedDevices() {
-		if d.Image == "" {
-			continue
-		}
-		id, ok := seen[d.Image]
-		if !ok {
-			var err error
-			if id, err = rt.ImageDigest(ctx, d.Image); err != nil {
-				// An image that is not here yet will be pulled, and the
-				// deployment that pulls it stamps the identity next time.
-				// Refusing here would make a first deploy impossible.
-				id = ""
+	if clustered(top) {
+		if tok, err := tokenFor(token); err == nil {
+			cl := client.NewCluster(top.Lab, tok)
+			for _, n := range cl.Nodes {
+				got, err := n.ImageDigests(ctx, list)
+				if err != nil {
+					continue
+				}
+				for ref, id := range got {
+					if id != "" && seen[ref] == "" {
+						seen[ref] = id
+					}
+				}
+				if len(seen) == len(list) {
+					break
+				}
 			}
-			seen[d.Image] = id
 		}
-		d.ImageID = id
+	} else {
+		rt := runtime.NewDocker()
+		for _, ref := range list {
+			// An image that is not here yet will be pulled, and the deployment
+			// that pulls it stamps the identity next time; refusing here would
+			// make a first deploy impossible.
+			if id, err := rt.ImageDigest(ctx, ref); err == nil {
+				seen[ref] = id
+			}
+		}
+	}
+
+	for _, d := range top.SortedDevices() {
+		d.ImageID = seen[d.Image]
 	}
 }
 
