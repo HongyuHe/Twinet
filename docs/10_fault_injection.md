@@ -293,3 +293,25 @@ Recording these here so they are not discovered late.
 This is **M8**, sequenced after the grading engine (M5), whose check framework
 and ephemeral labs it reuses, and after the services (M2), which several fault
 types require. See [07](07_roadmap.md).
+
+## Coverage as measured
+
+| | Count |
+| --- | --- |
+| Registered in Twinet | 37 |
+| NIKA types total | 48 |
+| Of those, Kubernetes-specific and therefore out of this substrate | 4 |
+| In-substrate NIKA types | 44 |
+| **Covered** | **34** |
+| Not yet covered | 10 |
+
+The ten are not arbitrary: each needs a service the lab does not yet run. Five
+are DHCP faults, three belong to an SDN control plane, one needs a load balancer
+and one a VPN. They are absent because the services are, and adding a fault
+against a service that does not exist would produce an episode with no symptom —
+which is worse than an absent fault, because it looks like a working one.
+
+Every registered fault is exercised against the live cluster by `make e2e`,
+which injects and resolves all thirty-seven in about thirty-six seconds. A fault
+that cannot be undone is treated as a failure there, because an episode that
+contaminates the next one is worse than an episode that never ran.

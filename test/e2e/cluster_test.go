@@ -132,20 +132,28 @@ func TestEveryFaultRoundTrips(t *testing.T) {
 		}
 		name := f[0]
 		args := []string{"--as", "5", "--device", "CHI"}
-		switch {
-		case strings.HasPrefix(name, "host_"):
+		if strings.HasPrefix(name, "host_") {
 			args = []string{"--as", "5", "--device", "CHI_host"}
 		}
-		// Faults that need a subject are given one, rather than being skipped:
-		// an untested fault is one that will fail the first time it matters.
+		// Faults that need a particular kind of device or a subject are given
+		// one rather than skipped: an untested fault is one that will fail the
+		// first time it matters, which is in the middle of an evaluation.
 		switch name {
 		case "host_ip_conflict":
 			args = append(args, "--param", "victim=as5/CHI")
 		case "bgp_hijacking":
 			args = []string{"--as", "5", "--device", "MSP", "--peer", "3"}
+		case "bgp_blackhole_route_leak":
+			args = []string{"--as", "5", "--device", "MSP", "--peer", "3"}
 		case "bgp_peer_asn_misconfig":
 			// Only a border router has an external neighbour to misconfigure.
 			args = []string{"--as", "5", "--device", "MSP"}
+		case "web_dos_attack":
+			args = []string{"--as", "5", "--device", "CHI_host", "--param", "victim=5.105.0.2"}
+		case "flow_rule_shadowing", "flow_rule_loop":
+			args = []string{"--as", "5", "--device", "DCN_S1"}
+		case "dns_service_down", "dns_port_blocked", "dns_record_error", "dns_lookup_latency":
+			args = []string{"--device", "svc/dns"}
 		}
 		specs = append(specs, spec{name, args})
 	}
