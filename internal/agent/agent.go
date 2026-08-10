@@ -211,6 +211,8 @@ func (s *Server) Serve(ctx context.Context) error {
 	mux.HandleFunc("POST /v1/apply", s.auth(s.handleApply))
 	mux.HandleFunc("POST /v1/destroy", s.auth(s.handleDestroy))
 	mux.HandleFunc("POST /v1/exec", s.auth(s.handleExec))
+	mux.HandleFunc("POST /v1/lifecycle", s.auth(s.handleLifecycle))
+	mux.HandleFunc("POST /v1/reshape", s.auth(s.handleReshape))
 	mux.HandleFunc("GET /v1/underlay", s.auth(s.handleUnderlay))
 
 	srv := &http.Server{
@@ -592,6 +594,119 @@ type ExecResponse struct {
 	ExitCode int    `json:"exit_code"`
 	Stdout   string `json:"stdout"`
 	Stderr   string `json:"stderr"`
+}
+
+// ReshapeRequest asks the agent to put an interface back to a declared shaping.
+//
+// It exists so that undoing a traffic-control fault produces byte-identical
+// state to a deployment. Reproducing the deployer's arithmetic with tc's
+// command line does not: a burst asked for in bits is converted differently
+// from one computed in scheduler ticks, so a "restored" link ends up with a
+// different queue from the one the topology describes, and every later
+// measurement on it is quietly wrong.
+type ReshapeRequest struct {
+	Container string       `json:"container"`
+	Iface     string       `json:"iface"`
+	Shaping   netx.Shaping `json:"shaping"`
+	MTU       int          `json:"mtu,omitempty"`
+}
+
+func (s *Server) handleReshape(w http.ResponseWriter, r *http.Request) {
+	var req ReshapeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpError(w, http.StatusBadRequest, err)
+		return
+	}
+	if req.Container == "" || req.Iface == "" {
+		httpError(w, http.StatusBadRequest, errors.New("container and iface are both required"))
+		return
+	}
+	c, err := s.rt.Inspect(r.Context(), req.Container)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if c.State == rt.StateAbsent {
+		httpError(w, http.StatusNotFound, fmt.Errorf("no container %q on %s", req.Container, s.cfg.Node))
+		return
+	}
+	if c.Labels[deploy.LabelManaged] != "true" {
+		httpError(w, http.StatusForbidden, errors.New("that container is not managed by twinet"))
+		return
+	}
+	ns, err := s.rt.NSPath(r.Context(), req.Container)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if err := netx.ReshapeInNS(ns, req.Iface, req.Shaping, req.MTU); err != nil {
+		httpError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, map[string]string{"status": "ok", "iface": req.Iface})
+}
+
+// LifecycleRequest asks the agent to change a container's run state.
+type LifecycleRequest struct {
+	Container string `json:"container"`
+	// Action is one of pause, unpause, stop, start or restart.
+	Action string `json:"action"`
+	Owner  string `json:"owner,omitempty"`
+}
+
+func (s *Server) handleLifecycle(w http.ResponseWriter, r *http.Request) {
+	var req LifecycleRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpError(w, http.StatusBadRequest, err)
+		return
+	}
+	if req.Container == "" || req.Action == "" {
+		httpError(w, http.StatusBadRequest, errors.New("container and action are both required"))
+		return
+	}
+	c, err := s.rt.Inspect(r.Context(), req.Container)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if c.State == rt.StateAbsent {
+		httpError(w, http.StatusNotFound, fmt.Errorf("no container %q on %s", req.Container, s.cfg.Node))
+		return
+	}
+	// The same authorisation as exec. Pausing a container is at least as
+	// disruptive as running a command in it, so it cannot be the weaker door.
+	if c.Labels[deploy.LabelManaged] != "true" {
+		httpError(w, http.StatusForbidden, errors.New("that container is not managed by twinet"))
+		return
+	}
+	if req.Owner != "" && c.Labels[deploy.LabelOwner] != req.Owner {
+		httpError(w, http.StatusForbidden,
+			fmt.Errorf("%s belongs to %q, not %q", req.Container, c.Labels[deploy.LabelOwner], req.Owner))
+		return
+	}
+
+	switch req.Action {
+	case "pause":
+		err = s.rt.Pause(r.Context(), req.Container)
+	case "unpause":
+		err = s.rt.Unpause(r.Context(), req.Container)
+	case "stop":
+		err = s.rt.Stop(r.Context(), req.Container, 10*time.Second)
+	case "start":
+		err = s.rt.Start(r.Context(), req.Container)
+	case "restart":
+		if err = s.rt.Stop(r.Context(), req.Container, 10*time.Second); err == nil {
+			err = s.rt.Start(r.Context(), req.Container)
+		}
+	default:
+		httpError(w, http.StatusBadRequest, fmt.Errorf("unknown action %q", req.Action))
+		return
+	}
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, map[string]string{"status": "ok", "action": req.Action})
 }
 
 func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {

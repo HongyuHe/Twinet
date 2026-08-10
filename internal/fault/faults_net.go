@@ -162,9 +162,43 @@ func init() {
 	})
 
 	Register(&Fault{
-		Name: "host_crash", Category: CatEndHost, Needs: []Capability{CapProcess},
+		Name: "host_crash", Category: CatEndHost, Needs: []Capability{CapLifecycle},
 		Symptom:  "A host stopped responding entirely.",
-		Describe: "The device's networking was torn down, so it is present but unreachable.",
+		Describe: "The device's processes were frozen, so it holds its addresses but answers nothing.",
+		// A frozen container, not an interface taken down. The difference is
+		// the whole diagnostic value of the fault: a paused machine still owns
+		// its addresses and its neighbours still believe the link is up, so
+		// traffic is sent and silently lost. Taking the interfaces down instead
+		// tells every neighbour immediately, which is a different and far
+		// easier problem.
+		Inject: func(ctx context.Context, e *Env, t Target) (State, error) {
+			if _, err := e.Device(t); err != nil {
+				return nil, err
+			}
+			if err := e.Do(ctx, t.DeviceID(), "pause"); err != nil {
+				return nil, err
+			}
+			return State{"paused": "true"}, nil
+		},
+		Verify: func(ctx context.Context, e *Env, t Target, s State) (Evidence, error) {
+			// A paused container cannot run a command, so the failure that
+			// would normally be a problem is the evidence.
+			_, code := e.Try(ctx, t.DeviceID(), "true")
+			return Evidence{
+				Verified: code != 0,
+				Observed: "the device does not respond to any command",
+				Expected: "a crashed machine executes nothing",
+			}, nil
+		},
+		Resolve: func(ctx context.Context, e *Env, t Target, s State) error {
+			return e.Do(ctx, t.DeviceID(), "unpause")
+		},
+	})
+
+	Register(&Fault{
+		Name: "host_network_down", Category: CatEndHost, Needs: []Capability{CapInterface},
+		Symptom:  "A host is unreachable, and its neighbours report the link as down.",
+		Describe: "Every interface on the device was administratively taken down.",
 		Inject: func(ctx context.Context, e *Env, t Target) (State, error) {
 			d, err := e.Device(t)
 			if err != nil {
@@ -256,7 +290,73 @@ func init() {
 	Register(&Fault{
 		Name: "bgp_asn_misconfig", Category: CatMisconfig, Needs: []Capability{CapFRR},
 		Symptom:  "Some hosts are experiencing connectivity issues.",
-		Describe: "A BGP neighbour's remote AS number was changed, so the session never establishes.",
+		Describe: "The router's own BGP AS number was changed, so every session it has stops establishing.",
+		// The router's own AS number is changed, not a neighbour's remote-as.
+		// The distinction matters: changing one neighbour statement breaks one
+		// session, while changing the local AS breaks all of them at once and
+		// makes every peer report the mismatch from the other side. Only the
+		// second matches the fault of the same name in the taxonomy this is
+		// meant to be comparable with, and a benchmark whose faults merely
+		// share names with another's is not comparable at all.
+		Inject: func(ctx context.Context, e *Env, t Target) (State, error) {
+			asn, err := localASN(ctx, e, t)
+			if err != nil {
+				return nil, err
+			}
+			wrong := asn + 600
+			if err := e.VtyshConfig(ctx, t.DeviceID(), "configure terminal",
+				fmt.Sprintf("no router bgp %d", asn),
+				"end"); err != nil {
+				return nil, err
+			}
+			// The old process is gone, so the replacement is announced under
+			// the wrong number with nothing else configured, which is exactly
+			// what a mistyped AS number does in practice.
+			if err := e.VtyshConfig(ctx, t.DeviceID(), "configure terminal",
+				fmt.Sprintf("router bgp %d", wrong),
+				"end"); err != nil {
+				return nil, err
+			}
+			return State{"asn": fmt.Sprint(asn), "wrong": fmt.Sprint(wrong)}, nil
+		},
+		Verify: func(ctx context.Context, e *Env, t Target, s State) (Evidence, error) {
+			out, err := e.Vtysh(ctx, t.DeviceID(), "show running-config")
+			if err != nil {
+				return Evidence{}, err
+			}
+			wrong := "router bgp " + s["wrong"]
+			return Evidence{
+				Verified: strings.Contains(out, wrong),
+				Observed: wrong,
+				Expected: "router bgp " + s["asn"],
+			}, nil
+		},
+		Resolve: func(ctx context.Context, e *Env, t Target, s State) error {
+			if s["asn"] == "" {
+				return fmt.Errorf("no original AS number was recorded")
+			}
+			// Restoring the number alone would leave a router with an empty
+			// BGP configuration, which is a different fault rather than a
+			// repair, and FRR will not accept a second instance while the
+			// wrong one exists. Restarting the daemons onto the configuration
+			// on disk is the only undo that is certain to land, whatever state
+			// the injection left behind.
+			if _, err := e.Sh(ctx, t.DeviceID(), strings.Join([]string{
+				"for p in $(ps -ef | awk '/watchfrr/ && !/awk/ {print $1}'); do kill $p 2>/dev/null || true; done",
+				"/usr/lib/frr/frrinit.sh stop >/dev/null 2>&1 || true",
+				"rm -f /var/run/frr/*.pid /var/run/frr/*.vty 2>/dev/null || true",
+				"/usr/lib/frr/frrinit.sh start",
+			}, "\n")); err != nil {
+				return err
+			}
+			return nil
+		},
+	})
+
+	Register(&Fault{
+		Name: "bgp_peer_asn_misconfig", Category: CatMisconfig, Needs: []Capability{CapFRR},
+		Symptom:  "One neighbour is unreachable, while the others are fine.",
+		Describe: "One BGP neighbour statement names the wrong remote AS, so that single session never establishes.",
 		Inject: func(ctx context.Context, e *Env, t Target) (State, error) {
 			peer, asn, err := ebgpPeer(e, t)
 			if err != nil {
@@ -272,21 +372,17 @@ func init() {
 			return State{"peer": peer, "asn": fmt.Sprint(asn)}, nil
 		},
 		Verify: func(ctx context.Context, e *Env, t Target, s State) (Evidence, error) {
-			peer, asn, err := ebgpPeer(e, t)
-			if err != nil {
-				return Evidence{}, err
-			}
 			out, err := e.Vtysh(ctx, t.DeviceID(), "show running-config")
 			if err != nil {
 				return Evidence{}, err
 			}
-			want := fmt.Sprintf("neighbor %s remote-as %d", peer, asn)
+			want := fmt.Sprintf("neighbor %s remote-as %s", s["peer"], s["asn"])
 			return Evidence{Verified: !strings.Contains(out, want),
-				Expected: "the remote AS is no longer " + fmt.Sprint(asn)}, nil
+				Expected: "the remote AS is no longer " + s["asn"]}, nil
 		},
 		Resolve: func(ctx context.Context, e *Env, t Target, s State) error {
 			if s["peer"] == "" {
-				return nil
+				return fmt.Errorf("no peer was recorded for this fault")
 			}
 			return e.VtyshConfig(ctx, t.DeviceID(), "configure terminal",
 				fmt.Sprintf("router bgp %d", t.AS),
@@ -424,7 +520,7 @@ func init() {
 				"tc qdisc replace dev %s root tbf rate %s burst 32kbit latency 400ms", iface, rate)); err != nil {
 				return nil, err
 			}
-			return State{"iface": iface, "prev": strings.TrimSpace(prev)}, nil
+			return State{"iface": iface, "rate": rate, "prev": strings.TrimSpace(prev)}, nil
 		},
 		Verify: func(ctx context.Context, e *Env, t Target, s State) (Evidence, error) {
 			iface, err := faultIface(e, t)
@@ -432,14 +528,19 @@ func init() {
 				return Evidence{}, err
 			}
 			out, _ := e.Try(ctx, t.DeviceID(), "tc qdisc show dev "+iface)
-			return Evidence{Verified: strings.Contains(out, "tbf"), Observed: firstLine(out)}, nil
+			// The presence of a token bucket proves nothing: the link's own
+			// bandwidth is enforced with one, so a repaired link has one too.
+			// Only the throttled rate distinguishes the two, which is why the
+			// rate is recorded at injection rather than re-derived here.
+			want := normaliseRate(s["rate"])
+			return Evidence{
+				Verified: want != "" && strings.Contains(normaliseRate(out), want),
+				Observed: firstLine(out),
+				Expected: "a token bucket at " + s["rate"],
+			}, nil
 		},
 		Resolve: func(ctx context.Context, e *Env, t Target, s State) error {
-			// The link's own shaping is reapplied by the next deploy; removing
-			// the root qdisc returns it to the platform's default.
-			_, err := e.Sh(ctx, t.DeviceID(),
-				"tc qdisc del dev "+s["iface"]+" root 2>/dev/null || true")
-			return err
+			return restoreShaping(ctx, e, t, s["iface"])
 		},
 	})
 
@@ -468,9 +569,7 @@ func init() {
 			return Evidence{Verified: strings.Contains(out, "corrupt"), Observed: firstLine(out)}, nil
 		},
 		Resolve: func(ctx context.Context, e *Env, t Target, s State) error {
-			_, err := e.Sh(ctx, t.DeviceID(),
-				"tc qdisc del dev "+s["iface"]+" root 2>/dev/null || true")
-			return err
+			return restoreShaping(ctx, e, t, s["iface"])
 		},
 	})
 }
@@ -507,6 +606,52 @@ func parseHexFlags(s string) (int, error) {
 }
 
 // faultIface picks the interface a link fault acts on.
+// restoreShaping puts an interface back to the shaping the topology declares.
+//
+// Deleting the fault's qdisc is not enough. A Twinet link carries its own
+// delay, bandwidth and loss, installed at deploy time as the root qdisc, and a
+// fault that replaces the root and then deletes it leaves the link faster and
+// closer than the topology says. Nothing reports that: the link still works,
+// it is merely no longer the link the lab describes, and every later
+// measurement on it is quietly wrong.
+// normaliseRate makes tc's rendering of a rate comparable with the one asked
+// for: tc prints "64Kbit" where the request said "64kbit".
+func normaliseRate(s string) string {
+	return strings.ToLower(strings.ReplaceAll(s, " ", ""))
+}
+
+func restoreShaping(ctx context.Context, e *Env, t Target, iface string) error {
+	if iface == "" {
+		return fmt.Errorf("no interface recorded for this fault")
+	}
+	// The platform reapplies the shaping through the same code path the
+	// deployer uses, which is the only way the result is guaranteed to equal a
+	// freshly deployed link rather than merely resemble one.
+	return e.Reshaped(ctx, t.DeviceID(), iface)
+}
+
+// localASN reads the AS number the router actually runs BGP under, rather than
+// the one the topology says it should, so a fault reverses what it found.
+func localASN(ctx context.Context, e *Env, t Target) (int, error) {
+	out, err := e.Vtysh(ctx, t.DeviceID(), "show running-config")
+	if err != nil {
+		return 0, err
+	}
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(strings.TrimSpace(line))
+		if len(f) >= 3 && f[0] == "router" && f[1] == "bgp" {
+			var n int
+			if _, err := fmt.Sscanf(f[2], "%d", &n); err == nil {
+				return n, nil
+			}
+		}
+	}
+	if t.AS != 0 {
+		return t.AS, nil
+	}
+	return 0, fmt.Errorf("%s is not running BGP, so its AS number cannot be changed", t.DeviceID())
+}
+
 func faultIface(e *Env, t Target) (string, error) {
 	if t.Iface != "" {
 		return t.Iface, nil

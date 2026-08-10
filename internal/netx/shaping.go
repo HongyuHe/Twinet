@@ -307,3 +307,28 @@ func netemLimit(s Shaping, mtu int) uint32 {
 	}
 	return uint32(pkts)
 }
+
+// ReshapeInNS puts one interface inside a namespace back to a declared shaping.
+//
+// It exists so that undoing a traffic-control fault leaves byte-identical state
+// to a deployment. Reproducing the arithmetic on tc's command line does not: a
+// burst asked for in bits is converted differently from one computed in
+// scheduler ticks, so a "restored" link ends up with a different queue from the
+// one the topology describes. Nothing reports that, and every later measurement
+// on the link is quietly wrong. Sharing this one function with the deployer is
+// the only way the two can be guaranteed to agree.
+func ReshapeInNS(nsPath, iface string, s Shaping, mtu int) error {
+	ns, err := OpenNS(nsPath)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = ns.Close() }()
+
+	return ns.Do(func() error {
+		link, err := netlink.LinkByName(iface)
+		if err != nil {
+			return fmt.Errorf("interface %s: %w", iface, err)
+		}
+		return ApplyShaping(link, s)
+	})
+}

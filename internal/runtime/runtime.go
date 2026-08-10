@@ -190,6 +190,12 @@ type Runtime interface {
 	Start(ctx context.Context, nameOrID string) error
 	// Stop stops a running container.
 	Stop(ctx context.Context, nameOrID string, timeout time.Duration) error
+	// Pause freezes every process in a container without stopping it, which is
+	// what a crashed machine looks like from the network: addresses still
+	// assigned, nothing answering, not even ARP.
+	Pause(ctx context.Context, nameOrID string) error
+	// Unpause resumes a paused container.
+	Unpause(ctx context.Context, nameOrID string) error
 	// Remove deletes a container, stopping it first if necessary.
 	Remove(ctx context.Context, nameOrID string, force bool) error
 	// Inspect returns one container, or StateAbsent if it does not exist.

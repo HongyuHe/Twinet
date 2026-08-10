@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -16,6 +17,7 @@ import (
 	"github.com/HongyuHe/twinet/internal/client"
 	"github.com/HongyuHe/twinet/internal/grade"
 	"github.com/HongyuHe/twinet/internal/model"
+	"github.com/HongyuHe/twinet/internal/netx"
 	"github.com/HongyuHe/twinet/internal/runtime"
 )
 
@@ -171,7 +173,7 @@ the hours a sleep-driven serial grader takes.`,
 			fmt.Fprintln(cmd.OutOrStdout())
 			fmt.Fprint(cmd.OutOrStdout(), summary.Text())
 			fmt.Fprintf(cmd.OutOrStdout(), "\nreports written to %s\n", outDir)
-			return nil
+			return releaseGuard(summary, cmd.ErrOrStderr())
 		},
 	}
 	cmd.Flags().StringVarP(&rubricPath, "rubric", "r", "", "rubric file (default: <lab>/rubric/cos461.yaml)")
@@ -224,6 +226,159 @@ func execFunc(ctx context.Context, top *model.Topology, token string) (
 //
 // Structured output is what makes a grading run usable afterwards: the legacy
 // graders produced text logs or SQLite blobs and left bundling to a human.
+// lifecycleFunc returns a function that changes a device container's run
+// state, wherever in the cluster that container happens to live.
+func lifecycleFunc(top *model.Topology, token string) (
+	func(context.Context, string, string) error, error) {
+
+	if !clustered(top) {
+		rt := runtime.NewDocker()
+		return func(ctx context.Context, deviceID, action string) error {
+			d, ok := top.Device(deviceID)
+			if !ok {
+				return fmt.Errorf("no device %q", deviceID)
+			}
+			switch action {
+			case "pause":
+				return rt.Pause(ctx, d.Container)
+			case "unpause":
+				return rt.Unpause(ctx, d.Container)
+			case "stop":
+				return rt.Stop(ctx, d.Container, 10*time.Second)
+			case "start":
+				return rt.Start(ctx, d.Container)
+			case "restart":
+				if err := rt.Stop(ctx, d.Container, 10*time.Second); err != nil {
+					return err
+				}
+				return rt.Start(ctx, d.Container)
+			}
+			return fmt.Errorf("unknown action %q", action)
+		}, nil
+	}
+
+	tok, err := tokenFor(token)
+	if err != nil {
+		return nil, err
+	}
+	cl := client.NewCluster(top.Lab, tok)
+	return func(ctx context.Context, deviceID, action string) error {
+		d, ok := top.Device(deviceID)
+		if !ok {
+			return fmt.Errorf("no device %q", deviceID)
+		}
+		n, ok := cl.Node(d.Node)
+		if !ok {
+			return fmt.Errorf("device %s is on unknown node %q", deviceID, d.Node)
+		}
+		return n.Lifecycle(ctx, agent.LifecycleRequest{Container: d.Container, Action: action})
+	}, nil
+}
+
+// reshapeFunc returns a function that puts an interface back to the shaping
+// the topology declares, wherever in the cluster the device lives.
+func reshapeFunc(top *model.Topology, token string) (
+	func(context.Context, string, string) error, error) {
+
+	shapingOf := func(deviceID, iface string) (netx.Shaping, int, error) {
+		d, ok := top.Device(deviceID)
+		if !ok {
+			return netx.Shaping{}, 0, fmt.Errorf("no device %q", deviceID)
+		}
+		for _, i := range d.Ifaces {
+			if i.Name != iface || i.Link == nil {
+				continue
+			}
+			p := i.Link.Props
+			return netx.Shaping{
+				Bandwidth: p.Bandwidth, Delay: p.Delay,
+				Queue: p.Queue, Loss: p.Loss,
+			}, derefInt(p.MTU), nil
+		}
+		// An interface with no link carries no declared shaping, so clearing
+		// it is the correct restoration.
+		return netx.Shaping{}, 0, nil
+	}
+
+	if !clustered(top) {
+		rt := runtime.NewDocker()
+		return func(ctx context.Context, deviceID, iface string) error {
+			d, ok := top.Device(deviceID)
+			if !ok {
+				return fmt.Errorf("no device %q", deviceID)
+			}
+			s, mtu, err := shapingOf(deviceID, iface)
+			if err != nil {
+				return err
+			}
+			ns, err := rt.NSPath(ctx, d.Container)
+			if err != nil {
+				return err
+			}
+			_ = mtu
+			return netx.ReshapeInNS(ns, iface, s, 0)
+		}, nil
+	}
+
+	tok, err := tokenFor(token)
+	if err != nil {
+		return nil, err
+	}
+	cl := client.NewCluster(top.Lab, tok)
+	return func(ctx context.Context, deviceID, iface string) error {
+		d, ok := top.Device(deviceID)
+		if !ok {
+			return fmt.Errorf("no device %q", deviceID)
+		}
+		n, ok := cl.Node(d.Node)
+		if !ok {
+			return fmt.Errorf("device %s is on unknown node %q", deviceID, d.Node)
+		}
+		s, mtu, err := shapingOf(deviceID, iface)
+		if err != nil {
+			return err
+		}
+		return n.Reshape(ctx, agent.ReshapeRequest{
+			Container: d.Container, Iface: iface, Shaping: s, MTU: mtu,
+		})
+	}, nil
+}
+
+func derefInt(p *int) int {
+	if p == nil {
+		return 0
+	}
+	return *p
+}
+
+// releaseGuard refuses to let a run that did not fully work be mistaken for a
+// clean set of marks. It is the last line of defence against the worst failure
+// this system can have: a platform fault becoming a student's zero.
+func releaseGuard(s *grade.Summary, out io.Writer) error {
+	q := s.Quarantined()
+	if len(q) == 0 {
+		return nil
+	}
+	fmt.Fprintf(out, "\n%d of %d submission(s) could not be graded and are quarantined:\n",
+		len(q), len(s.Reports))
+	for _, r := range q {
+		fmt.Fprintf(out, "  %-14s %s\n", r.Submission, firstLine(reportProblem(r)))
+	}
+	fmt.Fprintln(out, "\nTheir rows carry no total, so they cannot be imported as marks by accident.")
+	fmt.Fprintln(out, "Re-run those submissions once the cause is fixed.")
+	return fmt.Errorf("%d submission(s) need review; no marks were released for them", len(q))
+}
+
+func reportProblem(r *grade.Report) string {
+	if r.Err != "" {
+		return r.Err
+	}
+	if len(r.Warnings) > 0 {
+		return r.Warnings[0]
+	}
+	return "grading did not complete correctly"
+}
+
 func writeReports(dir string, s *grade.Summary) error {
 	for _, r := range s.Reports {
 		if r == nil {

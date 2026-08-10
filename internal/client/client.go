@@ -167,6 +167,17 @@ func (n *Node) Exec(ctx context.Context, req agent.ExecRequest) (agent.ExecRespo
 	return resp, err
 }
 
+// Lifecycle changes a container's run state on this node.
+func (n *Node) Lifecycle(ctx context.Context, req agent.LifecycleRequest) error {
+	return n.do(ctx, http.MethodPost, "/v1/lifecycle", req, nil)
+}
+
+// Reshape puts an interface back to a declared shaping using the same code the
+// deployer uses, so an undo cannot drift from a deployment.
+func (n *Node) Reshape(ctx context.Context, req agent.ReshapeRequest) error {
+	return n.do(ctx, http.MethodPost, "/v1/reshape", req, nil)
+}
+
 // Underlay probes the fabric MTU toward a peer.
 func (n *Node) Underlay(ctx context.Context, peer string) (agent.UnderlayResponse, error) {
 	var resp agent.UnderlayResponse

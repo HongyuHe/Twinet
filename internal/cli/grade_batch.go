@@ -143,7 +143,7 @@ mark, unless --keep-labs is given for a dispute.`,
 			fmt.Fprintln(cmd.OutOrStdout())
 			fmt.Fprint(cmd.OutOrStdout(), summary.Text())
 			fmt.Fprintf(cmd.OutOrStdout(), "\nreports written to %s\n", outDir)
-			return nil
+			return releaseGuard(summary, cmd.ErrOrStderr())
 		},
 	}
 	cmd.Flags().StringVarP(&subDir, "submissions", "s", "submissions", "directory of per-group submissions")

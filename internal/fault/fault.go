@@ -66,6 +66,9 @@ const (
 	CapProcess   Capability = "process"
 	CapFile      Capability = "file"
 	CapFRR       Capability = "frr"
+	// CapLifecycle is the ability to change a container's run state, which is
+	// held by the platform rather than by anything inside the container.
+	CapLifecycle Capability = "lifecycle"
 	CapOVS       Capability = "ovs"
 	CapService   Capability = "service"
 	CapDNS       Capability = "dns"
@@ -127,8 +130,17 @@ type Env struct {
 	Topology *model.Topology
 	// Exec runs a command inside a device.
 	Exec func(ctx context.Context, deviceID string, cmd []string) (rt.ExecResult, error)
-	// Restart replaces a device's container, used by faults that crash a node.
-	Restart func(ctx context.Context, deviceID string) error
+	// Lifecycle changes a device container's run state: pause, unpause, stop,
+	// start or restart. A crashed machine is a paused container, not one with
+	// its interfaces taken down, because a paused container still holds its
+	// addresses and simply never answers -- which is what makes the fault hard
+	// to diagnose and therefore worth injecting.
+	Lifecycle func(ctx context.Context, deviceID, action string) error
+	// Reshape puts an interface back to the shaping the topology declares,
+	// through the platform's own code rather than through tc's command line,
+	// so that undoing a traffic-control fault cannot leave a link subtly
+	// different from the one the lab describes.
+	Reshape func(ctx context.Context, deviceID, iface string) error
 	// Seed makes a time-varying fault replay exactly rather than differing run
 	// to run.
 	Seed int64
@@ -350,13 +362,40 @@ func Resolve(ctx context.Context, env *Env, inj *Injection) error {
 		return fmt.Errorf("resolve %s: %w", inj.Fault, err)
 	}
 	// A resolve that silently half-worked is the most damaging failure here,
-	// because the contamination it leaves behind is invisible.
+	// because the contamination it leaves behind is invisible: the next episode
+	// runs on a lab that is still broken, and its result is attributed to
+	// whatever that episode injected.
+	//
+	// This fails closed. A verification that cannot run is not evidence that
+	// the fault is gone; it is the absence of evidence either way, and treating
+	// it as success is how contamination becomes silent.
 	ev, err := f.Verify(ctx, env, inj.Target, inj.State)
-	if err == nil && ev.Verified {
+	if err != nil {
+		return fmt.Errorf("resolve %s: the undo ran, but it could not be confirmed, "+
+			"so the lab must be treated as contaminated: %w", inj.Fault, err)
+	}
+	if ev.Verified {
 		return fmt.Errorf("resolve %s: the fault is still present afterwards: %s",
 			inj.Fault, ev.Detail)
 	}
 	return nil
+}
+
+// Do changes a device's run state, refusing clearly when the environment
+// cannot. A fault that silently does nothing is worse than one that fails.
+func (e *Env) Do(ctx context.Context, deviceID, action string) error {
+	if e.Lifecycle == nil {
+		return fmt.Errorf("this environment cannot %s a container", action)
+	}
+	return e.Lifecycle(ctx, deviceID, action)
+}
+
+// Reshaped asks the platform to restore an interface's declared shaping.
+func (e *Env) Reshaped(ctx context.Context, deviceID, iface string) error {
+	if e.Reshape == nil {
+		return fmt.Errorf("this environment cannot restore the shaping of %s", iface)
+	}
+	return e.Reshape(ctx, deviceID, iface)
 }
 
 func firstLine(s string) string {

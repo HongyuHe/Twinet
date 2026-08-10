@@ -214,6 +214,23 @@ func (d *Docker) Start(ctx context.Context, name string) error {
 }
 
 // Stop stops a running container.
+// Pause freezes every process in a container without stopping it.
+//
+// This is what a crashed machine looks like from the network: the interfaces
+// are still up and the addresses still assigned, but nothing answers, not even
+// ARP. Taking the interfaces down instead produces a different and much easier
+// puzzle, because the neighbours see the link go away.
+func (d *Docker) Pause(ctx context.Context, name string) error {
+	_, err := d.mustRun(ctx, "pause", name)
+	return err
+}
+
+// Unpause resumes a paused container.
+func (d *Docker) Unpause(ctx context.Context, name string) error {
+	_, err := d.mustRun(ctx, "unpause", name)
+	return err
+}
+
 func (d *Docker) Stop(ctx context.Context, name string, timeout time.Duration) error {
 	secs := int(timeout.Seconds())
 	if secs <= 0 {

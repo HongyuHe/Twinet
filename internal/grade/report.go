@@ -267,23 +267,60 @@ func Summarise(rubric string, reports []*Report, dur time.Duration) *Summary {
 	return s
 }
 
+// Quarantined returns the reports that must not be released as marks.
+//
+// A report needs review when some part of the grading did not run correctly:
+// the harness failed to deploy, an agent was unreachable, a submission could
+// not be loaded. Its total is zero, and a zero produced that way is
+// indistinguishable, in a spreadsheet, from a student who did nothing. Keeping
+// them identifiable is the difference between a grading run and a liability.
+func (s *Summary) Quarantined() []*Report {
+	var out []*Report
+	for _, r := range s.Reports {
+		if r != nil && (r.NeedsReview || r.Err != "") {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
 // CSV renders one row per student, one column per question, ready for a
 // gradebook import.
+//
+// Every row carries a status, and a report that needs review carries no total
+// at all rather than a zero. A grader who imports this file cannot silently
+// award a zero that the platform, not the student, is responsible for.
 func (s *Summary) CSV() string {
 	var b strings.Builder
 	var qids []string
-	if len(s.Reports) > 0 {
-		for _, q := range s.Reports[0].Questions {
-			qids = append(qids, q.ID)
+	for _, r := range s.Reports {
+		if r != nil && len(r.Questions) > 0 {
+			for _, q := range r.Questions {
+				qids = append(qids, q.ID)
+			}
+			break
 		}
 	}
-	b.WriteString("submission,as,total,max")
+	b.WriteString("submission,as,status,total,max")
 	for _, q := range qids {
 		b.WriteString("," + q)
 	}
-	b.WriteString("\n")
+	b.WriteString(",note\n")
 	for _, r := range s.Reports {
-		fmt.Fprintf(&b, "%s,%d,%.2f,%.2f", r.Submission, r.AS, r.Total, r.MaxTotal)
+		if r == nil {
+			continue
+		}
+		if r.NeedsReview || r.Err != "" {
+			// No total, no per-question marks: there is nothing here that may
+			// be pasted into a gradebook by accident.
+			fmt.Fprintf(&b, "%s,%d,needs-review,,%.2f", r.Submission, r.AS, r.MaxTotal)
+			for range qids {
+				b.WriteString(",")
+			}
+			fmt.Fprintf(&b, ",%s\n", csvField(firstProblem(r)))
+			continue
+		}
+		fmt.Fprintf(&b, "%s,%d,graded,%.2f,%.2f", r.Submission, r.AS, r.Total, r.MaxTotal)
 		byID := map[string]float64{}
 		for _, q := range r.Questions {
 			byID[q.ID] = q.Awarded
@@ -291,9 +328,29 @@ func (s *Summary) CSV() string {
 		for _, id := range qids {
 			fmt.Fprintf(&b, ",%.2f", byID[id])
 		}
-		b.WriteString("\n")
+		b.WriteString(",\n")
 	}
 	return b.String()
+}
+
+func firstProblem(r *Report) string {
+	if r.Err != "" {
+		return r.Err
+	}
+	if len(r.Warnings) > 0 {
+		return r.Warnings[0]
+	}
+	return "grading did not complete correctly"
+}
+
+// csvField quotes a field so an error message containing a comma, a quote or a
+// newline cannot shift every subsequent column of a gradebook.
+func csvField(s string) string {
+	s = strings.ReplaceAll(s, "\n", " ")
+	if strings.ContainsAny(s, ",\"") {
+		return "\"" + strings.ReplaceAll(s, "\"", "\"\"") + "\""
+	}
+	return s
 }
 
 // Text renders the class summary.

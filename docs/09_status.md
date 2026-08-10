@@ -29,10 +29,10 @@ plan but not yet implemented; it is milestone M8.
 | Grading engine: rubric, 17 checks, structured reports | done | 3 submissions in **31 s**; JSON, text and CSV output |
 | Reference solution (`--solve`) | partial | scores **7.33 / 10** against its own rubric |
 | Container images | done | `hyhe/twinet-{router,host,switch,svc}` |
-| Fault injection engine | done | 19 types across all six NIKA categories; **19/19 inject, verify and resolve** on the live cluster |
+| Fault injection engine | partial | 21 types across all six NIKA categories, out of the 47 that are in-substrate; **21/21 inject, verify and resolve** on the live cluster, re-checked by `make e2e` in 25 seconds |
 | Incident runner | done | `twinet incident run`; a two-fault scenario injects, holds and unwinds in 798 ms |
 | Ground-truth isolation | verified | audited: 0 hits for the fault name, root cause or ground truth anywhere in a target container's files, environment or labels |
-| DNS zone generation | done | forward and reverse zones derived from the model; `msp.group3` resolves to an address MSP actually owns |
+| DNS zone generation | partial | zones are generated from the model and are correct by construction; **no server yet answers them**, so nothing in a lab can resolve a name |
 | Matrix, looking glass, policy analyzer | done | control-plane collectors; the analyzer reads structured paths and the declared relationships rather than scraping text |
 | CI, Makefile, lint config | done | `.github/workflows/ci.yml` |
 
@@ -99,7 +99,7 @@ reached students, and each motivated a permanent test.
 
 | Item | Milestone | Note |
 |---|---|---|
-| DNS, matrix, looking glass, BGP analyzer, web UI | M2 | Service containers are placed and wired; their payloads are not yet implemented |
+| Serving DNS, matrix, looking glass and the web UI | M2 | The data is generated and tested; the containers that should serve it still run `sleep infinity`. A student cannot yet resolve a name or open a looking glass |
 | SSH gateway with label-based authorisation | M2 | The agent already enforces owner-scoped exec, which is the hard half |
 | RPKI (Krill + Routinator) provisioning | M2 | Needed for the last point of the rubric |
 | Reference answers for exchange communities, traffic engineering and RPKI | M7 | The remaining 2.67 points of `--solve` |
@@ -121,4 +121,4 @@ reached students, and each motivated a permanent test.
 | Cross-node link RTT (25 ms configured) | 50.22 ms, σ 9 µs |
 | Links kept local by AS-granular placement | 86.6 % |
 | Grading, 3 submissions, 10 questions, 17 checks | 31 s |
-| Extrapolated grading, 100 submissions at `--parallel 8` | under 3 minutes |
+| Grading, 1 submission in its own full-breadth harness | 6 minutes |
