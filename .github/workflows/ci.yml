@@ -86,7 +86,7 @@ jobs:
         run: make images
 
   shell:
-    name: Shell scripts
+    name: Shell scripts and conventions
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -94,3 +94,5 @@ jobs:
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
           shellcheck scripts/*.sh
+      - name: Check naming conventions
+        run: ./scripts/check_naming.sh

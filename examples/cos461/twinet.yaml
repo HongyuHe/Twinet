@@ -76,14 +76,14 @@ addressing:
     measurement: "{{ .AS }}.0.199.0/24"
 
 as_defaults:
-  template: student-as
+  template: student_as
   role: student
   region_of: "r{{ div (sub .AS 1) 8 }}"
 
 autonomous_systems:
   # Staff-operated Tier-1 transit, hosting the RPKI certificate authority.
   - list: [1, 2]
-    template: transit-as
+    template: transit_as
     role: staff
   # Student groups.
   - range: [3, 10]
@@ -108,13 +108,13 @@ peerings:
 services:
   dns:
     kind: builtin.dns
-    attach: {template: student-as, router: MSP, iface: dns}
+    attach: {template: student_as, router: MSP, iface: dns}
   matrix:
     kind: builtin.matrix
-    attach: {template: student-as, router: ATL, iface: matrix}
+    attach: {template: student_as, router: ATL, iface: matrix}
   measurement:
     kind: builtin.measurement
-    attach: {template: student-as, router: HOU, iface: measurement}
+    attach: {template: student_as, router: HOU, iface: measurement}
   web:
     kind: builtin.web
     listen: ":9000"

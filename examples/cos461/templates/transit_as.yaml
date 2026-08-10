@@ -1,7 +1,7 @@
 apiVersion: twinet.dev/v1
 kind: ASTemplate
 metadata:
-  name: transit-as
+  name: transit_as
   description: >
     A reduced, staff-operated transit AS. It has a single router carrying every
     external port, which keeps the resource cost of the backdrop ASes low while

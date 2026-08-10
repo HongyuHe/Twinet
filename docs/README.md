@@ -8,6 +8,9 @@ practically works.
 > **Twin** + **net**: every student group operates a real AS — real FRR, real
 > BGP, real OSPF, real RPKI — inside a faithful, reproducible, horizontally
 > scalable digital twin of the Internet.
+>
+> The same twin, deliberately broken in a known way, is a benchmark for whether
+> an AI agent can find the fault.
 
 ---
 
@@ -16,7 +19,7 @@ practically works.
 The current platform works and has taught thousands of students, but it has
 accumulated ~35,000 lines of ad-hoc bash and Python with no schema, no tests,
 no state model, and a hard single-machine ceiling. See
-[01-assessment.md](01-assessment.md) for the full critique.
+[01_assessment.md](01_assessment.md) for the full critique.
 
 Twinet keeps everything that makes the mini-Internet pedagogically excellent
 and replaces the machinery underneath it.
@@ -39,15 +42,27 @@ and replaces the machinery underneath it.
 
 | # | Document | Contents |
 |---|---|---|
-| 01 | [Assessment](01-assessment.md) | Critical review of the current implementation; what to keep, what to kill |
-| 02 | [Architecture](02-architecture.md) | Components, control/data plane split, state model, runtime abstraction |
-| 03 | [Topology model](03-topology-model.md) | The Twinet manifest, AS templates, IPAM, the provisioned/student config split |
-| 04 | [Networking & scale-out](04-networking-and-scaleout.md) | Link realization, VXLAN fabric, placement, shaping, MTU, measured results |
-| 05 | [Services](05-services.md) | DNS, matrix, looking glass, RPKI, IXP, measurement, VPN, web, access/SSH |
-| 06 | [Grading](06-grading.md) | The autograding engine: ephemeral labs, probes, rubrics, parallelism |
-| 07 | [Roadmap](07-roadmap.md) | Milestones, deliverables, acceptance criteria, risks |
-| 08 | [Resources needed](08-resources-needed.md) | What I need from you to execute this plan |
-| 09 | [Implementation status](09-status.md) | What is built and verified, with measurements |
+| 01 | [Assessment](01_assessment.md) | Critical review of the current implementation; what to keep, what to kill |
+| 02 | [Architecture](02_architecture.md) | Components, control/data plane split, state model, runtime abstraction |
+| 03 | [Topology model](03_topology_model.md) | The Twinet manifest, AS templates, IPAM, the provisioned/student config split |
+| 04 | [Networking & scale-out](04_networking_and_scaleout.md) | Link realization, VXLAN fabric, placement, shaping, MTU, measured results |
+| 05 | [Services](05_services.md) | DNS, matrix, looking glass, RPKI, IXP, measurement, VPN, web, access/SSH |
+| 06 | [Grading](06_grading.md) | The autograding engine: ephemeral labs, probes, rubrics, parallelism |
+| 07 | [Roadmap](07_roadmap.md) | Milestones, deliverables, acceptance criteria, risks |
+| 08 | [Resources needed](08_resources_needed.md) | What I need from you to execute this plan |
+| 09 | [Implementation status](09_status.md) | What is built and verified, with measurements |
+| 10 | [Fault injection and RCA](10_fault_injection.md) | Injecting the NIKA fault taxonomy, for assessing AI agents at root-cause analysis |
+
+## Repository conventions
+
+| Thing | Convention | Example |
+|---|---|---|
+| File names | `snake_case` | `bgp_json.go`, `04_networking_and_scaleout.md`, `twinet_motd` |
+| Folder names | `this-kind-of-format` | `internal/grade`, `.github/workflows` |
+| Exceptions | Names a tool requires | `README.md`, `Makefile`, `Dockerfile`, `go.mod`, Go's `testdata/` |
+
+`scripts/check_naming.sh` enforces this and runs in CI, because a convention
+that is only written down decays. The exemption list lives in that script.
 
 ## Design principles
 
@@ -70,3 +85,8 @@ and replaces the machinery underneath it.
    capacity; no single node is special except by choice.
 7. **Grading is a first-class product, not a script.** Reproducible, isolated,
    parallel, rubric-driven, with structured output and a re-runnable artifact.
+8. **A fault is as first-class as a configuration.** Twinet must be able to
+   break a network as precisely as it can build one: injectably, verifiably,
+   reversibly, and with machine-readable ground truth. That is what lets the
+   same platform teach students and measure whether an AI agent can actually
+   diagnose an incident. See [10](10_fault_injection.md).

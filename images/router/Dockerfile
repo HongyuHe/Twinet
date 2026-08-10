@@ -31,7 +31,7 @@ RUN printf 'service integrated-vtysh-config\n' > /etc/frr/vtysh.conf \
     && chown frr:frrvty /etc/frr/vtysh.conf
 
 COPY entrypoint.sh /usr/local/bin/twinet-entrypoint
-COPY twinet-motd /etc/twinet/motd
+COPY twinet_motd /etc/twinet/motd
 RUN chmod 0755 /usr/local/bin/twinet-entrypoint
 
 LABEL org.opencontainers.image.title="twinet-router" \

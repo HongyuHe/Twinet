@@ -1,7 +1,7 @@
 apiVersion: twinet.dev/v1
 kind: ASTemplate
 metadata:
-  name: student-as
+  name: student_as
   description: >
     The full eight-router AS operated by a student group, spanning US cities and
     connecting two datacenters. Mirrors the COS-461 routing project topology.

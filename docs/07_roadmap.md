@@ -177,6 +177,41 @@ exercises are solvable end-to-end on Twinet, verified by `twinet solve` +
 
 ---
 
+---
+
+## M8 — Fault injection and RCA evaluation (8 d)
+
+**Deliver:** Twinet as a platform for measuring an AI agent's root-cause
+analysis, covering the NIKA fault taxonomy. Full design in
+[10](10_fault_injection.md).
+
+- `internal/fault`: the fault registry, the `Inject`/`Verify`/`Resolve`/
+  `GroundTruth` lifecycle, and reversibility as an enforced contract.
+- The **47 in-substrate fault types** of NIKA's 60, across all six categories.
+- Seeded, recorded schedules for time-varying faults (`link_flap`,
+  `web_dos_attack`) so an episode replays exactly.
+- Baseline capture and restore between episodes, reusing `internal/state`.
+- `twinet fault list|inject|verify|resolve|status` and `twinet incident run`.
+- A NIKA `LabRuntime` adapter exposing the ~50 semantic operations its faults
+  call, plus a capability declaration so NIKA refuses a fault this backend
+  cannot serve rather than injecting it half-way.
+- The prerequisite services several fault types need: DHCP, a web service and
+  load balancer, and traffic generation.
+
+**Acceptance:** all 47 in-substrate types inject, verify and resolve, each with
+a test asserting the fault manifests *and* that resolving restores the baseline
+exactly; ground truth serialises to NIKA's schema and is not observable from
+inside the lab; NIKA runs an unmodified scenario against the Twinet backend and
+agrees with containerlab's verdict; 100 concurrent episodes run across the
+cluster, each isolated and each resetting cleanly.
+
+**Deferred, deliberately:** the 13 fault types needing substrate Twinet does not
+model. P4/BMv2 (6) and an SDN controller (3) are proposed follow-on device
+kinds; the 4 Kubernetes types are a poor fit and should be delegated to NIKA's
+existing Kubernetes backend rather than duplicated.
+
+---
+
 ## Summary
 
 | Milestone | Days | Cumulative |
@@ -189,6 +224,7 @@ exercises are solvable end-to-end on Twinet, verified by `twinet solve` +
 | M5 Grading engine | 6 | 25 |
 | M6 Scale validation | 3 | 28 |
 | M7 Course parity and docs | 4 | 32 |
+| M8 Fault injection and RCA | 8 | 40 |
 
 ## Risks and mitigations
 
@@ -201,3 +237,6 @@ exercises are solvable end-to-end on Twinet, verified by `twinet solve` +
 | Grading fidelity: an ephemeral lab differs subtly from the live class network | Medium | Keep `--live` mode; M5 acceptance cross-validates ephemeral vs. live scores on an audit set |
 | Scope creep from the advanced course (MPLS/VRF/multicast) | Medium | Deferred to M7, behind the same primitives; no core redesign needed |
 | Single control-plane machine becomes a bottleneck at 100+ ASes | Low | Control plane is stateless and fan-out only; probing and exec already run agent-side |
+| A fault cannot be cleanly reversed, so episodes contaminate each other | Medium | Reversibility is a contract every fault must satisfy, asserted by a test that compares the post-resolve state against the captured baseline; the state store provides the fallback of a full restore |
+| Ground truth leaks into the lab, making an RCA task trivial | Medium | Ground truth lives only in the control plane and is never written to a container, a label or a file an agent can read; asserted by a test that greps the whole lab for the answer |
+| NIKA's fault implementations assume a Kathará or containerlab detail | Medium | The adapter is written against NIKA's declared capability set, and M8's acceptance includes running an unmodified NIKA scenario and comparing verdicts |

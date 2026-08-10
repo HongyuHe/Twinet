@@ -23,7 +23,7 @@ and 6. Twinet uses a **manifest + templates** model.
 cos461-f25/
   twinet.yaml            # the lab manifest — the only entry point
   templates/
-    student-as.yaml      # internal topology of a full student AS
+    student_as.yaml      # internal topology of a full student AS
     tier1-as.yaml        # reduced TA-operated AS
     stub-as.yaml
     ixp.yaml
@@ -148,7 +148,7 @@ placement:
 
 ## 4. An AS template
 
-`templates/student-as.yaml` — this is where the eight positional `.txt` files
+`templates/student_as.yaml` — this is where the eight positional `.txt` files
 collapse into one coherent, readable document.
 
 ```yaml
@@ -301,7 +301,7 @@ so generated labs remain hand-editable — no separate "compiled" format.
 Also: `twinet gen roster --csv students.csv` assigns groups to ASNs, mints SSH
 credentials, and emits both the access config and a per-group hand-out.
 
-## 7. Behaviours (scripted misconfiguration)
+## 7. Behaviours and faults (scripted misconfiguration)
 
 The RPKI exercise requires stub ASes to hijack each other. Today that is
 `utils/hijacks/hijack.sh` plus three `question_3_*.sh` scripts driving
@@ -320,6 +320,21 @@ behaviours:
 
 `twinet behaviour apply|revert hijacker` is idempotent and auditable, and the
 grader can assert the hijack was actually live during a check.
+
+**This generalises into fault injection.** A behaviour is a fault whose purpose
+happens to be pedagogical; the same declaration, lifecycle
+(`inject → verify → resolve`) and ground-truth emission serve an incident used to
+measure whether an AI agent can diagnose a network. A BGP hijack is
+simultaneously question 2.6 of the assignment and NIKA's `bgp_hijacking` fault
+type. The two must therefore share one implementation, not two.
+
+The full taxonomy, the coverage of NIKA's 60 fault types, and the constraints
+this places on the rest of the design are in
+[10 — Fault injection and RCA](10_fault_injection.md). The most important
+constraint to keep in mind while reading the rest of this document: **every
+fault must be reversible**, which means a fault may never be applied by
+rewriting configuration wholesale, only as a delta that records how to undo
+itself.
 
 ## 8. Compatibility with existing course material
 

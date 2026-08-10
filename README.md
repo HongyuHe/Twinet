@@ -10,7 +10,7 @@ real BGP, real RPKI, real Open vSwitch — and must cooperate with every other
 group for the Internet to work.
 
 > **Status: under construction.** The design is in [`docs/`](docs/); what is
-> built and measured so far is in [`docs/09-status.md`](docs/09-status.md).
+> built and measured so far is in [`docs/09_status.md`](docs/09_status.md).
 >
 > A twelve-AS lab of 211 containers and 291 links currently deploys across three
 > machines in 83 seconds, and a rubric-driven grading run completes a submission
@@ -24,6 +24,10 @@ group for the Internet to work.
 - **Autograding.** Hundreds of submissions graded in parallel, in isolated
   reproducible labs, in minutes.
 - **Scale-out.** The unit of placement is an AS; adding a machine adds capacity.
+- **Agent evaluation.** The same twin, broken in a known and reversible way, is
+  a reproducible benchmark for whether an AI agent can perform root-cause
+  analysis. Twinet targets the [NIKA](https://github.com/sands-lab/nika) fault
+  taxonomy and aims to serve as a NIKA backend.
 
 ## Design in one page
 
@@ -40,15 +44,16 @@ group for the Internet to work.
 
 | Document | Contents |
 |---|---|
-| [Assessment](docs/01-assessment.md) | Critical review of the current mini-Internet implementation |
-| [Architecture](docs/02-architecture.md) | Components, state model, runtime abstraction, deployment pipeline |
-| [Topology model](docs/03-topology-model.md) | Manifest, AS templates, IPAM, the provisioning contract |
-| [Networking & scale-out](docs/04-networking-and-scaleout.md) | Link realization, VXLAN fabric, placement, capacity |
-| [Services](docs/05-services.md) | DNS, matrix, looking glass, RPKI, IXP, VPN, web, SSH access |
-| [Grading](docs/06-grading.md) | Ephemeral labs, test doubles, checks, rubrics, reports |
-| [Roadmap](docs/07-roadmap.md) | Milestones, acceptance criteria, risks |
-| [Resources needed](docs/08-resources-needed.md) | Open decisions and required resources |
-| [Implementation status](docs/09-status.md) | What is built and verified, with measurements |
+| [Assessment](docs/01_assessment.md) | Critical review of the current mini-Internet implementation |
+| [Architecture](docs/02_architecture.md) | Components, state model, runtime abstraction, deployment pipeline |
+| [Topology model](docs/03_topology_model.md) | Manifest, AS templates, IPAM, the provisioning contract |
+| [Networking & scale-out](docs/04_networking_and_scaleout.md) | Link realization, VXLAN fabric, placement, capacity |
+| [Services](docs/05_services.md) | DNS, matrix, looking glass, RPKI, IXP, VPN, web, SSH access |
+| [Grading](docs/06_grading.md) | Ephemeral labs, test doubles, checks, rubrics, reports |
+| [Roadmap](docs/07_roadmap.md) | Milestones, acceptance criteria, risks |
+| [Resources needed](docs/08_resources_needed.md) | Open decisions and required resources |
+| [Implementation status](docs/09_status.md) | What is built and verified, with measurements |
+| [Fault injection and RCA](docs/10_fault_injection.md) | Injecting the NIKA fault taxonomy to assess AI agents at root-cause analysis |
 
 ## Credits
 

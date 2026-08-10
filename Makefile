@@ -15,7 +15,7 @@ TAG     ?= 0.1
 # Must match .github/workflows/ci.yml, or local lint and CI can disagree.
 GOLANGCI_VERSION ?= v2.5.0
 
-.PHONY: all build test lint fmt vet images push clean install e2e ci
+.PHONY: all build test lint fmt vet images push clean install e2e ci naming
 
 all: build
 
@@ -42,8 +42,12 @@ lint: fmt vet
 		echo "golangci-lint not installed; ran go vet only. Install $(GOLANGCI_VERSION) to match CI."; \
 	fi
 
+# Files are snake_case and folders are this-kind-of-format.
+naming:
+	./scripts/check_naming.sh
+
 # Everything CI checks, runnable before pushing.
-ci: lint test build
+ci: naming lint test build
 	./bin/twinet validate -m examples/demo
 	./bin/twinet validate -m examples/cos461
 	./bin/twinet grade validate examples/cos461/rubric/cos461.yaml

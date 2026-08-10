@@ -4,7 +4,10 @@ This records what is built and verified, so the plan and the code cannot drift.
 Measurements are from the three-node cluster (node-0/1/2, 56 cores and 251 GiB
 each, 10 GbE private fabric).
 
-Last updated after the grading milestone.
+Last updated after the grading milestone and the first external code review.
+
+The fault-injection objective of [10](10_fault_injection.md) is recorded in the
+plan but not yet implemented; it is milestone M8.
 
 ## Built and verified
 
@@ -61,7 +64,7 @@ reached students, and each motivated a permanent test.
    paths tie and no fourth does.
 
 5. **A stale agent.** A rollout used a binary built before the change it was
-   meant to carry, which presented as a networking bug. `scripts/deploy-agents.sh`
+   meant to carry, which presented as a networking bug. `scripts/deploy_agents.sh`
    now verifies each node ends up with the checksum that was just built.
 
 6. **Kubernetes-style memory quantities.** Docker rejects `512Mi`. Quantities are
@@ -75,7 +78,7 @@ reached students, and each motivated a permanent test.
   is therefore pinned to **1450** and applied to *every* link, local ones
   included, so a student's network behaves identically wherever their AS is
   scheduled. This was the documented fallback in
-  [04](04-networking-and-scaleout.md) §1.3.
+  [04](04_networking_and_scaleout.md) §1.3.
 
 ## Remaining work
 
@@ -90,6 +93,9 @@ reached students, and each motivated a permanent test.
 | `twinet save` / `restore` | M2 | |
 | Advanced-course exercises (MPLS, VRF, multicast) | M7 | The agent already loads the MPLS modules |
 | 80-AS scale run | M6 | The 12-AS run extrapolates to roughly 9 minutes |
+| Fault injection and RCA evaluation | M8 | The NIKA taxonomy; see [10](10_fault_injection.md). Not started. The `behaviours:` block is the design seed, and `internal/state` already provides the baseline capture an episode needs |
+| DHCP, web and load-balancer services, traffic generation | M8 | Prerequisites for eleven NIKA fault types |
+| NIKA `LabRuntime` adapter | M8 | About fifty semantic operations, brokered through the existing agent exec API |
 
 ## Measurements
 

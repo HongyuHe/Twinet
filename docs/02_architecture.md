@@ -45,7 +45,7 @@ There is deliberately **no database and no message broker**. See §4.
 | "Easy to maintain" | A typed model with a compiler; refactors are mechanical instead of `grep`-and-pray across 225 shell files. |
 | Massive parallelism | Goroutines + `errgroup`; deploying 2,000 containers and grading 100 students are both fan-out problems. Python's GIL and bash's `&` are why the current system is slow. |
 | Netns/netlink/tc/VXLAN | `vishvananda/netlink` and `containernetworking/plugins/pkg/ns` give first-class, race-free access. The current `_connect_utils.sh` shells out to `ip`, and needs a `trap` to remove `/var/run/netns` symlinks on 6 signals. |
-| Precedent | containerlab is exactly this design and is production-proven. We adopt its low-level wiring approach (see [04](04-networking-and-scaleout.md)). |
+| Precedent | containerlab is exactly this design and is production-proven. We adopt its low-level wiring approach (see [04](04_networking_and_scaleout.md)). |
 
 Python remains welcome for *course content* (grading rubrics can call out to
 scripts), but not for infrastructure.

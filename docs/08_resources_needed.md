@@ -102,6 +102,21 @@ Each has a default; tell me only if you disagree.
 | D9 | **IPv6 depth.** The course needs IPv6 addressing in the L2 domains plus 6in4 tunnels — not full dual-stack routing. I will implement exactly that. | Course-level IPv6 |
 | D10 | **Repo hygiene.** I will keep `main` always green (CI must pass), commit per logical change with `Hongyu Hè` as sole author and no Copilot trailer, and push after each milestone. | As stated |
 
+## 3a. Resources the fault-injection objective adds
+
+Recorded here because [10](10_fault_injection.md) was added to the plan after
+the original list.
+
+| # | Item | Why |
+|---|---|---|
+| A | **Confirmation that NIKA integration is two-way.** I plan both a native Twinet fault API *and* a NIKA `LabRuntime` adapter, so NIKA's existing 60 fault implementations run unmodified against a Twinet lab. If you only want one direction, the adapter is the one to keep. | Scope |
+| B | **A decision on the 13 out-of-substrate fault types.** My recommendation: build P4/BMv2 and SDN-controller device kinds (9 types), and delegate the 4 Kubernetes types to NIKA's existing backend rather than duplicating a container orchestrator's failure modes inside a network emulator. | Scope |
+| C | **Whether Twinet should be upstreamed to NIKA as a backend**, or kept as an adapter in this repository. Upstreaming means matching their release cadence and review; an adapter here means tracking their interface. | Process |
+| D | **An agent endpoint to test against.** To validate the evaluation loop end to end I need at least one agent I can point `twinet incident run` at. NIKA's mock agent would do for mechanics; a real one is needed to know the task is neither trivial nor impossible. | Validation |
+| E | **Any NIKA scenarios you consider canonical**, so M8's acceptance test ("NIKA agrees with containerlab's verdict for the same fault") compares against cases you care about rather than ones I pick. | Validation |
+
+None of these block starting M8, and none change anything before it.
+
 ## 4. What I do *not* need
 
 - Access to the live `hecate` deployment — I would rather build and validate
