@@ -285,3 +285,47 @@ func safe(s string) string {
 	}
 	return out
 }
+
+// PutTopology records the topology a lab was last applied with.
+//
+// The agent's own memory is not a safe place for this. It is what a destroy
+// consults to know which devices hold student work worth capturing, and what a
+// restart needs to know which labs the node is hosting. An agent restarted for
+// any reason -- an upgrade, a crash, a reboot -- would otherwise come back
+// believing the node is empty, and the next destroy would take a class's work
+// with it without noticing there was anything to save.
+func (s *Store) PutTopology(lab string, raw []byte) error {
+	dir := filepath.Join(s.root, safe(lab))
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	return writeAtomic(filepath.Join(dir, "topology.json"), raw, 0o600)
+}
+
+// Topology returns the recorded topology for a lab, if there is one.
+func (s *Store) Topology(lab string) ([]byte, error) {
+	return os.ReadFile(filepath.Join(s.root, safe(lab), "topology.json"))
+}
+
+// Labs lists every lab the store knows about, which after a restart is how the
+// agent rediscovers what this node is hosting.
+func (s *Store) Labs() ([]string, error) {
+	entries, err := os.ReadDir(s.root)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var out []string
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(s.root, e.Name(), "topology.json")); err == nil {
+			out = append(out, e.Name())
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}

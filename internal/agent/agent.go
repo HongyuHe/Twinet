@@ -164,6 +164,7 @@ func New(cfg Config) (*Server, error) {
 			return nil, fmt.Errorf("state directory: %w", err)
 		}
 		srv.store = st
+		srv.rehydrate()
 	}
 	return srv, nil
 }
@@ -174,6 +175,40 @@ func renderer(top *model.Topology, mode render.Mode, ungraded int) *render.Rende
 		return render.NewHarness(top, ungraded)
 	}
 	return render.New(top, mode)
+}
+
+// rehydrate reloads the labs this node was hosting before the agent restarted.
+//
+// Without it, an upgrade or a reboot leaves the agent believing the node is
+// empty. Nothing looks wrong -- the containers are still running -- until a
+// destroy arrives and skips the capture of student work it no longer knows
+// exists.
+func (s *Server) rehydrate() {
+	labs, err := s.store.Labs()
+	if err != nil {
+		slog.Warn("reloading known labs", "err", err)
+		return
+	}
+	for _, lab := range labs {
+		raw, err := s.store.Topology(lab)
+		if err != nil {
+			continue
+		}
+		var wt Wire
+		if err := json.Unmarshal(raw, &wt); err != nil {
+			slog.Warn("reloading a lab", "lab", lab, "err", err)
+			continue
+		}
+		top, err := wt.Rehydrate()
+		if err != nil {
+			slog.Warn("rehydrating a lab", "lab", lab, "err", err)
+			continue
+		}
+		s.current[top.Name] = top
+	}
+	if len(s.current) > 0 {
+		slog.Info("reloaded labs from the state store", "count", len(s.current))
+	}
 }
 
 // acquire takes the operation lease for one lab, refusing rather than queueing
@@ -463,6 +498,18 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	s.current[top.Name] = top
 	s.mu.Unlock()
+
+	// Recorded on disk as well as in memory. An agent restarted for any reason
+	// would otherwise come back believing the node is empty, and the next
+	// destroy would take a class's work with it without noticing there was
+	// anything to capture.
+	if s.store != nil {
+		if raw, err := json.Marshal(req.Topology); err == nil {
+			if err := s.store.PutTopology(top.Name, raw); err != nil {
+				slog.Warn("recording the applied topology", "lab", top.Name, "err", err)
+			}
+		}
+	}
 
 	resp := ApplyResponse{
 		Node: s.cfg.Node, Steps: p.Len(),
