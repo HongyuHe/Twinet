@@ -359,14 +359,14 @@ func (s *Server) handleContainers(w http.ResponseWriter, r *http.Request) {
 
 // ApplyRequest carries the slice of a topology this node is responsible for.
 type ApplyRequest struct {
-	Topology     *Wire             `json:"topology"`
-	Mode         string            `json:"mode"`
-	PullPolicy   string            `json:"pull_policy"`
+	Topology   *Wire  `json:"topology"`
+	Mode       string `json:"mode"`
+	PullPolicy string `json:"pull_policy"`
 	// Ungraded names the one AS that keeps platform mode while the rest of the
 	// lab is rendered with the reference solution. It is how a grading harness
 	// surrounds a submission with a correct internet without also configuring
 	// the work being marked.
-	Ungraded int `json:"ungraded_as,omitempty"`
+	Ungraded     int               `json:"ungraded_as,omitempty"`
 	Workers      int               `json:"workers"`
 	DryRun       bool              `json:"dry_run"`
 	PeerUnderlay map[string]string `json:"peer_underlay"`

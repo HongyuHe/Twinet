@@ -27,11 +27,18 @@ type submission struct {
 	Group string
 	AS    int
 	Dir   string
-	// Files maps a router's short name to the configuration text submitted
-	// for it. A submission that names a router the AS does not have is a
-	// mistake worth reporting rather than ignoring: silently dropping it would
-	// mark the student on an empty router and tell them their routing is wrong.
+	// Files maps a router's short name to the FRR configuration submitted for
+	// it. A submission that names a router the AS does not have is a mistake
+	// worth reporting rather than ignoring: silently dropping it would mark
+	// the student on an empty router and tell them their routing is wrong.
 	Files map[string]string
+	// Scripts maps a device's short name to a shell script run inside it.
+	//
+	// Not everything a student configures is FRR. VLANs live in the switch,
+	// tunnels and host routes are set with ip(8), and a grader that could only
+	// load FRR configuration would mark those exercises as failed no matter
+	// what the student did.
+	Scripts map[string]string
 }
 
 func newGradeBatchCmd(opts *Options) *cobra.Command {
@@ -328,6 +335,11 @@ func applySubmission(ctx context.Context, exec execFn, h *model.Topology, s subm
 	}
 
 	var missing []string
+	for name := range s.Scripts {
+		if _, ok := known[strings.ToUpper(name)]; !ok {
+			missing = append(missing, name)
+		}
+	}
 	for name := range s.Files {
 		if _, ok := known[strings.ToUpper(name)]; !ok {
 			missing = append(missing, name)
@@ -339,44 +351,85 @@ func applySubmission(ctx context.Context, exec execFn, h *model.Topology, s subm
 			s.AS, strings.Join(missing, ", "))
 	}
 
-	for name, body := range s.Files {
+	names := make([]string, 0, len(s.Files))
+	for name := range s.Files {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
 		d := known[strings.ToUpper(name)]
-		if err := loadFRRConfig(ctx, exec, d, body); err != nil {
+		if err := loadFRRConfig(ctx, exec, d, s.Files[name]); err != nil {
 			return fmt.Errorf("%s: %w", d.ID, err)
+		}
+	}
+
+	// Scripts run after the routing configuration, because a tunnel or a host
+	// route may depend on an address the configuration has just brought up.
+	names = names[:0]
+	for name := range s.Scripts {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		d := known[strings.ToUpper(name)]
+		res, err := exec(ctx, d.ID, []string{"sh", "-c", s.Scripts[name]})
+		if err != nil {
+			return fmt.Errorf("%s: running the submitted script: %w", d.ID, err)
+		}
+		if res.ExitCode != 0 {
+			return fmt.Errorf("%s: the submitted script exited %d: %s",
+				d.ID, res.ExitCode, firstLine(res.Stderr+res.Stdout))
 		}
 	}
 	return nil
 }
 
+// loadFRRConfig installs a submitted configuration and restarts FRR onto it.
+//
+// The obvious approach, feeding the file to "vtysh -f", does not work for a
+// whole configuration: vtysh accepts commands, and a configuration file also
+// contains directives such as "frr version" that exist only for the daemons'
+// own startup parser. Feeding one in fails at that line, and the failure looks
+// like a student error when it is the grader's.
+//
+// So the submission is installed exactly where a real deployment puts it and
+// FRR is restarted onto it, which is also the only way to be sure the mark
+// reflects the file the student submitted rather than that file layered on top
+// of whatever the router was already running.
 func loadFRRConfig(ctx context.Context, exec execFn, d *model.Device, body string) error {
-	const path = "/etc/frr/submission.conf"
-	write := fmt.Sprintf("cat > %s <<'TWINET_EOF'\n%s\nTWINET_EOF", path, body)
-	res, err := exec(ctx, d.ID, []string{"sh", "-c", write})
+	script := strings.Join([]string{
+		"set -e",
+		"cat > /etc/frr/frr.conf <<'TWINET_EOF'\n" + body + "\nTWINET_EOF",
+		"chown frr:frr /etc/frr/frr.conf 2>/dev/null || true",
+		"chmod 640 /etc/frr/frr.conf",
+		// watchfrr keeps its own pid file and outlives a plain stop, after
+		// which the daemons can never start again. It has to go first.
+		"for p in $(ps -ef | awk '/watchfrr/ && !/awk/ {print $1}'); do kill $p 2>/dev/null || true; done",
+		"/usr/lib/frr/frrinit.sh stop >/dev/null 2>&1 || true",
+		"rm -f /var/run/frr/*.pid /var/run/frr/*.vty 2>/dev/null || true",
+		"/usr/lib/frr/frrinit.sh start",
+	}, "\n")
+
+	res, err := exec(ctx, d.ID, []string{"sh", "-c", script})
 	if err != nil {
-		return fmt.Errorf("writing the configuration: %w", err)
+		return fmt.Errorf("installing the configuration: %w", err)
 	}
-	if err := res.Err(); err != nil {
-		return fmt.Errorf("writing the configuration: %w", err)
+	if res.ExitCode != 0 {
+		return fmt.Errorf("installing the configuration: %s",
+			firstLine(res.Stdout+res.Stderr))
 	}
 
-	// vtysh names the line it rejects, and that text is the most useful
-	// feedback a student can be given, so it is surfaced rather than reduced
-	// to an exit status.
-	res, err = exec(ctx, d.ID, []string{"vtysh", "-f", path})
+	// A daemon that rejected the file exits, and FRR's own start script does
+	// not fail when that happens. Asking vtysh which daemons answered is the
+	// only reliable signal, and it is also the feedback the student needs.
+	res, err = exec(ctx, d.ID, []string{"sh", "-c",
+		"sleep 2; vtysh -c 'show version' >/dev/null 2>&1 && vtysh -c 'show running-config' | head -1"})
 	if err != nil {
-		return fmt.Errorf("applying the configuration: %w", err)
+		return fmt.Errorf("checking that frr came up: %w", err)
 	}
-	combined := res.Stdout + res.Stderr
 	if res.ExitCode != 0 {
-		return fmt.Errorf("frr rejected the configuration: %s", firstLine(combined))
-	}
-	// vtysh exits zero even when it rejects individual lines, so the output
-	// has to be read. A submission half-applied is worse than one refused: the
-	// student would be marked on a router carrying some of their intent.
-	for _, line := range strings.Split(combined, "\n") {
-		if strings.HasPrefix(strings.TrimSpace(line), "%") {
-			return fmt.Errorf("frr rejected a line of the configuration: %s", strings.TrimSpace(line))
-		}
+		return fmt.Errorf("frr did not come up on the submitted configuration: %s",
+			firstLine(res.Stdout+res.Stderr))
 	}
 	return nil
 }
@@ -427,7 +480,10 @@ func readSubmissions(dir string, class *model.Topology) ([]submission, error) {
 			}
 		}
 
-		sub := submission{Group: group, AS: asn, Dir: filepath.Join(dir, group), Files: map[string]string{}}
+		sub := submission{
+			Group: group, AS: asn, Dir: filepath.Join(dir, group),
+			Files: map[string]string{}, Scripts: map[string]string{},
+		}
 		files, err := os.ReadDir(sub.Dir)
 		if err != nil {
 			return nil, err
@@ -437,16 +493,21 @@ func readSubmissions(dir string, class *model.Topology) ([]submission, error) {
 				continue
 			}
 			ext := filepath.Ext(f.Name())
-			if ext != ".conf" && ext != ".cfg" && ext != ".txt" {
+			if ext != ".conf" && ext != ".cfg" && ext != ".txt" && ext != ".sh" {
 				continue
 			}
 			raw, err := os.ReadFile(filepath.Join(sub.Dir, f.Name()))
 			if err != nil {
 				return nil, err
 			}
-			sub.Files[strings.TrimSuffix(f.Name(), ext)] = string(raw)
+			base := strings.TrimSuffix(f.Name(), ext)
+			if ext == ".sh" {
+				sub.Scripts[base] = string(raw)
+			} else {
+				sub.Files[base] = string(raw)
+			}
 		}
-		if len(sub.Files) == 0 {
+		if len(sub.Files) == 0 && len(sub.Scripts) == 0 {
 			return nil, fmt.Errorf("submission %q contains no configuration files", group)
 		}
 		subs = append(subs, sub)
