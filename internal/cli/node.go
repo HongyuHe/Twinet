@@ -153,7 +153,7 @@ what will run with root on their machines before it does.`,
 		},
 	}
 
-	cmd.AddCommand(status, check, bootstrap)
+	cmd.AddCommand(status, check, bootstrap, newNodePKICmd(opts))
 	return cmd
 }
 

@@ -24,3 +24,7 @@
 # Binaries staged into an image build context. They are build outputs, not
 # sources, and the image build copies them in from bin/.
 images/*/twinet-rtr
+
+# Issued certificates and the CA key. The CA key alone lets an attacker mint a
+# controller certificate for the cluster.
+**/.twinet/pki/

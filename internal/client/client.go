@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -35,6 +36,9 @@ type Node struct {
 	Token string
 
 	http *http.Client
+	// tls is the client configuration the raw attach stream reuses, so the
+	// streaming path cannot end up weaker than the request path.
+	tls *tls.Config
 }
 
 // TLS carries the client's mutual-TLS material.
@@ -54,6 +58,7 @@ func NewNodeTLS(name, addr, token string, t TLS) *Node {
 		DialContext:         (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
 		MaxIdleConnsPerHost: 8,
 	}
+	var streamCfg *tls.Config
 	if t.Cert != "" && t.Key != "" {
 		scheme = "https://"
 		cfg := &tls.Config{MinVersion: tls.VersionTLS13}
@@ -69,12 +74,14 @@ func NewNodeTLS(name, addr, token string, t TLS) *Node {
 			}
 		}
 		tr.TLSClientConfig = cfg
+		streamCfg = cfg
 	}
 	if !strings.Contains(addr, "://") {
 		addr = scheme + addr
 	}
 	return &Node{
 		Name: name, Addr: strings.TrimRight(addr, "/"), Token: token,
+		tls: streamCfg,
 		http: &http.Client{
 			Timeout:   30 * time.Minute, // a large apply legitimately takes a while
 			Transport: tr,
@@ -237,11 +244,30 @@ type Cluster struct {
 
 // NewCluster builds a cluster client from a lab's placement configuration.
 func NewCluster(lab *model.Lab, token string) *Cluster {
-	return NewClusterTLS(lab, token, TLS{
+	t := TLS{
 		Cert: os.Getenv("TWINET_TLS_CERT"),
 		Key:  os.Getenv("TWINET_TLS_KEY"),
 		CA:   os.Getenv("TWINET_CA"),
-	})
+	}
+	// Fall back to the material the lab itself issued. Requiring an operator to
+	// export three environment variables before anything works is how a cluster
+	// ends up running without them: the insecure path is the one that needs no
+	// setup, so it becomes the path everyone uses.
+	if t.Cert == "" && lab != nil && lab.Dir != "" {
+		dir := filepath.Join(lab.Dir, ".twinet", "pki")
+		cert := filepath.Join(dir, "controller_cert.pem")
+		key := filepath.Join(dir, "controller_key.pem")
+		ca := filepath.Join(dir, "ca_cert.pem")
+		if fileExists(cert) && fileExists(key) && fileExists(ca) {
+			t = TLS{Cert: cert, Key: key, CA: ca}
+		}
+	}
+	return NewClusterTLS(lab, token, t)
+}
+
+func fileExists(p string) bool {
+	_, err := os.Stat(p)
+	return err == nil
 }
 
 // NewClusterTLS builds a cluster client with explicit TLS material.

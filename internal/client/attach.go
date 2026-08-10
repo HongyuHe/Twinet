@@ -3,6 +3,7 @@ package client
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,6 +11,31 @@ import (
 	"net/url"
 	"strings"
 )
+
+// dialStream opens the transport an attach runs over, matching whatever the
+// node's HTTP client uses so the two cannot disagree about security.
+func (n *Node) dialStream(ctx context.Context, host string) (net.Conn, error) {
+	var d net.Dialer
+	raw, err := d.DialContext(ctx, "tcp", host)
+	if err != nil {
+		return nil, err
+	}
+	if n.tls == nil {
+		return raw, nil
+	}
+	name := host
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		name = h
+	}
+	cfg := n.tls.Clone()
+	cfg.ServerName = name
+	c := tls.Client(raw, cfg)
+	if err := c.HandshakeContext(ctx); err != nil {
+		_ = raw.Close()
+		return nil, err
+	}
+	return c, nil
+}
 
 // Attach opens a bidirectional stream into a container on this node.
 //
@@ -38,8 +64,11 @@ func (n *Node) Attach(ctx context.Context, container string, cmd []string,
 		host = host[:i]
 	}
 
-	var d net.Dialer
-	conn, err := d.DialContext(ctx, "tcp", host)
+	// The stream is raw, so it has to establish its own transport rather than
+	// borrowing the HTTP client's. Without this the attach path would be the
+	// one plaintext hole left in a cluster that had otherwise moved to mutual
+	// TLS -- and it is the path carrying an interactive root shell.
+	conn, err := n.dialStream(ctx, host)
 	if err != nil {
 		return 1, fmt.Errorf("reach node %s: %w", n.Name, err)
 	}
@@ -72,9 +101,10 @@ func (n *Node) Attach(ctx context.Context, container string, cmd []string,
 	go func() {
 		_, _ = io.Copy(conn, stdin)
 		// Half-close so the far side sees EOF on stdin and a piped command can
-		// finish, rather than waiting forever for input that will never come.
-		if tc, ok := conn.(*net.TCPConn); ok {
-			_ = tc.CloseWrite()
+		// finish, rather than waiting forever for input that never comes.
+		type halfCloser interface{ CloseWrite() error }
+		if hc, ok := conn.(halfCloser); ok {
+			_ = hc.CloseWrite()
 		}
 	}()
 	_, _ = io.Copy(stdout, br)

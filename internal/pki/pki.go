@@ -1,0 +1,181 @@
+// Package pki issues the certificates the cluster authenticates with.
+//
+// The agent API can create privileged containers and rewire hosts, so the
+// question is not whether it needs strong authentication but why it shipped
+// without it. A shared bearer token over plain HTTP has three problems that no
+// amount of care makes acceptable: it is replayable by anyone who sees one
+// request, it is identical on every node so a single leak compromises the
+// cluster, and it authenticates the caller to the agent while leaving the agent
+// unauthenticated to the caller -- so anything that can occupy the port can
+// collect tokens.
+//
+// Mutual TLS answers all three, and the only reason it was not the default is
+// that nothing generated the material. This does.
+package pki
+
+import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"fmt"
+	"math/big"
+	"net"
+	"os"
+	"path/filepath"
+	"time"
+)
+
+// Material is one issued identity on disk.
+type Material struct {
+	CertPath string
+	KeyPath  string
+	CAPath   string
+}
+
+// Bundle is everything a cluster needs.
+type Bundle struct {
+	Dir    string
+	CA     Material
+	Client Material
+	Nodes  map[string]Material
+}
+
+const (
+	// caValidity is long because rotating a teaching cluster's CA mid-term is
+	// worse than the marginal risk of a longer-lived key kept offline.
+	caValidity   = 5 * 365 * 24 * time.Hour
+	leafValidity = 2 * 365 * 24 * time.Hour
+)
+
+// Generate issues a CA, one server certificate per node, and a client
+// certificate for the controller.
+//
+// Each node gets its own key. One shared server certificate would be simpler
+// and would recreate the property that makes the bearer token unacceptable: a
+// single compromised machine able to impersonate every other.
+func Generate(dir string, nodes map[string][]string) (*Bundle, error) {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, err
+	}
+
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, err
+	}
+	caTmpl := &x509.Certificate{
+		SerialNumber:          serial(),
+		Subject:               pkix.Name{CommonName: "twinet cluster CA"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(caValidity),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		MaxPathLenZero:        true,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTmpl, caTmpl, &caKey.PublicKey, caKey)
+	if err != nil {
+		return nil, err
+	}
+	caCert, err := x509.ParseCertificate(caDER)
+	if err != nil {
+		return nil, err
+	}
+
+	b := &Bundle{Dir: dir, Nodes: map[string]Material{}}
+	b.CA = Material{
+		CertPath: filepath.Join(dir, "ca_cert.pem"),
+		KeyPath:  filepath.Join(dir, "ca_key.pem"),
+	}
+	if err := writePEM(b.CA.CertPath, "CERTIFICATE", caDER, 0o644); err != nil {
+		return nil, err
+	}
+	if err := writeKey(b.CA.KeyPath, caKey); err != nil {
+		return nil, err
+	}
+
+	for name, sans := range nodes {
+		m, err := issue(dir, name+"_server", caCert, caKey, sans,
+			[]x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth})
+		if err != nil {
+			return nil, fmt.Errorf("node %s: %w", name, err)
+		}
+		m.CAPath = b.CA.CertPath
+		b.Nodes[name] = m
+	}
+
+	client, err := issue(dir, "controller", caCert, caKey, nil,
+		[]x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth})
+	if err != nil {
+		return nil, err
+	}
+	client.CAPath = b.CA.CertPath
+	b.Client = client
+	return b, nil
+}
+
+func issue(dir, name string, caCert *x509.Certificate, caKey *ecdsa.PrivateKey,
+	sans []string, usage []x509.ExtKeyUsage) (Material, error) {
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return Material{}, err
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: serial(),
+		Subject:      pkix.Name{CommonName: name},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(leafValidity),
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:  usage,
+	}
+	for _, s := range sans {
+		if ip := net.ParseIP(s); ip != nil {
+			tmpl.IPAddresses = append(tmpl.IPAddresses, ip)
+		} else {
+			tmpl.DNSNames = append(tmpl.DNSNames, s)
+		}
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, caCert, &key.PublicKey, caKey)
+	if err != nil {
+		return Material{}, err
+	}
+	m := Material{
+		CertPath: filepath.Join(dir, name+"_cert.pem"),
+		KeyPath:  filepath.Join(dir, name+"_key.pem"),
+	}
+	if err := writePEM(m.CertPath, "CERTIFICATE", der, 0o644); err != nil {
+		return Material{}, err
+	}
+	if err := writeKey(m.KeyPath, key); err != nil {
+		return Material{}, err
+	}
+	return m, nil
+}
+
+func writePEM(path, kind string, der []byte, mode os.FileMode) error {
+	return os.WriteFile(path, pem.EncodeToMemory(&pem.Block{Type: kind, Bytes: der}), mode)
+}
+
+func writeKey(path string, key *ecdsa.PrivateKey) error {
+	der, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		return err
+	}
+	// 0600: a private key readable by anyone on the machine is not private, and
+	// this one authorises privileged container creation.
+	return writePEM(path, "EC PRIVATE KEY", der, 0o600)
+}
+
+func serial() *big.Int {
+	n, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		// A predictable serial is a genuine weakness, so failing here is the
+		// right answer: the alternative is issuing a certificate that is weaker
+		// than it claims to be, silently.
+		panic("pki: no randomness available: " + err.Error())
+	}
+	return n
+}

@@ -17,7 +17,11 @@ package e2e
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -367,5 +371,63 @@ func TestTheReferenceSolutionScoresFullMarks(t *testing.T) {
 	}
 	if strings.Contains(out, "need review") {
 		t.Errorf("grading the reference did not complete cleanly:\n%s", out)
+	}
+}
+
+// The agent API creates privileged containers and rewires hosts. A shared
+// bearer token over plain HTTP is replayable by anyone who sees one request,
+// identical on every node so a single leak compromises the cluster, and leaves
+// the agent unauthenticated to the caller -- so anything that can occupy the
+// port collects tokens.
+func TestTheAgentAPIRefusesUnauthenticatedCallers(t *testing.T) {
+	dir := labDir(t)
+	pkiDir := filepath.Join(dir, ".twinet", "pki")
+	if _, err := os.Stat(filepath.Join(pkiDir, "ca_cert.pem")); err != nil {
+		t.Skip("this cluster has no PKI issued; run `twinet node pki`")
+	}
+
+	out, err := twinet(t, "node", "status", "-m", dir)
+	if err != nil {
+		t.Fatalf("the controller cannot reach its own cluster: %v\n%s", err, out)
+	}
+
+	// Find an agent address from the cluster's own view of itself. The columns
+	// are scanned for something that parses as an address rather than indexed,
+	// because the runtime column holds two words and an index silently picks
+	// the wrong field -- which reads as "no cluster" and skips the test.
+	addr := ""
+	for _, line := range strings.Split(out, "\n")[1:] {
+		for _, f := range strings.Fields(line) {
+			if ip := net.ParseIP(f); ip != nil && ip.To4() != nil {
+				addr = f + ":7200"
+				break
+			}
+		}
+		if addr != "" {
+			break
+		}
+	}
+	if addr == "" {
+		t.Skip("could not determine an agent address")
+	}
+
+	// Plain HTTP against a TLS listener must not produce a usable answer.
+	plain := &http.Client{Timeout: 5 * time.Second}
+	if res, err := plain.Get("http://" + addr + "/v1/status"); err == nil {
+		defer func() { _ = res.Body.Close() }()
+		body, _ := io.ReadAll(io.LimitReader(res.Body, 256))
+		if res.StatusCode == http.StatusOK && strings.Contains(string(body), "underlay") {
+			t.Error("the agent answered a plaintext request with cluster state")
+		}
+	}
+
+	// TLS without a client certificate must be refused: possession of a bearer
+	// token is not identity, which is the property a token cannot express.
+	noCert := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS13}, //nolint:gosec // deliberately testing that the server refuses us
+	}}
+	if res, err := noCert.Get("https://" + addr + "/v1/status"); err == nil {
+		defer func() { _ = res.Body.Close() }()
+		t.Errorf("a caller with no client certificate reached the API (status %d)", res.StatusCode)
 	}
 }
