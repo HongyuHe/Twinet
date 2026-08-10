@@ -11,6 +11,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/HongyuHe/twinet/internal/agent"
+	"github.com/HongyuHe/twinet/internal/alloc"
 	"github.com/HongyuHe/twinet/internal/client"
 	"github.com/HongyuHe/twinet/internal/model"
 )
@@ -184,10 +185,41 @@ func bootstrapScript(n model.NodeSpec, token string) string {
 }
 
 // deployCluster fans the deployment out across node agents.
+// deconflictOverlays reassigns VXLAN identifiers that another lab already owns.
+func deconflictOverlays(ctx context.Context, c *client.Cluster, top *model.Topology) int {
+	inUse := c.OverlaysInUse(ctx)
+	if len(inUse) == 0 {
+		return 0
+	}
+	assigned := make(map[string]uint32, len(top.Links))
+	for _, l := range top.Links {
+		if l.VNI != 0 {
+			assigned[l.ID] = l.VNI
+		}
+	}
+	updated, moved := alloc.Deconflict(top.Name, assigned, inUse)
+	if moved == 0 {
+		return 0
+	}
+	for _, l := range top.Links {
+		if v, ok := updated[l.ID]; ok {
+			l.VNI = v
+		}
+	}
+	return moved
+}
+
 func deployCluster(ctx context.Context, top *model.Topology, tok string, req agent.ApplyRequest, out, errOut interface {
 	Write([]byte) (int, error)
 }) error {
 	c := client.NewCluster(top.Lab, tok)
+
+	// Move any overlay identifier another lab is already using, before the
+	// topology is sent anywhere. Doing it here means both ends of every link
+	// receive the same value without the nodes having to agree on anything.
+	if moved := deconflictOverlays(ctx, c, top); moved > 0 {
+		fmt.Fprintf(errOut, "  moved %d overlay identifier(s) that another lab was using\n", moved)
+	}
 
 	// Refuse to build a lab whose links cannot fit through the fabric.
 	if problems := c.CheckUnderlay(ctx, top); len(problems) > 0 {

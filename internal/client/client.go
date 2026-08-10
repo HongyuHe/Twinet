@@ -172,6 +172,26 @@ func (n *Node) Lifecycle(ctx context.Context, req agent.LifecycleRequest) error 
 	return n.do(ctx, http.MethodPost, "/v1/lifecycle", req, nil)
 }
 
+// OverlaysInUse maps every VXLAN identifier deployed anywhere in the cluster to
+// the lab that owns it. A node that cannot be reached contributes nothing,
+// which is deliberate: refusing to deploy because one node is down would be a
+// worse failure than the collision this avoids, and the collision is caught
+// again at the node itself.
+func (c *Cluster) OverlaysInUse(ctx context.Context) map[uint32]string {
+	out := map[uint32]string{}
+	for _, r := range c.Status(ctx) {
+		if r.Err != nil {
+			continue
+		}
+		for vni, lab := range r.Value.Overlays {
+			if lab != "" {
+				out[vni] = lab
+			}
+		}
+	}
+	return out
+}
+
 // Reshape puts an interface back to a declared shaping using the same code the
 // deployer uses, so an undo cannot drift from a deployment.
 func (n *Node) Reshape(ctx context.Context, req agent.ReshapeRequest) error {

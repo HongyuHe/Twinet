@@ -275,6 +275,7 @@ func joinInts(xs []int) string {
 }
 
 func deployQuiet(ctx context.Context, c *client.Cluster, h *model.Topology, target int) error {
+	deconflictOverlays(ctx, c, h)
 	if problems := c.CheckUnderlay(ctx, h); len(problems) > 0 {
 		return fmt.Errorf("underlay cannot carry the harness: %s", problems[0])
 	}

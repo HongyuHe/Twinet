@@ -47,6 +47,57 @@ func VNI(lab, linkID string, salt int) uint32 {
 	return uint32(h.Sum64()%(vniMax-vniMin)) + vniMin
 }
 
+// Deconflict reassigns any VNI that another lab is already using.
+//
+// Within one lab, collisions are resolved by re-probing. Across labs there is
+// nothing to re-probe against, because each lab hashes its own name and knows
+// nothing of the others -- and the birthday bound is not on the side of hope
+// here: a hundred concurrent grading harnesses of three hundred links each draw
+// thirty thousand values from sixteen million, and a collision is close to
+// certain rather than rare. Two labs sharing a tunnel is not a degraded lab, it
+// is two labs whose packets appear in each other's networks.
+//
+// The reassignment happens in the orchestrator, once, before the topology is
+// sent anywhere. Both ends of every link therefore receive the same value
+// without needing to agree on anything themselves, which is what keeps the
+// nodes free of shared state.
+func Deconflict(lab string, assigned map[string]uint32, inUse map[uint32]string) (map[string]uint32, int) {
+	taken := map[uint32]bool{}
+	for vni, owner := range inUse {
+		if owner != lab {
+			taken[vni] = true
+		}
+	}
+	for _, v := range assigned {
+		taken[v] = true
+	}
+
+	ids := make([]string, 0, len(assigned))
+	for id := range assigned {
+		ids = append(ids, id)
+	}
+	sortStrings(ids)
+
+	moved := 0
+	for _, id := range ids {
+		v := assigned[id]
+		if owner, clash := inUse[v]; !clash || owner == lab || owner == "" {
+			continue
+		}
+		delete(taken, v)
+		for salt := 1; ; salt++ {
+			cand := VNI(lab, id, salt)
+			if !taken[cand] && inUse[cand] == "" {
+				assigned[id] = cand
+				taken[cand] = true
+				moved++
+				break
+			}
+		}
+	}
+	return assigned, moved
+}
+
 // AssignVNIs allocates a unique VNI for every link ID, resolving the rare
 // collision by re-probing with an increasing salt. Input order does not matter:
 // IDs are processed in sorted order so the result is stable.

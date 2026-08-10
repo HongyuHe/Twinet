@@ -38,6 +38,16 @@ type OverlaySpec struct {
 	MTU int
 	// Port overrides the VTEP UDP port.
 	Port int
+	// Lab names the lab this overlay belongs to.
+	//
+	// Two labs on one node derive their identifiers independently, so nothing
+	// stops them landing on the same 24-bit VNI: with a few hundred links each,
+	// a collision is likely rather than exotic. Without an owner recorded on
+	// the device, the second lab silently joins the first one's tunnel, and
+	// cleaning up either one deletes the other's fabric. The name is stamped on
+	// the interface so both can be detected and neither can be destroyed by
+	// accident.
+	Lab string
 }
 
 // EnsureOverlay creates the bridge and VXLAN netdev for a cross-node link and
@@ -72,9 +82,23 @@ func EnsureOverlay(spec OverlaySpec) (string, error) {
 	brName := BridgeName(spec.VNI)
 	vxName := VxlanName(spec.VNI)
 
+	// A tunnel that already exists and belongs to another lab is a collision,
+	// not something to reuse. Joining it would put two labs' traffic on one
+	// wire, which shows up as impossible routing rather than as an error.
+	if owner, ok, err := overlayOwner(vxName); err != nil {
+		return "", err
+	} else if ok && spec.Lab != "" && owner != "" && owner != spec.Lab {
+		return "", fmt.Errorf(
+			"VNI %d is already in use by lab %q on this node; two labs cannot share a tunnel. "+
+				"Rename one lab, or destroy %q first", spec.VNI, owner, owner)
+	}
+
 	br, err := ensureBridge(brName, mtu+50)
 	if err != nil {
 		return "", err
+	}
+	if spec.Lab != "" {
+		_ = netlink.LinkSetAlias(br, ownerAlias(spec.Lab))
 	}
 
 	var vtepIdx int
@@ -108,6 +132,11 @@ func EnsureOverlay(spec OverlaySpec) (string, error) {
 			if err := reconcileDefaultFDB(vx, remote); err != nil {
 				return "", err
 			}
+			// An overlay created before ownership was recorded is adopted
+			// rather than rebuilt, so an upgrade does not tear down a class.
+			if spec.Lab != "" && ownerFromAlias(vx.Attrs().Alias) == "" {
+				_ = netlink.LinkSetAlias(existing, ownerAlias(spec.Lab))
+			}
 			return brName, nil
 		}
 	} else if !IsNotFound(err) {
@@ -115,7 +144,7 @@ func EnsureOverlay(spec OverlaySpec) (string, error) {
 	}
 
 	vx := &netlink.Vxlan{
-		LinkAttrs:    netlink.LinkAttrs{Name: vxName, MTU: mtu},
+		LinkAttrs:    netlink.LinkAttrs{Name: vxName, MTU: mtu, Alias: ownerAlias(spec.Lab)},
 		VxlanId:      int(spec.VNI),
 		SrcAddr:      local,
 		Group:        remote, // unicast remote, not a multicast group
@@ -338,6 +367,34 @@ func UnderlayMTU(remote string) (int, string, error) {
 // caller happens to remember: a lab destroyed without its manifest, or an AS
 // moved to another node, would otherwise leave tunnels behind forever.
 func ListOverlays() ([]uint32, error) {
+	return listOverlays("")
+}
+
+// ListOverlaysOfLab returns only the overlays a lab owns. Cleaning up one lab
+// must not remove another's fabric, which is what an unqualified sweep of every
+// twvx device on the host does.
+func ListOverlaysOfLab(lab string) ([]uint32, error) {
+	return listOverlays(lab)
+}
+
+// OverlayOwners maps every Twinet overlay on this host to the lab that owns it.
+func OverlayOwners() (map[uint32]string, error) {
+	links, err := netlink.LinkList()
+	if err != nil {
+		return nil, fmt.Errorf("list host interfaces: %w", err)
+	}
+	out := map[uint32]string{}
+	for _, l := range links {
+		vx, ok := l.(*netlink.Vxlan)
+		if !ok || !strings.HasPrefix(vx.Name, "twvx") {
+			continue
+		}
+		out[uint32(vx.VxlanId)] = ownerFromAlias(vx.Attrs().Alias)
+	}
+	return out, nil
+}
+
+func listOverlays(lab string) ([]uint32, error) {
 	links, err := netlink.LinkList()
 	if err != nil {
 		return nil, fmt.Errorf("list host interfaces: %w", err)
@@ -345,13 +402,39 @@ func ListOverlays() ([]uint32, error) {
 	var out []uint32
 	for _, l := range links {
 		vx, ok := l.(*netlink.Vxlan)
-		if !ok {
+		if !ok || !strings.HasPrefix(vx.Name, "twvx") {
 			continue
 		}
-		if !strings.HasPrefix(vx.Name, "twvx") {
+		if lab != "" && ownerFromAlias(vx.Attrs().Alias) != lab {
 			continue
 		}
 		out = append(out, uint32(vx.VxlanId))
 	}
 	return out, nil
+}
+
+// aliasPrefix marks an interface alias as Twinet's ownership record. The alias
+// is used rather than a name because interface names are capped at fifteen
+// characters, which a lab name and a VNI do not fit into together.
+const aliasPrefix = "twinet:"
+
+func ownerAlias(lab string) string { return aliasPrefix + lab }
+
+func ownerFromAlias(alias string) string {
+	if !strings.HasPrefix(alias, aliasPrefix) {
+		return ""
+	}
+	return strings.TrimPrefix(alias, aliasPrefix)
+}
+
+// overlayOwner reports which lab owns an existing overlay device.
+func overlayOwner(vxName string) (string, bool, error) {
+	l, err := netlink.LinkByName(vxName)
+	if err != nil {
+		if _, ok := err.(netlink.LinkNotFoundError); ok {
+			return "", false, nil
+		}
+		return "", false, nil
+	}
+	return ownerFromAlias(l.Attrs().Alias), true, nil
 }

@@ -304,6 +304,10 @@ type StatusResponse struct {
 	// harnesses at once cannot be described by a single name.
 	Labs []string `json:"labs,omitempty"`
 	Busy []string `json:"busy,omitempty"`
+	// Overlays maps each VXLAN identifier in use on this node to the lab that
+	// owns it, so an orchestrator can avoid handing a second lab an identifier
+	// the first is already using.
+	Overlays map[uint32]string `json:"overlays,omitempty"`
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -342,6 +346,10 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	sort.Strings(busy)
 	resp.Busy = busy
 	s.mu.Unlock()
+
+	if owners, err := netx.OverlayOwners(); err == nil {
+		resp.Overlays = owners
+	}
 	writeJSON(w, resp)
 }
 
@@ -557,7 +565,12 @@ func (s *Server) handleDestroy(w http.ResponseWriter, r *http.Request) {
 		// Without a manifest there is no VNI list, so cleanup works from what
 		// is actually on the host. This is what makes `destroy --lab NAME`
 		// able to clean up after a topology nobody has a copy of any more.
-		vnis, err := netx.ListOverlays()
+		//
+		// It is still restricted to the overlays this lab owns. A node may host
+		// several labs at once -- a class lab beside a harness per submission
+		// being graded -- and removing every tunnel on the host would take all
+		// of them down together.
+		vnis, err := netx.ListOverlaysOfLab(req.Lab)
 		if err != nil {
 			slog.Warn("listing overlays", "err", err)
 		} else if err := eng.DestroyOverlays(vnis); err != nil {

@@ -423,7 +423,10 @@ func (e *Engine) PruneOverlays(top *model.Topology) ([]string, error) {
 			want[l.VNI] = true
 		}
 	}
-	live, err := netx.ListOverlays()
+	// Only this lab's own overlays are considered. A sweep of every twvx
+	// device on the host would delete the fabric of every other lab sharing
+	// the node, which is exactly the situation batch grading creates.
+	live, err := netx.ListOverlaysOfLab(top.Name)
 	if err != nil {
 		return nil, err
 	}
@@ -557,6 +560,7 @@ func (e *Engine) wireCrossNode(ctx context.Context, top *model.Topology, l *mode
 		RemoteIP:    remoteIP,
 		UnderlayDev: e.UnderlayDev,
 		MTU:         mtu,
+		Lab:         top.Name,
 	})
 	if err != nil {
 		return fmt.Errorf("link %s: %w", l.ID, err)
