@@ -47,6 +47,7 @@ and replaces the machinery underneath it.
 | 06 | [Grading](06-grading.md) | The autograding engine: ephemeral labs, probes, rubrics, parallelism |
 | 07 | [Roadmap](07-roadmap.md) | Milestones, deliverables, acceptance criteria, risks |
 | 08 | [Resources needed](08-resources-needed.md) | What I need from you to execute this plan |
+| 09 | [Implementation status](09-status.md) | What is built and verified, with measurements |
 
 ## Design principles
 

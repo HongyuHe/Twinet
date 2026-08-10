@@ -48,6 +48,7 @@ across a cluster and graded automatically.`,
 		newExecCmd(opts),
 		newGraphCmd(opts),
 		newNodeCmd(opts),
+		newGradeCmd(opts),
 		newVersionCmd(),
 	)
 	return root

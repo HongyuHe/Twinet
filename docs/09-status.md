@@ -1,0 +1,103 @@
+# 09 — Implementation status
+
+This records what is built and verified, so the plan and the code cannot drift.
+Measurements are from the three-node cluster (node-0/1/2, 56 cores and 251 GiB
+each, 10 GbE private fabric).
+
+Last updated after the grading milestone.
+
+## Built and verified
+
+| Area | State | Evidence |
+|---|---|---|
+| Typed model, manifest loading, aggregated positional validation | done | `internal/model`, `internal/manifest`; `twinet validate` reports every problem in one pass |
+| Expression-based addressing plan | done | `internal/ipam`; tests assert the plan reproduces the COS-461 assignment text exactly |
+| Deterministic allocation (VNI, MAC, interface names) | done | `internal/alloc`; tests assert order-independence, uniqueness across 5,000 links, and that names fit `IFNAMSIZ` |
+| Template expansion, tiered-internet generator, post-expansion verifier | done | `internal/expand`; the verifier caught two real modelling defects (see below) |
+| Netlink wiring: veth, netns, shaping, VXLAN | done | `internal/netx`; rate/time parsing tested against bit-vs-byte and binary-vs-decimal confusion |
+| Container runtime abstraction | done | `internal/runtime` (docker) |
+| Staged deployment DAG with per-scope failure isolation | done | `internal/plan`; tests assert stage ordering, real concurrency, and that one broken AS does not stop a class |
+| Convergence predicates in place of sleeps | done | `internal/plan.Wait`, `internal/grade/converge.go` |
+| Single-node deployment | done | 4-AS demo: 57 devices, 74 links, 64 s |
+| Node agent and cluster fabric | done | 12-AS lab: 211 devices, 291 links across 3 nodes in **83 s**, zero failures |
+| Cross-node VXLAN | done | 50.22 ms measured for a 25 ms configured delay, 9 µs jitter, no duplicates |
+| AS-granular placement | done | 13.4 % of links cross the fabric; `twinet inspect --placement` |
+| Underlay MTU verification | done | `twinet node check` refuses a lab that would not fit and names the MTU to use |
+| Grading engine: rubric, 17 checks, structured reports | done | 3 submissions in **31 s**; JSON, text and CSV output |
+| Reference solution (`--solve`) | partial | scores **7.33 / 10** against its own rubric |
+| Container images | done | `hyhe/twinet-{router,host,switch,svc}` |
+| CI, Makefile, lint config | done | `.github/workflows/ci.yml` |
+
+## Defects found by the platform's own checks
+
+Recording these because each is the kind of fault that would otherwise have
+reached students, and each motivated a permanent test.
+
+1. **Colliding interface names.** A reduced staff-run AS carries every external
+   port on one router, so two links to the same peer both wanted `ext_3`.
+   External interfaces are now named after the peer's *router*, with a
+   deterministic uniquifying pass behind that. Caught by the post-expansion
+   verifier.
+
+2. **The internet exchange was not a shared LAN.** It was modelled as
+   point-to-point cables that all carried the same `/24`, so every member would
+   have believed the whole peering LAN was on-link while being unable to reach
+   any of it. An exchange is now a real fabric switch, which is what the
+   hardware is and what lets a member at `180.Z.0.<ASN>` reach the route server
+   at `180.Z.0.Z` as the assignment promises. Caught by the prefix-overlap check.
+
+3. **Duplicated packets on every cross-node link.** Creating a VXLAN device with
+   a unicast remote already installs the all-zeros forwarding entry, so
+   appending another produced two copies of every flooded frame. Students would
+   have seen duplicate ICMP replies and inexplicable traceroutes and reasonably
+   concluded they had misconfigured something. The entry is now reconciled
+   rather than appended.
+
+4. **A wrong reference answer.** Two keys in the OSPF cost map were written in
+   the opposite order to the lookup, so their costs silently defaulted and one
+   of the three prescribed load-balanced paths never appeared. Now the map is
+   canonicalised at startup, and `TestReferenceECMPArithmetic` computes shortest
+   paths through the real topology to assert that exactly the three prescribed
+   paths tie and no fourth does.
+
+5. **A stale agent.** A rollout used a binary built before the change it was
+   meant to carry, which presented as a networking bug. `scripts/deploy-agents.sh`
+   now verifies each node ends up with the checksum that was just built.
+
+6. **Kubernetes-style memory quantities.** Docker rejects `512Mi`. Quantities are
+   now normalised, and validated at author time rather than discovered one
+   container at a time during a deployment.
+
+## Environment findings
+
+- **Jumbo frames are unavailable.** Raising `eno2` to MTU 9000 dropped the
+  carrier and made a node unreachable; it was reverted immediately. The lab MTU
+  is therefore pinned to **1450** and applied to *every* link, local ones
+  included, so a student's network behaves identically wherever their AS is
+  scheduled. This was the documented fallback in
+  [04](04-networking-and-scaleout.md) §1.3.
+
+## Remaining work
+
+| Item | Milestone | Note |
+|---|---|---|
+| DNS, matrix, looking glass, BGP analyzer, web UI | M2 | Service containers are placed and wired; their payloads are not yet implemented |
+| SSH gateway with label-based authorisation | M2 | The agent already enforces owner-scoped exec, which is the hard half |
+| RPKI (Krill + Routinator) provisioning | M2 | Needed for the last point of the rubric |
+| Reference answers for exchange communities, traffic engineering and RPKI | M7 | The remaining 2.67 points of `--solve` |
+| Ephemeral per-submission grading labs | M5 | The engine, rubric and checks are done and run against a live lab; synthesising a private lab per submission is the remaining piece |
+| Diff-and-converge `apply` | M4 | Deploy is idempotent, but does not yet compute a minimal change plan |
+| `twinet save` / `restore` | M2 | |
+| Advanced-course exercises (MPLS, VRF, multicast) | M7 | The agent already loads the MPLS modules |
+| 80-AS scale run | M6 | The 12-AS run extrapolates to roughly 9 minutes |
+
+## Measurements
+
+| Metric | Value |
+|---|---|
+| 12-AS lab, 211 containers, 291 links, 3 nodes | 83 s |
+| Same lab, single node | not attempted; 4-AS/57-container demo takes 64 s |
+| Cross-node link RTT (25 ms configured) | 50.22 ms, σ 9 µs |
+| Links kept local by AS-granular placement | 86.6 % |
+| Grading, 3 submissions, 10 questions, 17 checks | 31 s |
+| Extrapolated grading, 100 submissions at `--parallel 8` | under 3 minutes |

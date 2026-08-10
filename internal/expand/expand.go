@@ -425,6 +425,14 @@ func (e *expander) expandL2Domain(as *model.AS, tpl *model.ASTemplate, routers m
 	}
 
 	// L2 hosts in access VLANs.
+	vlanIndex := map[int]int{}
+	for i, v := range vlans {
+		vlanIndex[v] = i
+	}
+	hostIndex := map[string]int{}
+	for i, hn := range sortedKeys(dom.Hosts) {
+		hostIndex[hn] = i
+	}
 	for _, hn := range sortedKeys(dom.Hosts) {
 		h := dom.Hosts[hn]
 		s, ok := sw[h.Switch]
@@ -438,6 +446,26 @@ func (e *expander) expandL2Domain(as *model.AS, tpl *model.ASTemplate, routers m
 		d.L2Domain = name
 		owner := e.ownerFor(as, tpl, hn, "l2")
 		hIf := &model.Iface{Device: d, Name: h.Switch, Role: model.RoleL2Access, VLAN: h.VLAN, Owner: owner}
+		// Record the expected address so the reference solution can apply it
+		// and the grader can check it, even though the student types it in.
+		if vi, ok := vlanIndex[h.VLAN]; ok {
+			if e.plan.Has(ipam.FieldL2VLAN) {
+				sub, err := e.plan.Eval(ipam.FieldL2VLAN,
+					ipam.Ctx{AS: as.ASN, L2ID: dom.ID, VLAN: h.VLAN, VLANIndex: vi})
+				if err != nil {
+					return err
+				}
+				hIf.Addr4 = hostInSubnet(sub, 10+hostIndex[hn])
+			}
+			if e.plan.Has(ipam.FieldL2VLANV6) {
+				sub, err := e.plan.Eval(ipam.FieldL2VLANV6,
+					ipam.Ctx{AS: as.ASN, L2ID: dom.ID, VLAN: h.VLAN, VLANIndex: vi})
+				if err != nil {
+					return err
+				}
+				hIf.Addr6 = hostInSubnet(sub, 10+hostIndex[hn])
+			}
+		}
 		sIf := &model.Iface{Device: s, Name: "port_" + hn, Role: model.RoleL2Access, VLAN: h.VLAN, Owner: owner}
 		d.AddIface(hIf)
 		s.AddIface(sIf)

@@ -123,13 +123,19 @@ func Router(top *model.Topology, d *model.Device) (RouterConfig, error) {
 
 func isPlatformOwned(as *model.AS) bool { return as.Role != model.RoleStudent }
 
-// ospfCost returns a non-default OSPF cost for an interface, or zero.
+// ospfCost returns the OSPF cost the reference solution puts on an interface.
 //
-// The COS-461 load-balancing question asks students to choose weights so that
-// traffic between two routers splits over exactly three paths. The reference
-// solution therefore needs costs, and they belong with the topology rather than
-// in a grader constant.
-func ospfCost(i *model.Iface) int { return 0 }
+// The load-balancing question asks students to choose weights so that traffic
+// between two named routers splits over exactly three paths and no others. The
+// reference answer therefore needs real costs, and they are derived from the
+// topology rather than hard-coded, so changing the map does not silently
+// invalidate the reference.
+func ospfCost(i *model.Iface) int {
+	if i.Link == nil {
+		return 0
+	}
+	return ecmpCost(i)
+}
 
 func renderOSPF(d *model.Device) string {
 	var nets []string

@@ -1,0 +1,626 @@
+package grade
+
+import (
+	"context"
+	"fmt"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+
+	"github.com/HongyuHe/twinet/internal/model"
+)
+
+// This file registers the checks that grade the intra-domain half of the
+// assignment: layer-2 isolation, addressing, OSPF, load balancing and tunnels.
+
+func init() {
+	Register(&Check{
+		Name:     "l3.addressing_matches_plan",
+		Describe: "every router interface carries the address the assignment prescribes",
+		Run:      checkAddressing,
+	})
+	Register(&Check{
+		Name:     "ospf.full_adjacency",
+		Describe: "every OSPF neighbour has reached the Full state",
+		Run:      checkOSPFAdjacency,
+	})
+	Register(&Check{
+		Name:     "ospf.subnets_advertised",
+		Describe: "every required subnet, including the service subnets, is in OSPF",
+		Run:      checkOSPFSubnets,
+	})
+	Register(&Check{
+		Name:     "ospf.ecmp_paths",
+		Describe: "traffic between two routers is load-balanced over exactly the prescribed paths",
+		Run:      checkECMP,
+	})
+	Register(&Check{
+		Name:     "l2.vlan_isolation",
+		Describe: "hosts reach their own VLAN directly and the other VLAN only through the gateway",
+		Run:      checkVLANIsolation,
+	})
+	Register(&Check{
+		Name:     "dataplane.internal_reachability",
+		Describe: "every host in the AS can reach every other host",
+		Run:      checkInternalReachability,
+	})
+}
+
+// checkAddressing compares each interface against the expected value recorded
+// in the model.
+//
+// This is only possible because the addressing plan is data: the model knows
+// what a correct answer looks like, so the grader does not restate it. In the
+// platform this replaces, the plan lived in a bash file, the assignment text,
+// the DNS generator and the grader independently, and they drifted.
+func checkAddressing(ctx context.Context, env *Env) Result {
+	type mismatch struct {
+		Device, Iface, Want, Got string
+	}
+	var bad []mismatch
+	var missing []string
+	checked := 0
+
+	for _, r := range env.Routers() {
+		out, err := env.Exec(ctx, r.ID, []string{"ip", "-o", "-4", "addr", "show"})
+		if err != nil {
+			return Errored("l3.addressing_matches_plan", err)
+		}
+		have := parseIPAddrOutput(out.Stdout)
+
+		for _, i := range r.Ifaces {
+			if i.Addr4 == "" || i.Role == model.RoleInterAS || i.Role == model.RoleIXPLink {
+				continue // inter-AS addressing is agreed with a neighbour, not prescribed
+			}
+			checked++
+			got := have[i.Name]
+			switch {
+			case len(got) == 0:
+				missing = append(missing, fmt.Sprintf("%s:%s (expected %s)", r.Name, i.Name, i.Addr4))
+			case !containsStr(got, i.Addr4):
+				bad = append(bad, mismatch{r.Name, i.Name, i.Addr4, strings.Join(got, ", ")})
+			}
+		}
+	}
+
+	if len(bad) == 0 && len(missing) == 0 {
+		return Pass("l3.addressing_matches_plan", Evidence{
+			Detail: fmt.Sprintf("all %d prescribed addresses are configured", checked),
+		})
+	}
+	var detail strings.Builder
+	for _, m := range missing {
+		fmt.Fprintf(&detail, "not configured: %s\n", m)
+	}
+	for _, m := range bad {
+		fmt.Fprintf(&detail, "%s:%s has %s, expected %s\n", m.Device, m.Iface, m.Got, m.Want)
+	}
+	wrong := len(bad) + len(missing)
+	return Partial("l3.addressing_matches_plan", float64(checked-wrong)/float64(maxI(checked, 1)), Evidence{
+		Expected: fmt.Sprintf("%d addresses", checked),
+		Observed: fmt.Sprintf("%d correct", checked-wrong),
+		Detail:   strings.TrimRight(detail.String(), "\n"),
+		Hint:     "the required addresses are listed in the assignment's L3 topology figure",
+		Command:  "ip -o -4 addr show",
+	})
+}
+
+// ospfNeighborJSON is the shape of `show ip ospf neighbor json`.
+type ospfNeighborJSON struct {
+	Neighbors map[string][]struct {
+		NbrState  string `json:"nbrState"`
+		IfaceName string `json:"ifaceName"`
+		Converged string `json:"converged"`
+	} `json:"neighbors"`
+}
+
+func checkOSPFAdjacency(ctx context.Context, env *Env) Result {
+	total, full := 0, 0
+	var stuck []string
+	for _, r := range env.Routers() {
+		var out ospfNeighborJSON
+		if err := env.VtyshJSON(ctx, r.Name, "show ip ospf neighbor json", &out); err != nil {
+			// A router with OSPF entirely unconfigured is a legitimate student
+			// failure, not a grader failure, so it counts as zero adjacencies.
+			continue
+		}
+		for id, ns := range out.Neighbors {
+			for _, n := range ns {
+				total++
+				if strings.HasPrefix(n.NbrState, "Full") {
+					full++
+				} else {
+					stuck = append(stuck, fmt.Sprintf("%s -> %s on %s is %s",
+						r.Name, id, n.IfaceName, n.NbrState))
+				}
+			}
+		}
+	}
+
+	// The expected number of adjacencies is twice the number of intra-AS links,
+	// which the model knows exactly.
+	want := 0
+	for _, l := range env.Topology.Links {
+		if l.InterAS || l.A.Device.ASN != env.AS {
+			continue
+		}
+		if l.A.Device.IsRouter() && l.B.Device.IsRouter() {
+			want += 2
+		}
+	}
+
+	if want > 0 && full == want && len(stuck) == 0 {
+		return Pass("ospf.full_adjacency", Evidence{
+			Observed: fmt.Sprintf("%d/%d adjacencies Full", full, want)})
+	}
+	sort.Strings(stuck)
+	return Partial("ospf.full_adjacency", ratio(full, want), Evidence{
+		Expected: fmt.Sprintf("%d adjacencies in state Full", want),
+		Observed: fmt.Sprintf("%d Full of %d seen", full, total),
+		Detail:   strings.Join(stuck, "\n"),
+		Hint:     "check that OSPF is enabled on every inter-router subnet, on both ends",
+		Command:  "show ip ospf neighbor json",
+	})
+}
+
+// ospfRouteJSON is the shape of `show ip route ospf json`.
+type ospfRouteJSON map[string][]struct {
+	Protocol  string `json:"protocol"`
+	Prefix    string `json:"prefix"`
+	Selected  bool   `json:"selected"`
+	Installed bool   `json:"installed"`
+	Nexthops  []struct {
+		InterfaceName string `json:"interfaceName"`
+		IP            string `json:"ip"`
+	} `json:"nexthops"`
+}
+
+func checkOSPFSubnets(ctx context.Context, env *Env) Result {
+	routers := env.Routers()
+	if len(routers) == 0 {
+		return Errored("ospf.subnets_advertised", fmt.Errorf("AS %d has no routers", env.AS))
+	}
+	// Every subnet inside the AS that a correct configuration must carry.
+	want := map[string]string{} // prefix -> why it matters
+	for _, l := range env.Topology.Links {
+		if l.Subnet == "" || l.InterAS {
+			continue
+		}
+		if l.A.Device.ASN != env.AS && l.B.Device.ASN != env.AS {
+			continue
+		}
+		why := "an internal subnet"
+		if l.Kind == model.LinkService {
+			why = "a service subnet the assignment requires in OSPF"
+		}
+		want[l.Subnet] = why
+	}
+	for _, r := range routers {
+		if lo, ok := r.IfaceByName("lo"); ok && lo.Addr4 != "" {
+			want[hostRoute(lo.Addr4)] = "a router loopback"
+		}
+	}
+
+	// Observe from a router that is not the origin of most of them, so the
+	// check tests advertisement rather than mere local connectivity.
+	vantage := routers[len(routers)-1]
+	var routes ospfRouteJSON
+	if err := env.VtyshJSON(ctx, vantage.Name, "show ip route json", &routes); err != nil {
+		return Errored("ospf.subnets_advertised", err)
+	}
+	seen := map[string]bool{}
+	for prefix, entries := range routes {
+		for _, e := range entries {
+			if e.Protocol == "ospf" || e.Protocol == "connected" {
+				seen[prefix] = true
+			}
+		}
+	}
+
+	var absent []string
+	for p, why := range want {
+		if !seen[p] {
+			absent = append(absent, fmt.Sprintf("%s (%s)", p, why))
+		}
+	}
+	sort.Strings(absent)
+
+	if len(absent) == 0 {
+		return Pass("ospf.subnets_advertised", Evidence{
+			Observed: fmt.Sprintf("all %d internal subnets visible from %s", len(want), vantage.Name)})
+	}
+	return Partial("ospf.subnets_advertised", ratio(len(want)-len(absent), len(want)), Evidence{
+		Expected: fmt.Sprintf("%d subnets reachable from %s", len(want), vantage.Name),
+		Observed: fmt.Sprintf("%d missing", len(absent)),
+		Detail:   strings.Join(absent, "\n"),
+		Hint:     "the DNS and measurement subnets must be advertised in OSPF too",
+		Command:  "show ip route json",
+	})
+}
+
+// checkECMP verifies equal-cost multipath between two routers.
+//
+// It walks the whole prescribed path rather than only inspecting the first hop.
+// That matters because two prescribed paths often share their first hop and
+// diverge later: ATL-PHY-BOS and ATL-PHY-NYC-BOS both leave ATL via PHY, so a
+// first-hop-only check cannot tell whether both exist, and would report two
+// paths where the assignment asks for three.
+//
+// It asserts on the forwarding tables rather than by sampling traceroutes. The
+// tables state exactly which next hops are installed, whereas repeated
+// traceroutes only sample the hash: they can miss a live path entirely, which
+// the legacy platform's own bug list records as an unresolved complaint.
+func checkECMP(ctx context.Context, env *Env) Result {
+	from := env.ArgString("a", "ATL")
+	to := env.ArgString("b", "BOS")
+	wantPaths := env.ArgPaths("paths")
+	exclusive := env.ArgBool("exclusive", true)
+
+	if len(wantPaths) == 0 {
+		return Errored("ospf.ecmp_paths", fmt.Errorf("the rubric supplied no paths to check"))
+	}
+	dst, ok := env.Device(to)
+	if !ok {
+		return Errored("ospf.ecmp_paths", fmt.Errorf("no router %q in AS %d", to, env.AS))
+	}
+	lo, ok := dst.IfaceByName("lo")
+	if !ok || lo.Addr4 == "" {
+		return Errored("ospf.ecmp_paths", fmt.Errorf("router %s has no loopback address in the plan", to))
+	}
+	target := hostRoute(lo.Addr4)
+
+	// Cache each router's next hops toward the destination.
+	nextHops := map[string]map[string]bool{}
+	fetch := func(router string) (map[string]bool, error) {
+		if v, ok := nextHops[router]; ok {
+			return v, nil
+		}
+		var routes ospfRouteJSON
+		if err := env.VtyshJSON(ctx, router, "show ip route json", &routes); err != nil {
+			return nil, err
+		}
+		set := map[string]bool{}
+		for _, e := range routes[target] {
+			if !e.Selected && !e.Installed {
+				continue
+			}
+			for _, nh := range e.Nexthops {
+				if nh.InterfaceName != "" {
+					set[nh.InterfaceName] = true
+				}
+			}
+		}
+		nextHops[router] = set
+		return set, nil
+	}
+
+	if hops, err := fetch(from); err != nil {
+		return Errored("ospf.ecmp_paths", err)
+	} else if len(hops) == 0 {
+		return Fail("ospf.ecmp_paths", Evidence{
+			Expected: fmt.Sprintf("%d equal-cost paths from %s to %s", len(wantPaths), from, to),
+			Observed: "no route at all",
+			Detail:   fmt.Sprintf("%s has no route to %s (%s)", from, to, target),
+			Hint:     "OSPF must be converged before load balancing can be assessed",
+			Command:  "show ip route json",
+		})
+	}
+
+	// Every hop of every prescribed path must be installed.
+	var detail strings.Builder
+	present := 0
+	for _, path := range wantPaths {
+		ok := true
+		for i := 0; i+1 < len(path); i++ {
+			hops, err := fetch(path[i])
+			if err != nil {
+				ok = false
+				fmt.Fprintf(&detail, "could not read the routing table of %s: %v\n", path[i], err)
+				break
+			}
+			want := "port_" + path[i+1]
+			if path[i+1] == to && len(hops) > 0 && !hops[want] {
+				// The final hop may be reached over any interface toward the
+				// destination; only require the named one when it exists.
+				if !hops[want] {
+					ok = false
+					fmt.Fprintf(&detail, "%s does not forward toward %s (no next hop on %s)\n",
+						path[i], path[i+1], want)
+					break
+				}
+			}
+			if !hops[want] {
+				ok = false
+				fmt.Fprintf(&detail, "%s does not forward toward %s (no next hop on %s)\n",
+					path[i], path[i+1], want)
+				break
+			}
+		}
+		if ok {
+			present++
+		} else {
+			fmt.Fprintf(&detail, "path not installed: %s\n", strings.Join(path, "-"))
+		}
+	}
+
+	// Exclusivity: the source must use only the first hops the prescribed
+	// paths need, so a fourth path carrying traffic is caught.
+	var extra []string
+	if exclusive {
+		allowed := map[string]bool{}
+		for _, p := range wantPaths {
+			if len(p) > 1 {
+				allowed["port_"+p[1]] = true
+			}
+		}
+		hops, _ := fetch(from)
+		for h := range hops {
+			if !allowed[h] {
+				extra = append(extra, h)
+			}
+		}
+		sort.Strings(extra)
+		for _, x := range extra {
+			fmt.Fprintf(&detail, "%s also forwards over %s, which no prescribed path uses\n", from, x)
+		}
+	}
+
+	got := make([]string, 0)
+	for h := range nextHops[from] {
+		got = append(got, h)
+	}
+	sort.Strings(got)
+
+	if present == len(wantPaths) && len(extra) == 0 {
+		return Pass("ospf.ecmp_paths", Evidence{
+			Observed: fmt.Sprintf("all %d prescribed paths installed; %s balances over %s",
+				len(wantPaths), from, strings.Join(got, ", "))})
+	}
+	score := ratio(present, len(wantPaths))
+	if len(extra) > 0 {
+		// Carrying traffic on a path that should not be used is a real error,
+		// not a rounding difference.
+		score *= 0.5
+	}
+	return Partial("ospf.ecmp_paths", score, Evidence{
+		Expected: fmt.Sprintf("%d equal-cost paths, and no others", len(wantPaths)),
+		Observed: fmt.Sprintf("%d installed; %s balances over %s", present, from, strings.Join(got, ", ")),
+		Detail:   strings.TrimRight(detail.String(), "\n"),
+		Hint:     "the cost of a path is the sum of its links; make exactly the intended paths equal",
+		Command:  "show ip route json",
+	})
+}
+
+// checkVLANIsolation verifies that hosts in the same VLAN reach each other
+// directly while hosts in different VLANs are forced through the gateway.
+func checkVLANIsolation(ctx context.Context, env *Env) Result {
+	domain := env.ArgString("domain", "")
+	hosts := map[int][]*model.Device{} // vlan -> hosts
+	var gateway *model.Device
+
+	as, ok := env.Topology.ASes[env.AS]
+	if !ok {
+		return Errored("l2.vlan_isolation", fmt.Errorf("AS %d not in the grading lab", env.AS))
+	}
+	for _, d := range as.Devices {
+		if d.Kind != model.KindHost || d.L2Domain == "" {
+			continue
+		}
+		if domain != "" && d.L2Domain != domain {
+			continue
+		}
+		for _, i := range d.Ifaces {
+			if i.VLAN > 0 {
+				hosts[i.VLAN] = append(hosts[i.VLAN], d)
+			}
+		}
+	}
+	for _, r := range as.Routers {
+		if r.L2Gateway != "" && (domain == "" || r.L2Gateway == domain) {
+			gateway = r
+		}
+	}
+	if len(hosts) < 2 || gateway == nil {
+		return Errored("l2.vlan_isolation",
+			fmt.Errorf("the lab has %d VLANs and gateway=%v in domain %q", len(hosts), gateway != nil, domain))
+	}
+
+	vlans := make([]int, 0, len(hosts))
+	for v := range hosts {
+		vlans = append(vlans, v)
+	}
+	sort.Ints(vlans)
+
+	var detail strings.Builder
+	passed, total := 0, 0
+
+	// Same VLAN: must be reachable, and directly (one hop).
+	for _, v := range vlans {
+		hs := hosts[v]
+		if len(hs) < 2 {
+			continue
+		}
+		src, dst := hs[0], hs[1]
+		total++
+		hops, err := traceHops(ctx, env, src, dst)
+		switch {
+		case err != nil:
+			fmt.Fprintf(&detail, "VLAN %d: %s cannot reach %s (%v)\n", v, src.Name, dst.Name, err)
+		case hops == 1:
+			passed++
+		default:
+			fmt.Fprintf(&detail, "VLAN %d: %s reaches %s in %d hops; hosts in one VLAN must be adjacent\n",
+				v, src.Name, dst.Name, hops)
+		}
+	}
+
+	// Across VLANs: reachable, but through the gateway.
+	if len(vlans) >= 2 {
+		src, dst := hosts[vlans[0]][0], hosts[vlans[1]][0]
+		total++
+		hops, err := traceHops(ctx, env, src, dst)
+		switch {
+		case err != nil:
+			fmt.Fprintf(&detail, "%s cannot reach %s across VLANs (%v)\n", src.Name, dst.Name, err)
+		case hops >= 2:
+			passed++
+		default:
+			fmt.Fprintf(&detail, "%s reaches %s in %d hop; different VLANs must be separated at layer 2\n",
+				src.Name, dst.Name, hops)
+		}
+	}
+
+	if total > 0 && passed == total {
+		return Pass("l2.vlan_isolation", Evidence{
+			Observed: fmt.Sprintf("%d VLANs isolated correctly, routed via %s", len(vlans), gateway.Name)})
+	}
+	return Partial("l2.vlan_isolation", ratio(passed, total), Evidence{
+		Expected: "same VLAN adjacent, different VLANs via the gateway",
+		Observed: fmt.Sprintf("%d of %d relationships correct", passed, total),
+		Detail:   strings.TrimRight(detail.String(), "\n"),
+		Hint:     "use access ports with a VLAN tag for hosts and a trunk toward the gateway",
+	})
+}
+
+func checkInternalReachability(ctx context.Context, env *Env) Result {
+	as, ok := env.Topology.ASes[env.AS]
+	if !ok {
+		return Errored("dataplane.internal_reachability", fmt.Errorf("AS %d not in the lab", env.AS))
+	}
+	var hosts []*model.Device
+	for _, d := range as.Devices {
+		if d.Kind == model.KindHost && d.L2Domain == "" {
+			hosts = append(hosts, d)
+		}
+	}
+	if len(hosts) < 2 {
+		return Errored("dataplane.internal_reachability", fmt.Errorf("AS %d has %d L3 hosts", env.AS, len(hosts)))
+	}
+
+	// A full mesh is quadratic; a hub-and-spoke from one host exercises every
+	// path through the backbone and is linear, which matters when a class is
+	// being graded a hundred submissions at a time.
+	src := hosts[0]
+	var failed []string
+	for _, dst := range hosts[1:] {
+		addr := firstAddr(dst)
+		if addr == "" {
+			continue
+		}
+		res, err := env.Exec(ctx, src.ID, []string{"ping", "-c", "2", "-W", "2", "-i", "0.2", addr})
+		if err != nil || res.ExitCode != 0 {
+			failed = append(failed, fmt.Sprintf("%s cannot reach %s (%s)", src.Name, dst.Name, addr))
+		}
+	}
+	tried := len(hosts) - 1
+	if len(failed) == 0 {
+		return Pass("dataplane.internal_reachability", Evidence{
+			Observed: fmt.Sprintf("%s reaches all %d other hosts", src.Name, tried)})
+	}
+	sort.Strings(failed)
+	return Partial("dataplane.internal_reachability", ratio(tried-len(failed), tried), Evidence{
+		Expected: fmt.Sprintf("%d reachable hosts", tried),
+		Observed: fmt.Sprintf("%d unreachable", len(failed)),
+		Detail:   strings.Join(failed, "\n"),
+		Hint:     "every internal subnet, including the router-host links, must be advertised in OSPF",
+		Command:  "ping",
+	})
+}
+
+// traceHops counts the hops between two hosts.
+func traceHops(ctx context.Context, env *Env, src, dst *model.Device) (int, error) {
+	addr := firstAddr(dst)
+	if addr == "" {
+		return 0, fmt.Errorf("%s has no address configured", dst.Name)
+	}
+	res, err := env.Exec(ctx, src.ID, []string{"traceroute", "-n", "-q", "1", "-w", "2", "-m", "8", addr})
+	if err != nil {
+		return 0, err
+	}
+	return countTracerouteHops(res.Stdout, addr), nil
+}
+
+var hopRe = regexp.MustCompile(`^\s*(\d+)\s+(\S+)`)
+
+// countTracerouteHops returns the hop number at which the destination replied,
+// or zero if it never did.
+func countTracerouteHops(out, dst string) int {
+	for _, line := range strings.Split(out, "\n") {
+		m := hopRe.FindStringSubmatch(line)
+		if m == nil {
+			continue
+		}
+		if m[2] == dst {
+			n, _ := strconv.Atoi(m[1])
+			return n
+		}
+	}
+	return 0
+}
+
+// parseIPAddrOutput turns `ip -o -4 addr show` into interface -> addresses.
+func parseIPAddrOutput(out string) map[string][]string {
+	res := map[string][]string{}
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 4 {
+			continue
+		}
+		iface := strings.TrimSuffix(fields[1], ":")
+		for i := 2; i < len(fields)-1; i++ {
+			if fields[i] == "inet" || fields[i] == "inet6" {
+				res[iface] = append(res[iface], fields[i+1])
+			}
+		}
+	}
+	return res
+}
+
+// hostRoute converts an interface address into the /32 the routing table uses
+// for a loopback.
+func hostRoute(cidr string) string {
+	addr := cidr
+	if i := strings.IndexByte(cidr, '/'); i > 0 {
+		addr = cidr[:i]
+	}
+	return addr + "/32"
+}
+
+func firstAddr(d *model.Device) string {
+	for _, i := range d.Ifaces {
+		if i.Addr4 != "" {
+			if j := strings.IndexByte(i.Addr4, '/'); j > 0 {
+				return i.Addr4[:j]
+			}
+			return i.Addr4
+		}
+	}
+	return ""
+}
+
+func containsStr(hay []string, s string) bool {
+	for _, h := range hay {
+		if h == s {
+			return true
+		}
+	}
+	return false
+}
+
+func ratio(got, want int) float64 {
+	if want <= 0 {
+		return 0
+	}
+	if got < 0 {
+		got = 0
+	}
+	return float64(got) / float64(want)
+}
+
+func maxI(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}

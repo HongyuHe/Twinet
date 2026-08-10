@@ -3,6 +3,7 @@ package render
 import (
 	"context"
 	"fmt"
+	"net/netip"
 	"sort"
 	"strings"
 	"time"
@@ -97,6 +98,10 @@ func (r *Renderer) routerCommands(d *model.Device) []deploy.Command {
 		})
 	}
 
+	if r.Mode == ModeSolve {
+		cmds = append(cmds, r.tunnelSolution(d)...)
+	}
+
 	cmds = append(cmds, []deploy.Command{
 		{Args: []string{"sh", "-c", "chown -R frr:frr /etc/frr 2>/dev/null || true"},
 			Describe: "fix FRR file ownership", IgnoreError: true},
@@ -142,6 +147,79 @@ func (r *Renderer) switchCommands(d *model.Device) []deploy.Command {
 		cmds = append(cmds, r.switchSolution(d, br)...)
 	}
 	return cmds
+}
+
+// tunnelSolution builds the 6in4 tunnel between the two L2 gateways.
+//
+// The assignment requires it because FRR cannot configure a tunnel: students
+// have to drop to a shell inside the router. The reference solution does the
+// same thing, through the same interface, so `twinet solve` exercises the same
+// path a student does rather than a privileged shortcut.
+func (r *Renderer) tunnelSolution(d *model.Device) []deploy.Command {
+	if d.L2Gateway == "" {
+		return nil
+	}
+	as, ok := r.Top.ASes[d.ASN]
+	if !ok {
+		return nil
+	}
+	// The far end is the other L2 gateway in this AS.
+	var peer *model.Device
+	for _, o := range as.Routers {
+		if o != d && o.L2Gateway != "" {
+			peer = o
+		}
+	}
+	if peer == nil {
+		return nil
+	}
+	local, lok := d.IfaceByName("lo")
+	remote, rok := peer.IfaceByName("lo")
+	if !lok || !rok || local.Addr4 == "" || remote.Addr4 == "" {
+		return nil
+	}
+
+	name := "tun6"
+	// The tunnel carries the *other* datacentre's IPv6 prefix, so each gateway
+	// routes its peer's subnets across it.
+	var routes []string
+	for _, i := range peer.Ifaces {
+		if i.Role == model.RoleL2SubIface && i.Addr6 != "" {
+			routes = append(routes, network6(i.Addr6))
+		}
+	}
+	sort.Strings(routes)
+
+	script := fmt.Sprintf(
+		"ip link show %s >/dev/null 2>&1 || ip tunnel add %s mode sit remote %s local %s ttl 64; ip link set %s up",
+		name, name, addrOf(remote.Addr4), addrOf(local.Addr4), name)
+	cmds := []deploy.Command{{
+		Args: []string{"sh", "-c", script}, Describe: "create the 6in4 tunnel",
+	}}
+	for _, n := range routes {
+		if n == "" {
+			continue
+		}
+		cmds = append(cmds, deploy.Command{
+			Args:        []string{"sh", "-c", fmt.Sprintf("ip -6 route replace %s dev %s", n, name)},
+			Describe:    "route " + n + " over the tunnel",
+			IgnoreError: true,
+		})
+	}
+	return cmds
+}
+
+// network6 masks an IPv6 address to its prefix.
+func network6(cidr string) string {
+	i := strings.IndexByte(cidr, '/')
+	if i < 0 {
+		return ""
+	}
+	p, err := netip.ParsePrefix(cidr)
+	if err != nil {
+		return ""
+	}
+	return p.Masked().String()
 }
 
 // switchSolution applies the VLAN assignment a correct student would make.
@@ -195,6 +273,25 @@ func (r *Renderer) hostCommands(d *model.Device) []deploy.Command {
 			apply(i)
 		}
 	}
+	// An L2 host's default gateway is its datacentre's router.
+	if r.Mode == ModeSolve && d.L2Domain != "" {
+		if gw4, gw6 := r.l2Gateway(d); gw4 != "" {
+			cmds = append(cmds, deploy.Command{
+				Args:        []string{"sh", "-c", fmt.Sprintf("ip route replace default via %s || true", gw4)},
+				Describe:    "default route via the datacentre gateway",
+				IgnoreError: true,
+			})
+			if gw6 != "" {
+				cmds = append(cmds, deploy.Command{
+					Args:        []string{"sh", "-c", fmt.Sprintf("ip -6 route replace default via %s || true", gw6)},
+					Describe:    "IPv6 default route via the datacentre gateway",
+					IgnoreError: true,
+				})
+			}
+		}
+		return cmds
+	}
+
 	// A host's default route points at its attached router.
 	if r.Mode == ModeSolve || d.Kind == model.KindService {
 		for _, i := range d.Ifaces {
@@ -263,6 +360,38 @@ func (r *Renderer) Ready(d *model.Device, rt runtime.Runtime) *plan.Waiter {
 		}
 	}
 	return nil
+}
+
+// l2Gateway finds the addresses of the gateway serving a host's VLAN.
+func (r *Renderer) l2Gateway(host *model.Device) (string, string) {
+	as, ok := r.Top.ASes[host.ASN]
+	if !ok {
+		return "", ""
+	}
+	vlan := 0
+	for _, i := range host.Ifaces {
+		if i.VLAN > 0 {
+			vlan = i.VLAN
+		}
+	}
+	for _, rt := range as.Routers {
+		if rt.L2Gateway != host.L2Domain {
+			continue
+		}
+		for _, i := range rt.Ifaces {
+			if i.Role == model.RoleL2SubIface && i.VLAN == vlan {
+				return addrOf(i.Addr4), addrOf6(i.Addr6)
+			}
+		}
+	}
+	return "", ""
+}
+
+func addrOf6(cidr string) string {
+	if i := strings.IndexByte(cidr, '/'); i > 0 {
+		return cidr[:i]
+	}
+	return cidr
 }
 
 func vlanList(d *model.Device) string {

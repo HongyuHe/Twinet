@@ -9,8 +9,12 @@ Every student group operates a real Autonomous System — real FRR, real OSPF,
 real BGP, real RPKI, real Open vSwitch — and must cooperate with every other
 group for the Internet to work.
 
-> **Status: design.** The implementation plan is in [`docs/`](docs/).
-> Start with [`docs/README.md`](docs/README.md).
+> **Status: under construction.** The design is in [`docs/`](docs/); what is
+> built and measured so far is in [`docs/09-status.md`](docs/09-status.md).
+>
+> A twelve-AS lab of 211 containers and 291 links currently deploys across three
+> machines in 83 seconds, and a rubric-driven grading run completes a submission
+> in about ten seconds.
 
 ## What it is for
 
@@ -44,6 +48,7 @@ group for the Internet to work.
 | [Grading](docs/06-grading.md) | Ephemeral labs, test doubles, checks, rubrics, reports |
 | [Roadmap](docs/07-roadmap.md) | Milestones, acceptance criteria, risks |
 | [Resources needed](docs/08-resources-needed.md) | Open decisions and required resources |
+| [Implementation status](docs/09-status.md) | What is built and verified, with measurements |
 
 ## Credits
 
