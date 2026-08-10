@@ -221,6 +221,52 @@ type nopObserver struct{}
 func (nopObserver) StepStarted(*Step)   {}
 func (nopObserver) StepFinished(Result) {}
 
+// Restrict returns a copy of the plan containing only the steps that match,
+// together with every step they transitively depend on.
+//
+// This is how a scoped repair is expressed. The alternative -- deleting devices
+// from the topology -- leaves every cross-reference dangling, so an AS whose
+// routers were removed still claims to own them and expansion-time invariants
+// no longer hold. Narrowing the *work* rather than the *world* keeps the model
+// whole.
+func (p *Plan) Restrict(match func(*Step) bool) *Plan {
+	keep := map[string]bool{}
+	var need func(id string)
+	need = func(id string) {
+		if keep[id] {
+			return
+		}
+		keep[id] = true
+		for _, dep := range p.steps[id].Needs {
+			if _, ok := p.steps[dep]; ok {
+				need(dep)
+			}
+		}
+	}
+	for _, id := range p.order {
+		if match(p.steps[id]) {
+			need(id)
+		}
+	}
+
+	out := New()
+	for _, id := range p.order {
+		if !keep[id] {
+			continue
+		}
+		s := *p.steps[id]
+		var needs []string
+		for _, dep := range s.Needs {
+			if keep[dep] {
+				needs = append(needs, dep)
+			}
+		}
+		s.Needs = needs
+		out.Add(&s)
+	}
+	return out
+}
+
 // Options control execution.
 type Options struct {
 	// Workers bounds concurrency. Zero means one per CPU, which is the right
@@ -266,6 +312,12 @@ func (p *Plan) Execute(ctx context.Context, opts Options) (*Report, error) {
 	// A scope that has failed causes its not-yet-started steps to be skipped,
 	// so one broken AS does not spew a cascade of derived errors.
 	failedScopes := map[string]bool{}
+	// A step whose own prerequisite failed must also be skipped, even when the
+	// prerequisite belongs to a different scope. An inter-AS wire step is
+	// scoped to "peering" while the router that depends on it is scoped to its
+	// AS, so scope isolation alone would happily configure and start a router
+	// whose links were never created.
+	failedSteps := map[string]bool{}
 
 	var (
 		mu      sync.Mutex
@@ -286,7 +338,7 @@ func (p *Plan) Execute(ctx context.Context, opts Options) (*Report, error) {
 		}
 
 		if err := runStage(ctx, batch, remaining, dependents, workers, opts, obs,
-			&mu, &results, rep, failedScopes, p); err != nil {
+			&mu, &results, rep, failedScopes, failedSteps, p); err != nil {
 			rep.Results = results
 			rep.Duration = time.Since(start)
 			return rep, err
@@ -314,6 +366,7 @@ func runStage(
 	results *[]Result,
 	rep *Report,
 	failedScopes map[string]bool,
+	failedSteps map[string]bool,
 	p *Plan,
 ) error {
 	inStage := map[string]bool{}
@@ -346,9 +399,22 @@ func runStage(
 
 			mu.Lock()
 			skip := s.Scope != "" && failedScopes[s.Scope]
+			var because string
+			if !skip {
+				for _, need := range s.Needs {
+					if failedSteps[need] {
+						skip, because = true, need
+						break
+					}
+				}
+			}
 			mu.Unlock()
 			if skip {
-				done <- Result{Step: s, Skipped: true}
+				r := Result{Step: s, Skipped: true}
+				if because != "" {
+					r.Err = fmt.Errorf("skipped: its prerequisite %q failed", because)
+				}
+				done <- r
 				return
 			}
 			if opts.DryRun {
@@ -398,7 +464,15 @@ func runStage(
 
 		mu.Lock()
 		*results = append(*results, r)
-		if r.Err != nil && !r.Step.Optional {
+		if r.Skipped && r.Err != nil {
+			// A skip caused by a failed prerequisite propagates, so anything
+			// downstream is skipped too rather than running half-wired.
+			failedSteps[r.Step.ID] = true
+		}
+		if r.Err != nil && !r.Skipped && !r.Step.Optional {
+			failedSteps[r.Step.ID] = true
+		}
+		if r.Err != nil && !r.Skipped && !r.Step.Optional {
 			scope := r.Step.Scope
 			if scope == "" {
 				scope = "lab"

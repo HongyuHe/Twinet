@@ -89,9 +89,10 @@ func Partial(check string, score float64, ev Evidence) Result {
 		score = 1
 	}
 	st := StatusPartial
-	if score == 0 {
+	switch score {
+	case 0:
 		st = StatusFail
-	} else if score == 1 {
+	case 1:
 		st = StatusPass
 	}
 	return Result{Check: check, Status: st, Score: score, Evidence: ev}
@@ -111,6 +112,10 @@ type QuestionResult struct {
 	Status  Status   `json:"status"`
 	Results []Result `json:"results"`
 	Skipped string   `json:"skipped_because,omitempty"`
+	// NeedsReview marks a question whose mark is not trustworthy because the
+	// grader, not the student, fell short.
+	NeedsReview bool   `json:"needs_review,omitempty"`
+	Note        string `json:"note,omitempty"`
 }
 
 // Report is one student's complete result.
@@ -127,6 +132,9 @@ type Report struct {
 	Questions  []QuestionResult `json:"questions"`
 	Warnings   []string         `json:"warnings,omitempty"`
 	Err        string           `json:"error,omitempty"`
+	// NeedsReview marks a report that must not be released without a human
+	// looking at it, because some part of the grading did not run correctly.
+	NeedsReview bool `json:"needs_review,omitempty"`
 }
 
 // Percent returns the score as a percentage.
@@ -150,6 +158,10 @@ func (r *Report) Text() string {
 		fmt.Fprintf(&b, "grading failed: %s\n", r.Err)
 		return b.String()
 	}
+	if r.NeedsReview {
+		b.WriteString("NEEDS REVIEW: part of this run did not complete correctly; " +
+			"the marks below are provisional.\n\n")
+	}
 	for _, q := range r.Questions {
 		mark := "x"
 		switch q.Status {
@@ -159,10 +171,15 @@ func (r *Report) Text() string {
 			mark = "~"
 		case StatusSkipped:
 			mark = "-"
+		case StatusError:
+			mark = "!"
 		}
 		fmt.Fprintf(&b, "[%-2s] %-8s %-42s %.2f / %.2f\n", mark, q.ID, q.Title, q.Awarded, q.Points)
 		if q.Skipped != "" {
 			fmt.Fprintf(&b, "        skipped: %s\n", q.Skipped)
+		}
+		if q.Note != "" {
+			fmt.Fprintf(&b, "        %s\n", q.Note)
 		}
 		for _, res := range q.Results {
 			if res.Passed() {

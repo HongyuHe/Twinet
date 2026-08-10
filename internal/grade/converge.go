@@ -30,25 +30,37 @@ func WaitOSPF(ctx context.Context, env *Env, timeout time.Duration) error {
 		StableFor: 2,
 		Check: func(ctx context.Context) (bool, error) {
 			var notFull []string
+			seen, queried := 0, 0
 			for _, r := range env.Routers() {
 				var out ospfNeighborJSON
 				if err := env.VtyshJSON(ctx, r.Name, "show ip ospf neighbor json", &out); err != nil {
 					continue
 				}
+				queried++
 				for id, ns := range out.Neighbors {
 					for _, n := range ns {
+						seen++
 						if !strings.HasPrefix(n.NbrState, "Full") {
 							notFull = append(notFull, fmt.Sprintf("%s->%s %s", r.Name, id, n.NbrState))
 						}
 					}
 				}
 			}
+			// Zero observed adjacencies is not convergence, it is an OSPF that
+			// has not started. Treating it as settled would let every later
+			// check run against a network that is still empty.
+			if queried == 0 {
+				return false, fmt.Errorf("no router answered an OSPF query")
+			}
+			if seen == 0 {
+				return false, fmt.Errorf("no OSPF adjacencies exist yet")
+			}
 			if len(notFull) == 0 {
 				return true, nil
 			}
 			sort.Strings(notFull)
-			return false, fmt.Errorf("%d adjacencies not Full: %s",
-				len(notFull), strings.Join(truncate(notFull, 3), ", "))
+			return false, fmt.Errorf("%d of %d adjacencies not Full: %s",
+				len(notFull), seen, strings.Join(truncate(notFull, 3), ", "))
 		},
 	})
 }
@@ -130,8 +142,9 @@ func ribFingerprint(ctx context.Context, env *Env) (string, int, error) {
 			lastErr = err
 			continue
 		}
-		prefixes := make([]string, 0, len(tbl.Routes))
-		for p := range tbl.Routes {
+		table := tbl.Table()
+		prefixes := make([]string, 0, len(table))
+		for p := range table {
 			prefixes = append(prefixes, p)
 		}
 		sort.Strings(prefixes)
@@ -141,7 +154,7 @@ func ribFingerprint(ctx context.Context, env *Env) (string, int, error) {
 			fmt.Fprintf(h, "%s:", p)
 			// Include the chosen path and preference: a table with the same
 			// prefixes but a different best path has not converged.
-			for _, e := range tbl.Routes[p] {
+			for _, e := range table[p] {
 				if e.BestPath {
 					fmt.Fprintf(h, "%s/%d;", strings.TrimSpace(e.Path), e.LocalPref)
 				}

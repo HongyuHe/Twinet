@@ -45,7 +45,7 @@ func (e *expander) ensureIXPFabric(as *model.AS) (*model.Device, error) {
 
 	rsIf := &model.Iface{
 		Device: rs, Name: "fabric", Role: model.RoleIXPLink,
-		Addr4: rsAddr, Owner: model.OwnerPlatform,
+		Addr4: rsAddr, Owner: model.OwnerPlatform, Prescribed: true, Subnet: subnet,
 	}
 	swIf := &model.Iface{
 		Device: sw, Name: "port_rs", Role: model.RoleL2Access, Owner: model.OwnerPlatform,
@@ -89,6 +89,10 @@ func (e *expander) connectToIXP(member *model.AS, memberRouter *model.Device, ix
 		Role:   model.RoleIXPLink,
 		Addr4:  addr,
 		Owner:  ownerOf(member, model.OwnerStudent),
+		// At an exchange the address is dictated exactly: the assignment says
+		// "you must use this address".
+		Prescribed: true,
+		Subnet:     subnet,
 	}
 	swIf := &model.Iface{
 		Device: sw,

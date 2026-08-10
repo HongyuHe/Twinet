@@ -1,5 +1,8 @@
 version: "2"
 
+run:
+  timeout: 5m
+
 linters:
   default: standard
   enable:
@@ -11,11 +14,30 @@ linters:
     - misspell
     - bodyclose
     - nilerr
+
   settings:
     misspell:
-      locale: UK
+      # Deliberately no locale.
+      #
+      # The prose in this repository is British, but `locale: UK` applies to
+      # identifiers and string literals too, where it is actively wrong: it
+      # flags FRR's own command words ("show ip ospf neighbor json") and its
+      # JSON keys, and "correcting" them would break every routing query the
+      # grader makes. Without a locale, misspell still catches genuine typos,
+      # which is the value it actually provides.
+
+    errcheck:
+      exclude-functions:
+        # Writing progress to a terminal cannot fail in a way the program can
+        # act on, and checking every call would bury the errors that matter
+        # under hundreds that do not.
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln
+
   exclusions:
     rules:
+      # Tests assert on results, not on the plumbing that produced them.
       - path: _test\.go
         linters: [errcheck]
 

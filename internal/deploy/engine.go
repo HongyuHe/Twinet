@@ -14,24 +14,37 @@ import (
 	"strings"
 	"time"
 
+	"crypto/sha256"
+	"encoding/hex"
+	"sync"
+
 	"github.com/HongyuHe/twinet/internal/alloc"
 	"github.com/HongyuHe/twinet/internal/model"
 	"github.com/HongyuHe/twinet/internal/netx"
 	"github.com/HongyuHe/twinet/internal/plan"
 	"github.com/HongyuHe/twinet/internal/runtime"
+	"github.com/HongyuHe/twinet/internal/state"
 )
 
 // Label keys stamped onto every container. These are the observed state: there
 // is no database, so "what is deployed" is answered by querying labels.
 const (
-	LabelLab      = "twinet.lab"
-	LabelAS       = "twinet.as"
-	LabelDevice   = "twinet.device"
-	LabelKind     = "twinet.kind"
-	LabelRole     = "twinet.role"
-	LabelOwner    = "twinet.owner"
-	LabelNode     = "twinet.node"
-	LabelHash     = "twinet.topology-hash"
+	LabelLab    = "twinet.lab"
+	LabelAS     = "twinet.as"
+	LabelDevice = "twinet.device"
+	LabelKind   = "twinet.kind"
+	LabelRole   = "twinet.role"
+	LabelOwner  = "twinet.owner"
+	LabelNode   = "twinet.node"
+	LabelHash   = "twinet.topology-hash"
+	// LabelSpec is a hash of everything about *this* container that would
+	// require it to be recreated. The topology hash alone is far too coarse:
+	// changing one link's delay changes it, which would otherwise recreate
+	// every container in the class.
+	LabelSpec = "twinet.spec-hash"
+	// LabelGen is the deployment generation, used to find objects that the
+	// current topology no longer wants.
+	LabelGen      = "twinet.generation"
 	LabelRegion   = "twinet.region"
 	LabelManaged  = "twinet.managed"
 	LabelDeviceID = "twinet.device-id"
@@ -59,6 +72,20 @@ type Engine struct {
 	UnderlayDev string
 	// PeerUnderlay maps node name to VTEP address, for cross-node links.
 	PeerUnderlay map[string]string
+	// State persists student-owned configuration. When set, a container is
+	// never replaced without its contents being captured first and replayed
+	// afterwards, so a deployment cannot destroy a student's work.
+	State *state.Store
+	// Prune removes containers this node hosts that the topology no longer
+	// wants. Off by default: a partial topology (say, `--only as=12`) must not
+	// be read as "delete everything else".
+	Prune bool
+	// Generation stamps this deployment, so pruning can identify leftovers.
+	Generation string
+
+	// pendingRestore records devices whose captured configuration must be
+	// replayed once their interfaces exist.
+	pendingRestore sync.Map
 }
 
 // Renderer produces the files and commands that configure a device.
@@ -175,7 +202,13 @@ func (e *Engine) Build(top *model.Topology) (*plan.Plan, error) {
 			Describe: "configure " + dev.ID,
 			Needs:    dedup(needs),
 			Run: func(ctx context.Context) error {
-				return e.configure(ctx, dev)
+				if err := e.configure(ctx, dev); err != nil {
+					return err
+				}
+				// Whatever the student had is replayed *after* the platform's
+				// own configuration and after the interfaces exist, so it wins
+				// over the defaults and lands on devices that are present.
+				return e.replayPending(ctx, top, dev)
 			},
 		})
 	}
@@ -222,15 +255,33 @@ func (e *Engine) ensureContainer(ctx context.Context, top *model.Topology, d *mo
 	if err != nil {
 		return err
 	}
+	want := SpecHash(d)
+
 	if cur.State != runtime.StateAbsent {
-		if cur.Labels[LabelHash] == top.Hash {
+		// Only a change to *this* container's own specification justifies
+		// replacing it. Anything else -- a neighbour's address, another AS's
+		// link delay -- must leave it alone, because replacing it would throw
+		// away whatever the student had configured inside.
+		if cur.Labels[LabelSpec] == want {
 			if cur.State.Joinable() {
 				return nil
 			}
-			return e.Runtime.Start(ctx, d.Container)
+			// The container exists but is stopped: start it and put back
+			// whatever was captured before it went down.
+			if err := e.Runtime.Start(ctx, d.Container); err != nil {
+				return err
+			}
+			return e.restoreIfNeeded(ctx, top, d)
+		}
+
+		// It genuinely must be replaced. Capture first; if capture fails we
+		// refuse rather than proceed, because the alternative is silent
+		// destruction of a student's work.
+		if err := e.captureBeforeReplace(ctx, top, d); err != nil {
+			return err
 		}
 		if err := e.Runtime.Remove(ctx, d.Container, true); err != nil {
-			return fmt.Errorf("replace stale container %s: %w", d.Container, err)
+			return fmt.Errorf("replace container %s: %w", d.Container, err)
 		}
 	}
 
@@ -266,7 +317,163 @@ func (e *Engine) ensureContainer(ctx context.Context, top *model.Topology, d *mo
 	if _, err := e.Runtime.Create(ctx, spec); err != nil {
 		return err
 	}
-	return e.Runtime.Start(ctx, d.Container)
+	if err := e.Runtime.Start(ctx, d.Container); err != nil {
+		return err
+	}
+	return e.restoreIfNeeded(ctx, top, d)
+}
+
+// captureBeforeReplace snapshots a student-owned device before it is destroyed.
+func (e *Engine) captureBeforeReplace(ctx context.Context, top *model.Topology, d *model.Device) error {
+	if e.State == nil || !studentOwned(top, d) {
+		return nil
+	}
+	snaps, err := Capture(ctx, e.Runtime, d, top.Name, top.Hash)
+	if err != nil {
+		return fmt.Errorf("refusing to replace %s: its configuration could not be captured: %w", d.ID, err)
+	}
+	for _, s := range snaps {
+		if _, err := e.State.Put(s); err != nil {
+			return fmt.Errorf("refusing to replace %s: its configuration could not be saved: %w", d.ID, err)
+		}
+	}
+	return nil
+}
+
+// restoreIfNeeded replays captured configuration into a device that has just
+// been created or restarted.
+func (e *Engine) restoreIfNeeded(ctx context.Context, top *model.Topology, d *model.Device) error {
+	if e.State == nil || !studentOwned(top, d) {
+		return nil
+	}
+	// Restoration must happen after the interfaces exist, or addresses land on
+	// devices that are not there yet. It is therefore deferred to the configure
+	// stage; this records that it is pending.
+	e.pendingRestore.Store(d.ID, true)
+	return nil
+}
+
+// replayPending restores a device's captured configuration if one was pending.
+func (e *Engine) replayPending(ctx context.Context, top *model.Topology, d *model.Device) error {
+	if _, pending := e.pendingRestore.LoadAndDelete(d.ID); !pending {
+		return nil
+	}
+	if e.State == nil {
+		return nil
+	}
+	ok, err := Restore(ctx, e.Runtime, d, top.Name, e.State)
+	if err != nil {
+		// A failed restore is loud: the snapshot is still on disk, and an
+		// operator must know that this device came back empty.
+		return fmt.Errorf("%s was recreated but its saved configuration could not be replayed "+
+			"(the snapshot is safe in the state store): %w", d.ID, err)
+	}
+	_ = ok
+	return nil
+}
+
+// PruneOrphans removes containers on this node that belong to the lab but are
+// not in the topology any more.
+//
+// Deployment alone only ensures the desired objects exist; without this, an AS
+// removed from the manifest keeps running, and an AS moved to another node runs
+// twice, announcing the same prefix from two places.
+func (e *Engine) PruneOrphans(ctx context.Context, top *model.Topology) ([]string, error) {
+	want := map[string]bool{}
+	for _, d := range top.DevicesOnNode(e.Node) {
+		want[d.Container] = true
+	}
+	// A device that has moved to another node must also be removed from here.
+	elsewhere := map[string]bool{}
+	for _, d := range top.SortedDevices() {
+		if d.Node != e.Node {
+			elsewhere[d.Container] = true
+		}
+	}
+
+	cs, err := e.Runtime.List(ctx, runtime.Filter{All: true,
+		Labels: map[string]string{LabelLab: top.Name}})
+	if err != nil {
+		return nil, err
+	}
+	var removed []string
+	for _, c := range cs {
+		if want[c.Name] {
+			continue
+		}
+		// Only remove what this node is responsible for, and only what the
+		// topology genuinely no longer places here.
+		if c.Labels[LabelNode] != "" && c.Labels[LabelNode] != e.Node && !elsewhere[c.Name] {
+			continue
+		}
+		if err := e.Runtime.Remove(ctx, c.Name, true); err != nil {
+			return removed, fmt.Errorf("remove orphan %s: %w", c.Name, err)
+		}
+		removed = append(removed, c.Name)
+	}
+	sort.Strings(removed)
+	return removed, nil
+}
+
+// PruneOverlays removes VXLAN bridges and tunnels this node no longer needs.
+func (e *Engine) PruneOverlays(top *model.Topology) ([]string, error) {
+	want := map[uint32]bool{}
+	for _, l := range top.LinksTouchingNode(e.Node) {
+		if l.CrossNode() {
+			want[l.VNI] = true
+		}
+	}
+	live, err := netx.ListOverlays()
+	if err != nil {
+		return nil, err
+	}
+	var removed []string
+	for _, vni := range live {
+		if want[vni] {
+			continue
+		}
+		if err := netx.DeleteHostLink(hostSideName(vni)); err != nil {
+			return removed, err
+		}
+		if err := netx.RemoveOverlay(vni); err != nil {
+			return removed, err
+		}
+		removed = append(removed, netx.VxlanName(vni))
+	}
+	sort.Strings(removed)
+	return removed, nil
+}
+
+// SpecHash is a digest of everything about a container that would require it to
+// be recreated if it changed.
+//
+// Deliberately excluded: anything that can be changed in place, such as link
+// shaping or an address on an interface. Deliberately included: image, command,
+// resource limits, capabilities, sysctls, binds, environment and placement,
+// because none of those can be altered on a running container.
+func SpecHash(d *model.Device) string {
+	h := sha256.New()
+	fmt.Fprintf(h, "id=%s\nkind=%s\nimage=%s\nhost=%s\nnode=%s\n",
+		d.ID, d.Kind, d.Image, d.Hostname, d.Node)
+	fmt.Fprintf(h, "cpus=%v\nmem=%s\npids=%d\nrestart=%s\npriv=%v\n",
+		d.CPUs, d.Memory, d.Pids, d.Restart, d.Privileged)
+	fmt.Fprintf(h, "cmd=%s\ncaps=%s\nbinds=%s\n",
+		strings.Join(d.Command, ","),
+		strings.Join(sortedCopy(d.Capabilities), ","),
+		strings.Join(sortedCopy(d.Binds), ","))
+	for _, k := range sortedKeys(d.Env) {
+		fmt.Fprintf(h, "env:%s=%s\n", k, d.Env[k])
+	}
+	for _, k := range sortedKeys(d.Sysctls) {
+		fmt.Fprintf(h, "sysctl:%s=%s\n", k, d.Sysctls[k])
+	}
+	return hex.EncodeToString(h.Sum(nil))[:16]
+}
+
+func sortedCopy(in []string) []string {
+	out := append([]string{}, in...)
+	sort.Strings(out)
+	return out
 }
 
 func (e *Engine) labels(top *model.Topology, d *model.Device) map[string]string {
@@ -278,6 +485,10 @@ func (e *Engine) labels(top *model.Topology, d *model.Device) map[string]string 
 		LabelKind:     string(d.Kind),
 		LabelNode:     e.Node,
 		LabelHash:     top.Hash,
+		LabelSpec:     SpecHash(d),
+	}
+	if e.Generation != "" {
+		out[LabelGen] = e.Generation
 	}
 	if d.ASN > 0 {
 		out[LabelAS] = strconv.Itoa(d.ASN)

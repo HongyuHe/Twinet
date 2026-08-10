@@ -3,6 +3,7 @@ package netx
 import (
 	"fmt"
 	"net"
+	"strings"
 	"syscall"
 
 	"github.com/vishvananda/netlink"
@@ -329,4 +330,28 @@ func UnderlayMTU(remote string) (int, string, error) {
 		return 0, "", fmt.Errorf("resolve outgoing interface for %s: %w", remote, err)
 	}
 	return l.Attrs().MTU, l.Attrs().Name, nil
+}
+
+// ListOverlays returns the VNIs of every Twinet-owned VXLAN device on this host.
+//
+// Cleanup must work from what is actually on the machine, not from a list the
+// caller happens to remember: a lab destroyed without its manifest, or an AS
+// moved to another node, would otherwise leave tunnels behind forever.
+func ListOverlays() ([]uint32, error) {
+	links, err := netlink.LinkList()
+	if err != nil {
+		return nil, fmt.Errorf("list host interfaces: %w", err)
+	}
+	var out []uint32
+	for _, l := range links {
+		vx, ok := l.(*netlink.Vxlan)
+		if !ok {
+			continue
+		}
+		if !strings.HasPrefix(vx.Name, "twvx") {
+			continue
+		}
+		out = append(out, uint32(vx.VxlanId))
+	}
+	return out, nil
 }

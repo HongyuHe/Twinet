@@ -417,7 +417,7 @@ func advertisedOwnPrefix(ctx context.Context, env *Env, router, peer, own string
 	if err != nil {
 		return 0, false
 	}
-	entries, ok := adv.Routes[own]
+	entries, ok := adv.Table()[own]
 	if !ok || len(entries) == 0 {
 		return 0, false
 	}
@@ -437,7 +437,7 @@ func advertisedPrefixes(ctx context.Context, env *Env, router, peer string) map[
 	if err != nil {
 		return out
 	}
-	for p := range adv.Routes {
+	for p := range adv.Table() {
 		out[p] = true
 	}
 	return out
@@ -450,7 +450,15 @@ func advertisedRoutes(ctx context.Context, env *Env, router, peer string) (bgpRo
 	if err != nil {
 		return adv, err
 	}
-	return adv, jsonUnmarshalLoose(out, &adv)
+	if err := jsonUnmarshalLoose(out, &adv); err != nil {
+		return adv, fmt.Errorf("%s: could not read what is advertised to %s: %w", router, peer, err)
+	}
+	if !adv.Decoded() {
+		// An unrecognised document must never pass for an empty table: that is
+		// exactly how a policy check silently became an unconditional pass.
+		return adv, fmt.Errorf("%s: the advertised-routes output for %s was not recognised", router, peer)
+	}
+	return adv, nil
 }
 
 func medianLocalPref(ctx context.Context, env *Env, peer string) int {
@@ -460,7 +468,7 @@ func medianLocalPref(ctx context.Context, env *Env, peer string) int {
 		if err != nil {
 			continue
 		}
-		for _, entries := range tbl.Routes {
+		for _, entries := range tbl.Table() {
 			for _, e := range entries {
 				for _, nh := range e.Nexthops {
 					if nh.IP == peer {

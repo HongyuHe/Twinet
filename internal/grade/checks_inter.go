@@ -194,24 +194,6 @@ func checkEBGPEstablished(ctx context.Context, env *Env) Result {
 	})
 }
 
-// bgpRouteJSON is the shape of `show ip bgp json`.
-type bgpRouteJSON struct {
-	Routes map[string][]struct {
-		Valid     bool   `json:"valid"`
-		BestPath  bool   `json:"bestpath"`
-		LocalPref int    `json:"locPrf"`
-		Origin    string `json:"origin"`
-		Path      string `json:"path"`
-		PeerID    string `json:"peerId"`
-		Nexthops  []struct {
-			IP string `json:"ip"`
-		} `json:"nexthops"`
-		Community *struct {
-			String string `json:"string"`
-		} `json:"community"`
-	} `json:"routes"`
-}
-
 func bgpTable(ctx context.Context, env *Env, router string) (bgpRouteJSON, error) {
 	var out bgpRouteJSON
 	err := env.VtyshJSON(ctx, router, "show ip bgp json", &out)
@@ -233,7 +215,7 @@ func checkOwnPrefix(ctx context.Context, env *Env) Result {
 	}
 
 	originated := map[string]bool{}
-	for prefix, entries := range tbl.Routes {
+	for prefix, entries := range tbl.Table() {
 		for _, e := range entries {
 			// An empty AS path on a locally injected route means we originate it.
 			if strings.TrimSpace(e.Path) == "" {
@@ -308,7 +290,7 @@ func checkGaoRexford(ctx context.Context, env *Env) Result {
 		if err != nil {
 			continue
 		}
-		for _, entries := range tbl.Routes {
+		for _, entries := range tbl.Table() {
 			for _, e := range entries {
 				for _, nh := range e.Nexthops {
 					if rel, ok := relOf[nh.IP]; ok {
@@ -398,23 +380,23 @@ func checkNoTransit(ctx context.Context, env *Env) Result {
 
 	// For each non-customer neighbour, look at what we advertise to them.
 	var leaks []string
+	var unreadable []string
 	checked := 0
 	for _, r := range routers {
 		for addr, rel := range relOf {
 			if rel == model.RelCustomer {
 				continue // a customer may receive everything
 			}
-			out, err := env.Vtysh(ctx, r.Name,
-				fmt.Sprintf("show ip bgp neighbors %s advertised-routes json", addr))
+			adv, err := advertisedRoutes(ctx, env, r.Name, addr)
 			if err != nil {
+				// The session may simply not exist yet, which is a student
+				// finding; an unreadable document is ours, and is recorded so
+				// it cannot masquerade as a pass.
+				unreadable = append(unreadable, err.Error())
 				continue
 			}
 			checked++
-			var adv bgpRouteJSON
-			if err := jsonUnmarshalLoose(out, &adv); err != nil {
-				continue
-			}
-			for prefix, entries := range adv.Routes {
+			for prefix, entries := range adv.Table() {
 				for _, e := range entries {
 					// A route we originate has an empty path and may go anywhere.
 					if strings.TrimSpace(e.Path) == "" {
@@ -433,8 +415,10 @@ func checkNoTransit(ctx context.Context, env *Env) Result {
 		}
 	}
 	if checked == 0 {
-		return Errored("policy.no_transit_for_peers",
-			fmt.Errorf("could not read any advertised-routes output; is BGP configured?"))
+		sort.Strings(unreadable)
+		return Errored("policy.no_transit_for_peers", fmt.Errorf(
+			"no neighbour's advertised routes could be read, so nothing could be assessed: %s",
+			strings.Join(truncate(unreadable, 3), "; ")))
 	}
 	if len(leaks) == 0 {
 		return Pass("policy.no_transit_for_peers", Evidence{
@@ -453,22 +437,8 @@ func checkNoTransit(ctx context.Context, env *Env) Result {
 	})
 }
 
-// sourceRelationship infers where a route came from using its community tags,
-// falling back to unknown when they are absent.
-func sourceRelationship(e struct {
-	Valid     bool   `json:"valid"`
-	BestPath  bool   `json:"bestpath"`
-	LocalPref int    `json:"locPrf"`
-	Origin    string `json:"origin"`
-	Path      string `json:"path"`
-	PeerID    string `json:"peerId"`
-	Nexthops  []struct {
-		IP string `json:"ip"`
-	} `json:"nexthops"`
-	Community *struct {
-		String string `json:"string"`
-	} `json:"community"`
-}, relOf map[string]model.Relationship) model.Relationship {
+// sourceRelationship infers which neighbour a route was learned from.
+func sourceRelationship(e bgpRoute, relOf map[string]model.Relationship) model.Relationship {
 	for _, nh := range e.Nexthops {
 		if rel, ok := relOf[nh.IP]; ok {
 			return rel

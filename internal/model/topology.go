@@ -139,6 +139,17 @@ type Iface struct {
 	Addr6 string
 	// Owner says whether Twinet configures this interface or the student does.
 	Owner ConfigOwner
+	// Prescribed says whether the assignment mandates this exact address.
+	//
+	// Some addresses are dictated ("the loopback of router Y is X.[150+Y].0.1")
+	// and some are the student's to choose ("use the subnet X.200.0.0/23; you
+	// are free to use any address in it"). Grading must not confuse the two: a
+	// check that demanded the reference answer for a free choice would fail a
+	// perfectly correct student, which is worse than not checking at all.
+	Prescribed bool
+	// Subnet is the prefix this interface's address must fall inside, used to
+	// grade a free choice.
+	Subnet string
 	// VLAN is the access VLAN for switch ports and the tag for sub-interfaces.
 	VLAN int
 	// Trunk marks a switch port carrying tagged traffic for multiple VLANs.

@@ -23,8 +23,7 @@ import (
 // hot path is netlink, which we do natively. In exchange the whole backend is
 // a few hundred readable lines with no version pinning problem.
 type Docker struct {
-	bin  string
-	sudo bool
+	bin string
 }
 
 // NewDocker constructs a Docker runtime.

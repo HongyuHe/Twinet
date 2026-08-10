@@ -64,7 +64,7 @@ func mergePeering(over, base model.PeeringLink) model.PeeringLink {
 	if over.Subnet != "" {
 		out.Subnet = over.Subnet
 	}
-	out.LinkProps = over.LinkProps.Merge(base.LinkProps)
+	out.LinkProps = over.Merge(base.LinkProps)
 	return out
 }
 

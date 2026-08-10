@@ -436,9 +436,3 @@ func roleColour(r model.ASRole) string {
 func mermaidID(s string) string {
 	return strings.NewReplacer("/", "_", ":", "_", "-", "_", ".", "_").Replace(s)
 }
-
-func sortedStrings(in []string) []string {
-	out := append([]string{}, in...)
-	sort.Strings(out)
-	return out
-}

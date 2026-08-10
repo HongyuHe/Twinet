@@ -9,12 +9,15 @@ package client
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -34,19 +37,47 @@ type Node struct {
 	http *http.Client
 }
 
+// TLS carries the client's mutual-TLS material.
+type TLS struct {
+	Cert string
+	Key  string
+	CA   string
+}
+
 // NewNode constructs a node client.
-func NewNode(name, addr, token string) *Node {
+func NewNode(name, addr, token string) *Node { return NewNodeTLS(name, addr, token, TLS{}) }
+
+// NewNodeTLS constructs a node client, optionally with mutual TLS.
+func NewNodeTLS(name, addr, token string, t TLS) *Node {
+	scheme := "http://"
+	tr := &http.Transport{
+		DialContext:         (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
+		MaxIdleConnsPerHost: 8,
+	}
+	if t.Cert != "" && t.Key != "" {
+		scheme = "https://"
+		cfg := &tls.Config{MinVersion: tls.VersionTLS13}
+		if cert, err := tls.LoadX509KeyPair(t.Cert, t.Key); err == nil {
+			cfg.Certificates = []tls.Certificate{cert}
+		}
+		if t.CA != "" {
+			if pem, err := os.ReadFile(t.CA); err == nil {
+				pool := x509.NewCertPool()
+				if pool.AppendCertsFromPEM(pem) {
+					cfg.RootCAs = pool
+				}
+			}
+		}
+		tr.TLSClientConfig = cfg
+	}
 	if !strings.Contains(addr, "://") {
-		addr = "http://" + addr
+		addr = scheme + addr
 	}
 	return &Node{
 		Name: name, Addr: strings.TrimRight(addr, "/"), Token: token,
 		http: &http.Client{
-			Timeout: 30 * time.Minute, // a large apply legitimately takes a while
-			Transport: &http.Transport{
-				DialContext:         (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
-				MaxIdleConnsPerHost: 8,
-			},
+			Timeout:   30 * time.Minute, // a large apply legitimately takes a while
+			Transport: tr,
 		},
 	}
 }
@@ -72,7 +103,7 @@ func (n *Node) do(ctx context.Context, method, path string, body, out any) error
 	if err != nil {
 		return fmt.Errorf("node %s: %w", n.Name, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode >= 400 {
 		var e struct {
@@ -148,13 +179,22 @@ type Cluster struct {
 
 // NewCluster builds a cluster client from a lab's placement configuration.
 func NewCluster(lab *model.Lab, token string) *Cluster {
+	return NewClusterTLS(lab, token, TLS{
+		Cert: os.Getenv("TWINET_TLS_CERT"),
+		Key:  os.Getenv("TWINET_TLS_KEY"),
+		CA:   os.Getenv("TWINET_CA"),
+	})
+}
+
+// NewClusterTLS builds a cluster client with explicit TLS material.
+func NewClusterTLS(lab *model.Lab, token string, t TLS) *Cluster {
 	c := &Cluster{}
 	for _, n := range lab.Placement.Nodes {
 		addr := n.Addr
 		if addr == "" {
 			addr = n.Name + ":7200"
 		}
-		c.Nodes = append(c.Nodes, NewNode(n.Name, addr, token))
+		c.Nodes = append(c.Nodes, NewNodeTLS(n.Name, addr, token, t))
 	}
 	return c
 }

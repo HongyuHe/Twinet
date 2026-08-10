@@ -175,7 +175,6 @@ func Run(ctx context.Context, r *Rubric, env *Env, opts RunOptions) *Report {
 		opts.Parallel = 4
 	}
 
-	converged := false
 	earned := map[string]float64{}
 
 	for _, q := range r.Questions {
@@ -191,30 +190,60 @@ func Run(ctx context.Context, r *Rubric, env *Env, opts RunOptions) *Report {
 			continue
 		}
 
-		if q.Converge && !converged {
+		// Convergence is tracked per question rather than once globally: a
+		// timeout before an early question must not be taken as licence to
+		// skip the wait before a later one that depends on more state.
+		if q.Converge {
 			if err := WaitConverged(ctx, env, opts.ConvergeTimeout); err != nil {
 				rep.Warnings = append(rep.Warnings,
-					fmt.Sprintf("the network did not fully converge before %s: %v", q.ID, err))
+					fmt.Sprintf("the network had not settled before %s: %v", q.ID, err))
+				qr.NeedsReview = true
+				qr.Note = "the control plane had not converged when this was assessed"
+				rep.NeedsReview = true
 			}
-			converged = true
 		}
 
 		results := runChecks(ctx, q, env, opts)
+
+		// A check that could not run is a fault in the grader, not in the
+		// student. Scoring it zero would quietly turn our outage into their
+		// mark, so its weight is excluded and the question is flagged for a
+		// human instead.
 		var awarded, weightSum float64
+		var broken []string
 		for i, c := range q.Checks {
 			w := c.Weight
 			if w == 0 {
 				w = 1
 			}
+			if results[i].Status == StatusError {
+				broken = append(broken, results[i].Check)
+				continue
+			}
 			weightSum += w
 			awarded += w * results[i].Score
 		}
-		if weightSum > 0 {
+		switch {
+		case weightSum > 0:
 			awarded /= weightSum
+		default:
+			// Every check failed to run: award nothing yet and mark the whole
+			// question as needing attention rather than as a zero.
+			awarded = 0
 		}
 		qr.Awarded = awarded * q.Points
 		qr.Results = results
 		qr.Status = statusFor(awarded)
+		if len(broken) > 0 {
+			sort.Strings(broken)
+			qr.NeedsReview = true
+			qr.Note = fmt.Sprintf("%d check(s) could not run (%s); this question needs a human before the mark stands",
+				len(broken), strings.Join(broken, ", "))
+			rep.NeedsReview = true
+			if weightSum == 0 {
+				qr.Status = StatusError
+			}
+		}
 		earned[q.ID] = qr.Awarded
 
 		rep.Total += qr.Awarded

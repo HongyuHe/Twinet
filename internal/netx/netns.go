@@ -114,17 +114,6 @@ func PIDAlive(pid int) bool {
 	return err == nil
 }
 
-// linkByNameIn looks up a link inside a namespace.
-func linkByNameIn(ns *NS, name string) (netlink.Link, error) {
-	var l netlink.Link
-	err := ns.Do(func() error {
-		var e error
-		l, e = netlink.LinkByName(name)
-		return e
-	})
-	return l, err
-}
-
 // IsNotFound reports whether an error means "no such link".
 func IsNotFound(err error) bool {
 	if err == nil {

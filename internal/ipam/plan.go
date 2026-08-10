@@ -32,6 +32,8 @@ type Ctx struct {
 	VLAN      int    // VLAN id
 	VLANIndex int    // 0-based position of the VLAN within its domain
 	IXP       int    // IXP AS number
+	Low       int    // the lower of two AS numbers, for symmetric inter-AS prefixes
+	High      int    // the higher of two AS numbers
 	Host      int    // host index within a subnet
 	Name      string // free-form: service name, device name
 	Region    string

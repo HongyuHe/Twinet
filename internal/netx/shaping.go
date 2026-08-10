@@ -113,8 +113,12 @@ func ApplyShaping(link netlink.Link, s Shaping) error {
 			Handle:    netlink.MakeHandle(10, 0),
 			Parent:    netlink.MakeHandle(1, 1),
 		},
-		Rate:   rate,
-		Buffer: burstToBuffer(rate, burst),
+		Rate: rate,
+		// Buffer is expressed in scheduler ticks, not bytes. Passing bytes
+		// silently programs a burst orders of magnitude off: a 125,000 byte
+		// burst arrived as 10,000 and a 50ms queue as 142ms, which changes the
+		// behaviour students measure. tc's own conversion is xmittime.
+		Buffer: netlink.Xmittime(rate, uint32(burst)),
 		Limit:  tbfLimit(rate, latencyUS, burst),
 	}
 	if err := netlink.QdiscAdd(tbf); err != nil {
@@ -160,17 +164,8 @@ func BurstSize(rateBytesPerSec uint64, mtu int) uint64 {
 	return burst
 }
 
-// burstToBuffer converts a burst in bytes into the tbf buffer parameter, which
-// the kernel expects in "bytes worth of tokens" scaled by the timer resolution.
-// netlink's Tbf takes the buffer in bytes directly.
-func burstToBuffer(_ uint64, burst uint64) uint32 {
-	if burst > math.MaxUint32 {
-		return math.MaxUint32
-	}
-	return uint32(burst)
-}
-
-// tbfLimit converts a maximum queueing latency into a byte limit.
+// tbfLimit converts a maximum queueing latency into a byte limit, using the
+// same formula tc does: limit = rate * latency + burst.
 func tbfLimit(rateBytesPerSec uint64, latencyUS uint32, burst uint64) uint32 {
 	l := rateBytesPerSec*uint64(latencyUS)/1_000_000 + burst
 	if l > math.MaxUint32 {

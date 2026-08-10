@@ -3,6 +3,7 @@ package grade
 import (
 	"context"
 	"fmt"
+	"net/netip"
 	"regexp"
 	"sort"
 	"strconv"
@@ -55,9 +56,7 @@ func init() {
 // platform this replaces, the plan lived in a bash file, the assignment text,
 // the DNS generator and the grader independently, and they drifted.
 func checkAddressing(ctx context.Context, env *Env) Result {
-	type mismatch struct {
-		Device, Iface, Want, Got string
-	}
+	type mismatch struct{ Device, Iface, Want, Got string }
 	var bad []mismatch
 	var missing []string
 	checked := 0
@@ -70,40 +69,82 @@ func checkAddressing(ctx context.Context, env *Env) Result {
 		have := parseIPAddrOutput(out.Stdout)
 
 		for _, i := range r.Ifaces {
-			if i.Addr4 == "" || i.Role == model.RoleInterAS || i.Role == model.RoleIXPLink {
-				continue // inter-AS addressing is agreed with a neighbour, not prescribed
+			// Inter-AS addressing is agreed with a neighbour, not prescribed.
+			if i.Role == model.RoleInterAS {
+				continue
+			}
+			if i.Addr4 == "" && i.Subnet == "" {
+				continue
 			}
 			checked++
 			got := have[i.Name]
-			switch {
-			case len(got) == 0:
-				missing = append(missing, fmt.Sprintf("%s:%s (expected %s)", r.Name, i.Name, i.Addr4))
-			case !containsStr(got, i.Addr4):
-				bad = append(bad, mismatch{r.Name, i.Name, i.Addr4, strings.Join(got, ", ")})
+			if len(got) == 0 {
+				want := i.Addr4
+				if !i.Prescribed {
+					want = "an address in " + i.Subnet
+				}
+				missing = append(missing, fmt.Sprintf("%s:%s (expected %s)", r.Name, i.Name, want))
+				continue
+			}
+			if i.Prescribed {
+				// The assignment dictates the exact value.
+				if !containsStr(got, i.Addr4) {
+					bad = append(bad, mismatch{r.Name, i.Name, i.Addr4, strings.Join(got, ", ")})
+				}
+				continue
+			}
+			// The student chose; only membership of the mandated prefix is
+			// graded. Demanding the reference answer here would fail a correct
+			// student, which is worse than not checking at all.
+			if i.Subnet != "" && !anyInSubnet(got, i.Subnet) {
+				bad = append(bad, mismatch{r.Name, i.Name, "an address in " + i.Subnet, strings.Join(got, ", ")})
 			}
 		}
 	}
 
 	if len(bad) == 0 && len(missing) == 0 {
 		return Pass("l3.addressing_matches_plan", Evidence{
-			Detail: fmt.Sprintf("all %d prescribed addresses are configured", checked),
-		})
+			Detail: fmt.Sprintf("all %d required addresses are configured", checked)})
 	}
 	var detail strings.Builder
+	sort.Strings(missing)
 	for _, m := range missing {
 		fmt.Fprintf(&detail, "not configured: %s\n", m)
 	}
+	sort.Slice(bad, func(i, j int) bool { return bad[i].Device+bad[i].Iface < bad[j].Device+bad[j].Iface })
 	for _, m := range bad {
 		fmt.Fprintf(&detail, "%s:%s has %s, expected %s\n", m.Device, m.Iface, m.Got, m.Want)
 	}
 	wrong := len(bad) + len(missing)
-	return Partial("l3.addressing_matches_plan", float64(checked-wrong)/float64(maxI(checked, 1)), Evidence{
+	return Partial("l3.addressing_matches_plan", ratio(checked-wrong, checked), Evidence{
 		Expected: fmt.Sprintf("%d addresses", checked),
 		Observed: fmt.Sprintf("%d correct", checked-wrong),
 		Detail:   strings.TrimRight(detail.String(), "\n"),
-		Hint:     "the required addresses are listed in the assignment's L3 topology figure",
+		Hint:     "the required addresses are in the assignment's L3 topology figure",
 		Command:  "ip -o -4 addr show",
 	})
+}
+
+// anyInSubnet reports whether any of the configured addresses falls inside the
+// mandated prefix.
+func anyInSubnet(addrs []string, subnet string) bool {
+	p, err := netip.ParsePrefix(subnet)
+	if err != nil {
+		return true // an unparseable expectation must not cost a student marks
+	}
+	for _, a := range addrs {
+		pa, err := netip.ParsePrefix(a)
+		if err != nil {
+			if ip, err2 := netip.ParseAddr(a); err2 == nil && p.Contains(ip) {
+				return true
+			}
+			continue
+		}
+		if p.Contains(pa.Addr()) {
+			return true
+		}
+	}
+	return false
 }
 
 // ospfNeighborJSON is the shape of `show ip ospf neighbor json`.
@@ -616,11 +657,4 @@ func ratio(got, want int) float64 {
 		got = 0
 	}
 	return float64(got) / float64(want)
-}
-
-func maxI(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
 }

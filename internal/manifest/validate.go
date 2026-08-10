@@ -242,7 +242,7 @@ func (l *Loaded) validateASes(d *Diagnostics, file string) {
 		if len(asns) == 0 {
 			d.Add(file, path, "declares no autonomous systems", node)
 		}
-		spec := g.ASSpec.Merge(l.Lab.ASDefaults)
+		spec := g.Merge(l.Lab.ASDefaults)
 		if spec.Template == "" {
 			d.AddHint(file, path+".template", node, "no template specified",
 				"set as_defaults.template or this group's template")

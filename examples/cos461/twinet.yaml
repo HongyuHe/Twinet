@@ -65,7 +65,10 @@ addressing:
   l2_vlan:             "{{ cidrSubnet (printf \"%d.%d.0.0/23\" .AS (add 199 .L2ID)) .VLANIndex 24 }}"
   l2_domain_v6:        "{{ .AS }}:{{ add 199 .L2ID }}::/32"
   l2_vlan_v6:          "{{ cidrSubnet (printf \"%d:%d::/32\" .AS (add 199 .L2ID)) .VLANIndex 48 }}"
-  inter_as:            "{{ cidrSubnet \"179.0.0.0/8\" .LinkIndex 24 }}"
+  # The assignment states the rule directly: the link between AS 3 and AS 6 uses
+  # 179.3.6.0/24. Deriving the prefix from the two AS numbers rather than from a
+  # counter is what makes the platform and the published text agree.
+  inter_as:            "179.{{ .Low }}.{{ .High }}.0/24"
   ixp_peering:         "180.{{ .IXP }}.0.0/24"
   services:
     dns:         "198.{{ .AS }}.0.0/24"

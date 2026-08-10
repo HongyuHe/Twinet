@@ -125,7 +125,7 @@ func installHalf(tempName string, ep EndpointSpec, mtu int) error {
 	if err != nil {
 		return err
 	}
-	defer ns.Close()
+	defer func() { _ = ns.Close() }()
 
 	if err := netlink.LinkSetNsFd(link, ns.Fd()); err != nil {
 		return fmt.Errorf("move %s into %s: %w", tempName, ep.NSPath, err)
@@ -262,7 +262,7 @@ func endpointPresent(ep EndpointSpec) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	defer ns.Close()
+	defer func() { _ = ns.Close() }()
 	var present bool
 	err = ns.Do(func() error {
 		var e error
@@ -294,7 +294,7 @@ func configureEndpoint(ep EndpointSpec) error {
 	if err != nil {
 		return err
 	}
-	defer ns.Close()
+	defer func() { _ = ns.Close() }()
 	return ns.Do(apply)
 }
 
@@ -316,7 +316,7 @@ func deleteEndpoint(ep EndpointSpec) error {
 	if err != nil {
 		return err
 	}
-	defer ns.Close()
+	defer func() { _ = ns.Close() }()
 	return ns.Do(del)
 }
 

@@ -32,6 +32,7 @@ func newDeployCmd(opts *Options) *cobra.Command {
 		only    string
 		quiet   bool
 		token   string
+		prune   bool
 	)
 	cmd := &cobra.Command{
 		Use:   "deploy",
@@ -44,10 +45,9 @@ after a partial failure, a reboot, or a topology edit.`,
 			if err != nil {
 				return err
 			}
-			if only != "" {
-				if err := restrict(top, only); err != nil {
-					return err
-				}
+			scope, err := parseScope(only)
+			if err != nil {
+				return err
 			}
 
 			if clustered(top) {
@@ -60,6 +60,9 @@ after a partial failure, a reboot, or a topology edit.`,
 					PullPolicy: pull,
 					Workers:    workers,
 					DryRun:     dryRun,
+					Prune:      prune && only == "",
+					Generation: time.Now().UTC().Format("20060102T150405"),
+					OnlySteps:  scope,
 				}, cmd.OutOrStdout(), cmd.ErrOrStderr())
 			}
 
@@ -90,6 +93,13 @@ after a partial failure, a reboot, or a topology edit.`,
 			p, err := eng.Build(top)
 			if err != nil {
 				return err
+			}
+			if len(scope) > 0 {
+				want := map[string]bool{}
+				for _, s := range scope {
+					want[s] = true
+				}
+				p = p.Restrict(func(st *plan.Step) bool { return want[st.Scope] })
 			}
 			if p.Len() == 0 {
 				return fmt.Errorf("nothing is placed on node %q; check placement.nodes", node)
@@ -127,7 +137,10 @@ after a partial failure, a reboot, or a topology edit.`,
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "show what would happen without doing it")
 	cmd.Flags().IntVar(&workers, "workers", 0, "concurrency (default: 4x CPU count)")
 	cmd.Flags().StringVar(&pull, "pull", "if-missing", "image pull policy: if-missing, always, never")
-	cmd.Flags().StringVar(&only, "only", "", "restrict to a scope, e.g. as=12 or services")
+	cmd.Flags().StringVar(&only, "only", "",
+		"restrict the work to a scope, e.g. as=12, peering or services; the topology stays whole")
+	cmd.Flags().BoolVar(&prune, "prune", false,
+		"also remove containers and overlays this topology no longer wants")
 	cmd.Flags().BoolVarP(&quiet, "quiet", "q", false, "suppress per-step progress")
 	cmd.Flags().StringVar(&token, "token", "", "agent token for cluster deployments (or set TWINET_TOKEN)")
 	return cmd
@@ -407,42 +420,24 @@ func peerUnderlays(top *model.Topology) map[string]string {
 	return out
 }
 
-// restrict prunes the topology to a scope, so a redeploy can target one AS
-// without touching the other ninety-nine.
-func restrict(top *model.Topology, sel string) error {
+// parseScope turns a --only selector into the plan scopes it names.
+func parseScope(sel string) ([]string, error) {
 	switch {
+	case sel == "":
+		return nil, nil
 	case strings.HasPrefix(sel, "as="):
 		var asn int
-		if _, err := fmt.Sscanf(sel, "as=%d", &asn); err != nil {
-			return fmt.Errorf("bad selector %q; use as=12", sel)
+		if _, err := fmt.Sscanf(sel, "as=%d", &asn); err != nil || asn <= 0 {
+			return nil, fmt.Errorf("bad selector %q; use as=12", sel)
 		}
-		if _, ok := top.ASes[asn]; !ok {
-			return fmt.Errorf("AS %d is not in this lab", asn)
-		}
-		for id, d := range top.Devices {
-			if d.ASN != asn {
-				delete(top.Devices, id)
-			}
-		}
+		return []string{fmt.Sprintf("as%d", asn)}, nil
 	case sel == "services":
-		for id, d := range top.Devices {
-			if d.ASN != 0 {
-				delete(top.Devices, id)
-			}
-		}
+		return []string{"services"}, nil
+	case sel == "peering":
+		return []string{"peering"}, nil
 	default:
-		return fmt.Errorf("unknown selector %q; use as=N or services", sel)
+		return nil, fmt.Errorf("unknown selector %q; use as=N, peering or services", sel)
 	}
-	var keep []*model.Link
-	for _, l := range top.Links {
-		_, a := top.Devices[l.A.Device.ID]
-		_, b := top.Devices[l.B.Device.ID]
-		if a && b {
-			keep = append(keep, l)
-		}
-	}
-	top.Links = keep
-	return nil
 }
 
 func resolveDevice(top *model.Topology, name string) (*model.Device, bool) {

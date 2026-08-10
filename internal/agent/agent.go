@@ -15,6 +15,8 @@ package agent
 import (
 	"context"
 	"crypto/subtle"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -35,10 +37,15 @@ import (
 	"github.com/HongyuHe/twinet/internal/plan"
 	"github.com/HongyuHe/twinet/internal/render"
 	rt "github.com/HongyuHe/twinet/internal/runtime"
+	"github.com/HongyuHe/twinet/internal/state"
 )
 
 // Version is stamped at build time.
 var Version = "dev"
+
+// maxRequestBytes bounds a request body. A full topology for a large class is a
+// few megabytes; anything far beyond that is a mistake or an attack.
+const maxRequestBytes = 128 << 20
 
 // Config is the agent's runtime configuration.
 type Config struct {
@@ -47,6 +54,13 @@ type Config struct {
 	Token       string
 	UnderlayIP  string
 	UnderlayDev string
+	// StateDir holds student-owned configuration snapshots. It must survive
+	// container replacement and node reboots, because it is the only copy of
+	// work a class cannot recreate.
+	StateDir string
+	TLSCert  string
+	TLSKey   string
+	ClientCA string
 }
 
 // Main is the agent entry point.
@@ -58,6 +72,10 @@ func Main(ctx context.Context, args []string) error {
 		token   = fs.String("token", os.Getenv("TWINET_TOKEN"), "shared secret the control plane must present")
 		uip     = fs.String("underlay-ip", "", "VTEP source address for cross-node links")
 		udev    = fs.String("underlay-dev", "", "interface to source tunnels from")
+		sdir    = fs.String("state-dir", "/var/lib/twinet/state", "where student configuration snapshots are kept")
+		cert    = fs.String("tls-cert", os.Getenv("TWINET_TLS_CERT"), "server certificate (enables TLS)")
+		key     = fs.String("tls-key", os.Getenv("TWINET_TLS_KEY"), "server private key")
+		cacert  = fs.String("client-ca", os.Getenv("TWINET_CLIENT_CA"), "CA that signs permitted client certificates (enables mutual TLS)")
 		verbose = fs.Bool("verbose", false, "debug logging")
 		version = fs.Bool("version", false, "print the version and exit")
 	)
@@ -83,7 +101,8 @@ func Main(ctx context.Context, args []string) error {
 
 	s, err := New(Config{
 		Node: *node, Listen: *listen, Token: *token,
-		UnderlayIP: *uip, UnderlayDev: *udev,
+		UnderlayIP: *uip, UnderlayDev: *udev, StateDir: *sdir,
+		TLSCert: *cert, TLSKey: *key, ClientCA: *cacert,
 	})
 	if err != nil {
 		return err
@@ -95,9 +114,20 @@ func Main(ctx context.Context, args []string) error {
 type Server struct {
 	cfg     Config
 	rt      rt.Runtime
+	store   *state.Store
+	started time.Time
+
 	mu      sync.Mutex
 	current *model.Topology
-	started time.Time
+
+	// opMu serialises mutating operations on a lab. Docker inspect-then-create
+	// and netlink lookup-then-add are check-then-act sequences: two overlapping
+	// applies, or an apply racing a destroy, can otherwise wire a container
+	// that another request has just replaced.
+	opMu   sync.Mutex
+	opLab  string
+	opKind string
+	opAt   time.Time
 }
 
 // New constructs an agent.
@@ -109,7 +139,38 @@ func New(cfg Config) (*Server, error) {
 	if _, err := engine.Ping(context.Background()); err != nil {
 		return nil, fmt.Errorf("cannot reach the container engine: %w", err)
 	}
-	return &Server{cfg: cfg, rt: engine, started: time.Now()}, nil
+	srv := &Server{cfg: cfg, rt: engine, started: time.Now()}
+	if cfg.StateDir != "" {
+		st, err := state.Open(cfg.StateDir)
+		if err != nil {
+			return nil, fmt.Errorf("state directory: %w", err)
+		}
+		srv.store = st
+	}
+	return srv, nil
+}
+
+// acquire takes the per-node operation lease, refusing rather than queueing so
+// a caller learns immediately that something else is mid-flight.
+func (s *Server) acquire(lab, kind string) error {
+	if !s.opMu.TryLock() {
+		s.mu.Lock()
+		inflight := fmt.Sprintf("%s on lab %q, started %s ago",
+			s.opKind, s.opLab, time.Since(s.opAt).Round(time.Second))
+		s.mu.Unlock()
+		return fmt.Errorf("another operation is already running on this node: %s", inflight)
+	}
+	s.mu.Lock()
+	s.opLab, s.opKind, s.opAt = lab, kind, time.Now()
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *Server) release() {
+	s.mu.Lock()
+	s.opLab, s.opKind = "", ""
+	s.mu.Unlock()
+	s.opMu.Unlock()
 }
 
 // Serve runs the HTTP API until the context is cancelled.
@@ -127,15 +188,47 @@ func (s *Server) Serve(ctx context.Context) error {
 	mux.HandleFunc("GET /v1/underlay", s.auth(s.handleUnderlay))
 
 	srv := &http.Server{
-		Addr:              s.cfg.Listen,
-		Handler:           mux,
+		Addr:    s.cfg.Listen,
+		Handler: http.MaxBytesHandler(mux, maxRequestBytes),
+		// An agent that can create privileged containers must not be held open
+		// by a stalled or malicious peer.
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       15 * time.Minute,
+		WriteTimeout:      35 * time.Minute,
+		IdleTimeout:       2 * time.Minute,
+	}
+
+	tlsMode := "disabled"
+	if s.cfg.TLSCert != "" && s.cfg.TLSKey != "" {
+		cfg := &tls.Config{MinVersion: tls.VersionTLS13}
+		tlsMode = "server"
+		if s.cfg.ClientCA != "" {
+			pool := x509.NewCertPool()
+			pem, err := os.ReadFile(s.cfg.ClientCA)
+			if err != nil {
+				return fmt.Errorf("read client CA: %w", err)
+			}
+			if !pool.AppendCertsFromPEM(pem) {
+				return fmt.Errorf("client CA %s contains no certificates", s.cfg.ClientCA)
+			}
+			cfg.ClientCAs = pool
+			cfg.ClientAuth = tls.RequireAndVerifyClientCert
+			tlsMode = "mutual"
+		}
+		srv.TLSConfig = cfg
+	} else {
+		slog.Warn("the agent is serving plain HTTP with only a bearer token; " +
+			"pass -tls-cert, -tls-key and -client-ca for mutual TLS before exposing it beyond a trusted network")
 	}
 
 	errc := make(chan error, 1)
 	go func() {
 		slog.Info("agent listening", "node", s.cfg.Node, "addr", s.cfg.Listen,
-			"underlay", s.cfg.UnderlayIP)
+			"underlay", s.cfg.UnderlayIP, "tls", tlsMode, "state", s.cfg.StateDir)
+		if srv.TLSConfig != nil {
+			errc <- srv.ListenAndServeTLS(s.cfg.TLSCert, s.cfg.TLSKey)
+			return
+		}
 		errc <- srv.ListenAndServe()
 	}()
 
@@ -228,6 +321,15 @@ type ApplyRequest struct {
 	Workers      int               `json:"workers"`
 	DryRun       bool              `json:"dry_run"`
 	PeerUnderlay map[string]string `json:"peer_underlay"`
+	// Prune removes containers and overlays this node holds that the topology
+	// no longer wants. Only safe when the topology is complete.
+	Prune bool `json:"prune"`
+	// Generation identifies this deployment in logs and labels.
+	Generation string `json:"generation"`
+	// OnlySteps, when non-empty, restricts the plan to these step IDs. This is
+	// how a scoped repair is expressed: the topology stays whole so every
+	// cross-reference still resolves, and only the work is narrowed.
+	OnlySteps []string `json:"only_steps,omitempty"`
 }
 
 // ApplyResponse reports the outcome.
@@ -236,6 +338,8 @@ type ApplyResponse struct {
 	Steps      int                 `json:"steps"`
 	DurationMS int64               `json:"duration_ms"`
 	Failures   map[string][]string `json:"failures,omitempty"`
+	Pruned     []string            `json:"pruned,omitempty"`
+	Snapshots  int                 `json:"snapshots,omitempty"`
 }
 
 func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
@@ -253,6 +357,11 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, fmt.Errorf("rehydrate topology: %w", err))
 		return
 	}
+	if err := s.acquire(top.Name, "apply"); err != nil {
+		httpError(w, http.StatusConflict, err)
+		return
+	}
+	defer s.release()
 
 	mode := render.Mode(req.Mode)
 	if mode == "" {
@@ -266,11 +375,21 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		UnderlayIP:   s.cfg.UnderlayIP,
 		UnderlayDev:  s.cfg.UnderlayDev,
 		PeerUnderlay: req.PeerUnderlay,
+		State:        s.store,
+		Prune:        req.Prune,
+		Generation:   req.Generation,
 	}
 	p, err := eng.Build(top)
 	if err != nil {
 		httpError(w, http.StatusBadRequest, err)
 		return
+	}
+	if len(req.OnlySteps) > 0 {
+		want := map[string]bool{}
+		for _, sc := range req.OnlySteps {
+			want[sc] = true
+		}
+		p = p.Restrict(func(st *plan.Step) bool { return want[st.Scope] })
 	}
 	rep, err := p.Execute(r.Context(), plan.Options{
 		Workers:         req.Workers,
@@ -290,6 +409,32 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		Node: s.cfg.Node, Steps: p.Len(),
 		DurationMS: rep.Duration.Milliseconds(),
 	}
+
+	// Pruning happens only after a clean run and only when asked, so a partial
+	// topology or a half-failed deployment can never be read as "remove
+	// everything else".
+	if req.Prune && !req.DryRun && !rep.Failed() {
+		gone, err := eng.PruneOrphans(r.Context(), top)
+		if err != nil {
+			slog.Warn("pruning containers", "err", err)
+		}
+		resp.Pruned = gone
+		if overlays, err := eng.PruneOverlays(top); err != nil {
+			slog.Warn("pruning overlays", "err", err)
+		} else {
+			resp.Pruned = append(resp.Pruned, overlays...)
+		}
+	}
+
+	// Snapshot student work at the end of every successful apply, so the most
+	// recent copy is never older than the last time anyone touched the lab.
+	if s.store != nil && !req.DryRun {
+		if n, err := eng.CaptureAll(r.Context(), top, s.store); err != nil {
+			slog.Warn("capturing student configuration", "err", err, "saved", n)
+		} else if n > 0 {
+			resp.Snapshots = n
+		}
+	}
 	if rep.Failed() {
 		resp.Failures = map[string][]string{}
 		for _, scope := range rep.FailedScopes() {
@@ -305,6 +450,11 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 type DestroyRequest struct {
 	Lab  string   `json:"lab"`
 	VNIs []uint32 `json:"vnis,omitempty"`
+	// Force skips the pre-destroy snapshot of student work.
+	Force bool `json:"force,omitempty"`
+	// AllOverlays removes every Twinet overlay on the node, which is how a lab
+	// is cleaned up when its manifest is no longer available.
+	AllOverlays bool `json:"all_overlays,omitempty"`
 }
 
 func (s *Server) handleDestroy(w http.ResponseWriter, r *http.Request) {
@@ -317,12 +467,47 @@ func (s *Server) handleDestroy(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, errors.New("a lab name is required"))
 		return
 	}
-	eng := &deploy.Engine{Runtime: s.rt, Node: s.cfg.Node}
+	if err := s.acquire(req.Lab, "destroy"); err != nil {
+		httpError(w, http.StatusConflict, err)
+		return
+	}
+	defer s.release()
+
+	eng := &deploy.Engine{Runtime: s.rt, Node: s.cfg.Node, State: s.store}
+
+	// Destroying a lab must not lose a class's work: everything is captured
+	// first, and refusing is better than proceeding blind.
+	if s.store != nil && !req.Force {
+		s.mu.Lock()
+		top := s.current
+		s.mu.Unlock()
+		if top != nil && top.Name == req.Lab {
+			if n, err := eng.CaptureAll(r.Context(), top, s.store); err != nil {
+				httpError(w, http.StatusConflict, fmt.Errorf(
+					"refusing to destroy %s: student configuration could not be captured (%w); "+
+						"pass force to override", req.Lab, err))
+				return
+			} else if n > 0 {
+				slog.Info("captured before destroy", "lab", req.Lab, "snapshots", n)
+			}
+		}
+	}
 	if err := eng.Destroy(r.Context(), req.Lab); err != nil {
 		httpError(w, http.StatusInternalServerError, err)
 		return
 	}
-	if len(req.VNIs) > 0 {
+	switch {
+	case req.AllOverlays:
+		// Without a manifest there is no VNI list, so cleanup works from what
+		// is actually on the host. This is what makes `destroy --lab NAME`
+		// able to clean up after a topology nobody has a copy of any more.
+		vnis, err := netx.ListOverlays()
+		if err != nil {
+			slog.Warn("listing overlays", "err", err)
+		} else if err := eng.DestroyOverlays(vnis); err != nil {
+			slog.Warn("overlay cleanup incomplete", "err", err)
+		}
+	case len(req.VNIs) > 0:
 		if err := eng.DestroyOverlays(req.VNIs); err != nil {
 			slog.Warn("overlay cleanup incomplete", "err", err)
 		}

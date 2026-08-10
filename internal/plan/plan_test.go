@@ -273,3 +273,72 @@ func contains(hay, needle string) bool {
 		return false
 	})()
 }
+
+// A step whose prerequisite failed must not run, even when the prerequisite
+// belongs to a different scope.
+//
+// Inter-AS wiring is scoped to "peering" while the routers that depend on it
+// are scoped to their AS, so scope isolation alone would configure and start a
+// router whose links were never created. That is precisely the half-wired state
+// the design claims to prevent.
+func TestFailedPrerequisiteBlocksDependentInAnotherScope(t *testing.T) {
+	var ran sync.Map
+	mk := func(id, scope string, stage Stage, fail bool, needs ...string) *Step {
+		return &Step{ID: id, Scope: scope, Stage: stage, Describe: id, Needs: needs,
+			Run: func(context.Context) error {
+				ran.Store(id, true)
+				if fail {
+					return errors.New("boom")
+				}
+				return nil
+			}}
+	}
+	p := New()
+	p.Add(mk("as1-create", "as1", StageCreate, false))
+	p.Add(mk("wire-peering", "peering", StageWire, true, "as1-create"))
+	p.Add(mk("as1-configure", "as1", StageConfigure, false, "as1-create", "wire-peering"))
+	p.Add(mk("as1-ready", "as1", StageReady, false, "as1-configure"))
+
+	rep, err := p.Execute(context.Background(), Options{Workers: 4, ContinueOnError: true})
+	if err != nil {
+		t.Fatalf("execute returned a hard error: %v", err)
+	}
+	if !rep.Failed() {
+		t.Fatal("expected the peering failure to be recorded")
+	}
+	if _, ok := ran.Load("as1-configure"); ok {
+		t.Error("as1-configure ran despite its wire prerequisite failing: this is the half-wired state the design forbids")
+	}
+	if _, ok := ran.Load("as1-ready"); ok {
+		t.Error("as1-ready ran despite an upstream failure")
+	}
+}
+
+// A failure in one scope must not skip an unrelated scope that merely shares an
+// earlier step, or one broken image pull would stop a whole class.
+func TestUnrelatedScopesStillRunAfterAFailure(t *testing.T) {
+	var ran sync.Map
+	mk := func(id, scope string, stage Stage, fail bool, needs ...string) *Step {
+		return &Step{ID: id, Scope: scope, Stage: stage, Describe: id, Needs: needs,
+			Run: func(context.Context) error {
+				ran.Store(id, true)
+				if fail {
+					return errors.New("boom")
+				}
+				return nil
+			}}
+	}
+	p := New()
+	p.Add(mk("image", "", StageImage, false))
+	p.Add(mk("as1-create", "as1", StageCreate, true, "image"))
+	p.Add(mk("as2-create", "as2", StageCreate, false, "image"))
+	p.Add(mk("as2-configure", "as2", StageConfigure, false, "as2-create"))
+
+	rep, _ := p.Execute(context.Background(), Options{Workers: 4, ContinueOnError: true})
+	if !rep.Failed() {
+		t.Fatal("expected as1 to be recorded as failed")
+	}
+	if _, ok := ran.Load("as2-configure"); !ok {
+		t.Error("as2 should have completed despite as1 failing")
+	}
+}

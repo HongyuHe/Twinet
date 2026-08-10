@@ -75,6 +75,11 @@ func Router(top *model.Topology, d *model.Device) (RouterConfig, error) {
 	if !ok {
 		return RouterConfig{}, fmt.Errorf("%s belongs to unknown AS %d", d.ID, d.ASN)
 	}
+	// An exchange's route server peers with every member of its fabric, not
+	// with whatever is at the end of its cable, so it needs its own renderer.
+	if as.Role == model.RoleIXP {
+		return RouteServer(top, d)
+	}
 
 	var plat, exp strings.Builder
 	header := func(b *strings.Builder) {
@@ -224,7 +229,9 @@ func renderBGP(top *model.Topology, as *model.AS, d *model.Device) string {
 	}
 
 	b.WriteString(" address-family ipv4 unicast\n")
-	fmt.Fprintf(&b, "  network %s\n", as.Block)
+	if as.Role != model.RoleIXP {
+		fmt.Fprintf(&b, "  network %s\n", as.Block)
+	}
 	for _, p := range peers {
 		fmt.Fprintf(&b, "  neighbor %s activate\n", p)
 		fmt.Fprintf(&b, "  neighbor %s next-hop-self\n", p)

@@ -78,10 +78,6 @@ type expander struct {
 	interASIndex map[string]int
 }
 
-func (e *expander) warnf(format string, args ...any) {
-	e.warnings = append(e.warnings, fmt.Sprintf(format, args...))
-}
-
 func (e *expander) compilePlan() (*ipam.Plan, error) {
 	a := e.lab.Addressing
 	exprs := map[string]string{
@@ -117,7 +113,7 @@ func (e *expander) expandASes() error {
 	var entries []entry
 	seen := map[int]bool{}
 	for gi, g := range e.lab.AutonomousSystems {
-		spec := g.ASSpec.Merge(e.lab.ASDefaults)
+		spec := g.Merge(e.lab.ASDefaults)
 		asns := g.ASNs()
 		if len(asns) == 0 {
 			return fmt.Errorf("autonomous_systems[%d]: neither 'range' nor 'list' declares any AS", gi)
@@ -208,10 +204,11 @@ func (e *expander) expandOneAS(asn int, spec model.ASSpec) error {
 		// Loopback. Always present; owned by the student in student ASes since
 		// configuring it is an explicit assignment task.
 		lo := &model.Iface{
-			Device: d,
-			Name:   "lo",
-			Role:   model.RoleLoopback,
-			Owner:  e.ownerFor(as, tpl, rn, "lo"),
+			Device:     d,
+			Name:       "lo",
+			Role:       model.RoleLoopback,
+			Owner:      e.ownerFor(as, tpl, rn, "lo"),
+			Prescribed: true,
 		}
 		if e.plan.Has(ipam.FieldRouterLoopback) {
 			addr, err := e.plan.Eval(ipam.FieldRouterLoopback, ipam.Ctx{AS: asn, RouterID: rs.ID, Name: rn})
@@ -274,8 +271,10 @@ func (e *expander) expandOneAS(asn int, spec model.ASSpec) error {
 		hostAddr, routerAddr := hostPair(subnet)
 		owner := e.ownerFor(as, tpl, rn, "host")
 
-		hIf := &model.Iface{Device: hostDev, Name: hostIface, Role: model.RoleHostLink, Addr4: hostAddr, Owner: owner}
-		rIf := &model.Iface{Device: r, Name: "host", Role: model.RoleHostLink, Addr4: routerAddr, Owner: owner}
+		hIf := &model.Iface{Device: hostDev, Name: hostIface, Role: model.RoleHostLink,
+			Addr4: hostAddr, Owner: owner, Prescribed: true, Subnet: subnet}
+		rIf := &model.Iface{Device: r, Name: "host", Role: model.RoleHostLink,
+			Addr4: routerAddr, Owner: owner, Prescribed: true, Subnet: subnet}
 		hostDev.AddIface(hIf)
 		r.AddIface(rIf)
 		e.link(hIf, rIf, model.LinkVeth, e.lab.LinkDefaults, subnet, owner)
@@ -312,11 +311,13 @@ func (e *expander) expandOneAS(asn int, spec model.ASSpec) error {
 		}
 		aAddr, bAddr := hostPair(subnet)
 		owner := e.ownerFor(as, tpl, il.A, "intra")
-		aIf := &model.Iface{Device: a, Name: "port_" + il.B, Role: model.RoleIntraAS, Addr4: aAddr, Owner: owner}
-		bIf := &model.Iface{Device: b, Name: "port_" + il.A, Role: model.RoleIntraAS, Addr4: bAddr, Owner: owner}
+		aIf := &model.Iface{Device: a, Name: "port_" + il.B, Role: model.RoleIntraAS,
+			Addr4: aAddr, Owner: owner, Prescribed: true, Subnet: subnet}
+		bIf := &model.Iface{Device: b, Name: "port_" + il.A, Role: model.RoleIntraAS,
+			Addr4: bAddr, Owner: owner, Prescribed: true, Subnet: subnet}
 		a.AddIface(aIf)
 		b.AddIface(bIf)
-		e.link(aIf, bIf, model.LinkVeth, il.LinkProps.Merge(e.lab.LinkDefaults), subnet, owner)
+		e.link(aIf, bIf, model.LinkVeth, il.Merge(e.lab.LinkDefaults), subnet, owner)
 	}
 
 	// Layer-2 domains.
@@ -376,6 +377,16 @@ func (e *expander) expandL2Domain(as *model.AS, tpl *model.ASTemplate, routers m
 	sw[uplinkSwitch].AddIface(swUplink)
 	e.link(gwIf, swUplink, model.LinkVeth, e.lab.LinkDefaults, "", model.OwnerPlatform)
 
+	// The datacentre's own prefix, which the assignment does mandate.
+	domSubnet := ""
+	if e.plan.Has(ipam.FieldL2Domain) {
+		v, err := e.plan.Eval(ipam.FieldL2Domain, ipam.Ctx{AS: as.ASN, L2ID: dom.ID})
+		if err != nil {
+			return err
+		}
+		domSubnet = v
+	}
+
 	// Router-side VLAN sub-interfaces carry the L3 gateway addresses.
 	for vi, v := range vlans {
 		sub := &model.Iface{
@@ -385,6 +396,10 @@ func (e *expander) expandL2Domain(as *model.AS, tpl *model.ASTemplate, routers m
 			VLAN:   v,
 			Role:   model.RoleL2SubIface,
 			Owner:  e.ownerFor(as, tpl, dom.Gateway, "l2"),
+			// The assignment names the datacentre's prefix but lets students
+			// choose addresses inside it, so only the subnet is graded.
+			Prescribed: false,
+			Subnet:     domSubnet,
 		}
 		if e.plan.Has(ipam.FieldL2VLAN) {
 			s, err := e.plan.Eval(ipam.FieldL2VLAN, ipam.Ctx{AS: as.ASN, L2ID: dom.ID, VLAN: v, VLANIndex: vi})
@@ -421,7 +436,7 @@ func (e *expander) expandL2Domain(as *model.AS, tpl *model.ASTemplate, routers m
 			Owner: e.ownerFor(as, tpl, sl.B, "l2")}
 		a.AddIface(aIf)
 		b.AddIface(bIf)
-		e.link(aIf, bIf, model.LinkVeth, sl.LinkProps.Merge(e.lab.LinkDefaults), "", model.OwnerPlatform)
+		e.link(aIf, bIf, model.LinkVeth, sl.Merge(e.lab.LinkDefaults), "", model.OwnerPlatform)
 	}
 
 	// L2 hosts in access VLANs.
@@ -445,7 +460,8 @@ func (e *expander) expandL2Domain(as *model.AS, tpl *model.ASTemplate, routers m
 		d := e.newDevice(as, hn, model.KindHost, h.DeviceDefaults)
 		d.L2Domain = name
 		owner := e.ownerFor(as, tpl, hn, "l2")
-		hIf := &model.Iface{Device: d, Name: h.Switch, Role: model.RoleL2Access, VLAN: h.VLAN, Owner: owner}
+		hIf := &model.Iface{Device: d, Name: h.Switch, Role: model.RoleL2Access,
+			VLAN: h.VLAN, Owner: owner, Prescribed: false, Subnet: domSubnet}
 		// Record the expected address so the reference solution can apply it
 		// and the grader can check it, even though the student types it in.
 		if vi, ok := vlanIndex[h.VLAN]; ok {
@@ -548,7 +564,12 @@ func (e *expander) expandOnePeering(pl model.PeeringLink) error {
 	idx := e.interASIndex[pl.Key()]
 	subnet := pl.Subnet
 	if subnet == "" {
-		s, err := e.plan.Eval(ipam.FieldInterAS, ipam.Ctx{AS: pl.A, PeerAS: pl.B, LinkIndex: idx})
+		lo, hi := pl.A, pl.B
+		if lo > hi {
+			lo, hi = hi, lo
+		}
+		s, err := e.plan.Eval(ipam.FieldInterAS, ipam.Ctx{
+			AS: pl.A, PeerAS: pl.B, Low: lo, High: hi, LinkIndex: idx})
 		if err != nil {
 			return err
 		}
@@ -566,12 +587,16 @@ func (e *expander) expandOnePeering(pl model.PeeringLink) error {
 
 	aName := extIfaceName(bAS, pl.B, bR.Name)
 	bName := extIfaceName(aAS, pl.A, aR.Name)
-	aIf := &model.Iface{Device: aR, Name: aName, Role: model.RoleInterAS, Addr4: aAddr, Owner: ownerOf(aAS, owner)}
-	bIf := &model.Iface{Device: bR, Name: bName, Role: model.RoleInterAS, Addr4: bAddr, Owner: ownerOf(bAS, owner)}
+	// Two groups agree the exact addresses between themselves, so only the
+	// subnet is mandated on an ordinary inter-AS link.
+	aIf := &model.Iface{Device: aR, Name: aName, Role: model.RoleInterAS,
+		Addr4: aAddr, Owner: ownerOf(aAS, owner), Prescribed: false, Subnet: subnet}
+	bIf := &model.Iface{Device: bR, Name: bName, Role: model.RoleInterAS,
+		Addr4: bAddr, Owner: ownerOf(bAS, owner), Prescribed: false, Subnet: subnet}
 	aR.AddIface(aIf)
 	bR.AddIface(bIf)
 
-	l := e.link(aIf, bIf, model.LinkVeth, pl.LinkProps.Merge(e.lab.LinkDefaults), subnet, owner)
+	l := e.link(aIf, bIf, model.LinkVeth, pl.Merge(e.lab.LinkDefaults), subnet, owner)
 	l.InterAS = true
 	l.Rel = pl.Rel
 	return nil
