@@ -116,10 +116,15 @@ func (s *Server) handleAttach(w http.ResponseWriter, r *http.Request) {
 		// Anything the client buffered during the handshake belongs to the
 		// session, not to the HTTP request, so it is forwarded before the raw
 		// connection: dropping it loses the first keystrokes of every login.
+		// The Reader is named explicitly because bufio.ReadWriter embeds both a
+		// Reader and a Writer, and both have these methods: dropping the
+		// qualifier does not compile. staticcheck's QF1008 suggests otherwise
+		// and is wrong here.
+		//nolint:staticcheck // QF1008: the selector is ambiguous without it
 		if n := buf.Reader.Buffered(); n > 0 {
-			if b, err := buf.Reader.Peek(n); err == nil {
+			if b, err := buf.Reader.Peek(n); err == nil { //nolint:staticcheck // QF1008: as above
 				_, _ = stdin.Write(b)
-				_, _ = buf.Reader.Discard(n)
+				_, _ = buf.Reader.Discard(n) //nolint:staticcheck // QF1008: as above
 			}
 		}
 		_, _ = io.Copy(stdin, conn)

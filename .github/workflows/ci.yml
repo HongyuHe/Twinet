@@ -1,9 +1,20 @@
 name: CI
 
+# Disabled on push and pull request, by request, while the implementation is
+# moving faster than the hosted runners are useful for.
+#
+# The gates themselves are not disabled and have not been weakened: `make ci`
+# runs exactly what this workflow runs -- build, vet, race tests, golangci-lint
+# including its config verification, shellcheck, the naming check and manifest
+# validation -- and it is run before every commit. Re-enable by restoring the
+# push and pull_request triggers below; nothing else needs to change.
+#
+# on:
+#   push:
+#     branches: [main]
+#   pull_request:
 on:
-  push:
-    branches: [main]
-  pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
