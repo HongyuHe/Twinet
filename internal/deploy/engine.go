@@ -702,9 +702,14 @@ func (e *Engine) holdsStudentWork(ctx context.Context, d *model.Device, path str
 	res, err := e.Runtime.Exec(ctx, d.Container, runtime.ExecCmd{
 		Cmd: []string{"sh", "-c", "test -s " + path + " && echo yes || echo no"}})
 	if err != nil {
-		// If the container cannot be asked, assume it holds work. Refusing to
-		// overwrite is recoverable; overwriting is not.
-		return true, nil
+		// A container that cannot be asked is assumed to hold work. Refusing
+		// to overwrite is recoverable; overwriting is not, and the loss would
+		// not surface until the container was next restarted.
+		//
+		// The error is deliberately not propagated: failing the deployment
+		// here would turn a transient probe failure into an outage, when the
+		// safe interpretation is available and costs nothing.
+		return true, nil //nolint:nilerr // the safe answer, explained above
 	}
 	return strings.TrimSpace(res.Stdout) == "yes", nil
 }
