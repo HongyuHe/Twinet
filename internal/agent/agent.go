@@ -27,6 +27,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -117,17 +118,30 @@ type Server struct {
 	store   *state.Store
 	started time.Time
 
-	mu      sync.Mutex
-	current *model.Topology
+	mu sync.Mutex
+	// current is the last topology applied, per lab. One node may host several
+	// labs at once -- a class lab beside a harness per submission being graded
+	// -- and a single slot would make each new deployment forget the previous
+	// one, so a later destroy could no longer capture the work it holds.
+	current map[string]*model.Topology
 
-	// opMu serialises mutating operations on a lab. Docker inspect-then-create
-	// and netlink lookup-then-add are check-then-act sequences: two overlapping
-	// applies, or an apply racing a destroy, can otherwise wire a container
-	// that another request has just replaced.
-	opMu   sync.Mutex
-	opLab  string
-	opKind string
-	opAt   time.Time
+	// ops holds one lease per lab. Docker inspect-then-create and netlink
+	// lookup-then-add are check-then-act sequences, so two overlapping applies
+	// to the same lab can wire a container another request has just replaced.
+	//
+	// The lease is per lab rather than per node because that is the true scope
+	// of the race: container names and overlay device names are both derived
+	// from the lab name, so operations on different labs touch disjoint
+	// objects. A node-wide lease would be correct but would also serialise the
+	// whole cluster, which is exactly what makes grading a class one submission
+	// at a time instead of many.
+	ops map[string]*lease
+}
+
+// lease records an in-flight mutating operation on one lab.
+type lease struct {
+	kind string
+	at   time.Time
 }
 
 // New constructs an agent.
@@ -139,7 +153,11 @@ func New(cfg Config) (*Server, error) {
 	if _, err := engine.Ping(context.Background()); err != nil {
 		return nil, fmt.Errorf("cannot reach the container engine: %w", err)
 	}
-	srv := &Server{cfg: cfg, rt: engine, started: time.Now()}
+	srv := &Server{
+		cfg: cfg, rt: engine, started: time.Now(),
+		current: map[string]*model.Topology{},
+		ops:     map[string]*lease{},
+	}
 	if cfg.StateDir != "" {
 		st, err := state.Open(cfg.StateDir)
 		if err != nil {
@@ -150,27 +168,35 @@ func New(cfg Config) (*Server, error) {
 	return srv, nil
 }
 
-// acquire takes the per-node operation lease, refusing rather than queueing so
-// a caller learns immediately that something else is mid-flight.
+// renderer builds the configuration renderer for one apply.
+func renderer(top *model.Topology, mode render.Mode, ungraded int) *render.Renderer {
+	if ungraded != 0 {
+		return render.NewHarness(top, ungraded)
+	}
+	return render.New(top, mode)
+}
+
+// acquire takes the operation lease for one lab, refusing rather than queueing
+// so a caller learns immediately that something else is mid-flight on that lab.
+// Operations on other labs are unaffected.
 func (s *Server) acquire(lab, kind string) error {
-	if !s.opMu.TryLock() {
-		s.mu.Lock()
-		inflight := fmt.Sprintf("%s on lab %q, started %s ago",
-			s.opKind, s.opLab, time.Since(s.opAt).Round(time.Second))
-		s.mu.Unlock()
-		return fmt.Errorf("another operation is already running on this node: %s", inflight)
+	if lab == "" {
+		return errors.New("an operation must name the lab it acts on")
 	}
 	s.mu.Lock()
-	s.opLab, s.opKind, s.opAt = lab, kind, time.Now()
-	s.mu.Unlock()
+	defer s.mu.Unlock()
+	if held, ok := s.ops[lab]; ok {
+		return fmt.Errorf("another operation is already running on lab %q: %s, started %s ago",
+			lab, held.kind, time.Since(held.at).Round(time.Second))
+	}
+	s.ops[lab] = &lease{kind: kind, at: time.Now()}
 	return nil
 }
 
-func (s *Server) release() {
+func (s *Server) release(lab string) {
 	s.mu.Lock()
-	s.opLab, s.opKind = "", ""
+	delete(s.ops, lab)
 	s.mu.Unlock()
-	s.opMu.Unlock()
 }
 
 // Serve runs the HTTP API until the context is cancelled.
@@ -271,6 +297,11 @@ type StatusResponse struct {
 	Containers  int    `json:"containers"`
 	Lab         string `json:"lab,omitempty"`
 	Hash        string `json:"topology_hash,omitempty"`
+	// Labs is every lab this node currently hosts, and Busy every lab with an
+	// operation in flight. A node that hosts a class lab and a dozen grading
+	// harnesses at once cannot be described by a single name.
+	Labs []string `json:"labs,omitempty"`
+	Busy []string `json:"busy,omitempty"`
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -292,9 +323,22 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		Containers:  len(cs),
 	}
 	s.mu.Lock()
-	if s.current != nil {
-		resp.Lab, resp.Hash = s.current.Name, s.current.Hash
+	labs := make([]string, 0, len(s.current))
+	for name := range s.current {
+		labs = append(labs, name)
 	}
+	sort.Strings(labs)
+	if len(labs) > 0 {
+		resp.Lab = strings.Join(labs, ",")
+		resp.Hash = s.current[labs[0]].Hash
+	}
+	resp.Labs = labs
+	busy := make([]string, 0, len(s.ops))
+	for lab, l := range s.ops {
+		busy = append(busy, fmt.Sprintf("%s:%s", lab, l.kind))
+	}
+	sort.Strings(busy)
+	resp.Busy = busy
 	s.mu.Unlock()
 	writeJSON(w, resp)
 }
@@ -318,6 +362,11 @@ type ApplyRequest struct {
 	Topology     *Wire             `json:"topology"`
 	Mode         string            `json:"mode"`
 	PullPolicy   string            `json:"pull_policy"`
+	// Ungraded names the one AS that keeps platform mode while the rest of the
+	// lab is rendered with the reference solution. It is how a grading harness
+	// surrounds a submission with a correct internet without also configuring
+	// the work being marked.
+	Ungraded int `json:"ungraded_as,omitempty"`
 	Workers      int               `json:"workers"`
 	DryRun       bool              `json:"dry_run"`
 	PeerUnderlay map[string]string `json:"peer_underlay"`
@@ -361,7 +410,7 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusConflict, err)
 		return
 	}
-	defer s.release()
+	defer s.release(top.Name)
 
 	mode := render.Mode(req.Mode)
 	if mode == "" {
@@ -371,7 +420,7 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		Runtime:      s.rt,
 		Node:         s.cfg.Node,
 		PullPolicy:   rt.PullPolicy(req.PullPolicy),
-		Renderer:     render.New(top, mode),
+		Renderer:     renderer(top, mode, req.Ungraded),
 		UnderlayIP:   s.cfg.UnderlayIP,
 		UnderlayDev:  s.cfg.UnderlayDev,
 		PeerUnderlay: req.PeerUnderlay,
@@ -402,7 +451,7 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mu.Lock()
-	s.current = top
+	s.current[top.Name] = top
 	s.mu.Unlock()
 
 	resp := ApplyResponse{
@@ -455,6 +504,11 @@ type DestroyRequest struct {
 	// AllOverlays removes every Twinet overlay on the node, which is how a lab
 	// is cleaned up when its manifest is no longer available.
 	AllOverlays bool `json:"all_overlays,omitempty"`
+	// Ephemeral marks a lab whose state is worthless and must not outlive it,
+	// such as a grading harness. Snapshots are discarded rather than kept, so
+	// a later lab of the same name starts from the manifest and not from
+	// whatever the previous run happened to leave behind.
+	Ephemeral bool `json:"ephemeral,omitempty"`
 }
 
 func (s *Server) handleDestroy(w http.ResponseWriter, r *http.Request) {
@@ -471,17 +525,17 @@ func (s *Server) handleDestroy(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusConflict, err)
 		return
 	}
-	defer s.release()
+	defer s.release(req.Lab)
 
 	eng := &deploy.Engine{Runtime: s.rt, Node: s.cfg.Node, State: s.store}
 
 	// Destroying a lab must not lose a class's work: everything is captured
 	// first, and refusing is better than proceeding blind.
-	if s.store != nil && !req.Force {
+	if s.store != nil && !req.Force && !req.Ephemeral {
 		s.mu.Lock()
-		top := s.current
+		top := s.current[req.Lab]
 		s.mu.Unlock()
-		if top != nil && top.Name == req.Lab {
+		if top != nil {
 			if n, err := eng.CaptureAll(r.Context(), top, s.store); err != nil {
 				httpError(w, http.StatusConflict, fmt.Errorf(
 					"refusing to destroy %s: student configuration could not be captured (%w); "+
@@ -512,8 +566,13 @@ func (s *Server) handleDestroy(w http.ResponseWriter, r *http.Request) {
 			slog.Warn("overlay cleanup incomplete", "err", err)
 		}
 	}
+	if req.Ephemeral && s.store != nil {
+		if err := s.store.Forget(req.Lab); err != nil {
+			slog.Warn("discarding ephemeral lab state", "lab", req.Lab, "err", err)
+		}
+	}
 	s.mu.Lock()
-	s.current = nil
+	delete(s.current, req.Lab)
 	s.mu.Unlock()
 	writeJSON(w, map[string]string{"status": "destroyed", "lab": req.Lab})
 }

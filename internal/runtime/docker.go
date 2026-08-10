@@ -66,6 +66,11 @@ func (d *Docker) ImageExists(ctx context.Context, ref string) (bool, error) {
 }
 
 // PullImage fetches an image according to the policy.
+//
+// An unrecognised policy is an error rather than a fallback to pulling. A typo
+// that silently means "always" turns a lab built from local images into one
+// that contacts a registry, and the failure surfaces far from its cause: as a
+// pull denied for an image that is sitting on the machine already.
 func (d *Docker) PullImage(ctx context.Context, ref string, policy PullPolicy) error {
 	switch policy {
 	case PullNever:
@@ -75,6 +80,10 @@ func (d *Docker) PullImage(ctx context.Context, ref string, policy PullPolicy) e
 		if ok {
 			return nil
 		}
+	case PullAlways:
+	default:
+		return fmt.Errorf("unknown pull policy %q; use %q, %q or %q",
+			policy, PullIfMissing, PullAlways, PullNever)
 	}
 	_, err := d.mustRun(ctx, "pull", "--quiet", ref)
 	return err

@@ -51,7 +51,7 @@ func Capture(ctx context.Context, r rt.Runtime, d *model.Device, lab, topoHash s
 	case model.KindRouter:
 		res, err := r.Exec(ctx, d.Container, rt.ExecCmd{Cmd: []string{"vtysh", "-c", "show running-config"}})
 		if err == nil && res.ExitCode == 0 {
-			add(state.KindFRR, res.Stdout)
+			add(state.KindFRR, cleanRunningConfig(res.Stdout))
 		}
 		// Tunnels are configured with ip(8) rather than through FRR, so they
 		// are captured separately or the 6in4 exercise would be lost.
@@ -123,6 +123,28 @@ func (e *Engine) CaptureAll(ctx context.Context, top *model.Topology, store *sta
 	return saved, nil
 }
 
+// cleanRunningConfig strips the preamble vtysh prints before a configuration.
+//
+// "show running-config" begins with "Building configuration..." and a
+// "Current configuration:" banner, which are not configuration and which vtysh
+// itself rejects when the text is fed back in. Capturing them means every
+// restore fails on its first line, and the failure appears only later, when a
+// container is replaced and a class's work is due to be replayed into it.
+func cleanRunningConfig(out string) string {
+	lines := strings.Split(out, "\n")
+	start := 0
+	for i, l := range lines {
+		t := strings.TrimSpace(l)
+		if t == "" || strings.HasPrefix(t, "Building configuration") ||
+			strings.HasPrefix(t, "Current configuration") {
+			start = i + 1
+			continue
+		}
+		break
+	}
+	return strings.TrimRight(strings.Join(lines[start:], "\n"), "\n")
+}
+
 // Restore replays a device's captured configuration into a fresh container.
 func Restore(ctx context.Context, r rt.Runtime, d *model.Device, lab string, store *state.Store) (bool, error) {
 	if store == nil {
@@ -136,7 +158,13 @@ func Restore(ctx context.Context, r rt.Runtime, d *model.Device, lab string, sto
 			// The captured configuration is replayed through vtysh's own file
 			// loader, which is the same path `restore_configs` used and the
 			// only one that accepts a running-config verbatim.
-			if err := r.CopyTo(ctx, d.Container, "/etc/twinet/restore.conf", 0o600, snap.Content); err != nil {
+			//
+			// The preamble is stripped again on the way in, not only on the
+			// way out. Snapshots outlive the code that wrote them, and a
+			// snapshot taken by an older build must still restore rather than
+			// permanently fail every future deployment of that device.
+			body := []byte(cleanRunningConfig(string(snap.Content)) + "\n")
+			if err := r.CopyTo(ctx, d.Container, "/etc/twinet/restore.conf", 0o600, body); err != nil {
 				return false, fmt.Errorf("copy saved configuration into %s: %w", d.ID, err)
 			}
 			res, err := r.Exec(ctx, d.Container, rt.ExecCmd{

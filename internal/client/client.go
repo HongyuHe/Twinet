@@ -154,6 +154,12 @@ func (n *Node) Destroy(ctx context.Context, lab string, vnis []uint32) error {
 		agent.DestroyRequest{Lab: lab, VNIs: vnis}, nil)
 }
 
+// DestroyEphemeral removes a disposable lab and discards its saved state.
+func (n *Node) DestroyEphemeral(ctx context.Context, lab string, vnis []uint32) error {
+	return n.do(ctx, http.MethodPost, "/v1/destroy",
+		agent.DestroyRequest{Lab: lab, VNIs: vnis, Ephemeral: true}, nil)
+}
+
 // Exec runs a command in a container on the node.
 func (n *Node) Exec(ctx context.Context, req agent.ExecRequest) (agent.ExecResponse, error) {
 	var resp agent.ExecResponse
@@ -267,6 +273,14 @@ func (c *Cluster) Apply(ctx context.Context, top *model.Topology, req agent.Appl
 func (c *Cluster) Destroy(ctx context.Context, lab string, vnis []uint32) []NodeResult[struct{}] {
 	return fanOut(ctx, c.Nodes, func(ctx context.Context, n *Node) (struct{}, error) {
 		return struct{}{}, n.Destroy(ctx, lab, vnis)
+	})
+}
+
+// DestroyEphemeral removes a disposable lab from every node and discards its
+// saved state, so a lab of the same name later starts from the manifest.
+func (c *Cluster) DestroyEphemeral(ctx context.Context, lab string, vnis []uint32) []NodeResult[struct{}] {
+	return fanOut(ctx, c.Nodes, func(ctx context.Context, n *Node) (struct{}, error) {
+		return struct{}{}, n.DestroyEphemeral(ctx, lab, vnis)
 	})
 }
 

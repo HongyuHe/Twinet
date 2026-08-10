@@ -30,9 +30,32 @@ const (
 type Renderer struct {
 	Top  *model.Topology
 	Mode Mode
+	// Ungraded, when non-zero, is the one AS that keeps the platform's own
+	// mode while every other AS is rendered with the reference solution.
+	//
+	// This is what a grading harness needs. The surrounding internet must be
+	// correct, or the submission is marked against neighbours that never
+	// brought a session up; the AS under test must be left exactly as the
+	// student submitted it, or the reference solution would be marked instead
+	// of their work.
+	Ungraded int
 }
 
 // New creates a renderer.
+// NewHarness renders the reference solution everywhere except one AS, which is
+// left to the configuration its owner submitted.
+func NewHarness(top *model.Topology, ungraded int) *Renderer {
+	return &Renderer{Top: top, Mode: ModeSolve, Ungraded: ungraded}
+}
+
+// modeFor returns the rendering mode that applies to one device.
+func (r *Renderer) modeFor(d *model.Device) Mode {
+	if r.Ungraded != 0 && d != nil && d.ASN == r.Ungraded {
+		return ModePlatform
+	}
+	return r.Mode
+}
+
 func New(top *model.Topology, mode Mode) *Renderer {
 	if mode == "" {
 		mode = ModePlatform
@@ -50,7 +73,7 @@ func (r *Renderer) Files(d *model.Device) (map[string]deploy.FileSpec, error) {
 			return nil, err
 		}
 		body := cfg.Platform
-		if r.Mode == ModeSolve {
+		if r.modeFor(d) == ModeSolve {
 			body = cfg.Platform + cfg.Expected
 		}
 		out["/etc/frr/daemons"] = deploy.FileSpec{Content: []byte(FRRDaemons), Mode: 0o640}
@@ -98,7 +121,7 @@ func (r *Renderer) routerCommands(d *model.Device) []deploy.Command {
 		})
 	}
 
-	if r.Mode == ModeSolve {
+	if r.modeFor(d) == ModeSolve {
 		cmds = append(cmds, r.tunnelSolution(d)...)
 	}
 
@@ -143,7 +166,7 @@ func (r *Renderer) switchCommands(d *model.Device) []deploy.Command {
 			Describe: "attach port " + i.Name,
 		})
 	}
-	if r.Mode == ModeSolve {
+	if r.modeFor(d) == ModeSolve {
 		cmds = append(cmds, r.switchSolution(d, br)...)
 	}
 	return cmds
@@ -269,12 +292,12 @@ func (r *Renderer) hostCommands(d *model.Device) []deploy.Command {
 		}
 	}
 	for _, i := range d.Ifaces {
-		if i.Owner == model.OwnerPlatform || r.Mode == ModeSolve {
+		if i.Owner == model.OwnerPlatform || r.modeFor(d) == ModeSolve {
 			apply(i)
 		}
 	}
 	// An L2 host's default gateway is its datacentre's router.
-	if r.Mode == ModeSolve && d.L2Domain != "" {
+	if r.modeFor(d) == ModeSolve && d.L2Domain != "" {
 		if gw4, gw6 := r.l2Gateway(d); gw4 != "" {
 			cmds = append(cmds, deploy.Command{
 				Args:        []string{"sh", "-c", fmt.Sprintf("ip route replace default via %s || true", gw4)},
@@ -293,7 +316,7 @@ func (r *Renderer) hostCommands(d *model.Device) []deploy.Command {
 	}
 
 	// A host's default route points at its attached router.
-	if r.Mode == ModeSolve || d.Kind == model.KindService {
+	if r.modeFor(d) == ModeSolve || d.Kind == model.KindService {
 		for _, i := range d.Ifaces {
 			if i.Peer == nil || i.Peer.Addr4 == "" {
 				continue

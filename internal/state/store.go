@@ -202,6 +202,20 @@ func (s *Store) Devices(lab string) ([]string, error) {
 }
 
 // Prune keeps the newest n snapshots of each artefact and removes the rest.
+// Forget removes every snapshot belonging to a lab.
+//
+// It exists for disposable labs. A grading harness is created, marked and
+// destroyed, and its snapshots must not survive: a later run under the same
+// name would replay the previous run's configuration into a fresh container
+// and mark a student on work they did not submit this time.
+func (s *Store) Forget(lab string) error {
+	dir := filepath.Join(s.root, safe(lab))
+	if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return os.RemoveAll(dir)
+}
+
 func (s *Store) Prune(lab string, keep int) (int, error) {
 	if keep < 1 {
 		keep = 1
