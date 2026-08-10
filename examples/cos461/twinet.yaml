@@ -42,7 +42,13 @@ link_defaults:
   bandwidth: 10mbit
   delay: 10ms
   queue: 50ms
-  mtu: 1500
+  # Every cross-node link is carried in a VXLAN tunnel, which adds 50 bytes.
+  # This cluster's fabric does not accept jumbo frames, so the lab MTU is set
+  # 50 below the 1500 byte underlay. It is applied to *every* link, local ones
+  # included, so a student's network behaves identically no matter which
+  # machine their AS happens to be scheduled onto.
+  # `twinet node check` verifies this against the live underlay before deploying.
+  mtu: 1450
 
 # The addressing plan. This is the single definition of every subnet in the
 # lab; the assignment text, the DNS zones, the grader and `twinet solve` all
@@ -116,6 +122,8 @@ access:
   legacy_ports: {enabled: true, base: 2000}
 
 placement:
-  strategy: single-node
+  strategy: pack-by-as
   nodes:
-    - {name: node-0, underlay_ip: 10.0.1.1, front: true}
+    - {name: node-0, addr: "10.0.1.1:7200", underlay_ip: 10.0.1.1, front: true}
+    - {name: node-1, addr: "10.0.1.2:7200", underlay_ip: 10.0.1.2}
+    - {name: node-2, addr: "10.0.1.3:7200", underlay_ip: 10.0.1.3}

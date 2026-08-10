@@ -723,3 +723,23 @@ func (l *Lab) String() string {
 func (p LinkProps) Empty() bool {
 	return p.Bandwidth == "" && p.Delay == "" && p.Queue == "" && p.Loss == ""
 }
+
+// Equal compares two LinkProps by value.
+//
+// LinkProps holds MTU as a pointer so that "unset" is distinguishable from
+// "explicitly zero", which makes the compiler's == compare addresses rather
+// than values. Anything comparing shaping must use this.
+func (p LinkProps) Equal(o LinkProps) bool {
+	if p.Bandwidth != o.Bandwidth || p.Delay != o.Delay ||
+		p.Queue != o.Queue || p.Loss != o.Loss {
+		return false
+	}
+	switch {
+	case p.MTU == nil && o.MTU == nil:
+		return true
+	case p.MTU == nil || o.MTU == nil:
+		return false
+	default:
+		return *p.MTU == *o.MTU
+	}
+}

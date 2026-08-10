@@ -104,6 +104,9 @@ func EnsureOverlay(spec OverlaySpec) (string, error) {
 			if err := netlink.LinkSetUp(existing); err != nil {
 				return "", fmt.Errorf("overlay VNI %d: set %s up: %w", spec.VNI, vxName, err)
 			}
+			if err := reconcileDefaultFDB(vx, remote); err != nil {
+				return "", err
+			}
 			return brName, nil
 		}
 	} else if !IsNotFound(err) {
@@ -131,29 +134,83 @@ func EnsureOverlay(spec OverlaySpec) (string, error) {
 		return "", fmt.Errorf("overlay VNI %d: set %s up: %w", spec.VNI, vxName, err)
 	}
 
-	// With learning disabled we install the one forwarding entry the link needs:
-	// "everything unknown goes to the peer VTEP".
-	if err := ensureDefaultFDB(vx, remote); err != nil {
+	if err := reconcileDefaultFDB(vx, remote); err != nil {
 		return "", err
 	}
 	return brName, nil
 }
 
-// ensureDefaultFDB installs the all-zero MAC entry that forwards unknown and
-// broadcast traffic to the single remote VTEP.
-func ensureDefaultFDB(vx *netlink.Vxlan, remote net.IP) error {
-	entry := &netlink.Neigh{
-		LinkIndex:    vx.Attrs().Index,
-		Family:       syscall.AF_BRIDGE,
-		State:        netlink.NUD_PERMANENT,
-		Flags:        netlink.NTF_SELF,
-		IP:           remote,
-		HardwareAddr: net.HardwareAddr{0, 0, 0, 0, 0, 0},
+// reconcileDefaultFDB makes sure the tunnel has exactly one default forwarding
+// entry, pointing at the intended peer.
+//
+// Creating a VXLAN device with a unicast remote already installs the all-zeros
+// entry that sends unknown and broadcast traffic to that peer, so appending
+// another produces *two* copies of every flooded frame. That is a genuinely
+// nasty bug in a teaching platform: students would see duplicate ICMP replies
+// and inexplicable traceroute output, and would reasonably conclude they had
+// misconfigured something.
+//
+// The entries are therefore reconciled rather than appended: strays left by an
+// earlier version or by a peer that moved to another node are removed, and one
+// is added only if the kernel has not already provided it.
+func reconcileDefaultFDB(vx *netlink.Vxlan, remote net.IP) error {
+	zero := net.HardwareAddr{0, 0, 0, 0, 0, 0}
+	entries, err := netlink.NeighList(vx.Attrs().Index, syscall.AF_BRIDGE)
+	if err != nil {
+		return fmt.Errorf("vxlan %s: list forwarding entries: %w", vx.Name, err)
 	}
-	if err := netlink.NeighAppend(entry); err != nil && !isExist(err) {
-		return fmt.Errorf("vxlan %s: add forwarding entry for %s: %w", vx.Name, remote, err)
+
+	correct := 0
+	for i := range entries {
+		e := entries[i]
+		if !bytesEqual(e.HardwareAddr, zero) {
+			continue
+		}
+		if e.IP != nil && e.IP.Equal(remote) {
+			correct++
+			if correct > 1 {
+				// A duplicate: remove it, or every broadcast is replicated.
+				e.Flags = netlink.NTF_SELF
+				if err := netlink.NeighDel(&e); err != nil {
+					return fmt.Errorf("vxlan %s: remove duplicate forwarding entry: %w", vx.Name, err)
+				}
+				correct--
+			}
+			continue
+		}
+		// Points somewhere else entirely: the peer moved.
+		e.Flags = netlink.NTF_SELF
+		if err := netlink.NeighDel(&e); err != nil {
+			return fmt.Errorf("vxlan %s: remove stale forwarding entry for %s: %w", vx.Name, e.IP, err)
+		}
+	}
+
+	if correct == 0 {
+		entry := &netlink.Neigh{
+			LinkIndex:    vx.Attrs().Index,
+			Family:       syscall.AF_BRIDGE,
+			State:        netlink.NUD_PERMANENT,
+			Flags:        netlink.NTF_SELF,
+			IP:           remote,
+			HardwareAddr: zero,
+		}
+		if err := netlink.NeighAppend(entry); err != nil && !isExist(err) {
+			return fmt.Errorf("vxlan %s: add forwarding entry for %s: %w", vx.Name, remote, err)
+		}
 	}
 	return nil
+}
+
+func bytesEqual(a, b net.HardwareAddr) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // ensureBridge creates a bridge if absent and returns it.

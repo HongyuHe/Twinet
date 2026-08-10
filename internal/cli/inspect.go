@@ -3,6 +3,7 @@ package cli
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"sort"
 	"strings"
@@ -80,14 +81,18 @@ func newInspectCmd(opts *Options) *cobra.Command {
 		showAddr    bool
 		filterAS    int
 		filterOwner string
+		showPlace   bool
 	)
 	cmd := &cobra.Command{
 		Use:   "inspect",
 		Short: "Show the expanded topology",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			top, err := load(opts)
+			top, err := loadAndPlace(opts)
 			if err != nil {
 				return err
+			}
+			if showPlace {
+				return writePlacement(cmd.OutOrStdout(), top)
 			}
 			if opts.JSON {
 				return emitJSON(cmd.OutOrStdout(), top, showLinks, showIfaces)
@@ -164,7 +169,51 @@ func newInspectCmd(opts *Options) *cobra.Command {
 	cmd.Flags().BoolVar(&showAddr, "addresses", false, "also list interface addresses")
 	cmd.Flags().IntVar(&filterAS, "as", 0, "restrict output to one AS")
 	cmd.Flags().StringVar(&filterOwner, "owner", "", "restrict output to one owner group")
+	cmd.Flags().BoolVar(&showPlace, "placement", false, "show how ASes are distributed across nodes")
 	return cmd
+}
+
+// writePlacement shows which node each AS landed on and how many links have to
+// cross the fabric, which is the number that matters when judging whether a
+// placement is good.
+func writePlacement(out io.Writer, top *model.Topology) error {
+	byNode := map[string][]int{}
+	for _, asn := range top.SortedASNs() {
+		as := top.ASes[asn]
+		if len(as.Devices) == 0 {
+			continue
+		}
+		byNode[as.Devices[0].Node] = append(byNode[as.Devices[0].Node], asn)
+	}
+	counts := map[string]int{}
+	for _, d := range top.Devices {
+		counts[d.Node]++
+	}
+	nodes := make([]string, 0, len(counts))
+	for n := range counts {
+		nodes = append(nodes, n)
+	}
+	sort.Strings(nodes)
+
+	w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "NODE\tCONTAINERS\tASES\tWHICH")
+	for _, n := range nodes {
+		fmt.Fprintf(w, "%s\t%d\t%d\t%v\n", n, counts[n], len(byNode[n]), byNode[n])
+	}
+	if err := w.Flush(); err != nil {
+		return err
+	}
+	s := top.Stats()
+	fmt.Fprintf(out, "\n%d of %d links cross the fabric (%.1f%%); %d inter-AS links in total\n",
+		s.CrossNode, s.Links, 100*float64(s.CrossNode)/float64(max(1, s.Links)), s.InterAS)
+	return nil
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func newGraphCmd(opts *Options) *cobra.Command {
@@ -176,7 +225,7 @@ func newGraphCmd(opts *Options) *cobra.Command {
 		Use:   "graph",
 		Short: "Render the topology as a graph",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			top, err := load(opts)
+			top, err := loadAndPlace(opts)
 			if err != nil {
 				return err
 			}

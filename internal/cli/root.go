@@ -47,6 +47,7 @@ across a cluster and graded automatically.`,
 		newDestroyCmd(opts),
 		newExecCmd(opts),
 		newGraphCmd(opts),
+		newNodeCmd(opts),
 		newVersionCmd(),
 	)
 	return root

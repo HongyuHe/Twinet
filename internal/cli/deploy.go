@@ -13,6 +13,8 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/HongyuHe/twinet/internal/agent"
+	"github.com/HongyuHe/twinet/internal/client"
 	"github.com/HongyuHe/twinet/internal/deploy"
 	"github.com/HongyuHe/twinet/internal/model"
 	"github.com/HongyuHe/twinet/internal/place"
@@ -29,6 +31,7 @@ func newDeployCmd(opts *Options) *cobra.Command {
 		pull    string
 		only    string
 		quiet   bool
+		token   string
 	)
 	cmd := &cobra.Command{
 		Use:   "deploy",
@@ -45,6 +48,19 @@ after a partial failure, a reboot, or a topology edit.`,
 				if err := restrict(top, only); err != nil {
 					return err
 				}
+			}
+
+			if clustered(top) {
+				tok, err := tokenFor(token)
+				if err != nil {
+					return err
+				}
+				return deployCluster(cmd.Context(), top, tok, agent.ApplyRequest{
+					Mode:       modeName(solve),
+					PullPolicy: pull,
+					Workers:    workers,
+					DryRun:     dryRun,
+				}, cmd.OutOrStdout(), cmd.ErrOrStderr())
 			}
 
 			rt := runtime.NewDocker()
@@ -113,14 +129,24 @@ after a partial failure, a reboot, or a topology edit.`,
 	cmd.Flags().StringVar(&pull, "pull", "if-missing", "image pull policy: if-missing, always, never")
 	cmd.Flags().StringVar(&only, "only", "", "restrict to a scope, e.g. as=12 or services")
 	cmd.Flags().BoolVarP(&quiet, "quiet", "q", false, "suppress per-step progress")
+	cmd.Flags().StringVar(&token, "token", "", "agent token for cluster deployments (or set TWINET_TOKEN)")
 	return cmd
+}
+
+// modeName maps the --solve flag onto the renderer's mode.
+func modeName(solve bool) string {
+	if solve {
+		return string(render.ModeSolve)
+	}
+	return string(render.ModePlatform)
 }
 
 func newDestroyCmd(opts *Options) *cobra.Command {
 	var (
-		yes  bool
-		lab  string
-		keep bool
+		yes   bool
+		lab   string
+		keep  bool
+		token string
 	)
 	cmd := &cobra.Command{
 		Use:   "destroy",
@@ -128,19 +154,49 @@ func newDestroyCmd(opts *Options) *cobra.Command {
 		Long: `Destroy works from container labels, so it can clean up a deployment even
 if the manifest that created it is no longer available.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			rt := runtime.NewDocker()
+			var top *model.Topology
 			name := lab
 			var vnis []uint32
 			if name == "" {
-				top, err := loadAndPlace(opts)
+				t, err := loadAndPlace(opts)
 				if err != nil {
 					return fmt.Errorf("%w\n(pass --lab NAME to destroy without a manifest)", err)
 				}
+				top = t
 				name = top.Name
 				for _, l := range top.Links {
 					vnis = append(vnis, l.VNI)
 				}
 			}
+
+			if top != nil && clustered(top) {
+				tok, err := tokenFor(token)
+				if err != nil {
+					return err
+				}
+				if !yes {
+					fmt.Fprintf(cmd.OutOrStdout(),
+						"about to remove lab %q from %d nodes; pass --yes to proceed\n",
+						name, len(top.Lab.Placement.Nodes))
+					return nil
+				}
+				c := client.NewCluster(top.Lab, tok)
+				var bad int
+				for _, r := range c.Destroy(cmd.Context(), name, vnis) {
+					if r.Err != nil {
+						bad++
+						fmt.Fprintf(cmd.ErrOrStderr(), "  %s: %v\n", r.Node, r.Err)
+					}
+				}
+				if bad > 0 {
+					return fmt.Errorf("%d node(s) failed to clean up", bad)
+				}
+				fmt.Fprintf(cmd.OutOrStdout(), "removed lab %q from %d nodes\n",
+					name, len(c.Nodes))
+				return nil
+			}
+
+			rt := runtime.NewDocker()
 			cs, err := rt.List(cmd.Context(), runtime.Filter{
 				All: true, Labels: map[string]string{deploy.LabelLab: name}})
 			if err != nil {
@@ -172,6 +228,7 @@ if the manifest that created it is no longer available.`,
 	cmd.Flags().BoolVarP(&yes, "yes", "y", false, "do not ask for confirmation")
 	cmd.Flags().StringVar(&lab, "lab", "", "lab name, when no manifest is available")
 	cmd.Flags().BoolVar(&keep, "keep-overlays", false, "leave VXLAN bridges and tunnels in place")
+	cmd.Flags().StringVar(&token, "token", "", "agent token for cluster deployments (or set TWINET_TOKEN)")
 	return cmd
 }
 
@@ -180,6 +237,7 @@ func newExecCmd(opts *Options) *cobra.Command {
 		asFilter int
 		kind     string
 		all      bool
+		token    string
 	)
 	cmd := &cobra.Command{
 		Use:   "exec [device] -- command...",
@@ -190,7 +248,6 @@ func newExecCmd(opts *Options) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			rt := runtime.NewDocker()
 
 			var targets []*model.Device
 			var command []string
@@ -222,12 +279,42 @@ func newExecCmd(opts *Options) *cobra.Command {
 
 			// Fan out: running one command across a hundred routers is a
 			// routine operational need, and doing it serially is why the legacy
-			// platform's equivalent scripts took minutes.
+			// platform's equivalent scripts took minutes. When the lab spans a
+			// cluster the command is brokered through each device's own node,
+			// so a student or a TA never needs to know or care where their AS
+			// happens to be running.
 			type out struct {
 				dev *model.Device
 				res runtime.ExecResult
 				err error
 			}
+
+			var (
+				cluster *client.Cluster
+				local   runtime.Runtime
+			)
+			if clustered(top) {
+				tok, err := tokenFor(token)
+				if err != nil {
+					return err
+				}
+				cluster = client.NewCluster(top.Lab, tok)
+			} else {
+				local = runtime.NewDocker()
+			}
+
+			runOne := func(ctx context.Context, d *model.Device) (runtime.ExecResult, error) {
+				if cluster == nil {
+					return local.Exec(ctx, d.Container, runtime.ExecCmd{Cmd: command})
+				}
+				n, ok := cluster.Node(d.Node)
+				if !ok {
+					return runtime.ExecResult{}, fmt.Errorf("device %s is placed on unknown node %q", d.ID, d.Node)
+				}
+				r, err := n.Exec(ctx, agent.ExecRequest{Container: d.Container, Cmd: command})
+				return runtime.ExecResult{ExitCode: r.ExitCode, Stdout: r.Stdout, Stderr: r.Stderr}, err
+			}
+
 			results := make([]out, len(targets))
 			var wg sync.WaitGroup
 			sem := make(chan struct{}, 32)
@@ -237,7 +324,7 @@ func newExecCmd(opts *Options) *cobra.Command {
 					defer wg.Done()
 					sem <- struct{}{}
 					defer func() { <-sem }()
-					res, err := rt.Exec(cmd.Context(), d.Container, runtime.ExecCmd{Cmd: command})
+					res, err := runOne(cmd.Context(), d)
 					results[i] = out{dev: d, res: res, err: err}
 				}(i, d)
 			}
@@ -272,6 +359,7 @@ func newExecCmd(opts *Options) *cobra.Command {
 	cmd.Flags().IntVar(&asFilter, "as", 0, "run across every device of one AS")
 	cmd.Flags().StringVar(&kind, "kind", "", "run across every device of one kind")
 	cmd.Flags().BoolVar(&all, "all", false, "run across every device")
+	cmd.Flags().StringVar(&token, "token", "", "agent token for cluster labs (or set TWINET_TOKEN)")
 	return cmd
 }
 
