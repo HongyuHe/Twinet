@@ -50,6 +50,7 @@ across a cluster and graded automatically.`,
 		newNodeCmd(opts),
 		newGradeCmd(opts),
 		newFaultCmd(opts),
+		newIncidentCmd(opts),
 		newVersionCmd(),
 	)
 	return root

@@ -1,0 +1,22 @@
+apiVersion: twinet.dev/v1
+kind: Scenario
+metadata:
+  name: ospf_adjacency_lost
+  description: >
+    A single OSPF adjacency has been removed inside one AS. Traffic still
+    reaches its destination, but over a longer path, so the symptom is latency
+    rather than an outage. The agent must localise the missing adjacency.
+
+# What the agent is told. It must describe the observation, never the cause.
+brief: >
+  Users in AS 3 report that traffic between the eastern and western sites has
+  become noticeably slower since this morning. Nothing is unreachable.
+
+seed: 461
+
+faults:
+  - type: ospf_neighbor_missing
+    target:
+      as: 3
+      device: NYC
+      iface: port_PHY

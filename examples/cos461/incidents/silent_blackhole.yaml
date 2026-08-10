@@ -1,0 +1,26 @@
+apiVersion: twinet.dev/v1
+kind: Scenario
+metadata:
+  name: silent_blackhole
+  description: >
+    Two independent faults with overlapping symptoms: a blackhole route and a
+    firewall rule that drops ICMP. The ICMP block is a decoy, and an agent that
+    trusts ping alone will misdiagnose the blackhole.
+
+brief: >
+  Part of the address space has become unreachable from AS 3, and some hosts
+  have stopped answering ping entirely. It is not clear whether the two reports
+  are related.
+
+seed: 461
+
+faults:
+  - type: host_static_blackhole
+    target:
+      as: 3
+      device: SFO
+      prefix: 100.64.0.0/10
+  - type: icmp_acl_block
+    target:
+      as: 3
+      device: CHI_host

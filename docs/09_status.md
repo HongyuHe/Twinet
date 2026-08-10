@@ -29,6 +29,11 @@ plan but not yet implemented; it is milestone M8.
 | Grading engine: rubric, 17 checks, structured reports | done | 3 submissions in **31 s**; JSON, text and CSV output |
 | Reference solution (`--solve`) | partial | scores **7.33 / 10** against its own rubric |
 | Container images | done | `hyhe/twinet-{router,host,switch,svc}` |
+| Fault injection engine | done | 19 types across all six NIKA categories; **19/19 inject, verify and resolve** on the live cluster |
+| Incident runner | done | `twinet incident run`; a two-fault scenario injects, holds and unwinds in 798 ms |
+| Ground-truth isolation | verified | audited: 0 hits for the fault name, root cause or ground truth anywhere in a target container's files, environment or labels |
+| DNS zone generation | done | forward and reverse zones derived from the model; `msp.group3` resolves to an address MSP actually owns |
+| Matrix, looking glass, policy analyzer | done | control-plane collectors; the analyzer reads structured paths and the declared relationships rather than scraping text |
 | CI, Makefile, lint config | done | `.github/workflows/ci.yml` |
 
 ## Defects found by the platform's own checks
@@ -71,6 +76,16 @@ reached students, and each motivated a permanent test.
    now normalised, and validated at author time rather than discovered one
    container at a time during a deployment.
 
+7. **Six faults that did not work, or could not be undone.** Exercising all
+   nineteen against the live cluster found: verify predicates too loose to tell
+   an active fault from a repaired one; `pgrep -x` silently matching nothing on
+   busybox, so a fault reported success without ever stopping the daemon;
+   `pkill -f` matching the command line of the shell running it and killing
+   itself half-way; `watchfrr` surviving a stop and holding its pid lock so the
+   router never came back; `rm` failing on Docker's bind-mounted
+   `/etc/resolv.conf`; and a fault that captured an empty file and would have
+   guaranteed data loss on resolve. None of these were reachable by unit test.
+
 ## Environment findings
 
 - **Jumbo frames are unavailable.** Raising `eno2` to MTU 9000 dropped the
@@ -93,8 +108,8 @@ reached students, and each motivated a permanent test.
 | `twinet save` / `restore` | M2 | |
 | Advanced-course exercises (MPLS, VRF, multicast) | M7 | The agent already loads the MPLS modules |
 | 80-AS scale run | M6 | The 12-AS run extrapolates to roughly 9 minutes |
-| Fault injection and RCA evaluation | M8 | The NIKA taxonomy; see [10](10_fault_injection.md). Not started. The `behaviours:` block is the design seed, and `internal/state` already provides the baseline capture an episode needs |
-| DHCP, web and load-balancer services, traffic generation | M8 | Prerequisites for eleven NIKA fault types |
+| The remaining 28 in-substrate fault types | M8 | 19 of the 47 are implemented; the rest are mostly variants over the same primitives |
+| DHCP, web and load-balancer services, traffic generation | M8 | Prerequisites for eleven of the remaining fault types |
 | NIKA `LabRuntime` adapter | M8 | About fifty semantic operations, brokered through the existing agent exec API |
 
 ## Measurements
