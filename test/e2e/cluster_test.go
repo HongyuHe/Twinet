@@ -220,3 +220,36 @@ func normaliseQdisc(s string) string {
 	}
 	return strings.Join(keep, "\n")
 }
+
+// A deployment converges the platform's own state. It has no business rewriting
+// the part it deliberately left to someone else. Overwriting is silent when it
+// happens: FRR is not restarted, so the router keeps running correctly and the
+// loss only appears later, when the container restarts onto a configuration
+// nobody chose.
+func TestRedeployDoesNotOverwriteStudentConfiguration(t *testing.T) {
+	dir := labDir(t)
+	const dev = "as5/CHI"
+	const marker = "! twinet-e2e-marker"
+
+	if out, err := twinet(t, "exec", "-m", dir, dev, "--", "sh", "-c",
+		"grep -q '"+marker+"' /etc/frr/frr.conf || echo '"+marker+"' >> /etc/frr/frr.conf"); err != nil {
+		t.Fatalf("seeding the marker: %v\n%s", err, out)
+	}
+	t.Cleanup(func() {
+		_, _ = twinet(t, "exec", "-m", dir, dev, "--", "sh", "-c",
+			"sed -i '/twinet-e2e-marker/d' /etc/frr/frr.conf")
+	})
+
+	if out, err := twinet(t, "deploy", "-m", dir, "--solve"); err != nil {
+		t.Fatalf("redeploy: %v\n%s", err, out)
+	}
+
+	out, err := twinet(t, "exec", "-m", dir, dev, "--", "sh", "-c",
+		"grep -c 'twinet-e2e-marker' /etc/frr/frr.conf || true")
+	if err != nil {
+		t.Fatalf("checking the marker: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "1") {
+		t.Errorf("a redeploy destroyed configuration the platform does not own:\n%s", out)
+	}
+}

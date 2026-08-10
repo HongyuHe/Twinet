@@ -635,6 +635,20 @@ func (e *Engine) configure(ctx context.Context, d *model.Device) error {
 	}
 	for _, path := range sortedKeys(files) {
 		f := files[path]
+		keep, err := e.holdsStudentWork(ctx, d, path)
+		if err != nil {
+			return err
+		}
+		if keep {
+			// The file on disk is the student's, and overwriting it would be
+			// silent: FRR is not restarted here, so the router keeps running
+			// correctly and the loss only appears later, when the container is
+			// restarted and comes up on a configuration nobody chose.
+			//
+			// A deployment converges the platform's own state. It has no
+			// business rewriting the part it deliberately left to someone else.
+			continue
+		}
 		if err := e.Runtime.CopyTo(ctx, d.Container, path, f.Mode, f.Content); err != nil {
 			return fmt.Errorf("write %s to %s: %w", path, d.ID, err)
 		}
@@ -653,6 +667,39 @@ func (e *Engine) configure(ctx context.Context, d *model.Device) error {
 		}
 	}
 	return nil
+}
+
+// studentOwnedPaths are the files a student's own work can end up in. Only
+// these are protected: everything else is the platform's and must converge.
+var studentOwnedPaths = map[string]bool{
+	"/etc/frr/frr.conf": true,
+}
+
+// holdsStudentWork reports whether a file already in the container is work the
+// platform did not write and must not overwrite.
+func (e *Engine) holdsStudentWork(ctx context.Context, d *model.Device, path string) (bool, error) {
+	if !studentOwnedPaths[path] || !hasStudentConfig(d) {
+		return false, nil
+	}
+	res, err := e.Runtime.Exec(ctx, d.Container, runtime.ExecCmd{
+		Cmd: []string{"sh", "-c", "test -s " + path + " && echo yes || echo no"}})
+	if err != nil {
+		// If the container cannot be asked, assume it holds work. Refusing to
+		// overwrite is recoverable; overwriting is not.
+		return true, nil
+	}
+	return strings.TrimSpace(res.Stdout) == "yes", nil
+}
+
+// hasStudentConfig reports whether any part of a device is the student's to
+// configure.
+func hasStudentConfig(d *model.Device) bool {
+	for _, i := range d.Ifaces {
+		if i.Owner == model.OwnerStudent {
+			return true
+		}
+	}
+	return false
 }
 
 // Destroy removes every container belonging to a lab on this node. It works
