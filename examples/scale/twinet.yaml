@@ -1,0 +1,153 @@
+apiVersion: twinet.dev/v1
+kind: Lab
+metadata:
+  name: scale
+  description: The Princeton COS-461 routing project mini-Internet.
+  course: COS 461 - Computer Networks, Princeton
+  term: fall25
+
+defaults:
+  cpus: 2
+  memory: 512Mi
+  pids: 256
+  restart: unless-stopped
+
+kinds:
+  router:
+    image: hyhe/twinet-router:0.1
+    capabilities: [NET_ADMIN, NET_RAW, SYS_ADMIN]
+    sysctls:
+      net.ipv4.ip_forward: "1"
+      net.ipv6.conf.all.forwarding: "1"
+      net.ipv6.conf.all.disable_ipv6: "0"
+      net.ipv4.fib_multipath_hash_policy: "1"
+      net.ipv4.conf.all.rp_filter: "0"
+      net.ipv4.conf.default.rp_filter: "0"
+      net.ipv4.icmp_ratelimit: "0"
+  host:
+    image: hyhe/twinet-host:0.1
+    capabilities: [NET_ADMIN, NET_RAW]
+    pids: 128
+    sysctls:
+      net.ipv6.conf.all.disable_ipv6: "0"
+  switch:
+    image: hyhe/twinet-switch:0.1
+    capabilities: [NET_ADMIN, NET_RAW, SYS_NICE]
+    pids: 512
+  service:
+    image: hyhe/twinet-svc:0.1
+    capabilities: [NET_ADMIN, NET_RAW]
+
+link_defaults:
+  bandwidth: 10mbit
+  delay: 10ms
+  queue: 50ms
+  # Every cross-node link is carried in a VXLAN tunnel, which adds 50 bytes.
+  # This cluster's fabric does not accept jumbo frames, so the lab MTU is set
+  # 50 below the 1500 byte underlay. It is applied to *every* link, local ones
+  # included, so a student's network behaves identically no matter which
+  # machine their AS happens to be scheduled onto.
+  # `twinet node check` verifies this against the live underlay before deploying.
+  mtu: 1450
+
+# The addressing plan. This is the single definition of every subnet in the
+# lab; the assignment text, the DNS zones, the grader and `twinet solve` all
+# read it from here.
+addressing:
+  as_block:            "{{ .AS }}.0.0.0/8"
+  as_block_v6:         "{{ printf \"%x\" .AS }}::/32"
+  router_loopback:     "{{ .AS }}.{{ add 150 .RouterID }}.0.1/24"
+  router_router:       "{{ .AS }}.0.{{ add 1 .LinkIndex }}.0/24"
+  router_host:         "{{ .AS }}.{{ add 100 .RouterID }}.0.0/24"
+  # DCS is X.200.0.0/23 and DCN is X.201.0.0/23; each is split into one /24
+  # per VLAN, exactly as the assignment text instructs students to do.
+  l2_domain:           "{{ .AS }}.{{ add 199 .L2ID }}.0.0/23"
+  l2_vlan:             "{{ cidrSubnet (printf \"%d.%d.0.0/23\" .AS (add 199 .L2ID)) .VLANIndex 24 }}"
+  l2_domain_v6:        "{{ .AS }}:{{ add 199 .L2ID }}::/32"
+  l2_vlan_v6:          "{{ cidrSubnet (printf \"%d:%d::/32\" .AS (add 199 .L2ID)) .VLANIndex 48 }}"
+  # The assignment states the rule directly: the link between AS 3 and AS 6 uses
+  # 179.3.6.0/24. Deriving the prefix from the two AS numbers rather than from a
+  # counter is what makes the platform and the published text agree.
+  inter_as:            "179.{{ .Low }}.{{ .High }}.0/24"
+  ixp_peering:         "180.{{ .IXP }}.0.0/24"
+  services:
+    dns:         "198.{{ .AS }}.0.0/24"
+    rpki:        "197.{{ .AS }}.0.0/24"
+    matrix:      "{{ .AS }}.0.198.0/24"
+    measurement: "{{ .AS }}.0.199.0/24"
+
+as_defaults:
+  template: student_as
+  role: student
+  region_of: "r{{ div (sub .AS 1) 8 }}"
+
+autonomous_systems:
+  # Staff-operated Tier-1 transit, hosting the RPKI certificate authority.
+  - list: [1, 2]
+    template: transit_as
+    role: staff
+  # Student groups.
+  - range: [3, 82]
+    role: student
+  # Regional internet exchange points.
+  - list: [140, 141]
+    template: ixp
+    role: ixp
+
+peerings:
+  generator:
+    kind: tiered-internet
+    tiers:
+      - [1, 2]
+      - [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28]
+      - [29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82]
+    ixps: [140, 141]
+    slow_link:
+      per_as: 1
+      delay: 25ms
+
+services:
+  dns:
+    kind: builtin.dns
+    attach: {template: student_as, router: MSP, iface: dns}
+  matrix:
+    kind: builtin.matrix
+    attach: {template: student_as, router: ATL, iface: matrix}
+  measurement:
+    kind: builtin.measurement
+    attach: {template: student_as, router: HOU, iface: measurement}
+  # The lab is its own trust anchor. A public validator would make an exercise's
+  # answer depend on what somebody else publishes; a pinned snapshot of real
+  # data is enormous and still arbitrary. Deriving the payload from the topology
+  # makes it correct by construction and lets an exercise state exactly which
+  # announcement is meant to be invalid.
+  rpki:
+    kind: builtin.rpki
+    attach: {template: student_as, router: BOS, iface: rpki}
+  web:
+    kind: builtin.web
+    listen: ":9000"
+
+# The trust anchor's deliberate discrepancies. Declared, so an exercise can say
+# exactly which announcement is meant to be invalid rather than hoping one is.
+rpki:
+  # AS 9 has no ROA, which is the common case on the real internet. A student
+  # who accepts only explicitly-valid routes would drop it, so this is what
+  # catches a filter that has gone too far.
+  not_found: [9]
+  # AS 2 holds a ROA for a prefix inside AS 10's space. Whoever announces it
+  # looks like a hijacker to anyone validating, and looks fine to anyone not.
+  invalid:
+    2: "10.128.0.0/9"
+
+access:
+  mode: gateway
+  listen: ":2022"
+  legacy_ports: {enabled: true, base: 2000}
+
+placement:
+  strategy: pack-by-as
+  nodes:
+    - {name: node-0, addr: "10.0.1.1:7200", underlay_ip: 10.0.1.1, front: true}
+    - {name: node-1, addr: "10.0.1.2:7200", underlay_ip: 10.0.1.2}
+    - {name: node-2, addr: "10.0.1.3:7200", underlay_ip: 10.0.1.3}

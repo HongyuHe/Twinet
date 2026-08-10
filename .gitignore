@@ -20,3 +20,7 @@
 **/.twinet/roster.json
 **/.twinet/credentials.txt
 **/.twinet/gateway_host_key
+
+# Binaries staged into an image build context. They are build outputs, not
+# sources, and the image build copies them in from bin/.
+images/*/twinet-rtr

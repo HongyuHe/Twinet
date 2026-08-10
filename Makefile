@@ -57,7 +57,11 @@ ci: naming lint test build
 		echo "shellcheck not installed; skipped"
 	@echo "all CI gates passed"
 
-images:
+# The service image ships the RTR validator, which is built from this module
+# rather than downloaded, so the lab's trust anchor is the code in this
+# repository and not a binary from somewhere else.
+images: build
+	@cp $(BIN)/twinet-rtr images/svc/twinet-rtr
 	@for i in $(IMAGES); do \
 		echo "building $(REGISTRY)/twinet-$$i:$(TAG)"; \
 		docker build -q -t $(REGISTRY)/twinet-$$i:$(TAG) images/$$i || exit 1; \

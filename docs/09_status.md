@@ -127,3 +127,7 @@ reached students, and each motivated a permanent test.
 | Links kept local by AS-granular placement | 86.6 % |
 | Grading, 3 submissions, 10 questions, 17 checks | 31 s |
 | Grading, 1 submission in its own full-breadth harness | 6 minutes |
+| **Class-scale deployment: 84 ASes, 2012 devices, 2927 links across 3 nodes** | **22m 38s, zero failures** |
+| Containers per node at that scale | 724 / 750 / 750 |
+| Node utilisation at that scale | 22 GiB of 251, load average 13 of 56 cores |
+| Emulated latency on a cross-node link at that scale | 20.07 ms for 20 ms configured |

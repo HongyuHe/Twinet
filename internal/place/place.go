@@ -75,12 +75,13 @@ func Place(top *model.Topology, opts Options) (*Assignment, error) {
 	}
 
 	names := make([]string, 0, len(nodes))
-	capacity := map[string]int{}
+	caps := map[string]demand{}
+	hasCap := map[string]bool{}
+	loads := map[string]demand{}
 	for _, n := range nodes {
 		names = append(names, n.Name)
-		if n.Capacity != nil && n.Capacity.Containers > 0 {
-			capacity[n.Name] = n.Capacity.Containers
-		}
+		c, ok := capacityOf(n, lab.Placement.Reserve)
+		caps[n.Name], hasCap[n.Name] = c, ok
 	}
 	sort.Strings(names)
 
@@ -119,14 +120,24 @@ func Place(top *model.Topology, opts Options) (*Assignment, error) {
 		}
 	}
 
-	// Count containers per AS so packing is by real cost, not AS count.
-	weight := map[int]int{}
+	// What each AS costs, in every dimension a node can run out of. Counting
+	// containers alone treats eight small routers and eight four-core ones as
+	// the same, so a node accepts both and the second lab starves -- and it
+	// starves at run time, as apparent congestion, not at placement time as a
+	// refusal anyone could act on.
+	weight := map[int]demand{}
 	for _, asn := range top.SortedASNs() {
-		weight[asn] = len(top.ASes[asn].Devices)
+		var d demand
+		for _, dev := range top.ASes[asn].Devices {
+			d = d.add(deviceDemand(dev))
+		}
+		weight[asn] = d
 	}
 	for _, s := range top.SortedServiceNames() {
 		if svc := top.Services[s]; svc != nil && svc.Device != nil {
-			a.Load[a.ByService[s]]++
+			n := a.ByService[s]
+			loads[n] = loads[n].add(deviceDemand(svc.Device))
+			a.Load[n]++
 		}
 	}
 
@@ -138,7 +149,8 @@ func Place(top *model.Topology, opts Options) (*Assignment, error) {
 				return nil, fmt.Errorf("AS %d is pinned to unknown node %q", asn, n)
 			}
 			a.ByAS[asn] = n
-			a.Load[n] += weight[asn]
+			loads[n] = loads[n].add(weight[asn])
+			a.Load[n] += weight[asn].Containers
 			continue
 		}
 		free = append(free, asn)
@@ -150,24 +162,32 @@ func Place(top *model.Topology, opts Options) (*Assignment, error) {
 		// order for equal weights, which keeps neighbouring groups together and
 		// therefore keeps more inter-AS links local.
 		sort.SliceStable(free, func(i, j int) bool {
-			if weight[free[i]] != weight[free[j]] {
-				return weight[free[i]] > weight[free[j]]
+			if weight[free[i]].Containers != weight[free[j]].Containers {
+				return weight[free[i]].Containers > weight[free[j]].Containers
 			}
 			return free[i] < free[j]
 		})
 		for _, asn := range free {
-			n, err := leastLoaded(names, a.Load, capacity, weight[asn])
+			n, err := leastPressured(names, loads, caps, hasCap, weight[asn])
 			if err != nil {
 				return nil, fmt.Errorf("AS %d: %w", asn, err)
 			}
 			a.ByAS[asn] = n
-			a.Load[n] += weight[asn]
+			loads[n] = loads[n].add(weight[asn])
+			a.Load[n] += weight[asn].Containers
 		}
 	case "spread-by-as":
-		for i, asn := range free {
-			n := names[i%len(names)]
+		// Round-robin still has to respect capacity. Skipping the check here
+		// was a way to build a lab that could not run: the strategy asks for an
+		// even spread, not for an impossible one.
+		for _, asn := range free {
+			n, err := leastPressured(names, loads, caps, hasCap, weight[asn])
+			if err != nil {
+				return nil, fmt.Errorf("AS %d: %w", asn, err)
+			}
 			a.ByAS[asn] = n
-			a.Load[n] += weight[asn]
+			loads[n] = loads[n].add(weight[asn])
+			a.Load[n] += weight[asn].Containers
 		}
 	default:
 		return nil, fmt.Errorf("unknown placement strategy %q", strategy)
@@ -213,36 +233,6 @@ func finish(top *model.Topology, a *Assignment) (*Assignment, error) {
 		}
 	}
 	return a, nil
-}
-
-func leastLoaded(names []string, load, capacity map[string]int, need int) (string, error) {
-	best := ""
-	bestLoad := -1
-	for _, n := range names {
-		if c, ok := capacity[n]; ok && load[n]+need > c {
-			continue
-		}
-		if best == "" || load[n] < bestLoad {
-			best, bestLoad = n, load[n]
-		}
-	}
-	if best == "" {
-		return "", fmt.Errorf("no node has room for %d more containers (capacities: %s)",
-			need, describeCapacity(names, load, capacity))
-	}
-	return best, nil
-}
-
-func describeCapacity(names []string, load, capacity map[string]int) string {
-	var parts []string
-	for _, n := range names {
-		if c, ok := capacity[n]; ok {
-			parts = append(parts, fmt.Sprintf("%s %d/%d", n, load[n], c))
-		} else {
-			parts = append(parts, fmt.Sprintf("%s %d/unlimited", n, load[n]))
-		}
-	}
-	return strings.Join(parts, ", ")
 }
 
 func matches(m model.PinMatch, asn int, as *model.AS) bool {
