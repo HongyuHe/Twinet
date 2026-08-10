@@ -28,3 +28,7 @@ images/*/twinet-rtr
 # Issued certificates and the CA key. The CA key alone lets an attacker mint a
 # controller certificate for the cluster.
 **/.twinet/pki/
+
+# Python bytecode from running the NIKA adapter.
+__pycache__/
+*.pyc

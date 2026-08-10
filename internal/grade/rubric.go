@@ -205,33 +205,17 @@ func Run(ctx context.Context, r *Rubric, env *Env, opts RunOptions) *Report {
 
 		results := runChecks(ctx, q, env, opts)
 
-		// A check that could not run is a fault in the grader, not in the
-		// student. Scoring it zero would quietly turn our outage into their
-		// mark, so its weight is excluded and the question is flagged for a
-		// human instead.
-		var awarded, weightSum float64
 		var broken []string
-		for i, c := range q.Checks {
-			w := c.Weight
-			if w == 0 {
-				w = 1
-			}
+		for i := range q.Checks {
 			if results[i].Status == StatusError {
 				broken = append(broken, results[i].Check)
-				continue
 			}
-			weightSum += w
-			awarded += w * results[i].Score
 		}
-		switch {
-		case weightSum > 0:
-			awarded /= weightSum
-		default:
-			// Every check failed to run: award nothing yet and mark the whole
-			// question as needing attention rather than as a zero.
-			awarded = 0
+		qr.Awarded = awardFor(q, results)
+		awarded := 0.0
+		if q.Points > 0 {
+			awarded = qr.Awarded / q.Points
 		}
-		qr.Awarded = awarded * q.Points
 		qr.Results = results
 		qr.Status = statusFor(awarded)
 		if len(broken) > 0 {
@@ -240,7 +224,9 @@ func Run(ctx context.Context, r *Rubric, env *Env, opts RunOptions) *Report {
 			qr.Note = fmt.Sprintf("%d check(s) could not run (%s); this question needs a human before the mark stands",
 				len(broken), strings.Join(broken, ", "))
 			rep.NeedsReview = true
-			if weightSum == 0 {
+			if len(broken) == len(q.Checks) {
+				// Nothing about this question was actually assessed, so it is
+				// an error rather than a zero.
 				qr.Status = StatusError
 			}
 		}
@@ -311,6 +297,38 @@ func unmetDependency(q QuestionSpec, earned map[string]float64) string {
 		}
 	}
 	return ""
+}
+
+// awardFor scores one question from its check results.
+//
+// Weighted, so a rubric can say that one check matters more than another, and
+// with checks that could not run excluded from the weighting rather than scored
+// zero. The second half is the important one: scoring a broken check zero turns
+// the grader's own outage into the student's mark, and produces a number that
+// looks exactly like a number they earned.
+func awardFor(q QuestionSpec, results []Result) float64 {
+	var awarded, weightSum float64
+	for i, c := range q.Checks {
+		if i >= len(results) {
+			break
+		}
+		w := c.Weight
+		if w == 0 {
+			w = 1
+		}
+		if results[i].Status == StatusError {
+			continue
+		}
+		weightSum += w
+		awarded += w * results[i].Score
+	}
+	if weightSum == 0 {
+		// Every check failed to run. Award nothing for now; the question is
+		// separately marked as needing a human, which is what stops this zero
+		// being mistaken for a mark.
+		return 0
+	}
+	return (awarded / weightSum) * q.Points
 }
 
 func statusFor(fraction float64) Status {

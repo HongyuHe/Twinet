@@ -326,15 +326,18 @@ func (s *Server) run(ctx context.Context, ch ssh.Channel, sess Session, cmd []st
 		}
 		device = chosen
 		cmd = []string{"/bin/sh", "-lc", "exec /bin/bash 2>/dev/null || exec /bin/sh"}
-	} else if d, rest, ok := splitDevicePrefix(cmd); ok {
+	} else if name, rest, ok := splitDevicePrefix(cmd); ok {
 		// "ssh group3@gw MSP show ip route" targets one device directly, which
 		// is what a script wants.
-		full, err := s.resolve(sess, d)
-		if err != nil {
-			fmt.Fprintf(ch, "%v\r\n", err)
-			return 1
+		//
+		// The split only happens when the first word is genuinely one of this
+		// session's devices. Treating any bare first word as a device name
+		// means "echo hello" is read as a device called echo: the command
+		// fails with a confusing message, and the student is told their device
+		// does not exist when the problem is that it was never a device name.
+		if full, err := s.resolve(sess, name); err == nil {
+			device, cmd = full, rest
 		}
-		device, cmd = full, rest
 	}
 
 	code, err := s.cfg.Exec.Shell(ctx, device, cmd, ch, ch, ch.Stderr(), tty, rows, cols)
@@ -433,7 +436,12 @@ func (s *Server) chooseDevice(ch ssh.Channel, sess Session) (string, error) {
 	}
 }
 
-// splitDevicePrefix recognises "DEVICE rest of command".
+// splitDevicePrefix recognises a possible "DEVICE rest of command".
+//
+// It only reports what the shape of the request could mean. Whether the first
+// word is actually a device is decided by looking it up in the session's own
+// autonomous system, because that is the only place the answer exists and the
+// only place the authorisation boundary lives.
 func splitDevicePrefix(cmd []string) (string, []string, bool) {
 	if len(cmd) != 3 || cmd[0] != "sh" {
 		return "", nil, false
@@ -442,8 +450,9 @@ func splitDevicePrefix(cmd []string) (string, []string, bool) {
 	if len(fields) < 2 {
 		return "", nil, false
 	}
-	// A device name is a bare word; anything with a slash or a dot is a path.
-	if strings.ContainsAny(fields[0], "/.=|&;$") {
+	// Anything holding a path separator, a redirection or a separator is a
+	// command, not a name, whatever it resolves to.
+	if strings.ContainsAny(fields[0], "/.=|&;$<>`\"'") {
 		return "", nil, false
 	}
 	return fields[0], []string{"sh", "-c", strings.Join(fields[1:], " ")}, true
