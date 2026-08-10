@@ -111,6 +111,30 @@ func (r *Renderer) Commands(d *model.Device) ([]deploy.Command, error) {
 func (r *Renderer) routerCommands(d *model.Device) []deploy.Command {
 	cmds := r.resolverCommands(d)
 
+	// Solve mode installs the reference answer, so the running daemon must end
+	// up matching the file. Writing frr.conf does not do that: FRR keeps
+	// whatever it already had, so a neighbour removed from the manifest lives
+	// on in the running configuration, pointed at an address that no longer
+	// exists. The session sits Active forever on a lab whose manifest and
+	// configuration files are both correct -- which is exactly how it was
+	// found, in a grading run that could not be explained.
+	//
+	// Only solve mode does this. Restarting FRR under a student would discard
+	// whatever they were part-way through configuring.
+	if r.modeFor(d) == ModeSolve {
+		cmds = append(cmds, deploy.Command{
+			Describe: "restart frr onto the reference configuration",
+			Args: []string{"sh", "-c", strings.Join([]string{
+				// watchfrr outlives a plain stop and holds the pid lock, after
+				// which the daemons can never start again.
+				"for p in $(ps -ef | awk '/watchfrr/ && !/awk/ {print $1}'); do kill $p 2>/dev/null || true; done",
+				"/usr/lib/frr/frrinit.sh stop >/dev/null 2>&1 || true",
+				"rm -f /var/run/frr/*.pid /var/run/frr/*.vty 2>/dev/null || true",
+				"/usr/lib/frr/frrinit.sh start",
+			}, "\n")},
+		})
+	}
+
 	// VLAN sub-interfaces on an L2 gateway must exist before the student can
 	// configure them: the assignment tells students they will see ATL-L2.10
 	// and ATL-L2.20 in `show interface brief`, so the platform creates the

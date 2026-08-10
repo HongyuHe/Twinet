@@ -18,6 +18,11 @@ import (
 // healthy from every angle except the only one that matters.
 func (r *Renderer) serviceFiles(d *model.Device) map[string]deploy.FileSpec {
 	out := map[string]deploy.FileSpec{}
+	if isRPKI(d) {
+		p := svc.BuildRPKI(r.Top, r.Top.Lab.RPKI.NotFound, r.Top.Lab.RPKI.Invalid)
+		out["/etc/twinet/rpki.json"] = deploy.FileSpec{Content: p.JSON(), Mode: 0o644}
+		return out
+	}
 	if !isDNS(d) {
 		return out
 	}
@@ -31,6 +36,24 @@ func (r *Renderer) serviceFiles(d *model.Device) map[string]deploy.FileSpec {
 
 // serviceCommands starts the daemon a service device exists to run.
 func (r *Renderer) serviceCommands(d *model.Device) []deploy.Command {
+	if isRPKI(d) {
+		return []deploy.Command{{
+			Describe: "start the RPKI validator",
+			Args: []string{"sh", "-c", strings.Join([]string{
+				"for p in $(ps -ef | awk '/twinet-rtr/ && !/awk/ {print $1}'); do kill $p 2>/dev/null || true; done",
+				"nohup twinet-rtr -listen :3323 -payload /etc/twinet/rpki.json >/var/log/twinet-rtr.log 2>&1 &",
+				// A validator that is listening but serving nothing is worse
+				// than one that failed to start: every route becomes
+				// not-found, and an exercise about filtering passes for a
+				// reason that has nothing to do with the student.
+				// socat, not bash's /dev/tcp: the service image runs busybox
+				// sh, where /dev/tcp is an ordinary missing path, so the probe
+				// would fail against a validator that was working perfectly.
+				"for i in 1 2 3 4 5 6 7 8 9 10; do socat -u /dev/null TCP:127.0.0.1:3323 2>/dev/null && exit 0; sleep 1; done",
+				"echo 'the validator is not accepting connections' >&2; exit 1",
+			}, "\n")},
+		}}
+	}
 	if !isDNS(d) {
 		return nil
 	}
@@ -89,6 +112,10 @@ func (r *Renderer) resolverCommands(d *model.Device) []deploy.Command {
 			addr, d.ASN)},
 		IgnoreError: true,
 	}}
+}
+
+func isRPKI(d *model.Device) bool {
+	return d.Kind == model.KindService && strings.Contains(strings.ToLower(d.Name), "rpki")
 }
 
 func isDNS(d *model.Device) bool {

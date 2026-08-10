@@ -122,3 +122,48 @@ func TestRehydrateRequiresLabName(t *testing.T) {
 		t.Fatal("expected an error for a wire topology with no lab name")
 	}
 }
+
+// Reconstructing a minimal Lab on the far side and copying across the fields
+// the agent was known to need is a bug generator: a new manifest field arrives
+// empty, the renderer produces something subtly different from what the author
+// wrote, and nothing reports it. It cost a debugging session over an RPKI
+// payload that was correct on the controller and empty on the node.
+func TestTheWholeManifestSurvivesTheWire(t *testing.T) {
+	l, err := manifest.Load("../../examples/cos461")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := expand.Expand(l.Lab)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(Serialise(res.Topology))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var w Wire
+	if err := json.Unmarshal(raw, &w); err != nil {
+		t.Fatal(err)
+	}
+	got, err := w.Rehydrate()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := l.Lab
+	if len(got.Lab.RPKI.NotFound) != len(want.RPKI.NotFound) {
+		t.Errorf("rpki.not_found did not survive: %v vs %v", got.Lab.RPKI.NotFound, want.RPKI.NotFound)
+	}
+	if len(got.Lab.RPKI.Invalid) != len(want.RPKI.Invalid) {
+		t.Errorf("rpki.invalid did not survive: %v vs %v", got.Lab.RPKI.Invalid, want.RPKI.Invalid)
+	}
+	if got.Lab.Access.Listen != want.Access.Listen {
+		t.Errorf("access.listen did not survive: %q vs %q", got.Lab.Access.Listen, want.Access.Listen)
+	}
+	if len(got.Lab.Services) != len(want.Services) {
+		t.Errorf("services did not survive: %d vs %d", len(got.Lab.Services), len(want.Services))
+	}
+	if got.Lab.Addressing.InterAS != want.Addressing.InterAS {
+		t.Errorf("addressing did not survive: %q vs %q", got.Lab.Addressing.InterAS, want.Addressing.InterAS)
+	}
+}

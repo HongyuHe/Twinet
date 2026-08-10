@@ -149,6 +149,15 @@ type Lab struct {
 	// Behaviours declares scripted misconfigurations (hijacks, failures).
 	Behaviours map[string]*Behaviour `yaml:"behaviours,omitempty" json:"behaviours,omitempty"`
 
+	// RPKI declares the deliberate discrepancies in the lab's trust anchor.
+	//
+	// They are declared rather than incidental because an exercise has to be
+	// able to state exactly which announcement is meant to be invalid, and
+	// because a student who filters everything that is not explicitly valid
+	// must be caught: without a not-found route in the lab, that student scores
+	// full marks for a router that would black-hole most of the internet.
+	RPKI RPKISpec `yaml:"rpki,omitempty" json:"rpki,omitempty"`
+
 	// Access configures how students reach their devices.
 	Access Access `yaml:"access,omitempty" json:"access,omitempty"`
 
@@ -569,6 +578,16 @@ type VictimSelector struct {
 	Rel  string `yaml:"rel,omitempty" json:"rel,omitempty" jsonschema:"description=e.g. same-region"`
 	Role ASRole `yaml:"role,omitempty" json:"role,omitempty"`
 	List []int  `yaml:"list,omitempty" json:"list,omitempty"`
+}
+
+// RPKISpec configures the lab's trust anchor.
+type RPKISpec struct {
+	// NotFound lists ASes deliberately left without a ROA, which is the common
+	// case on the real internet.
+	NotFound []int `yaml:"not_found,omitempty" json:"not_found,omitempty"`
+	// Invalid maps an AS to a prefix it holds a ROA for but does not announce,
+	// so whoever does announce it looks like a hijacker.
+	Invalid map[int]string `yaml:"invalid,omitempty" json:"invalid,omitempty"`
 }
 
 // Access configures student access to the lab.

@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"encoding/json"
 	"fmt"
 
 	"github.com/HongyuHe/twinet/internal/model"
@@ -25,6 +26,17 @@ type Wire struct {
 	ASes     []WireAS    `json:"ases"`
 	Services []WireSvc   `json:"services,omitempty"`
 	Defaults WireDefault `json:"defaults"`
+	// LabSpec is the manifest itself, carried whole.
+	//
+	// Reconstructing a minimal Lab on the far side and copying across the few
+	// fields the agent was known to need is a bug generator: every new
+	// manifest field silently arrives empty, the renderer produces something
+	// subtly different from what the author wrote, and nothing anywhere
+	// reports it. That cost a debugging session over an RPKI payload that was
+	// correct on the controller and empty on the node. Carrying the whole
+	// specification makes the class of bug impossible rather than fixing this
+	// instance of it.
+	LabSpec json.RawMessage `json:"lab_spec,omitempty"`
 }
 
 // WireDev is one device.
@@ -125,8 +137,15 @@ type WireDefault struct {
 // Serialise projects a topology onto the wire form.
 func Serialise(top *model.Topology) *Wire {
 	w := &Wire{Lab: top.Name, Hash: top.Hash}
-	if top.Lab != nil && top.Lab.LinkDefaults.MTU != nil {
-		w.Defaults.MTU = *top.Lab.LinkDefaults.MTU
+	if top.Lab != nil {
+		if top.Lab.LinkDefaults.MTU != nil {
+			w.Defaults.MTU = *top.Lab.LinkDefaults.MTU
+		}
+		// The manifest travels whole, so a field added to it reaches the node
+		// without anyone remembering to extend this projection.
+		if raw, err := json.Marshal(top.Lab); err == nil {
+			w.LabSpec = raw
+		}
 	}
 
 	for _, d := range top.SortedDevices() {
@@ -209,8 +228,15 @@ func (w *Wire) Rehydrate() (*model.Topology, error) {
 		mtu = 1500
 	}
 	lab := &model.Lab{}
+	if len(w.LabSpec) > 0 {
+		if err := json.Unmarshal(w.LabSpec, lab); err != nil {
+			return nil, fmt.Errorf("decode the lab specification: %w", err)
+		}
+	}
 	lab.Metadata.Name = w.Lab
-	lab.LinkDefaults.MTU = &mtu
+	if lab.LinkDefaults.MTU == nil {
+		lab.LinkDefaults.MTU = &mtu
+	}
 
 	top := &model.Topology{
 		Lab: lab, Name: w.Lab, Hash: w.Hash,

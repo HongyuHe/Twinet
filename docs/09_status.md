@@ -29,6 +29,8 @@ plan but not yet implemented; it is milestone M8.
 | Grading engine: rubric, 17 checks, structured reports | done | 3 submissions in **31 s**; JSON, text and CSV output |
 | Reference solution (`--solve`) | partial | scores **7.33 / 10** against its own rubric |
 | Container images | done | `hyhe/twinet-{router,host,switch,svc}` |
+| Reference solution | **10.00 / 10.00** | verified end to end on the live cluster; a rubric whose reference cannot score full marks is unfalsifiable, and every student who loses that mark loses it to the platform |
+| RPKI | done | the lab is its own trust anchor: an RTR validator serves a payload derived from the topology, with declared discrepancies so an exercise can state exactly which announcement is invalid and which has no ROA |
 | SSH gateway | done | one credential per group, authenticated at the edge; device names resolve within the student own AS so another group router cannot be named at all. Legacy per-AS ports are served but do not authorise. Verified across the cluster |
 | Save and restore | done | `twinet save` archives every group work with the topology hash and per-file checksums; restore refuses an archive from a different topology or one edited after it was taken |
 | Per-submission grading harnesses | done | `twinet grade batch` gives each submission a private lab in which every AS but one is solved; verified with two submissions graded concurrently across three nodes |

@@ -623,7 +623,24 @@ func (e *Engine) endpoint(top *model.Topology, i *model.Iface, nsPath string, l 
 	}
 	// Addresses are applied only for interfaces the platform owns. Those the
 	// student owns are left bare on purpose: configuring them is the exercise.
+	//
+	// Where the platform does own them, it owns them exactly: an address left
+	// behind by an earlier revision of the manifest is removed. Converging by
+	// adding alone is not converging -- the router answers on both the old and
+	// the new address, and the session comes up on neither, because each end
+	// uses what its own copy of the model says and those no longer agree.
 	if i.Owner == model.OwnerPlatform {
+		ep.OwnAddrs = true
+		if i.Addr4 != "" {
+			ep.Addrs = append(ep.Addrs, i.Addr4)
+		}
+		if i.Addr6 != "" {
+			ep.Addrs = append(ep.Addrs, i.Addr6)
+		}
+	} else if e.Authoritative {
+		// Solve mode installs the reference answer, which includes the
+		// addresses a student would have chosen, so it owns them too.
+		ep.OwnAddrs = true
 		if i.Addr4 != "" {
 			ep.Addrs = append(ep.Addrs, i.Addr4)
 		}

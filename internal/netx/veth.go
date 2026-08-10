@@ -22,6 +22,12 @@ type EndpointSpec struct {
 	// Addrs are addresses to configure, in CIDR form. Empty for interfaces the
 	// student is expected to address themselves.
 	Addrs []string
+	// OwnAddrs says the platform owns this interface's addressing, so anything
+	// else present is stale and must go.
+	//
+	// It is false for interfaces a student addresses: removing what they chose
+	// would be the platform undoing their work every time anyone redeployed.
+	OwnAddrs bool
 	// Altname is the ownership tag stamped on the interface so orphans left by
 	// a crash can be found and removed without consulting any external state.
 	Altname string
@@ -185,7 +191,7 @@ func renameAndConfigure(link netlink.Link, ep EndpointSpec, mtu int) error {
 			return fmt.Errorf("set %s up: %w", ep.Name, err)
 		}
 	}
-	if err := applyAddrs(link, ep.Addrs); err != nil {
+	if err := applyAddrs(link, ep.Addrs, ep.OwnAddrs); err != nil {
 		return err
 	}
 	if ep.Shaping != nil {
@@ -199,8 +205,17 @@ func renameAndConfigure(link netlink.Link, ep EndpointSpec, mtu int) error {
 	return nil
 }
 
-func applyAddrs(link netlink.Link, addrs []string) error {
-	if len(addrs) == 0 {
+// applyAddrs makes an interface hold exactly the addresses the model gives it,
+// when the platform owns them.
+//
+// Converging by adding alone is not converging. An address left over from an
+// earlier revision of the manifest stays on the interface, the router answers
+// on both, and the session that matters comes up on neither: the two ends each
+// use the address their own copy of the model says, and those no longer agree.
+// It presents as a peering that is permanently Active, on a lab whose manifest
+// and configuration are both correct, and it cost a grading run here to find.
+func applyAddrs(link netlink.Link, addrs []string, authoritative bool) error {
+	if len(addrs) == 0 && !authoritative {
 		return nil
 	}
 	existing, err := netlink.AddrList(link, netlink.FAMILY_ALL)
@@ -211,6 +226,30 @@ func applyAddrs(link netlink.Link, addrs []string) error {
 	for _, a := range existing {
 		have[a.IPNet.String()] = true
 	}
+
+	if authoritative {
+		want := map[string]bool{}
+		for _, s := range addrs {
+			if a, err := netlink.ParseAddr(s); err == nil {
+				want[a.IPNet.String()] = true
+			}
+		}
+		for _, a := range existing {
+			// Link-local addresses are the kernel's, not ours.
+			if a.IP.IsLinkLocalUnicast() || a.IP.IsLoopback() {
+				continue
+			}
+			if want[a.IPNet.String()] {
+				continue
+			}
+			if err := netlink.AddrDel(link, &a); err != nil {
+				return fmt.Errorf("remove stale %s from %s: %w",
+					a.IPNet.String(), link.Attrs().Name, err)
+			}
+			delete(have, a.IPNet.String())
+		}
+	}
+
 	for _, s := range addrs {
 		if s == "" {
 			continue
@@ -279,7 +318,7 @@ func configureEndpoint(ep EndpointSpec) error {
 		if err != nil {
 			return err
 		}
-		if err := applyAddrs(l, ep.Addrs); err != nil {
+		if err := applyAddrs(l, ep.Addrs, ep.OwnAddrs); err != nil {
 			return err
 		}
 		if ep.Shaping != nil {

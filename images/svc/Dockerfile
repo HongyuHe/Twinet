@@ -15,8 +15,13 @@ RUN apk add --no-cache \
     && mkdir -p /etc/twinet /etc/bind \
     && install -d -o named -g named -m 0755 /var/named /var/run/named /var/log/named
 
+# The RTR validator is the lab's own trust anchor. Shipping it here rather than
+# depending on an external validator keeps an exercise's answer a property of
+# the lab instead of a property of what somebody else has published today.
+COPY twinet-rtr /usr/local/bin/twinet-rtr
+
 COPY entrypoint.sh /usr/local/bin/twinet-entrypoint
-RUN chmod 0755 /usr/local/bin/twinet-entrypoint
+RUN chmod 0755 /usr/local/bin/twinet-entrypoint /usr/local/bin/twinet-rtr
 
 LABEL org.opencontainers.image.title="twinet-svc" \
       org.opencontainers.image.source="https://github.com/HongyuHe/Twinet"

@@ -112,6 +112,14 @@ func IsInfra(err error) bool {
 // during the check, and overrides the verdict if it did.
 func (e *Env) infra(device, op string, err error) error {
 	ie := &InfraError{Device: device, Op: op, Err: err}
+	// A deadline we imposed ourselves is not an infrastructure failure. A
+	// convergence wait that runs out of budget cancels its own probe, and
+	// recording that as the machinery breaking would quarantine every
+	// submission that was merely slow to converge -- turning a timeout that
+	// should be reported as "did not converge" into "the grader is broken".
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return ie
+	}
 	if e.infraSeen != nil {
 		e.infraSeen.record(ie)
 	}

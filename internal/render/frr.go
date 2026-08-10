@@ -20,6 +20,7 @@ import (
 	"strings"
 
 	"github.com/HongyuHe/twinet/internal/model"
+	"github.com/HongyuHe/twinet/internal/svc"
 )
 
 // FRRDaemons is the /etc/frr/daemons file. Only the daemons the courses need
@@ -46,7 +47,11 @@ vrrpd=no
 pathd=no
 
 zebra_options="  -A 127.0.0.1 -s 90000000"
-bgpd_options="   -A 127.0.0.1"
+# The RPKI module is loaded here rather than left to the exercise: it is a
+# build-time capability of the daemon, not something a student can configure.
+# Without it the rpki commands do not exist, and a student following the
+# assignment exactly would be told their syntax is wrong.
+bgpd_options="   -A 127.0.0.1 -M rpki"
 ospfd_options="  -A 127.0.0.1"
 ospf6d_options=" -A ::1"
 ldpd_options="   -A 127.0.0.1"
@@ -201,17 +206,23 @@ func renderBGP(top *model.Topology, as *model.AS, d *model.Device) string {
 	}
 
 	// eBGP sessions.
-	type ext struct {
-		addr string
-		asn  int
-		rel  model.Relationship
-	}
 	var exts []ext
 	for _, i := range d.Ifaces {
 		if i.Role != model.RoleInterAS && i.Role != model.RoleIXPLink {
 			continue
 		}
-		if i.Peer == nil || i.Peer.Addr4 == "" {
+		// An exchange is modelled as a real fabric switch, so the interface's
+		// peer is a switch port with no address of its own. The session is with
+		// the route server on the same segment, and looking only at the direct
+		// peer meant the reference solution never peered with the exchange at
+		// all -- it scored zero on its own IXP question and nothing said why.
+		peerAddr, peerASN := "", 0
+		if i.Role == model.RoleIXPLink {
+			peerAddr, peerASN = routeServerOn(top, i)
+		} else if i.Peer != nil {
+			peerAddr, peerASN = addrOf(i.Peer.Addr4), i.Peer.Device.ASN
+		}
+		if peerAddr == "" {
 			continue
 		}
 		rel := model.RelPeer
@@ -221,12 +232,19 @@ func renderBGP(top *model.Topology, as *model.AS, d *model.Device) string {
 				rel = rel.Inverse()
 			}
 		}
-		exts = append(exts, ext{addr: addrOf(i.Peer.Addr4), asn: i.Peer.Device.ASN, rel: rel})
+		exts = append(exts, ext{
+			addr: peerAddr, asn: peerASN, rel: rel,
+			ixp:  i.Role == model.RoleIXPLink,
+			slow: parseDelayMS(i.Link) >= 25,
+		})
 	}
 	sort.Slice(exts, func(x, y int) bool { return exts[x].addr < exts[y].addr })
 	for _, x := range exts {
 		fmt.Fprintf(&b, " neighbor %s remote-as %d\n", x.addr, x.asn)
 	}
+
+	hasRPKI := svc.RPKIAddrFor(top, as.ASN) != ""
+	slowRels := map[model.Relationship]bool{}
 
 	b.WriteString(" address-family ipv4 unicast\n")
 	if as.Role != model.RoleIXP {
@@ -238,15 +256,278 @@ func renderBGP(top *model.Topology, as *model.AS, d *model.Device) string {
 	}
 	for _, x := range exts {
 		fmt.Fprintf(&b, "  neighbor %s activate\n", x.addr)
-		fmt.Fprintf(&b, "  neighbor %s route-map LP-%s in\n", x.addr, strings.ToUpper(string(x.rel)))
-		fmt.Fprintf(&b, "  neighbor %s route-map EXPORT-%s out\n", x.addr, strings.ToUpper(string(x.rel)))
+		out := "EXPORT-" + strings.ToUpper(string(x.rel))
+		in := "LP-" + strings.ToUpper(string(x.rel))
+		if x.slow && !x.ixp {
+			// The slow neighbour stays reachable -- the question forbids
+			// filtering it away, because it is the backup -- but is made
+			// unattractive in both directions: less preferred for traffic we
+			// send, and a longer path for traffic others send us.
+			in = fmt.Sprintf("LP-SLOW-%s", strings.ToUpper(string(x.rel)))
+			out = fmt.Sprintf("EXPORT-SLOW-%s", strings.ToUpper(string(x.rel)))
+			slowRels[x.rel] = true
+		}
+		if x.ixp {
+			// At an exchange the export policy also tags the announcement for
+			// the members that should receive it, and the import policy
+			// refuses announcements that have already been through the region.
+			out = fmt.Sprintf("EXPORT-IXP-%d", x.asn)
+			in = fmt.Sprintf("IMPORT-IXP-%d", x.asn)
+		}
+		if hasRPKI {
+			// Origin validation runs before the relationship policy, so an
+			// invalid announcement is gone before it can win on local
+			// preference. Ordering these the other way round would let a
+			// hijacked prefix be preferred and then rejected, which works by
+			// accident and fails as soon as the policy changes.
+			fmt.Fprintf(&b, "  neighbor %s route-map RPKI-IN in\n", x.addr)
+		}
+		fmt.Fprintf(&b, "  neighbor %s route-map %s in\n", x.addr, in)
+		fmt.Fprintf(&b, "  neighbor %s route-map %s out\n", x.addr, out)
 	}
 	b.WriteString(" exit-address-family\nexit\n!\n")
 
 	if len(exts) > 0 {
 		b.WriteString(gaoRexfordPolicy())
+		b.WriteString(slowLinkPolicy(as, slowRels))
+		b.WriteString(ixpPolicy(top, as, exts))
+		b.WriteString(rpkiPolicy(top, as))
 	}
 	return b.String()
+}
+
+// ext is one external BGP neighbour of a router.
+type ext struct {
+	addr string
+	asn  int
+	rel  model.Relationship
+	ixp  bool
+	// slow marks a deliberately high-delay neighbour, which the traffic
+	// engineering exercise asks a student to make less attractive in both
+	// directions without filtering it away entirely.
+	slow bool
+}
+
+// parseDelayMS reads a link's one-way delay in milliseconds.
+func parseDelayMS(l *model.Link) float64 {
+	if l == nil || l.Props.Delay == "" {
+		return 0
+	}
+	var v float64
+	unit := strings.TrimLeft(l.Props.Delay, "0123456789.")
+	if _, err := fmt.Sscanf(strings.TrimSuffix(l.Props.Delay, unit), "%f", &v); err != nil {
+		return 0
+	}
+	switch unit {
+	case "s":
+		return v * 1000
+	case "us":
+		return v / 1000
+	default:
+		return v
+	}
+}
+
+// slowLinkPolicy renders the traffic-engineering answer: prefer the fast
+// neighbour of a class, and make ourselves less attractive over the slow one.
+//
+// Both halves are needed and neither may be filtering. Lowering local
+// preference only steers what we send; prepending only steers what others send
+// us; and denying the announcement outright would remove the backup path the
+// question requires to remain.
+func slowLinkPolicy(as *model.AS, rels map[model.Relationship]bool) string {
+	if len(rels) == 0 {
+		return ""
+	}
+	ordered := []model.Relationship{model.RelCustomer, model.RelPeer, model.RelProvider}
+	base := map[model.Relationship]int{
+		model.RelCustomer: 300, model.RelPeer: 200, model.RelProvider: 100,
+	}
+	var b strings.Builder
+	for _, rel := range ordered {
+		if !rels[rel] {
+			continue
+		}
+		up := strings.ToUpper(string(rel))
+		fmt.Fprintf(&b, "route-map LP-SLOW-%s permit 10\n set local-preference %d\n set community 1:%d\nexit\n",
+			up, base[rel]-50, communityFor(rel))
+		// The export mirrors the fast neighbour of the same class exactly, and
+		// adds only the prepend. Anything else is filtering: withholding a
+		// prefix from the slow neighbour that the fast one receives removes
+		// the backup path the question requires to remain, and the difference
+		// is invisible unless the two are compared side by side.
+		if rel != model.RelCustomer {
+			fmt.Fprintf(&b, "route-map EXPORT-SLOW-%s deny 10\n match community PEER\nexit\n", up)
+			fmt.Fprintf(&b, "route-map EXPORT-SLOW-%s deny 20\n match community PROVIDER\nexit\n", up)
+		}
+		fmt.Fprintf(&b, "route-map EXPORT-SLOW-%s permit 30\n set as-path prepend %d %d %d\nexit\n!\n",
+			up, as.ASN, as.ASN, as.ASN)
+	}
+	return b.String()
+}
+
+func communityFor(rel model.Relationship) int {
+	switch rel {
+	case model.RelCustomer:
+		return 10
+	case model.RelPeer:
+		return 20
+	default:
+		return 30
+	}
+}
+
+// ixpPolicy renders the community-gated relay policy an exchange uses.
+//
+// The exchange relays an announcement to member X only if it carries the
+// community <ixp>:X, so the sender chooses who sees it. The import side refuses
+// anything whose path has already been through another member of the same
+// region, which is what stops the exchange being used as transit between two of
+// its own members.
+func ixpPolicy(top *model.Topology, as *model.AS, exts []ext) string {
+	var b strings.Builder
+	for _, x := range exts {
+		if !x.ixp {
+			continue
+		}
+		ixp := top.ASes[x.asn]
+		if ixp == nil {
+			continue
+		}
+
+		// The exchange relays an announcement to member X only if it carries
+		// <ixp>:X, so an announcement is tagged for every other member: that
+		// is what being at an exchange is for.
+		//
+		// An earlier version tagged only members outside our own region, on
+		// the theory that in-region members reach us directly. Every member of
+		// this exchange happens to share our region, so the set was empty, no
+		// community was ever set, and the reference solution scored zero on
+		// its own question -- while looking entirely reasonable in the source.
+		var others, sameRegion []int
+		for _, asn := range top.SortedASNs() {
+			peer := top.ASes[asn]
+			if peer == nil || asn == as.ASN || peer.Role == model.RoleIXP {
+				continue
+			}
+			if !attachedTo(top, asn, x.asn) {
+				continue
+			}
+			others = append(others, asn)
+			if peer.Region == as.Region && peer.Role == model.RoleStudent {
+				sameRegion = append(sameRegion, asn)
+			}
+		}
+
+		if len(sameRegion) > 0 {
+			fmt.Fprintf(&b, "bgp as-path access-list IXP-%d-REGION permit _(%s)_\n",
+				x.asn, joinASNs(sameRegion, "|"))
+			fmt.Fprintf(&b, "!\nroute-map IMPORT-IXP-%d deny 10\n match as-path IXP-%d-REGION\nexit\n",
+				x.asn, x.asn)
+			fmt.Fprintf(&b, "route-map IMPORT-IXP-%d permit 20\n set local-preference 200\n set community %d:%d\nexit\n!\n",
+				x.asn, 1, 20)
+		} else {
+			fmt.Fprintf(&b, "route-map IMPORT-IXP-%d permit 10\n set local-preference 200\n set community %d:%d\nexit\n!\n",
+				x.asn, 1, 20)
+		}
+
+		// Tag our own announcement for each member that should receive it.
+		tags := make([]string, 0, len(others))
+		for _, m := range others {
+			tags = append(tags, fmt.Sprintf("%d:%d", x.asn, m))
+		}
+		// A peer's or a provider's routes are never relayed onward: doing so
+		// would offer the exchange free transit through us.
+		fmt.Fprintf(&b, "route-map EXPORT-IXP-%d deny 10\n match community PEER\nexit\n", x.asn)
+		fmt.Fprintf(&b, "route-map EXPORT-IXP-%d deny 20\n match community PROVIDER\nexit\n", x.asn)
+		fmt.Fprintf(&b, "route-map EXPORT-IXP-%d permit 30\n", x.asn)
+		if len(tags) > 0 {
+			fmt.Fprintf(&b, " set community %s\n", strings.Join(tags, " "))
+		}
+		b.WriteString("exit\n!\n")
+	}
+	return b.String()
+}
+
+// rpkiPolicy renders origin validation against the lab's own trust anchor.
+//
+// Invalid routes are refused and not-found routes are kept. The second half
+// matters as much as the first: a router that accepts only what is explicitly
+// valid would black-hole most of the real internet, and a check that tested
+// only for rejection would award full marks for exactly that mistake.
+func rpkiPolicy(top *model.Topology, as *model.AS) string {
+	addr := svc.RPKIAddrFor(top, as.ASN)
+	if addr == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("rpki\n")
+	// FRR 10 spells this without a transport keyword. The version that
+	// takes "tcp" is newer, and using it here fails as an unknown command --
+	// which a student would read as their own syntax error.
+	fmt.Fprintf(&b, " rpki cache %s 3323 preference 1\n", addr)
+	b.WriteString(" rpki polling_period 30\nexit\n!\n")
+	b.WriteString(`route-map RPKI-IN deny 5
+ match rpki invalid
+exit
+route-map RPKI-IN permit 10
+ match rpki notfound
+ set local-preference 90
+exit
+route-map RPKI-IN permit 20
+exit
+!
+`)
+	return b.String()
+}
+
+// routeServerOn finds the exchange's route server on the segment an interface
+// is attached to.
+func routeServerOn(top *model.Topology, i *model.Iface) (string, int) {
+	if i.Link == nil {
+		return "", 0
+	}
+	seg := i.Link.Segment
+	for _, l := range top.Links {
+		if l.Segment == "" || l.Segment != seg {
+			continue
+		}
+		for _, side := range []*model.Iface{l.A, l.B} {
+			if side == nil || side.Device == nil || side.Addr4 == "" {
+				continue
+			}
+			as := top.ASes[side.Device.ASN]
+			if as == nil || as.Role != model.RoleIXP {
+				continue
+			}
+			return addrOf(side.Addr4), side.Device.ASN
+		}
+	}
+	return "", 0
+}
+
+// attachedTo reports whether an AS has a link into a given exchange.
+func attachedTo(top *model.Topology, asn, ixp int) bool {
+	as := top.ASes[asn]
+	if as == nil {
+		return false
+	}
+	for _, d := range as.Devices {
+		for _, i := range d.Ifaces {
+			if i.Role == model.RoleIXPLink && i.Peer != nil && i.Peer.Device.ASN == ixp {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func joinASNs(asns []int, sep string) string {
+	parts := make([]string, len(asns))
+	for i, a := range asns {
+		parts[i] = fmt.Sprint(a)
+	}
+	return strings.Join(parts, sep)
 }
 
 // gaoRexfordPolicy renders the business-relationship policy the courses teach:

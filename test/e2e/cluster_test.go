@@ -343,3 +343,29 @@ func TestNamesResolveInsideTheLab(t *testing.T) {
 		t.Errorf("a host is not pointed at the lab's resolver:\n%s", out)
 	}
 }
+
+// The reference solution must score full marks.
+//
+// Without this the rubric is unfalsifiable: a check that can never pass is
+// indistinguishable from a class that never gets it right, and every student
+// who loses that mark loses it to the platform. Getting from 7.33 to 10 found
+// five real defects -- a generator that made every transit link slow so the
+// traffic-engineering question had no correct answer, a reference that never
+// peered with the exchange it was marked on, addresses left behind by an
+// earlier manifest revision, a running configuration that no longer matched
+// the file, and a manifest field that silently arrived empty at the node.
+func TestTheReferenceSolutionScoresFullMarks(t *testing.T) {
+	dir := labDir(t)
+
+	out, err := twinet(t, "grade", "run", "-m", dir, "--as", "3",
+		"-o", t.TempDir(), "--converge-timeout", "6m")
+	if err != nil {
+		t.Fatalf("grading the reference: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "10.00") {
+		t.Errorf("the reference solution did not score full marks:\n%s", out)
+	}
+	if strings.Contains(out, "need review") {
+		t.Errorf("grading the reference did not complete cleanly:\n%s", out)
+	}
+}

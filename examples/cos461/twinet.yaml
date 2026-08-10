@@ -72,6 +72,7 @@ addressing:
   ixp_peering:         "180.{{ .IXP }}.0.0/24"
   services:
     dns:         "198.{{ .AS }}.0.0/24"
+    rpki:        "197.{{ .AS }}.0.0/24"
     matrix:      "{{ .AS }}.0.198.0/24"
     measurement: "{{ .AS }}.0.199.0/24"
 
@@ -115,9 +116,29 @@ services:
   measurement:
     kind: builtin.measurement
     attach: {template: student_as, router: HOU, iface: measurement}
+  # The lab is its own trust anchor. A public validator would make an exercise's
+  # answer depend on what somebody else publishes; a pinned snapshot of real
+  # data is enormous and still arbitrary. Deriving the payload from the topology
+  # makes it correct by construction and lets an exercise state exactly which
+  # announcement is meant to be invalid.
+  rpki:
+    kind: builtin.rpki
+    attach: {template: student_as, router: BOS, iface: rpki}
   web:
     kind: builtin.web
     listen: ":9000"
+
+# The trust anchor's deliberate discrepancies. Declared, so an exercise can say
+# exactly which announcement is meant to be invalid rather than hoping one is.
+rpki:
+  # AS 9 has no ROA, which is the common case on the real internet. A student
+  # who accepts only explicitly-valid routes would drop it, so this is what
+  # catches a filter that has gone too far.
+  not_found: [9]
+  # AS 2 holds a ROA for a prefix inside AS 10's space. Whoever announces it
+  # looks like a hijacker to anyone validating, and looks fine to anyone not.
+  invalid:
+    2: "10.128.0.0/9"
 
 access:
   mode: gateway

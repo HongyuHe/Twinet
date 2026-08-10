@@ -173,8 +173,12 @@ func WaitConverged(ctx context.Context, env *Env, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	remaining := func() time.Duration {
 		d := time.Until(deadline)
-		if d < time.Second {
-			return time.Second
+		if d < 15*time.Second {
+			// A phase given a second or two cannot finish, and its probe is
+			// cancelled mid-flight, so the report blames whichever router was
+			// being asked rather than saying the lab did not converge. A floor
+			// large enough to complete one poll keeps the message honest.
+			return 15 * time.Second
 		}
 		return d
 	}

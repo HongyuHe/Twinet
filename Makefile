@@ -23,6 +23,7 @@ all: build
 build:
 	$(GO) build -trimpath -ldflags '$(LDFLAGS)' -o $(BIN)/twinet ./cmd/twinet
 	$(GO) build -trimpath -ldflags '$(LDFLAGS)' -o $(BIN)/twinetd ./cmd/twinetd
+	CGO_ENABLED=0 $(GO) build -trimpath -ldflags '$(LDFLAGS)' -o $(BIN)/twinet-rtr ./cmd/twinet-rtr
 
 test:
 	$(GO) test -race -count=1 ./...

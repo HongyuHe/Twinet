@@ -92,7 +92,10 @@ func (e *expander) generate(g *model.PeeringGenerator) ([]model.PeeringLink, err
 	if seed == 0 {
 		seed = 461 // deterministic by default; topologies must be reproducible
 	}
-	rng := rand.New(rand.NewSource(seed))
+	// The generator is deterministic: a topology that differs between two runs
+	// cannot be graded, because a student's marks would depend on when the lab
+	// was built.
+	_ = rand.New(rand.NewSource(seed))
 
 	ports := e.portNames()
 	var out []model.PeeringLink
@@ -160,42 +163,86 @@ func (e *expander) generate(g *model.PeeringGenerator) ([]model.PeeringLink, err
 		}
 	}
 
-	// The slow links. Exactly one provider link and one customer link per AS
-	// are marked high-delay, which is what question 2.5 is built around.
+	// The slow links.
+	//
+	// The exercise asks a student to prefer a fast neighbour over a slow one of
+	// the same relationship class, so the invariant that matters is not "each
+	// AS has a slow link" but "each AS has both a slow link and a fast one of
+	// the same class". Marking one link per AS does not give that: a link is
+	// shared by two ASes and either may mark it, so an AS whose neighbours each
+	// marked the link they share with it ends up with nothing fast to compare
+	// against, and the question has no correct answer.
+	//
+	// That is what happened here, and it was invisible from the manifest: the
+	// generator did exactly what it said, the lab looked right, and the
+	// reference solution simply could not score the mark.
 	if g.SlowLink != nil && g.SlowLink.PerAS > 0 {
 		delay := orDefault(g.SlowLink.Delay, "25ms")
-		byAS := map[int][]int{} // asn -> indices of its provider/customer links
+
+		byASRel := map[int]map[model.Relationship][]int{}
+		add := func(asn int, rel model.Relationship, idx int) {
+			if byASRel[asn] == nil {
+				byASRel[asn] = map[model.Relationship][]int{}
+			}
+			byASRel[asn][rel] = append(byASRel[asn][rel], idx)
+		}
 		for i, l := range out {
 			if l.Rel != model.RelProvider {
 				continue
 			}
-			byAS[l.A] = append(byAS[l.A], i)
-			byAS[l.B] = append(byAS[l.B], i)
+			// A provider link is a provider relationship for one side and a
+			// customer relationship for the other, so each AS sees it in the
+			// class that matters to it.
+			add(l.A, model.RelProvider, i)
+			add(l.B, model.RelCustomer, i)
 		}
-		marked := map[int]bool{}
-		asns := make([]int, 0, len(byAS))
-		for a := range byAS {
+
+		slow := map[int]bool{}
+		// fastLeft reports how many links of this class the AS would still have
+		// unmarked if idx were marked.
+		fastLeft := func(asn int, rel model.Relationship, idx int) int {
+			n := 0
+			for _, j := range byASRel[asn][rel] {
+				if j != idx && !slow[j] {
+					n++
+				}
+			}
+			return n
+		}
+
+		asns := make([]int, 0, len(byASRel))
+		for a := range byASRel {
 			asns = append(asns, a)
 		}
 		sort.Ints(asns)
+
 		for _, a := range asns {
-			cand := byAS[a]
-			n := 0
-			for _, idx := range cand {
-				if n >= g.SlowLink.PerAS {
-					break
+			for _, rel := range []model.Relationship{model.RelProvider, model.RelCustomer} {
+				cand := byASRel[a][rel]
+				already := 0
+				for _, idx := range cand {
+					if slow[idx] {
+						already++
+					}
 				}
-				if marked[idx] {
+				if already >= g.SlowLink.PerAS {
 					continue
 				}
-				out[idx].Delay = delay
-				marked[idx] = true
-				n++
-			}
-			// If every candidate was already slow, pick one at random to keep
-			// the invariant "each AS has at least one slow neighbour".
-			if n == 0 && len(cand) > 0 {
-				out[cand[rng.Intn(len(cand))]].Delay = delay
+				for _, idx := range cand {
+					if slow[idx] {
+						continue
+					}
+					// Marking must leave both endpoints a fast alternative in
+					// their own class, or the exercise becomes unanswerable for
+					// whichever of them runs out.
+					if fastLeft(out[idx].A, model.RelProvider, idx) == 0 ||
+						fastLeft(out[idx].B, model.RelCustomer, idx) == 0 {
+						continue
+					}
+					out[idx].Delay = delay
+					slow[idx] = true
+					break
+				}
 			}
 		}
 	}
