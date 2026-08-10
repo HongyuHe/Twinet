@@ -178,12 +178,24 @@ func (e *Env) Sh(ctx context.Context, deviceID, script string) (string, error) {
 }
 
 // Try runs a shell command and tolerates a non-zero exit, for probes.
+//
+// A non-zero exit is a legitimate answer from the device. A transport failure
+// is not an answer at all, and the two must not look alike: a verifier that
+// reads an unreachable node as "the fault is not there" reports a successful
+// undo on a lab that is still broken, and the contamination is invisible.
+// Callers that need to tell them apart use TryE.
 func (e *Env) Try(ctx context.Context, deviceID, script string) (string, int) {
+	out, code, _ := e.TryE(ctx, deviceID, script)
+	return out, code
+}
+
+// TryE is Try, but it reports whether the device could be reached at all.
+func (e *Env) TryE(ctx context.Context, deviceID, script string) (string, int, error) {
 	res, err := e.Exec(ctx, deviceID, []string{"sh", "-c", script})
 	if err != nil {
-		return "", -1
+		return "", -1, fmt.Errorf("%s could not be reached: %w", deviceID, err)
 	}
-	return res.Stdout, res.ExitCode
+	return res.Stdout, res.ExitCode, nil
 }
 
 // Vtysh runs an FRR command.
@@ -369,6 +381,13 @@ func Resolve(ctx context.Context, env *Env, inj *Injection) error {
 	// This fails closed. A verification that cannot run is not evidence that
 	// the fault is gone; it is the absence of evidence either way, and treating
 	// it as success is how contamination becomes silent.
+	// The device is probed directly first. Every verifier reads the device, so
+	// if it cannot be reached, whatever the verifier concludes is an artefact
+	// of the failure rather than an observation of the lab.
+	if err := env.reachable(ctx, inj.Target.DeviceID()); err != nil {
+		return fmt.Errorf("resolve %s: the undo ran, but %w, so the lab must be "+
+			"treated as contaminated", inj.Fault, err)
+	}
 	ev, err := f.Verify(ctx, env, inj.Target, inj.State)
 	if err != nil {
 		return fmt.Errorf("resolve %s: the undo ran, but it could not be confirmed, "+
@@ -377,6 +396,17 @@ func Resolve(ctx context.Context, env *Env, inj *Injection) error {
 	if ev.Verified {
 		return fmt.Errorf("resolve %s: the fault is still present afterwards: %s",
 			inj.Fault, ev.Detail)
+	}
+	return nil
+}
+
+// reachable reports whether a device can be asked anything at all.
+//
+// A paused container is deliberately excluded from this: host_crash freezes the
+// device, and its own verifier is the one that must interpret the silence.
+func (e *Env) reachable(ctx context.Context, deviceID string) error {
+	if _, _, err := e.TryE(ctx, deviceID, "true"); err != nil {
+		return err
 	}
 	return nil
 }

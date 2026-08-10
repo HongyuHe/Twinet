@@ -227,6 +227,10 @@ type Summary struct {
 	Duration  string         `json:"duration"`
 	Reports   []*Report      `json:"reports"`
 	FailCount map[string]int `json:"failures_by_check"`
+	// Graded is how many submissions the statistics are computed from, which
+	// is fewer than Count whenever something could not be graded.
+	Graded int    `json:"graded"`
+	Note   string `json:"note,omitempty"`
 }
 
 // Summarise builds a class summary.
@@ -239,10 +243,26 @@ func Summarise(rubric string, reports []*Report, dur time.Duration) *Summary {
 	if len(reports) == 0 {
 		return s
 	}
+	defer func() {
+		if n := len(s.Quarantined()); n > 0 {
+			s.Note = fmt.Sprintf("%d submission(s) are excluded from these statistics because "+
+				"they could not be graded", n)
+		}
+	}()
 	scores := make([]float64, 0, len(reports))
 	for _, r := range reports {
-		scores = append(scores, r.Total)
+		if r == nil {
+			continue
+		}
 		s.MaxTotal = maxF(s.MaxTotal, r.MaxTotal)
+		// A report that could not be graded contributes no score. Including its
+		// zero would drag the class mean down by an amount that measures the
+		// platform's reliability rather than anything a student did, and the
+		// number would look exactly like a real one.
+		if r.NeedsReview || r.Err != "" {
+			continue
+		}
+		scores = append(scores, r.Total)
 		for _, q := range r.Questions {
 			for _, res := range q.Results {
 				if res.Status == StatusFail || res.Status == StatusPartial {
@@ -252,6 +272,15 @@ func Summarise(rubric string, reports []*Report, dur time.Duration) *Summary {
 		}
 	}
 	sort.Float64s(scores)
+	s.Graded = len(scores)
+	if len(scores) == 0 {
+		// Every submission was quarantined. There is no distribution to report,
+		// and inventing zeros would describe the platform rather than the class.
+		// The reports themselves are still attached: they are the whole point.
+		sort.Slice(reports, func(i, j int) bool { return reports[i].Submission < reports[j].Submission })
+		s.Reports = reports
+		return s
+	}
 	s.Min, s.Max = scores[0], scores[len(scores)-1]
 	var sum float64
 	for _, v := range scores {
@@ -292,13 +321,21 @@ func (s *Summary) Quarantined() []*Report {
 // award a zero that the platform, not the student, is responsible for.
 func (s *Summary) CSV() string {
 	var b strings.Builder
+	// Columns are the union of every question seen, not the questions of
+	// whichever report happens to be first. If the first submission failed to
+	// deploy it has no questions at all, and every other student's marks would
+	// silently collapse into no columns.
 	var qids []string
+	seen := map[string]bool{}
 	for _, r := range s.Reports {
-		if r != nil && len(r.Questions) > 0 {
-			for _, q := range r.Questions {
+		if r == nil {
+			continue
+		}
+		for _, q := range r.Questions {
+			if !seen[q.ID] {
+				seen[q.ID] = true
 				qids = append(qids, q.ID)
 			}
-			break
 		}
 	}
 	b.WriteString("submission,as,status,total,max")

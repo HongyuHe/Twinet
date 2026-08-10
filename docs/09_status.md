@@ -29,11 +29,13 @@ plan but not yet implemented; it is milestone M8.
 | Grading engine: rubric, 17 checks, structured reports | done | 3 submissions in **31 s**; JSON, text and CSV output |
 | Reference solution (`--solve`) | partial | scores **7.33 / 10** against its own rubric |
 | Container images | done | `hyhe/twinet-{router,host,switch,svc}` |
+| Per-submission grading harnesses | done | `twinet grade batch` gives each submission a private lab in which every AS but one is solved; verified with two submissions graded concurrently across three nodes |
 | Fault injection engine | partial | 21 types across all six NIKA categories, out of the 47 that are in-substrate; **21/21 inject, verify and resolve** on the live cluster, re-checked by `make e2e` in 25 seconds |
 | Incident runner | done | `twinet incident run`; a two-fault scenario injects, holds and unwinds in 798 ms |
 | Ground-truth isolation | verified | audited: 0 hits for the fault name, root cause or ground truth anywhere in a target container's files, environment or labels |
 | DNS zone generation | partial | zones are generated from the model and are correct by construction; **no server yet answers them**, so nothing in a lab can resolve a name |
-| Matrix, looking glass, policy analyzer | done | control-plane collectors; the analyzer reads structured paths and the declared relationships rather than scraping text |
+| Matrix, looking glass, policy analyzer | partial | the collectors and the analysis are implemented and tested, but nothing yet serves their output, so a student cannot open a looking glass |
+| _(collectors)_ | done | control-plane collectors; the analyzer reads structured paths and the declared relationships rather than scraping text |
 | CI, Makefile, lint config | done | `.github/workflows/ci.yml` |
 
 ## Defects found by the platform's own checks
@@ -103,7 +105,6 @@ reached students, and each motivated a permanent test.
 | SSH gateway with label-based authorisation | M2 | The agent already enforces owner-scoped exec, which is the hard half |
 | RPKI (Krill + Routinator) provisioning | M2 | Needed for the last point of the rubric |
 | Reference answers for exchange communities, traffic engineering and RPKI | M7 | The remaining 2.67 points of `--solve` |
-| Ephemeral per-submission grading labs | M5 | The engine, rubric and checks are done and run against a live lab; synthesising a private lab per submission is the remaining piece |
 | Diff-and-converge `apply` | M4 | Deploy is idempotent, but does not yet compute a minimal change plan |
 | `twinet save` / `restore` | M2 | |
 | Advanced-course exercises (MPLS, VRF, multicast) | M7 | The agent already loads the MPLS modules |

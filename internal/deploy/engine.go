@@ -72,6 +72,17 @@ type Engine struct {
 	UnderlayDev string
 	// PeerUnderlay maps node name to VTEP address, for cross-node links.
 	PeerUnderlay map[string]string
+	// Authoritative makes the rendered configuration win over whatever is in
+	// the container already.
+	//
+	// It is deliberately not the default: an ordinary redeploy converges the
+	// platform's own state and must leave a student's file alone, because
+	// overwriting it is silent -- FRR is not restarted, so the router keeps
+	// running correctly and the loss only appears when the container next
+	// restarts. Solve mode is the exception, since installing the reference
+	// solution over whatever is there is its entire purpose; preserving in that
+	// mode would leave the grading oracle quietly wrong.
+	Authoritative bool
 	// State persists student-owned configuration. When set, a container is
 	// never replaced without its contents being captured first and replayed
 	// afterwards, so a deployment cannot destroy a student's work.
@@ -679,6 +690,13 @@ var studentOwnedPaths = map[string]bool{
 // platform did not write and must not overwrite.
 func (e *Engine) holdsStudentWork(ctx context.Context, d *model.Device, path string) (bool, error) {
 	if !studentOwnedPaths[path] || !hasStudentConfig(d) {
+		return false, nil
+	}
+	// Solve mode exists precisely to install the reference solution over
+	// whatever is there. Preserving in that mode would make the golden answer
+	// silently not apply, which is worse than the loss this guard prevents:
+	// the grading oracle would be wrong and nothing would say so.
+	if e.Authoritative {
 		return false, nil
 	}
 	res, err := e.Runtime.Exec(ctx, d.Container, runtime.ExecCmd{

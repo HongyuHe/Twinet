@@ -7,7 +7,8 @@ DATE    ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 LDFLAGS := -s -w \
 	-X github.com/HongyuHe/twinet/internal/cli.Version=$(VERSION) \
 	-X github.com/HongyuHe/twinet/internal/cli.Commit=$(COMMIT) \
-	-X github.com/HongyuHe/twinet/internal/cli.Date=$(DATE)
+	-X github.com/HongyuHe/twinet/internal/cli.Date=$(DATE) \
+	-X github.com/HongyuHe/twinet/internal/agent.Version=$(VERSION)
 
 IMAGES  := router host switch svc
 REGISTRY?= hyhe

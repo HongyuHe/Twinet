@@ -329,3 +329,14 @@ func (s *Store) Labs() ([]string, error) {
 	sort.Strings(out)
 	return out, nil
 }
+
+// ForgetTopology drops the record that this node hosts a lab, while keeping the
+// snapshots of student work. A destroyed lab must not be resurrected by a later
+// restart, but the work captured from it is still worth having.
+func (s *Store) ForgetTopology(lab string) error {
+	err := os.Remove(filepath.Join(s.root, safe(lab), "topology.json"))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
+}

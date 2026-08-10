@@ -82,12 +82,13 @@ after a partial failure, a reboot, or a topology edit.`,
 			}
 			node := localNode(top)
 			eng := &deploy.Engine{
-				Runtime:      rt,
-				Node:         node,
-				PullPolicy:   runtime.PullPolicy(pull),
-				Renderer:     render.New(top, mode),
-				UnderlayIP:   underlayOf(top, node),
-				PeerUnderlay: peerUnderlays(top),
+				Runtime:       rt,
+				Node:          node,
+				PullPolicy:    runtime.PullPolicy(pull),
+				Renderer:      render.New(top, mode),
+				Authoritative: mode == render.ModeSolve,
+				UnderlayIP:    underlayOf(top, node),
+				PeerUnderlay:  peerUnderlays(top),
 			}
 
 			p, err := eng.Build(top)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -209,6 +210,28 @@ func deconflictOverlays(ctx context.Context, c *client.Cluster, top *model.Topol
 	return moved
 }
 
+// warnVersionSkew reports nodes whose agent differs from this controller.
+func warnVersionSkew(ctx context.Context, c *client.Cluster, errOut interface {
+	Write([]byte) (int, error)
+}) {
+	want := Version
+	var odd []string
+	for _, r := range c.Status(ctx) {
+		if r.Err != nil {
+			continue
+		}
+		if v := r.Value.Version; v != "" && v != want {
+			odd = append(odd, fmt.Sprintf("%s runs %s", r.Node, v))
+		}
+	}
+	if len(odd) > 0 {
+		sort.Strings(odd)
+		fmt.Fprintf(errOut, "  warning: this controller is %s but %s; "+
+			"re-run scripts/deploy_agents.sh before trusting the result\n",
+			want, strings.Join(odd, ", "))
+	}
+}
+
 func deployCluster(ctx context.Context, top *model.Topology, tok string, req agent.ApplyRequest, out, errOut interface {
 	Write([]byte) (int, error)
 }) error {
@@ -228,6 +251,11 @@ func deployCluster(ctx context.Context, top *model.Topology, tok string, req age
 		}
 		return fmt.Errorf("the underlay cannot carry this lab; fix the above or lower link_defaults.mtu")
 	}
+
+	// A cluster running mixed binaries produces results that cannot be
+	// attributed to any one version, and the mismatch is otherwise invisible:
+	// every node reports success while behaving differently.
+	warnVersionSkew(ctx, c, errOut)
 
 	start := time.Now()
 	results := c.Apply(ctx, top, req)

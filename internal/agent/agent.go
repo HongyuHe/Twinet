@@ -462,16 +462,19 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		mode = render.ModePlatform
 	}
 	eng := &deploy.Engine{
-		Runtime:      s.rt,
-		Node:         s.cfg.Node,
-		PullPolicy:   rt.PullPolicy(req.PullPolicy),
-		Renderer:     renderer(top, mode, req.Ungraded),
-		UnderlayIP:   s.cfg.UnderlayIP,
-		UnderlayDev:  s.cfg.UnderlayDev,
-		PeerUnderlay: req.PeerUnderlay,
-		State:        s.store,
-		Prune:        req.Prune,
-		Generation:   req.Generation,
+		Runtime:    s.rt,
+		Node:       s.cfg.Node,
+		PullPolicy: rt.PullPolicy(req.PullPolicy),
+		Renderer:   renderer(top, mode, req.Ungraded),
+		// Solve mode installs the reference solution, which is the one case
+		// where the rendered configuration must overwrite what is there.
+		Authoritative: mode == render.ModeSolve && req.Ungraded == 0,
+		UnderlayIP:    s.cfg.UnderlayIP,
+		UnderlayDev:   s.cfg.UnderlayDev,
+		PeerUnderlay:  req.PeerUnderlay,
+		State:         s.store,
+		Prune:         req.Prune,
+		Generation:    req.Generation,
 	}
 	p, err := eng.Build(top)
 	if err != nil {
@@ -503,7 +506,9 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 	// would otherwise come back believing the node is empty, and the next
 	// destroy would take a class's work with it without noticing there was
 	// anything to capture.
-	if s.store != nil {
+	// A dry run changed nothing, so recording it would make the node claim to
+	// host a lab that was never built.
+	if s.store != nil && !req.DryRun {
 		if raw, err := json.Marshal(req.Topology); err == nil {
 			if err := s.store.PutTopology(top.Name, raw); err != nil {
 				slog.Warn("recording the applied topology", "lab", top.Name, "err", err)
@@ -607,30 +612,52 @@ func (s *Server) handleDestroy(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusInternalServerError, err)
 		return
 	}
-	switch {
-	case req.AllOverlays:
-		// Without a manifest there is no VNI list, so cleanup works from what
-		// is actually on the host. This is what makes `destroy --lab NAME`
-		// able to clean up after a topology nobody has a copy of any more.
-		//
-		// It is still restricted to the overlays this lab owns. A node may host
-		// several labs at once -- a class lab beside a harness per submission
-		// being graded -- and removing every tunnel on the host would take all
-		// of them down together.
-		vnis, err := netx.ListOverlaysOfLab(req.Lab)
-		if err != nil {
-			slog.Warn("listing overlays", "err", err)
-		} else if err := eng.DestroyOverlays(vnis); err != nil {
-			slog.Warn("overlay cleanup incomplete", "err", err)
-		}
-	case len(req.VNIs) > 0:
-		if err := eng.DestroyOverlays(req.VNIs); err != nil {
-			slog.Warn("overlay cleanup incomplete", "err", err)
+	// Overlays are removed by ownership, never by the identifiers the caller
+	// computed. Two reasons. A lab whose identifiers were moved to avoid a
+	// collision no longer matches what its manifest derives, so a
+	// manifest-driven list would leak the tunnels it actually has and delete
+	// the ones it does not -- which belong to the lab it collided with. And a
+	// lab whose manifest is gone entirely can still be cleaned up, because the
+	// node knows what it owns without being told.
+	owned, err := netx.ListOverlaysOfLab(req.Lab)
+	if err != nil {
+		slog.Warn("listing this lab's overlays", "lab", req.Lab, "err", err)
+	}
+	if len(owned) > 0 {
+		if err := eng.DestroyOverlays(owned); err != nil {
+			slog.Warn("overlay cleanup incomplete", "lab", req.Lab, "err", err)
 		}
 	}
-	if req.Ephemeral && s.store != nil {
-		if err := s.store.Forget(req.Lab); err != nil {
-			slog.Warn("discarding ephemeral lab state", "lab", req.Lab, "err", err)
+	// Identifiers the caller supplied are honoured only where they are
+	// unowned, which cleans up a tunnel created before ownership was recorded
+	// without ever touching one that belongs to somebody else.
+	if len(req.VNIs) > 0 {
+		owners, err := netx.OverlayOwners()
+		if err == nil {
+			var safeVNIs []uint32
+			for _, v := range req.VNIs {
+				if owner, ok := owners[v]; ok && owner == "" {
+					safeVNIs = append(safeVNIs, v)
+				}
+			}
+			if len(safeVNIs) > 0 {
+				if err := eng.DestroyOverlays(safeVNIs); err != nil {
+					slog.Warn("overlay cleanup incomplete", "lab", req.Lab, "err", err)
+				}
+			}
+		}
+	}
+
+	if s.store != nil {
+		if req.Ephemeral {
+			if err := s.store.Forget(req.Lab); err != nil {
+				slog.Warn("discarding ephemeral lab state", "lab", req.Lab, "err", err)
+			}
+		} else if err := s.store.ForgetTopology(req.Lab); err != nil {
+			// The snapshots of student work are kept; only the record that
+			// this node hosts the lab is dropped, or a restart would resurrect
+			// a lab that no longer exists.
+			slog.Warn("clearing the lab's topology record", "lab", req.Lab, "err", err)
 		}
 	}
 	s.mu.Lock()

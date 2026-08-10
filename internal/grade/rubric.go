@@ -286,7 +286,18 @@ func runChecks(ctx context.Context, q QuestionSpec, env *Env, opts RunOptions) [
 			// into a sibling running concurrently.
 			e := *env
 			e.Args = cs.Args
-			results[i] = runCheck(cctx, c, &e)
+			e.infraSeen = &infraTracker{}
+			res := runCheck(cctx, c, &e)
+
+			// A check that concluded anything while the machinery was failing
+			// concluded it about the grader, not about the student. The
+			// verdict is discarded rather than trusted, because a check that
+			// absorbed an unreachable node into a "fail" turns an outage into
+			// a mark and says nothing about it.
+			if fail := e.infraSeen.failure(); fail != nil && res.Status != StatusError {
+				res = Errored(cs.Check, fail)
+			}
+			results[i] = res
 		}(i, c, cs)
 	}
 	wg.Wait()

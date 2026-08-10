@@ -17,9 +17,12 @@ package e2e
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -39,13 +42,46 @@ func labDir(t *testing.T) string {
 	return dir
 }
 
+// binOnce builds the controller from the source under test, exactly once.
+//
+// Running whatever happens to be in bin/ is how a suite ends up passing against
+// a binary nobody reviewed: the tests are green, the tree has moved on, and the
+// evidence proves nothing about the code it is attached to.
+var (
+	binOnce sync.Once
+	binPath string
+	binErr  error
+)
+
+func controller(t *testing.T) string {
+	t.Helper()
+	binOnce.Do(func() {
+		dir, err := os.MkdirTemp("", "twinet-e2e")
+		if err != nil {
+			binErr = err
+			return
+		}
+		binPath = filepath.Join(dir, "twinet")
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, "go", "build", "-o", binPath, "../../cmd/twinet")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			binErr = fmt.Errorf("building the controller under test: %v\n%s", err, out)
+		}
+	})
+	if binErr != nil {
+		t.Fatal(binErr)
+	}
+	return binPath
+}
+
 func twinet(t *testing.T, args ...string) (string, error) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	bin := os.Getenv("TWINET_BIN")
 	if bin == "" {
-		bin = "../../bin/twinet"
+		bin = controller(t)
 	}
 	cmd := exec.CommandContext(ctx, bin, args...)
 	out, err := cmd.CombinedOutput()
@@ -240,10 +276,11 @@ func TestRedeployDoesNotOverwriteStudentConfiguration(t *testing.T) {
 			"sed -i '/twinet-e2e-marker/d' /etc/frr/frr.conf")
 	})
 
-	if out, err := twinet(t, "deploy", "-m", dir, "--solve"); err != nil {
+	// An ordinary redeploy converges the platform's own state and must leave
+	// the student's file alone.
+	if out, err := twinet(t, "deploy", "-m", dir); err != nil {
 		t.Fatalf("redeploy: %v\n%s", err, out)
 	}
-
 	out, err := twinet(t, "exec", "-m", dir, dev, "--", "sh", "-c",
 		"grep -c 'twinet-e2e-marker' /etc/frr/frr.conf || true")
 	if err != nil {
@@ -251,5 +288,20 @@ func TestRedeployDoesNotOverwriteStudentConfiguration(t *testing.T) {
 	}
 	if !strings.Contains(out, "1") {
 		t.Errorf("a redeploy destroyed configuration the platform does not own:\n%s", out)
+	}
+
+	// Solve mode is the exception: installing the reference solution over
+	// whatever is there is its entire purpose, and preserving in that mode
+	// would leave the grading oracle quietly wrong.
+	if out, err := twinet(t, "deploy", "-m", dir, "--solve"); err != nil {
+		t.Fatalf("solve redeploy: %v\n%s", err, out)
+	}
+	out, err = twinet(t, "exec", "-m", dir, dev, "--", "sh", "-c",
+		"grep -c 'twinet-e2e-marker' /etc/frr/frr.conf || true")
+	if err != nil {
+		t.Fatalf("checking the marker after solve: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "0") {
+		t.Errorf("solve mode did not install the reference solution over what was there:\n%s", out)
 	}
 }
