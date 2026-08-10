@@ -249,6 +249,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	mux.HandleFunc("POST /v1/lifecycle", s.auth(s.handleLifecycle))
 	mux.HandleFunc("POST /v1/reshape", s.auth(s.handleReshape))
 	mux.HandleFunc("GET /v1/images", s.auth(s.handleImages))
+	mux.HandleFunc("GET /v1/attach", s.auth(s.handleAttach))
 	mux.HandleFunc("GET /v1/underlay", s.auth(s.handleUnderlay))
 
 	srv := &http.Server{

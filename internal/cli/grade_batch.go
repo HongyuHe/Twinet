@@ -459,6 +459,51 @@ func loadFRRConfig(ctx context.Context, exec execFn, d *model.Device, body strin
 	return nil
 }
 
+// submissionFromArchive reads a submission out of a `twinet save` archive.
+//
+// The topology hash inside is checked against the lab being graded. A
+// configuration is only meaningful relative to a topology -- addresses move
+// when a lab is edited -- so grading an archive from a different revision
+// produces failures the student could not have avoided, attributed to them.
+func submissionFromArchive(p string, class *model.Topology) (submission, error) {
+	b, files, err := readBundle(p)
+	if err != nil {
+		return submission{}, fmt.Errorf("%s: %w", filepath.Base(p), err)
+	}
+	group := b.Group
+	if group == "" {
+		group = strings.TrimSuffix(strings.TrimSuffix(filepath.Base(p), ".tar.gz"), ".tgz")
+	}
+	as, ok := class.ASes[b.AS]
+	if !ok || as.Role != model.RoleStudent {
+		return submission{}, fmt.Errorf("%s claims AS %d, which is not a student AS in this lab",
+			filepath.Base(p), b.AS)
+	}
+	if b.Topology != "" && b.Topology != class.Hash {
+		return submission{}, fmt.Errorf(
+			"%s was written against topology %s but this lab is %s; grading it would "+
+				"attribute to the student failures they could not have avoided",
+			filepath.Base(p), short(b.Topology), short(class.Hash))
+	}
+
+	sub := submission{
+		Group: group, AS: b.AS, Dir: p,
+		Files: map[string]string{}, Scripts: map[string]string{},
+	}
+	for name, body := range files {
+		switch {
+		case strings.HasSuffix(name, ".conf"):
+			sub.Files[strings.TrimSuffix(name, ".conf")] = string(body)
+		case strings.HasSuffix(name, ".sh"):
+			sub.Scripts[strings.TrimSuffix(name, ".sh")] = string(body)
+		}
+	}
+	if len(sub.Files) == 0 && len(sub.Scripts) == 0 {
+		return submission{}, fmt.Errorf("%s contains no configuration", filepath.Base(p))
+	}
+	return sub, nil
+}
+
 // readSubmissions reads a directory of per-group submissions.
 //
 // Layout: one directory per group, named after the group in the manifest or
@@ -483,7 +528,21 @@ func readSubmissions(dir string, class *model.Topology) ([]submission, error) {
 
 	var subs []submission
 	for _, e := range entries {
-		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
+		if strings.HasPrefix(e.Name(), ".") {
+			continue
+		}
+		// An archive produced by `twinet save` is a submission too, and the
+		// common case: a class hands in tarballs, not directory trees. Reading
+		// only directories meant the grader could not consume its own output.
+		if !e.IsDir() {
+			if !strings.HasSuffix(e.Name(), ".tar.gz") && !strings.HasSuffix(e.Name(), ".tgz") {
+				continue
+			}
+			sub, err := submissionFromArchive(filepath.Join(dir, e.Name()), class)
+			if err != nil {
+				return nil, err
+			}
+			subs = append(subs, sub)
 			continue
 		}
 		group := e.Name()

@@ -29,6 +29,8 @@ plan but not yet implemented; it is milestone M8.
 | Grading engine: rubric, 17 checks, structured reports | done | 3 submissions in **31 s**; JSON, text and CSV output |
 | Reference solution (`--solve`) | partial | scores **7.33 / 10** against its own rubric |
 | Container images | done | `hyhe/twinet-{router,host,switch,svc}` |
+| SSH gateway | done | one credential per group, authenticated at the edge; device names resolve within the student own AS so another group router cannot be named at all. Legacy per-AS ports are served but do not authorise. Verified across the cluster |
+| Save and restore | done | `twinet save` archives every group work with the topology hash and per-file checksums; restore refuses an archive from a different topology or one edited after it was taken |
 | Per-submission grading harnesses | done | `twinet grade batch` gives each submission a private lab in which every AS but one is solved; verified with two submissions graded concurrently across three nodes |
 | Fault injection engine | partial | 21 types across all six NIKA categories, out of the 47 that are in-substrate; **21/21 inject, verify and resolve** on the live cluster, re-checked by `make e2e` in 25 seconds |
 | Incident runner | done | `twinet incident run`; a two-fault scenario injects, holds and unwinds in 798 ms |

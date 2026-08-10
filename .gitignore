@@ -14,3 +14,9 @@
 
 # Injected-fault records carry ground truth and must never be committed.
 .twinet/
+
+# Credentials and host keys generated for a lab. These are secrets by
+# definition and a repository is the last place they belong.
+**/.twinet/roster.json
+**/.twinet/credentials.txt
+**/.twinet/gateway_host_key
