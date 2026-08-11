@@ -335,6 +335,22 @@ func deployCluster(ctx context.Context, top *model.Topology, tok string, req age
 		fmt.Fprintf(errOut, "  warning (skew allowed): %v\n", err)
 	}
 
+	// Work preserved on a node that is losing a device is carried to the node
+	// that will run it, before that node builds anything. Without this a
+	// rebalance leaves a class's configuration stranded on a machine that no
+	// longer runs the device: not deleted, but indistinguishable from deleted
+	// to anyone who does not know to go looking.
+	if !req.DryRun {
+		moved, problems := c.MigrateState(ctx, top)
+		if moved > 0 {
+			fmt.Fprintf(errOut, "  carried %d preserved snapshot(s) to the nodes now "+
+				"holding their devices\n", moved)
+		}
+		for _, p := range problems {
+			fmt.Fprintln(errOut, "  warning: "+p)
+		}
+	}
+
 	start := time.Now()
 	results := c.Apply(ctx, top, req)
 

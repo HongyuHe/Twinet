@@ -288,6 +288,8 @@ func (s *Server) Serve(ctx context.Context) error {
 	mux.HandleFunc("GET /v1/images", s.auth(s.handleImages))
 	mux.HandleFunc("GET /v1/attach", s.auth(s.handleAttach))
 	mux.HandleFunc("GET /v1/underlay", s.auth(s.handleUnderlay))
+	mux.HandleFunc("GET /v1/state", s.auth(s.handleStateExport))
+	mux.HandleFunc("POST /v1/state", s.auth(s.handleStateImport))
 
 	srv := &http.Server{
 		Addr:    s.cfg.Listen,
