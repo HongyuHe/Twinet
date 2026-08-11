@@ -2,6 +2,7 @@ package render
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/HongyuHe/twinet/internal/deploy"
@@ -112,6 +113,42 @@ func (r *Renderer) resolverCommands(d *model.Device) []deploy.Command {
 			addr, d.ASN)},
 		IgnoreError: true,
 	}}
+}
+
+// serviceRoutes gives a service container a route to each AS it serves,
+// through that AS's own link.
+//
+// Without them a service has only its directly-connected subnets and a default
+// route out whichever AS happened to be last, so a reply to any device that is
+// not on the service link leaves through the wrong AS. For DNS that was
+// survivable and therefore invisible: the reply crossed the entire emulated
+// internet and arrived anyway, with a path and a latency that were nonsense.
+// For the RPKI validator, whose session is TCP, it simply failed -- and the
+// failure presented as origin validation not working on any router except the
+// one the validator happened to be cabled to.
+func (r *Renderer) serviceRoutes(d *model.Device) []deploy.Command {
+	if d.Kind != model.KindService {
+		return nil
+	}
+	var cmds []deploy.Command
+	for _, i := range d.Ifaces {
+		var asn int
+		if _, err := fmt.Sscanf(i.Name, "as%d", &asn); err != nil || asn == 0 {
+			continue
+		}
+		as, ok := r.Top.ASes[asn]
+		if !ok || as.Block == "" || i.Peer == nil || i.Peer.Addr4 == "" {
+			continue
+		}
+		gw := addrOf(i.Peer.Addr4)
+		cmds = append(cmds, deploy.Command{
+			Describe: fmt.Sprintf("route to AS %d through its own link", asn),
+			Args: []string{"sh", "-c", fmt.Sprintf(
+				"ip route replace %s via %s dev %s", as.Block, gw, i.Name)},
+		})
+	}
+	sort.Slice(cmds, func(a, b int) bool { return cmds[a].Describe < cmds[b].Describe })
+	return cmds
 }
 
 func isRPKI(d *model.Device) bool {

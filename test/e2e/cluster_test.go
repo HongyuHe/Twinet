@@ -18,6 +18,7 @@ package e2e
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -31,17 +32,45 @@ import (
 	"time"
 )
 
-func labDir(t *testing.T) string {
-	t.Helper()
+// TestMain refuses to run at all without a cluster, rather than letting every
+// test skip.
+//
+// A suite that exits PASS having run nothing is worse than one that fails: it
+// is quoted as evidence, and the absence of the cluster is exactly the
+// condition under which nobody looks closely. Skipping is right for one test
+// that needs something optional; it is wrong for a suite whose entire purpose
+// is to exercise a real deployment.
+func TestMain(m *testing.M) {
+	if os.Getenv("TWINET_TOKEN") == "" {
+		fmt.Fprintln(os.Stderr,
+			"e2e: TWINET_TOKEN is not set. These tests exist to exercise a real\n"+
+				"cluster, and a green run that exercised nothing is worse than a red one.\n"+
+				"Set TWINET_TOKEN, or run the unit tests instead with `go test ./...`.")
+		os.Exit(1)
+	}
+	if dir := labDirPath(); dir == "" {
+		fmt.Fprintln(os.Stderr, "e2e: no lab manifest found; set TWINET_LAB")
+		os.Exit(1)
+	}
+	os.Exit(m.Run())
+}
+
+func labDirPath() string {
 	dir := os.Getenv("TWINET_LAB")
 	if dir == "" {
 		dir = "../../examples/cos461"
 	}
 	if _, err := os.Stat(dir); err != nil {
-		t.Skipf("no lab at %s: %v", dir, err)
+		return ""
 	}
-	if os.Getenv("TWINET_TOKEN") == "" {
-		t.Skip("TWINET_TOKEN is not set; these tests need a running cluster")
+	return dir
+}
+
+func labDir(t *testing.T) string {
+	t.Helper()
+	dir := labDirPath()
+	if dir == "" {
+		t.Fatal("no lab manifest; TestMain should have refused to start")
 	}
 	return dir
 }
@@ -368,17 +397,72 @@ func TestNamesResolveInsideTheLab(t *testing.T) {
 // the file, and a manifest field that silently arrived empty at the node.
 func TestTheReferenceSolutionScoresFullMarks(t *testing.T) {
 	dir := labDir(t)
+	out := t.TempDir()
 
-	out, err := twinet(t, "grade", "run", "-m", dir, "--as", "3",
-		"-o", t.TempDir(), "--converge-timeout", "6m")
+	// The report is parsed, not the console output. Searching that output for
+	// "10.00" proved nothing whatsoever: every line is printed as
+	// "score / 10.00", so a zero satisfied it. A test that cannot fail is
+	// worse than no test, because it is quoted as evidence.
+	res, err := twinet(t, "grade", "run", "-m", dir, "--as", "3",
+		"-o", out, "--converge-timeout", "6m")
 	if err != nil {
-		t.Fatalf("grading the reference: %v\n%s", err, out)
+		t.Fatalf("grading the reference: %v\n%s", err, res)
 	}
-	if !strings.Contains(out, "10.00") {
-		t.Errorf("the reference solution did not score full marks:\n%s", out)
+
+	raw, err := os.ReadFile(filepath.Join(out, "group3.json"))
+	if err != nil {
+		t.Fatalf("no report was written: %v", err)
 	}
-	if strings.Contains(out, "need review") {
-		t.Errorf("grading the reference did not complete cleanly:\n%s", out)
+	var rep struct {
+		Total       float64 `json:"total"`
+		MaxTotal    float64 `json:"max_total"`
+		Err         string  `json:"error"`
+		NeedsReview bool    `json:"needs_review"`
+		Questions   []struct {
+			ID      string  `json:"id"`
+			Awarded float64 `json:"awarded"`
+			Points  float64 `json:"points"`
+			Status  string  `json:"status"`
+			Results []struct {
+				Check  string `json:"check"`
+				Status string `json:"status"`
+			} `json:"results"`
+		} `json:"questions"`
+	}
+	if err := json.Unmarshal(raw, &rep); err != nil {
+		t.Fatalf("the report does not parse: %v", err)
+	}
+
+	if rep.Err != "" || rep.NeedsReview {
+		t.Fatalf("grading the reference did not complete cleanly: needs_review=%v err=%q",
+			rep.NeedsReview, rep.Err)
+	}
+	if rep.MaxTotal <= 0 {
+		t.Fatal("the rubric is worth nothing, so a full score means nothing")
+	}
+	if rep.Total < rep.MaxTotal {
+		t.Errorf("the reference scored %.2f of %.2f", rep.Total, rep.MaxTotal)
+	}
+
+	// Every question must have been assessed and passed. A rubric whose own
+	// reference cannot score full marks is unfalsifiable: a check that can
+	// never pass looks exactly like a class that never gets it right, and
+	// every student who loses that mark loses it to the platform.
+	if len(rep.Questions) == 0 {
+		t.Fatal("the report contains no questions")
+	}
+	for _, q := range rep.Questions {
+		if q.Awarded < q.Points {
+			t.Errorf("question %s awarded %.2f of %.2f (%s)", q.ID, q.Awarded, q.Points, q.Status)
+		}
+		if len(q.Results) == 0 {
+			t.Errorf("question %s ran no checks at all", q.ID)
+		}
+		for _, r := range q.Results {
+			if r.Status != "pass" {
+				t.Errorf("question %s: check %s is %s", q.ID, r.Check, r.Status)
+			}
+		}
 	}
 }
 

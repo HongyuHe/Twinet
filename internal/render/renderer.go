@@ -97,13 +97,14 @@ func (r *Renderer) Files(d *model.Device) (map[string]deploy.FileSpec, error) {
 func (r *Renderer) Commands(d *model.Device) ([]deploy.Command, error) {
 	switch d.Kind {
 	case model.KindRouter:
-		return r.routerCommands(d), nil
+		return append(r.routerCommands(d), r.rpkiReadyCommands(d)...), nil
 	case model.KindSwitch:
 		return r.switchCommands(d), nil
 	case model.KindHost:
 		return append(r.hostCommands(d), r.resolverCommands(d)...), nil
 	case model.KindService:
-		return append(r.hostCommands(d), r.serviceCommands(d)...), nil
+		cmds := append(r.hostCommands(d), r.serviceRoutes(d)...)
+		return append(cmds, r.serviceCommands(d)...), nil
 	}
 	return nil, nil
 }
@@ -179,6 +180,49 @@ func (r *Renderer) routerCommands(d *model.Device) []deploy.Command {
 // can do anything. VLAN tags are *not* set here, because assigning ports to
 // VLANs and configuring trunks is the exercise. That split is exactly what the
 // provisioning contract in the model expresses.
+// rpkiReadyCommands makes a router's validator session self-healing.
+//
+// FRR opens the RTR session when the cache is configured and does not reliably
+// retry one that was unreachable at that moment. The validator lives behind
+// routing the deployment is still installing, so whether a router ends up
+// validating depends on which scope finished first -- and a router that lost
+// the race stays silently disconnected, with every route becoming not-found
+// and origin validation quietly doing nothing. Only the router the validator
+// is cabled to would work, which is exactly the arrangement that survives a
+// spot check.
+//
+// Resetting is cheap and idempotent, so it is done unconditionally rather than
+// only when the session is down: a conditional would make the outcome depend on
+// when the check happened to run.
+func (r *Renderer) rpkiReadyCommands(d *model.Device) []deploy.Command {
+	if d.Kind != model.KindRouter || d.ASN == 0 {
+		return nil
+	}
+	// Only routers that actually carry the cache. A router with no external
+	// sessions has nothing to validate and is given no cache, so waiting for a
+	// session on it means every deployment pays a fixed delay per interior
+	// router and then warns about a validator that was never configured.
+	if !hasRPKICache(r.Top, d) {
+		return nil
+	}
+	return []deploy.Command{{
+		Describe: "connect to the origin validator",
+		Args: []string{"sh", "-c", strings.Join([]string{
+			"for i in 1 2 3 4 5 6 7 8; do",
+			"  vtysh -c 'show rpki cache-connection' 2>/dev/null | grep -q Connected && exit 0",
+			"  vtysh -c 'rpki reset' >/dev/null 2>&1 || true",
+			"  sleep 4",
+			"done",
+			// Not a hard failure: a lab without a working validator is still a
+			// usable lab, and refusing to deploy over it would turn a degraded
+			// service into an outage. The grading check for origin validation
+			// is what makes the degradation visible where it matters.
+			"echo 'the origin validator did not answer; routes will be treated as not-found' >&2",
+		}, "\n")},
+		IgnoreError: true,
+	}}
+}
+
 func (r *Renderer) switchCommands(d *model.Device) []deploy.Command {
 	br := "br0"
 	cmds := []deploy.Command{

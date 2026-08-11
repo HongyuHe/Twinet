@@ -82,3 +82,103 @@ func TestPlainModesAreUnaffected(t *testing.T) {
 		}
 	}
 }
+
+// FRR allows one inbound route-map per neighbour and keeps the last statement
+// it is given. Emitting origin validation as a second map therefore silently
+// replaced the relationship policy -- or, depending on order, silently
+// discarded the validation -- while the configuration looked correct at a
+// glance and every router reported itself configured to validate.
+func TestOneInboundRouteMapPerNeighbour(t *testing.T) {
+	top := courseTopology(t)
+	checked := 0
+	for _, d := range top.SortedDevices() {
+		if d.Kind != model.KindRouter {
+			continue
+		}
+		cfg, err := Router(top, d)
+		if err != nil {
+			t.Fatalf("%s: %v", d.ID, err)
+		}
+		perNeighbour := map[string][]string{}
+		for _, line := range strings.Split(cfg.Platform+cfg.Expected, "\n") {
+			f := strings.Fields(strings.TrimSpace(line))
+			// neighbor <addr> route-map <name> in
+			if len(f) == 5 && f[0] == "neighbor" && f[2] == "route-map" && f[4] == "in" {
+				perNeighbour[f[1]] = append(perNeighbour[f[1]], f[3])
+			}
+		}
+		for addr, maps := range perNeighbour {
+			checked++
+			if len(maps) > 1 {
+				t.Errorf("%s gives neighbour %s %d inbound route-maps (%s); "+
+					"FRR keeps only the last, so the others never run",
+					d.ID, addr, len(maps), strings.Join(maps, ", "))
+			}
+		}
+	}
+	if checked == 0 {
+		t.Fatal("no inbound route-maps were found, so this proves nothing")
+	}
+}
+
+// Origin validation has to be reachable from the map that is actually applied.
+// Rejecting invalid routes is only half of it: a router accepting only what is
+// explicitly valid would black-hole most of the real internet, and a check
+// testing for rejection alone would award full marks for exactly that mistake.
+func TestValidationIsPartOfTheAppliedPolicy(t *testing.T) {
+	top := courseTopology(t)
+
+	var withCache int
+	for _, d := range top.SortedDevices() {
+		if d.Kind != model.KindRouter || d.ASN == 0 {
+			continue
+		}
+		cfg, err := Router(top, d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body := cfg.Platform + cfg.Expected
+		if !strings.Contains(body, "rpki cache") {
+			continue
+		}
+		withCache++
+
+		// Every map named on an inbound statement must carry both halves.
+		for _, line := range strings.Split(body, "\n") {
+			f := strings.Fields(strings.TrimSpace(line))
+			if len(f) != 5 || f[0] != "neighbor" || f[2] != "route-map" || f[4] != "in" {
+				continue
+			}
+			name := f[3]
+			clauses := routeMapBody(body, name)
+			if !strings.Contains(clauses, "match rpki invalid") {
+				t.Errorf("%s applies %s inbound, which never rejects an invalid origin", d.ID, name)
+			}
+			if !strings.Contains(clauses, "match rpki notfound") {
+				t.Errorf("%s applies %s inbound, which does not keep routes with no ROA", d.ID, name)
+			}
+		}
+	}
+	if withCache == 0 {
+		t.Fatal("no router has a validator configured, so this proves nothing")
+	}
+}
+
+// routeMapBody returns every clause of a named route-map.
+func routeMapBody(cfg, name string) string {
+	var out []string
+	in := false
+	for _, line := range strings.Split(cfg, "\n") {
+		t := strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(t, "route-map "+name+" "):
+			in = true
+		case strings.HasPrefix(t, "route-map "):
+			in = false
+		}
+		if in {
+			out = append(out, t)
+		}
+	}
+	return strings.Join(out, "\n")
+}

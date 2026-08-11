@@ -274,24 +274,21 @@ func renderBGP(top *model.Topology, as *model.AS, d *model.Device) string {
 			out = fmt.Sprintf("EXPORT-IXP-%d", x.asn)
 			in = fmt.Sprintf("IMPORT-IXP-%d", x.asn)
 		}
-		if hasRPKI {
-			// Origin validation runs before the relationship policy, so an
-			// invalid announcement is gone before it can win on local
-			// preference. Ordering these the other way round would let a
-			// hijacked prefix be preferred and then rejected, which works by
-			// accident and fails as soon as the policy changes.
-			fmt.Fprintf(&b, "  neighbor %s route-map RPKI-IN in\n", x.addr)
-		}
+		// One inbound route-map per neighbour. FRR keeps only the last such
+		// statement, so emitting origin validation as a second map silently
+		// replaced the relationship policy -- or, depending on order, silently
+		// discarded the validation. Both halves must live in the same map, and
+		// they do: rpkiClauses is folded into every inbound map below.
 		fmt.Fprintf(&b, "  neighbor %s route-map %s in\n", x.addr, in)
 		fmt.Fprintf(&b, "  neighbor %s route-map %s out\n", x.addr, out)
 	}
 	b.WriteString(" exit-address-family\nexit\n!\n")
 
 	if len(exts) > 0 {
-		b.WriteString(gaoRexfordPolicy())
-		b.WriteString(slowLinkPolicy(as, slowRels))
-		b.WriteString(ixpPolicy(top, as, exts))
-		b.WriteString(rpkiPolicy(top, as))
+		b.WriteString(gaoRexfordPolicy(hasRPKI))
+		b.WriteString(slowLinkPolicy(as, slowRels, hasRPKI))
+		b.WriteString(ixpPolicy(top, as, exts, hasRPKI))
+		b.WriteString(rpkiCache(top, as))
 	}
 	return b.String()
 }
@@ -335,7 +332,7 @@ func parseDelayMS(l *model.Link) float64 {
 // preference only steers what we send; prepending only steers what others send
 // us; and denying the announcement outright would remove the backup path the
 // question requires to remain.
-func slowLinkPolicy(as *model.AS, rels map[model.Relationship]bool) string {
+func slowLinkPolicy(as *model.AS, rels map[model.Relationship]bool, rpki bool) string {
 	if len(rels) == 0 {
 		return ""
 	}
@@ -349,8 +346,7 @@ func slowLinkPolicy(as *model.AS, rels map[model.Relationship]bool) string {
 			continue
 		}
 		up := strings.ToUpper(string(rel))
-		fmt.Fprintf(&b, "route-map LP-SLOW-%s permit 10\n set local-preference %d\n set community 1:%d\nexit\n",
-			up, base[rel]-50, communityFor(rel))
+		b.WriteString(inboundMap("LP-SLOW-"+up, rel, base[rel]-50, rpki))
 		// The export mirrors the fast neighbour of the same class exactly, and
 		// adds only the prepend. Anything else is filtering: withholding a
 		// prefix from the slow neighbour that the fast one receives removes
@@ -384,7 +380,7 @@ func communityFor(rel model.Relationship) int {
 // anything whose path has already been through another member of the same
 // region, which is what stops the exchange being used as transit between two of
 // its own members.
-func ixpPolicy(top *model.Topology, as *model.AS, exts []ext) string {
+func ixpPolicy(top *model.Topology, as *model.AS, exts []ext, rpki bool) string {
 	var b strings.Builder
 	for _, x := range exts {
 		if !x.ixp {
@@ -419,17 +415,19 @@ func ixpPolicy(top *model.Topology, as *model.AS, exts []ext) string {
 			}
 		}
 
+		name := fmt.Sprintf("IMPORT-IXP-%d", x.asn)
+		if rpki {
+			fmt.Fprintf(&b, "route-map %s deny 3\n match rpki invalid\nexit\n", name)
+		}
 		if len(sameRegion) > 0 {
 			fmt.Fprintf(&b, "bgp as-path access-list IXP-%d-REGION permit _(%s)_\n",
 				x.asn, joinASNs(sameRegion, "|"))
-			fmt.Fprintf(&b, "!\nroute-map IMPORT-IXP-%d deny 10\n match as-path IXP-%d-REGION\nexit\n",
-				x.asn, x.asn)
-			fmt.Fprintf(&b, "route-map IMPORT-IXP-%d permit 20\n set local-preference 200\n set community %d:%d\nexit\n!\n",
-				x.asn, 1, 20)
-		} else {
-			fmt.Fprintf(&b, "route-map IMPORT-IXP-%d permit 10\n set local-preference 200\n set community %d:%d\nexit\n!\n",
-				x.asn, 1, 20)
+			fmt.Fprintf(&b, "!\nroute-map %s deny 10\n match as-path IXP-%d-REGION\nexit\n", name, x.asn)
 		}
+		if rpki {
+			fmt.Fprintf(&b, "route-map %s permit 15\n match rpki notfound\n set local-preference 150\n set community 1:20\nexit\n", name)
+		}
+		fmt.Fprintf(&b, "route-map %s permit 20\n set local-preference 200\n set community 1:20\nexit\n!\n", name)
 
 		// Tag our own announcement for each member that should receive it.
 		tags := make([]string, 0, len(others))
@@ -455,7 +453,7 @@ func ixpPolicy(top *model.Topology, as *model.AS, exts []ext) string {
 // matters as much as the first: a router that accepts only what is explicitly
 // valid would black-hole most of the real internet, and a check that tested
 // only for rejection would award full marks for exactly that mistake.
-func rpkiPolicy(top *model.Topology, as *model.AS) string {
+func rpkiCache(top *model.Topology, as *model.AS) string {
 	addr := svc.RPKIAddrFor(top, as.ASN)
 	if addr == "" {
 		return ""
@@ -466,19 +464,34 @@ func rpkiPolicy(top *model.Topology, as *model.AS) string {
 	// takes "tcp" is newer, and using it here fails as an unknown command --
 	// which a student would read as their own syntax error.
 	fmt.Fprintf(&b, " rpki cache %s 3323 preference 1\n", addr)
-	b.WriteString(" rpki polling_period 30\nexit\n!\n")
-	b.WriteString(`route-map RPKI-IN deny 5
- match rpki invalid
-exit
-route-map RPKI-IN permit 10
- match rpki notfound
- set local-preference 90
-exit
-route-map RPKI-IN permit 20
-exit
-!
-`)
+	// A short retry interval matters more than it looks. The validator lives
+	// behind the routing the deployment is still installing, so a router that
+	// configures its cache first finds it unreachable -- and without a retry
+	// it stays disconnected, silently, with every route becoming not-found and
+	// origin validation quietly doing nothing. Only the router the validator
+	// happens to be cabled to would work, which is precisely the arrangement
+	// that looks correct in a spot check.
+	b.WriteString(" rpki polling_period 30\n rpki retry_interval 15\n rpki expire_interval 600\nexit\n!\n")
 	return b.String()
+}
+
+// hasRPKICache reports whether a router is configured with a validator.
+//
+// The condition is shared with the renderer rather than restated, because the
+// two drifting apart is how a router ends up waiting for a session it was
+// never given -- or, worse, being given one nothing ever checks.
+func hasRPKICache(top *model.Topology, d *model.Device) bool {
+	as, ok := top.ASes[d.ASN]
+	if !ok || svc.RPKIAddrFor(top, d.ASN) == "" {
+		return false
+	}
+	for _, i := range d.Ifaces {
+		if i.Role == model.RoleInterAS || i.Role == model.RoleIXPLink {
+			return true
+		}
+	}
+	_ = as
+	return false
 }
 
 // routeServerOn finds the exchange's route server on the segment an interface
@@ -533,23 +546,11 @@ func joinASNs(asns []int, sep string) string {
 // gaoRexfordPolicy renders the business-relationship policy the courses teach:
 // prefer customer over peer over provider, and export a customer's routes to
 // everyone but a peer's or provider's routes only to customers.
-func gaoRexfordPolicy() string {
-	return `bgp community-list standard CUSTOMER permit 1:10
+func gaoRexfordPolicy(rpki bool) string {
+	var b strings.Builder
+	b.WriteString(`bgp community-list standard CUSTOMER permit 1:10
 bgp community-list standard PEER permit 1:20
 bgp community-list standard PROVIDER permit 1:30
-!
-route-map LP-CUSTOMER permit 10
- set local-preference 300
- set community 1:10
-exit
-route-map LP-PEER permit 10
- set local-preference 200
- set community 1:20
-exit
-route-map LP-PROVIDER permit 10
- set local-preference 100
- set community 1:30
-exit
 !
 route-map EXPORT-CUSTOMER permit 10
 exit
@@ -570,7 +571,49 @@ exit
 route-map EXPORT-PROVIDER permit 30
 exit
 !
-`
+`)
+	// The inbound maps carry both the relationship policy and, where the lab
+	// has a validator, origin validation. They cannot be separate maps: FRR
+	// allows one inbound route-map per neighbour and keeps the last, so a
+	// second one silently replaces the first -- which is exactly what happened
+	// here, leaving every router configured to validate and none of them doing
+	// it, with the running configuration looking correct at a glance.
+	for _, rel := range []model.Relationship{model.RelCustomer, model.RelPeer, model.RelProvider} {
+		b.WriteString(inboundMap("LP-"+strings.ToUpper(string(rel)), rel, localPrefFor(rel), rpki))
+	}
+	return b.String()
+}
+
+// localPrefFor is the preference a relationship earns: customer over peer over
+// provider, which is what makes the money flow the right way.
+func localPrefFor(rel model.Relationship) int {
+	switch rel {
+	case model.RelCustomer:
+		return 300
+	case model.RelPeer:
+		return 200
+	default:
+		return 100
+	}
+}
+
+// inboundMap renders one inbound route-map, optionally validating origins.
+//
+// Invalid routes are refused and routes with no ROA are kept at a lower
+// preference. The second half matters as much as the first: a router that
+// accepted only what is explicitly valid would black-hole most of the real
+// internet, and a check testing only for rejection would award full marks for
+// exactly that mistake.
+func inboundMap(name string, rel model.Relationship, pref int, rpki bool) string {
+	var b strings.Builder
+	if rpki {
+		fmt.Fprintf(&b, "route-map %s deny 5\n match rpki invalid\nexit\n", name)
+		fmt.Fprintf(&b, "route-map %s permit 10\n match rpki notfound\n set local-preference %d\n set community 1:%d\nexit\n",
+			name, pref-50, communityFor(rel))
+	}
+	fmt.Fprintf(&b, "route-map %s permit 20\n set local-preference %d\n set community 1:%d\nexit\n!\n",
+		name, pref, communityFor(rel))
+	return b.String()
 }
 
 func routerID(d *model.Device) string {
