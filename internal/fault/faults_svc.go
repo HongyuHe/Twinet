@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // Faults against the lab's own services: DNS, and the layer-2 fabric.
@@ -121,31 +122,61 @@ func init() {
 			// The NS record is skipped deliberately. Repointing the authority
 			// record breaks the whole zone, which is a different and much
 			// louder fault than one service resolving to the wrong machine.
+			// The name that was repointed is printed on stderr so verification
+			// can ask the server for it. Without it, verification had nothing
+			// to query and fell back to reading the file back, which is not
+			// the same claim.
 			script := fmt.Sprintf(
 				"awk 'BEGIN{done=0} { if(!done && $1!=\"ns\" && $2==\"IN\" && $3==\"A\"){ "+
-					"print $1\" IN A %s\"; done=1 } else print }' %s > %s.new && mv %s.new %s",
+					"print $1\" IN A %s\"; print \"TWINET_NAME=\"$1 > \"/dev/stderr\"; done=1 } "+
+					"else print }' %s > %s.new && mv %s.new %s",
 				bad, zone, zone, zone, zone)
-			if _, err := e.Sh(ctx, t.DeviceID(), script); err != nil {
+			out, err := e.Sh(ctx, t.DeviceID(), script)
+			if err != nil {
 				return nil, err
+			}
+			name := valueAfter(out, "TWINET_NAME=")
+			if name == "" {
+				return nil, fmt.Errorf("no A record in %s could be repointed, so the fault "+
+					"would have reported success while changing nothing", zone)
 			}
 			if _, err := e.Sh(ctx, t.DeviceID(), reloadNamed()); err != nil {
 				return nil, err
 			}
-			return State{"zone": zone, "before": before, "address": bad}, nil
+			return State{"zone": zone, "before": before, "address": bad,
+				"name": name, "origin": zoneOrigin(before)}, nil
 		},
 		Verify: func(ctx context.Context, e *Env, t Target, s State) (Evidence, error) {
-			out, _, err := e.TryE(ctx, t.DeviceID(), "cat "+s["zone"])
+			// Ask the server, do not read the file. The fault claims a name
+			// resolves to the wrong machine; a zone file containing the wrong
+			// address proves only that a file was edited. If named failed to
+			// reload -- a bad zone, a syntax error, a serial that did not
+			// advance -- the file check passed and the server went on handing
+			// out the correct address, so the episode had no symptom at all
+			// and any agent asked to diagnose it was being misled.
+			fqdn := strings.TrimSuffix(s["name"], ".")
+			if o := s["origin"]; o != "" && !strings.HasSuffix(fqdn, o) {
+				fqdn = fqdn + "." + o
+			}
+			answer, err := e.Settled(ctx, 30*time.Second,
+				func(c context.Context) (string, error) {
+					out, _, err := e.TryE(c, t.DeviceID(),
+						"nslookup "+fqdn+" 127.0.0.1 2>/dev/null || true")
+					return out, err
+				},
+				func(o string) bool { return strings.Contains(o, s["address"]) })
 			if err != nil {
 				return Evidence{}, err
 			}
-			observed := matchingLine(out, s["address"])
-			if observed == "" {
-				observed = "no record points at " + s["address"]
+			got := strings.Contains(answer, s["address"])
+			observed := "the server did not answer with " + s["address"]
+			if got {
+				observed = firstLine(matchingLine(answer, s["address"]))
 			}
 			return Evidence{
-				Verified: strings.Contains(out, s["address"]),
+				Verified: got,
 				Observed: observed,
-				Expected: "a record pointing at " + s["address"],
+				Expected: fqdn + " resolving to " + s["address"],
 			}, nil
 		},
 		Resolve: func(ctx context.Context, e *Env, t Target, s State) error {
@@ -442,4 +473,26 @@ func boolWord(b bool, yes, no string) string {
 		return yes
 	}
 	return no
+}
+
+// valueAfter pulls a KEY=value token out of command output.
+func valueAfter(out, key string) string {
+	for _, ln := range strings.Split(out, "\n") {
+		if i := strings.Index(ln, key); i >= 0 {
+			return strings.TrimSpace(ln[i+len(key):])
+		}
+	}
+	return ""
+}
+
+// zoneOrigin reads $ORIGIN from a zone file so a bare record name can be turned
+// into something resolvable.
+func zoneOrigin(zone string) string {
+	for _, ln := range strings.Split(zone, "\n") {
+		f := strings.Fields(ln)
+		if len(f) >= 2 && f[0] == "$ORIGIN" {
+			return strings.TrimSuffix(f[1], ".")
+		}
+	}
+	return ""
 }

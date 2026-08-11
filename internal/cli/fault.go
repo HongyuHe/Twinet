@@ -235,7 +235,12 @@ func newFaultInjectCmd(opts *Options) *cobra.Command {
 			}
 
 			fmt.Fprintf(cmd.OutOrStdout(), "injected %s on %s\n", inj.Fault, inj.Target.DeviceID())
-			fmt.Fprintf(cmd.OutOrStdout(), "  verified: %s\n", inj.Evidence.Observed)
+			// Say what was checked and what was seen. Printing only Observed
+			// showed an empty line whenever the symptom was an absence -- an
+			// adjacency gone, no session established -- which is most of them,
+			// so the one line meant to report the verdict was blank exactly
+			// when the fault had worked.
+			fmt.Fprintf(cmd.OutOrStdout(), "  verified: %s\n", describeEvidence(inj.Evidence))
 			if f, ok := fault.Lookup(inj.Fault); ok {
 				fmt.Fprintf(cmd.OutOrStdout(), "  reported symptom: %s\n", f.Symptom)
 			}
@@ -514,4 +519,23 @@ func parseKV(in []string) map[string]string {
 		}
 	}
 	return out
+}
+
+// describeEvidence renders a verification result as a sentence.
+func describeEvidence(ev fault.Evidence) string {
+	verdict := "no"
+	if ev.Verified {
+		verdict = "yes"
+	}
+	parts := []string{verdict}
+	if ev.Expected != "" {
+		parts = append(parts, "expected "+ev.Expected)
+	}
+	if ev.Observed != "" {
+		parts = append(parts, "observed "+ev.Observed)
+	}
+	if ev.Detail != "" {
+		parts = append(parts, ev.Detail)
+	}
+	return strings.Join(parts, "; ")
 }

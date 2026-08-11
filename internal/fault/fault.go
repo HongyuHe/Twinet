@@ -127,6 +127,11 @@ type Evidence struct {
 
 // Env is what a fault is given to work with.
 type Env struct {
+	// wantSymptom tells Settled which transition to wait for. Inject sets it
+	// true, Resolve false; it is unexported because a fault must not be able
+	// to decide what its own verification means.
+	wantSymptom bool
+
 	Topology *model.Topology
 	// Exec runs a command inside a device.
 	Exec func(ctx context.Context, deviceID string, cmd []string) (rt.ExecResult, error)
@@ -335,8 +340,23 @@ func Inject(ctx context.Context, env *Env, name string, t Target) (*Injection, e
 		return nil, fmt.Errorf("no fault named %q; try `twinet fault list`", name)
 	}
 	if t.Device != "" {
-		if _, err := env.Device(t); err != nil {
+		d, err := env.Device(t)
+		if err != nil {
 			return nil, err
+		}
+		// Fill in the AS from the device.
+		//
+		// Faults build commands like `router bgp %d` out of Target.AS, and it
+		// is zero whenever a device was named without --as, which is the
+		// obvious way to invoke this. That produced `router bgp 0`: on a good
+		// day vtysh refused it and the fault reported a confusing error, on a
+		// bad one it created a second empty BGP process next to the real one.
+		// The device already knows which AS it belongs to.
+		if t.AS == 0 {
+			t.AS = d.ASN
+		} else if t.AS != d.ASN {
+			return nil, fmt.Errorf("device %s belongs to AS %d, not AS %d",
+				d.ID, d.ASN, t.AS)
 		}
 	}
 
@@ -370,6 +390,7 @@ func Inject(ctx context.Context, env *Env, name string, t Target) (*Injection, e
 		Truth:      f.Truth(t, ""),
 	}
 
+	env.wantSymptom = true
 	ev, err := f.Verify(ctx, env, t, state)
 	if err != nil {
 		if rerr := f.Resolve(ctx, env, t, state); rerr != nil {
@@ -425,6 +446,7 @@ func Resolve(ctx context.Context, env *Env, inj *Injection) error {
 		return fmt.Errorf("resolve %s: %w, so the lab must be treated as contaminated%s",
 			inj.Fault, err, alsoFailed(undoErr))
 	}
+	env.wantSymptom = false
 	ev, err := f.Verify(ctx, env, inj.Target, inj.State)
 	if err != nil {
 		return fmt.Errorf("resolve %s: it could not be confirmed, "+
@@ -548,3 +570,65 @@ func Verify(ctx context.Context, env *Env, inj *Injection) (Evidence, error) {
 	}
 	return f.Verify(ctx, env, inj.Target, inj.State)
 }
+
+// Settled polls until the network agrees with the fault, or gives up.
+//
+// A verifier that reads back the configuration it just wrote proves only that
+// vtysh accepted a line. The claim a fault makes is about behaviour -- the
+// adjacency drops, the session stops establishing, the name resolves wrongly --
+// and behaviour takes time to follow configuration: OSPF has a dead interval,
+// BGP a hold timer. Checking immediately would fail on a fault that works, so
+// the honest options are to poll for the symptom or to not check it at all.
+// This is the first option; the three faults that used to take the second are
+// the reason it exists.
+//
+// The returned Evidence carries the last observation either way, so a fault
+// that never produced its symptom says what it saw instead.
+func (e *Env) Settled(ctx context.Context, within time.Duration,
+	observe func(context.Context) (string, error),
+	satisfied func(string) bool) (string, error) {
+
+	// Which way the transition runs depends on who is asking. After an
+	// injection the symptom has to appear; after a resolve it has to clear.
+	// Polling for "present" in both cases made every symptom-checking fault
+	// impossible to resolve: the undo was applied, the check ran before the
+	// protocol had reconverged, the symptom was still there, and resolve
+	// declared the lab contaminated while it was in fact recovering normally.
+	want := e.wantSymptom
+	deadline := time.Now().Add(within)
+	var last string
+	var lastErr error
+	for {
+		out, err := observe(ctx)
+		if err == nil {
+			last, lastErr = out, nil
+			if satisfied(out) == want {
+				return out, nil
+			}
+		} else {
+			lastErr = err
+		}
+		if time.Now().After(deadline) {
+			return last, lastErr
+		}
+		select {
+		case <-ctx.Done():
+			return last, ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
+	}
+}
+
+// SymptomWindow is how long a control-plane fault is given to show itself.
+//
+// FRR's default dead interval is 40s, and a neighbour is only declared down
+// once it expires -- so an adjacency broken by an area change is still listed
+// for the better part of a minute after the change lands. 45s was tried first
+// and was not enough: the fault worked, the check ran a few seconds early, and
+// the injection was rolled back as ineffective every time, which made the
+// fault type unusable while looking like a bug in the fault.
+//
+// 90s leaves room for the dead interval plus the reconvergence that follows.
+// It costs nothing when the symptom appears sooner, because Settled returns as
+// soon as it sees what it is waiting for.
+const SymptomWindow = 90 * time.Second

@@ -79,16 +79,30 @@ func init() {
 			return State{"prefix": prefix, "asn": fmt.Sprint(asn)}, nil
 		},
 		Verify: func(ctx context.Context, e *Env, t Target, s State) (Evidence, error) {
-			out, err := e.Vtysh(ctx, t.DeviceID(), "show running-config")
+			// The damage is that traffic for the prefix is drawn here and
+			// dropped, so check the forwarding table: the route must be in the
+			// RIB pointing at Null0. Confirming both configuration lines were
+			// typed said nothing about whether the router had installed
+			// anything, and a leak that is not installed swallows no traffic.
+			prefix := s["prefix"]
+			out, err := e.Settled(ctx, SymptomWindow,
+				func(c context.Context) (string, error) {
+					return e.Vtysh(c, t.DeviceID(), "show ip route "+prefix)
+				},
+				// FRR reports a discard route as "unreachable (blackhole)" in
+				// `show ip route`; the Null0 spelling only exists in the
+				// configuration, so looking for it here never matched and the
+				// fault was rolled back as ineffective every time.
+				func(o string) bool { return strings.Contains(o, "blackhole") })
 			if err != nil {
 				return Evidence{}, err
 			}
-			leaked := strings.Contains(out, "network "+s["prefix"]) &&
-				strings.Contains(out, "ip route "+s["prefix"]+" Null0")
+			leaked := strings.Contains(out, "blackhole")
 			return Evidence{
 				Verified: leaked,
-				Observed: boolWord(leaked, "the prefix is originated and discarded locally", "no leak present"),
-				Expected: "the router originates " + s["prefix"] + " into a null route",
+				Observed: boolWord(leaked, "traffic for "+prefix+" is discarded here",
+					"the router has no discard route for "+prefix),
+				Expected: "the router originates " + prefix + " into a null route",
 			}, nil
 		},
 		Resolve: func(ctx context.Context, e *Env, t Target, s State) error {
@@ -133,19 +147,35 @@ func init() {
 			return State{"network": network, "area": area, "wrong": wrong}, nil
 		},
 		Verify: func(ctx context.Context, e *Env, t Target, s State) (Evidence, error) {
-			out, err := e.Vtysh(ctx, t.DeviceID(), "show running-config")
+			// Moving a link into another area breaks the adjacency across it,
+			// because OSPF neighbours must agree on the area. That broken
+			// adjacency is the symptom an operator sees, so that is what is
+			// checked. The configuration line being present proved only that
+			// the area had been retyped.
+			// The peer is resolved from the network the injection actually
+			// moved, not from the target's first internal link. Those are
+			// chosen by different code -- inject reads the running config,
+			// the other reads the model -- and when they disagreed the
+			// verifier watched an adjacency the fault had not touched, saw it
+			// still up, and rolled back a fault that had worked perfectly.
+			peer, err := ospfPeerOnNetwork(e, t, s["network"])
 			if err != nil {
 				return Evidence{}, err
 			}
-			want := fmt.Sprintf("network %s area %s", s["network"], s["wrong"])
-			// What is on the device, not what the fault wanted to put there.
-			// Reporting the wanted line either way made a fault that had been
-			// undone read as though it were still present, which is the one
-			// thing verification exists to tell apart.
+			out, err := e.Settled(ctx, SymptomWindow,
+				func(c context.Context) (string, error) {
+					return e.Vtysh(c, t.DeviceID(), "show ip ospf neighbor")
+				},
+				func(o string) bool { return !strings.Contains(o, peer) })
+			if err != nil {
+				return Evidence{}, err
+			}
+			down := !strings.Contains(out, peer)
 			return Evidence{
-				Verified: strings.Contains(out, want),
-				Observed: ospfAreaOf(out, s["network"]),
-				Expected: want,
+				Verified: down,
+				Observed: boolWord(down, "no adjacency with "+peer,
+					firstLine(matchingLine(out, peer))),
+				Expected: "the adjacency with " + peer + " is down, the areas disagreeing",
 			}, nil
 		},
 		Resolve: func(ctx context.Context, e *Env, t Target, s State) error {

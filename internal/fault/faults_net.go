@@ -3,6 +3,7 @@ package fault
 import (
 	"context"
 	"fmt"
+	"net"
 	"strconv"
 	"strings"
 )
@@ -310,16 +311,29 @@ func init() {
 			return State{"network": net}, nil
 		},
 		Verify: func(ctx context.Context, e *Env, t Target, s State) (Evidence, error) {
-			net, err := ospfNetworkFor(e, t)
+			// The claim is that the adjacency never forms, so that is what is
+			// checked. Reading back the absence of the network statement only
+			// proved vtysh had accepted "no network", which it had already
+			// reported; it would have passed just as happily on a router whose
+			// neighbour was still fully adjacent through another statement
+			// covering the same link.
+			peer, err := ospfPeerAcross(e, t)
 			if err != nil {
 				return Evidence{}, err
 			}
-			out, err := e.Vtysh(ctx, t.DeviceID(), "show running-config")
+			out, err := e.Settled(ctx, SymptomWindow,
+				func(c context.Context) (string, error) {
+					return e.Vtysh(c, t.DeviceID(), "show ip ospf neighbor")
+				},
+				func(o string) bool { return !strings.Contains(o, peer) })
 			if err != nil {
 				return Evidence{}, err
 			}
-			return Evidence{Verified: !strings.Contains(out, "network "+net+" area"),
-				Expected: "no network statement for " + net}, nil
+			return Evidence{
+				Verified: !strings.Contains(out, peer),
+				Observed: firstLine(matchingLine(out, peer)),
+				Expected: "no OSPF adjacency with " + peer,
+			}, nil
 		},
 		Resolve: func(ctx context.Context, e *Env, t Target, s State) error {
 			if s["network"] == "" {
@@ -363,15 +377,24 @@ func init() {
 			return State{"asn": fmt.Sprint(asn), "wrong": fmt.Sprint(wrong)}, nil
 		},
 		Verify: func(ctx context.Context, e *Env, t Target, s State) (Evidence, error) {
-			out, err := e.Vtysh(ctx, t.DeviceID(), "show running-config")
+			// The claim is that every session stops establishing. Confirming
+			// the wrong number appears in the configuration confirmed only
+			// that the typo was typed -- it would have passed on a router
+			// whose sessions were all still up, which is the one outcome that
+			// would mean the fault had not happened.
+			out, err := e.Settled(ctx, SymptomWindow,
+				func(c context.Context) (string, error) {
+					return e.Vtysh(c, t.DeviceID(), "show bgp summary")
+				},
+				func(o string) bool { return establishedPeers(o) == 0 })
 			if err != nil {
 				return Evidence{}, err
 			}
-			wrong := "router bgp " + s["wrong"]
+			n := establishedPeers(out)
 			return Evidence{
-				Verified: strings.Contains(out, wrong),
-				Observed: matchingLine(out, "router bgp "),
-				Expected: wrong,
+				Verified: n == 0,
+				Observed: fmt.Sprintf("%d established session(s)", n),
+				Expected: "no established BGP sessions",
 			}, nil
 		},
 		Resolve: func(ctx context.Context, e *Env, t Target, s State) error {
@@ -426,13 +449,25 @@ func init() {
 			return State{"peer": peer, "asn": fmt.Sprint(asn)}, nil
 		},
 		Verify: func(ctx context.Context, e *Env, t Target, s State) (Evidence, error) {
-			out, err := e.Vtysh(ctx, t.DeviceID(), "show running-config")
+			// The claim is that this one session stops establishing. Checking
+			// that the old remote-as line is gone confirms only that the edit
+			// landed -- it says nothing about the session, which is the thing
+			// an agent diagnosing this would look at.
+			peer := s["peer"]
+			out, err := e.Settled(ctx, SymptomWindow,
+				func(c context.Context) (string, error) {
+					return e.Vtysh(c, t.DeviceID(), "show bgp summary")
+				},
+				func(o string) bool { return !peerEstablished(o, peer) })
 			if err != nil {
 				return Evidence{}, err
 			}
-			want := fmt.Sprintf("neighbor %s remote-as %s", s["peer"], s["asn"])
-			return Evidence{Verified: !strings.Contains(out, want),
-				Expected: "the remote AS is no longer " + s["asn"]}, nil
+			up := peerEstablished(out, peer)
+			return Evidence{
+				Verified: !up,
+				Observed: firstLine(matchingLine(out, peer)),
+				Expected: "the session with " + peer + " not established",
+			}, nil
 		},
 		Resolve: func(ctx context.Context, e *Env, t Target, s State) error {
 			if s["peer"] == "" {
@@ -463,13 +498,37 @@ func init() {
 			return State{"prefix": as.Block}, nil
 		},
 		Verify: func(ctx context.Context, e *Env, t Target, s State) (Evidence, error) {
+			// The claim is that the AS stops originating its prefix, so the
+			// prefix must actually leave the BGP table. The configuration
+			// check passed the moment the statement was removed, which is
+			// before BGP has withdrawn anything and would have passed even if
+			// the prefix were still being originated by another statement.
 			as := e.Topology.ASes[t.AS]
-			out, err := e.Vtysh(ctx, t.DeviceID(), "show running-config")
+			block := as.Block
+			// What must stop is this router originating the prefix, which FRR
+			// marks "sourced" on the locally generated path.
+			//
+			// Not "the prefix disappears": every router in the AS originates
+			// it, so the others keep it in this one's table over iBGP and it
+			// never goes away. An earlier check for the prefix being absent
+			// could therefore never pass on any multi-router AS, which is all
+			// of them here -- the fault was rolled back every time and the
+			// fault type was in practice unusable.
+			out, err := e.Settled(ctx, SymptomWindow,
+				func(c context.Context) (string, error) {
+					return e.Vtysh(c, t.DeviceID(), "show bgp ipv4 unicast "+block)
+				},
+				func(o string) bool { return !strings.Contains(o, "sourced") })
 			if err != nil {
 				return Evidence{}, err
 			}
-			return Evidence{Verified: !strings.Contains(out, "network "+as.Block),
-				Expected: "the AS no longer originates " + as.Block}, nil
+			gone := !strings.Contains(out, "sourced")
+			return Evidence{
+				Verified: gone,
+				Observed: boolWord(gone, "the router no longer originates "+block,
+					"the router still originates "+block),
+				Expected: block + " no longer originated here",
+			}, nil
 		},
 		Resolve: func(ctx context.Context, e *Env, t Target, s State) error {
 			if s["prefix"] == "" {
@@ -511,17 +570,25 @@ func init() {
 			if victim == "" {
 				return Evidence{}, fmt.Errorf("no hijacked prefix recorded")
 			}
-			out, err := e.Vtysh(ctx, t.DeviceID(), "show running-config")
+			// The claim is that this router originates someone else's prefix,
+			// so look for it in the BGP table as a local origin. The
+			// configuration check confirmed a `network` statement had been
+			// typed, which is true even when BGP refuses to originate the
+			// prefix because no matching route exists -- a hijack that never
+			// left the router and that no victim would ever see.
+			out, err := e.Settled(ctx, SymptomWindow,
+				func(c context.Context) (string, error) {
+					return e.Vtysh(c, t.DeviceID(), "show bgp ipv4 unicast "+victim)
+				},
+				func(o string) bool { return strings.Contains(o, "Local") })
 			if err != nil {
 				return Evidence{}, err
 			}
-			// The AS's own prefix is always originated, so the predicate must
-			// name the victim's prefix specifically.
-			originated := matchingLine(out, "network "+victim)
-			if originated == "" {
-				originated = "no `network " + victim + "` statement"
+			originated := firstLine(out)
+			if !strings.Contains(out, "Local") {
+				originated = "the router is not originating " + victim
 			}
-			return Evidence{Verified: strings.Contains(out, "network "+victim),
+			return Evidence{Verified: strings.Contains(out, "Local"),
 				Expected: "AS " + fmt.Sprint(t.AS) + " originates " + victim,
 				Observed: originated}, nil
 		},
@@ -771,4 +838,99 @@ func countAlive(ctx context.Context, e *Env, t Target, pids string) (int, error)
 		return 0, fmt.Errorf("could not read how many processes are alive from %q", strings.TrimSpace(out))
 	}
 	return n, nil
+}
+
+// ospfPeerAcross names the router on the other end of the link this fault
+// removed from OSPF, so verification can look for the adjacency itself rather
+// than for the configuration line that was supposed to cause it to drop.
+//
+// It resolves the same interface ospfNetworkFor chose, so the two cannot
+// disagree about which link the fault is about.
+func ospfPeerAcross(e *Env, t Target) (string, error) {
+	d, err := e.Device(t)
+	if err != nil {
+		return "", err
+	}
+	for _, i := range d.Ifaces {
+		if t.Iface != "" && i.Name != t.Iface {
+			continue
+		}
+		if i.Role != "intra-as" || i.Link == nil || i.Link.Subnet == "" {
+			continue
+		}
+		if i.Peer == nil || i.Peer.Device == nil {
+			return "", fmt.Errorf("the link from %s on %s has no resolved peer, so the "+
+				"adjacency cannot be checked", i.Name, d.ID)
+		}
+		// FRR lists neighbours by router ID, which the platform sets to the
+		// peer's loopback address.
+		if lo, ok := i.Peer.Device.IfaceByName("lo"); ok && lo.Addr4 != "" {
+			return addrOnly(lo.Addr4), nil
+		}
+		return addrOnly(i.Peer.Addr4), nil
+	}
+	return "", fmt.Errorf("device %s has no internal link to remove from OSPF", d.ID)
+}
+
+// establishedPeers counts the sessions in `show bgp summary` that are actually
+// up. FRR prints the prefix count in the state column once a session
+// establishes and a state name while it is not, so a column that parses as a
+// number is an established session.
+func establishedPeers(summary string) int {
+	n := 0
+	for _, ln := range strings.Split(summary, "\n") {
+		f := strings.Fields(ln)
+		if len(f) < 10 {
+			continue
+		}
+		if net.ParseIP(f[0]) == nil {
+			continue
+		}
+		if _, err := strconv.Atoi(f[9]); err == nil {
+			n++
+		}
+	}
+	return n
+}
+
+// peerEstablished reports whether one neighbour's session is up in the output
+// of `show bgp summary`. FRR prints a prefix count once a session establishes
+// and a state name while it is not, so a numeric state column means up.
+func peerEstablished(summary, peer string) bool {
+	if peer == "" {
+		return false
+	}
+	for _, ln := range strings.Split(summary, "\n") {
+		f := strings.Fields(ln)
+		if len(f) < 10 || f[0] != peer {
+			continue
+		}
+		_, err := strconv.Atoi(f[9])
+		return err == nil
+	}
+	return false
+}
+
+// ospfPeerOnNetwork names the router reached across a particular subnet, so a
+// verifier can watch the adjacency that a fault actually disturbed rather than
+// whichever one it would have picked independently.
+func ospfPeerOnNetwork(e *Env, t Target, subnet string) (string, error) {
+	if subnet == "" {
+		return ospfPeerAcross(e, t)
+	}
+	d, err := e.Device(t)
+	if err != nil {
+		return "", err
+	}
+	for _, i := range d.Ifaces {
+		if i.Link == nil || i.Link.Subnet != subnet || i.Peer == nil || i.Peer.Device == nil {
+			continue
+		}
+		if lo, ok := i.Peer.Device.IfaceByName("lo"); ok && lo.Addr4 != "" {
+			return addrOnly(lo.Addr4), nil
+		}
+		return addrOnly(i.Peer.Addr4), nil
+	}
+	return "", fmt.Errorf("no link on %s carries subnet %s, so the adjacency the fault "+
+		"changed cannot be identified", d.ID, subnet)
 }
