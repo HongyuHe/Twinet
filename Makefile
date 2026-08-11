@@ -70,7 +70,9 @@ ci: ci-tools naming lint test build tidy-check
 	# The schema is generated, so it can only be trusted if something checks it
 	# still describes the manifests that exist.
 	./bin/twinet schema > /tmp/twinet-lab.schema.json
-	@python3 -c "import jsonschema" 2>/dev/null && 		for m in examples/demo examples/cos461 examples/advnet examples/scale; do 			python3 scripts/check_schema.py /tmp/twinet-lab.schema.json $$m/twinet.yaml || exit 1; 		done || echo "  (skipping schema conformance: python jsonschema not installed)"
+	@for m in examples/demo examples/cos461 examples/advnet examples/scale; do \
+		python3 scripts/check_schema.py /tmp/twinet-lab.schema.json $$m/twinet.yaml || exit 1; \
+	done
 	shellcheck scripts/*.sh
 	@echo "all CI gates passed"
 
@@ -80,11 +82,13 @@ ci-tools:
 	for t in golangci-lint shellcheck; do \
 		command -v $$t >/dev/null 2>&1 || missing="$$missing $$t"; \
 	done; \
+	python3 -c "import jsonschema" >/dev/null 2>&1 || missing="$$missing python3-jsonschema"; \
 	if [ -n "$$missing" ]; then \
 		echo "make ci cannot run: missing$$missing"; \
 		echo "these gates run in CI, so skipping them here would report a pass"; \
 		echo "that CI will not agree with. Install golangci-lint $(GOLANGCI_VERSION)"; \
-		echo "and shellcheck, or run the individual targets you want."; \
+		echo "and shellcheck, pip install jsonschema, or run the individual"; \
+		echo "targets you want."; \
 		exit 1; \
 	fi
 

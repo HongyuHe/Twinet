@@ -37,6 +37,37 @@ type Schema struct {
 	Required    []string           `json:"required,omitempty"`
 	Items       *Schema            `json:"items,omitempty"`
 	AddProps    *Schema            `json:"additionalProperties,omitempty"`
+	Enum        []string           `json:"enum,omitempty"`
+
+	// Closed marks an object that accepts only the properties it names.
+	//
+	// It is separate from AddProps because "additionalProperties": false and
+	// "additionalProperties": {...} are the same JSON key with different
+	// types, and a *Schema cannot express the false.
+	Closed bool `json:"-"`
+}
+
+// MarshalJSON writes additionalProperties: false for a closed object.
+//
+// Without it the schema accepted any unknown top-level field, so a manifest
+// with a misspelled key -- "servces:", "placment:" -- validated cleanly and
+// then silently did not have the thing the author meant to configure. That is
+// the failure a schema exists to prevent, and it is the most common one.
+func (s Schema) MarshalJSON() ([]byte, error) {
+	type plain Schema
+	if !s.Closed {
+		return json.Marshal(plain(s))
+	}
+	raw, err := json.Marshal(plain(s))
+	if err != nil {
+		return nil, err
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return nil, err
+	}
+	m["additionalProperties"] = json.RawMessage("false")
+	return json.Marshal(m)
 }
 
 type generator struct {
@@ -102,7 +133,10 @@ func (g *generator) structSchema(t reflect.Type) *Schema {
 		name = strings.TrimPrefix(t.PkgPath(), "github.com/HongyuHe/twinet/internal/") + "." + name
 	}
 	g.seen[t] = name
-	s := &Schema{Type: "object", Properties: map[string]*Schema{}, Title: t.Name()}
+	// Closed: a struct names every field it has, so anything else in the YAML
+	// is a mistake -- almost always a misspelling, which otherwise validates
+	// and then silently configures nothing.
+	s := &Schema{Type: "object", Properties: map[string]*Schema{}, Title: t.Name(), Closed: true}
 	g.defs[name] = s
 
 	for i := 0; i < t.NumField(); i++ {
@@ -130,6 +164,15 @@ func (g *generator) structSchema(t reflect.Type) *Schema {
 			key = strings.ToLower(f.Name)
 		}
 		fs := g.walk(f.Type)
+		// An enum constrains the value, and the constraint is already written
+		// on the field. Emitting it is what makes the schema able to reject
+		// placement.strategy: "balanced-ish" rather than merely note that it
+		// is a string.
+		if vals := tagValues(f, "jsonschema", "enum"); len(vals) > 0 {
+			cp := *fs
+			cp.Enum = vals
+			fs = &cp
+		}
 		if doc := tagValue(f, "jsonschema", "description"); doc != "" {
 			// A copy, so a description on one use of a shared type does not
 			// leak onto every other use of it.
@@ -187,4 +230,16 @@ func hasTagFlag(f reflect.StructField, tag, flag string) bool {
 // JSON renders the schema.
 func JSON(v any) ([]byte, error) {
 	return json.MarshalIndent(Of(v), "", "  ")
+}
+
+// tagValues collects every occurrence of a repeated key in a struct tag, which
+// is how an enum with several members is written: enum=a,enum=b,enum=c.
+func tagValues(f reflect.StructField, tag, key string) []string {
+	var out []string
+	for _, part := range strings.Split(f.Tag.Get(tag), ",") {
+		if v, ok := strings.CutPrefix(part, key+"="); ok {
+			out = append(out, v)
+		}
+	}
+	return out
 }
