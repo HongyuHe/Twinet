@@ -486,7 +486,6 @@ func mermaidID(s string) string {
 	return strings.NewReplacer("/", "_", ":", "_", "-", "_", ".", "_").Replace(s)
 }
 
-
 // writeReferenceConfig prints what a router's configuration should look like
 // when the assignment has been done correctly.
 //

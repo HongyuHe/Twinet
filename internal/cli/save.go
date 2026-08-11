@@ -202,7 +202,16 @@ func saveAS(ctx context.Context, top *model.Topology, asn int, outDir string,
 	gz := gzip.NewWriter(f)
 	tw := tar.NewWriter(gz)
 
-	meta, err := json.MarshalIndent(b, "", "  ")
+	// The manifest is signed before it is written. Without it, the group, the
+	// AS and every checksum are simply whatever the archive says they are: a
+	// student who edits a configuration recomputes the sha256 sitting next to
+	// it, and one who wants a better mark edits the group field.
+	key, err := submissionKey()
+	if err != nil {
+		return "", fmt.Errorf("no key to sign this submission with (%w); an unsigned archive "+
+			"cannot be told apart from one written by hand", err)
+	}
+	meta, err := bundleJSON(b, signBundle(b, key))
 	if err != nil {
 		return "", err
 	}
@@ -409,6 +418,8 @@ blame them for it.`,
 	}
 	cmd.Flags().StringVar(&token, "token", "", "agent token for cluster labs")
 	cmd.Flags().BoolVar(&force, "force", false, "restore even if the topology has changed")
+	cmd.Flags().BoolVar(&allowUnsignedBundles, "allow-unsigned", false,
+		"grade archives that carry no signature (only for archives collected by an older build)")
 	return cmd
 }
 
@@ -427,6 +438,7 @@ func readBundle(p string) (Bundle, map[string][]byte, error) {
 	defer func() { _ = gz.Close() }()
 
 	files := map[string][]byte{}
+	var sig string
 	tr := tar.NewReader(gz)
 	for {
 		h, err := tr.Next()
@@ -454,9 +466,21 @@ func readBundle(p string) (Bundle, map[string][]byte, error) {
 			if err := json.Unmarshal(body, &b); err != nil {
 				return b, nil, fmt.Errorf("manifest: %w", err)
 			}
+			var sigOnly struct {
+				Signature string `json:"signature"`
+			}
+			_ = json.Unmarshal(body, &sigOnly)
+			sig = sigOnly.Signature
 			continue
 		}
 		files[path.Base(name)] = body
+	}
+
+	// The signature is checked before the checksums, because the checksums are
+	// only worth anything once it is established that they were written by the
+	// platform and not by the person being marked.
+	if err := checkBundleSignature(b, sig, allowUnsignedBundles); err != nil {
+		return b, nil, fmt.Errorf("%s: %w", filepath.Base(p), err)
 	}
 
 	// A checksum mismatch means the archive was edited after it was taken.

@@ -156,6 +156,8 @@ mark, unless --keep-labs is given for a dispute.`,
 	cmd.Flags().BoolVar(&keepHosts, "keep-hosts", true, "keep one host per neighbour, for end-to-end checks")
 	cmd.Flags().BoolVar(&keepLabs, "keep-labs", false, "do not destroy harnesses, for investigating a disputed mark")
 	cmd.Flags().StringVar(&token, "token", "", "agent token (or TWINET_TOKEN)")
+	cmd.Flags().BoolVar(&allowUnsignedBundles, "allow-unsigned", false,
+		"grade archives that carry no signature (only for archives collected by an older build)")
 	cmd.Flags().DurationVar(&converge, "converge-timeout", 3*time.Minute, "how long a convergence predicate may wait")
 	cmd.Flags().DurationVar(&settle, "settle", 0,
 		"fixed grace period after configuring; 0 waits for convergence instead, which is both faster and correct")
