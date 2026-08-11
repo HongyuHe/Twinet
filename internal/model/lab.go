@@ -396,6 +396,58 @@ type ASTemplate struct {
 	// IXP marks this template as an internet exchange point, in which case
 	// Routers must contain exactly one router acting as the route server.
 	IXP bool `yaml:"ixp,omitempty" json:"ixp,omitempty"`
+
+	// MPLS turns on label switching and LDP across the AS's interior, which
+	// the advanced course's BGP-free core exercise is built on.
+	MPLS MPLSSpec `yaml:"mpls,omitempty" json:"mpls,omitempty"`
+
+	// VRFs are the virtual routing tables this AS offers. Each is a separate
+	// routing table, so two customers using the same private address space can
+	// both be carried without either seeing the other.
+	VRFs map[string]*VRFSpec `yaml:"vrfs,omitempty" json:"vrfs,omitempty"`
+}
+
+// MPLSSpec turns on label switching for an AS.
+//
+// Enabling it makes the interior forward on labels rather than on destination
+// addresses, which is what allows the core routers to carry traffic for
+// prefixes they hold no route to -- a "BGP-free core". LDP distributes the
+// labels; there is nothing for the author to configure beyond saying which
+// routers should run it.
+type MPLSSpec struct {
+	// Enabled runs LDP on every intra-AS interface of every router that has
+	// one, using the router's loopback as the transport address.
+	Enabled bool `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	// Core lists the routers that must not run BGP at all. Naming them is what
+	// makes "BGP-free core" a checkable property rather than an aspiration:
+	// the grader can say which routers were meant to be free of it.
+	Core []string `yaml:"core,omitempty" json:"core,omitempty"`
+}
+
+// VRFSpec describes one virtual routing and forwarding instance.
+//
+// The route distinguisher makes two customers' identical prefixes distinct in
+// the provider's BGP table; the route targets decide which VRFs may import each
+// other's routes, and so decide which sites can reach which. Isolation between
+// two banks, and the deliberate lack of it between two branches of one bank,
+// are both expressed here and nowhere else.
+type VRFSpec struct {
+	// Table is the kernel routing table number. Distinct per VRF within an AS.
+	Table int `yaml:"table,omitempty" json:"table,omitempty"`
+	// RD is the route distinguisher. Leave it empty and each provider edge
+	// derives its own from its loopback, which is what you want: the value is
+	// part of the key a VPN route is stored under, so two edges using one
+	// value overwrite each other's copy of a customer and one of that
+	// customer's sites silently vanishes from the other's routing table.
+	//
+	// Set it only for course material that publishes specific values, and then
+	// only where one router terminates the table.
+	RD string `yaml:"rd,omitempty" json:"rd,omitempty"`
+	// Import and Export are route-target communities.
+	Import []string `yaml:"import,omitempty" json:"import,omitempty"`
+	Export []string `yaml:"export,omitempty" json:"export,omitempty"`
+	// Attach lists the external port names whose interface joins this VRF.
+	Attach []string `yaml:"attach,omitempty" json:"attach,omitempty"`
 }
 
 // RouterSpec describes one router within an AS template.
@@ -457,6 +509,9 @@ type L2Host struct {
 // these names, which decouples the inter-AS graph from the intra-AS topology.
 type ExtPort struct {
 	Router string `yaml:"router" json:"router" jsonschema:"required"`
+	// VRF names the virtual routing table this port belongs to, empty for the
+	// default one.
+	VRF string `yaml:"vrf,omitempty" json:"vrf,omitempty"`
 }
 
 // Provisioning is the contract that distinguishes what Twinet configures from

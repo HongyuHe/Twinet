@@ -684,6 +684,33 @@ func (e *Engine) endpoint(top *model.Topology, i *model.Iface, nsPath string, l 
 		Altname: alloc.LinkAltname(top.Name, l.ID),
 		Up:      true,
 	}
+	// Label switching is enabled on every interface of a router in an
+	// MPLS-enabled AS, including the ones facing customers: LDP is not offered
+	// there, but a labelled packet that does arrive must be forwarded rather
+	// than dropped, and deciding per interface here would mean two places that
+	// have to agree about which interfaces are interior.
+	if as := top.ASes[i.Device.ASN]; as != nil && as.MPLS.Enabled {
+		ep.MPLS = true
+		// Room is left for the label stack.
+		//
+		// A label is four bytes on the wire, and a VPN packet carries two: the
+		// transport label and the VPN label. The interface MTU is what TCP
+		// derives its segment size from, so without this a router negotiates
+		// segments that are exactly the link MTU and every one of them becomes
+		// oversized the moment a label is pushed.
+		//
+		// The failure that produces is remarkably quiet. Small messages get
+		// through, so BGP sessions to label-switched peers open, exchange
+		// keepalives and sit there reporting Established while not one UPDATE
+		// crosses -- and only for peers more than one hop away, because the
+		// last hop uses implicit null and pushes no label at all. The result
+		// is a VPN whose sessions are all up and which carries no routes,
+		// which looks like a policy mistake and is not one.
+		if ep.MTU > mplsLabelHeadroom {
+			ep.MTU -= mplsLabelHeadroom
+		}
+	}
+
 	// A customer-facing interface belongs to that customer's routing table.
 	// This is a kernel device, not only an FRR setting: without it the
 	// addresses land in the main table, and two customers using the same
@@ -862,6 +889,12 @@ func (e *Engine) DestroyOverlays(vnis []uint32) error {
 	}
 	return nil
 }
+
+// mplsLabelHeadroom is the number of bytes reserved on a label-switching
+// interface. Four bytes per label, and three labels is enough for a transport
+// label, a VPN label and one more for a future fast-reroute or entropy label
+// without having to revisit this.
+const mplsLabelHeadroom = 12
 
 func linkMTU(l *model.Link) int {
 	if l.Props.MTU != nil {

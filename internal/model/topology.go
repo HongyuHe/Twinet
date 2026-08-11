@@ -50,12 +50,40 @@ type AS struct {
 	ExtPorts   map[string]*ExtPortBinding
 	Labels     map[string]string
 	Node       string // pinned node, empty means "let the placer decide"
+
+	// MPLS and VRFs carry the advanced course's label-switching and
+	// virtual-routing configuration through to the renderer and the grader,
+	// so both work from the same declaration rather than from two.
+	MPLS MPLSSpec
+	VRFs map[string]*VRFSpec
+}
+
+// VRFsSorted returns the VRF names in a stable order.
+func (a *AS) VRFsSorted() []string {
+	out := make([]string, 0, len(a.VRFs))
+	for n := range a.VRFs {
+		out = append(out, n)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// InCore reports whether a router was declared part of the BGP-free core.
+func (a *AS) InCore(name string) bool {
+	for _, c := range a.MPLS.Core {
+		if c == name {
+			return true
+		}
+	}
+	return false
 }
 
 // ExtPortBinding resolves a named external port to a concrete router.
 type ExtPortBinding struct {
 	Name   string
 	Router *Device
+	// VRF names the virtual routing table this port's interface joins.
+	VRF string
 }
 
 // Device is one container in the expanded topology.
@@ -164,6 +192,15 @@ type Iface struct {
 	Role IfaceRole
 	// Peer is the interface at the other end, for point-to-point links.
 	Peer *Iface
+	// VRF names the virtual routing and forwarding instance this interface
+	// belongs to, empty for the default table.
+	//
+	// A VRF is what makes two customers' identical private address space
+	// coexist on one provider router: each has its own routing table, and the
+	// interface facing a customer is enslaved to theirs. Without it the
+	// advanced course's central exercise -- a BGP/MPLS L3VPN where two banks
+	// both use 192.168.0.0/16 -- has no way to be expressed at all.
+	VRF string
 }
 
 // IfaceRole classifies an interface for configuration rendering and grading.

@@ -103,7 +103,11 @@ func Router(top *model.Topology, d *model.Device) (RouterConfig, error) {
 		if i.Addr4 == "" && i.Addr6 == "" {
 			continue
 		}
-		fmt.Fprintf(b, "interface %s\n", i.Name)
+		if i.VRF != "" {
+			fmt.Fprintf(b, "interface %s vrf %s\n", i.Name, i.VRF)
+		} else {
+			fmt.Fprintf(b, "interface %s\n", i.Name)
+		}
 		if i.Addr4 != "" {
 			fmt.Fprintf(b, " ip address %s\n", i.Addr4)
 		}
@@ -119,13 +123,25 @@ func Router(top *model.Topology, d *model.Device) (RouterConfig, error) {
 	// OSPF: every intra-AS subnet plus the service subnets, which the
 	// assignment explicitly requires students to advertise.
 	ospf := renderOSPF(d)
-	bgp := renderBGP(top, as, d)
+	// A router declared part of a BGP-free core runs no BGP at all. That is
+	// the property the advanced exercise is about, so rendering a session on
+	// one would make the reference solution contradict the question.
+	bgp := ""
+	if !as.InCore(d.Name) {
+		bgp = renderBGP(top, as, d)
+	}
+	mpls := renderMPLS(as, d)
+	vrfBGP := renderVRFBGP(as, d)
 	if isPlatformOwned(as) {
 		plat.WriteString(ospf)
 		plat.WriteString(bgp)
+		plat.WriteString(mpls)
+		plat.WriteString(vrfBGP)
 	} else {
 		exp.WriteString(ospf)
 		exp.WriteString(bgp)
+		exp.WriteString(mpls)
+		exp.WriteString(vrfBGP)
 	}
 
 	return RouterConfig{Platform: plat.String(), Expected: exp.String()}, nil
@@ -200,15 +216,51 @@ func renderBGP(top *model.Topology, as *model.AS, d *model.Device) string {
 		peers = append(peers, addrOf(rlo.Addr4))
 	}
 	sort.Strings(peers)
+	// A core router runs no BGP, so nothing peers with it. Leaving it in the
+	// mesh would leave every edge with a session that can never come up, and
+	// "the core is BGP-free" would be contradicted by every other router's
+	// configuration.
+	if len(as.MPLS.Core) > 0 {
+		var kept []string
+		for _, r := range as.Routers {
+			if as.InCore(r.Name) {
+				continue
+			}
+			if lo, ok := r.IfaceByName("lo"); ok && lo.Addr4 != "" && addrOf(lo.Addr4) != "" {
+				for _, p := range peers {
+					if p == addrOf(lo.Addr4) {
+						kept = append(kept, p)
+					}
+				}
+			}
+		}
+		peers = kept
+	}
 	for _, p := range peers {
 		fmt.Fprintf(&b, " neighbor %s remote-as %d\n", p, as.ASN)
 		fmt.Fprintf(&b, " neighbor %s update-source lo\n", p)
+		if len(as.VRFs) > 0 {
+			// The next hop for a VPN route must be this router's own loopback,
+			// or the receiving edge resolves it to an interior address the
+			// core does not advertise into BGP -- and the route is accepted,
+			// installed, and unusable.
+			fmt.Fprintf(&b, " neighbor %s next-hop-self\n", p)
+		}
 	}
 
 	// eBGP sessions.
 	var exts []ext
 	for _, i := range d.Ifaces {
 		if i.Role != model.RoleInterAS && i.Role != model.RoleIXPLink {
+			continue
+		}
+		// A neighbour reached through a virtual routing table belongs to that
+		// table's BGP instance and to no other. Peering with it here as well
+		// would put the customer's routes into the provider's global table,
+		// where they collide with every other customer using the same private
+		// address space -- which is the exact failure the tables exist to
+		// prevent, arrived at by configuring the session twice.
+		if i.VRF != "" {
 			continue
 		}
 		// An exchange is modelled as a real fabric switch, so the interface's
@@ -281,7 +333,9 @@ func renderBGP(top *model.Topology, as *model.AS, d *model.Device) string {
 		fmt.Fprintf(&b, "  neighbor %s route-map %s in\n", x.addr, in)
 		fmt.Fprintf(&b, "  neighbor %s route-map %s out\n", x.addr, out)
 	}
-	b.WriteString(" exit-address-family\nexit\n!\n")
+	b.WriteString(" exit-address-family\n")
+	b.WriteString(vpnAddressFamily(as, d, edgePeers(as, d)))
+	b.WriteString("exit\n!\n")
 
 	if len(exts) > 0 {
 		b.WriteString(gaoRexfordPolicy(hasRPKI))

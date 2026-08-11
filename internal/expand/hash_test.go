@@ -55,8 +55,8 @@ func TestTheHashMovesWhenTheLabMeansSomethingDifferent(t *testing.T) {
 			change: func(top *model.Topology) { m := 1280; top.Links[0].Props.MTU = &m },
 		},
 		{
-			what:   "an interface changes role",
-			why:    "it decides whether the platform or the student configures it",
+			what: "an interface changes role",
+			why:  "it decides whether the platform or the student configures it",
 			change: func(top *model.Topology) {
 				i := firstIface(top)
 				i.Role = "some-other-role"
@@ -73,8 +73,8 @@ func TestTheHashMovesWhenTheLabMeansSomethingDifferent(t *testing.T) {
 			change: func(top *model.Topology) { top.Links[0].Subnet = "10.99.0.0/24" },
 		},
 		{
-			what:   "an AS gains a different prefix",
-			why:    "what it originates is what its neighbours are marked on seeing",
+			what: "an AS gains a different prefix",
+			why:  "what it originates is what its neighbours are marked on seeing",
 			change: func(top *model.Topology) {
 				for _, asn := range top.SortedASNs() {
 					top.ASes[asn].Block = "10.0.0.0/8"

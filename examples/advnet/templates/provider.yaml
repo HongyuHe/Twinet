@@ -1,0 +1,75 @@
+apiVersion: twinet.dev/v1
+kind: ASTemplate
+metadata:
+  name: provider
+  description: >
+    Swisscom, the provider of the advanced-networks exercise. Five routers: four
+    provider edges, each facing one customer site, and one in the middle that
+    carries their traffic without holding a single BGP route.
+
+    The point of the exercise is that the middle router works at all. It has no
+    idea what a customer prefix is; it forwards on labels distributed by LDP.
+    That is what lets a real backbone scale, and it is only checkable because
+    the manifest says which routers were meant to be free of BGP.
+
+routers:
+  R1: {id: 1}
+  R2: {id: 2}
+  R3: {id: 3}
+  R4: {id: 4}
+  R5: {id: 5}
+
+hosts:
+  per_router: false
+
+internal_links:
+  - {a: R1, b: R2}
+  - {a: R1, b: R3}
+  - {a: R2, b: R3}
+  - {a: R2, b: R4}
+  - {a: R3, b: R4}
+  - {a: R1, b: R5}
+  - {a: R2, b: R5}
+  - {a: R3, b: R5}
+  - {a: R4, b: R5}
+
+# Label switching across the interior, and the one router that must never run
+# BGP. Naming it here is what turns "BGP-free core" from an aspiration into
+# something the grader can check and the renderer can honour: R5 gets no BGP
+# configuration at all, and no other router tries to peer with it.
+mpls:
+  enabled: true
+  core: [R5]
+
+# Two customers, each with a routing table of their own.
+#
+# The route targets are the whole answer to the isolation question. UBS's two
+# sites import and export 1:1, so they see each other; Credit Suisse's two sites
+# import and export 2:1, so they see each other; and neither imports the other's
+# target, so a bank cannot reach its competitor even though both use the same
+# private address space.
+vrfs:
+  VRF_UBS:
+    table: 101
+    # No route distinguisher is given, so each provider edge derives its own
+    # from its loopback. It must differ per edge: it is part of the key a VPN
+    # route is stored under, so two edges advertising one customer under a
+    # single value overwrite each other and a site silently disappears.
+    export: ["1:1"]
+    import: ["1:1"]
+    attach: [ubs_bellevue, ubs_bahnhof]
+  VRF_CS:
+    table: 102
+    export: ["2:1"]
+    import: ["2:1"]
+    attach: [cs_oerlikon, cs_paradeplatz]
+
+external_ports:
+  ubs_bellevue:    {router: R1}
+  ubs_bahnhof:     {router: R4}
+  cs_oerlikon:     {router: R2}
+  cs_paradeplatz:  {router: R3}
+
+provisioning:
+  provisioned:
+    - scope: all

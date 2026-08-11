@@ -155,6 +155,29 @@ func (r *Renderer) routerCommands(d *model.Device) []deploy.Command {
 		})
 	}
 
+	// Label switching has to be enabled per interface, not once per router.
+	//
+	// A router with `mpls ldp` configured will happily distribute labels and
+	// install label-switched routes while the kernel drops every labelled
+	// packet that arrives, because net.mpls.conf.<iface>.input defaults to 0
+	// and only lo was ever set. Everything reports success: LDP sessions are
+	// operational, `show mpls table` is populated, the route is there with a
+	// label on it -- and nothing gets through. That is precisely the failure
+	// this platform is meant not to have.
+	//
+	// It is done here rather than in the manifest's sysctl list because the
+	// interfaces do not exist when the container starts: they are created by
+	// the link stage, and a sysctl for an interface that is not there yet
+	// silently does nothing.
+	if as, ok := r.Top.ASes[d.ASN]; ok && as.MPLS.Enabled {
+		cmds = append(cmds, deploy.Command{
+			Describe: "accept labelled packets on every interface",
+			Args: []string{"sh", "-c",
+				"for i in $(ls /sys/class/net); do " +
+					"sysctl -qw net.mpls.conf.$i.input=1 2>/dev/null || true; done"},
+		})
+	}
+
 	// VLAN sub-interfaces on an L2 gateway must exist before the student can
 	// configure them: the assignment tells students they will see ATL-L2.10
 	// and ATL-L2.20 in `show interface brief`, so the platform creates the

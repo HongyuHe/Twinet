@@ -1,0 +1,108 @@
+apiVersion: twinet.dev/v1
+kind: Lab
+metadata:
+  name: advnet
+  description: >
+    The BGP-free core and BGP/MPLS L3VPN exercise from the ETH advanced-networks
+    course. Swisscom (AS 1) carries the private networks of two banks across one
+    backbone whose middle router holds no BGP routes at all.
+  course: Advanced Topics in Computer Networks, ETH Zurich
+  term: fall25
+
+defaults:
+  cpus: 1
+  memory: 384Mi
+  pids: 256
+  restart: unless-stopped
+
+kinds:
+  router:
+    image: hyhe/twinet-router:0.1
+    capabilities: [NET_ADMIN, NET_RAW, SYS_ADMIN]
+    sysctls:
+      net.ipv4.ip_forward: "1"
+      net.ipv4.conf.all.rp_filter: "0"
+      net.ipv4.conf.default.rp_filter: "0"
+      net.ipv4.icmp_ratelimit: "0"
+      # Label switching has to be turned on per interface as well as loaded as
+      # a module, and the count bounds how many labels may be stacked. A
+      # backbone label plus a VPN label is two; the headroom costs nothing and
+      # a value too low drops the traffic silently.
+      net.mpls.platform_labels: "1048575"
+      net.mpls.conf.lo.input: "1"
+  host:
+    image: hyhe/twinet-host:0.1
+    capabilities: [NET_ADMIN, NET_RAW]
+    pids: 128
+  switch:
+    image: hyhe/twinet-switch:0.1
+    capabilities: [NET_ADMIN, NET_RAW, SYS_NICE]
+    pids: 512
+  service:
+    image: hyhe/twinet-svc:0.1
+    capabilities: [NET_ADMIN, NET_RAW]
+
+link_defaults:
+  bandwidth: 100mbit
+  delay: 1ms
+  queue: 50ms
+  # 50 below the underlay, so a link behaves the same whichever machine it is
+  # scheduled onto. MPLS adds four bytes per label on top of that, which is
+  # inside the margin.
+  mtu: 1450
+
+addressing:
+  as_block:        "{{ .AS }}.0.0.0/8"
+  # A /32, unlike the COS-461 lab's /24.
+  #
+  # This is not cosmetic here. OSPF advertises a loopback as a host route
+  # whatever mask it is given, so with a /24 every router routes to
+  # 1.151.0.1/32 while the router that owns it only has the connected
+  # 1.151.0.0/24 -- and LDP binds labels to prefixes. The two never match, so
+  # no label-switched path to a loopback ever completes. Sessions still
+  # establish, because the first packets are small enough to take the plain IP
+  # path, and then nothing else gets through: a VPN with every session up and
+  # no routes in it.
+  #
+  # /32 loopbacks are what real label-switched networks use, for this reason.
+  router_loopback: "{{ .AS }}.{{ add 150 .RouterID }}.0.1/32"
+  router_router:   "{{ .AS }}.0.{{ add 1 .LinkIndex }}.0/24"
+  router_host:     "{{ .AS }}.{{ add 100 .RouterID }}.0.0/24"
+  # The provider-to-branch links. Numbered from the two AS numbers so that the
+  # figure in the exercise and the running lab cannot drift apart.
+  inter_as:        "179.{{ .Low }}.{{ .High }}.0/24"
+
+autonomous_systems:
+  # Swisscom: the provider under study.
+  - list: [1]
+    template: provider
+    role: staff
+  # The four branches. Two banks, two sites each.
+  #
+  # They are separate autonomous systems rather than layer-2 sites because that
+  # is what makes the exercise's question sharp: each branch runs ordinary eBGP
+  # and knows nothing about MPLS, so if the two sites of a bank can reach each
+  # other, it is the provider's VPN doing it and nothing else.
+  - list: [20, 21, 30, 31]
+    template: branch
+    role: staff
+
+peerings:
+  links:
+    # UBS: Bellevue at R1, Bahnhofstrasse at R4.
+    - {a: 1, a_port: ubs_bellevue,   b: 20, b_port: uplink, rel: provider}
+    - {a: 1, a_port: ubs_bahnhof,    b: 21, b_port: uplink, rel: provider}
+    # Credit Suisse: Oerlikon at R2, Paradeplatz at R3.
+    - {a: 1, a_port: cs_oerlikon,    b: 30, b_port: uplink, rel: provider}
+    - {a: 1, a_port: cs_paradeplatz, b: 31, b_port: uplink, rel: provider}
+
+access:
+  mode: gateway
+  listen: ":2023"
+
+placement:
+  strategy: pack-by-as
+  nodes:
+    - {name: node-0, addr: "10.0.1.1:7200", underlay_ip: 10.0.1.1, front: true}
+    - {name: node-1, addr: "10.0.1.2:7200", underlay_ip: 10.0.1.2}
+    - {name: node-2, addr: "10.0.1.3:7200", underlay_ip: 10.0.1.3}

@@ -6,6 +6,7 @@ import (
 	"net"
 
 	"github.com/vishvananda/netlink"
+	"os"
 )
 
 // EndpointSpec describes one side of a link as it should appear inside a
@@ -28,9 +29,31 @@ type EndpointSpec struct {
 	// It is false for interfaces a student addresses: removing what they chose
 	// would be the platform undoing their work every time anyone redeployed.
 	OwnAddrs bool
+	// MPLS enables label switching on this interface.
+	//
+	// It has to be done per interface and from outside the container: the
+	// kernel drops labelled packets unless net.mpls.conf.<iface>.input is 1,
+	// and a container's /proc/sys is read-only, so the router cannot set it
+	// for itself. The interface also does not exist when the container is
+	// created, so a sysctl in the manifest cannot name it either.
+	//
+	// Without this a router configured with `mpls ldp` reports operational
+	// sessions, a populated label table and label-switched routes, and drops
+	// every labelled packet that arrives.
+	MPLS bool
 	// Altname is the ownership tag stamped on the interface so orphans left by
 	// a crash can be found and removed without consulting any external state.
 	Altname string
+	// VRF, when set, is the virtual routing table this interface is enslaved
+	// to, and VRFTable its kernel table number.
+	//
+	// This is a kernel device, not merely an FRR setting. FRR's `interface X
+	// vrf Y` binds its own view; without the master device the addresses stay
+	// in the main table, so two customers using the same private prefix
+	// overwrite each other's routes and the isolation the exercise is about
+	// does not exist -- with nothing anywhere reporting a problem.
+	VRF      string
+	VRFTable int
 	// Shaping is applied inside the namespace, on the container side, so that
 	// it is identical whether the peer is local or across the cluster.
 	Shaping *Shaping
@@ -186,6 +209,23 @@ func renameAndConfigure(link netlink.Link, ep EndpointSpec, mtu int) error {
 		_ = netlink.LinkAddAltName(link, ep.Altname)
 	}
 
+	if ep.MPLS {
+		if err := enableMPLS(ep.Name); err != nil {
+			return err
+		}
+	}
+
+	// Enslaved before the addresses are applied. Moving an interface into a
+	// VRF afterwards makes the kernel flush them, so doing it the other way
+	// round leaves the interface in the right table with no addresses at all.
+	if ep.VRF != "" {
+		if err := joinVRF(link, ep.VRF, ep.VRFTable); err != nil {
+			return err
+		}
+		if link, err = netlink.LinkByName(ep.Name); err != nil {
+			return fmt.Errorf("re-resolve %s after enslaving it: %w", ep.Name, err)
+		}
+	}
 	if ep.Up {
 		if err := netlink.LinkSetUp(link); err != nil {
 			return fmt.Errorf("set %s up: %w", ep.Name, err)
@@ -318,6 +358,44 @@ func configureEndpoint(ep EndpointSpec) error {
 		if err != nil {
 			return err
 		}
+		// Membership of a virtual routing table is re-asserted here, not only
+		// when the interface is first created.
+		//
+		// Deploy converges: an interface that already exists takes this path
+		// and not the creation one, so a lab that gained a VRF -- because the
+		// manifest changed, or because the platform learned how to do them --
+		// would keep every interface in the main table for ever, with the
+		// routing daemon configured for tables the kernel does not have. The
+		// routes then land in one shared table and two customers using the
+		// same private prefix silently overwrite each other, which is the
+		// exact failure the tables exist to prevent.
+		// The MTU is re-asserted on convergence, not only at creation.
+		//
+		// Every mutable property of an interface has to be applied on both
+		// paths, because deploy converges: an interface that already exists
+		// never takes the creation path again. An MTU applied only at creation
+		// is correct on a fresh lab and silently stale on every redeployed
+		// one -- which is the harder case to notice, since the lab that has
+		// been running longest is the one that is wrong.
+		if ep.MTU > 0 && l.Attrs().MTU != ep.MTU {
+			if err := netlink.LinkSetMTU(l, ep.MTU); err != nil {
+				return fmt.Errorf("set MTU %d on %s: %w", ep.MTU, ep.Name, err)
+			}
+		}
+		if ep.MPLS {
+			if err := enableMPLS(ep.Name); err != nil {
+				return err
+			}
+		}
+		if ep.VRF != "" {
+			if err := joinVRF(l, ep.VRF, ep.VRFTable); err != nil {
+				return err
+			}
+			// Enslaving flushes the addresses, so they are re-applied after.
+			if l, err = netlink.LinkByName(ep.Name); err != nil {
+				return err
+			}
+		}
 		if err := applyAddrs(l, ep.Addrs, ep.OwnAddrs); err != nil {
 			return err
 		}
@@ -384,6 +462,70 @@ func DeleteHostLink(name string) error {
 	}
 	if err := netlink.LinkDel(l); err != nil {
 		return fmt.Errorf("delete %s: %w", name, err)
+	}
+	return nil
+}
+
+// joinVRF makes an interface a member of a virtual routing table, creating the
+// table's device if it is not there yet.
+//
+// Idempotent in both parts: an existing VRF with the right table is reused, and
+// an interface already enslaved to it is left alone. Deploy runs repeatedly
+// against a live lab, so anything here that was not idempotent would tear a
+// customer's routing down on every convergence pass.
+func joinVRF(link netlink.Link, name string, table int) error {
+	if table <= 0 {
+		return fmt.Errorf("VRF %q has no routing table number", name)
+	}
+	master, err := netlink.LinkByName(name)
+	if err != nil {
+		vrf := &netlink.Vrf{
+			LinkAttrs: netlink.LinkAttrs{Name: name},
+			Table:     uint32(table),
+		}
+		if err := netlink.LinkAdd(vrf); err != nil {
+			return fmt.Errorf("create VRF %s (table %d): %w", name, table, err)
+		}
+		if err := netlink.LinkSetUp(vrf); err != nil {
+			return fmt.Errorf("bring VRF %s up: %w", name, err)
+		}
+		master, err = netlink.LinkByName(name)
+		if err != nil {
+			return fmt.Errorf("re-resolve VRF %s: %w", name, err)
+		}
+	}
+	if v, ok := master.(*netlink.Vrf); ok && int(v.Table) != table {
+		// Two tables under one name would silently merge two customers'
+		// routes, which is the one failure this whole mechanism exists to
+		// prevent, so it is refused rather than papered over.
+		return fmt.Errorf("VRF %s already exists with table %d, not %d", name, v.Table, table)
+	}
+	if link.Attrs().MasterIndex == master.Attrs().Index {
+		return nil
+	}
+	if err := netlink.LinkSetMaster(link, master); err != nil {
+		return fmt.Errorf("enslave %s to VRF %s: %w", link.Attrs().Name, name, err)
+	}
+	return nil
+}
+
+// enableMPLS lets an interface accept labelled packets.
+//
+// Written through /proc rather than with a netlink call because the kernel
+// exposes no netlink attribute for it. The caller is already inside the
+// target network namespace, and /proc/sys/net is per-namespace, so this
+// reaches the right interface.
+//
+// A missing directory is not an error: it means the mpls_router module is not
+// loaded, which is the normal state on a node running no label-switching lab,
+// and there is nothing to enable.
+func enableMPLS(name string) error {
+	path := fmt.Sprintf("/proc/sys/net/mpls/conf/%s/input", name)
+	if _, err := os.Stat("/proc/sys/net/mpls"); err != nil {
+		return nil
+	}
+	if err := os.WriteFile(path, []byte("1"), 0o644); err != nil {
+		return fmt.Errorf("enabling label switching on %s: %w", name, err)
 	}
 	return nil
 }

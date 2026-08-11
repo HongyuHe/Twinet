@@ -1,0 +1,28 @@
+apiVersion: twinet.dev/v1
+kind: ASTemplate
+metadata:
+  name: branch
+  description: >
+    One bank branch: a single router and a host behind it. The branch does not
+    know it is being carried over anybody's backbone; it runs plain eBGP towards
+    the provider and expects to reach its sibling branch as though the two were
+    directly connected.
+
+    That is the property the exercise is really about, and the reason a branch
+    is deliberately ordinary: if it had to be configured specially, the VPN
+    would not be transparent, and the whole exercise would be pointless.
+
+routers:
+  BR: {id: 1}
+
+hosts:
+  per_router: true
+  name: host
+  iface: "{{ .Router }}br"
+
+external_ports:
+  uplink: {router: BR}
+
+provisioning:
+  provisioned:
+    - scope: all
