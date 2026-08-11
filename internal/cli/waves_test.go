@@ -1,7 +1,10 @@
 package cli
 
 import (
+	"github.com/HongyuHe/twinet/internal/grade"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/HongyuHe/twinet/internal/expand"
 	"github.com/HongyuHe/twinet/internal/manifest"
@@ -117,5 +120,45 @@ func TestNoTwoSubmissionsInAWaveAreNeighbours(t *testing.T) {
 		if total != len(subs) {
 			t.Errorf("%s: %d submissions were placed into waves, but there are %d", dir, total, len(subs))
 		}
+	}
+}
+
+// A wave that could not be returned to the reference solution contaminates
+// every wave after it: those submissions are graded across an AS still holding
+// the previous student's work, and their marks move accordingly.
+//
+// The old behaviour was to print a warning and carry on. A mark that is wrong
+// and labelled correct is worse than no mark at all: the student has no reason
+// to appeal it and the grader has no reason to look at it. The remaining waves
+// are now held for review instead.
+func TestAFailedRestoreHoldsTheRemainingWaves(t *testing.T) {
+	waves := [][]submission{
+		{{Group: "group5", AS: 5}, {Group: "group7", AS: 7}},
+		{{Group: "group9", AS: 9}},
+	}
+	held := quarantine(waves, 10, "AS 3 could not be reset")
+	if len(held) != 3 {
+		t.Fatalf("held %d submissions, want all 3", len(held))
+	}
+	for _, r := range held {
+		if !r.NeedsReview {
+			t.Errorf("%s was not held for review", r.Submission)
+		}
+		if r.Total != 0 || r.Err == "" {
+			t.Errorf("%s carries a mark (%v) rather than a reason", r.Submission, r.Total)
+		}
+		if !strings.Contains(r.Err, "could not be returned to the reference") {
+			t.Errorf("%s does not say why it was held: %q", r.Submission, r.Err)
+		}
+		if !strings.Contains(r.Err, "AS 3 could not be reset") {
+			t.Errorf("%s does not carry the underlying cause: %q", r.Submission, r.Err)
+		}
+	}
+
+	// And a held report must not be releasable as a grade.
+	sum := grade.Summarise("t", held, time.Second)
+	if len(sum.Quarantined()) != 3 {
+		t.Errorf("%d of 3 held reports were quarantined; the rest could be imported as marks",
+			len(sum.Quarantined()))
 	}
 }

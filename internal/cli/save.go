@@ -255,7 +255,33 @@ func captureCommands(ctx context.Context, exec func(context.Context, string, []s
 	// planned addresses and the archive carries them too. With `add` those
 	// lines fail, and the failures were being swallowed so that a restore in
 	// which every line failed still reported success.
+	// Order matters, and getting it wrong cost a question.
+	//
+	// Tunnels are created first, because the routes that follow point at them:
+	// a route through a device that does not exist yet cannot be installed.
+	// The tunnel's own delete-then-add -- which is how it is made safe to
+	// re-run -- takes every route through that device with it, so emitting the
+	// routes first meant restoring them and then destroying them a few lines
+	// later. The restore reported success and the 6in4 question scored zero.
 	script := strings.Join([]string{
+		// Tunnels, which is how the 6in4 exercise is answered.
+		//
+		// These used to be written as comments, prefixed "# tunnel:". The
+		// archive recorded that a tunnel had existed and the restore skipped
+		// the line, so a student regraded from their own archive lost the 6in4
+		// question with nothing reporting that their answer had not been
+		// loaded. They are commands now.
+		//
+		// `ip tunnel add` is not idempotent and the restore runner has no
+		// shell to interpret a guard, so the delete before it is marked
+		// optional with a leading "-", which the runner understands.
+		`ip -d tunnel show 2>/dev/null | while read -r l; do case "$l" in sit0:*) continue;; esac; ` +
+			`n=${l%%:*}; r=$(echo "$l" | sed -n 's/.*remote \([^ ]*\).*/\1/p'); ` +
+			`o=$(echo "$l" | sed -n 's/.*local \([^ ]*\).*/\1/p'); ` +
+			`[ -z "$r" ] || [ -z "$o" ] || [ "$r" = any ] || [ "$o" = any ] && continue; ` +
+			`echo "-ip tunnel del $n"; ` +
+			`echo "ip tunnel add $n mode sit remote $r local $o ttl 64"; ` +
+			`echo "ip link set $n up"; done`,
 		// Addresses the student added: anything on an interface beyond what a
 		// deployment configures is theirs.
 		`ip -o -4 addr show | awk '$2!="lo"{print "ip addr replace "$4" dev "$2}'`,
@@ -271,27 +297,6 @@ func captureCommands(ctx context.Context, exec func(context.Context, string, []s
 		// what distinguishes the student's work from the routing daemon's.
 		`ip -o -4 route show | grep -v " proto " | awk '{print "ip route replace "$0}'`,
 		`ip -o -6 route show 2>/dev/null | grep -v " proto " | grep -v "^fe80" | awk '{print "ip -6 route replace "$0}'`,
-		// Tunnels, which is how the 6in4 exercise is answered.
-		//
-		// These used to be written as comments, prefixed "# tunnel:". The
-		// archive therefore recorded that a tunnel had existed and the restore
-		// skipped the line, so a student regraded from their own archive lost
-		// the 6in4 question with nothing reporting that their answer had not
-		// been loaded. They are commands now.
-		`ip -d tunnel show 2>/dev/null | while read -r l; do case "$l" in sit0:*) continue;; esac; ` +
-			`n=${l%%:*}; r=$(echo "$l" | sed -n 's/.*remote \([^ ]*\).*/\1/p'); ` +
-			`o=$(echo "$l" | sed -n 's/.*local \([^ ]*\).*/\1/p'); ` +
-			`[ -z "$r" ] || [ -z "$o" ] || [ "$r" = any ] || [ "$o" = any ] && continue; ` +
-			// A restore must run against a device that may already have the
-			// tunnel. `ip tunnel add` is not idempotent, and the shell
-			// redirection that would guard it is not available: the restore
-			// runner executes each line by word splitting, without a shell to
-			// interpret ">". The delete is therefore marked optional with a
-			// leading "-", which the runner understands, and the add that
-			// follows is required.
-			`echo "-ip tunnel del $n"; ` +
-			`echo "ip tunnel add $n mode sit remote $r local $o ttl 64"; ` +
-			`echo "ip link set $n up"; done`,
 	}, "\n")
 
 	res, err := exec(ctx, d.ID, []string{"sh", "-c", script})

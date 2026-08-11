@@ -396,9 +396,29 @@ func TestNamesResolveInsideTheLab(t *testing.T) {
 // peered with the exchange it was marked on, addresses left behind by an
 // earlier manifest revision, a running configuration that no longer matched
 // the file, and a manifest field that silently arrived empty at the node.
+
+// solveAS puts one autonomous system back to the reference solution.
+//
+// The suite shares a single lab, and the tests that run before these two inject
+// forty-one faults and destroy configuration on purpose. A grading test that
+// starts from whatever they left behind is not measuring the reference: it is
+// measuring the reference minus whatever has not been put back, and the result
+// moves depending on which tests ran first. That is worse than a flaky test,
+// because the number it prints looks like a grade.
+func solveAS(t *testing.T, dir string, as int) {
+	t.Helper()
+	if out, err := twinet(t, "deploy", "-m", dir, "--solve",
+		"--only", fmt.Sprintf("as=%d", as)); err != nil {
+		t.Fatalf("restoring AS %d to the reference solution: %v\n%s", as, err, out)
+	}
+}
+
 func TestTheReferenceSolutionScoresFullMarks(t *testing.T) {
 	dir := labDir(t)
 	out := t.TempDir()
+
+	// Start from the reference, not from whatever the preceding tests left.
+	solveAS(t, dir, 3)
 
 	// The report is parsed, not the console output. Searching that output for
 	// "10.00" proved nothing whatsoever: every line is printed as
@@ -537,6 +557,9 @@ func TestTheAgentAPIRefusesUnauthenticatedCallers(t *testing.T) {
 func TestASubmissionSurvivesSaveAndRestore(t *testing.T) {
 	dir := labDir(t)
 	archives := t.TempDir()
+
+	// The archive is only worth testing if what it captures is a full answer.
+	solveAS(t, dir, 3)
 
 	if out, err := twinet(t, "save", "-m", dir, "-o", archives, "--as", "3"); err != nil {
 		t.Fatalf("save: %v\n%s", err, out)
