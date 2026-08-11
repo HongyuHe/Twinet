@@ -11,7 +11,7 @@ ability to perform root-cause analysis** on a live network. Concretely:
 > Twinet lab and an agent's diagnosis scored against machine-readable ground
 > truth.
 
-NIKA is "SWE-bench for network troubleshooting": it registers **60 fault types**
+NIKA is "SWE-bench for network troubleshooting": it registers **48 fault types**
 across six categories and evaluates an agent that is connected to a live network
 while the incident is ongoing. It already abstracts over lab backends —
 today Kathará and containerlab. **Twinet's goal is to become a third backend**,
@@ -49,7 +49,7 @@ structured evidence. One codebase serves both.
 ```yaml
 faults:
   # A fault is declared once and can be instantiated many times against
-  # different targets, which is what turns 60 fault types into hundreds of
+  # different targets, which is what turns 48 fault types into hundreds of
   # reproducible incidents.
   ospf-adjacency-lost:
     type: ospf_neighbor_missing        # a registered fault type
@@ -100,7 +100,7 @@ Emitted in NIKA's shape so scoring code is shared, not reimplemented:
 }
 ```
 
-## 4. Coverage of NIKA's 60 fault types
+## 4. Coverage of NIKA's 48 fault types
 
 Honest accounting. Of the 60 registered types, **47 map onto the substrate
 Twinet already has or will have from the milestones in this plan**; 13 need
@@ -189,7 +189,7 @@ operations that faults call: `set_interface_state`, `get_host_ip`,
 `add_nft_drop_rule`, `tc_set_netem`, `frr_get_bgp_asn_number`, `kill_process`,
 and so on.
 
-Twinet will expose these through a thin adapter, so NIKA's existing 60 fault
+Twinet will expose these through a thin adapter, so NIKA's existing fault
 implementations run unmodified against a Twinet lab:
 
 ```

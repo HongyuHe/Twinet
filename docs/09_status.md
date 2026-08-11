@@ -27,7 +27,7 @@ plan but not yet implemented; it is milestone M8.
 | AS-granular placement | done | 13.4 % of links cross the fabric; `twinet inspect --placement` |
 | Underlay MTU verification | done | `twinet node check` refuses a lab that would not fit and names the MTU to use |
 | Grading engine: rubric, 17 checks, structured reports | done | 3 submissions in **31 s**; JSON, text and CSV output |
-| Reference solution (`--solve`) | partial | scores **7.33 / 10** against its own rubric |
+| Reference solution (`--solve`) | done | scores **10.00 / 10.00** against its own rubric, verified end to end and re-checked by `make e2e` |
 | Container images | done | `hyhe/twinet-{router,host,switch,svc}` |
 | Reference solution | **10.00 / 10.00** | verified end to end on the live cluster; a rubric whose reference cannot score full marks is unfalsifiable, and every student who loses that mark loses it to the platform |
 | RPKI | done | the lab is its own trust anchor: an RTR validator serves a payload derived from the topology, with declared discrepancies so an exercise can state exactly which announcement is invalid and which has no ROA |
@@ -133,6 +133,6 @@ reached students, and each motivated a permanent test.
 | Grading 1 submission in its own private harness | ~12 minutes; measured, and the reason waves exist |
 | 8 private harnesses at once on 3 nodes | saturates the cluster; the failures are resource exhaustion, not marks |
 | **Class-scale deployment: 84 ASes, 2012 devices, 2927 links across 3 nodes** | **22m 38s, zero failures** |
-| Containers per node at that scale | 724 / 750 / 750 |
+| Containers per node at that scale | 662 / 675 / 675 of the lab, plus what else the nodes were hosting at the time |
 | Node utilisation at that scale | 22 GiB of 251, load average 13 of 56 cores |
 | Emulated latency on a cross-node link at that scale | 20.07 ms for 20 ms configured |

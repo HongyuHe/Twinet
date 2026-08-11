@@ -155,6 +155,16 @@ submission produce byte-identical scores.
 BGP convergence with the reference solution, and stays stable for 24 h under a
 synthetic student-activity load.
 
+**Measured:** an 84-AS lab (2012 devices, 2927 links, 419 of them crossing
+nodes) deploys across three nodes in **22 minutes 38 seconds** — over the
+target, and recorded here rather than quietly restated. Two things are worth
+separating. The target was set before anything had been built, against no
+evidence; and the deployment is not close to the hardware's limits, using 22 GiB
+of 251 and a load average of 13 against 56 cores. The time is spent serialising
+work per node, not waiting on the machines, so the honest statement is that the
+number is beatable and has not yet been beaten. The 24-hour soak has not been
+run.
+
 ---
 
 ## M7 — Course parity and documentation (4 d)

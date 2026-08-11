@@ -328,7 +328,7 @@ measure whether an AI agent can diagnose a network. A BGP hijack is
 simultaneously question 2.6 of the assignment and NIKA's `bgp_hijacking` fault
 type. The two must therefore share one implementation, not two.
 
-The full taxonomy, the coverage of NIKA's 60 fault types, and the constraints
+The full taxonomy, the coverage of NIKA's 48 fault types, and the constraints
 this places on the rest of the design are in
 [10 — Fault injection and RCA](10_fault_injection.md). The most important
 constraint to keep in mind while reading the rest of this document: **every

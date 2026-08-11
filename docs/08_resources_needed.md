@@ -109,7 +109,7 @@ the original list.
 
 | # | Item | Why |
 |---|---|---|
-| A | **Confirmation that NIKA integration is two-way.** I plan both a native Twinet fault API *and* a NIKA `LabRuntime` adapter, so NIKA's existing 60 fault implementations run unmodified against a Twinet lab. If you only want one direction, the adapter is the one to keep. | Scope |
+| A | **Confirmation that NIKA integration is two-way.** I plan both a native Twinet fault API *and* a NIKA `LabRuntime` adapter, so NIKA's existing fault implementations run unmodified against a Twinet lab. If you only want one direction, the adapter is the one to keep. | Scope |
 | B | **A decision on the 13 out-of-substrate fault types.** My recommendation: build P4/BMv2 and SDN-controller device kinds (9 types), and delegate the 4 Kubernetes types to NIKA's existing backend rather than duplicating a container orchestrator's failure modes inside a network emulator. | Scope |
 | C | **Whether Twinet should be upstreamed to NIKA as a backend**, or kept as an adapter in this repository. Upstreaming means matching their release cadence and review; an adapter here means tracking their interface. | Process |
 | D | **An agent endpoint to test against.** To validate the evaluation loop end to end I need at least one agent I can point `twinet incident run` at. NIKA's mock agent would do for mechanics; a real one is needed to know the task is neither trivial nor impossible. | Validation |
