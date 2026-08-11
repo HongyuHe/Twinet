@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
@@ -116,9 +117,61 @@ func saveInjections(top *model.Topology, in []*fault.Injection) error {
 	if err != nil {
 		return err
 	}
+	// Written to a temporary file and renamed into place.
+	//
+	// This is the only record of what has been injected and how to undo it. A
+	// partial write leaves live faults on the lab that nothing can name, and
+	// the next episode runs on a network that is already broken in a way its
+	// own ground truth does not mention. Rename is atomic on the same
+	// filesystem, so a reader sees either the old file or the new one.
+	//
 	// Ground truth lives here, in the control plane, and is never written into
 	// a container: an agent that could read the answer is not being measured.
-	return os.WriteFile(p, raw, 0o600)
+	tmp, err := os.CreateTemp(filepath.Dir(p), ".injections-*")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = os.Remove(tmp.Name()) }()
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(raw); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), p)
+}
+
+// lockInjections serialises access to the record.
+//
+// Two injections at once would each read the file, add their own entry, and
+// write back, so one of them would be forgotten -- left running on the lab with
+// nothing able to name or undo it.
+func lockInjections(top *model.Topology) (func(), error) {
+	p := injectionsPath(top) + ".lock"
+	if err := os.MkdirAll(filepath.Dir(p), 0o750); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(p, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("waiting for the injection record: %w", err)
+	}
+	return func() {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = f.Close()
+	}, nil
 }
 
 func newFaultInjectCmd(opts *Options) *cobra.Command {
@@ -143,14 +196,41 @@ func newFaultInjectCmd(opts *Options) *cobra.Command {
 			}
 			target.Params = parseKV(params)
 
+			unlock, err := lockInjections(top)
+			if err != nil {
+				return err
+			}
+			defer unlock()
+
+			// The record is read before anything is injected, and a read error
+			// is fatal.
+			//
+			// It used to be read afterwards with the error discarded, so an
+			// unreadable record became an empty one: every fault already on the
+			// lab was forgotten, left running, and could never be resolved
+			// because nothing knew it was there. The next episode then ran on a
+			// network broken in a way its own ground truth did not mention.
+			existing, err := loadInjections(top)
+			if err != nil {
+				return fmt.Errorf("the record of what is already injected could not be read (%w); "+
+					"injecting now would leave whatever it holds running with nothing able to "+
+					"name or undo it", err)
+			}
+
 			inj, err := fault.Inject(cmd.Context(), env, args[0], target)
 			if err != nil {
 				return err
 			}
-			existing, _ := loadInjections(top)
-			existing = append(existing, inj)
-			if err := saveInjections(top, existing); err != nil {
-				return err
+			if err := saveInjections(top, append(existing, inj)); err != nil {
+				// The fault is live and unrecorded. Undo it rather than leave
+				// contamination nothing can find.
+				if rerr := fault.Resolve(cmd.Context(), env, inj); rerr != nil {
+					return fmt.Errorf("%s was injected but could not be recorded (%w), and undoing "+
+						"it also failed (%v); the lab is contaminated and must be redeployed",
+						args[0], err, rerr)
+				}
+				return fmt.Errorf("%s could not be recorded (%w), so it was undone rather than "+
+					"left running with nothing able to name it", args[0], err)
 			}
 
 			fmt.Fprintf(cmd.OutOrStdout(), "injected %s on %s\n", inj.Fault, inj.Target.DeviceID())

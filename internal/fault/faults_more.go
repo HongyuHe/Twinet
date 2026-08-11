@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -257,18 +258,43 @@ func init() {
 		Symptom:  "A service stops answering, and the machine hosting it is saturated.",
 		Describe: "A flood of connections is aimed at a service until it cannot accept more.",
 		Inject: func(ctx context.Context, e *Env, t Target) (State, error) {
+			// The victim must be something that is actually listening.
+			//
+			// This used to pick an arbitrary neighbour off the ARP table and
+			// aim at port 53, which on a host runs nothing at all. The flood
+			// then hit a closed port: the "attack" produced no symptom, the
+			// service it claimed to overwhelm was never touched, and the fault
+			// verified as successful because its own process was running. An
+			// episode with no symptom is worse than an absent fault, because it
+			// looks like a working one and whatever the agent concludes is
+			// scored against a cause that was never present.
+			//
+			// The lab's resolver is the default: it is a real server, on a real
+			// port, that every host in the lab depends on.
 			victim := t.Param("victim", "")
+			port := t.Param("port", "53")
 			if victim == "" {
-				v, _, err := arpVictim(e, t)
+				v, err := labResolver(ctx, e, t)
 				if err != nil {
 					return nil, err
 				}
 				victim = v
 			}
-			port := t.Param("port", "53")
+			if !listening(ctx, e, t, victim, port) {
+				return nil, fmt.Errorf("nothing is listening on %s port %s, so flooding it would "+
+					"produce no symptom; name a victim that runs the service", victim, port)
+			}
 			// Bounded rather than unbounded: an attack that consumes the node
 			// itself takes down every other lab sharing it, which is a fault in
 			// the platform rather than in the network under study.
+			// Recorded before the flood so the effect can be measured rather
+			// than assumed.
+			baseline := probeServiceHealth(ctx, e, t, victim, port)
+			if baseline <= 0 {
+				return nil, fmt.Errorf("%s port %s did not answer before the flood started, "+
+					"so any later failure could not be attributed to it", victim, port)
+			}
+
 			script := fmt.Sprintf(
 				"nohup sh -c 'while true; do for i in 1 2 3 4 5 6 7 8; do "+
 					"(echo | timeout 1 nc %s %s >/dev/null 2>&1 &) ; done; sleep 0.2; done' "+
@@ -281,17 +307,31 @@ func init() {
 			if pid == "" {
 				return nil, fmt.Errorf("the flood did not report a process id, so it could not be tracked")
 			}
-			return State{"pids": pid, "victim": victim, "port": port}, nil
+			return State{"pids": pid, "victim": victim, "port": port,
+				"baseline_ok": strconv.Itoa(baseline)}, nil
 		},
 		Verify: func(ctx context.Context, e *Env, t Target, s State) (Evidence, error) {
 			alive, err := countAlive(ctx, e, t, s["pids"])
 			if err != nil {
 				return Evidence{}, err
 			}
+			if alive == 0 {
+				return Evidence{
+					Verified: false,
+					Observed: "the flood is not running",
+					Expected: "a flood aimed at " + s["victim"],
+				}, nil
+			}
+			// The flood running is the mechanism. What has to be true is that
+			// the service is worse off than it was, measured against what it
+			// managed before the flood started.
+			now := probeServiceHealth(ctx, e, t, s["victim"], s["port"])
+			base, _ := strconv.Atoi(s["baseline_ok"])
 			return Evidence{
-				Verified: alive > 0,
-				Observed: fmt.Sprintf("%d flooding process(es)", alive),
-				Expected: "a flood aimed at " + s["victim"],
+				Verified: alive > 0 && now < base,
+				Observed: fmt.Sprintf("%d flooding process(es); %s answered %d of 6 requests, "+
+					"against %d of 6 before", alive, s["victim"], now, base),
+				Expected: "fewer requests answered while the flood runs",
 			}, nil
 		},
 		Resolve: func(ctx context.Context, e *Env, t Target, s State) error {
@@ -504,4 +544,66 @@ func firstSwitchPort(ctx context.Context, e *Env, t Target, bridge string) (stri
 		return "", fmt.Errorf("%s has no ports on bridge %s", t.DeviceID(), bridge)
 	}
 	return p, nil
+}
+
+// labResolver returns the address the target host is configured to resolve
+// against, which is a server the lab actually runs.
+func labResolver(ctx context.Context, e *Env, t Target) (string, error) {
+	out, _ := e.Try(ctx, t.DeviceID(),
+		`awk '/^nameserver/{print $2; exit}' /etc/resolv.conf 2>/dev/null`)
+	addr := strings.TrimSpace(out)
+	if addr == "" {
+		return "", fmt.Errorf("%s has no resolver configured, so there is no service to flood",
+			t.DeviceID())
+	}
+	return addr, nil
+}
+
+// listening reports whether a TCP or UDP service answers on an address.
+//
+// resolvableName derives a name the lab's own resolver certainly serves: the
+// device's hostname in its own search domain.
+const resolvableName = "n=$(hostname); " +
+	"d=$(awk '/^search/{print $2; exit}' /etc/resolv.conf 2>/dev/null); " +
+	"q=$n; [ -n \"$d\" ] && q=$n.$d; "
+
+// busybox has no /dev/tcp, so this uses whichever of nc or socat the image
+// carries; a probe that cannot run returns false, because injecting on the
+// strength of "we could not tell" is how an episode ends up with no symptom.
+func listening(ctx context.Context, e *Env, t Target, addr, port string) bool {
+	out, _ := e.Try(ctx, t.DeviceID(), fmt.Sprintf(
+		// The device's own name is one the lab's resolver certainly serves.
+		// Asking for the root zone instead returns no answer and dig exits 9,
+		// which reads identically to a server that is not there.
+		`%sif [ %q = 53 ]; then dig +time=2 +tries=1 @%s "$q" >/dev/null 2>&1 && echo yes; `+
+			`else (echo | timeout 2 nc -w 2 %s %s >/dev/null 2>&1 && echo yes); fi`,
+		resolvableName, port, addr, addr, port))
+	return strings.Contains(out, "yes")
+}
+
+// probeServiceHealth counts how many of a fixed number of requests the service
+// answers.
+//
+// Timing was tried first and does not work here: busybox's date has no %N, so
+// every measurement came back as zero milliseconds and the comparison passed by
+// default -- which is precisely the shape of verification this fault was
+// criticised for. Counting answered requests needs no sub-second clock and
+// measures the thing the symptom describes: a service that stops answering.
+func probeServiceHealth(ctx context.Context, e *Env, t Target, addr, port string) int {
+	const attempts = 6
+	script := fmt.Sprintf(
+		`%sok=0; i=0; while [ $i -lt %d ]; do `+
+			`if [ %q = 53 ]; then dig +time=1 +tries=1 @%s "$q" >/dev/null 2>&1 && ok=$((ok+1)); `+
+			`else echo | timeout 1 nc -w 1 %s %s >/dev/null 2>&1 && ok=$((ok+1)); fi; `+
+			`i=$((i+1)); done; echo $ok`,
+		resolvableName, attempts, port, addr, addr, port)
+	out, code := e.Try(ctx, t.DeviceID(), script)
+	if code != 0 {
+		return -1
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(out))
+	if err != nil {
+		return -1
+	}
+	return n
 }
