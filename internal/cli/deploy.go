@@ -809,6 +809,12 @@ func strategyOf(top *model.Topology, rebalance, adopted bool) string {
 // are lost. That is sometimes the right thing -- a node has been removed, or a
 // rebalance was asked for -- but it is never something to discover afterwards.
 func warnAboutMoves(w io.Writer, a *place.Assignment, rebalance bool) {
+	// Said on every path, including --rebalance, because a node being asked
+	// for more than it has is exactly what a rebalance can produce.
+	for _, o := range a.Overloaded {
+		fmt.Fprintf(w, "warning: %s; the containers that do not fit are killed under "+
+			"load rather than refused now, which looks like a broken lab\n", o)
+	}
 	if rebalance {
 		fmt.Fprintln(w, "warning: --rebalance recomputes placement; every AS that moves "+
 			"has its containers destroyed and rebuilt")

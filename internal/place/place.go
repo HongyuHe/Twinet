@@ -31,6 +31,12 @@ type Assignment struct {
 	// Moved records ASes that could not be left where the record says they
 	// were, and why. Each one is a set of containers that will be rebuilt.
 	Moved []string
+	// Overloaded names nodes asked to carry more than they declare capacity
+	// for. Reported rather than refused: the budgets are hand-written and a
+	// stale one should not stop a class running, but the failure it predicts
+	// arrives as containers being killed under load an hour later, looking
+	// like a bug in the lab.
+	Overloaded []string
 }
 
 // Record is the assignment in the form it is written down in.
@@ -276,6 +282,78 @@ func Place(top *model.Topology, opts Options) (*Assignment, error) {
 }
 
 // finish stamps the assignment onto devices and computes summary statistics.
+// checkCapacity reports nodes asked to carry more than they declared.
+//
+// It runs on the finished assignment rather than inside the balanced placer,
+// because it was inside the balanced placer and three ways of placing a lab
+// never reached it: the single-node strategy, which puts everything on the
+// front node; an explicit pin, which wins over every other consideration; and
+// services, which are placed separately. So the arrangements most likely to
+// overload a machine -- "put it all here", "put this one here specifically" --
+// were exactly the ones nothing checked, and the check applied only to the
+// strategy that was already trying to avoid the problem.
+//
+// It is a warning and not a refusal. The budgets are declared by hand in the
+// manifest, and a node whose declared memory is stale should not stop a class
+// from running; but somebody has to be told, because the failure it predicts
+// arrives as containers being killed under load, an hour later, looking like a
+// bug in the lab.
+func checkCapacity(top *model.Topology, a *Assignment) []string {
+	lab := top.Lab
+	if lab == nil {
+		return nil
+	}
+	caps := map[string]demand{}
+	known := map[string]bool{}
+	for _, n := range lab.Placement.Nodes {
+		if c, ok := capacityOf(n, lab.Placement.Reserve); ok {
+			caps[n.Name], known[n.Name] = c, true
+		}
+	}
+	if len(known) == 0 {
+		return nil
+	}
+	load := map[string]demand{}
+	for _, d := range top.SortedDevices() {
+		if d.Node == "" {
+			continue
+		}
+		load[d.Node] = load[d.Node].add(deviceDemand(d))
+	}
+	var out []string
+	for _, name := range sortedNodeNames(load) {
+		if !known[name] {
+			continue
+		}
+		c, l := caps[name], load[name]
+		switch {
+		case c.Containers > 0 && l.Containers > c.Containers:
+			out = append(out, fmt.Sprintf("%s is asked to run %d containers but declares room for %d",
+				name, l.Containers, c.Containers))
+		case c.CPUs > 0 && l.CPUs > c.CPUs:
+			out = append(out, fmt.Sprintf("%s is asked for %.1f CPUs but declares %.1f",
+				name, l.CPUs, c.CPUs))
+		case c.MemBytes > 0 && l.MemBytes > c.MemBytes:
+			out = append(out, fmt.Sprintf("%s is asked for %d MiB but declares %d MiB",
+				name, l.MemBytes>>20, c.MemBytes>>20))
+		}
+	}
+	return out
+}
+
+func sortedNodeNames(m map[string]demand) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// finish resolves every device onto a node and is the single point every
+// placement strategy passes through, which is why the capacity check lives
+// here: put anywhere earlier, it is a check on one strategy rather than on the
+// answer.
 func finish(top *model.Topology, a *Assignment) (*Assignment, error) {
 	for _, d := range top.SortedDevices() {
 		if d.ASN > 0 {
@@ -311,6 +389,7 @@ func finish(top *model.Topology, a *Assignment) (*Assignment, error) {
 			a.CrossNodeLinks++
 		}
 	}
+	a.Overloaded = checkCapacity(top, a)
 	return a, nil
 }
 
