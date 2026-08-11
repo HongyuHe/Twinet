@@ -82,7 +82,7 @@ func checkSixIn4(ctx context.Context, env *Env) Result {
 	var missing []string
 	for _, d := range domains {
 		gw := gateways[d]
-		out, err := env.Exec(ctx, gw.ID, []string{"ip", "-o", "link", "show"})
+		out, err := env.Probe(ctx, gw.ID, []string{"ip", "-o", "link", "show"})
 		if err != nil {
 			return Errored("tunnel.sixin4", err)
 		}
@@ -102,7 +102,7 @@ func checkSixIn4(ctx context.Context, env *Env) Result {
 			if addr == "" {
 				reach = fmt.Sprintf("%s has no IPv6 address configured", dst.Name)
 			} else {
-				res, err := env.Exec(ctx, src.ID,
+				res, err := env.Probe(ctx, src.ID,
 					[]string{"ping6", "-c", "2", "-W", "2", "-i", "0.3", addr})
 				if err == nil && res.ExitCode == 0 {
 					reachable = true

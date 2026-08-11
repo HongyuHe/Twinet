@@ -168,6 +168,28 @@ func ribFingerprint(ctx context.Context, env *Env) (string, int, error) {
 	return hex.EncodeToString(h.Sum(nil))[:16], total, nil
 }
 
+// waitForScope waits for whichever part of the control plane a question is
+// about.
+//
+// Waiting for more than the question needs is not conservative, it is wrong: a
+// question about the interior that waits for external sessions reports a
+// student whose OSPF is perfect as ungradeable because their BGP is not written
+// yet, and an ungradeable report is a mark nobody receives.
+func waitForScope(ctx context.Context, env *Env, scope string, timeout time.Duration) error {
+	switch scope {
+	case "ospf":
+		return WaitOSPF(ctx, env, timeout)
+	case "bgp":
+		deadline := time.Now().Add(timeout)
+		if err := WaitBGPSessions(ctx, env, timeout); err != nil {
+			return err
+		}
+		return WaitRIBStable(ctx, env, time.Until(deadline))
+	default:
+		return WaitConverged(ctx, env, timeout)
+	}
+}
+
 // WaitConverged waits for the whole control plane of the AS to settle.
 func WaitConverged(ctx context.Context, env *Env, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)

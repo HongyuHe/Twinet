@@ -75,6 +75,22 @@ func (e *Env) VtyshJSON(ctx context.Context, device, command string, out any) er
 	return nil
 }
 
+// Probe runs a command in a device and records a transport failure as a fault
+// of the machinery rather than of the submission.
+//
+// Every check must go through this rather than calling Exec directly. Tagging
+// only the vtysh path left the dataplane probes untagged, so an unreachable
+// node still read as "the student's network cannot reach that host" -- which is
+// the single worst thing this system can get wrong, because it produces a
+// plausible mark that nobody has any reason to question.
+func (e *Env) Probe(ctx context.Context, deviceID string, cmd []string) (rt.ExecResult, error) {
+	res, err := e.Exec(ctx, deviceID, cmd)
+	if err != nil {
+		return res, e.infra(deviceID, strings.Join(cmd, " "), err)
+	}
+	return res, nil
+}
+
 // InfraError marks a failure of the grading machinery rather than of the
 // submission: a node that could not be reached, a container that is not there,
 // an agent that returned an error.

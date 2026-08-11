@@ -366,6 +366,7 @@ func checkGaoRexford(ctx context.Context, env *Env) Result {
 func checkNoTransit(ctx context.Context, env *Env) Result {
 	routers := env.Routers()
 	relOf := map[string]model.Relationship{}
+	relOfASN := map[int]model.Relationship{}
 	for _, r := range routers {
 		for _, i := range r.Ifaces {
 			if i.Link == nil || !i.Link.InterAS || i.Peer == nil || i.Peer.Addr4 == "" {
@@ -377,6 +378,9 @@ func checkNoTransit(ctx context.Context, env *Env) Result {
 			// wrong answer was self-consistent and scored full marks.
 			rel := i.Link.PeerRelationship(i)
 			relOf[addrOf(i.Peer.Addr4)] = rel
+			if i.Peer.Device != nil {
+				relOfASN[i.Peer.Device.ASN] = rel
+			}
 		}
 	}
 
@@ -406,7 +410,7 @@ func checkNoTransit(ctx context.Context, env *Env) Result {
 					}
 					// Otherwise it came from someone: if it came from a peer or
 					// provider, exporting it here is a leak.
-					src := sourceRelationship(e, relOf)
+					src := sourceRelationship(e, relOf, relOfASN)
 					if src == model.RelPeer || src == model.RelProvider {
 						leaks = append(leaks, fmt.Sprintf(
 							"%s advertises %s (learned from a %s, path %q) to a %s at %s",
@@ -440,10 +444,34 @@ func checkNoTransit(ctx context.Context, env *Env) Result {
 }
 
 // sourceRelationship infers which neighbour a route was learned from.
-func sourceRelationship(e bgpRoute, relOf map[string]model.Relationship) model.Relationship {
+//
+// Both spellings of the next hop are read. FRR uses a "nexthops" array for
+// `show ip bgp` and a scalar "nextHop" for advertised routes, and this check
+// runs over the latter -- so reading only the array meant every advertisement
+// had an unknown source, no leak could ever be attributed, and a network
+// providing free transit to the entire internet passed the question about not
+// doing that.
+func sourceRelationship(e bgpRoute, relOf map[string]model.Relationship,
+	relOfASN map[int]model.Relationship) model.Relationship {
 	for _, nh := range e.Nexthops {
 		if rel, ok := relOf[nh.IP]; ok {
 			return rel
+		}
+	}
+	if e.NextHop != "" {
+		if rel, ok := relOf[e.NextHop]; ok {
+			return rel
+		}
+	}
+	// The AS path is the fallback, and for this question the better signal:
+	// an advertisement whose path begins with a neighbour is a route learned
+	// from that neighbour, whatever the next hop was rewritten to.
+	if f := strings.Fields(strings.TrimSpace(e.Path)); len(f) > 0 {
+		var asn int
+		if _, err := fmt.Sscanf(f[0], "%d", &asn); err == nil {
+			if rel, ok := relOfASN[asn]; ok {
+				return rel
+			}
 		}
 	}
 	return ""

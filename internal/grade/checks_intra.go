@@ -62,7 +62,7 @@ func checkAddressing(ctx context.Context, env *Env) Result {
 	checked := 0
 
 	for _, r := range env.Routers() {
-		out, err := env.Exec(ctx, r.ID, []string{"ip", "-o", "-4", "addr", "show"})
+		out, err := env.Probe(ctx, r.ID, []string{"ip", "-o", "-4", "addr", "show"})
 		if err != nil {
 			return Errored("l3.addressing_matches_plan", err)
 		}
@@ -549,7 +549,7 @@ func checkInternalReachability(ctx context.Context, env *Env) Result {
 		if addr == "" {
 			continue
 		}
-		res, err := env.Exec(ctx, src.ID, []string{"ping", "-c", "2", "-W", "2", "-i", "0.2", addr})
+		res, err := env.Probe(ctx, src.ID, []string{"ping", "-c", "2", "-W", "2", "-i", "0.2", addr})
 		if err != nil || res.ExitCode != 0 {
 			failed = append(failed, fmt.Sprintf("%s cannot reach %s (%s)", src.Name, dst.Name, addr))
 		}
@@ -575,7 +575,7 @@ func traceHops(ctx context.Context, env *Env, src, dst *model.Device) (int, erro
 	if addr == "" {
 		return 0, fmt.Errorf("%s has no address configured", dst.Name)
 	}
-	res, err := env.Exec(ctx, src.ID, []string{"traceroute", "-n", "-q", "1", "-w", "2", "-m", "8", addr})
+	res, err := env.Probe(ctx, src.ID, []string{"traceroute", "-n", "-q", "1", "-w", "2", "-m", "8", addr})
 	if err != nil {
 		return 0, err
 	}

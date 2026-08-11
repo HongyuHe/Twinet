@@ -45,6 +45,15 @@ type QuestionSpec struct {
 	// Converge asks the runner to wait for the control plane to settle before
 	// running this question's checks.
 	Converge bool `yaml:"converge,omitempty" json:"converge,omitempty"`
+	// ConvergeScope narrows what "settled" means: "ospf" waits only for the
+	// interior, "bgp" for sessions and a stable table, and empty for both.
+	//
+	// It exists because waiting for the wrong thing quarantines a correct
+	// submission. A question about the interior asked for convergence and got
+	// a wait that included external sessions, so a student whose OSPF was
+	// perfect and whose BGP was not yet written was reported as ungradeable
+	// rather than marked on the question they had answered.
+	ConvergeScope string `yaml:"converge_scope,omitempty" json:"converge_scope,omitempty" jsonschema:"enum=ospf,enum=bgp"`
 }
 
 // CheckSpec binds a registered check to a weight and arguments.
@@ -194,7 +203,7 @@ func Run(ctx context.Context, r *Rubric, env *Env, opts RunOptions) *Report {
 		// timeout before an early question must not be taken as licence to
 		// skip the wait before a later one that depends on more state.
 		if q.Converge {
-			if err := WaitConverged(ctx, env, opts.ConvergeTimeout); err != nil {
+			if err := waitForScope(ctx, env, q.ConvergeScope, opts.ConvergeTimeout); err != nil {
 				rep.Warnings = append(rep.Warnings,
 					fmt.Sprintf("the network had not settled before %s: %v", q.ID, err))
 				qr.NeedsReview = true

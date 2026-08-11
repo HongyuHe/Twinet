@@ -23,6 +23,11 @@ questions:
     title: IP addressing and OSPF
     points: 1
     converge: true
+    # The interior only. Waiting for external sessions here would report a
+    # student whose OSPF is perfect but whose BGP is not written yet as
+    # ungradeable, which is a mark they never receive for a question they
+    # answered correctly.
+    converge_scope: ospf
     checks:
       - check: l3.addressing_matches_plan
         weight: 0.25
