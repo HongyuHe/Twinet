@@ -248,16 +248,50 @@ func writeTar(tw *tar.Writer, name string, body []byte) error {
 func captureCommands(ctx context.Context, exec func(context.Context, string, []string) (execResult, error),
 	d *model.Device) string {
 
+	// `replace` throughout, not `add`.
+	//
+	// A restore has to be able to run against a device that already has some of
+	// this state, which is the normal case: the deployment configures the
+	// planned addresses and the archive carries them too. With `add` those
+	// lines fail, and the failures were being swallowed so that a restore in
+	// which every line failed still reported success.
 	script := strings.Join([]string{
 		// Addresses the student added: anything on an interface beyond what a
 		// deployment configures is theirs.
-		`ip -o -4 addr show | awk '$2!="lo"{print "ip addr add "$4" dev "$2}'`,
-		`ip -o -6 addr show | awk '$2!="lo" && $4 !~ /^fe80/{print "ip -6 addr add "$4" dev "$2}'`,
-		// Static routes, excluding the ones the kernel derives from an address.
-		`ip -o -4 route show | grep -v " proto kernel" | awk '{print "ip route add "$0}'`,
-		`ip -o -6 route show 2>/dev/null | grep -v " proto kernel" | grep -v "^fe80" | awk '{print "ip -6 route add "$0}'`,
+		`ip -o -4 addr show | awk '$2!="lo"{print "ip addr replace "$4" dev "$2}'`,
+		`ip -o -6 addr show | awk '$2!="lo" && $4 !~ /^fe80/{print "ip -6 addr replace "$4" dev "$2}'`,
+		// Routes the student added by hand, and only those.
+		//
+		// The filter used to exclude "proto kernel" alone, so every route OSPF
+		// and BGP had installed went into the archive. Those cannot be
+		// replayed -- iproute2 rejects the nexthop-group syntax it prints --
+		// and the restore was swallowing the failures, so an archive of a
+		// router was thirty commands that could never work and nobody knew.
+		// A manually added route carries no proto at all, which is exactly
+		// what distinguishes the student's work from the routing daemon's.
+		`ip -o -4 route show | grep -v " proto " | awk '{print "ip route replace "$0}'`,
+		`ip -o -6 route show 2>/dev/null | grep -v " proto " | grep -v "^fe80" | awk '{print "ip -6 route replace "$0}'`,
 		// Tunnels, which is how the 6in4 exercise is answered.
-		`ip -d tunnel show 2>/dev/null | awk -F: '/mode/ && $1!="sit0"{print}' | sed 's/^/# tunnel: /'`,
+		//
+		// These used to be written as comments, prefixed "# tunnel:". The
+		// archive therefore recorded that a tunnel had existed and the restore
+		// skipped the line, so a student regraded from their own archive lost
+		// the 6in4 question with nothing reporting that their answer had not
+		// been loaded. They are commands now.
+		`ip -d tunnel show 2>/dev/null | while read -r l; do case "$l" in sit0:*) continue;; esac; ` +
+			`n=${l%%:*}; r=$(echo "$l" | sed -n 's/.*remote \([^ ]*\).*/\1/p'); ` +
+			`o=$(echo "$l" | sed -n 's/.*local \([^ ]*\).*/\1/p'); ` +
+			`[ -z "$r" ] || [ -z "$o" ] || [ "$r" = any ] || [ "$o" = any ] && continue; ` +
+			// A restore must run against a device that may already have the
+			// tunnel. `ip tunnel add` is not idempotent, and the shell
+			// redirection that would guard it is not available: the restore
+			// runner executes each line by word splitting, without a shell to
+			// interpret ">". The delete is therefore marked optional with a
+			// leading "-", which the runner understands, and the add that
+			// follows is required.
+			`echo "-ip tunnel del $n"; ` +
+			`echo "ip tunnel add $n mode sit remote $r local $o ttl 64"; ` +
+			`echo "ip link set $n up"; done`,
 	}, "\n")
 
 	res, err := exec(ctx, d.ID, []string{"sh", "-c", script})
@@ -485,18 +519,29 @@ func restoreBundle(ctx context.Context, top *model.Topology, b Bundle,
 		if err := checkSubmittedScript(body); err != nil {
 			return n, fmt.Errorf("%s: %w", d.ID, err)
 		}
-		// Each command is applied on its own and failures are tolerated: an
-		// address that the deployment already configured is not an error, and
-		// refusing the whole archive because one line was redundant would lose
-		// the rest of the student's work.
+		// Each command runs on its own so one bad line does not lose the rest
+		// of the student's work, but the failures are counted and reported
+		// rather than discarded. Every command uses `replace` semantics, so a
+		// line that is merely redundant succeeds; a line that fails is a line
+		// whose effect is missing from the restored device, and reporting the
+		// restore as clean would tell the student their work is loaded when
+		// part of it is not.
+		// A line beginning with "-" may fail without failing the restore. It is
+		// how the archive says "remove this if it is there", which cannot be
+		// expressed as a command that always succeeds. Everything else must
+		// succeed: the alternative is a restore that applied none of a
+		// student's work and said so to nobody.
 		res, err := exec(ctx, d.ID, []string{"sh", "-c",
-			"while IFS= read -r c; do case \"$c\" in ''|\\#*) continue;; esac; $c 2>/dev/null || true; done <<'TWINET_RESTORE'\n" +
-				body + "\nTWINET_RESTORE"})
+			"fail=0\nwhile IFS= read -r c; do case \"$c\" in ''|\\#*) continue;; " +
+				"-*) c=${c#-}; $c >/dev/null 2>&1; continue;; esac; " +
+				"if ! out=$($c 2>&1); then fail=$((fail+1)); echo \"FAILED: $c: $out\" >&2; fi; " +
+				"done <<'TWINET_RESTORE'\n" + body + "\nTWINET_RESTORE\nexit $fail"})
 		if err != nil {
 			return n, fmt.Errorf("%s: %w", d.ID, err)
 		}
 		if res.ExitCode != 0 {
-			return n, fmt.Errorf("%s: restoring device state exited %d", d.ID, res.ExitCode)
+			return n, fmt.Errorf("%s: %d command(s) of the saved state could not be applied: %s",
+				d.ID, res.ExitCode, strings.TrimSpace(firstLines(res.Stderr, 3)))
 		}
 		n++
 	}
@@ -512,3 +557,13 @@ func short(h string) string {
 
 // execResult keeps this file independent of which runtime produced the result.
 type execResult = rt.ExecResult
+
+// firstLines returns at most n lines of output, for an error message that has
+// to name what went wrong without reproducing a whole log.
+func firstLines(s string, n int) string {
+	lines := strings.Split(strings.TrimSpace(s), "\n")
+	if len(lines) > n {
+		lines = append(lines[:n], fmt.Sprintf("(and %d more)", len(lines)-n))
+	}
+	return strings.Join(lines, "; ")
+}

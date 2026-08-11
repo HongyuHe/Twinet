@@ -546,7 +546,15 @@ func TestASubmissionSurvivesSaveAndRestore(t *testing.T) {
 		t.Fatalf("no archive was written: %v", err)
 	}
 
-	// Destroy the answer: remove BGP from every router in the AS.
+	// Destroy the answer, in every form the archive claims to preserve.
+	//
+	// Removing BGP alone proves only that the FRR configuration round-trips.
+	// The archive also carries addresses, routes, tunnels and VLAN assignments,
+	// and each of those is written and replayed by different code. A test that
+	// destroys one of the four and passes was reporting on a quarter of what it
+	// appeared to cover.
+
+	// 1. The routing configuration.
 	for _, r := range []string{"MSP", "NYC", "ATL", "BOS", "CHI", "HOU", "PHY", "SFO"} {
 		_, _ = twinet(t, "exec", "-m", dir, "as3/"+r, "--",
 			"vtysh", "-c", "conf t", "-c", "no router bgp 3", "-c", "end")
@@ -554,6 +562,37 @@ func TestASubmissionSurvivesSaveAndRestore(t *testing.T) {
 	out, _ := twinet(t, "exec", "-m", dir, "as3/MSP", "--", "vtysh", "-c", "show ip bgp summary")
 	if !strings.Contains(out, "not found") {
 		t.Fatalf("the answer was not actually destroyed, so a restore proves nothing:\n%s", out)
+	}
+
+	// 2. A host's addressing and its route off its own subnet.
+	hostBefore, _ := twinet(t, "exec", "-m", dir, "as3/MSP_host", "--",
+		"sh", "-c", "ip -o addr show; ip route show")
+	// The interface name follows from the model: a host's link to its router is
+	// named after that router.
+	if out, err := twinet(t, "exec", "-m", dir, "as3/MSP_host", "--",
+		"sh", "-c", "ip route del default; ip addr flush dev MSProuter"); err != nil {
+		t.Fatalf("could not destroy the host's addressing: %v\n%s", err, out)
+	}
+	if out, _ := twinet(t, "exec", "-m", dir, "as3/MSP_host", "--", "ip", "route", "show"); strings.Contains(out, "default") {
+		t.Fatal("the host kept its default route, so restoring it proves nothing")
+	}
+
+	// 3. A switch's VLAN assignment, which is what separates the two
+	//    datacentre segments from each other.
+	swBefore, _ := twinet(t, "exec", "-m", dir, "as3/DCS_S2", "--",
+		"sh", "-c", "ovs-vsctl list-ports br0 | while read p; do "+
+			"echo \"$p $(ovs-vsctl get port $p tag 2>/dev/null) $(ovs-vsctl get port $p trunks 2>/dev/null)\"; done")
+	_, _ = twinet(t, "exec", "-m", dir, "as3/DCS_S2", "--",
+		// `clear`, not `remove`: tag is a scalar column and ovs-vsctl's remove
+		// takes a value for those, so it silently changed nothing and the test
+		// then declared the state undestroyed.
+		"sh", "-c", "for p in $(ovs-vsctl list-ports br0); do "+
+			"ovs-vsctl clear port $p tag; ovs-vsctl clear port $p trunks; done")
+	swWrecked, _ := twinet(t, "exec", "-m", dir, "as3/DCS_S2", "--",
+		"sh", "-c", "ovs-vsctl list-ports br0 | while read p; do "+
+			"echo \"$p $(ovs-vsctl get port $p tag 2>/dev/null) $(ovs-vsctl get port $p trunks 2>/dev/null)\"; done")
+	if strings.TrimSpace(swBefore) == strings.TrimSpace(swWrecked) {
+		t.Fatal("the switch's VLAN assignment was not actually destroyed, so restoring it proves nothing")
 	}
 
 	if out, err := twinet(t, "restore", "-m", dir, archive); err != nil {
@@ -579,6 +618,24 @@ func TestASubmissionSurvivesSaveAndRestore(t *testing.T) {
 	if rep.Total < rep.MaxTotal {
 		t.Errorf("a submission scored %.2f of %.2f after a save and restore; "+
 			"part of the answer did not survive the archive", rep.Total, rep.MaxTotal)
+	}
+
+	// The score is the outcome that matters, but it can be reached without
+	// every kind of state coming back -- a question may not depend on the
+	// switch's VLANs. Each kind is therefore checked directly, so a silent gap
+	// in the archive is reported as itself rather than as a mark nobody lost.
+	hostAfter, _ := twinet(t, "exec", "-m", dir, "as3/MSP_host", "--",
+		"sh", "-c", "ip -o addr show; ip route show")
+	if !strings.Contains(hostAfter, "default") {
+		t.Errorf("the host's default route did not survive the archive:\nbefore:\n%s\nafter:\n%s",
+			hostBefore, hostAfter)
+	}
+	swAfter, _ := twinet(t, "exec", "-m", dir, "as3/DCS_S2", "--",
+		"sh", "-c", "ovs-vsctl list-ports br0 | while read p; do "+
+			"echo \"$p $(ovs-vsctl get port $p tag 2>/dev/null) $(ovs-vsctl get port $p trunks 2>/dev/null)\"; done")
+	if strings.TrimSpace(swAfter) != strings.TrimSpace(swBefore) {
+		t.Errorf("the switch's VLAN assignment did not survive the archive:\nbefore:\n%s\nafter:\n%s",
+			swBefore, swAfter)
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -584,6 +585,10 @@ func checkSubmittedScript(body string) error {
 		if t == "" || strings.HasPrefix(t, "#") {
 			continue
 		}
+		// A leading "-" marks a line that may fail harmlessly. It is a marker
+		// for the runner, not part of the command, so it is removed before the
+		// command is identified -- otherwise the allowlist would see "-ip".
+		t = strings.TrimPrefix(t, "-")
 		// Substitution and chaining would let an allowed first word introduce
 		// an arbitrary second one.
 		if strings.ContainsAny(t, "`$") {
@@ -605,11 +610,25 @@ func checkSubmittedScript(body string) error {
 
 // splitScriptCommands breaks a line on the separators a shell would act on, so
 // each command in a chain is checked rather than only the first.
+//
+// Redirections are removed first, because they are not commands and splitting
+// through one invents a fragment that is not there. A perfectly ordinary
+// guarded line -- `ip link show tun6 >/dev/null 2>&1 || ip tunnel add ...` --
+// was rejected because splitting on & left "1" standing alone, and the operator
+// was told the submission was trying to run a command called "1".
+//
+// A redirection cannot smuggle anything in: the target is a filename, and
+// substitution is refused outright before this point, so nothing inside one can
+// become something to execute.
 func splitScriptCommands(line string) []string {
-	return strings.FieldsFunc(line, func(r rune) bool {
+	return strings.FieldsFunc(redirection.ReplaceAllString(line, " "), func(r rune) bool {
 		return r == ';' || r == '|' || r == '&'
 	})
 }
+
+// redirection matches the file descriptor redirections a shell would consume:
+// ">file", "2>>file", "2>&1", "<file".
+var redirection = regexp.MustCompile(`[0-9]*(>>?|<)\s*(&[0-9]+|[^\s;|&]+)`)
 
 func sortedScriptCommands() []string {
 	out := make([]string, 0, len(scriptCommands))

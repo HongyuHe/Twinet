@@ -4,10 +4,11 @@ This records what is built and verified, so the plan and the code cannot drift.
 Measurements are from the three-node cluster (node-0/1/2, 56 cores and 251 GiB
 each, 10 GbE private fabric).
 
-Last updated after the grading milestone and the first external code review.
+Last updated after the sixth external code review.
 
-The fault-injection objective of [10](10_fault_injection.md) is recorded in the
-plan but not yet implemented; it is milestone M8.
+Rows are written from evidence produced by a run, not from intent. Where a
+number appears it came from the command named beside it; where a target was
+missed it is recorded as a miss.
 
 ## Built and verified
 
@@ -36,13 +37,17 @@ plan but not yet implemented; it is milestone M8.
 | Save and restore | done | `twinet save` archives every group work with the topology hash and per-file checksums; restore refuses an archive from a different topology or one edited after it was taken |
 | Per-submission grading harnesses | done | `twinet grade batch` gives each submission a private lab in which every AS but one is solved; verified with two submissions graded concurrently across three nodes |
 | NIKA LabRuntime adapter | done | NIKA's own `LabRuntimeLabAPI` runs unmodified over Twinet, exposing all 76 of its operations; verified live against the three-node cluster |
-| Fault injection engine | partial | **37 types, covering 34 of the 44 NIKA types that are in-substrate**; all 37 inject, verify and resolve on the live cluster, re-checked by `make e2e` in 36 seconds. The 10 remaining need services the lab does not run yet: DHCP (5), an SDN controller (3), a load balancer and a VPN |
+| Fault injection engine | partial | **41 types, of which 39 are NIKA's** (NIKA registers 60). All 41 inject, verify, resolve, and are then checked to have left the device exactly as they found it; `make e2e` runs the full round trip in 54 s. The 21 not implemented each need a substrate the lab does not run — see [10](10_fault_injection.md) §4.1 |
+| Faults are reversible, and proved to be | done | The engine fingerprints a device before and after injecting and requires resolving to leave neither what it added nor a hole where something it removed used to be. Introducing the check immediately found five faults that satisfied their own predicate while leaving the device broken |
+| Fault secrecy | verified | No fault writes a self-identifying path into the device under test. A test reads the fault sources and fails on any such path; it found one on its first run |
+| Self-healing wiring | done | A container that restarts comes back with an empty network namespace. Each node now notices within a minute and rebuilds that device's links and configuration. Measured: `svc/matrix` went 10 interfaces → 2 → 10, repaired 0.8 s after detection, with no deploy run |
 | Incident runner | done | `twinet incident run`; a two-fault scenario injects, holds and unwinds in 798 ms |
 | Ground-truth isolation | verified | audited: 0 hits for the fault name, root cause or ground truth anywhere in a target container's files, environment or labels |
 | DNS | done | zones are generated from the model, served by BIND in the service container, and every device points at the lab own resolver; verified end to end for forward and reverse lookups |
-| Matrix, looking glass, policy analyzer | partial | the collectors and the analysis are implemented and tested, but nothing yet serves their output, so a student cannot open a looking glass |
+| Matrix, looking glass, policy analyzer | partial | the collectors and the analysis are implemented and tested, but nothing yet serves their output, so a student cannot open a looking glass. This is the largest remaining gap |
 | _(collectors)_ | done | control-plane collectors; the analyzer reads structured paths and the declared relationships rather than scraping text |
-| CI, Makefile, lint config | done | `.github/workflows/ci.yml` |
+| CI gates | done | `make ci` refuses to run without golangci-lint and shellcheck rather than reporting a pass it did not verify, and includes `go mod tidy -diff`. Turning the lint on found five real problems. The GitHub workflow is disabled on push by request; `make ci` runs the identical gates |
+| Grading marks behaviour, not text | done | The exchange check requires the policy to be bound to the route server, the 6in4 check requires a tunnel that carried the packets rather than the kernel's own `sit0`, and the RPKI check requires a connected validator holding ROAs before an empty invalid table means anything |
 
 ## Defects found by the platform's own checks
 
@@ -94,6 +99,32 @@ reached students, and each motivated a permanent test.
    `/etc/resolv.conf`; and a fault that captured an empty file and would have
    guaranteed data loss on resolve. None of these were reachable by unit test.
 
+8. **A fault that destroyed what it was meant to perturb.** `host_incorrect_gateway`
+   pointed a host's default route at a dead neighbour and resolved by deleting
+   the default route; where no prior route had been recorded it put nothing
+   back. Its verifier asked whether the route went via the wrong gateway, the
+   answer was no, and the resolve reported success — while the host was left
+   unable to leave its own subnet. It surfaced a week later as a single
+   unreachable host in a grading run, by which point nothing connected it to
+   the cause. The mark it cost was very nearly attributed to the student. Every
+   resolve is now checked against the state the injection found, which
+   immediately found four more of the same shape: removing an address or
+   downing an interface takes with it every route that resolved through it.
+
+9. **A restart disconnected a device permanently.** A container that restarts
+   comes back with an empty network namespace, and nothing noticed. The wiring
+   was already idempotent and a deploy would have repaired it, but a deploy only
+   runs when a person runs one, and nobody has a reason to until the symptom is
+   reported. Each node now checks its own containers every minute.
+
+10. **A release gate that answered yes without looking.** `make ci` printed
+    "all CI gates passed" while skipping the lint and the shell check whenever
+    their tools were absent, which on the development machine was always.
+    Enabling them found five real problems, one of which mattered: the
+    preservation replay treated an unreadable snapshot the same as no snapshot,
+    so a corrupt capture was silently skipped and the device came back looking
+    clean.
+
 ## Environment findings
 
 - **Jumbo frames are unavailable.** Raising `eno2` to MTU 9000 dropped the
@@ -105,19 +136,22 @@ reached students, and each motivated a permanent test.
 
 ## Remaining work
 
+Every row here is genuinely outstanding. An earlier revision of this table
+listed save/restore, the NIKA adapter and RPKI as remaining while the table
+above listed the same three as done, and that contradiction survived two
+reviews. If a row appears in both, the row here is the one to believe until
+someone has checked.
+
 | Item | Milestone | Note |
 |---|---|---|
-| Serving DNS, matrix, looking glass and the web UI | M2 | The data is generated and tested; the containers that should serve it still run `sleep infinity`. A student cannot yet resolve a name or open a looking glass |
-| SSH gateway with label-based authorisation | M2 | The agent already enforces owner-scoped exec, which is the hard half |
-| RPKI (Krill + Routinator) provisioning | M2 | Needed for the last point of the rubric |
-| Reference answers for exchange communities, traffic engineering and RPKI | M7 | The remaining 2.67 points of `--solve` |
-| Diff-and-converge `apply` | M4 | Deploy is idempotent, but does not yet compute a minimal change plan |
-| `twinet save` / `restore` | M2 | |
-| Advanced-course exercises (MPLS, VRF, multicast) | M7 | The agent already loads the MPLS modules |
-| 80-AS scale run | M6 | The 12-AS run extrapolates to roughly 9 minutes |
-| The remaining 28 in-substrate fault types | M8 | 19 of the 47 are implemented; the rest are mostly variants over the same primitives |
-| DHCP, web and load-balancer services, traffic generation | M8 | Prerequisites for eleven of the remaining fault types |
-| NIKA `LabRuntime` adapter | M8 | About fifty semantic operations, brokered through the existing agent exec API |
+| Serving the matrix, looking glass and web UI | M2 | The collectors and the analysis are implemented and tested; nothing yet serves their output, so a student cannot open a looking glass. This is the largest remaining gap in the student-facing workflow |
+| Gateway `goto` / `save` / SFTP | M2 | The gateway authenticates and scopes exec; the convenience verbs the old system had are not there |
+| Krill as a live RPKI publication point | M2 | The lab serves an RTR feed derived from the topology, which is what the exercise needs; a real publication point with per-AS validators is the fuller version |
+| COS-461 Q2.6 stub-AS hijack scenarios | M7 | The RPKI machinery is in place and the check is honest; the scripted hijack scenarios are not written |
+| Diff-and-converge `apply` | M4 | Deploy is idempotent and now self-healing, but does not compute a minimal change plan |
+| Advanced-course exercises (MPLS, VRF, multicast) | M7 | The agent already loads the MPLS modules; no exercises or checks exist |
+| The 21 unimplemented NIKA fault types | M8 | Six P4, five DHCP, four Kubernetes, three SDN southbound, three others. Each needs a substrate the lab does not run — see [10](10_fault_injection.md) §4.1, which explains why DHCP in particular is a design change rather than a fault to add |
+| DHCP, web and load-balancer services, traffic generation | M8 | Prerequisites for nine of those |
 
 ## Measurements
 

@@ -120,8 +120,16 @@ func checkSixIn4(ctx context.Context, env *Env) Result {
 				break
 			}
 			before := tunnelTx(ctx, env, gw.ID, tunnels[domains[0]])
+			// Enough packets to survive a cold neighbour cache.
+			//
+			// The first packet has to wait for neighbour discovery, and on this
+			// path that solicitation crosses the tunnel and comes back: eighty
+			// milliseconds before the echo request has even been sent. With two
+			// packets and a two-second deadline a correct answer failed the
+			// first time it was graded after a redeploy and passed the second,
+			// which is the worst possible property for a mark.
 			res, err := env.Probe(ctx, src.ID,
-				[]string{"ping6", "-c", "2", "-W", "2", "-i", "0.3", addr})
+				[]string{"ping6", "-c", "5", "-W", "3", "-i", "0.3", addr})
 			if err == nil && res.ExitCode == 0 {
 				reachable = true
 			} else {

@@ -57,19 +57,29 @@ func (s *Server) reconcileOnce(ctx context.Context) {
 		if top == nil {
 			continue
 		}
-		// Never race a deploy or a destroy. If one holds the lab, whatever it
-		// is doing is a better answer than this loop's.
+		// The survey runs without the lab lock. Holding it for the whole scan
+		// made a background maintenance task block the operator: a deploy
+		// arriving mid-sweep was refused with "another operation is already
+		// running", for a sweep that in the normal case finds nothing to do.
+		// Reading a container's interface list changes nothing, so it does not
+		// need to exclude anyone.
+		broken := s.survey(ctx, top)
+		if len(broken) == 0 {
+			continue
+		}
+		// Repairing does change things, so it takes the lock -- and yields
+		// immediately if a deploy or a destroy holds it, because whatever they
+		// are doing is a better answer than this loop's.
 		if err := s.acquire(name, "reconcile"); err != nil {
 			continue
 		}
-		s.repairLab(ctx, top)
+		s.repairLab(ctx, top, broken)
 		s.release(name)
 	}
 }
 
-// repairLab rewires the devices on this node whose namespaces have been
-// emptied, and puts back the configuration they were holding.
-func (s *Server) repairLab(ctx context.Context, top *model.Topology) {
+// survey reports which of this node's devices have lost their wiring.
+func (s *Server) survey(ctx context.Context, top *model.Topology) []*model.Device {
 	var broken []*model.Device
 	for _, d := range top.Devices {
 		if d.Node != s.cfg.Node {
@@ -79,6 +89,22 @@ func (s *Server) repairLab(ctx context.Context, top *model.Topology) {
 			broken = append(broken, d)
 		}
 	}
+	return broken
+}
+
+// repairLab rewires the devices whose namespaces have been emptied, and puts
+// back the configuration they were holding.
+func (s *Server) repairLab(ctx context.Context, top *model.Topology, broken []*model.Device) {
+	// Re-checked under the lock: the survey ran without it, so a deploy may
+	// have repaired these already in the meantime, and rewiring a device that
+	// is now fine would undo work rather than restore it.
+	still := make([]*model.Device, 0, len(broken))
+	for _, d := range broken {
+		if s.hasLostItsWiring(ctx, d) {
+			still = append(still, d)
+		}
+	}
+	broken = still
 	if len(broken) == 0 {
 		return
 	}
