@@ -29,15 +29,16 @@ import (
 
 func newDeployCmd(opts *Options) *cobra.Command {
 	var (
-		solve     bool
-		dryRun    bool
-		workers   int
-		pull      string
-		only      string
-		quiet     bool
-		token     string
-		prune     bool
-		rebalance bool
+		solve      bool
+		dryRun     bool
+		workers    int
+		pull       string
+		only       string
+		quiet      bool
+		token      string
+		prune      bool
+		rebalance  bool
+		overcommit bool
 	)
 	cmd := &cobra.Command{
 		Use:   "deploy",
@@ -75,6 +76,22 @@ after a partial failure, a reboot, or a topology edit.`,
 				return err
 			}
 			warnAboutMoves(cmd.ErrOrStderr(), a, rebalance)
+			// A node asked for more than it declares is refused rather than
+			// warned about, for the same reason a mixed-version cluster is: a
+			// warning arrives in a stream of ordinary output, everything after
+			// it reports success, and the person reading has no reason to
+			// think the result is wrong. The failure it predicts arrives an
+			// hour later as containers killed under load, which reads as a
+			// broken lab rather than as a placement that never fitted.
+			//
+			// The budgets are written by hand, so a stale one must not be able
+			// to stop a class: --overcommit is the way past, and saying so in
+			// the refusal is what keeps the check from being deleted instead.
+			if len(a.Overloaded) > 0 && !overcommit {
+				return fmt.Errorf("this lab does not fit the cluster it is placed on:\n  %s\n"+
+					"Raise the node budgets in the manifest, add a node, or pass "+
+					"--overcommit to deploy anyway", strings.Join(a.Overloaded, "\n  "))
+			}
 			if err := resolveImageIDs(cmd.Context(), top, token); err != nil {
 				return err
 			}
@@ -198,6 +215,8 @@ after a partial failure, a reboot, or a topology edit.`,
 		"also remove containers and overlays this topology no longer wants")
 	cmd.Flags().BoolVarP(&quiet, "quiet", "q", false, "suppress per-step progress")
 	cmd.Flags().StringVar(&token, "token", "", "agent token for cluster deployments (or set TWINET_TOKEN)")
+	cmd.Flags().BoolVar(&overcommit, "overcommit", false,
+		"deploy even though a node is asked for more than it declares room for")
 	cmd.Flags().BoolVar(&rebalance, "rebalance", false,
 		"recompute placement from scratch; every AS that moves has its containers rebuilt")
 	return cmd

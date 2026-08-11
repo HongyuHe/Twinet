@@ -103,8 +103,8 @@ Emitted in NIKA's shape so scoring code is shared, not reimplemented:
 ## 4. Coverage of NIKA's fault taxonomy
 
 NIKA's registry currently defines **60** injectable root causes
-(`/users/hy/nika/docs/failure-types.md`). Twinet registers **41** fault types,
-of which **39 are NIKA types**; the remaining two (`bgp_peer_asn_misconfig`,
+(`/users/hy/nika/docs/failure-types.md`). Twinet registers **42** fault types,
+of which **40 are NIKA types**; the remaining two (`bgp_peer_asn_misconfig`,
 `host_network_down`) are Twinet's own.
 
 The numbers below are produced by diffing `twinet fault list --json` against
@@ -116,10 +116,10 @@ generating it.
 | | Count |
 |---|---:|
 | NIKA types | 60 |
-| Implemented in Twinet | **39** |
-| Not implemented | 21 |
+| Implemented in Twinet | **40** |
+| Not implemented | 20 |
 | Twinet-only types | 2 |
-| Total Twinet types | **41** |
+| Total Twinet types | **42** |
 
 Reproduce the accounting with:
 
@@ -132,15 +132,29 @@ comm -23 /tmp/want /tmp/have    # NIKA types Twinet does not implement
 
 ### 4.1 What is not implemented, and why
 
-The 21 gaps are not scattered: they are five substrates Twinet does not emulate.
+The 20 gaps are not scattered: they are four substrates Twinet does not emulate,
+plus one family that is a design change rather than a fault.
 
 | Group | Types | What it would take |
 |---|---:|---|
 | P4 / BMv2 | 6 | A `p4` device kind running BMv2 with a P4 program and a control plane |
 | Kubernetes | 4 | A Kubernetes node kind, or delegation to NIKA's existing backend |
 | DHCP | 5 | A DHCP server in the service image, and hosts that lease rather than are addressed |
+| VPN membership | — | **implemented**, once the advanced-networks lab gave the platform an L3VPN to break: `host_vpn_membership_missing` takes a customer-facing port out of its routing table |
 | SDN southbound | 3 | A `controller` device kind speaking OpenFlow to the OVS switches |
-| Other | 3 | `mpls_label_limit_exceeded`, `load_balancer_overload`, `host_vpn_membership_missing` |
+| Other | 2 | `mpls_label_limit_exceeded`, `load_balancer_overload` |
+
+`mpls_label_limit_exceeded` was attempted and abandoned, which is worth
+recording because the reason is not obvious. The limit that produces the fault
+is `net.mpls.platform_labels`, and that file is read-only inside a container —
+the same limitation that already forces the node agent to write the
+per-interface MPLS input flag from the namespace rather than letting the
+container do it. FRR's own `mpls label global-block` was tried as a substitute
+and does not constrain labels LDP has already distributed: narrowing it to two
+labels left the forwarding table unchanged, and clearing every LDP neighbour to
+force re-allocation left it unchanged again. A fault that configures something
+and changes nothing is worse than an absent one, so it is absent and counted as
+a gap.
 
 Twinet addresses every host statically from the plan, because the plan is also
 the grading key: a check can say "the address is not the one the assignment

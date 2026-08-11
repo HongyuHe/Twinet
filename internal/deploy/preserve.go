@@ -62,6 +62,18 @@ func Capture(ctx context.Context, r rt.Runtime, d *model.Device, lab, topoHash s
 			return "", false
 		}
 		if res.ExitCode != 0 {
+			// A router whose routing daemons are not running has no routing
+			// configuration left to lose: it is already gone, which is the
+			// thing being repaired. Refusing to replace such a container
+			// would preserve nothing and prevent the only fix, so this is
+			// reported as an empty capture rather than a failed one.
+			//
+			// The distinction is between "I could not look" and "I looked and
+			// the daemon is dead". Everything else is still a refusal.
+			if strings.Contains(res.Stderr, "failed to connect to any daemons") ||
+				strings.Contains(res.Stdout, "failed to connect to any daemons") {
+				return "", false
+			}
 			missed = append(missed, fmt.Sprintf("%s could not be read: %s exited %d: %s",
 				what, cmd[0], res.ExitCode, firstLine(res.Stderr)))
 			return "", false

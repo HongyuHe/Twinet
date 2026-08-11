@@ -155,6 +155,40 @@ func (r *Renderer) routerCommands(d *model.Device) []deploy.Command {
 		})
 	}
 
+	// And then check that it is actually running.
+	//
+	// frrinit.sh reports success whether or not the daemons come up, so a
+	// router can be deployed with no routing process at all while every
+	// device reports healthy and the lab reports zero failures. It is not a
+	// theoretical concern: it was found on two routers out of 212 in a
+	// class-scale lab, and the only symptom was a grading run timing out four
+	// hops away with "1 of 62 sessions not established" -- a message that
+	// points at the AS being graded rather than at the neighbour that had no
+	// bgpd.
+	//
+	// Checked on every router, not only the ones this platform restarts,
+	// because a student's daemon can die just as easily as a reference one and
+	// the consequence is the same: a network that is wrong for a reason no
+	// amount of looking at the configuration will reveal.
+	if d.Kind == model.KindRouter {
+		cmds = append(cmds, deploy.Command{
+			Describe: "check the routing daemons are running",
+			Args: []string{"sh", "-c", strings.Join([]string{
+				// A short wait: the daemons are being started a few commands
+				// earlier and take a moment to write their pid files.
+				"for i in 1 2 3 4 5 6 7 8 9 10; do",
+				"  if pidof zebra >/dev/null 2>&1 && pidof bgpd >/dev/null 2>&1; then exit 0; fi",
+				"  sleep 1",
+				"done",
+				`echo "the routing daemons are not running: zebra=$(pidof zebra || echo none) ` +
+					`bgpd=$(pidof bgpd || echo none). This router has no routing process, so ` +
+					`every session with it will sit Active and the failure will appear on its ` +
+					`neighbours rather than here." >&2`,
+				"exit 1",
+			}, "\n")},
+		})
+	}
+
 	// Label switching has to be enabled per interface, not once per router.
 	//
 	// A router with `mpls ldp` configured will happily distribute labels and

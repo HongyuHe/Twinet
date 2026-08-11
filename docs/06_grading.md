@@ -231,14 +231,36 @@ disputed mark, where isolation matters more than throughput.
 `twinet grade class` is the one to use for a class. It exploits the fact that a
 harness differs from the class lab in exactly one way — every autonomous system
 but one is the reference solution — so two submissions cannot affect each other
-as long as they are not neighbours. The lab is deployed once and submissions are
-loaded in waves of mutually non-adjacent systems, which gives the same
-guarantee: everything a submission can see is either its own work or the
-reference.
+unless a route can travel from one to the other. The lab is deployed once and
+submissions are loaded in waves chosen so that no two members of a wave are
+within two hops of each other in the peering graph.
 
-Measured on the three-node cluster: eight submissions, four waves, 22 minutes,
-every one scoring 10/10 against the reference. The count of waves is the
-chromatic number of the peering graph and does not grow with the class — a test
-computes it for both the 8-student lab and the 80-student one and gets four in
-both cases. The cost is therefore per wave rather than per submission, which is
-what makes a class of a hundred cost about what a class of eight does.
+Two hops, not one. Adjacency alone is not enough: with A — B — C, a route A
+originates reaches C through B, so a mistake in A can change what C is marked
+on even though they never peer. Widening the conflict relation costs waves, and
+this is what it costs, measured rather than assumed:
+
+| Class | Waves | Submissions per wave |
+|---|---:|---:|
+| 8 student ASes | 6 | 1.3 |
+| 80 student ASes | 42 | 1.9 |
+
+An earlier version of this document claimed four waves regardless of class size,
+which was true of the adjacency-only rule it described and is not true of this
+one. The wave count does grow with the class — slowly, roughly one wave per two
+submissions — so the honest claim is that waves cost about half of what private
+harnesses cost, not that a class of a hundred costs what a class of eight does.
+
+What has not changed is the isolation each wave provides, which is now stronger.
+
+### The limit of it
+
+Two hops is a heuristic, not a proof. A route can travel further than two hops
+through reference ASes, so a sufficiently long path can still carry one
+submission's mistake to another's harness. In the COS-461 topology the reference
+ASes between any two students filter and re-originate enough that this has not
+been observed, but it is not excluded by construction.
+
+`twinet grade batch` is the option that is airtight, at about twelve minutes per
+submission. Use it for a disputed mark, and for a class where the topology puts
+students within a few hops of each other along a path of pure transit.
