@@ -1,6 +1,9 @@
 package grade
 
 import (
+	"context"
+	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/HongyuHe/twinet/internal/model"
@@ -146,4 +149,41 @@ func routeServerOn(top *model.Topology, i *model.Iface) (string, int) {
 		}
 	}
 	return "", 0
+}
+
+// runningConfigs reads the configuration of every router in the AS under test.
+//
+// An absence-based check concludes something from what it does not find: "no
+// forbidden network is advertised into OSPF", "nothing denies routes without a
+// ROA". If a router's configuration could not be read, then what the check did
+// not find includes everything on that router, and the conclusion is unfounded.
+//
+// Three such checks used to skip the unreadable router and pass anyway, so a
+// submission whose FRR was not running at all scored full marks on every
+// question phrased as a prohibition -- and the mark was indistinguishable from
+// a correct answer, so nobody had any reason to look. Reading every router up
+// front, and refusing to conclude anything if one is missing, is what makes
+// "we did not see it" mean "it is not there".
+func runningConfigs(ctx context.Context, env *Env) (map[string]string, error) {
+	routers := env.Routers()
+	if len(routers) == 0 {
+		return nil, fmt.Errorf("AS %d has no routers", env.AS)
+	}
+	cfgs := make(map[string]string, len(routers))
+	var unreadable []string
+	for _, r := range routers {
+		out, err := env.Vtysh(ctx, r.Name, "show running-config")
+		if err != nil {
+			unreadable = append(unreadable, fmt.Sprintf("%s: %v", r.Name, err))
+			continue
+		}
+		cfgs[r.Name] = out
+	}
+	if len(unreadable) > 0 {
+		sort.Strings(unreadable)
+		return cfgs, fmt.Errorf("the configuration of %d of %d routers could not be read, so "+
+			"nothing can be concluded from its absence:\n%s",
+			len(unreadable), len(routers), strings.Join(unreadable, "\n"))
+	}
+	return cfgs, nil
 }

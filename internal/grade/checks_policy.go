@@ -648,11 +648,13 @@ func checkRPKIInvalidRejected(ctx context.Context, env *Env) Result {
 		})
 	}
 
-	// And confirm no invalid route is actually selected.
-	var selected []string
+	// And confirm no invalid route is actually selected. A router whose table
+	// could not be read is not evidence that it selects nothing.
+	var selected, unread []string
 	for _, r := range env.Routers() {
 		out, err := env.Vtysh(ctx, r.Name, "show bgp ipv4 unicast rpki invalid")
 		if err != nil {
+			unread = append(unread, fmt.Sprintf("%s: %v", r.Name, err))
 			continue
 		}
 		for _, line := range strings.Split(out, "\n") {
@@ -660,6 +662,15 @@ func checkRPKIInvalidRejected(ctx context.Context, env *Env) Result {
 				selected = append(selected, strings.TrimSpace(r.Name+": "+line))
 			}
 		}
+	}
+	if len(unread) > 0 {
+		return Partial("rpki.invalid_rejected", 0.6, Evidence{
+			Expected: "no invalid route selected on any router",
+			Observed: fmt.Sprintf("%d router(s) could not be asked", len(unread)),
+			Detail:   strings.Join(unread, "\n"),
+			Hint:     "an unanswered router is not a router with a clean table",
+			Command:  "show bgp ipv4 unicast rpki invalid",
+		})
 	}
 	if len(selected) == 0 {
 		return Pass("rpki.invalid_rejected", Evidence{
@@ -685,11 +696,18 @@ func checkRPKINotFoundPreserved(ctx context.Context, env *Env) Result {
 		})
 	}
 	var denies []string
+	cfgs, err := runningConfigs(ctx, env)
+	if err != nil {
+		return Fail("rpki.notfound_preserved", Evidence{
+			Expected: "every router's configuration readable, with no clause denying not-found routes",
+			Observed: "some configurations could not be read",
+			Detail:   err.Error(),
+			Hint:     "make sure FRR is running on every router before submitting",
+			Command:  "show running-config",
+		})
+	}
 	for _, r := range env.Routers() {
-		out, err := env.Vtysh(ctx, r.Name, "show running-config")
-		if err != nil {
-			continue
-		}
+		out := cfgs[r.Name]
 		lines := strings.Split(out, "\n")
 		for i, line := range lines {
 			if !strings.Contains(strings.ToLower(line), "match rpki notfound") {

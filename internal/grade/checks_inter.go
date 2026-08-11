@@ -506,12 +506,22 @@ func sourceRelationship(e bgpRoute, relOf map[string]model.Relationship,
 }
 
 func checkNoForbiddenOSPF(ctx context.Context, env *Env) Result {
+	// Every router, or none: this check concludes from what it does not find,
+	// so a router it could not read is a router whose forbidden statements it
+	// would also not have found.
+	cfgs, err := runningConfigs(ctx, env)
+	if err != nil {
+		return Fail("config.no_forbidden_ospf", Evidence{
+			Expected: "every router's configuration readable, with no 179.x or 180.x under router ospf",
+			Observed: "some configurations could not be read",
+			Detail:   err.Error(),
+			Hint:     "make sure FRR is running on every router before submitting",
+			Command:  "show running-config",
+		})
+	}
 	var found []string
 	for _, r := range env.Routers() {
-		out, err := env.Vtysh(ctx, r.Name, "show running-config")
-		if err != nil {
-			continue
-		}
+		out := cfgs[r.Name]
 		inOSPF := false
 		for _, line := range strings.Split(out, "\n") {
 			t := strings.TrimSpace(line)
