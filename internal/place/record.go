@@ -1,0 +1,96 @@
+package place
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+)
+
+// The record of where a lab was actually deployed.
+//
+// Placement is recomputed from the manifest by every command that has to find a
+// device: exec, grade, save, restore, the gateway. For that to work, the answer
+// must never change while a lab is running -- and it changed for all sorts of
+// ordinary reasons. Adding one student to a term already under way moved seven
+// of the other ten autonomous systems; so did any improvement to the placer
+// itself. The containers stayed where they were, so every command then looked
+// for them on the wrong node and reported "no such container", which reads like
+// a broken lab rather than arithmetic that has drifted.
+//
+// Writing the assignment down at deploy time and reading it back afterwards is
+// what makes the answer stable. It also makes a rebalance an explicit act with
+// a visible cost, rather than something that happens by accident.
+
+// RecordName is the file the assignment is written to inside the lab's private
+// directory.
+const RecordName = "placement.json"
+
+// LoadRecord reads the recorded placement for a lab.
+//
+// A missing record is not an error: the lab has simply not been deployed yet.
+// An unreadable one is, because carrying on would recompute a placement that
+// disagrees with the containers already running -- the exact failure the record
+// exists to prevent, arrived at by ignoring the evidence that it happened.
+func LoadRecord(dir, lab string) (*Record, error) {
+	raw, err := os.ReadFile(filepath.Join(dir, RecordName))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("reading the recorded placement: %w", err)
+	}
+	var r Record
+	if err := json.Unmarshal(raw, &r); err != nil {
+		return nil, fmt.Errorf("the recorded placement in %s is corrupt (%w); "+
+			"delete it and redeploy with --rebalance if the lab is not running",
+			filepath.Join(dir, RecordName), err)
+	}
+	if r.Lab != "" && lab != "" && r.Lab != lab {
+		return nil, fmt.Errorf("the recorded placement in %s belongs to lab %q, not %q",
+			filepath.Join(dir, RecordName), r.Lab, lab)
+	}
+	if r.ByAS == nil {
+		r.ByAS = map[int]string{}
+	}
+	if r.ByService == nil {
+		r.ByService = map[string]string{}
+	}
+	return &r, nil
+}
+
+// SaveRecord writes the assignment, atomically.
+//
+// A half-written record is worse than none: it would place some ASes and
+// silently recompute the rest, which is the drift this is meant to stop, in a
+// form that looks deliberate.
+func SaveRecord(dir string, r *Record) error {
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return err
+	}
+	raw, err := json.MarshalIndent(r, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, "."+RecordName+"-*")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = os.Remove(tmp.Name()) }()
+	if _, err := tmp.Write(append(raw, '\n')); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmp.Name(), 0o640); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), filepath.Join(dir, RecordName))
+}

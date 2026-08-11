@@ -204,8 +204,50 @@ func writePlacement(out io.Writer, top *model.Topology) error {
 		return err
 	}
 	s := top.Stats()
-	fmt.Fprintf(out, "\n%d of %d links cross the fabric (%.1f%%); %d inter-AS links in total\n",
-		s.CrossNode, s.Links, 100*float64(s.CrossNode)/float64(max(1, s.Links)), s.InterAS)
+	// Broken down by what the link is, because the aggregate hides the number
+	// that matters. Intra-AS links must never cross -- an AS split across two
+	// machines would carry its own interior routing over a tunnel -- and
+	// inter-AS links are the ones the partitioner is trying to keep local.
+	// A single percentage cannot distinguish a good partition from one that
+	// happens to have few inter-AS links.
+	var interCross, interTotal, svcCross, svcTotal, intraCross, intraTotal int
+	for _, l := range top.Links {
+		if l.A == nil || l.B == nil || l.A.Device == nil || l.B.Device == nil {
+			continue
+		}
+		x, y := l.A.Device.ASN, l.B.Device.ASN
+		cross := l.CrossNode()
+		switch {
+		case x == 0 || y == 0:
+			svcTotal++
+			if cross {
+				svcCross++
+			}
+		case x != y:
+			interTotal++
+			if cross {
+				interCross++
+			}
+		default:
+			intraTotal++
+			if cross {
+				intraCross++
+			}
+		}
+	}
+	pct := func(a, b int) string {
+		if b == 0 {
+			return "n/a"
+		}
+		return fmt.Sprintf("%d/%d (%.0f%%)", a, b, 100*float64(a)/float64(b))
+	}
+	fmt.Fprintf(out, "\n%d of %d links cross the fabric (%.1f%%)\n",
+		s.CrossNode, s.Links, 100*float64(s.CrossNode)/float64(max(1, s.Links)))
+	fmt.Fprintf(out, "  inter-AS %s   service %s   intra-AS %s\n",
+		pct(interCross, interTotal), pct(svcCross, svcTotal), pct(intraCross, intraTotal))
+	if intraCross > 0 {
+		fmt.Fprintf(out, "  warning: an autonomous system has been split across nodes\n")
+	}
 	return nil
 }
 

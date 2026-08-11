@@ -2,11 +2,13 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"text/tabwriter"
@@ -27,14 +29,15 @@ import (
 
 func newDeployCmd(opts *Options) *cobra.Command {
 	var (
-		solve   bool
-		dryRun  bool
-		workers int
-		pull    string
-		only    string
-		quiet   bool
-		token   string
-		prune   bool
+		solve     bool
+		dryRun    bool
+		workers   int
+		pull      string
+		only      string
+		quiet     bool
+		token     string
+		prune     bool
+		rebalance bool
 	)
 	cmd := &cobra.Command{
 		Use:   "deploy",
@@ -43,12 +46,46 @@ func newDeployCmd(opts *Options) *cobra.Command {
 is actually running and creates only what is missing, so it is safe to re-run
 after a partial failure, a reboot, or a topology edit.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			top, err := loadAndPlace(opts)
+			top, err := load(opts)
 			if err != nil {
 				return err
 			}
+			rec, err := place.LoadRecord(labPrivateDir(top), top.Name)
+			if err != nil {
+				return err
+			}
+			if rec == nil && !rebalance {
+				// No record, but the lab may still be running -- deployed by
+				// an earlier version, or the record lost. What is running is
+				// the authority.
+				rec, err = adoptRunningPlacement(cmd.Context(), top, token)
+				if err != nil {
+					return err
+				}
+				if rec != nil {
+					fmt.Fprintf(cmd.ErrOrStderr(),
+						"adopted the placement of the %d autonomous systems already running\n",
+						len(rec.ByAS))
+				}
+			}
+			a, err := place.Place(top, place.Options{Fixed: rec, Rebalance: rebalance})
+			if err != nil {
+				return err
+			}
+			warnAboutMoves(cmd.ErrOrStderr(), a, rebalance)
 			if err := resolveImageIDs(cmd.Context(), top, token); err != nil {
 				return err
+			}
+			// Written before anything is created, so that a deploy which
+			// fails half way leaves a record matching the containers that
+			// did come up. Writing it afterwards would mean a crash left the
+			// lab placed one way and the record saying another, which is the
+			// drift the record exists to prevent.
+			if !dryRun {
+				if err := place.SaveRecord(labPrivateDir(top),
+					a.Record(top.Name, strategyOf(top, rebalance))); err != nil {
+					return fmt.Errorf("recording where the lab was placed: %w", err)
+				}
 			}
 			scope, err := parseScope(only)
 			if err != nil {
@@ -159,6 +196,8 @@ after a partial failure, a reboot, or a topology edit.`,
 		"also remove containers and overlays this topology no longer wants")
 	cmd.Flags().BoolVarP(&quiet, "quiet", "q", false, "suppress per-step progress")
 	cmd.Flags().StringVar(&token, "token", "", "agent token for cluster deployments (or set TWINET_TOKEN)")
+	cmd.Flags().BoolVar(&rebalance, "rebalance", false,
+		"recompute placement from scratch; every AS that moves has its containers rebuilt")
 	return cmd
 }
 
@@ -260,6 +299,15 @@ if the manifest that created it is no longer available.`,
 			if !keep && len(vnis) > 0 {
 				if err := eng.DestroyOverlays(vnis); err != nil {
 					fmt.Fprintf(cmd.ErrOrStderr(), "warning: overlay cleanup: %v\n", err)
+				}
+			}
+			// The record describes containers that no longer exist. Leaving it
+			// would pin the next deployment to an arrangement chosen for a lab
+			// that is gone, and silently forgo any improvement to the placer.
+			if top != nil {
+				if err := os.Remove(filepath.Join(labPrivateDir(top), place.RecordName)); err != nil &&
+					!errors.Is(err, os.ErrNotExist) {
+					fmt.Fprintf(cmd.ErrOrStderr(), "warning: clearing the placement record: %v\n", err)
 				}
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), "removed %d containers of lab %q\n", len(cs), name)
@@ -538,15 +586,40 @@ func shortID(id string) string {
 	return id
 }
 
+// loadAndPlace resolves the manifest and works out which node every device is
+// on.
+//
+// The recorded placement is honoured whenever there is one. Every command that
+// touches a device -- exec, grade, save, restore, the gateway -- resolves it
+// through here, so if this returned a different answer than the deploy did, all
+// of them would look for containers on nodes that do not have them. That is not
+// hypothetical: adding one student to a running term moved seven of the other
+// ten autonomous systems, and `twinet exec` then failed on each of them with
+// "no such container", which reads like a broken lab.
 func loadAndPlace(opts *Options) (*model.Topology, error) {
 	top, err := load(opts)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := place.Place(top, place.Options{}); err != nil {
+	if _, err := placeWithRecord(top, false); err != nil {
 		return nil, err
 	}
 	return top, nil
+}
+
+// labPrivateDir is where the controller keeps what it knows about a lab.
+func labPrivateDir(top *model.Topology) string {
+	return filepath.Join(top.Lab.Dir, ".twinet")
+}
+
+// placeWithRecord places the topology, honouring the record of where the lab
+// was last deployed.
+func placeWithRecord(top *model.Topology, rebalance bool) (*place.Assignment, error) {
+	rec, err := place.LoadRecord(labPrivateDir(top), top.Name)
+	if err != nil {
+		return nil, err
+	}
+	return place.Place(top, place.Options{Fixed: rec, Rebalance: rebalance})
 }
 
 // localNode picks the node this invocation acts for. Single-node labs use the
@@ -707,4 +780,108 @@ func localStore(top *model.Topology) (*state.Store, error) {
 		return nil, fmt.Errorf("open state store %s: %w", dir, err)
 	}
 	return st, nil
+}
+
+// strategyOf names the strategy the record was produced with.
+func strategyOf(top *model.Topology, rebalance bool) string {
+	s := top.Lab.Placement.Strategy
+	if s == "" {
+		s = "pack-by-as"
+	}
+	if rebalance {
+		return s + " (rebalanced)"
+	}
+	return s
+}
+
+// warnAboutMoves says out loud when an AS is not where it was.
+//
+// Moving an AS destroys and rebuilds every container in it, so a student's
+// running processes, shell history and anything not captured by preservation
+// are lost. That is sometimes the right thing -- a node has been removed, or a
+// rebalance was asked for -- but it is never something to discover afterwards.
+func warnAboutMoves(w io.Writer, a *place.Assignment, rebalance bool) {
+	if rebalance {
+		fmt.Fprintln(w, "warning: --rebalance recomputes placement; every AS that moves "+
+			"has its containers destroyed and rebuilt")
+		return
+	}
+	for _, m := range a.Moved {
+		fmt.Fprintf(w, "warning: %s, so it moves and its containers are rebuilt\n", m)
+	}
+}
+
+// adoptRunningPlacement reconstructs the record from the containers that are
+// actually running.
+//
+// A lab can be running with no record: it was deployed by an earlier version,
+// or the record was lost, or somebody cleaned the lab directory. Placing it
+// afresh in that state is the worst available outcome, because the arithmetic
+// silently disagrees with reality and every command that has to find a device
+// reports "no such container" while the container is running perfectly well one
+// node over. What is running is the authority; the record only remembers it.
+func adoptRunningPlacement(ctx context.Context, top *model.Topology, token string) (*place.Record, error) {
+	if !clustered(top) {
+		return nil, nil
+	}
+	tok, tokErr := tokenFor(token)
+	if tokErr != nil {
+		// Without a token nothing can be asked, and the deploy that follows
+		// will fail on the same missing token with a clearer message than
+		// this one could give.
+		return nil, nil //nolint:nilerr // deploy reports the missing token
+	}
+	cs, errs := client.NewCluster(top.Lab, tok).Containers(ctx, top.Name)
+	if len(errs) > 0 {
+		// A node that cannot be asked might be holding half the lab. Adopting
+		// what the reachable ones say would pin those and re-place the rest,
+		// which is a worse answer than declining to adopt at all.
+		return nil, fmt.Errorf("the running placement could not be read from every node (%v); "+
+			"fix the unreachable node, or pass --rebalance to place the lab afresh "+
+			"and accept that containers move", errs[0])
+	}
+	if len(cs) == 0 {
+		return nil, nil
+	}
+	r := &place.Record{Lab: top.Name, Strategy: "adopted", ByAS: map[int]string{}, ByService: map[string]string{}}
+	conflict := map[int]string{}
+	for _, c := range cs {
+		node := c.Label(deploy.LabelNode)
+		asn, err := strconv.Atoi(c.Label(deploy.LabelAS))
+		if err != nil || node == "" {
+			continue
+		}
+		if asn == 0 {
+			if d := c.Label(deploy.LabelDevice); d != "" {
+				r.ByService[serviceNameOf(top, d)] = node
+			}
+			continue
+		}
+		if prev, ok := r.ByAS[asn]; ok && prev != node {
+			conflict[asn] = prev + " and " + node
+			continue
+		}
+		r.ByAS[asn] = node
+	}
+	if len(conflict) > 0 {
+		var parts []string
+		for asn, where := range conflict {
+			parts = append(parts, fmt.Sprintf("AS %d has containers on %s", asn, where))
+		}
+		sort.Strings(parts)
+		return nil, fmt.Errorf("the running lab is already split across nodes, which placement "+
+			"never produces:\n  %s\nRun `twinet destroy` and deploy again, or pass --rebalance",
+			strings.Join(parts, "\n  "))
+	}
+	return r, nil
+}
+
+// serviceNameOf maps a service device name back to the service that owns it.
+func serviceNameOf(top *model.Topology, device string) string {
+	for _, n := range top.SortedServiceNames() {
+		if svc := top.Services[n]; svc != nil && svc.Device != nil && svc.Device.Name == device {
+			return n
+		}
+	}
+	return device
 }

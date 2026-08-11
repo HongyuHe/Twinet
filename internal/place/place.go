@@ -28,12 +28,50 @@ type Assignment struct {
 	Load map[string]int
 	// CrossNodeLinks counts links whose endpoints landed on different nodes.
 	CrossNodeLinks int
+	// Moved records ASes that could not be left where the record says they
+	// were, and why. Each one is a set of containers that will be rebuilt.
+	Moved []string
+}
+
+// Record is the assignment in the form it is written down in.
+func (a *Assignment) Record(lab, strategy string) *Record {
+	r := &Record{Lab: lab, Strategy: strategy,
+		ByAS: map[int]string{}, ByService: map[string]string{}}
+	for k, v := range a.ByAS {
+		r.ByAS[k] = v
+	}
+	for k, v := range a.ByService {
+		r.ByService[k] = v
+	}
+	return r
 }
 
 // Options tune the placer.
 type Options struct {
 	// Strategy is pack-by-as, spread-by-as or single-node.
 	Strategy string
+	// Fixed is where a previous deployment put each AS and service, read back
+	// from the record. Anything named here stays where it is.
+	//
+	// Determinism for one manifest is not enough. Placement is recomputed by
+	// every command that has to find a device -- exec, grade, save, the
+	// gateway -- so if the answer ever changes, those commands look for
+	// containers on nodes that do not have them, and report "no such
+	// container" without a hint that the lab is fine and the arithmetic is
+	// not. Adding one student to a term already running is enough to move
+	// most of the others.
+	Fixed *Record
+	// Rebalance recomputes from scratch, ignoring the record. Containers move,
+	// so it is never implicit.
+	Rebalance bool
+}
+
+// Record is a placement as it was actually deployed.
+type Record struct {
+	Lab       string            `json:"lab"`
+	Strategy  string            `json:"strategy"`
+	ByAS      map[int]string    `json:"by_as"`
+	ByService map[string]string `json:"by_service"`
 }
 
 // Place assigns every AS and service to a node and writes the result back onto
@@ -110,6 +148,36 @@ func Place(top *model.Topology, opts Options) (*Assignment, error) {
 		}
 	}
 
+	// Where the lab is already running, unless a rebalance was asked for.
+	//
+	// A recorded assignment is honoured even when the placer would now choose
+	// otherwise, because moving an AS destroys and rebuilds every container in
+	// it. A node that has since been removed from the manifest is the one case
+	// where the AS has to move, and that is reported rather than silently
+	// obeyed.
+	var moved []string
+	if opts.Fixed != nil && !opts.Rebalance {
+		for _, asn := range top.SortedASNs() {
+			n, ok := opts.Fixed.ByAS[asn]
+			if !ok {
+				continue
+			}
+			if _, alreadyPinned := pinned[asn]; alreadyPinned {
+				continue
+			}
+			if !contains(names, n) {
+				moved = append(moved, fmt.Sprintf("AS %d was on %s, which is no longer a node", asn, n))
+				continue
+			}
+			pinned[asn] = n
+		}
+		for _, s := range top.SortedServiceNames() {
+			if n, ok := opts.Fixed.ByService[s]; ok && contains(names, n) {
+				pinnedSvc[s] = n
+			}
+		}
+	}
+
 	// Services default to the front node: they publish externally reachable
 	// endpoints and are the natural neighbours of the web UI and gateway.
 	for _, s := range top.SortedServiceNames() {
@@ -157,18 +225,30 @@ func Place(top *model.Topology, opts Options) (*Assignment, error) {
 	}
 
 	switch strategy {
-	case "pack-by-as":
-		// First-fit-decreasing by weight, then a stable pass in ascending AS
-		// order for equal weights, which keeps neighbouring groups together and
-		// therefore keeps more inter-AS links local.
-		sort.SliceStable(free, func(i, j int) bool {
-			if weight[free[i]].Containers != weight[free[j]].Containers {
-				return weight[free[i]].Containers > weight[free[j]].Containers
-			}
-			return free[i] < free[j]
-		})
-		for _, asn := range free {
-			n, err := leastPressured(names, loads, caps, hasCap, weight[asn])
+	case "pack-by-as", "spread-by-as":
+		// Both walk the peering graph so that each AS is placed while its
+		// neighbours are known, and both keep the cluster balanced. They
+		// differ in how much imbalance they will accept in exchange for
+		// locality: pack-by-as trades a little, spread-by-as almost none.
+		//
+		// This is the pass the design has always described and the code did
+		// not do: without it both strategies put each AS on whichever node
+		// was emptiest, which for a chain of peering ASes deals them out
+		// round-robin and turns very nearly every inter-AS link into a
+		// tunnel -- the exact opposite of the stated objective.
+		// How much imbalance each strategy will trade for locality, as a
+		// fraction of a node's capacity. pack-by-as accepts a tenth of a node
+		// to keep peering ASes together; spread-by-as accepts none, so
+		// locality only breaks an exact tie.
+		tolerance := 0.0
+		if strategy == "pack-by-as" {
+			tolerance = 0.10
+		}
+		g := buildAffinity(top)
+		nominal := nominalCapacity(names, caps, hasCap, len(top.Devices))
+		for _, asn := range orderForLocality(free, g, weight) {
+			n, err := bestForLocality(names, loads, caps, hasCap, weight[asn], tolerance, nominal,
+				func(node string) int { return g.pull(asn, node, a.ByAS, front) })
 			if err != nil {
 				return nil, fmt.Errorf("AS %d: %w", asn, err)
 			}
@@ -176,24 +256,23 @@ func Place(top *model.Topology, opts Options) (*Assignment, error) {
 			loads[n] = loads[n].add(weight[asn])
 			a.Load[n] += weight[asn].Containers
 		}
-	case "spread-by-as":
-		// Round-robin still has to respect capacity. Skipping the check here
-		// was a way to build a lab that could not run: the strategy asks for an
-		// even spread, not for an impossible one.
-		for _, asn := range free {
-			n, err := leastPressured(names, loads, caps, hasCap, weight[asn])
-			if err != nil {
-				return nil, fmt.Errorf("AS %d: %w", asn, err)
-			}
-			a.ByAS[asn] = n
-			loads[n] = loads[n].add(weight[asn])
-			a.Load[n] += weight[asn].Containers
+		// The greedy pass places each AS knowing only the ones before it.
+		// Local search repairs the choices that later ASes made bad.
+		refine(names, a.ByAS, g, weight, loads, caps, hasCap, pinned, front, tolerance, nominal)
+		a.Load = map[string]int{}
+		for _, n := range names {
+			a.Load[n] = loads[n].Containers
 		}
 	default:
-		return nil, fmt.Errorf("unknown placement strategy %q", strategy)
+		return nil, fmt.Errorf("unknown placement strategy %q; use pack-by-as, spread-by-as or single-node", strategy)
 	}
 
-	return finish(top, a)
+	res, err := finish(top, a)
+	if err != nil {
+		return nil, err
+	}
+	res.Moved = moved
+	return res, nil
 }
 
 // finish stamps the assignment onto devices and computes summary statistics.

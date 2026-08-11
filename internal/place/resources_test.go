@@ -102,7 +102,7 @@ func TestPlacementUsesEveryDimension(t *testing.T) {
 	// A node full on memory but idle on cores is full.
 	load := demand{Containers: 1, CPUs: 0.1, MemBytes: 15 << 30}
 	cap := demand{Containers: 100, CPUs: 8, MemBytes: 16 << 30}
-	if p := pressure(load, cap, true); p < 0.9 {
+	if p := pressure(load, cap, true, 100); p < 0.9 {
 		t.Errorf("pressure %f ignores memory; averaging hides the case that causes trouble", p)
 	}
 }

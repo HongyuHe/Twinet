@@ -131,18 +131,93 @@ placement:
   pin:
     - {match: {service: "*"},  node: node-0}
     - {match: {as: 1},         node: node-0}   # Krill/RPKI near the web tier
-  affinity:
-    - {match: {region: 0}, prefer: node-1}     # co-locate a region if desired
 ```
 
-The default strategy is first-fit-decreasing bin-packing on
-(cpus, memory, container-count), with a secondary objective of minimising
-cross-node inter-AS edges (a cheap greedy graph-partition pass over the peering
-graph). Placement is **recorded in the plan and stable across runs** for the
-same manifest, so redeploying does not shuffle ASes between machines.
+### The partitioner
 
-`twinet inspect placement` prints the assignment; `--rebalance` explicitly opts
-into recomputation.
+Placement is a **balanced graph partition of the peering graph**, in three
+steps (`internal/place`):
+
+1. **Order.** ASes are visited by growing outwards from the highest-degree
+   seed, so that each AS is placed while its neighbours are already known.
+   Weight-descending order — the natural one for bin-packing — walks the graph
+   arbitrarily, so most neighbours are still unplaced when a decision is made
+   and there is no locality to exploit.
+2. **Greedy assignment.** Each AS goes to the node that keeps the most of its
+   links local, among the nodes that would still be *balanced* after taking
+   it. The balance bound is expressed against the least-loaded option at that
+   moment, not as a fixed ceiling, so the candidate set is never empty and no
+   fallback is needed that would abandon balance altogether.
+3. **Local search.** Moves and pairwise swaps that keep more links inside a
+   node, and leave the load no less even, are applied until nothing improves
+   (capped at eight rounds). The greedy pass commits early to choices later
+   ASes make bad; this repairs them.
+
+Cost is a fraction of a second for eighty ASes and two thousand containers.
+
+`strategy` chooses how much imbalance is traded for locality:
+
+| Strategy | Trades | Use for |
+|---|---|---|
+| `pack-by-as` *(default)* | up to a tenth of a node's share | normal class deployment |
+| `spread-by-as` | nothing; locality breaks exact ties only | uniform hardware, maximum headroom |
+| `single-node` | everything onto the front node | development, CI, a one-machine course |
+
+Measured on the 80-AS lab across three nodes (`twinet inspect --placement`):
+
+| | inter-AS links crossing | node load |
+|---|---|---|
+| least-loaded assignment (what this replaced) | 201 / 283 (71%) | 662..675 |
+| `pack-by-as` | **111 / 283 (39%)** | 550..731 |
+| `spread-by-as` | **110 / 283 (39%)** | 660..677 |
+
+An **intra-AS link never crosses a node**, by construction: the AS is the unit
+of placement. `twinet inspect --placement` reports the three classes
+separately and warns if an AS is ever split, because a single aggregate
+percentage cannot distinguish a good partition from a topology that happens to
+have few inter-AS links.
+
+Service links are the remaining cost (≈64% cross at 80 ASes). A service that
+attaches to every AS is a star, and no assignment of one container can keep
+more than one node's share of a star local; the fix is more service replicas,
+not better placement.
+
+### Stability
+
+Placement is **deterministic for a given manifest** — every tie is broken by AS
+number or node name, and the local search only takes strictly improving moves
+(`TestPlacementIsIdenticalOnEveryRun`).
+
+Determinism alone is not enough, because the manifest changes. Every command
+that has to find a device — `exec`, `grade`, `save`, `restore`, the gateway —
+recomputes placement, so if the answer ever changed they would look for
+containers on nodes that do not have them and report "no such container" while
+the container runs perfectly well one node over. Adding a single student to a
+term already under way moved seven of the other ten ASes; so does any
+improvement to the placer itself.
+
+So the assignment is **written down**, in `<lab>/.twinet/placement.json`, and
+read back by everything that places:
+
+- `twinet deploy` writes the record before creating anything, so a deploy that
+  fails half way still leaves a record matching the containers that came up.
+- Any AS named in the record stays where the record says, even where the
+  placer would now choose otherwise. New ASes are placed around them.
+- If the record is missing but the lab is running — deployed by an earlier
+  version, or the record lost — `deploy` **adopts** the placement from the
+  running containers' `twinet.node` labels. What is running is the authority;
+  the record only remembers it.
+- A node removed from the manifest is the one case where an AS must move. It
+  is reported as a warning, because it costs that group their containers.
+- `twinet deploy --rebalance` recomputes from scratch. It warns first: every AS
+  that moves is destroyed and rebuilt.
+- `twinet destroy` clears the record, so the next deployment is free to place
+  the lab afresh and pick up any improvement to the placer.
+- A record that is corrupt, or belongs to another lab, is a **hard error**, not
+  a missing record. Treating it as absent would recompute a placement that
+  disagrees with the running containers — precisely what the record prevents.
+
+`twinet inspect --placement` prints the assignment.
 
 ## 3. Capacity model
 
