@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/HongyuHe/twinet/internal/model"
 )
@@ -119,23 +120,71 @@ func checkSixIn4(ctx context.Context, env *Env) Result {
 				reach = fmt.Sprintf("%s has no IPv6 address configured", dst.Name)
 				break
 			}
-			before := tunnelTx(ctx, env, gw.ID, tunnels[domains[0]])
-			// Enough packets to survive a cold neighbour cache.
+			// Each gateway resolves its own datacentre's host before anything
+			// is measured, and the result of that is discarded.
 			//
-			// The first packet has to wait for neighbour discovery, and on this
-			// path that solicitation crosses the tunnel and comes back: eighty
-			// milliseconds before the echo request has even been sent. With two
-			// packets and a two-second deadline a correct answer failed the
-			// first time it was graded after a redeploy and passed the second,
-			// which is the worst possible property for a mark.
-			res, err := env.Probe(ctx, src.ID,
-				[]string{"ping6", "-c", "5", "-W", "3", "-i", "0.3", addr})
-			if err == nil && res.ExitCode == 0 {
-				reachable = true
-			} else {
-				reach = fmt.Sprintf("%s cannot reach %s at %s over IPv6", src.Name, dst.Name, addr)
+			// This is not politeness, it is necessary. Measured on this
+			// cluster: after the datacentre is reconfigured -- which is what
+			// installing a solution does -- the gateway records the host as
+			// FAILED, and traffic arriving through the tunnel never clears it.
+			// Twenty seconds of forwarded pings left the entry FAILED; a
+			// single ping originated by the gateway itself made it REACHABLE
+			// and every forwarded packet then went through. So a correct
+			// answer scored zero or full marks depending on whether anything
+			// had happened to originate a packet from the right router in the
+			// preceding few minutes.
+			//
+			// Neighbour cache state is not part of the student's answer. This
+			// removes it from the measurement in the same spirit as waiting
+			// for BGP to converge, and it cannot manufacture a pass: the
+			// tunnel's own counters must still move and the end-to-end ping
+			// from the far datacentre must still succeed.
+			for _, d := range domains {
+				gw, h := gateways[d], hosts[d]
+				if gw == nil || h == nil {
+					continue
+				}
+				if a := firstAddr6(h); a != "" {
+					_, _ = env.Probe(ctx, gw.ID, []string{"ping6", "-c", "2", "-W", "3", a})
+				}
 			}
-			after := tunnelTx(ctx, env, gw.ID, tunnels[domains[0]])
+
+			// Reachability across the tunnel is waited for, not sampled once.
+			//
+			// The first packet has to wait for neighbour discovery, and the
+			// solicitation itself crosses the tunnel and comes back. If the
+			// tunnel was rebuilt moments earlier -- which is exactly what
+			// installing a solution does -- the path is not ready the instant
+			// the check asks. Graded immediately after a redeploy a correct
+			// answer scored zero; graded a minute later the same configuration
+			// scored full marks. Every other check in this rubric waits for the
+			// control plane to settle, and this one is no different: the
+			// difference between "not configured" and "not yet" is the whole
+			// question.
+			var before, after int
+			deadline := time.Now().Add(45 * time.Second)
+			for {
+				before = tunnelTx(ctx, env, gw.ID, tunnels[domains[0]])
+				res, err := env.Probe(ctx, src.ID,
+					[]string{"ping6", "-c", "3", "-W", "5", "-i", "0.3", addr})
+				after = tunnelTx(ctx, env, gw.ID, tunnels[domains[0]])
+				if err == nil && res.ExitCode == 0 {
+					reachable = true
+					break
+				}
+				if time.Now().After(deadline) {
+					reach = fmt.Sprintf("%s could not reach %s at %s over IPv6 in %s",
+						src.Name, dst.Name, addr, 45*time.Second)
+					break
+				}
+				select {
+				case <-ctx.Done():
+					reach = "the grading run was cancelled while waiting for IPv6 to come up"
+				case <-time.After(3 * time.Second):
+					continue
+				}
+				break
+			}
 			if reachable && tunnels[domains[0]] != "" && after > before {
 				throughTunnel = true
 			} else if reachable && tunnels[domains[0]] != "" {

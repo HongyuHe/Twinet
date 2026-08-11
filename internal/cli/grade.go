@@ -181,7 +181,15 @@ the hours a sleep-driven serial grader takes.`,
 	cmd.Flags().IntSliceVar(&asList, "as", nil, "AS numbers to grade (default: every student AS)")
 	cmd.Flags().StringVarP(&outDir, "out", "o", "", "directory for reports")
 	cmd.Flags().IntVarP(&parallel, "parallel", "p", 8, "submissions graded concurrently")
-	cmd.Flags().DurationVar(&converge, "converge-timeout", 90*time.Second,
+	// Four minutes, not ninety seconds.
+	//
+	// Ninety was a guess and it was wrong: an iBGP session in the 12-AS lab was
+	// measured taking three minutes and twenty seconds to establish after a
+	// redeploy. The wait gave up first, the question was flagged for review,
+	// and the report showed 54 of 56 sessions established -- a correct answer
+	// described as an incomplete one, with the truth of it buried in a warning.
+	// This matches what `grade batch` and `grade class` already use.
+	cmd.Flags().DurationVar(&converge, "converge-timeout", 4*time.Minute,
 		"how long to wait for the control plane to settle")
 	cmd.Flags().StringVar(&token, "token", "", "agent token for cluster labs (or set TWINET_TOKEN)")
 	cmd.Flags().BoolVarP(&quiet, "quiet", "q", false, "suppress per-submission progress")
