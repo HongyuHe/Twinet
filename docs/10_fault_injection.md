@@ -230,7 +230,7 @@ Twinet will expose these through a thin adapter, so NIKA's existing fault
 implementations run unmodified against a Twinet lab:
 
 ```
-NIKA problem  ──▶  LabRuntime (twinet)  ──▶  twinet agent API  ──▶  device
+NIKA problem  ──▶  LabRuntime (twinet)  ──▶  twinetd API        ──▶  device
 ```
 
 The adapter is small because the agent API already brokers exec into any

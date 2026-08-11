@@ -262,7 +262,7 @@ advanced course), issues an mTLS certificate, and verifies underlay reachability
 and MTU to every other node. `twinet node status` reports version skew, clock
 skew, capacity, and image cache state.
 
-Images are pulled by agents in parallel; `twinet images push` can pre-seed a
+Images are pulled by agents in parallel; `make push` pre-seeds a
 node from a local tarball for air-gapped or slow-link environments.
 
 ## 5. External connectivity

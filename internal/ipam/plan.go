@@ -182,10 +182,11 @@ func (c Conflict) String() string {
 // Conflicts returns every pair of overlapping claims, excluding pairs where one
 // side is an exempt aggregate.
 //
-// The check is O(n log n): claims are sorted by address, and overlap can then
-// only occur between neighbours in that order (for prefixes, containment and
-// disjointness are the only possibilities, so a sorted scan is sufficient once
-// we compare each claim against the running maximum extent).
+// Claims are sorted by start address, so the scan for a given claim can stop as
+// soon as it reaches one that starts beyond the claim's last address: for
+// prefixes, containment and disjointness are the only possibilities, so nothing
+// later can reach back. Near-linear in practice; quadratic only in the
+// pathological case of one prefix containing everything.
 func (r *Registry) Conflicts() []Conflict {
 	claims := append([]Claim{}, r.claims...)
 	sort.Slice(claims, func(i, j int) bool {

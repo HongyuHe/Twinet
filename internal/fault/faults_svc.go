@@ -138,10 +138,14 @@ func init() {
 			if err != nil {
 				return Evidence{}, err
 			}
+			observed := matchingLine(out, s["address"])
+			if observed == "" {
+				observed = "no record points at " + s["address"]
+			}
 			return Evidence{
 				Verified: strings.Contains(out, s["address"]),
-				Observed: "a record points at " + s["address"],
-				Expected: "no record points at " + s["address"],
+				Observed: observed,
+				Expected: "a record pointing at " + s["address"],
 			}, nil
 		},
 		Resolve: func(ctx context.Context, e *Env, t Target, s State) error {

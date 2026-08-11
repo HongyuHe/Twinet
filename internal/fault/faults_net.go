@@ -370,8 +370,8 @@ func init() {
 			wrong := "router bgp " + s["wrong"]
 			return Evidence{
 				Verified: strings.Contains(out, wrong),
-				Observed: wrong,
-				Expected: "router bgp " + s["asn"],
+				Observed: matchingLine(out, "router bgp "),
+				Expected: wrong,
 			}, nil
 		},
 		Resolve: func(ctx context.Context, e *Env, t Target, s State) error {
@@ -517,9 +517,13 @@ func init() {
 			}
 			// The AS's own prefix is always originated, so the predicate must
 			// name the victim's prefix specifically.
+			originated := matchingLine(out, "network "+victim)
+			if originated == "" {
+				originated = "no `network " + victim + "` statement"
+			}
 			return Evidence{Verified: strings.Contains(out, "network "+victim),
 				Expected: "AS " + fmt.Sprint(t.AS) + " originates " + victim,
-				Observed: victim}, nil
+				Observed: originated}, nil
 		},
 		Resolve: func(ctx context.Context, e *Env, t Target, s State) error {
 			if s["prefix"] == "" {

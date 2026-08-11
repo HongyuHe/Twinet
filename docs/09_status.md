@@ -160,13 +160,16 @@ someone has checked.
 | 12-AS lab, 211 containers, 291 links, 3 nodes | 83 s |
 | Same lab, single node | not attempted; 4-AS/57-container demo takes 64 s |
 | Cross-node link RTT (25 ms configured) | 50.22 ms, σ 9 µs |
-| Links kept local by AS-granular placement | 86.6 % |
+| Links kept local by AS-granular placement, 84-AS lab | **89.2 %** (315 of 2927 cross) |
+| — of which inter-AS links crossing | **111 of 283 (39 %)**, against 201 (71 %) before the partitioner |
+| — intra-AS links crossing | 0 of 2324, by construction |
+| Placement cost, 84 ASes / 2012 containers | < 1 s |
 | Grading, 3 submissions, 10 questions, 17 checks | 31 s |
 | Grading a class of 8 in waves, all scoring 10/10 | **22m 11s in 4 waves** |
 | Waves needed for 8 student ASes / for 80 | **4 / 4** — the count is a property of the topology's shape, not the class size |
 | Grading 1 submission in its own private harness | ~12 minutes; measured, and the reason waves exist |
 | 8 private harnesses at once on 3 nodes | saturates the cluster; the failures are resource exhaustion, not marks |
 | **Class-scale deployment: 84 ASes, 2012 devices, 2927 links across 3 nodes** | **22m 38s, zero failures** |
-| Containers per node at that scale | 662 / 675 / 675 of the lab, plus what else the nodes were hosting at the time |
+| Containers per node at that scale | 731 / 731 / 550 with `pack-by-as`, 660 / 675 / 677 with `spread-by-as` |
 | Node utilisation at that scale | 22 GiB of 251, load average 13 of 56 cores |
 | Emulated latency on a cross-node link at that scale | 20.07 ms for 20 ms configured |

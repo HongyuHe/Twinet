@@ -138,10 +138,14 @@ func init() {
 				return Evidence{}, err
 			}
 			want := fmt.Sprintf("network %s area %s", s["network"], s["wrong"])
+			// What is on the device, not what the fault wanted to put there.
+			// Reporting the wanted line either way made a fault that had been
+			// undone read as though it were still present, which is the one
+			// thing verification exists to tell apart.
 			return Evidence{
 				Verified: strings.Contains(out, want),
-				Observed: want,
-				Expected: fmt.Sprintf("network %s area %s", s["network"], s["area"]),
+				Observed: ospfAreaOf(out, s["network"]),
+				Expected: want,
 			}, nil
 		},
 		Resolve: func(ctx context.Context, e *Env, t Target, s State) error {
@@ -606,4 +610,14 @@ func probeServiceHealth(ctx context.Context, e *Env, t Target, addr, port string
 		return -1
 	}
 	return n
+}
+
+// ospfAreaOf returns the network statement for a prefix as it currently stands,
+// so verification reports the area the router is in rather than the area the
+// fault meant to put it in.
+func ospfAreaOf(cfg, network string) string {
+	if l := matchingLine(cfg, "network "+network+" area "); l != "" {
+		return l
+	}
+	return network + " is not in OSPF at all"
 }

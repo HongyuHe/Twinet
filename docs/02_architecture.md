@@ -31,7 +31,7 @@ Twinet is two Go binaries and nothing else.
   state from the agents. Also embeds the optional web server and the grader.
 - **`twinetd`** — the node agent. The only long-running privileged process.
   Owns containers, network namespaces, veths, VXLAN tunnels, `tc` qdiscs, the
-  exec broker (for `twinet attach`/`exec` and student SSH), and a local probe
+  exec broker (for `twinet exec` and student SSH), and a local probe
   engine (ping/traceroute/BGP-state collection executed near the containers
   rather than centrally).
 
@@ -237,7 +237,7 @@ Twinet:
 - **Structured logging** (`log/slog`, JSON) from both binaries.
 - **Prometheus metrics** from agents: container states, link states, deploy
   durations, probe results, per-AS BGP session counts, matrix cell states.
-- **Event stream**: `twinet events` tails a merged event feed (container
+- **Event stream** *(planned, not built)*: `twinet events` would tail a merged event feed (container
   lifecycle, link up/down, BGP session flaps, student logins) — replaces
   `setup_network_logging.sh` and the "history" container.
 - **Time-series snapshots**: the matrix and looking-glass history are just

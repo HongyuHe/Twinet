@@ -3,6 +3,7 @@ package fault
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -206,5 +207,70 @@ func TestProcRunningDoesNotUsePgrepDashX(t *testing.T) {
 	}
 	if !strings.Contains(script, "grep -v grep") {
 		t.Errorf("procRunning must exclude its own grep:\n%s", script)
+	}
+}
+
+// The undo is a means; the checks are the verdict.
+//
+// Resolve used to abort the moment the undo's own commands returned non-zero,
+// which made it impossible to repeat and impossible to run on a lab somebody
+// had already put right by hand. Removing an OSPF area change deletes a network
+// statement, and if a student has already restored it the deletion fails -- so
+// the fault could never be cleared from the ledger although the lab was at
+// baseline, and every later injection was refused on account of a fault that
+// was not there.
+func TestAnUndoThatWasAlreadyDoneStillResolves(t *testing.T) {
+	const name = "test_already_undone"
+	Register(&Fault{
+		Name: name, Category: CatLink, Symptom: "something is wrong",
+		Describe: "a test fault", Needs: []Capability{CapExec},
+		Inject: func(context.Context, *Env, Target) (State, error) { return State{}, nil },
+		Verify: func(context.Context, *Env, Target, State) (Evidence, error) {
+			return Evidence{Verified: false, Observed: "already back to normal"}, nil
+		},
+		Resolve: func(context.Context, *Env, Target, State) error {
+			return errors.New("no such statement to remove")
+		},
+	})
+	defer delete(registry, name)
+
+	env := &Env{Exec: func(context.Context, string, []string) (rt.ExecResult, error) {
+		return rt.ExecResult{}, nil
+	}}
+	if err := Resolve(context.Background(), env, &Injection{Fault: name}); err != nil {
+		t.Fatalf("the fault is verifiably gone, so resolve must succeed: %v", err)
+	}
+}
+
+// The converse, which is what makes the change safe: an undo that fails and
+// leaves the fault in place is still a failure, and the undo's own error is
+// reported alongside so there is something to act on.
+func TestAFailedUndoThatLeavesTheFaultIsStillAFailure(t *testing.T) {
+	const name = "test_undo_failed"
+	Register(&Fault{
+		Name: name, Category: CatLink, Symptom: "something is wrong",
+		Describe: "a test fault", Needs: []Capability{CapExec},
+		Inject: func(context.Context, *Env, Target) (State, error) { return State{}, nil },
+		Verify: func(context.Context, *Env, Target, State) (Evidence, error) {
+			return Evidence{Verified: true, Observed: "still there"}, nil
+		},
+		Resolve: func(context.Context, *Env, Target, State) error {
+			return errors.New("the device refused the command")
+		},
+	})
+	defer delete(registry, name)
+
+	env := &Env{Exec: func(context.Context, string, []string) (rt.ExecResult, error) {
+		return rt.ExecResult{}, nil
+	}}
+	err := Resolve(context.Background(), env, &Injection{Fault: name})
+	if err == nil {
+		t.Fatal("the fault is still present, so resolve must fail")
+	}
+	if !strings.Contains(err.Error(), "still present") {
+		t.Errorf("the error should say the fault survived: %v", err)
+	}
+	if !strings.Contains(err.Error(), "refused the command") {
+		t.Errorf("the undo's own error is the likely reason and must be reported: %v", err)
 	}
 }

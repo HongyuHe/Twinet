@@ -188,7 +188,7 @@ run, instead of reporting cascading failures.
   common failure modes, which check is failing for the most students (directly
   useful for deciding what to re-teach).
 - `reports/<id>.twinetlab` — the exact grading lab, replayable with
-  `twinet grade replay <file>` for appeals.
+  the report is self-contained JSON, so an appeal is answered by reading it.
 
 ## 8. Formative use
 

@@ -32,6 +32,7 @@ failed to inject must never be presented to an agent as a puzzle.`,
 		newFaultInjectCmd(opts),
 		newFaultResolveCmd(opts),
 		newFaultStatusCmd(opts),
+		newFaultVerifyCmd(opts),
 	)
 	return cmd
 }
@@ -314,6 +315,123 @@ func newFaultResolveCmd(opts *Options) *cobra.Command {
 	cmd.Flags().BoolVar(&all, "all", false, "resolve every injected fault")
 	cmd.Flags().StringVar(&token, "token", "", "agent token for cluster labs")
 	return cmd
+}
+
+// newFaultVerifyCmd re-checks that what was injected is still in effect.
+//
+// Injection verifies once and rolls back if the fault did not take. But a lab
+// runs for hours afterwards, and faults do not always stay: an interface comes
+// back, a daemon is restarted, a container is replaced and takes the fault with
+// it, a student repairs it by accident while looking for something else. An
+// evaluation that assumes the fault is still there scores the agent's answer
+// against a network that no longer has the problem -- and the episode looks
+// entirely valid, so nothing questions the result.
+func newFaultVerifyCmd(opts *Options) *cobra.Command {
+	var token string
+	cmd := &cobra.Command{
+		Use:   "verify [fault]",
+		Short: "Check that an injected fault is still in effect",
+		Long: `Re-runs the same predicate injection used, against the lab as it is now.
+
+An injected fault does not necessarily stay injected: a container may be
+replaced, a daemon restarted, or the symptom repaired by accident. Anything
+scored against ground truth should verify first.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			top, err := loadAndPlace(opts)
+			if err != nil {
+				return err
+			}
+			env, err := faultEnv(cmd, top, token)
+			if err != nil {
+				return err
+			}
+			injections, err := loadInjections(top)
+			if err != nil {
+				return err
+			}
+			var want []*fault.Injection
+			for _, inj := range injections {
+				if len(args) == 0 || inj.Fault == args[0] {
+					want = append(want, inj)
+				}
+			}
+			if len(want) == 0 {
+				if len(args) > 0 {
+					return fmt.Errorf("%s is not injected", args[0])
+				}
+				fmt.Fprintln(cmd.OutOrStdout(), "nothing is injected")
+				return nil
+			}
+
+			type row struct {
+				Fault    string         `json:"fault"`
+				Target   string         `json:"target"`
+				Verified bool           `json:"verified"`
+				Evidence fault.Evidence `json:"evidence"`
+				Error    string         `json:"error,omitempty"`
+			}
+			var rows []row
+			gone := 0
+			for _, inj := range want {
+				r := row{Fault: inj.Fault, Target: inj.Target.DeviceID()}
+				ev, err := fault.Verify(cmd.Context(), env, inj)
+				switch {
+				case err != nil:
+					// A verification that could not run is not a fault that is
+					// present. Reporting it as present is the failure mode this
+					// command exists to catch.
+					r.Error = err.Error()
+					gone++
+				case !ev.Verified:
+					r.Evidence = ev
+					gone++
+				default:
+					r.Verified, r.Evidence = true, ev
+				}
+				rows = append(rows, r)
+			}
+			if opts.JSON {
+				enc := json.NewEncoder(cmd.OutOrStdout())
+				enc.SetIndent("", "  ")
+				if err := enc.Encode(rows); err != nil {
+					return err
+				}
+			} else {
+				w := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
+				fmt.Fprintln(w, "FAULT\tTARGET\tSTILL IN EFFECT\tOBSERVED")
+				for _, r := range rows {
+					state := "yes"
+					detail := r.Evidence.Observed
+					if !r.Verified {
+						state = "NO"
+						if r.Error != "" {
+							detail = r.Error
+						}
+					}
+					fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", r.Fault, r.Target, state, firstLineOf(detail))
+				}
+				if err := w.Flush(); err != nil {
+					return err
+				}
+			}
+			if gone > 0 {
+				return fmt.Errorf("%d of %d injected fault(s) are no longer in effect; "+
+					"anything scored against this lab's ground truth would be scored against "+
+					"a problem that is not there", gone, len(rows))
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&token, "token", "", "agent token for cluster labs")
+	return cmd
+}
+
+// firstLineOf keeps a table one row per fault.
+func firstLineOf(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return s[:i]
+	}
+	return s
 }
 
 func newFaultStatusCmd(opts *Options) *cobra.Command {

@@ -395,9 +395,21 @@ func Resolve(ctx context.Context, env *Env, inj *Injection) error {
 	if !ok {
 		return fmt.Errorf("no fault named %q", inj.Fault)
 	}
-	if err := f.Resolve(ctx, env, inj.Target, inj.State); err != nil {
-		return fmt.Errorf("resolve %s: %w", inj.Fault, err)
-	}
+	// The undo is a means, not the verdict.
+	//
+	// It used to be fatal on its own, which made resolve impossible to repeat
+	// and impossible to run on a lab somebody had already repaired by hand.
+	// Undoing an OSPF area change removes the wrong network statement, and if
+	// a student had already put it back the removal fails -- so the fault
+	// could never be cleared from the ledger even though the lab was at
+	// baseline, and every later injection was refused because of a fault that
+	// was not there.
+	//
+	// The checks below decide, and they are strictly stronger than "the
+	// commands exited zero": the fault must be verifiably absent, and the
+	// device must be as it was found. An undo that errors and reaches the
+	// right state is a success; one that exits zero and does not is a failure.
+	undoErr := f.Resolve(ctx, env, inj.Target, inj.State)
 	// A resolve that silently half-worked is the most damaging failure here,
 	// because the contamination it leaves behind is invisible: the next episode
 	// runs on a lab that is still broken, and its result is attributed to
@@ -410,17 +422,17 @@ func Resolve(ctx context.Context, env *Env, inj *Injection) error {
 	// if it cannot be reached, whatever the verifier concludes is an artefact
 	// of the failure rather than an observation of the lab.
 	if err := env.reachable(ctx, inj.Target.DeviceID()); err != nil {
-		return fmt.Errorf("resolve %s: the undo ran, but %w, so the lab must be "+
-			"treated as contaminated", inj.Fault, err)
+		return fmt.Errorf("resolve %s: %w, so the lab must be treated as contaminated%s",
+			inj.Fault, err, alsoFailed(undoErr))
 	}
 	ev, err := f.Verify(ctx, env, inj.Target, inj.State)
 	if err != nil {
-		return fmt.Errorf("resolve %s: the undo ran, but it could not be confirmed, "+
-			"so the lab must be treated as contaminated: %w", inj.Fault, err)
+		return fmt.Errorf("resolve %s: it could not be confirmed, "+
+			"so the lab must be treated as contaminated: %w%s", inj.Fault, err, alsoFailed(undoErr))
 	}
 	if ev.Verified {
-		return fmt.Errorf("resolve %s: the fault is still present afterwards: %s",
-			inj.Fault, ev.Detail)
+		return fmt.Errorf("resolve %s: the fault is still present afterwards: %s%s",
+			inj.Fault, evidenceDetail(ev), alsoFailed(undoErr))
 	}
 
 	// "The predicate is false" is not "the device is as it was". A resolve can
@@ -439,15 +451,39 @@ func Resolve(ctx context.Context, env *Env, inj *Injection) error {
 	if len(added)+len(removed) > 0 {
 		now := fingerprint(ctx, env, inj.Target.DeviceID())
 		if now == "" {
-			return fmt.Errorf("resolve %s: the undo ran, but %s could not be re-read to confirm "+
-				"it was left as it was found", inj.Fault, inj.Target.DeviceID())
+			return fmt.Errorf("resolve %s: %s could not be re-read to confirm "+
+				"it was left as it was found%s", inj.Fault, inj.Target.DeviceID(), alsoFailed(undoErr))
 		}
 		if r := residue(added, removed, now); r != "" {
-			return fmt.Errorf("resolve %s: the fault is gone but %s was not left as it was found: %s",
-				inj.Fault, inj.Target.DeviceID(), r)
+			return fmt.Errorf("resolve %s: the fault is gone but %s was not left as it was found: %s%s",
+				inj.Fault, inj.Target.DeviceID(), r, alsoFailed(undoErr))
 		}
 	}
 	return nil
+}
+
+// alsoFailed appends the undo's own error to a failure the checks found.
+//
+// The checks are the verdict, but when they fail the undo's error is usually
+// the reason, and reporting only "the fault is still present" leaves whoever
+// reads it with nothing to act on.
+func alsoFailed(err error) string {
+	if err == nil {
+		return ""
+	}
+	return fmt.Sprintf(" (the undo also reported: %v)", err)
+}
+
+// evidenceDetail prefers the detail, falling back to what was observed, so a
+// failure is never reported with an empty explanation.
+func evidenceDetail(ev Evidence) string {
+	if ev.Detail != "" {
+		return ev.Detail
+	}
+	if ev.Observed != "" {
+		return ev.Observed
+	}
+	return "no detail was recorded"
 }
 
 // State reports a device container's run state.
@@ -491,4 +527,24 @@ func firstLine(s string) string {
 		return s[:i]
 	}
 	return strings.TrimSpace(s)
+}
+
+// Verify re-checks that an injection is still doing what it claims.
+//
+// Injection verifies once and rolls back if the fault did not take, but a lab
+// runs for a long time afterwards: an interface comes back up, a daemon is
+// restarted, a student repairs the thing by accident, a container is replaced
+// and the fault goes with it. An evaluation that assumes the fault is still
+// present scores an agent's conclusion against a network that no longer has
+// the problem, which is worse than having no fault at all -- the episode looks
+// valid and its ground truth is wrong.
+//
+// This is the same predicate injection uses, so a fault cannot pass here and
+// fail there.
+func Verify(ctx context.Context, env *Env, inj *Injection) (Evidence, error) {
+	f, ok := Lookup(inj.Fault)
+	if !ok {
+		return Evidence{}, fmt.Errorf("no fault named %q", inj.Fault)
+	}
+	return f.Verify(ctx, env, inj.Target, inj.State)
 }

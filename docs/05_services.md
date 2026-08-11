@@ -43,7 +43,7 @@ student ──ssh group12@host -p 2022──▶ twinet-gateway ──▶ authz(t
 ```
 
 - **Identity**: per-group SSH keys and/or passwords minted by
-  `twinet gen roster`. Optional SSH CA so credentials can be rotated/revoked
+  `twinet gateway roster`. Optional SSH CA so credentials can be rotated/revoked
   without touching `authorized_keys` on a container.
 - **Authorization**: the gateway resolves the requested device, checks its
   `twinet.owner` label, and refuses anything else. Isolation no longer depends

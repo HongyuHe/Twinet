@@ -32,7 +32,7 @@ and replaces the machinery underneath it.
 | State | `groups/` dir + `docker_pid.map` sourced as bash (stale after reboot) | Derived from container labels + deterministic allocation; no database to corrupt |
 | Deploy | `startup.sh` → 20 scripts, two hardcoded `sleep 60`s | Dependency DAG, parallel workers, active convergence detection |
 | Scale | Single beefy server, ~1.5–2k containers | Scales out across a cluster; AS-granular placement over a VXLAN fabric |
-| Restart one device | `restart_container.sh` (1,011 lines of bash) | `twinet redeploy --node <x>`, diff-and-converge |
+| Restart one device | `restart_container.sh` (1,011 lines of bash) | `twinet deploy --only <device>`, diff-and-converge |
 | Grading | Serial, `sleep(20)`-driven, mutates the live class network, hours per class | Parallel ephemeral per-student labs, convergence-triggered, minutes per class |
 | Tests | none | Unit + integration + e2e in CI |
 
@@ -68,7 +68,7 @@ that is only written down decays. The exemption list lives in that script.
 
 1. **One binary, no runtime dependencies.** `twinet` is a static Go binary.
    Deploying Twinet on a fresh machine is: install Docker, drop two binaries,
-   `twinet up`. No pip, no venv, no OVS on the host, no sourcing bash libraries.
+   `twinet deploy`. No pip, no venv, no OVS on the host, no sourcing bash libraries.
 2. **The manifest is the truth; everything else is derived.** Addressing, VNIs,
    ports, container names, DNS zones, IXP configs, the website, and the grading
    topology are all *computed* from one validated document. Nothing is

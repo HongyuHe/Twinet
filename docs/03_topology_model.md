@@ -255,9 +255,9 @@ containerlab or Kathará. It declares, per object, whether the address/config is
 1. **The grader** knows the right answer without a second hand-maintained
    source (today `mnet_utils.py` re-derives it, and the wiki states it a third
    time).
-2. **`twinet solve`** can render a complete reference solution — replacing the
-   hand-captured `golden-configs/` snapshot with a generated, always-correct one
-   (useful for smoke-testing the platform end-to-end before students arrive).
+2. **`twinet deploy --solve`** renders a complete reference solution — replacing
+   the hand-captured `golden-configs/` snapshot with a generated, always-correct
+   one. This is what the end-to-end tests grade, and it scores 10/10.
 3. **The assignment text** can be generated from the model (addressing tables,
    the per-group "your neighbours" page), so the wiki and the platform cannot
    disagree.
@@ -283,23 +283,26 @@ containerlab or Kathará. It declares, per object, whether the address/config is
 
 ## 6. Generators
 
-`twinet gen` produces manifests, replacing
-`utils/build_configs/generate_connections.py`:
+Generation is **declarative and inside the manifest**, not a separate
+code-generation step, replacing `utils/build_configs/generate_connections.py`:
 
-```bash
-twinet gen internet \
-  --students 80 --template student-as \
-  --tiers 2,8,20 --ixps 6 --regions 6 \
-  --slow-link-per-as 1 --out twinet.yaml
+```yaml
+peerings:
+  generator:
+    kind: tiered-internet          # Tier-1 clique + provider/customer trees
+    tiers:  [[1, 2], [3, 4, 5, 6], [7, 8, 9, 10]]
+    ixps:   [140, 141]
+    slow_link: {per_as: 1, delay: 25ms}
 ```
 
-Built-in generators: `tiered-internet` (Tier-1 clique + provider/customer trees
-+ regional IXPs, matching the ETH/Princeton pedagogy), `clos`, `ring`,
-`from-csv` (roster → AS assignment). Generators emit the *same* manifest schema,
-so generated labs remain hand-editable — no separate "compiled" format.
+Scaling the class is editing `tiers`. There is no generated artefact to keep in
+step with the manifest, and no "compiled" format: the manifest *is* the source,
+and `twinet validate` checks it whole.
 
-Also: `twinet gen roster --csv students.csv` assigns groups to ASNs, mints SSH
-credentials, and emits both the access config and a per-group hand-out.
+Credentials work the same way. `twinet gateway roster init` assigns groups to
+ASNs and mints one credential per student AS from the manifest, writing both the
+roster and the per-group hand-out; `twinet gateway roster list` shows who is
+enrolled, and `twinet gateway roster add-key` authorises a student's own key.
 
 ## 7. Behaviours and faults (scripted misconfiguration)
 
@@ -318,8 +321,11 @@ behaviours:
     via: [ixp]
 ```
 
-`twinet behaviour apply|revert hijacker` is idempotent and auditable, and the
-grader can assert the hijack was actually live during a check.
+A declared behaviour would be applied and reverted idempotently, and the grader
+could assert the hijack was live during a check. **This is not built**: the
+RPKI machinery and the checks exist, the scripted scenarios do not — see
+[09](09_status.md). What *is* built is the general mechanism it generalises
+into, below.
 
 **This generalises into fault injection.** A behaviour is a fault whose purpose
 happens to be pedagogical; the same declaration, lifecycle
@@ -338,7 +344,7 @@ itself.
 
 ## 8. Compatibility with existing course material
 
-- `twinet import mini-internet --dir /path/to/platform/config` reads the eight
+- *(Planned, see [07](07_roadmap.md))* `twinet import mini-internet --dir /path/to/platform/config` would read the eight
   legacy `.txt` files plus `subnet_config.sh` and emits an equivalent Twinet
   manifest. This lets us diff old vs. new behaviour and migrate the ETH advanced
   course exercises mechanically.
