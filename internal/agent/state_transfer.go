@@ -145,7 +145,6 @@ func (s *Server) handleStateImport(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, StateImportResponse{Stored: stored})
 }
 
-
 // captureBeforeExport snapshots any of the named devices this node is still
 // running, so that what is handed over is current rather than historical.
 //

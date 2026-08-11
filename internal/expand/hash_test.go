@@ -161,3 +161,136 @@ func loadFixture(t *testing.T) *model.Topology {
 	}
 	return res.Topology
 }
+
+// Two links must never share a tunnel number or a MAC.
+//
+// A link's identity is derived from the two interface names it joins, and it
+// used to be computed when the link was created -- before those names were made
+// unique. Two parallel links between the same pair of devices therefore started
+// with the same name on each side, took the same identity, and kept it after
+// the names were separated.
+//
+// Everything downstream comes from that identity. Two links sharing a tunnel
+// number become one broadcast domain: a router sees its neighbour's traffic on
+// the wrong interface, and the second link's addresses land on a segment that
+// already has them. Nothing reports it. The lab behaves as though a cable were
+// in the wrong socket, which is a very expensive thing for a student to debug
+// when the answer is that the platform is lying to them.
+func TestNoTwoLinksShareAnIdentity(t *testing.T) {
+	for _, dir := range []string{
+		"../../examples/cos461", "../../examples/advnet",
+		"../../examples/demo", "../../examples/scale",
+	} {
+		l, err := manifest.Load(dir)
+		if err != nil {
+			t.Fatalf("load %s: %v", dir, err)
+		}
+		res, err := Expand(l.Lab)
+		if err != nil {
+			t.Fatalf("expand %s: %v", dir, err)
+		}
+		top := res.Topology
+
+		byID := map[string]string{}
+		byVNI := map[uint32]string{}
+		for _, lk := range top.Links {
+			if other, dup := byID[lk.ID]; dup {
+				t.Errorf("%s: %s and %s have the same identity %q",
+					dir, other, lk.ID, lk.ID)
+			}
+			byID[lk.ID] = lk.ID
+			if lk.VNI == 0 {
+				continue
+			}
+			if other, dup := byVNI[lk.VNI]; dup {
+				t.Errorf("%s: %s and %s are both carried in tunnel %d, so they are one "+
+					"broadcast domain and each sees the other's traffic",
+					dir, other, lk.ID, lk.VNI)
+			}
+			byVNI[lk.VNI] = lk.ID
+		}
+
+		// A MAC must be unique within a device; two interfaces on one router
+		// answering to the same address is a neighbour cache that resolves to
+		// whichever replied last.
+		for _, d := range top.SortedDevices() {
+			seen := map[string]string{}
+			for _, i := range d.Ifaces {
+				if i.MAC == "" {
+					continue
+				}
+				if other, dup := seen[i.MAC]; dup {
+					t.Errorf("%s: %s has %s and %s both at %s",
+						dir, d.ID, other, i.Name, i.MAC)
+				}
+				seen[i.MAC] = i.Name
+			}
+		}
+	}
+}
+
+// The examples have no parallel links, so the check above cannot see this bug.
+// This builds the case that triggers it: two links between the same pair of
+// routers, which start with the same interface name on each side.
+func TestParallelLinksGetSeparateIdentities(t *testing.T) {
+	l, err := manifest.Load("../../examples/cos461")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lab := l.Lab
+
+	res, err := Expand(lab)
+	if err != nil {
+		t.Fatal(err)
+	}
+	top := res.Topology
+
+	// Find two routers in one AS and give them a second link, named exactly as
+	// the first would be.
+	var a, b *model.Device
+	byAS := map[int][]*model.Device{}
+	for _, d := range top.SortedDevices() {
+		if d.Kind == model.KindRouter {
+			byAS[d.ASN] = append(byAS[d.ASN], d)
+		}
+	}
+	for _, asn := range top.SortedASNs() {
+		if rs := byAS[asn]; len(rs) >= 2 {
+			a, b = rs[0], rs[1]
+			break
+		}
+	}
+	if a == nil || b == nil {
+		t.Skip("no two routers in one AS")
+	}
+
+	e := &expander{lab: lab, top: top}
+	mk := func() *model.Link {
+		ai := &model.Iface{Device: a, Name: "port_dup", Role: model.RoleIntraAS}
+		bi := &model.Iface{Device: b, Name: "port_dup", Role: model.RoleIntraAS}
+		a.AddIface(ai)
+		b.AddIface(bi)
+		return e.link(ai, bi, model.LinkVeth, model.LinkProps{}, "", model.OwnerPlatform)
+	}
+	l1, l2 := mk(), mk()
+
+	if l1.ID == l2.ID {
+		t.Logf("before uniquification both links are %q, as expected", l1.ID)
+	}
+	e.uniquifyIfaceNames()
+	e.assignVNIs()
+
+	if l1.ID == l2.ID {
+		t.Fatalf("two parallel links still share the identity %q after uniquification; "+
+			"everything derived from it -- the tunnel number, the ownership tag, the "+
+			"addressing -- collides too", l1.ID)
+	}
+	if l1.VNI == l2.VNI {
+		t.Errorf("two parallel links are both carried in tunnel %d, so they are one "+
+			"broadcast domain and each router sees the other link's traffic", l1.VNI)
+	}
+	if l1.A.MAC == l2.A.MAC {
+		t.Errorf("both of %s's interfaces answer to %s, so its neighbour cache resolves "+
+			"to whichever replied last", a.ID, l1.A.MAC)
+	}
+}

@@ -9,6 +9,8 @@ import (
 
 	"github.com/HongyuHe/twinet/internal/ipam"
 	"github.com/HongyuHe/twinet/internal/model"
+
+	"github.com/HongyuHe/twinet/internal/alloc"
 )
 
 // ifaceNameMax is IFNAMSIZ-1: the kernel's limit on an interface name.
@@ -223,6 +225,38 @@ func (e *expander) uniquifyIfaceNames() {
 				i.Name = base + suffix
 			}
 		}
+	}
+	e.reidentifyLinks()
+}
+
+// reidentifyLinks recomputes every link's identity from the interface names it
+// ended up with.
+//
+// A link's identity is built from the two names it joins, and it was built
+// when the link was created -- before the names were made unique. Two parallel
+// links between the same pair of devices therefore started life with the same
+// name on each side, took the same identity, and kept it after the names were
+// separated. Everything downstream is derived from that identity: the tunnel
+// number a cross-node link is carried in, the ownership tag, and the address
+// each end gets.
+//
+// Two links sharing a tunnel number is not a cosmetic clash. The two links
+// become one broadcast domain, so a router sees its neighbour's traffic on the
+// wrong interface, and the second link's addresses land on a segment that
+// already has them. Nothing reports it; the lab simply behaves as though a
+// cable had been plugged into the wrong socket.
+//
+// Recomputing here rather than deferring identity until after uniquification
+// keeps the identity in one place: it is always "the two names this link
+// joins", and this is the point at which those names stop changing.
+func (e *expander) reidentifyLinks() {
+	for _, l := range e.top.Links {
+		if l.A == nil || l.B == nil || l.A.Device == nil || l.B.Device == nil {
+			continue
+		}
+		l.ID = model.MakeLinkID(l.A.Device.ID, l.A.Name, l.B.Device.ID, l.B.Name)
+		l.A.MAC = alloc.MAC(e.lab.Metadata.Name, l.A.Device.ID, l.A.Name)
+		l.B.MAC = alloc.MAC(e.lab.Metadata.Name, l.B.Device.ID, l.B.Name)
 	}
 }
 
