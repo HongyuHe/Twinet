@@ -3,6 +3,7 @@ package fault
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -55,46 +56,52 @@ func init() {
 			// exactly; a benchmark whose fault differs run to run is not one.
 			down := t.Param("down_seconds", "5")
 			up := t.Param("up_seconds", "10")
-			// One pidfile per interface, not per device. A device with two
-			// flapping links would otherwise overwrite the first record with
-			// the second, and resolving would leave the first loop running
-			// forever: an unattributable fault, on a lab everyone believes is
-			// clean, that no later episode can explain.
-			pidfile := "/run/twinet_flap_" + safeFileName(iface) + ".pid"
-			if out, code := e.Try(ctx, t.DeviceID(),
-				fmt.Sprintf("test -f %s && kill -0 $(cat %s) 2>/dev/null && echo running", pidfile, pidfile)); code == 0 &&
-				strings.Contains(out, "running") {
-				return nil, fmt.Errorf("%s is already being flapped; resolve that first", iface)
-			}
 			script := fmt.Sprintf(
 				"while true; do ip link set %s down; sleep %s; ip link set %s up; sleep %s; done",
 				iface, down, iface, up)
-			if _, err := e.Sh(ctx, t.DeviceID(),
-				fmt.Sprintf("nohup sh -c %q >/dev/null 2>&1 & echo $! > %s", script, pidfile)); err != nil {
+			// A second loop on the same interface would fight the first, and
+			// resolving would stop only the one that was recorded: the link
+			// keeps flapping on a lab everyone believes is clean, and no later
+			// episode can explain it. The running loop is found by its command
+			// line, which is a property of the fault itself rather than a
+			// marker left behind for the purpose.
+			if out, code := e.Try(ctx, t.DeviceID(), procRunning(
+				fmt.Sprintf("ip link set %s down", iface))); code == 0 && strings.Contains(out, "running") {
+				return nil, fmt.Errorf("%s is already being flapped; resolve that first", iface)
+			}
+			out, err := e.Sh(ctx, t.DeviceID(),
+				fmt.Sprintf("nohup sh -c %q >/dev/null 2>&1 & echo $!", script))
+			if err != nil {
 				return nil, err
 			}
-			return State{"iface": iface, "pidfile": pidfile}, nil
+			pid := strings.TrimSpace(out)
+			if pid == "" {
+				return nil, fmt.Errorf("the flap loop did not report a process id, so it could not be tracked")
+			}
+			return State{"iface": iface, "pids": pid}, nil
 		},
 		Verify: func(ctx context.Context, e *Env, t Target, s State) (Evidence, error) {
-			pidfile := s["pidfile"]
-			if pidfile == "" {
+			if s["pids"] == "" {
 				return Evidence{}, fmt.Errorf("no flap loop was recorded for this fault")
 			}
-			out, _, err := e.TryE(ctx, t.DeviceID(), fmt.Sprintf(
-				"test -f %s && kill -0 $(cat %s) 2>/dev/null && echo running || echo stopped", pidfile, pidfile))
+			alive, err := countAlive(ctx, e, t, s["pids"])
 			if err != nil {
 				return Evidence{}, err
 			}
-			return Evidence{Verified: strings.Contains(out, "running"),
-				Expected: "the flap loop running", Observed: strings.TrimSpace(out)}, nil
+			return Evidence{Verified: alive > 0,
+				Expected: "the flap loop running",
+				Observed: fmt.Sprintf("%d flap loop(s) running", alive)}, nil
 		},
 		Resolve: func(ctx context.Context, e *Env, t Target, s State) error {
-			if s["pidfile"] == "" || s["iface"] == "" {
+			if s["pids"] == "" || s["iface"] == "" {
 				return fmt.Errorf("no flap loop was recorded, so it cannot be stopped")
 			}
-			_, err := e.Sh(ctx, t.DeviceID(), fmt.Sprintf(
-				"if [ -f %s ]; then kill $(cat %s) 2>/dev/null; rm -f %s; fi; ip link set %s up 2>/dev/null || true",
-				s["pidfile"], s["pidfile"], s["pidfile"], s["iface"]))
+			if err := killPIDs(ctx, e, t, s["pids"]); err != nil {
+				return err
+			}
+			// The loop may have been killed mid-cycle, with the link down.
+			_, err := e.Sh(ctx, t.DeviceID(),
+				fmt.Sprintf("ip link set %s up 2>/dev/null || true", s["iface"]))
 			return err
 		},
 	})
@@ -372,13 +379,17 @@ func init() {
 				fmt.Sprintf("no router bgp %s", s["wrong"]), "end"); err != nil {
 				return err
 			}
+			// mktemp rather than a fixed name: a resolve that fails partway
+			// would otherwise leave a file naming the framework behind on a
+			// device an agent is about to be asked to diagnose.
 			_, err := e.Sh(ctx, t.DeviceID(), strings.Join([]string{
 				"set -e",
+				"f=$(mktemp)",
+				"trap 'rm -f \"$f\"' EXIT",
 				// Extract just "router bgp <n>" and its indented body.
-				fmt.Sprintf("awk '/^router bgp %s$/{f=1} f{print} f&&/^exit$/{f=0}' /etc/frr/frr.conf > /tmp/twinet_bgp.conf", s["asn"]),
-				"test -s /tmp/twinet_bgp.conf",
-				"vtysh -f /tmp/twinet_bgp.conf",
-				"rm -f /tmp/twinet_bgp.conf",
+				fmt.Sprintf("awk '/^router bgp %s$/{f=1} f{print} f&&/^exit$/{f=0}' /etc/frr/frr.conf > \"$f\"", s["asn"]),
+				"test -s \"$f\"",
+				"vtysh -f \"$f\"",
 			}, "\n"))
 			if err != nil {
 				return fmt.Errorf("replaying the router's own BGP configuration: %w", err)
@@ -751,4 +762,41 @@ func ebgpPeer(e *Env, t Target) (addr string, asn int, err error) {
 		return strings.SplitN(i.Peer.Addr4, "/", 2)[0], i.Peer.Device.ASN, nil
 	}
 	return "", 0, fmt.Errorf("device %s has no external BGP neighbour", d.ID)
+}
+
+// killPIDs stops processes the injector started, by process id.
+//
+// Process ids are recorded in the injection record the controller keeps, not in
+// a file inside the container. A file called /run/twinet_flap_eth0.pid names the
+// framework, the fault and the interface, so anything with a shell on the
+// device can read the answer off the disk. For a lab that exists to measure how
+// well an agent diagnoses faults, leaving the solution lying in the filesystem
+// does not just weaken the measurement, it invalidates it.
+func killPIDs(ctx context.Context, e *Env, t Target, pids string) error {
+	list := strings.Fields(pids)
+	if len(list) == 0 {
+		return fmt.Errorf("no process was recorded, so none can be stopped")
+	}
+	_, err := e.Sh(ctx, t.DeviceID(),
+		fmt.Sprintf("for p in %s; do kill $p 2>/dev/null; done; true", strings.Join(list, " ")))
+	return err
+}
+
+// countAlive reports how many of the recorded processes are still running.
+func countAlive(ctx context.Context, e *Env, t Target, pids string) (int, error) {
+	list := strings.Fields(pids)
+	if len(list) == 0 {
+		return 0, nil
+	}
+	out, _, err := e.TryE(ctx, t.DeviceID(), fmt.Sprintf(
+		"n=0; for p in %s; do kill -0 $p 2>/dev/null && n=$((n+1)); done; echo $n",
+		strings.Join(list, " ")))
+	if err != nil {
+		return 0, err
+	}
+	n, convErr := strconv.Atoi(strings.TrimSpace(out))
+	if convErr != nil {
+		return 0, fmt.Errorf("could not read how many processes are alive from %q", strings.TrimSpace(out))
+	}
+	return n, nil
 }

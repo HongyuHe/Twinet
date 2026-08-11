@@ -25,6 +25,17 @@ import (
 // It returns nil, nil when the device is not running or has nothing to capture,
 // because a missing snapshot must never be mistaken for an empty one: writing
 // "empty" over a good snapshot would destroy exactly what this protects.
+// switchCapture records each port's VLAN assignment in a directly replayable
+// form. ovs-vsctl prints lists as "[10, 20]"; the space is stripped along with
+// the brackets, because a trunk written as "trunks=10, 20" is split by the
+// shell and silently loses every VLAN after the first.
+const switchCapture = `for p in $(ovs-vsctl list-ports br0 2>/dev/null); do
+  tag=$(ovs-vsctl get port "$p" tag 2>/dev/null | tr -d '[] ')
+  trunks=$(ovs-vsctl get port "$p" trunks 2>/dev/null | tr -d '[] ')
+  mode=$(ovs-vsctl get port "$p" vlan_mode 2>/dev/null | tr -d '"')
+  echo "port $p tag=${tag} trunks=${trunks} mode=${mode}"
+done`
+
 func Capture(ctx context.Context, r rt.Runtime, d *model.Device, lab, topoHash string) ([]state.Snapshot, error) {
 	c, err := r.Inspect(ctx, d.Container)
 	if err != nil {
@@ -76,13 +87,7 @@ func Capture(ctx context.Context, r rt.Runtime, d *model.Device, lab, topoHash s
 	case model.KindSwitch:
 		// ovs-vsctl show is human-oriented; the port/VLAN facts are what a
 		// restore needs, so they are captured in a directly replayable form.
-		script := `for p in $(ovs-vsctl list-ports br0 2>/dev/null); do
-  tag=$(ovs-vsctl get port "$p" tag 2>/dev/null | tr -d '[]')
-  trunks=$(ovs-vsctl get port "$p" trunks 2>/dev/null | tr -d '[]')
-  mode=$(ovs-vsctl get port "$p" vlan_mode 2>/dev/null | tr -d '"')
-  echo "port $p tag=${tag} trunks=${trunks} mode=${mode}"
-done`
-		if res, err := r.Exec(ctx, d.Container, rt.ExecCmd{Cmd: []string{"sh", "-c", script}}); err == nil && res.ExitCode == 0 {
+		if res, err := r.Exec(ctx, d.Container, rt.ExecCmd{Cmd: []string{"sh", "-c", switchCapture}}); err == nil && res.ExitCode == 0 {
 			add(state.KindOVS, res.Stdout)
 		}
 	}
@@ -152,6 +157,37 @@ func Restore(ctx context.Context, r rt.Runtime, d *model.Device, lab string, sto
 	}
 	restored := false
 
+	// A replay that quietly does nothing is worse than one that refuses: the
+	// device comes back believable but wrong, and the student is left debugging
+	// a topology that no longer matches what they configured. Every command is
+	// therefore allowed to fail, and any failure is reported rather than logged.
+	replay := func(kind state.Kind, build func(string) []string) error {
+		snap, err := store.Current(lab, d.ID, kind)
+		if err != nil || len(snap.Content) == 0 {
+			return nil
+		}
+		cmds := build(string(snap.Content))
+		if len(cmds) == 0 {
+			return nil
+		}
+		var failed []string
+		for _, cmd := range cmds {
+			res, err := r.Exec(ctx, d.Container, rt.ExecCmd{Cmd: []string{"sh", "-c", cmd}})
+			switch {
+			case err != nil:
+				failed = append(failed, fmt.Sprintf("%s: %v", cmd, err))
+			case res.ExitCode != 0:
+				failed = append(failed, fmt.Sprintf("%s: %s", cmd, firstLine(res.Stderr)))
+			}
+		}
+		if len(failed) > 0 {
+			return fmt.Errorf("restore %s %s: %d of %d commands failed: %s",
+				d.ID, kind, len(failed), len(cmds), strings.Join(failed, "; "))
+		}
+		restored = true
+		return nil
+	}
+
 	switch d.Kind {
 	case model.KindRouter:
 		if snap, err := store.Current(lab, d.ID, state.KindFRR); err == nil && len(snap.Content) > 0 {
@@ -178,33 +214,21 @@ func Restore(ctx context.Context, r rt.Runtime, d *model.Device, lab string, sto
 			}
 			restored = true
 		}
-		if snap, err := store.Current(lab, d.ID, state.KindTunnels); err == nil && len(snap.Content) > 0 {
-			for _, cmd := range tunnelReplay(string(snap.Content)) {
-				_, _ = r.Exec(ctx, d.Container, rt.ExecCmd{Cmd: []string{"sh", "-c", cmd}})
-			}
-			restored = true
+		if err := replay(state.KindTunnels, tunnelReplay); err != nil {
+			return restored, err
 		}
-		if snap, err := store.Current(lab, d.ID, state.KindAddrs); err == nil && len(snap.Content) > 0 {
-			for _, cmd := range addrReplay(string(snap.Content)) {
-				_, _ = r.Exec(ctx, d.Container, rt.ExecCmd{Cmd: []string{"sh", "-c", cmd}})
-			}
-			restored = true
+		if err := replay(state.KindAddrs, addrReplay); err != nil {
+			return restored, err
 		}
 
 	case model.KindHost:
-		if snap, err := store.Current(lab, d.ID, state.KindAddrs); err == nil && len(snap.Content) > 0 {
-			for _, cmd := range addrReplay(string(snap.Content)) {
-				_, _ = r.Exec(ctx, d.Container, rt.ExecCmd{Cmd: []string{"sh", "-c", cmd}})
-			}
-			restored = true
+		if err := replay(state.KindAddrs, addrReplay); err != nil {
+			return restored, err
 		}
 
 	case model.KindSwitch:
-		if snap, err := store.Current(lab, d.ID, state.KindOVS); err == nil && len(snap.Content) > 0 {
-			for _, cmd := range ovsReplay(string(snap.Content)) {
-				_, _ = r.Exec(ctx, d.Container, rt.ExecCmd{Cmd: []string{"sh", "-c", cmd}})
-			}
-			restored = true
+		if err := replay(state.KindOVS, ovsReplay); err != nil {
+			return restored, err
 		}
 	}
 	return restored, nil
@@ -245,7 +269,7 @@ func addrReplay(body string) []string {
 				if fields[i] == "inet6" {
 					flag = "-6 "
 				}
-				out = append(out, fmt.Sprintf("ip %saddr replace %s dev %s 2>/dev/null || true", flag, addr, iface))
+				out = append(out, fmt.Sprintf("ip %saddr replace %s dev %s", flag, addr, iface))
 			}
 		case 1, 2: // routes
 			if strings.HasPrefix(line, "default") || strings.Contains(line, " via ") {
@@ -253,7 +277,7 @@ func addrReplay(body string) []string {
 				if section == 2 {
 					flag = "-6 "
 				}
-				out = append(out, fmt.Sprintf("ip %sroute replace %s 2>/dev/null || true", flag, line))
+				out = append(out, fmt.Sprintf("ip %sroute replace %s", flag, line))
 			}
 		}
 	}
@@ -280,7 +304,7 @@ func tunnelReplay(body string) []string {
 		out = append(out,
 			fmt.Sprintf("ip link show %s >/dev/null 2>&1 || ip tunnel add %s mode sit remote %s local %s ttl 64",
 				name, name, remote, local),
-			fmt.Sprintf("ip link set %s up 2>/dev/null || true", name))
+			fmt.Sprintf("ip link set %s up", name))
 	}
 	return out
 }
@@ -306,13 +330,13 @@ func ovsReplay(body string) []string {
 			}
 		}
 		if tag != "" && tag != "[]" {
-			out = append(out, fmt.Sprintf("ovs-vsctl set port %s tag=%s 2>/dev/null || true", port, tag))
+			out = append(out, fmt.Sprintf("ovs-vsctl set port %s tag=%s", port, tag))
 		}
 		if trunks != "" {
-			out = append(out, fmt.Sprintf("ovs-vsctl set port %s trunks=%s 2>/dev/null || true", port, trunks))
+			out = append(out, fmt.Sprintf("ovs-vsctl set port %s trunks=%s", port, trunks))
 		}
 		if mode != "" {
-			out = append(out, fmt.Sprintf("ovs-vsctl set port %s vlan_mode=%s 2>/dev/null || true", port, mode))
+			out = append(out, fmt.Sprintf("ovs-vsctl set port %s vlan_mode=%s", port, mode))
 		}
 	}
 	return out

@@ -252,34 +252,36 @@ func init() {
 			script := fmt.Sprintf(
 				"nohup sh -c 'while true; do for i in 1 2 3 4 5 6 7 8; do "+
 					"(echo | timeout 1 nc %s %s >/dev/null 2>&1 &) ; done; sleep 0.2; done' "+
-					">/dev/null 2>&1 & echo $! > /run/twinet_dos.pid", victim, port)
-			if _, err := e.Sh(ctx, t.DeviceID(), script); err != nil {
+					">/dev/null 2>&1 & echo $!", victim, port)
+			out, err := e.Sh(ctx, t.DeviceID(), script)
+			if err != nil {
 				return nil, err
 			}
-			return State{"pidfile": "/run/twinet_dos.pid", "victim": victim, "port": port}, nil
+			pid := strings.TrimSpace(out)
+			if pid == "" {
+				return nil, fmt.Errorf("the flood did not report a process id, so it could not be tracked")
+			}
+			return State{"pids": pid, "victim": victim, "port": port}, nil
 		},
 		Verify: func(ctx context.Context, e *Env, t Target, s State) (Evidence, error) {
-			out, _, err := e.TryE(ctx, t.DeviceID(), fmt.Sprintf(
-				"test -f %s && kill -0 $(cat %s) 2>/dev/null && echo running || echo stopped",
-				s["pidfile"], s["pidfile"]))
+			alive, err := countAlive(ctx, e, t, s["pids"])
 			if err != nil {
 				return Evidence{}, err
 			}
 			return Evidence{
-				Verified: strings.Contains(out, "running"),
-				Observed: strings.TrimSpace(out),
+				Verified: alive > 0,
+				Observed: fmt.Sprintf("%d flooding process(es)", alive),
 				Expected: "a flood aimed at " + s["victim"],
 			}, nil
 		},
 		Resolve: func(ctx context.Context, e *Env, t Target, s State) error {
-			if s["pidfile"] == "" {
+			if s["pids"] == "" {
 				return fmt.Errorf("no flood was recorded, so it cannot be stopped")
 			}
-			_, err := e.Sh(ctx, t.DeviceID(), strings.Join([]string{
-				fmt.Sprintf("if [ -f %s ]; then kill $(cat %s) 2>/dev/null; rm -f %s; fi",
-					s["pidfile"], s["pidfile"], s["pidfile"]),
-				killMatching("timeout 1 nc"),
-			}, "\n"))
+			if err := killPIDs(ctx, e, t, s["pids"]); err != nil {
+				return err
+			}
+			_, err := e.Sh(ctx, t.DeviceID(), killMatching("timeout 1 nc"))
 			return err
 		},
 	})
@@ -402,39 +404,35 @@ func burnCPU(ctx context.Context, e *Env, t Target) (State, error) {
 	n := t.Param("workers", "4")
 	script := fmt.Sprintf(
 		"i=0; while [ $i -lt %s ]; do nohup sh -c 'while :; do :; done' >/dev/null 2>&1 & "+
-			"echo $! >> /run/twinet_burn.pid; i=$((i+1)); done", n)
-	if _, err := e.Sh(ctx, t.DeviceID(), "rm -f /run/twinet_burn.pid"); err != nil {
+			"echo $!; i=$((i+1)); done", n)
+	out, err := e.Sh(ctx, t.DeviceID(), script)
+	if err != nil {
 		return nil, err
 	}
-	if _, err := e.Sh(ctx, t.DeviceID(), script); err != nil {
-		return nil, err
+	pids := strings.Join(strings.Fields(out), " ")
+	if pids == "" {
+		return nil, fmt.Errorf("no worker reported a process id, so they could not be tracked")
 	}
-	return State{"pidfile": "/run/twinet_burn.pid", "workers": n}, nil
+	return State{"pids": pids, "workers": n}, nil
 }
 
 func verifyBurn(ctx context.Context, e *Env, t Target, s State) (Evidence, error) {
-	out, _, err := e.TryE(ctx, t.DeviceID(), fmt.Sprintf(
-		"n=0; if [ -f %s ]; then for p in $(cat %s); do kill -0 $p 2>/dev/null && n=$((n+1)); done; fi; echo $n",
-		s["pidfile"], s["pidfile"]))
+	alive, err := countAlive(ctx, e, t, s["pids"])
 	if err != nil {
 		return Evidence{}, err
 	}
-	alive := strings.TrimSpace(out)
 	return Evidence{
-		Verified: alive != "" && alive != "0",
-		Observed: alive + " worker(s) consuming processor time",
+		Verified: alive > 0,
+		Observed: fmt.Sprintf("%d worker(s) consuming processor time", alive),
 		Expected: s["workers"] + " workers",
 	}, nil
 }
 
 func resolveBurn(ctx context.Context, e *Env, t Target, s State) error {
-	if s["pidfile"] == "" {
+	if s["pids"] == "" {
 		return fmt.Errorf("no workers were recorded, so they cannot be stopped")
 	}
-	_, err := e.Sh(ctx, t.DeviceID(), fmt.Sprintf(
-		"if [ -f %s ]; then for p in $(cat %s); do kill $p 2>/dev/null; done; rm -f %s; fi",
-		s["pidfile"], s["pidfile"], s["pidfile"]))
-	return err
+	return killPIDs(ctx, e, t, s["pids"])
 }
 
 // ospfNetworkArea returns one network statement the router has, and its area.

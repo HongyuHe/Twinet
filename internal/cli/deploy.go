@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -21,6 +22,7 @@ import (
 	"github.com/HongyuHe/twinet/internal/plan"
 	"github.com/HongyuHe/twinet/internal/render"
 	"github.com/HongyuHe/twinet/internal/runtime"
+	"github.com/HongyuHe/twinet/internal/state"
 )
 
 func newDeployCmd(opts *Options) *cobra.Command {
@@ -82,9 +84,19 @@ after a partial failure, a reboot, or a topology edit.`,
 				mode = render.ModeSolve
 			}
 			node := localNode(top)
+			// Without a state store the engine's preservation path is dead
+			// code: a container replaced by a redeploy comes back with the
+			// image's configuration and the student's work is gone. The local
+			// path used to run exactly that way, so the guarantee documented
+			// for the cluster silently did not hold for a single node.
+			store, err := localStore(top)
+			if err != nil {
+				return err
+			}
 			eng := &deploy.Engine{
 				Runtime:       rt,
 				Node:          node,
+				State:         store,
 				PullPolicy:    runtime.PullPolicy(pull),
 				Renderer:      render.New(top, mode),
 				Authoritative: mode == render.ModeSolve,
@@ -227,7 +239,19 @@ if the manifest that created it is no longer available.`,
 				return nil
 			}
 
-			eng := &deploy.Engine{Runtime: rt, Node: "local"}
+			store, err := localStore(top)
+			if err != nil {
+				return err
+			}
+			eng := &deploy.Engine{Runtime: rt, Node: "local", State: store}
+			// Capture before removing. A destroy that discards a student's
+			// configuration without recording it is unrecoverable, and the
+			// person running it is usually not the person who loses the work.
+			if n, err := eng.CaptureAll(cmd.Context(), top, store); err != nil {
+				return fmt.Errorf("refusing to destroy %s: its configuration could not be captured first: %w", name, err)
+			} else if n > 0 {
+				fmt.Fprintf(cmd.OutOrStdout(), "captured %d configuration snapshots before destroy\n", n)
+			}
 			if err := eng.Destroy(cmd.Context(), name); err != nil {
 				return err
 			}
@@ -598,3 +622,15 @@ func (p *progress) done() {
 
 var _ = sort.Strings
 var _ = context.Background
+
+// localStore opens the snapshot store a single-node lab keeps beside its
+// manifest, so that the same preservation guarantees hold whether a lab runs on
+// one machine or a cluster.
+func localStore(top *model.Topology) (*state.Store, error) {
+	dir := filepath.Join(top.Lab.Dir, ".twinet", "state")
+	st, err := state.Open(dir)
+	if err != nil {
+		return nil, fmt.Errorf("open state store %s: %w", dir, err)
+	}
+	return st, nil
+}
