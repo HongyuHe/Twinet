@@ -26,11 +26,22 @@ import (
 //
 // The insight that makes it cheap is that a harness and the class lab differ in
 // exactly one way: in a harness every autonomous system except one is the
-// reference solution. Two submissions therefore cannot affect each other's
-// marks as long as they are not neighbours -- and in a course topology most
-// pairs are not. So the class lab is deployed once with every AS solved, and
-// submissions are loaded in waves of mutually non-adjacent autonomous systems.
-// Everything a submission can see is either its own work or the reference.
+// reference solution. So the class lab is deployed once with every AS solved,
+// and submissions are loaded in waves of systems that cannot reach each other's
+// announcements.
+//
+// "Cannot reach" is the part that has to be got right, and the first version of
+// it was wrong. It required only that two submissions not be neighbours, on the
+// reasoning that everything else they could see was the reference. But two
+// students hanging off the same reference transit do affect each other: AS1
+// runs ordinary BGP and re-advertises what its customers send it, so AS3's bad
+// announcement lands in AS5's table and changes the paths AS5 is marked on.
+// Submissions now conflict at distance two as well.
+//
+// That is sound against propagation through one reference system and not
+// against three hops through two. `twinet grade batch` gives each submission
+// its own lab and has no such caveat; this command trades that for the ability
+// to grade a class in minutes rather than hours.
 //
 // The number of waves is the chromatic number of the peering graph, which for a
 // tiered internet is small and does not grow with the class: adding students
@@ -229,6 +240,34 @@ func independentWaves(top *model.Topology, subs []submission) [][]submission {
 	// that never comes up, and that is a mark the student loses for someone
 	// else's work. Those stay adjacent.
 
+	// Two submissions also conflict when they share a neighbour, not only when
+	// they are neighbours.
+	//
+	// The original rule was direct adjacency, on the reasoning that everything
+	// a submission can see is either its own work or the reference. That is
+	// false as soon as two students hang off the same reference transit. AS3
+	// and AS5 are not adjacent, but both attach to AS1, AS2 and the exchange;
+	// AS1 runs ordinary BGP and re-advertises what its customers send it, so a
+	// bad announcement from AS3 arrives in AS5's table and changes the paths
+	// AS5 is marked on. A correct student loses marks for another student's
+	// mistake, and the report gives no hint of it.
+	//
+	// Conflicting at distance two closes that. It is not a proof of isolation
+	// -- influence can travel three hops through two reference systems, and the
+	// only construction that rules that out completely is one submission per
+	// lab, which is `twinet grade batch`. It is the difference between a rule
+	// that is sound against the failure that was demonstrated and one that was
+	// merely never tested. `grade class` documents the trade; `grade batch` is
+	// there for a run where the marks are final and the cost is worth paying.
+	share := func(a, b int) bool {
+		for n := range adj[a] {
+			if adj[b][n] {
+				return true
+			}
+		}
+		return false
+	}
+
 	// Most-constrained first, which keeps the number of waves down.
 	order := append([]submission(nil), subs...)
 	sort.Slice(order, func(i, j int) bool {
@@ -248,7 +287,7 @@ func independentWaves(top *model.Topology, subs []submission) [][]submission {
 		for w := range waves {
 			conflict := false
 			for _, other := range waves[w] {
-				if adj[s.AS][other.AS] || s.AS == other.AS {
+				if adj[s.AS][other.AS] || s.AS == other.AS || share(s.AS, other.AS) {
 					conflict = true
 					break
 				}

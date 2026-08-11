@@ -52,11 +52,29 @@ func itoa(n int) string {
 	return string(b)
 }
 
-// The whole argument for grading in waves is that the number of waves is a
-// property of the topology's shape rather than of the class size: adding
-// students adds autonomous systems, not adjacency. If waves grew with the
-// class, this would be no better than grading one submission at a time.
-func TestWavesDoNotGrowWithTheClass(t *testing.T) {
+// Waves must stay far cheaper than grading one submission at a time.
+//
+// The original claim was stronger -- that the wave count is a property of the
+// topology's shape and not of the class size -- and it was true only while
+// submissions conflicted on direct adjacency alone. That rule let two students
+// hanging off the same reference transit be graded together, which is not
+// isolation: AS1 re-advertises what its customers send it, so one student's bad
+// announcement reaches the other's table.
+//
+// Requiring distance two costs waves, because in a tiered topology most
+// students do share a transit. 80 submissions go from 6 waves to 42. That is
+// still six times better than a lab per submission, and each of those 42 waves
+// grades every submission in it concurrently.
+//
+// The trade was measured before it was made. On the live cluster, AS5 scored
+// 10/10 with the class at reference; with AS3 -- non-adjacent, sharing transit
+// AS1 -- withdrawing its prefix entirely, AS5 still scored 10/10; and with AS3
+// hijacking 5.0.0.0/8, AS5 still scored 10/10. So for this rubric the weaker
+// rule would have been adequate. It is not kept, because "no contamination was
+// observed for the checks this rubric happens to use" is not the same as "a
+// student cannot lose marks for another student's work", and the second is what
+// a grading system has to be able to say.
+func TestWavesStayFarCheaperThanALabPerSubmission(t *testing.T) {
 	small := labFor(t, "../../examples/cos461")
 	smallSubs := studentSubs(small)
 	smallWaves := independentWaves(small, smallSubs)
@@ -71,12 +89,16 @@ func TestWavesDoNotGrowWithTheClass(t *testing.T) {
 	if len(bigSubs) < 5*len(smallSubs) {
 		t.Fatalf("the large lab has only %d submissions; this proves nothing", len(bigSubs))
 	}
-	// Ten times the class must not cost ten times the waves. A small constant
-	// is what makes this approach worth having.
-	if len(bigWaves) > len(smallWaves)+4 {
-		t.Errorf("waves grew from %d to %d as the class grew from %d to %d submissions",
-			len(smallWaves), len(bigWaves), len(smallSubs), len(bigSubs))
+	// The point of waves is concurrency, so the measure that matters is how
+	// many submissions each wave carries, not how many waves there are.
+	perWave := float64(len(bigSubs)) / float64(len(bigWaves))
+	if perWave < 1.5 {
+		t.Errorf("%d submissions took %d waves (%.1f per wave); at that density the "+
+			"waves are barely better than grading one submission at a time, and "+
+			"`twinet grade batch` would give real isolation for a similar cost",
+			len(bigSubs), len(bigWaves), perWave)
 	}
+	t.Logf("%.1f submissions per wave", perWave)
 }
 
 // Within a wave, no two submissions may be neighbours: that is the property
@@ -202,4 +224,58 @@ func contains(v []string, s string) bool {
 		}
 	}
 	return false
+}
+
+// The reason waves are safe was "everything a submission can see is either its
+// own work or the reference". That is false as soon as two students hang off
+// the same reference transit: AS3 and AS5 are not neighbours, but both attach
+// to AS1 and AS2, which run ordinary BGP and re-advertise what their customers
+// send them. A bad announcement from one arrives in the other's table.
+//
+// This test is the counter-example that was found, kept so the rule cannot
+// quietly weaken back to direct adjacency.
+func TestSubmissionsSharingATransitAreNotGradedTogether(t *testing.T) {
+	top := labFor(t, "../../examples/cos461")
+
+	neighbours := map[int]map[int]bool{}
+	for _, l := range top.Links {
+		if !l.InterAS || l.A == nil || l.B == nil || l.A.Device == nil || l.B.Device == nil {
+			continue
+		}
+		a, b := l.A.Device.ASN, l.B.Device.ASN
+		if a == b {
+			continue
+		}
+		if neighbours[a] == nil {
+			neighbours[a] = map[int]bool{}
+		}
+		if neighbours[b] == nil {
+			neighbours[b] = map[int]bool{}
+		}
+		neighbours[a][b], neighbours[b][a] = true, true
+	}
+
+	subs := studentSubs(top)
+	if len(subs) < 2 {
+		t.Skip("needs at least two student systems")
+	}
+
+	for _, wave := range independentWaves(top, subs) {
+		for i := 0; i < len(wave); i++ {
+			for j := i + 1; j < len(wave); j++ {
+				a, b := wave[i].AS, wave[j].AS
+				for n := range neighbours[a] {
+					if !neighbours[b][n] {
+						continue
+					}
+					t.Errorf("AS %d and AS %d are graded in the same wave, and both attach "+
+						"to AS %d.\nAS %d runs ordinary BGP and re-advertises what its "+
+						"customers send it, so a bad announcement from one of them reaches "+
+						"the other's routing table and changes the paths it is marked on. "+
+						"A correct student loses marks for someone else's mistake, and "+
+						"nothing in the report says so.", a, b, n, n)
+				}
+			}
+		}
+	}
 }
