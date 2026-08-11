@@ -1,0 +1,48 @@
+apiVersion: twinet.dev/v1
+kind: Rubric
+metadata:
+  name: advnet-mpls-l3vpn
+  total: 6
+  notes: >
+    The ETH advanced-networks BGP-free core and BGP/MPLS L3VPN exercise.
+
+    The marks are split so that the two halves of the exercise cannot be
+    traded against each other. Carrying the customers is worth nothing on
+    its own -- a provider that put every customer in one table would do
+    that perfectly -- and keeping them apart is worth nothing if nothing
+    reaches anything. Both must be right.
+
+questions:
+  - id: q1
+    title: A core that forwards on labels alone
+    points: 2
+    converge: true
+    converge_scope: ospf
+    checks:
+      # Deliberately the larger share. Reachability can be achieved by
+      # running BGP everywhere, which is the answer the exercise exists to
+      # rule out, so the absence of BGP in the core is what actually
+      # distinguishes a correct submission.
+      - check: mpls.bgp_free_core
+        weight: 0.6
+      - check: mpls.ldp_adjacencies
+        weight: 0.4
+
+  - id: q2
+    title: Carrying each customer between its sites
+    points: 2
+    converge: true
+    checks:
+      - check: vpn.site_reachability
+        weight: 1.0
+
+  - id: q3
+    title: Keeping the customers apart
+    points: 2
+    converge: true
+    checks:
+      # Equal in weight to carrying them. A provider that leaks one bank's
+      # traffic into another's network has not partly solved the exercise;
+      # it has produced the failure the mechanism exists to prevent.
+      - check: vpn.isolation
+        weight: 1.0
