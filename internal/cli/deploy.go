@@ -54,6 +54,7 @@ after a partial failure, a reboot, or a topology edit.`,
 			if err != nil {
 				return err
 			}
+			adopted := false
 			if rec == nil && !rebalance {
 				// No record, but the lab may still be running -- deployed by
 				// an earlier version, or the record lost. What is running is
@@ -63,6 +64,7 @@ after a partial failure, a reboot, or a topology edit.`,
 					return err
 				}
 				if rec != nil {
+					adopted = true
 					fmt.Fprintf(cmd.ErrOrStderr(),
 						"adopted the placement of the %d autonomous systems already running\n",
 						len(rec.ByAS))
@@ -83,7 +85,7 @@ after a partial failure, a reboot, or a topology edit.`,
 			// drift the record exists to prevent.
 			if !dryRun {
 				if err := place.SaveRecord(labPrivateDir(top),
-					a.Record(top.Name, strategyOf(top, rebalance))); err != nil {
+					a.Record(top.Name, strategyOf(top, rebalance, adopted))); err != nil {
 					return fmt.Errorf("recording where the lab was placed: %w", err)
 				}
 			}
@@ -783,13 +785,19 @@ func localStore(top *model.Topology) (*state.Store, error) {
 }
 
 // strategyOf names the strategy the record was produced with.
-func strategyOf(top *model.Topology, rebalance bool) string {
+func strategyOf(top *model.Topology, rebalance, adopted bool) string {
 	s := top.Lab.Placement.Strategy
 	if s == "" {
 		s = "pack-by-as"
 	}
-	if rebalance {
+	switch {
+	case rebalance:
 		return s + " (rebalanced)"
+	case adopted:
+		// The placer did not choose this; the running containers did. Saying
+		// so matters, because it explains an assignment the strategy would
+		// not produce and would otherwise look like a bug in the placer.
+		return s + " (adopted from the running lab)"
 	}
 	return s
 }
