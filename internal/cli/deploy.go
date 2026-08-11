@@ -47,7 +47,9 @@ after a partial failure, a reboot, or a topology edit.`,
 			if err != nil {
 				return err
 			}
-			resolveImageIDs(cmd.Context(), top, token)
+			if err := resolveImageIDs(cmd.Context(), top, token); err != nil {
+				return err
+			}
 			scope, err := parseScope(only)
 			if err != nil {
 				return err
@@ -409,7 +411,7 @@ func newExecCmd(opts *Options) *cobra.Command {
 // A tag rebuilt in place is different software under an unchanged name. Without
 // this the spec hash never moves, so the new image is never deployed: the lab
 // keeps running the old one while every report says it is up to date.
-func resolveImageIDs(ctx context.Context, top *model.Topology, token string) {
+func resolveImageIDs(ctx context.Context, top *model.Topology, token string) error {
 	refs := map[string]bool{}
 	for _, d := range top.Devices {
 		if d.Image != "" {
@@ -432,19 +434,36 @@ func resolveImageIDs(ctx context.Context, top *model.Topology, token string) {
 	if clustered(top) {
 		if tok, err := tokenFor(token); err == nil {
 			cl := client.NewCluster(top.Lab, tok)
+			// Every node is asked, and their answers are compared.
+			//
+			// This used to accept the first node's answer and stop. Nodes drift
+			// -- one is rebuilt, a push half-succeeds, a pull is interrupted --
+			// and when they do, a student's routers run whichever build landed
+			// on whichever node their AS was placed on. Measured on this
+			// cluster: all four images differed between node-0 and the other
+			// two while every report said the deployment was current. A mark
+			// that depends on where a container was scheduled is not a mark,
+			// and nothing anywhere would have said so.
+			byRef := map[string]map[string]string{}
 			for _, n := range cl.Nodes {
 				got, err := n.ImageDigests(ctx, list)
 				if err != nil {
 					continue
 				}
 				for ref, id := range got {
-					if id != "" && seen[ref] == "" {
-						seen[ref] = id
+					if id == "" {
+						// Not pulled here yet; the deployment will pull it.
+						continue
 					}
+					if byRef[ref] == nil {
+						byRef[ref] = map[string]string{}
+					}
+					byRef[ref][n.Name] = id
+					seen[ref] = id
 				}
-				if len(seen) == len(list) {
-					break
-				}
+			}
+			if err := sameEverywhere(byRef); err != nil {
+				return err
 			}
 		}
 	} else {
@@ -462,6 +481,61 @@ func resolveImageIDs(ctx context.Context, top *model.Topology, token string) {
 	for _, d := range top.SortedDevices() {
 		d.ImageID = seen[d.Image]
 	}
+	return nil
+}
+
+// sameEverywhere refuses a deployment whose nodes do not agree on what an image
+// is.
+//
+// The alternative is to deploy anyway and let each student run whatever build
+// happens to be on the node their AS landed on. Nothing downstream can detect
+// that, and no report would mention it.
+func sameEverywhere(byRef map[string]map[string]string) error {
+	var problems []string
+	for _, ref := range sortedKeysOf(byRef) {
+		perNode := byRef[ref]
+		ids := map[string][]string{}
+		for node, id := range perNode {
+			ids[id] = append(ids[id], node)
+		}
+		if len(ids) <= 1 {
+			continue
+		}
+		var parts []string
+		for _, id := range sortedKeysOf(ids) {
+			nodes := ids[id]
+			sort.Strings(nodes)
+			parts = append(parts, fmt.Sprintf("%s on %s", shortID(id), strings.Join(nodes, ",")))
+		}
+		problems = append(problems, fmt.Sprintf("  %s is %s", ref, strings.Join(parts, "; ")))
+	}
+	if len(problems) == 0 {
+		return nil
+	}
+	return fmt.Errorf("the nodes do not agree on what these images are:\n%s\n"+
+		"A student's devices would run whichever build landed on the node their\n"+
+		"system was placed on, and no report would say so. Push the images again\n"+
+		"and pull them everywhere, or pin them by digest in the manifest",
+		strings.Join(problems, "\n"))
+}
+
+func sortedKeysOf[V any](m map[string]V) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func shortID(id string) string {
+	if i := strings.IndexByte(id, ':'); i >= 0 {
+		id = id[i+1:]
+	}
+	if len(id) > 12 {
+		return id[:12]
+	}
+	return id
 }
 
 func loadAndPlace(opts *Options) (*model.Topology, error) {

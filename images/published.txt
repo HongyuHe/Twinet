@@ -1,5 +1,5 @@
-# published 2026-08-10T23:05:16Z from 2b4a1fe
-hyhe/twinet-router:0.1 hyhe/twinet-router@sha256:26d10acd7dccf76a843b0f37670d3f655e3d4c18276331aa74ae8fe34c28d08f
-hyhe/twinet-host:0.1 hyhe/twinet-host@sha256:e7e889268dce06db7967415328b27efe0b0dd800addb1629ffcc4da095744ed0
-hyhe/twinet-switch:0.1 hyhe/twinet-switch@sha256:7078abf5de57bcaa61033a4eb95944eafdb0f8c69688fa4dc06acfe1de370f4c
-hyhe/twinet-svc:0.1 hyhe/twinet-svc@sha256:5873c806c90d1faaf09707740f48c498f30784528e7c77fef82933cdabc799b4
+# published 2026-08-11T11:40:42Z from d896215
+hyhe/twinet-router:0.1 hyhe/twinet-router@sha256:06350bc44aeedfa8af9c407fb43fc5e95ba105d1ef80909ef6d1d1d2b682b7e1
+hyhe/twinet-host:0.1 hyhe/twinet-host@sha256:23b9bb8fea9b0bab8224f86bd96dfc44281088e8cd9297015533339e46943db0
+hyhe/twinet-switch:0.1 hyhe/twinet-switch@sha256:dbbfee740748e06c9933c7313392532efe61cfdf11d3a7a520fcb70762dc7750
+hyhe/twinet-svc:0.1 hyhe/twinet-svc@sha256:5b150f8ad9d0fb46c522b021753325c36736b4a8f6ff922c7fab86b094877440

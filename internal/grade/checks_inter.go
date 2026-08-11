@@ -384,6 +384,13 @@ func checkNoTransit(ctx context.Context, env *Env) Result {
 		}
 	}
 
+	// What this AS is supposed to be announcing about itself.
+	own := ""
+	if as, ok := env.Topology.ASes[env.AS]; ok {
+		own = as.Block
+	}
+	announced := 0
+
 	// For each non-customer neighbour, look at what we advertise to them.
 	var leaks []string
 	var unreadable []string
@@ -403,6 +410,9 @@ func checkNoTransit(ctx context.Context, env *Env) Result {
 			}
 			checked++
 			for prefix, entries := range adv.Table() {
+				if own != "" && prefix == own {
+					announced++
+				}
 				for _, e := range entries {
 					// A route we originate has an empty path and may go anywhere.
 					if strings.TrimSpace(e.Path) == "" {
@@ -426,9 +436,27 @@ func checkNoTransit(ctx context.Context, env *Env) Result {
 			"no neighbour's advertised routes could be read, so nothing could be assessed: %s",
 			strings.Join(truncate(unreadable, 3), "; ")))
 	}
+	// Advertising nothing is not the same as advertising correctly.
+	//
+	// This check counted leaks and passed when it found none, so a deny-all
+	// export policy scored full marks: no advertisements, therefore no leaked
+	// advertisements. That is a badly wrong answer -- the AS is invisible to
+	// the internet -- receiving the same mark as a correct Gao-Rexford export.
+	// The question is what may cross the session, and a session carrying
+	// nothing has not answered it.
+	if announced == 0 {
+		return Fail("policy.no_transit_for_peers", Evidence{
+			Expected: "your own prefix advertised to peers and providers, and nothing learned from them",
+			Observed: fmt.Sprintf("nothing at all is advertised to any of the %d non-customer neighbours", checked),
+			Hint: "an export policy that denies everything leaks nothing, but it also means " +
+				"nobody outside your AS can reach you",
+			Command: "show ip bgp neighbors <addr> advertised-routes",
+		})
+	}
 	if len(leaks) == 0 {
 		return Pass("policy.no_transit_for_peers", Evidence{
-			Observed: fmt.Sprintf("no leaks across %d neighbour views", checked)})
+			Observed: fmt.Sprintf("no leaks across %d neighbour views; own prefix advertised to %d of them",
+				checked, announced)})
 	}
 	sort.Strings(leaks)
 	if len(leaks) > 12 {

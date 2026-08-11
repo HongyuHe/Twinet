@@ -243,20 +243,38 @@ func checkOSPFSubnets(ctx context.Context, env *Env) Result {
 		}
 	}
 
-	// Observe from a router that is not the origin of most of them, so the
-	// check tests advertisement rather than mere local connectivity.
-	vantage := routers[len(routers)-1]
-	var routes ospfRouteJSON
-	if err := env.VtyshJSON(ctx, vantage.Name, "show ip route json", &routes); err != nil {
-		return Errored("ospf.subnets_advertised", err)
-	}
+	// A prefix counts only where some router learned it *from* OSPF.
+	//
+	// This used to accept "ospf or connected" from a single vantage router,
+	// which meant every subnet that router was attached to was credited as
+	// advertised whether or not the student had put it in OSPF at all. Choosing
+	// a vantage far from most subnets narrowed the hole without closing it: its
+	// own links still counted, and so did every service subnet reachable
+	// directly. Asking every router and requiring at least one to hold the
+	// prefix as an OSPF route is what actually distinguishes "flooded through
+	// the area" from "plugged into this box".
 	seen := map[string]bool{}
-	for prefix, entries := range routes {
-		for _, e := range entries {
-			if e.Protocol == "ospf" || e.Protocol == "connected" {
-				seen[prefix] = true
+	read := 0
+	var unreadable []string
+	for _, r := range routers {
+		var routes ospfRouteJSON
+		if err := env.VtyshJSON(ctx, r.Name, "show ip route json", &routes); err != nil {
+			unreadable = append(unreadable, fmt.Sprintf("%s: %v", r.Name, err))
+			continue
+		}
+		read++
+		for prefix, entries := range routes {
+			for _, e := range entries {
+				if e.Protocol == "ospf" {
+					seen[prefix] = true
+				}
 			}
 		}
+	}
+	if read == 0 {
+		return Errored("ospf.subnets_advertised", fmt.Errorf(
+			"no router's routing table could be read, so nothing could be assessed: %s",
+			strings.Join(truncate(unreadable, 3), "; ")))
 	}
 
 	var absent []string
@@ -269,11 +287,12 @@ func checkOSPFSubnets(ctx context.Context, env *Env) Result {
 
 	if len(absent) == 0 {
 		return Pass("ospf.subnets_advertised", Evidence{
-			Observed: fmt.Sprintf("all %d internal subnets visible from %s", len(want), vantage.Name)})
+			Observed: fmt.Sprintf("all %d internal subnets are carried by OSPF, seen across %d routers",
+				len(want), read)})
 	}
 	return Partial("ospf.subnets_advertised", ratio(len(want)-len(absent), len(want)), Evidence{
-		Expected: fmt.Sprintf("%d subnets reachable from %s", len(want), vantage.Name),
-		Observed: fmt.Sprintf("%d missing", len(absent)),
+		Expected: fmt.Sprintf("all %d internal subnets carried by OSPF", len(want)),
+		Observed: fmt.Sprintf("%d not learned through OSPF on any router", len(absent)),
 		Detail:   strings.Join(absent, "\n"),
 		Hint:     "the DNS and measurement subnets must be advertised in OSPF too",
 		Command:  "show ip route json",
