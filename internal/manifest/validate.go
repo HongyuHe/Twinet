@@ -86,11 +86,51 @@ func (l *Loaded) validateAddressing(d *Diagnostics, file string) {
 	for name, expr := range a.Services {
 		exprs["svc_"+name] = expr
 	}
-	if _, err := ipam.Compile(exprs); err != nil {
+	plan, err := ipam.Compile(exprs)
+	if err != nil {
 		for _, line := range strings.Split(err.Error(), "\n") {
 			d.Add(file, "addressing", line, nodeAt(root, "addressing"))
 		}
+		return
 	}
+	// Compiling only proves the expression is a well-formed Go template. It
+	// says nothing about whether the string it produces is an address.
+	//
+	// `inter_as: "this is not a prefix"` compiled cleanly and validated
+	// cleanly, and the mistake surfaced much later as an addressing plan that
+	// could not be built -- by which point the message names an internal
+	// field rather than the line the author wrote. Evaluating each expression
+	// once, against representative values, turns that into a diagnostic
+	// pointing at the manifest.
+	for _, name := range sortedMapKeys(exprs) {
+		if strings.TrimSpace(exprs[name]) == "" {
+			continue
+		}
+		out, err := plan.Eval(name, sampleCtx)
+		if err != nil {
+			d.AddHint(file, "addressing."+name, nodeAt(root, "addressing"),
+				fmt.Sprintf("addressing.%s could not be evaluated: %v", name, err),
+				"the bindings available are .AS .PeerAS .RouterID .PeerID .LinkIndex "+
+					".L2ID .VLAN .VLANIndex .IXP .Low .High .Host .Name .Region")
+			continue
+		}
+		if _, perr := netip.ParsePrefix(out); perr != nil {
+			d.AddHint(file, "addressing."+name, nodeAt(root, "addressing"),
+				fmt.Sprintf("addressing.%s produced %q, which is not an address and prefix length",
+					name, out),
+				"every addressing expression must render something like 10.0.1.0/24")
+		}
+	}
+}
+
+// sampleCtx is a representative binding used to prove an addressing expression
+// renders an address at all. The values are arbitrary but plausible; what
+// matters is that every field is non-zero, so an expression that uses one
+// cannot appear to work by rendering an empty string.
+var sampleCtx = ipam.Ctx{
+	AS: 1, PeerAS: 2, RouterID: 1, PeerID: 2, LinkIndex: 0,
+	L2ID: 0, VLAN: 10, VLANIndex: 0, IXP: 100,
+	Low: 1, High: 2, Host: 1, Name: "sample", Region: "0",
 }
 
 func (l *Loaded) validateTemplates(d *Diagnostics) {

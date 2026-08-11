@@ -20,19 +20,49 @@ func writeLab(t *testing.T, body string) string {
 	return dir
 }
 
+// A manifest that is genuinely valid.
+//
+// The previous one was not: it named addressing fields and template shapes that
+// do not exist, so every test that used it failed at the schema and never
+// reached the thing it claimed to be checking. "A referenced template must
+// exist" passed because the error text happened to contain the letter it
+// searched for. A fixture that does not parse turns every test built on it into
+// one that cannot fail for the right reason.
 const minimal = `apiVersion: twinet.dev/v1
 kind: Lab
 metadata:
   name: t
 addressing:
   as_block: "{{ .AS }}.0.0.0/8"
-  intra_as: "{{ .AS }}.0.{{ .LinkIndex }}.0/24"
+  router_router: "{{ .AS }}.0.{{ .LinkIndex }}.0/24"
+  router_host: "{{ .AS }}.{{ add 100 .RouterID }}.0.0/24"
+  router_loopback: "{{ .AS }}.{{ add 150 .RouterID }}.0.1/24"
   inter_as: "179.{{ .Low }}.{{ .High }}.0/24"
-  loopback: "{{ .AS }}.{{ add 150 .RouterIndex }}.0.1/24"
+templates:
+  small:
+    routers:
+      A: {id: 1}
+      B: {id: 2}
+    internal_links:
+      - {a: A, b: B}
 autonomous_systems:
   - list: [1]
-    template: t
+    template: small
 `
+
+// The fixture has to actually load, or nothing built on it means anything.
+func TestTheMinimalFixtureIsValid(t *testing.T) {
+	l, err := Load(writeLab(t, minimal))
+	if err != nil {
+		t.Fatalf("the fixture every other test builds on does not load: %v", err)
+	}
+	// Load parses; Validate checks. A test that reads Diags without calling
+	// Validate is reading a field nothing has written, and passes whatever the
+	// manifest says.
+	if d := l.Validate(); d.HasErrors() {
+		t.Fatalf("the fixture reports errors: %v", d)
+	}
+}
 
 func TestTheExampleLabLoads(t *testing.T) {
 	l, err := Load("../../examples/cos461")
@@ -81,13 +111,21 @@ func TestAMalformedManifestSaysWhereItIsWrong(t *testing.T) {
 }
 
 func TestAReferencedTemplateMustExist(t *testing.T) {
-	dir := writeLab(t, minimal)
-	_, err := Load(dir)
-	if err == nil {
+	body := strings.Replace(minimal, "template: small", "template: no_such_template", 1)
+	l, err := Load(writeLab(t, body))
+	// The name is deliberately one that cannot appear by accident in an
+	// unrelated message: the previous test searched for "t", which appears in
+	// almost any Go type name, and would have passed on any error at all.
+	msg := ""
+	if err != nil {
+		msg = err.Error()
+	} else if d := l.Validate(); d.HasErrors() {
+		msg = d.String()
+	} else {
 		t.Fatal("a manifest naming a template that does not exist was accepted")
 	}
-	if !strings.Contains(err.Error(), "t") {
-		t.Errorf("the error does not name the missing template: %v", err)
+	if !strings.Contains(msg, "no_such_template") {
+		t.Errorf("the error does not name the missing template: %s", msg)
 	}
 }
 
@@ -98,7 +136,23 @@ func TestEveryProblemIsReportedAtOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if l.Diags.HasErrors() {
-		t.Errorf("the course lab reports errors: %v", l.Diags)
+	if d := l.Validate(); d.HasErrors() {
+		t.Errorf("the course lab reports errors: %v", d)
+	}
+
+	// And a manifest with several independent mistakes reports all of them, so
+	// an author fixes everything in one pass rather than rediscovering the next
+	// one after each edit.
+	body := strings.Replace(minimal, "template: small", "template: no_such_template", 1)
+	body = strings.Replace(body, `inter_as: "179.{{ .Low }}.{{ .High }}.0/24"`,
+		`inter_as: "this is not a prefix"`, 1)
+	bad, err := Load(writeLab(t, body))
+	if err != nil {
+		t.Fatalf("the manifest should load and then fail validation, not fail to parse: %v", err)
+	}
+	d := bad.Validate()
+	if n := len(d.Errors()); n < 2 {
+		t.Errorf("two independent mistakes produced %d diagnostic(s); an author would "+
+			"have to rerun after each fix:\n%v", n, d)
 	}
 }
