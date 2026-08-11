@@ -128,7 +128,10 @@ reached students, and each motivated a permanent test.
 | Cross-node link RTT (25 ms configured) | 50.22 ms, σ 9 µs |
 | Links kept local by AS-granular placement | 86.6 % |
 | Grading, 3 submissions, 10 questions, 17 checks | 31 s |
-| Grading, 1 submission in its own full-breadth harness | 6 minutes |
+| Grading a class of 8 in waves, all scoring 10/10 | **22m 11s in 4 waves** |
+| Waves needed for 8 student ASes / for 80 | **4 / 4** — the count is a property of the topology's shape, not the class size |
+| Grading 1 submission in its own private harness | ~12 minutes; measured, and the reason waves exist |
+| 8 private harnesses at once on 3 nodes | saturates the cluster; the failures are resource exhaustion, not marks |
 | **Class-scale deployment: 84 ASes, 2012 devices, 2927 links across 3 nodes** | **22m 38s, zero failures** |
 | Containers per node at that scale | 724 / 750 / 750 |
 | Node utilisation at that scale | 22 GiB of 251, load average 13 of 56 cores |

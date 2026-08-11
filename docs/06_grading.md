@@ -216,3 +216,29 @@ still keeps hidden checks for the graded run.
   (normalised token similarity), replacing the anecdotal use of the history GIF.
 - The event log records whether the graded AS's config matches what was live in
   the class network at the deadline.
+
+## Grading a class
+
+Two modes, and the difference is what they cost.
+
+`twinet grade batch` gives every submission a private lab. It is the strongest
+isolation available and it was measured: a full-breadth harness is the whole
+class topology, so a hundred submissions means deploying the class a hundred
+times, and eight concurrent harnesses already saturate three nodes. One
+submission takes about twelve minutes. It remains the right tool for a single
+disputed mark, where isolation matters more than throughput.
+
+`twinet grade class` is the one to use for a class. It exploits the fact that a
+harness differs from the class lab in exactly one way — every autonomous system
+but one is the reference solution — so two submissions cannot affect each other
+as long as they are not neighbours. The lab is deployed once and submissions are
+loaded in waves of mutually non-adjacent systems, which gives the same
+guarantee: everything a submission can see is either its own work or the
+reference.
+
+Measured on the three-node cluster: eight submissions, four waves, 22 minutes,
+every one scoring 10/10 against the reference. The count of waves is the
+chromatic number of the peering graph and does not grow with the class — a test
+computes it for both the 8-student lab and the 80-student one and gets four in
+both cases. The cost is therefore per wave rather than per submission, which is
+what makes a class of a hundred cost about what a class of eight does.

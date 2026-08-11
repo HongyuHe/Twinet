@@ -176,36 +176,22 @@ func independentWaves(top *model.Topology, subs []submission) [][]submission {
 		adj[a][b], adj[b][a] = true, true
 	}
 
-	// Two systems that share an exchange are neighbours for this purpose: at an
-	// exchange everyone sees everyone, so a broken member is visible to every
-	// other member even without a direct cable.
-	members := map[int][]int{}
-	for asn, as := range top.ASes {
-		if as.Role == model.RoleIXP {
-			continue
-		}
-		for _, d := range as.Devices {
-			for _, i := range d.Ifaces {
-				if i.Role == model.RoleIXPLink && i.Peer != nil && i.Peer.Device != nil {
-					ixp := i.Peer.Device.ASN
-					members[ixp] = append(members[ixp], asn)
-				}
-			}
-		}
-	}
-	for _, ms := range members {
-		for _, a := range ms {
-			for _, b := range ms {
-				if a == b {
-					continue
-				}
-				if adj[a] == nil {
-					adj[a] = map[int]bool{}
-				}
-				adj[a][b] = true
-			}
-		}
-	}
+	// Sharing an exchange does not make two systems neighbours for this
+	// purpose, and treating it as though it did was expensive: every member of
+	// an exchange became adjacent to every other, which collapsed the
+	// independence the waves exist to exploit and turned eight submissions into
+	// six waves.
+	//
+	// At an exchange each member peers with the route server, not with the
+	// other members. A broken member cannot stop another member's session
+	// establishing, cannot change what that member advertises, and cannot alter
+	// its interior -- which is what every question is marked on. What it can do
+	// is fail to announce a prefix, and no question marks a student on
+	// receiving some other student's routes.
+	//
+	// A direct peering is different: a neighbour that is broken is a session
+	// that never comes up, and that is a mark the student loses for someone
+	// else's work. Those stay adjacent.
 
 	// Most-constrained first, which keeps the number of waves down.
 	order := append([]submission(nil), subs...)
