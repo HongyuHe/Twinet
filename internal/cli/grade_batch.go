@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -397,6 +398,9 @@ func applySubmission(ctx context.Context, exec execFn, h *model.Topology, s subm
 	sort.Strings(names)
 	for _, name := range names {
 		d := known[strings.ToUpper(name)]
+		if err := checkSubmittedScript(s.Scripts[name]); err != nil {
+			return fmt.Errorf("%s: %w", d.ID, err)
+		}
 		res, err := exec(ctx, d.ID, []string{"sh", "-c", s.Scripts[name]})
 		if err != nil {
 			return fmt.Errorf("%s: running the submitted script: %w", d.ID, err)
@@ -422,9 +426,15 @@ func applySubmission(ctx context.Context, exec execFn, h *model.Topology, s subm
 // reflects the file the student submitted rather than that file layered on top
 // of whatever the router was already running.
 func loadFRRConfig(ctx context.Context, exec execFn, d *model.Device, body string) error {
+	// The configuration is base64-encoded rather than written through a shell
+	// heredoc. A submission is a file a student controls, and a line reading
+	// exactly TWINET_EOF ends the heredoc early -- everything after it becomes
+	// shell, running as root inside the container. Encoding removes the
+	// delimiter entirely, so there is nothing left to escape.
 	script := strings.Join([]string{
 		"set -e",
-		"cat > /etc/frr/frr.conf <<'TWINET_EOF'\n" + body + "\nTWINET_EOF",
+		"printf '%s' " + shellQuote(base64.StdEncoding.EncodeToString([]byte(body))) +
+			" | base64 -d > /etc/frr/frr.conf",
 		"chown frr:frr /etc/frr/frr.conf 2>/dev/null || true",
 		"chmod 640 /etc/frr/frr.conf",
 		// watchfrr keeps its own pid file and outlives a plain stop, after
@@ -502,6 +512,74 @@ func submissionFromArchive(p string, class *model.Topology) (submission, error) 
 		return submission{}, fmt.Errorf("%s contains no configuration", filepath.Base(p))
 	}
 	return sub, nil
+}
+
+// shellQuote makes a string safe to pass as a single shell word.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'"'"'`) + "'"
+}
+
+// scriptCommands are the commands a submitted script may use.
+//
+// Some answers are not FRR configuration: VLANs live in the switch, tunnels and
+// host routes are set with ip(8). Those exercises need commands to be run, so
+// the grader has to execute something a student wrote.
+//
+// It runs as root in that student's own container. The container is
+// unprivileged and holds only the network capabilities, and the harness is
+// disposable, so the blast radius is their own lab -- but "the sandbox will
+// hold" is a poor last line of defence when the alternative costs a list. The
+// list is what an answer to these exercises actually needs; anything else is
+// refused with the offending line quoted, which is also better feedback than a
+// mysterious failure.
+var scriptCommands = map[string]bool{
+	"ip": true, "tc": true, "ovs-vsctl": true, "ovs-ofctl": true,
+	"sysctl": true, "ifconfig": true, "route": true, "bridge": true,
+	"iptables": true, "ip6tables": true, "echo": true, "true": true, "sleep": true,
+}
+
+// checkSubmittedScript refuses anything outside the vocabulary the exercises
+// need.
+func checkSubmittedScript(body string) error {
+	for n, line := range strings.Split(body, "\n") {
+		t := strings.TrimSpace(line)
+		if t == "" || strings.HasPrefix(t, "#") {
+			continue
+		}
+		// Substitution and chaining would let an allowed first word introduce
+		// an arbitrary second one.
+		if strings.ContainsAny(t, "`$") {
+			return fmt.Errorf("line %d uses shell substitution, which submitted scripts may not: %q", n+1, t)
+		}
+		for _, part := range splitScriptCommands(t) {
+			f := strings.Fields(part)
+			if len(f) == 0 {
+				continue
+			}
+			if !scriptCommands[f[0]] {
+				return fmt.Errorf("line %d runs %q, which is not one of the commands a submission may use (%s)",
+					n+1, f[0], strings.Join(sortedScriptCommands(), ", "))
+			}
+		}
+	}
+	return nil
+}
+
+// splitScriptCommands breaks a line on the separators a shell would act on, so
+// each command in a chain is checked rather than only the first.
+func splitScriptCommands(line string) []string {
+	return strings.FieldsFunc(line, func(r rune) bool {
+		return r == ';' || r == '|' || r == '&'
+	})
+}
+
+func sortedScriptCommands() []string {
+	out := make([]string, 0, len(scriptCommands))
+	for c := range scriptCommands {
+		out = append(out, c)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // readSubmissions reads a directory of per-group submissions.

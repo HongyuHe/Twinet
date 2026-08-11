@@ -159,24 +159,27 @@ func saveAS(ctx context.Context, top *model.Topology, asn int, outDir string,
 			}
 			contents[d.Name+".conf"] = []byte(cleanConfig(res.Stdout))
 
-			// Tunnels and addresses are set with ip(8) and are invisible to
-			// FRR, so an archive of frr.conf alone silently loses the answer
-			// to any exercise that is not routing configuration.
-			if res, err := exec(ctx, d.ID, []string{"sh", "-c",
-				"ip -o addr show; echo ---; ip -d tunnel show 2>/dev/null; echo ---; ip -6 route show 2>/dev/null"}); err == nil {
-				contents[d.Name+".state"] = []byte(res.Stdout)
+			// Everything that is not FRR configuration, captured as the
+			// commands that recreate it rather than as a human-readable dump.
+			//
+			// This was a dump, and a dump cannot be replayed: the archive
+			// looked complete, restore silently applied only the routing
+			// configuration, and the VLAN, tunnel and addressing answers were
+			// gone. A student regraded from their own archive would lose the
+			// marks for three of the assignment's questions with nothing
+			// anywhere reporting that their work had not been loaded.
+			if sh := captureCommands(ctx, exec, d); sh != "" {
+				contents[d.Name+".sh"] = []byte(sh)
 			}
 
 		case model.KindSwitch:
-			if res, err := exec(ctx, d.ID, []string{"sh", "-c",
-				"ovs-vsctl show 2>/dev/null || true"}); err == nil && strings.TrimSpace(res.Stdout) != "" {
-				contents[d.Name+".switch"] = []byte(res.Stdout)
+			if sh := captureSwitch(ctx, exec, d); sh != "" {
+				contents[d.Name+".sh"] = []byte(sh)
 			}
 
 		case model.KindHost:
-			if res, err := exec(ctx, d.ID, []string{"sh", "-c",
-				"ip -o addr show; echo ---; ip -o route show"}); err == nil {
-				contents[d.Name+".state"] = []byte(res.Stdout)
+			if sh := captureCommands(ctx, exec, d); sh != "" {
+				contents[d.Name+".sh"] = []byte(sh)
 			}
 		}
 	}
@@ -233,6 +236,63 @@ func writeTar(tw *tar.Writer, name string, body []byte) error {
 	}
 	_, err := tw.Write(body)
 	return err
+}
+
+// captureCommands renders a device's non-FRR network state as the commands
+// that recreate it.
+//
+// Addresses, routes and tunnels only. Interface state that the platform owns is
+// deliberately excluded: replaying it would fight the deployment rather than
+// restore the student's answer, and the two disagreeing is far harder to
+// diagnose than either alone.
+func captureCommands(ctx context.Context, exec func(context.Context, string, []string) (execResult, error),
+	d *model.Device) string {
+
+	script := strings.Join([]string{
+		// Addresses the student added: anything on an interface beyond what a
+		// deployment configures is theirs.
+		`ip -o -4 addr show | awk '$2!="lo"{print "ip addr add "$4" dev "$2}'`,
+		`ip -o -6 addr show | awk '$2!="lo" && $4 !~ /^fe80/{print "ip -6 addr add "$4" dev "$2}'`,
+		// Static routes, excluding the ones the kernel derives from an address.
+		`ip -o -4 route show | grep -v " proto kernel" | awk '{print "ip route add "$0}'`,
+		`ip -o -6 route show 2>/dev/null | grep -v " proto kernel" | grep -v "^fe80" | awk '{print "ip -6 route add "$0}'`,
+		// Tunnels, which is how the 6in4 exercise is answered.
+		`ip -d tunnel show 2>/dev/null | awk -F: '/mode/ && $1!="sit0"{print}' | sed 's/^/# tunnel: /'`,
+	}, "\n")
+
+	res, err := exec(ctx, d.ID, []string{"sh", "-c", script})
+	if err != nil || res.ExitCode != 0 {
+		return ""
+	}
+	var keep []string
+	for _, line := range strings.Split(res.Stdout, "\n") {
+		t := strings.TrimSpace(line)
+		if t == "" {
+			continue
+		}
+		keep = append(keep, t)
+	}
+	if len(keep) == 0 {
+		return ""
+	}
+	return "# captured from " + d.ID + "\n" + strings.Join(keep, "\n") + "\n"
+}
+
+// captureSwitch renders a switch's port and VLAN configuration as commands.
+func captureSwitch(ctx context.Context, exec func(context.Context, string, []string) (execResult, error),
+	d *model.Device) string {
+
+	script := `for p in $(ovs-vsctl list-ports br0 2>/dev/null); do
+  tag=$(ovs-vsctl get port "$p" tag 2>/dev/null | tr -d '[]')
+  trunks=$(ovs-vsctl get port "$p" trunks 2>/dev/null | tr -d '[]')
+  [ -n "$tag" ] && [ "$tag" != "" ] && echo "ovs-vsctl set port $p tag=$tag"
+  [ -n "$trunks" ] && [ "$trunks" != "" ] && echo "ovs-vsctl set port $p trunks=$trunks"
+done`
+	res, err := exec(ctx, d.ID, []string{"sh", "-c", script})
+	if err != nil || res.ExitCode != 0 || strings.TrimSpace(res.Stdout) == "" {
+		return ""
+	}
+	return "# captured from " + d.ID + "\n" + strings.TrimSpace(res.Stdout) + "\n"
 }
 
 // cleanConfig strips the preamble vtysh prints before a configuration, which it
@@ -394,6 +454,38 @@ func restoreBundle(ctx context.Context, top *model.Topology, b Bundle,
 		}
 		if err := loadFRRConfig(ctx, exec, d, string(files[name])); err != nil {
 			return n, err
+		}
+		n++
+	}
+
+	// The rest of the answer: VLANs, addresses, routes and tunnels. Applied
+	// after the routing configuration, because a tunnel or a host route may
+	// depend on an address it has just brought up.
+	for _, name := range names {
+		if !strings.HasSuffix(name, ".sh") {
+			continue
+		}
+		short := strings.TrimSuffix(name, ".sh")
+		d, ok := byName[strings.ToUpper(short)]
+		if !ok {
+			return n, fmt.Errorf("archive names a device %q that AS %d does not have", short, b.AS)
+		}
+		body := string(files[name])
+		if err := checkSubmittedScript(body); err != nil {
+			return n, fmt.Errorf("%s: %w", d.ID, err)
+		}
+		// Each command is applied on its own and failures are tolerated: an
+		// address that the deployment already configured is not an error, and
+		// refusing the whole archive because one line was redundant would lose
+		// the rest of the student's work.
+		res, err := exec(ctx, d.ID, []string{"sh", "-c",
+			"while IFS= read -r c; do case \"$c\" in ''|\\#*) continue;; esac; $c 2>/dev/null || true; done <<'TWINET_RESTORE'\n" +
+				body + "\nTWINET_RESTORE"})
+		if err != nil {
+			return n, fmt.Errorf("%s: %w", d.ID, err)
+		}
+		if res.ExitCode != 0 {
+			return n, fmt.Errorf("%s: restoring device state exited %d", d.ID, res.ExitCode)
 		}
 		n++
 	}

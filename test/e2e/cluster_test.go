@@ -523,3 +523,60 @@ func TestTheAgentAPIRefusesUnauthenticatedCallers(t *testing.T) {
 		t.Errorf("a caller with no client certificate reached the API (status %d)", res.StatusCode)
 	}
 }
+
+// An archive has to contain the whole answer, not the part that happens to be
+// FRR configuration.
+//
+// It did not. Host addresses, static routes, VLAN tags and tunnels were saved
+// as human-readable dumps, which cannot be replayed, and restore silently
+// applied only the routing configuration. The archive looked complete and a
+// student regraded from their own submission would have lost the marks for
+// three of the assignment's questions, with nothing anywhere reporting that
+// their work had not been loaded.
+func TestASubmissionSurvivesSaveAndRestore(t *testing.T) {
+	dir := labDir(t)
+	archives := t.TempDir()
+
+	if out, err := twinet(t, "save", "-m", dir, "-o", archives, "--as", "3"); err != nil {
+		t.Fatalf("save: %v\n%s", err, out)
+	}
+	archive := filepath.Join(archives, "group3.tar.gz")
+	if _, err := os.Stat(archive); err != nil {
+		t.Fatalf("no archive was written: %v", err)
+	}
+
+	// Destroy the answer: remove BGP from every router in the AS.
+	for _, r := range []string{"MSP", "NYC", "ATL", "BOS", "CHI", "HOU", "PHY", "SFO"} {
+		_, _ = twinet(t, "exec", "-m", dir, "as3/"+r, "--",
+			"vtysh", "-c", "conf t", "-c", "no router bgp 3", "-c", "end")
+	}
+	out, _ := twinet(t, "exec", "-m", dir, "as3/MSP", "--", "vtysh", "-c", "show ip bgp summary")
+	if !strings.Contains(out, "not found") {
+		t.Fatalf("the answer was not actually destroyed, so a restore proves nothing:\n%s", out)
+	}
+
+	if out, err := twinet(t, "restore", "-m", dir, archive); err != nil {
+		t.Fatalf("restore: %v\n%s", err, out)
+	}
+
+	reports := t.TempDir()
+	if out, err := twinet(t, "grade", "run", "-m", dir, "--as", "3",
+		"-o", reports, "--converge-timeout", "6m"); err != nil {
+		t.Fatalf("grading the restored submission: %v\n%s", err, out)
+	}
+	raw, err := os.ReadFile(filepath.Join(reports, "group3.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rep struct {
+		Total    float64 `json:"total"`
+		MaxTotal float64 `json:"max_total"`
+	}
+	if err := json.Unmarshal(raw, &rep); err != nil {
+		t.Fatal(err)
+	}
+	if rep.Total < rep.MaxTotal {
+		t.Errorf("a submission scored %.2f of %.2f after a save and restore; "+
+			"part of the answer did not survive the archive", rep.Total, rep.MaxTotal)
+	}
+}
