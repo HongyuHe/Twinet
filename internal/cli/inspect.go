@@ -14,6 +14,7 @@ import (
 	"github.com/HongyuHe/twinet/internal/expand"
 	"github.com/HongyuHe/twinet/internal/manifest"
 	"github.com/HongyuHe/twinet/internal/model"
+	"github.com/HongyuHe/twinet/internal/render"
 )
 
 // load reads, validates and expands the manifest. Validation errors are
@@ -82,6 +83,7 @@ func newInspectCmd(opts *Options) *cobra.Command {
 		filterAS    int
 		filterOwner string
 		showPlace   bool
+		showConfig  string
 	)
 	cmd := &cobra.Command{
 		Use:   "inspect",
@@ -93,6 +95,9 @@ func newInspectCmd(opts *Options) *cobra.Command {
 			}
 			if showPlace {
 				return writePlacement(cmd.OutOrStdout(), top)
+			}
+			if showConfig != "" {
+				return writeReferenceConfig(cmd.OutOrStdout(), top, showConfig)
 			}
 			if opts.JSON {
 				return emitJSON(cmd.OutOrStdout(), top, showLinks, showIfaces)
@@ -170,6 +175,8 @@ func newInspectCmd(opts *Options) *cobra.Command {
 	cmd.Flags().IntVar(&filterAS, "as", 0, "restrict output to one AS")
 	cmd.Flags().StringVar(&filterOwner, "owner", "", "restrict output to one owner group")
 	cmd.Flags().BoolVar(&showPlace, "placement", false, "show how ASes are distributed across nodes")
+	cmd.Flags().StringVar(&showConfig, "config", "",
+		"print the reference configuration for one router, e.g. as3/ATL")
 	return cmd
 }
 
@@ -477,4 +484,35 @@ func roleColour(r model.ASRole) string {
 
 func mermaidID(s string) string {
 	return strings.NewReplacer("/", "_", ":", "_", "-", "_", ".", "_").Replace(s)
+}
+
+
+// writeReferenceConfig prints what a router's configuration should look like
+// when the assignment has been done correctly.
+//
+// This exists on the controller because it must not exist anywhere else. The
+// reference used to be written into every router as /etc/twinet/reference.conf
+// so a TA could diff in place, but students hold root in their own routers, so
+// the answer was inside the container of the person meant to derive it. It is
+// rendered here, on a machine students cannot reach, from the same code that
+// produces the deployed configuration -- so it cannot drift from what grading
+// expects, which was the only real argument for shipping the file.
+func writeReferenceConfig(w io.Writer, top *model.Topology, id string) error {
+	d, ok := top.Device(id)
+	if !ok {
+		if alt, ok2 := top.Device(strings.TrimPrefix(id, "/")); ok2 {
+			d = alt
+		} else {
+			return fmt.Errorf("no device %q; use `twinet inspect` to list them", id)
+		}
+	}
+	if d.Kind != model.KindRouter {
+		return fmt.Errorf("%s is a %s; only routers have a reference configuration", id, d.Kind)
+	}
+	cfg, err := render.Router(top, d)
+	if err != nil {
+		return err
+	}
+	fmt.Fprint(w, cfg.Platform+cfg.Expected)
+	return nil
 }

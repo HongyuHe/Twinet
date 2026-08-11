@@ -78,10 +78,20 @@ func (r *Renderer) Files(d *model.Device) (map[string]deploy.FileSpec, error) {
 		}
 		out["/etc/frr/daemons"] = deploy.FileSpec{Content: []byte(FRRDaemons), Mode: 0o640}
 		out["/etc/frr/frr.conf"] = deploy.FileSpec{Content: []byte(body), Mode: 0o640}
-		// The reference solution always ships alongside, so a TA can diff a
-		// student's configuration against it without re-deriving anything.
-		out["/etc/twinet/reference.conf"] = deploy.FileSpec{
-			Content: []byte(cfg.Platform + cfg.Expected), Mode: 0o600}
+		// The reference solution is deliberately NOT written here.
+		//
+		// It used to be, as /etc/twinet/reference.conf mode 0600, so that a TA
+		// could diff against it in place. But a student has a root shell in
+		// their own router -- that is the whole point of the exercise -- so
+		// 0600 protects nothing. The complete expected OSPF, iBGP, eBGP, RPKI
+		// and route-map configuration was sitting inside the container of the
+		// person being asked to derive it, on every ordinary deployment, not
+		// just under --solve. `cp /etc/twinet/reference.conf /etc/frr/frr.conf`
+		// was full marks.
+		//
+		// Nothing read the file; it was pure liability. A TA who wants the
+		// reference gets it from the controller with `twinet inspect --config`,
+		// which renders it on demand from the same code path.
 	case model.KindSwitch:
 		out["/etc/twinet/vlans"] = deploy.FileSpec{Content: []byte(vlanList(d)), Mode: 0o644}
 	case model.KindService:
@@ -111,6 +121,15 @@ func (r *Renderer) Commands(d *model.Device) ([]deploy.Command, error) {
 
 func (r *Renderer) routerCommands(d *model.Device) []deploy.Command {
 	cmds := r.resolverCommands(d)
+
+	// Earlier versions wrote the reference solution into every router. Deploy
+	// converges rather than recreating, so simply not writing the file leaves
+	// it in place on every lab already running -- the classes that are exposed
+	// are exactly the ones that have been up longest. Remove it explicitly.
+	cmds = append(cmds, deploy.Command{
+		Describe: "remove any reference solution left by an earlier version",
+		Args:     []string{"sh", "-c", "rm -f /etc/twinet/reference.conf"},
+	})
 
 	// Solve mode installs the reference answer, so the running daemon must end
 	// up matching the file. Writing frr.conf does not do that: FRR keeps
