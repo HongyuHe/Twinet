@@ -84,3 +84,38 @@ func contains(hay, needle string) bool {
 		return false
 	})()
 }
+
+// The reference solution binds its exchange policy to the route server, which
+// is on the shared fabric rather than on the far end of the member's own link.
+// A check that looked at the far end was looking at a switch port, found no
+// neighbour there, and failed a configuration that was correct.
+//
+// This is the shape of the configuration the reference produces; the parser
+// must find the policy through the route server's address.
+func TestTheReferenceExchangePolicyIsFound(t *testing.T) {
+	const cfg = `router bgp 5
+ neighbor 180.140.0.140 remote-as 140
+ address-family ipv4 unicast
+  neighbor 180.140.0.140 route-map IMPORT-IXP-140 in
+  neighbor 180.140.0.140 route-map EXPORT-IXP-140 out
+ exit-address-family
+exit
+route-map IMPORT-IXP-140 deny 10
+ match as-path IXP-140-REGION
+exit
+route-map EXPORT-IXP-140 permit 10
+ set community 140:6 140:7
+exit
+`
+	f := parseFRR(cfg)
+	const rs = "180.140.0.140"
+	if !f.hasNeighbor(rs) {
+		t.Fatal("the route server was not recognised as a neighbour")
+	}
+	if !contains(f.appliedBody(rs, "out"), "140:6") {
+		t.Error("the exchange communities were not found in the policy applied towards the route server")
+	}
+	if !contains(f.appliedBody(rs, "in"), "match as-path") {
+		t.Error("the in-region filter was not found in the policy applied from the route server")
+	}
+}

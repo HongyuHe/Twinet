@@ -26,6 +26,11 @@ type Wire struct {
 	ASes     []WireAS    `json:"ases"`
 	Services []WireSvc   `json:"services,omitempty"`
 	Defaults WireDefault `json:"defaults"`
+	// PeerUnderlay maps node name to VTEP address. It is carried with the lab
+	// so a node can rebuild a cross-node link on its own initiative, which it
+	// must be able to do: a container that restarts at three in the morning
+	// cannot wait for a controller to come round again.
+	PeerUnderlay map[string]string `json:"peer_underlay,omitempty"`
 	// LabSpec is the manifest itself, carried whole.
 	//
 	// Reconstructing a minimal Lab on the far side and copying across the few

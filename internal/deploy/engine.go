@@ -894,3 +894,34 @@ func dedup(in []string) []string {
 	}
 	return out
 }
+
+// RewireDevice rebuilds every link that terminates on one device.
+//
+// A container whose network namespace was emptied -- by a restart, an
+// out-of-memory kill, a host reboot -- is running and reachable and connected
+// to nothing. The wiring itself is idempotent, so the repair is to run it
+// again for that device's links alone, rather than redeploying the lab and
+// disturbing everyone else's work to fix one node.
+func (e *Engine) RewireDevice(ctx context.Context, top *model.Topology, d *model.Device) error {
+	var failed []string
+	for _, l := range top.Links {
+		if l.A == nil || l.B == nil || l.A.Device == nil || l.B.Device == nil {
+			continue
+		}
+		if l.A.Device.ID != d.ID && l.B.Device.ID != d.ID {
+			continue
+		}
+		if l.A.Device.Node != e.Node && l.B.Device.Node != e.Node {
+			continue
+		}
+		if err := e.wire(ctx, top, l); err != nil {
+			failed = append(failed, fmt.Sprintf("%s: %v", l.ID, err))
+		}
+	}
+	if len(failed) > 0 {
+		return fmt.Errorf("rewiring %s: %s", d.ID, strings.Join(failed, "; "))
+	}
+	// Interfaces are only half the device. The daemons were started against a
+	// namespace that no longer exists, so they are pointed at the new one.
+	return e.configure(ctx, d)
+}

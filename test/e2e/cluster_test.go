@@ -26,6 +26,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -579,4 +580,87 @@ func TestASubmissionSurvivesSaveAndRestore(t *testing.T) {
 		t.Errorf("a submission scored %.2f of %.2f after a save and restore; "+
 			"part of the answer did not survive the archive", rep.Total, rep.MaxTotal)
 	}
+}
+
+// A container that restarts comes back with an empty network namespace: every
+// interface gone, only lo and the kernel's sit0 left. It is running, its state
+// says healthy, and it can reach nothing at all.
+//
+// Nothing used to notice. The wiring is idempotent and a deploy would put it
+// back, but a deploy only runs when a person runs one, and the person has no
+// reason to until somebody reports the symptom. In between, the device is a
+// black hole in the middle of an assignment, and the first thing the student
+// suspects is their own configuration.
+func TestARestartedContainerRewiresItself(t *testing.T) {
+	const device = "svc/matrix"
+	container := containerFor(t, device)
+
+	before := interfaceCount(t, container)
+	if before < 3 {
+		t.Fatalf("%s started this test with %d interfaces; it is not wired to begin with",
+			device, before)
+	}
+
+	if out, err := exec.Command("sudo", "docker", "restart", container).CombinedOutput(); err != nil {
+		t.Fatalf("restarting %s: %v: %s", container, err, out)
+	}
+	time.Sleep(3 * time.Second)
+
+	if n := interfaceCount(t, container); n > 2 {
+		t.Skipf("%s kept %d interfaces across a restart, so this platform does not "+
+			"reproduce the failure this test exists for", device, n)
+	}
+
+	// The node repairs itself on its own schedule; no deploy is run here,
+	// because the whole point is that nobody has to.
+	deadline := time.Now().Add(3 * time.Minute)
+	for time.Now().Before(deadline) {
+		if interfaceCount(t, container) >= before {
+			t.Logf("%s rewired itself with no intervention", device)
+			return
+		}
+		time.Sleep(5 * time.Second)
+	}
+	t.Fatalf("%s still had %d of its %d interfaces three minutes after restarting; "+
+		"a device that restarts stays disconnected until a human notices",
+		device, interfaceCount(t, container), before)
+}
+
+func interfaceCount(t *testing.T, container string) int {
+	t.Helper()
+	out, err := exec.Command("sudo", "docker", "exec", container,
+		"sh", "-c", "ip -o link show 2>/dev/null | wc -l").Output()
+	if err != nil {
+		return 0
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+// containerFor resolves a lab device name to the container that runs it.
+func containerFor(t *testing.T, device string) string {
+	t.Helper()
+	out, err := twinet(t, "runtime", "nodes", "-m", labDir(t), "--json")
+	if err != nil {
+		t.Fatalf("listing the lab's devices: %v", err)
+	}
+	var doc struct {
+		Nodes []struct {
+			Name      string `json:"name"`
+			Container string `json:"container"`
+		} `json:"nodes"`
+	}
+	if err := json.Unmarshal([]byte(out), &doc); err != nil {
+		t.Fatalf("reading the device list: %v", err)
+	}
+	for _, n := range doc.Nodes {
+		if n.Name == device {
+			return n.Container
+		}
+	}
+	t.Fatalf("device %q is not in this lab", device)
+	return ""
 }

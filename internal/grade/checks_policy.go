@@ -182,9 +182,9 @@ func checkIXPCommunities(ctx context.Context, env *Env) Result {
 	for _, r := range as.Routers {
 		for _, i := range r.Ifaces {
 			if i.Role == model.RoleIXPLink && i.Peer != nil {
-				ixp = i.Peer.Device.ASN
-				ixpRouter = r
-				ixpPeer = ipOnly(i.Peer.Addr4)
+				if addr, asn := routeServerOn(env.Topology, i); addr != "" {
+					ixp, ixpRouter, ixpPeer = asn, r, addr
+				}
 			}
 		}
 	}

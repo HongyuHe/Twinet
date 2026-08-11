@@ -2,6 +2,8 @@ package grade
 
 import (
 	"strings"
+
+	"github.com/HongyuHe/twinet/internal/model"
 )
 
 // frrConfig gives the grader a structured view of a router's running
@@ -113,4 +115,35 @@ func ipOnly(addr string) string {
 		return addr[:i]
 	}
 	return addr
+}
+
+// routeServerOn finds the address of the exchange's route server on the segment
+// an interface is attached to.
+//
+// At an exchange the members share an L2 fabric rather than peering
+// point-to-point, so the interface on the far side of a member's link is a
+// switch port, not the route server. Using the far side's address made the
+// grader look for a policy bound to a neighbour that does not exist, and it
+// failed the reference solution -- whose configuration was right.
+func routeServerOn(top *model.Topology, i *model.Iface) (string, int) {
+	if i.Link == nil {
+		return "", 0
+	}
+	seg := i.Link.Segment
+	for _, l := range top.Links {
+		if l.Segment == "" || l.Segment != seg {
+			continue
+		}
+		for _, side := range []*model.Iface{l.A, l.B} {
+			if side == nil || side.Device == nil || side.Addr4 == "" {
+				continue
+			}
+			as := top.ASes[side.Device.ASN]
+			if as == nil || as.Role != model.RoleIXP {
+				continue
+			}
+			return ipOnly(side.Addr4), side.Device.ASN
+		}
+	}
+	return "", 0
 }

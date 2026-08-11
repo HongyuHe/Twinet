@@ -131,6 +131,10 @@ type Server struct {
 	// -- and a single slot would make each new deployment forget the previous
 	// one, so a later destroy could no longer capture the work it holds.
 	current map[string]*model.Topology
+	// peers records the VTEP address of every other node, per lab, so that a
+	// cross-node link can be rebuilt without waiting for the controller to
+	// send the map again.
+	peers map[string]map[string]string
 
 	// ops holds one lease per lab. Docker inspect-then-create and netlink
 	// lookup-then-add are check-then-act sequences, so two overlapping applies
@@ -212,6 +216,12 @@ func (s *Server) rehydrate() {
 			continue
 		}
 		s.current[top.Name] = top
+		if wt.PeerUnderlay != nil {
+			if s.peers == nil {
+				s.peers = map[string]map[string]string{}
+			}
+			s.peers[top.Name] = wt.PeerUnderlay
+		}
 	}
 	if len(s.current) > 0 {
 		slog.Info("reloaded labs from the state store", "count", len(s.current))
@@ -329,6 +339,11 @@ func (s *Server) Serve(ctx context.Context) error {
 		slog.Warn("serving plain HTTP with only a bearer token",
 			"listen", s.cfg.Listen, "reason", insecureReason(s.cfg))
 	}
+
+	// Repair devices whose network namespace has been emptied. Without this a
+	// container that restarts on its own is running, healthy and connected to
+	// nothing until somebody happens to redeploy.
+	go s.reconcileLoop(ctx)
 
 	errc := make(chan error, 1)
 	go func() {
@@ -546,6 +561,12 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 
 	s.mu.Lock()
 	s.current[top.Name] = top
+	if s.peers == nil {
+		s.peers = map[string]map[string]string{}
+	}
+	// Kept so a cross-node link can be rebuilt on this node's own initiative,
+	// without waiting for the controller to send the map again.
+	s.peers[top.Name] = req.PeerUnderlay
 	s.mu.Unlock()
 
 	// Recorded on disk as well as in memory. An agent restarted for any reason
@@ -555,7 +576,11 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 	// A dry run changed nothing, so recording it would make the node claim to
 	// host a lab that was never built.
 	if s.store != nil && !req.DryRun {
-		if raw, err := json.Marshal(req.Topology); err == nil {
+		// The peer map travels with the lab so a node that restarts can rebuild
+		// a cross-node link without the controller.
+		wt := req.Topology
+		wt.PeerUnderlay = req.PeerUnderlay
+		if raw, err := json.Marshal(wt); err == nil {
 			if err := s.store.PutTopology(top.Name, raw); err != nil {
 				slog.Warn("recording the applied topology", "lab", top.Name, "err", err)
 			}
