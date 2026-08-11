@@ -149,7 +149,7 @@ someone has checked.
 | Krill as a live RPKI publication point | M2 | The lab serves an RTR feed derived from the topology, which is what the exercise needs; a real publication point with per-AS validators is the fuller version |
 | COS-461 Q2.6 stub-AS hijack scenarios | M7 | The RPKI machinery is in place and the check is honest; the scripted hijack scenarios are not written |
 | Diff-and-converge `apply` | M4 | Deploy is idempotent and now self-healing, but does not compute a minimal change plan |
-| Advanced-course exercises (MPLS, VRF, multicast) | M7 | The agent already loads the MPLS modules; no exercises or checks exist |
+| Advanced-course exercises: multicast | M7 | MPLS and VRF are done -- `examples/advnet` is the ETH BGP-free-core and BGP/MPLS L3VPN exercise, verified end to end on the cluster: the two sites of each bank reach each other over a two-label stack, neither bank reaches the other, and the core router has no BGP instance and four operational LDP neighbours. Multicast has no exercise and no checks. `advnet` also has no rubric yet, so it can be deployed and explored but not graded |
 | The 21 unimplemented NIKA fault types | M8 | Six P4, five DHCP, four Kubernetes, three SDN southbound, three others. Each needs a substrate the lab does not run — see [10](10_fault_injection.md) §4.1, which explains why DHCP in particular is a design change rather than a fault to add |
 | DHCP, web and load-balancer services, traffic generation | M8 | Prerequisites for nine of those |
 
