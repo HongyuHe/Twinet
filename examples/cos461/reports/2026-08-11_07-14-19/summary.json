@@ -1,0 +1,279 @@
+{
+  "rubric": "cos461-routing",
+  "graded_at": "2026-08-11T07:15:13.702341765Z",
+  "count": 1,
+  "mean": 9.971428571428572,
+  "median": 9.971428571428572,
+  "min": 9.971428571428572,
+  "max": 9.971428571428572,
+  "max_total": 10,
+  "duration": "53.858s",
+  "reports": [
+    {
+      "submission": "group5",
+      "as": 5,
+      "lab": "cos461",
+      "rubric": "cos461-routing",
+      "manifest_hash": "252cf55d2253d6ed",
+      "graded_at": "2026-08-11T07:14:19.844492638Z",
+      "duration": "53.858s",
+      "total": 9.971428571428572,
+      "max_total": 10,
+      "questions": [
+        {
+          "id": "q1.1",
+          "title": "Layer-2 connectivity and VLANs",
+          "points": 1,
+          "awarded": 1,
+          "status": "pass",
+          "results": [
+            {
+              "check": "l2.vlan_isolation",
+              "status": "pass",
+              "score": 1,
+              "evidence": {
+                "observed": "2 VLANs isolated correctly, routed via ATL"
+              },
+              "duration": "436ms"
+            }
+          ]
+        },
+        {
+          "id": "q1.2",
+          "title": "IP addressing and OSPF",
+          "points": 1,
+          "awarded": 0.9714285714285715,
+          "status": "partial",
+          "results": [
+            {
+              "check": "l3.addressing_matches_plan",
+              "status": "pass",
+              "score": 1,
+              "evidence": {
+                "detail": "all 49 required addresses are configured"
+              },
+              "duration": "794ms"
+            },
+            {
+              "check": "ospf.full_adjacency",
+              "status": "pass",
+              "score": 1,
+              "evidence": {
+                "observed": "24/24 adjacencies Full"
+              },
+              "duration": "1.365s"
+            },
+            {
+              "check": "ospf.subnets_advertised",
+              "status": "pass",
+              "score": 1,
+              "evidence": {
+                "observed": "all 32 internal subnets visible from HOU"
+              },
+              "duration": "195ms"
+            },
+            {
+              "check": "dataplane.internal_reachability",
+              "status": "partial",
+              "score": 0.8571428571428571,
+              "evidence": {
+                "observed": "1 unreachable",
+                "expected": "7 reachable hosts",
+                "detail": "MSP_host cannot reach CHI_host (5.105.0.1)",
+                "hint": "every internal subnet, including the router-host links, must be advertised in OSPF",
+                "command": "ping"
+              },
+              "duration": "4.539s"
+            },
+            {
+              "check": "config.no_forbidden_ospf",
+              "status": "pass",
+              "score": 1,
+              "evidence": {
+                "observed": "no inter-AS subnets are advertised in OSPF"
+              },
+              "duration": "1.387s"
+            }
+          ]
+        },
+        {
+          "id": "q1.3",
+          "title": "OSPF load balancing",
+          "points": 1,
+          "awarded": 1,
+          "status": "pass",
+          "results": [
+            {
+              "check": "ospf.ecmp_paths",
+              "status": "pass",
+              "score": 1,
+              "evidence": {
+                "observed": "all 3 prescribed paths installed; ATL balances over port_BOS, port_PHY"
+              },
+              "duration": "538ms"
+            }
+          ]
+        },
+        {
+          "id": "q1.4",
+          "title": "IPv6 addressing and 6in4 tunnels",
+          "points": 1,
+          "awarded": 1,
+          "status": "pass",
+          "results": [
+            {
+              "check": "tunnel.sixin4",
+              "status": "pass",
+              "score": 1,
+              "evidence": {
+                "observed": "IPv6 crosses between DCN and DCS through a 6in4 tunnel"
+              },
+              "duration": "694ms"
+            }
+          ]
+        },
+        {
+          "id": "q2.1",
+          "title": "iBGP full mesh",
+          "points": 0.5,
+          "awarded": 0.5,
+          "status": "pass",
+          "results": [
+            {
+              "check": "bgp.ibgp_full_mesh",
+              "status": "pass",
+              "score": 1,
+              "evidence": {
+                "observed": "56 of 56 iBGP sessions established"
+              },
+              "duration": "1.356s"
+            }
+          ]
+        },
+        {
+          "id": "q2.2",
+          "title": "eBGP sessions and prefix advertisement",
+          "points": 0.5,
+          "awarded": 0.5,
+          "status": "pass",
+          "results": [
+            {
+              "check": "bgp.ebgp_established",
+              "status": "pass",
+              "score": 1,
+              "evidence": {
+                "observed": "all 5 eBGP sessions established"
+              },
+              "duration": "681ms"
+            },
+            {
+              "check": "bgp.own_prefix_only",
+              "status": "pass",
+              "score": 1,
+              "evidence": {
+                "observed": "originates 5.0.0.0/8"
+              },
+              "duration": "167ms"
+            }
+          ]
+        },
+        {
+          "id": "q2.3",
+          "title": "Business relationships",
+          "points": 2,
+          "awarded": 2,
+          "status": "pass",
+          "results": [
+            {
+              "check": "policy.gao_rexford",
+              "status": "pass",
+              "score": 1,
+              "evidence": {
+                "observed": "observed local preference: customer=300 peer=200 provider=50"
+              },
+              "duration": "1.352s"
+            },
+            {
+              "check": "policy.no_transit_for_peers",
+              "status": "pass",
+              "score": 1,
+              "evidence": {
+                "observed": "no leaks across 3 neighbour views"
+              },
+              "duration": "4.033s"
+            }
+          ]
+        },
+        {
+          "id": "q2.4",
+          "title": "Peering through an internet exchange",
+          "points": 1,
+          "awarded": 1,
+          "status": "pass",
+          "results": [
+            {
+              "check": "policy.ixp_communities",
+              "status": "pass",
+              "score": 1,
+              "evidence": {
+                "observed": "tags 7 exchange communities and filters on AS path",
+                "detail": "140:1 140:2 140:3 140:4 140:6 140:7 140:8"
+              },
+              "duration": "181ms"
+            }
+          ]
+        },
+        {
+          "id": "q2.5",
+          "title": "Traffic engineering around the slow links",
+          "points": 1,
+          "awarded": 1,
+          "status": "pass",
+          "results": [
+            {
+              "check": "policy.traffic_engineering",
+              "status": "pass",
+              "score": 1,
+              "evidence": {
+                "observed": "slow neighbours: AS1 via MSP (25ms) AS8 via SFO (25ms)"
+              },
+              "duration": "6.842s"
+            }
+          ]
+        },
+        {
+          "id": "q2.6",
+          "title": "RPKI and route origin validation",
+          "points": 1,
+          "awarded": 1,
+          "status": "pass",
+          "results": [
+            {
+              "check": "rpki.invalid_rejected",
+              "status": "pass",
+              "score": 1,
+              "evidence": {
+                "observed": "no RPKI-invalid route is selected",
+                "detail": "BOS: rpki cache 197.5.0.2 3323 preference 1\nCHI: rpki cache 197.5.0.2 3323 preference 1\nMSP: rpki cache 197.5.0.2 3323 preference 1\nNYC: rpki cache 197.5.0.2 3323 preference 1\nSFO: rpki cache 197.5.0.2 3323 preference 1"
+              },
+              "duration": "2.931s"
+            },
+            {
+              "check": "rpki.notfound_preserved",
+              "status": "pass",
+              "score": 1,
+              "evidence": {
+                "observed": "routes without a ROA are still accepted"
+              },
+              "duration": "2.771s"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "failures_by_check": {
+    "dataplane.internal_reachability": 1
+  },
+  "graded": 1
+}

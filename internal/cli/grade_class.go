@@ -100,6 +100,9 @@ another's work.`,
 
 			start := time.Now()
 			var reports []*grade.Report
+			// Set once the deployed lab can no longer be trusted to represent
+			// the reference solution.
+			contaminated := ""
 
 			for i, wave := range waves {
 				fmt.Fprintf(cmd.ErrOrStderr(), "\nwave %d/%d: %s\n", i+1, len(waves), groupNames(wave))
@@ -107,13 +110,31 @@ another's work.`,
 				loaded := make([]submission, 0, len(wave))
 				for _, s := range wave {
 					if err := applySubmission(cmd.Context(), exec, top, s); err != nil {
+						// A submission that failed partway through loading has
+						// left its AS in neither the reference state nor its
+						// own. Its neighbours in this wave are graded across
+						// that AS, so leaving it there would quietly move their
+						// marks. Put it back before going on.
+						note := fmt.Sprintf("loading the submission: %v", err)
+						if rerr := redeployScopes(cmd.Context(), top, token,
+							[]string{fmt.Sprintf("as%d", s.AS)}); rerr != nil {
+							note += fmt.Sprintf("; and AS %d could not be returned to the "+
+								"reference afterwards (%v), so this wave is suspect", s.AS, rerr)
+							contaminated = fmt.Sprintf(
+								"AS %d was left part-loaded after %s failed and could not be reset: %v",
+								s.AS, s.Group, rerr)
+						}
 						reports = append(reports, &grade.Report{
 							Submission: s.Group, AS: s.AS, MaxTotal: rubric.MaxTotal(),
-							Err: fmt.Sprintf("loading the submission: %v", err), NeedsReview: true,
+							Err: note, NeedsReview: true,
 						})
 						continue
 					}
 					loaded = append(loaded, s)
+				}
+				if contaminated != "" {
+					reports = append(reports, quarantine(waves[i:], rubric.MaxTotal(), contaminated)...)
+					break
 				}
 
 				// One convergence wait for the whole wave rather than one per
@@ -127,7 +148,22 @@ another's work.`,
 				reports = append(reports, got...)
 
 				if !keepLoaded {
-					restoreWave(cmd.Context(), opts, top, loaded, token, cmd.ErrOrStderr())
+					if err := restoreWave(cmd.Context(), opts, top, loaded, token); err != nil {
+						// Carrying on would grade every later wave against this
+						// wave's work and report the results as if they were
+						// sound. A mark that is wrong and labelled correct is
+						// worse than no mark: the student has no reason to
+						// appeal and the grader has no reason to look.
+						contaminated = err.Error()
+						fmt.Fprintf(cmd.ErrOrStderr(),
+							"\n  %v\n  the remaining waves cannot be graded against a known-good "+
+								"internet and are held for review\n", err)
+						if i+1 < len(waves) {
+							reports = append(reports,
+								quarantine(waves[i+1:], rubric.MaxTotal(), contaminated)...)
+						}
+						break
+					}
 				}
 			}
 
@@ -288,21 +324,42 @@ func gradeWave(ctx context.Context, top *model.Topology, rubric *grade.Rubric,
 // next wave is marked against a correct internet rather than against whatever
 // the previous wave left behind.
 func restoreWave(ctx context.Context, opts *Options, top *model.Topology,
-	wave []submission, token string, errOut interface{ Write([]byte) (int, error) }) {
+	wave []submission, token string) error {
 
 	if len(wave) == 0 {
-		return
+		return nil
 	}
 	var scopes []string
 	for _, s := range wave {
 		scopes = append(scopes, fmt.Sprintf("as%d", s.AS))
 	}
 	if err := redeployScopes(ctx, top, token, scopes); err != nil {
-		fmt.Fprintf(errOut,
-			"  warning: %s could not be returned to the reference (%v); "+
-				"later waves may be marked against this wave's work\n",
+		return fmt.Errorf("%s could not be returned to the reference solution: %w",
 			groupNames(wave), err)
 	}
+	return nil
+}
+
+// quarantine produces a held-for-review report for every submission that could
+// not be graded against a known-good internet.
+//
+// Reporting these as failures would be a lie in the student's disfavour, and
+// reporting them as passes would be a lie in the grader's. They are recorded as
+// ungraded, with the reason, so a human decides.
+func quarantine(waves [][]submission, maxTotal float64, reason string) []*grade.Report {
+	var out []*grade.Report
+	for _, w := range waves {
+		for _, s := range w {
+			out = append(out, &grade.Report{
+				Submission: s.Group, AS: s.AS, MaxTotal: maxTotal,
+				NeedsReview: true,
+				Err: "not graded: the lab could not be returned to the reference solution " +
+					"before this wave, so any mark would be measuring an earlier " +
+					"submission's work as much as this one's (" + reason + ")",
+			})
+		}
+	}
+	return out
 }
 
 func groupNames(wave []submission) string {

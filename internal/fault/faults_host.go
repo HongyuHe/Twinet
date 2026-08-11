@@ -20,6 +20,7 @@ func init() {
 		Symptom:  "Some hosts are unable to communicate with other devices in the network.",
 		Describe: "The host's IPv4 address was removed from its interface.",
 		Inject: func(ctx context.Context, e *Env, t Target) (State, error) {
+			routes := saveRoutes(ctx, e, t)
 			iface, addr, err := hostAddr(e, t)
 			if err != nil {
 				return nil, err
@@ -27,7 +28,7 @@ func init() {
 			if _, err := e.Sh(ctx, t.DeviceID(), fmt.Sprintf("ip addr del %s dev %s", addr, iface)); err != nil {
 				return nil, err
 			}
-			return State{"iface": iface, "addr": addr}, nil
+			return State{"iface": iface, "addr": addr, "routes": routes}, nil
 		},
 		Verify: func(ctx context.Context, e *Env, t Target, s State) (Evidence, error) {
 			iface, addr, err := hostAddr(e, t)
@@ -43,9 +44,11 @@ func init() {
 			if s["addr"] == "" {
 				return nil
 			}
-			_, err := e.Sh(ctx, t.DeviceID(),
-				fmt.Sprintf("ip addr replace %s dev %s", s["addr"], s["iface"]))
-			return err
+			if _, err := e.Sh(ctx, t.DeviceID(),
+				fmt.Sprintf("ip addr replace %s dev %s", s["addr"], s["iface"])); err != nil {
+				return err
+			}
+			return restoreRoutes(ctx, e, t, s["routes"])
 		},
 	})
 
@@ -54,6 +57,7 @@ func init() {
 		Symptom:  "Some hosts seem to be unreachable in the network.",
 		Describe: "The host's IPv4 address was changed to one outside its subnet.",
 		Inject: func(ctx context.Context, e *Env, t Target) (State, error) {
+			routes := saveRoutes(ctx, e, t)
 			iface, addr, err := hostAddr(e, t)
 			if err != nil {
 				return nil, err
@@ -67,7 +71,7 @@ func init() {
 			if err != nil {
 				return nil, err
 			}
-			return State{"iface": iface, "addr": addr, "wrong": wrong}, nil
+			return State{"iface": iface, "addr": addr, "wrong": wrong, "routes": routes}, nil
 		},
 		Verify: func(ctx context.Context, e *Env, t Target, s State) (Evidence, error) {
 			iface, addr, err := hostAddr(e, t)
@@ -84,10 +88,12 @@ func init() {
 			if s["addr"] == "" {
 				return nil
 			}
-			_, err := e.Sh(ctx, t.DeviceID(), fmt.Sprintf(
+			if _, err := e.Sh(ctx, t.DeviceID(), fmt.Sprintf(
 				"ip addr del %s dev %s 2>/dev/null; ip addr replace %s dev %s",
-				s["wrong"], s["iface"], s["addr"], s["iface"]))
-			return err
+				s["wrong"], s["iface"], s["addr"], s["iface"])); err != nil {
+				return err
+			}
+			return restoreRoutes(ctx, e, t, s["routes"])
 		},
 	})
 
@@ -96,6 +102,7 @@ func init() {
 		Symptom:  "Some hosts seem to be unreachable in the network.",
 		Describe: "The host's prefix length was widened, so it believes remote destinations are on-link.",
 		Inject: func(ctx context.Context, e *Env, t Target) (State, error) {
+			routes := saveRoutes(ctx, e, t)
 			iface, addr, err := hostAddr(e, t)
 			if err != nil {
 				return nil, err
@@ -110,7 +117,7 @@ func init() {
 			if err != nil {
 				return nil, err
 			}
-			return State{"iface": iface, "addr": addr, "wrong": bad}, nil
+			return State{"iface": iface, "addr": addr, "wrong": bad, "routes": routes}, nil
 		},
 		Verify: func(ctx context.Context, e *Env, t Target, s State) (Evidence, error) {
 			iface, addr, err := hostAddr(e, t)
@@ -125,10 +132,12 @@ func init() {
 			if s["addr"] == "" {
 				return nil
 			}
-			_, err := e.Sh(ctx, t.DeviceID(), fmt.Sprintf(
+			if _, err := e.Sh(ctx, t.DeviceID(), fmt.Sprintf(
 				"ip addr del %s dev %s 2>/dev/null; ip addr replace %s dev %s",
-				s["wrong"], s["iface"], s["addr"], s["iface"]))
-			return err
+				s["wrong"], s["iface"], s["addr"], s["iface"])); err != nil {
+				return err
+			}
+			return restoreRoutes(ctx, e, t, s["routes"])
 		},
 	})
 
@@ -139,6 +148,21 @@ func init() {
 		Inject: func(ctx context.Context, e *Env, t Target) (State, error) {
 			cur, _ := e.Try(ctx, t.DeviceID(), "ip route show default")
 			cur = strings.TrimSpace(cur)
+			// Refuse rather than destroy what cannot be put back.
+			//
+			// This used to inject regardless and resolve with
+			// "ip route del default; if a baseline was recorded, restore it".
+			// When nothing had been recorded the second half was skipped, so
+			// resolving deleted the host's default route and put nothing back.
+			// The fault then verified as resolved -- the bogus gateway really
+			// was gone -- while the host was left permanently unable to leave
+			// its own subnet, on a lab everyone believed was clean. It cost a
+			// student a reachability mark before it was found.
+			if cur == "" {
+				return nil, fmt.Errorf(
+					"%s has no default route to misdirect; injecting would leave it with none at all",
+					t.DeviceID())
+			}
 			iface, addr, err := hostAddr(e, t)
 			if err != nil {
 				return nil, err
@@ -173,12 +197,22 @@ func init() {
 				Expected: "the default route via " + wrong, Observed: strings.TrimSpace(out)}, nil
 		},
 		Resolve: func(ctx context.Context, e *Env, t Target, s State) error {
-			script := "ip route del default 2>/dev/null || true"
-			if s["route"] != "" {
-				script += "; ip route replace " + s["route"]
+			if s["route"] == "" {
+				return fmt.Errorf("no default route was recorded for %s, so it cannot be put back; "+
+					"deleting the wrong one would leave the host with no route at all", t.DeviceID())
 			}
-			_, err := e.Sh(ctx, t.DeviceID(), script)
-			return err
+			if _, err := e.Sh(ctx, t.DeviceID(),
+				"ip route del default 2>/dev/null || true; ip route replace "+s["route"]); err != nil {
+				return err
+			}
+			// Confirm the baseline is back, not merely that the wrong gateway
+			// is gone. The two are not the same, and only one of them leaves
+			// the host working.
+			out, _ := e.Try(ctx, t.DeviceID(), "ip route show default")
+			if strings.TrimSpace(out) == "" {
+				return fmt.Errorf("%s was left with no default route after resolving", t.DeviceID())
+			}
+			return nil
 		},
 	})
 
@@ -240,6 +274,7 @@ func init() {
 		Symptom:  "Some hosts experience intermittent connectivity issues.",
 		Describe: "A second device was given the same address, so ARP resolves inconsistently.",
 		Inject: func(ctx context.Context, e *Env, t Target) (State, error) {
+			routes := saveRoutes(ctx, e, t)
 			victim := t.Param("victim", "")
 			if victim == "" {
 				return nil, fmt.Errorf("host_ip_conflict needs a victim device in params")
@@ -257,7 +292,7 @@ func init() {
 				fmt.Sprintf("ip addr add %s dev %s", addr, iface)); err != nil {
 				return nil, err
 			}
-			return State{"iface": iface, "addr": addr}, nil
+			return State{"iface": iface, "addr": addr, "routes": routes}, nil
 		},
 		Verify: func(ctx context.Context, e *Env, t Target, s State) (Evidence, error) {
 			// The duplicate address must be present on the attacker, not merely
@@ -272,9 +307,13 @@ func init() {
 			if s["addr"] == "" {
 				return nil
 			}
-			_, err := e.Sh(ctx, t.DeviceID(),
-				fmt.Sprintf("ip addr del %s dev %s 2>/dev/null || true", s["addr"], s["iface"]))
-			return err
+			if _, err := e.Sh(ctx, t.DeviceID(),
+				fmt.Sprintf("ip addr del %s dev %s 2>/dev/null || true", s["addr"], s["iface"])); err != nil {
+				return err
+			}
+			// Removing an address can take a connected route with it, and every
+			// route that resolved through it.
+			return restoreRoutes(ctx, e, t, s["routes"])
 		},
 	})
 
@@ -364,4 +403,37 @@ func neighbourAddr(addr string) (string, error) {
 	b := p.Addr().As4()
 	b[3] = 254
 	return netip.AddrFrom4(b).String(), nil
+}
+
+// saveRoutes records the statically configured routes on a device.
+//
+// Removing an address takes its connected route with it, and the kernel then
+// silently drops every route whose next hop that connected route resolved --
+// including the default. Restoring the address does not bring them back, so a
+// fault that only put the address back left the host able to talk to its own
+// subnet and nothing else. That is how a host in this lab spent a week with no
+// default route, and the reachability mark it cost was blamed on the student.
+func saveRoutes(ctx context.Context, e *Env, t Target) string {
+	out, _ := e.Try(ctx, t.DeviceID(),
+		`ip -o route show 2>/dev/null | grep -v 'proto \(bgp\|ospf\|zebra\|kernel\)'`)
+	var keep []string
+	for _, l := range strings.Split(out, "\n") {
+		if l = strings.TrimSpace(l); l != "" {
+			keep = append(keep, l)
+		}
+	}
+	return strings.Join(keep, "\n")
+}
+
+// restoreRoutes puts back what removing an address took with it.
+func restoreRoutes(ctx context.Context, e *Env, t Target, saved string) error {
+	for _, l := range strings.Split(saved, "\n") {
+		if l = strings.TrimSpace(l); l == "" {
+			continue
+		}
+		if _, err := e.Sh(ctx, t.DeviceID(), "ip route replace "+l); err != nil {
+			return fmt.Errorf("putting back the route %q: %w", l, err)
+		}
+	}
+	return nil
 }

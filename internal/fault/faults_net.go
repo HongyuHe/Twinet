@@ -20,10 +20,16 @@ func init() {
 			if err != nil {
 				return nil, err
 			}
+			// Taking an interface down takes its connected route with it, and
+			// with that every manually added route that resolved through it --
+			// typically the default. Bringing the interface back up restores
+			// only the connected route, so without this the device is left
+			// reachable on its own subnet and nowhere else.
+			routes := saveRoutes(ctx, e, t)
 			if _, err := e.Sh(ctx, t.DeviceID(), "ip link set "+iface+" down"); err != nil {
 				return nil, err
 			}
-			return State{"iface": iface}, nil
+			return State{"iface": iface, "routes": routes}, nil
 		},
 		Verify: func(ctx context.Context, e *Env, t Target, s State) (Evidence, error) {
 			iface, err := faultIface(e, t)
@@ -38,8 +44,10 @@ func init() {
 			if s["iface"] == "" {
 				return nil
 			}
-			_, err := e.Sh(ctx, t.DeviceID(), "ip link set "+s["iface"]+" up")
-			return err
+			if _, err := e.Sh(ctx, t.DeviceID(), "ip link set "+s["iface"]+" up"); err != nil {
+				return err
+			}
+			return restoreRoutes(ctx, e, t, s["routes"])
 		},
 	})
 
@@ -244,12 +252,13 @@ func init() {
 					names = append(names, i.Name)
 				}
 			}
+			routes := saveRoutes(ctx, e, t)
 			for _, n := range names {
 				if _, err := e.Sh(ctx, t.DeviceID(), "ip link set "+n+" down"); err != nil {
 					return nil, err
 				}
 			}
-			return State{"ifaces": strings.Join(names, ",")}, nil
+			return State{"ifaces": strings.Join(names, ","), "routes": routes}, nil
 		},
 		Verify: func(ctx context.Context, e *Env, t Target, s State) (Evidence, error) {
 			var up int
@@ -280,7 +289,7 @@ func init() {
 					return err
 				}
 			}
-			return nil
+			return restoreRoutes(ctx, e, t, s["routes"])
 		},
 	})
 

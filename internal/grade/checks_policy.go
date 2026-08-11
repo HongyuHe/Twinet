@@ -78,53 +78,76 @@ func checkSixIn4(ctx context.Context, env *Env) Result {
 	}
 	sort.Strings(domains)
 
-	// A tunnel device must exist on both gateways.
+	// A configured tunnel must exist on both gateways.
+	//
+	// Every container carries the kernel's own sit0, so a substring test for
+	// "sit" is true before the student has done anything at all. Only a device
+	// with both endpoints set counts.
 	var missing []string
+	tunnels := map[string]string{}
 	for _, d := range domains {
 		gw := gateways[d]
-		out, err := env.Probe(ctx, gw.ID, []string{"ip", "-o", "link", "show"})
+		out, err := env.Probe(ctx, gw.ID, []string{"sh", "-c", "ip -d tunnel show 2>/dev/null"})
 		if err != nil {
 			return Errored("tunnel.sixin4", err)
 		}
-		if !strings.Contains(out.Stdout, "sit") && !strings.Contains(out.Stdout, "ip6tnl") {
-			missing = append(missing, fmt.Sprintf("%s has no 6in4 (sit) tunnel device", gw.Name))
+		if name := configuredTunnel(out.Stdout); name != "" {
+			tunnels[d] = name
+		} else {
+			missing = append(missing, fmt.Sprintf("%s has no configured 6in4 tunnel "+
+				"(the kernel's own sit0 does not count: it has no endpoints)", gw.Name))
 		}
 	}
 
-	// And IPv6 must actually get across.
+	// And IPv6 must actually get across *through the tunnel*.
+	//
+	// Native IPv6 routing between the datacentres also makes the ping succeed,
+	// and it is not what the question asks for. The tunnel's own counters
+	// settle it: if they do not move, the packets went some other way.
 	var reach string
-	reachable := false
+	reachable, throughTunnel := false, false
 	if len(domains) >= 2 {
 		src, sok := hosts[domains[0]]
 		dst, dok := hosts[domains[1]]
-		if sok && dok {
+		gw := gateways[domains[0]]
+		switch {
+		case !sok || !dok:
+			reach = "could not find a host in each datacentre"
+		default:
 			addr := firstAddr6(dst)
 			if addr == "" {
 				reach = fmt.Sprintf("%s has no IPv6 address configured", dst.Name)
-			} else {
-				res, err := env.Probe(ctx, src.ID,
-					[]string{"ping6", "-c", "2", "-W", "2", "-i", "0.3", addr})
-				if err == nil && res.ExitCode == 0 {
-					reachable = true
-				} else {
-					reach = fmt.Sprintf("%s cannot reach %s at %s over IPv6", src.Name, dst.Name, addr)
-				}
+				break
 			}
-		} else {
-			reach = "could not find a host in each datacentre"
+			before := tunnelTx(ctx, env, gw.ID, tunnels[domains[0]])
+			res, err := env.Probe(ctx, src.ID,
+				[]string{"ping6", "-c", "2", "-W", "2", "-i", "0.3", addr})
+			if err == nil && res.ExitCode == 0 {
+				reachable = true
+			} else {
+				reach = fmt.Sprintf("%s cannot reach %s at %s over IPv6", src.Name, dst.Name, addr)
+			}
+			after := tunnelTx(ctx, env, gw.ID, tunnels[domains[0]])
+			if reachable && tunnels[domains[0]] != "" && after > before {
+				throughTunnel = true
+			} else if reachable && tunnels[domains[0]] != "" {
+				reach = fmt.Sprintf("IPv6 reaches %s, but %s carried no packets during the test, "+
+					"so the traffic is being routed natively rather than encapsulated",
+					dst.Name, tunnels[domains[0]])
+			}
 		}
 	}
 
 	switch {
-	case len(missing) == 0 && reachable:
+	case len(missing) == 0 && reachable && throughTunnel:
 		return Pass("tunnel.sixin4", Evidence{
-			Observed: fmt.Sprintf("IPv6 crosses between %s and %s through a 6in4 tunnel",
-				domains[0], domains[1])})
+			Observed: fmt.Sprintf("IPv6 crosses between %s and %s through %s, which carried the packets",
+				domains[0], domains[1], tunnels[domains[0]])})
 	case reachable:
 		return Partial("tunnel.sixin4", 0.5, Evidence{
 			Expected: "IPv6 carried over a 6in4 tunnel",
-			Observed: "IPv6 works, but no tunnel device was found",
-			Detail:   strings.Join(missing, "\n"),
+			Observed: "IPv6 works, but not through a tunnel",
+			Detail:   strings.TrimSpace(strings.Join(append(missing, reach), "\n")),
 			Hint:     "the question asks for encapsulation, not native IPv6 routing",
 		})
 	default:
@@ -149,14 +172,19 @@ func checkIXPCommunities(ctx context.Context, env *Env) Result {
 		return Errored("policy.ixp_communities", fmt.Errorf("AS %d not in the lab", env.AS))
 	}
 
-	// Find the exchange this AS is attached to, and its number.
+	// Find the exchange this AS is attached to, its number, and the address
+	// the exchange's route server is reached at. The peer address matters:
+	// the mark is for a policy the route server actually sees, not for one
+	// written in the configuration and never attached to anything.
 	ixp := 0
 	var ixpRouter *model.Device
+	ixpPeer := ""
 	for _, r := range as.Routers {
 		for _, i := range r.Ifaces {
 			if i.Role == model.RoleIXPLink && i.Peer != nil {
 				ixp = i.Peer.Device.ASN
 				ixpRouter = r
+				ixpPeer = ipOnly(i.Peer.Addr4)
 			}
 		}
 	}
@@ -168,11 +196,22 @@ func checkIXPCommunities(ctx context.Context, env *Env) Result {
 	if err != nil {
 		return Errored("policy.ixp_communities", err)
 	}
+	cfg := parseFRR(out)
+	if !cfg.hasNeighbor(ixpPeer) {
+		return Fail("policy.ixp_communities", Evidence{
+			Expected: fmt.Sprintf("a session with the exchange's route server at %s", ixpPeer),
+			Observed: "no such neighbour is configured",
+			Hint:     "the exchange relays announcements only between its own members",
+			Command:  "show running-config",
+		})
+	}
 
-	// Look for community values of the form <ixp>:<member> being set.
+	// (i) Communities must be set on what leaves towards the route server.
+	// A "set community" anywhere else changes nothing the exchange can see.
+	outbound := cfg.appliedBody(ixpPeer, "out")
 	prefix := strconv.Itoa(ixp) + ":"
 	var tagged []string
-	for _, line := range strings.Split(out, "\n") {
+	for _, line := range strings.Split(outbound, "\n") {
 		t := strings.TrimSpace(line)
 		if !strings.HasPrefix(t, "set community") {
 			continue
@@ -186,28 +225,42 @@ func checkIXPCommunities(ctx context.Context, env *Env) Result {
 	sort.Strings(tagged)
 	tagged = uniq(tagged)
 
-	// And for an import policy that rejects in-region announcements.
-	filters := strings.Contains(out, "as-path access-list") ||
-		strings.Contains(out, "bgp as-path access-list") ||
-		strings.Contains(out, "match as-path")
+	// (ii) The in-region filter must be applied to what arrives from the
+	// route server, and must actually match on AS path.
+	inbound := cfg.appliedBody(ixpPeer, "in")
+	filters := strings.Contains(inbound, "match as-path")
+
+	unapplied := ""
+	if len(tagged) == 0 && strings.Contains(out, "set community "+prefix) {
+		unapplied = fmt.Sprintf("a route-map sets %s<member> but it is not applied outbound to %s", prefix, ixpPeer)
+	} else if !filters && strings.Contains(out, "match as-path") {
+		unapplied = fmt.Sprintf("an AS-path filter exists but is not applied inbound from %s", ixpPeer)
+	}
 
 	switch {
 	case len(tagged) > 0 && filters:
 		return Pass("policy.ixp_communities", Evidence{
-			Observed: fmt.Sprintf("tags %d exchange communities and filters on AS path", len(tagged)),
-			Detail:   strings.Join(tagged, " "),
+			Observed: fmt.Sprintf("tags %d exchange communities towards %s and filters arrivals on AS path",
+				len(tagged), ixpPeer),
+			Detail: strings.Join(tagged, " "),
 		})
 	case len(tagged) > 0:
 		return Partial("policy.ixp_communities", 0.5, Evidence{
 			Expected: "communities set for out-of-region members, and in-region announcements refused",
-			Observed: fmt.Sprintf("communities set (%s) but no AS-path filter found", strings.Join(tagged, " ")),
-			Hint:     "part (ii) asks you to deny announcements whose path contains an in-region AS",
-			Command:  "show running-config",
+			Observed: fmt.Sprintf("communities set (%s) but no AS-path filter is applied inbound from %s",
+				strings.Join(tagged, " "), ixpPeer),
+			Hint:    "part (ii) asks you to deny announcements whose path contains an in-region AS",
+			Detail:  unapplied,
+			Command: "show running-config",
 		})
 	default:
+		obs := "none set on the session with the route server"
+		if unapplied != "" {
+			obs = unapplied
+		}
 		return Fail("policy.ixp_communities", Evidence{
-			Expected: fmt.Sprintf("community values of the form %s<member>", prefix),
-			Observed: "none set",
+			Expected: fmt.Sprintf("community values of the form %s<member>, set outbound towards %s", prefix, ixpPeer),
+			Observed: obs,
 			Hint: fmt.Sprintf("the exchange relays an announcement to member X only if it carries %s%s",
 				prefix, "X"),
 			Command: "show running-config",
@@ -522,6 +575,22 @@ func checkRPKIInvalidRejected(ctx context.Context, env *Env) Result {
 		})
 	}
 
+	// An empty invalid table is exactly what an unreachable validator produces:
+	// with no ROAs, every route is "notfound" and nothing is ever invalid. So
+	// "no invalid route is selected" on its own is not evidence of anything.
+	// Validation must be shown to be running before its silence means anything.
+	live, liveDetail := rpkiValidating(ctx, env)
+	if !live {
+		return Partial("rpki.invalid_rejected", 0.5, Evidence{
+			Expected: "a validator session that is up, with ROAs received and applied to the BGP table",
+			Observed: liveDetail,
+			Detail:   detail,
+			Hint: "the route-maps are right, but nothing is validating: with no ROAs every route is " +
+				"`notfound`, so no route can be invalid and the policy never fires",
+			Command: "show rpki cache-connection",
+		})
+	}
+
 	// And confirm no invalid route is actually selected.
 	var selected []string
 	for _, r := range env.Routers() {
@@ -537,7 +606,8 @@ func checkRPKIInvalidRejected(ctx context.Context, env *Env) Result {
 	}
 	if len(selected) == 0 {
 		return Pass("rpki.invalid_rejected", Evidence{
-			Observed: "no RPKI-invalid route is selected", Detail: detail})
+			Observed: "validation is live and no RPKI-invalid route is selected",
+			Detail:   liveDetail + "\n" + detail})
 	}
 	return Partial("rpki.invalid_rejected", 0.6, Evidence{
 		Expected: "no invalid route selected",
@@ -651,4 +721,108 @@ func uniq(in []string) []string {
 		prev = s
 	}
 	return out
+}
+
+// rpkiValidating reports whether origin validation is actually operating, as
+// opposed to merely being configured.
+//
+// Three things have to hold, and each has been seen to fail on its own: the
+// session to the validator is established, ROAs have arrived, and the BGP table
+// reflects them. A cache that FRR never connected to leaves all three of the
+// per-state tables empty, which reads identically to a network in which every
+// route is legitimate.
+func rpkiValidating(ctx context.Context, env *Env) (bool, string) {
+	var connected, withROAs, validated []string
+	for _, r := range env.Routers() {
+		if out, err := env.Vtysh(ctx, r.Name, "show rpki cache-connection"); err == nil &&
+			strings.Contains(strings.ToLower(out), "connected") {
+			connected = append(connected, r.Name)
+		}
+		if out, err := env.Vtysh(ctx, r.Name, "show rpki prefix-table"); err == nil {
+			if n := countROAs(out); n > 0 {
+				withROAs = append(withROAs, fmt.Sprintf("%s: %d ROAs", r.Name, n))
+			}
+		}
+		if out, err := env.Vtysh(ctx, r.Name, "show bgp ipv4 unicast rpki valid"); err == nil &&
+			strings.Contains(out, "V") && strings.Contains(out, "Displayed") {
+			validated = append(validated, r.Name)
+		}
+	}
+	sort.Strings(connected)
+	sort.Strings(withROAs)
+	switch {
+	case len(connected) == 0:
+		return false, "no router has an established session with a validator"
+	case len(withROAs) == 0:
+		return false, fmt.Sprintf("%d router(s) reached a validator but received no ROAs", len(connected))
+	case len(validated) == 0:
+		return false, fmt.Sprintf("ROAs were received (%s) but no route carries a validation state",
+			strings.Join(truncate(withROAs, 3), ", "))
+	}
+	return true, fmt.Sprintf("%d router(s) connected to a validator, %s, %d with validated routes",
+		len(connected), strings.Join(truncate(withROAs, 3), ", "), len(validated))
+}
+
+// countROAs counts prefix entries in `show rpki prefix-table` output.
+func countROAs(out string) int {
+	n := 0
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		// "6.0.0.0   8 -   8   6": address, length, "-", maxlen, origin AS.
+		if len(f) >= 5 && strings.Count(f[0], ".") == 3 {
+			n++
+		}
+	}
+	return n
+}
+
+// configuredTunnel returns the name of a 6in4 tunnel with both endpoints set.
+//
+// `ip -d tunnel show` always lists the kernel's sit0 with "remote any local
+// any"; it is not the student's work and matching it awards the mark before
+// the exercise is begun.
+func configuredTunnel(out string) string {
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || !strings.Contains(line, "remote ") || !strings.Contains(line, "local ") {
+			continue
+		}
+		name := strings.TrimSuffix(strings.Fields(line)[0], ":")
+		if name == "sit0" || name == "" {
+			continue
+		}
+		if fieldAfter(line, "remote") == "any" || fieldAfter(line, "local") == "any" {
+			continue
+		}
+		return name
+	}
+	return ""
+}
+
+// tunnelTx reads a tunnel's transmitted packet count.
+func tunnelTx(ctx context.Context, env *Env, device, iface string) int {
+	if iface == "" {
+		return -1
+	}
+	res, err := env.Probe(ctx, device, []string{"sh", "-c",
+		"cat /sys/class/net/" + iface + "/statistics/tx_packets 2>/dev/null"})
+	if err != nil {
+		return -1
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(res.Stdout))
+	if err != nil {
+		return -1
+	}
+	return n
+}
+
+// fieldAfter returns the token following a keyword on a line.
+func fieldAfter(line, key string) string {
+	f := strings.Fields(line)
+	for i, x := range f {
+		if x == key && i+1 < len(f) {
+			return f[i+1]
+		}
+	}
+	return ""
 }

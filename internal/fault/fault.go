@@ -340,9 +340,29 @@ func Inject(ctx context.Context, env *Env, name string, t Target) (*Injection, e
 		}
 	}
 
+	// The device is fingerprinted before anything is changed, so that resolving
+	// can be held to "the device is as it was" rather than the far weaker
+	// "the fault predicate is now false". A fault can satisfy the second while
+	// leaving the device permanently broken.
+	base := ""
+	if t.DeviceID() != "" {
+		base = fingerprint(ctx, env, t.DeviceID())
+	}
+
 	state, err := f.Inject(ctx, env, t)
 	if err != nil {
 		return nil, fmt.Errorf("inject %s: %w", name, err)
+	}
+	if base != "" {
+		if state == nil {
+			state = State{}
+		}
+		if after := fingerprint(ctx, env, t.DeviceID()); after != "" {
+			added, removed := delta(base, after)
+			state[addedKey] = strings.Join(added, "\n")
+			state[removedKey] = strings.Join(removed, "\n")
+			state[versionKey] = fingerprintVersion
+		}
 	}
 	inj := &Injection{
 		Fault: name, Target: t, State: state,
@@ -401,6 +421,31 @@ func Resolve(ctx context.Context, env *Env, inj *Injection) error {
 	if ev.Verified {
 		return fmt.Errorf("resolve %s: the fault is still present afterwards: %s",
 			inj.Fault, ev.Detail)
+	}
+
+	// "The predicate is false" is not "the device is as it was". A resolve can
+	// satisfy the first by destroying the state the fault perturbed: deleting a
+	// misdirected default route removes the misdirection and leaves the host
+	// unable to reach anything. Comparing against the baseline is what
+	// distinguishes an undo from a demolition.
+	added := splitNonEmpty(inj.State[addedKey])
+	removed := splitNonEmpty(inj.State[removedKey])
+	if inj.State[versionKey] != fingerprintVersion {
+		// Recorded by a build that compared different fields. The undo itself
+		// ran and was verified; only the "left as found" check is skipped,
+		// because it could not give a meaningful answer.
+		added, removed = nil, nil
+	}
+	if len(added)+len(removed) > 0 {
+		now := fingerprint(ctx, env, inj.Target.DeviceID())
+		if now == "" {
+			return fmt.Errorf("resolve %s: the undo ran, but %s could not be re-read to confirm "+
+				"it was left as it was found", inj.Fault, inj.Target.DeviceID())
+		}
+		if r := residue(added, removed, now); r != "" {
+			return fmt.Errorf("resolve %s: the fault is gone but %s was not left as it was found: %s",
+				inj.Fault, inj.Target.DeviceID(), r)
+		}
 	}
 	return nil
 }

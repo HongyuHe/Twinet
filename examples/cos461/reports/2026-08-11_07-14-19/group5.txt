@@ -1,0 +1,16 @@
+group5 (AS 5)
+============================================================  9.97 / 10.00 (100%)
+
+[ok] q1.1     Layer-2 connectivity and VLANs             1.00 / 1.00
+[~ ] q1.2     IP addressing and OSPF                     0.97 / 1.00
+        dataplane.internal_reachability: expected 7 reachable hosts, observed 1 unreachable
+          MSP_host cannot reach CHI_host (5.105.0.1)
+          hint: every internal subnet, including the router-host links, must be advertised in OSPF
+[ok] q1.3     OSPF load balancing                        1.00 / 1.00
+[ok] q1.4     IPv6 addressing and 6in4 tunnels           1.00 / 1.00
+[ok] q2.1     iBGP full mesh                             0.50 / 0.50
+[ok] q2.2     eBGP sessions and prefix advertisement     0.50 / 0.50
+[ok] q2.3     Business relationships                     2.00 / 2.00
+[ok] q2.4     Peering through an internet exchange       1.00 / 1.00
+[ok] q2.5     Traffic engineering around the slow links  1.00 / 1.00
+[ok] q2.6     RPKI and route origin validation           1.00 / 1.00
