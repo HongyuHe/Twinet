@@ -74,7 +74,7 @@ lets that be told apart from a mistake, months later, in a dispute.`,
 				}
 			}
 			if outDir == "" {
-				outDir = filepath.Join("submissions", time.Now().UTC().Format("2006-01-02_15-04-05"))
+				outDir = filepath.Join("submissions", time.Now().UTC().Format("2006-01-02-150405"))
 			}
 			if err := os.MkdirAll(outDir, 0o755); err != nil {
 				return err

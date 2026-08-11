@@ -3,6 +3,7 @@ package deploy
 import (
 	"context"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -163,7 +164,19 @@ func Restore(ctx context.Context, r rt.Runtime, d *model.Device, lab string, sto
 	// therefore allowed to fail, and any failure is reported rather than logged.
 	replay := func(kind state.Kind, build func(string) []string) error {
 		snap, err := store.Current(lab, d.ID, kind)
-		if err != nil || len(snap.Content) == 0 {
+		switch {
+		case os.IsNotExist(err):
+			// Nothing was ever captured for this device and kind, which is the
+			// normal case for a device the student has not touched.
+			return nil
+		case err != nil:
+			// A snapshot that exists but cannot be read is not the same thing
+			// as no snapshot. Treating them alike means a corrupt or
+			// unreadable capture is silently skipped and the device comes back
+			// looking clean, which is the failure this whole path exists to
+			// prevent.
+			return fmt.Errorf("reading the saved %s of %s: %w", kind, d.ID, err)
+		case len(snap.Content) == 0:
 			return nil
 		}
 		cmds := build(string(snap.Content))
@@ -190,7 +203,11 @@ func Restore(ctx context.Context, r rt.Runtime, d *model.Device, lab string, sto
 
 	switch d.Kind {
 	case model.KindRouter:
-		if snap, err := store.Current(lab, d.ID, state.KindFRR); err == nil && len(snap.Content) > 0 {
+		snap, err := store.Current(lab, d.ID, state.KindFRR)
+		if err != nil && !os.IsNotExist(err) {
+			return false, fmt.Errorf("reading the saved configuration of %s: %w", d.ID, err)
+		}
+		if err == nil && len(snap.Content) > 0 {
 			// The captured configuration is replayed through vtysh's own file
 			// loader, which is the same path `restore_configs` used and the
 			// only one that accepts a running-config verbatim.

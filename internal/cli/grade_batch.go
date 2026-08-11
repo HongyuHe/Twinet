@@ -94,7 +94,7 @@ mark, unless --keep-labs is given for a dispute.`,
 				return err
 			}
 			if outDir == "" {
-				outDir = filepath.Join("reports", time.Now().UTC().Format("2006-01-02_15-04-05"))
+				outDir = filepath.Join("reports", time.Now().UTC().Format("2006-01-02-150405"))
 			}
 			if err := os.MkdirAll(outDir, 0o755); err != nil {
 				return err

@@ -25,7 +25,7 @@ BUILD_TAG ?= $(TAG)-$(COMMIT)
 # Must match .github/workflows/ci.yml, or local lint and CI can disagree.
 GOLANGCI_VERSION ?= v2.5.0
 
-.PHONY: all build test lint fmt vet images push digests clean install e2e ci naming
+.PHONY: all build test lint fmt vet images push digests clean install e2e ci ci-tools tidy-check naming
 
 all: build
 
@@ -58,13 +58,36 @@ naming:
 	./scripts/check_naming.sh
 
 # Everything CI checks, runnable before pushing.
-ci: naming lint test build
+# `make ci` is the release gate, so it must fail when it cannot check something
+# rather than report success for the subset of gates that happened to be
+# installed. A tool that is missing is an unrun gate, and an unrun gate that
+# prints "passed" is worse than no gate at all: it is a gate that lies.
+ci: ci-tools naming lint test build tidy-check
 	./bin/twinet validate -m examples/demo
 	./bin/twinet validate -m examples/cos461
 	./bin/twinet grade validate examples/cos461/rubric/cos461.yaml
-	@command -v shellcheck >/dev/null 2>&1 && shellcheck scripts/*.sh || \
-		echo "shellcheck not installed; skipped"
+	shellcheck scripts/*.sh
 	@echo "all CI gates passed"
+
+# ci-tools refuses to start a release check that cannot be completed.
+ci-tools:
+	@missing=""; \
+	for t in golangci-lint shellcheck; do \
+		command -v $$t >/dev/null 2>&1 || missing="$$missing $$t"; \
+	done; \
+	if [ -n "$$missing" ]; then \
+		echo "make ci cannot run: missing$$missing"; \
+		echo "these gates run in CI, so skipping them here would report a pass"; \
+		echo "that CI will not agree with. Install golangci-lint $(GOLANGCI_VERSION)"; \
+		echo "and shellcheck, or run the individual targets you want."; \
+		exit 1; \
+	fi
+
+# tidy-check fails when go.mod or go.sum do not match the imports in the tree.
+# A missing sum breaks any build that starts from a clean module cache, which is
+# every CI build and every new contributor's first one.
+tidy-check:
+	$(GO) mod tidy -diff
 
 # The service image ships the RTR validator, which is built from this module
 # rather than downloaded, so the lab's trust anchor is the code in this

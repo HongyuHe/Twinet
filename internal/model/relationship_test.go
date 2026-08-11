@@ -39,7 +39,7 @@ func TestAPeeringLooksTheSameFromBothSides(t *testing.T) {
 // customer is revenue, a route from a peer is free, a route from a provider
 // costs money. Preferring them in any other order is a bill.
 func TestCustomerRoutesOutrankPeerWhichOutranksProvider(t *testing.T) {
-	if !(prefRank(RelCustomer) > prefRank(RelPeer) && prefRank(RelPeer) > prefRank(RelProvider)) {
+	if prefRank(RelCustomer) <= prefRank(RelPeer) || prefRank(RelPeer) <= prefRank(RelProvider) {
 		t.Error("the relationship preference order is not customer > peer > provider")
 	}
 }

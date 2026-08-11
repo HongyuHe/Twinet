@@ -706,20 +706,6 @@ func localASN(ctx context.Context, e *Env, t Target) (int, error) {
 	return 0, fmt.Errorf("%s is not running BGP, so its AS number cannot be changed", t.DeviceID())
 }
 
-// safeFileName makes an interface name usable in a path.
-func safeFileName(s string) string {
-	var b strings.Builder
-	for _, r := range s {
-		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_', r == '-':
-			b.WriteRune(r)
-		default:
-			b.WriteRune('_')
-		}
-	}
-	return b.String()
-}
-
 func faultIface(e *Env, t Target) (string, error) {
 	if t.Iface != "" {
 		return t.Iface, nil

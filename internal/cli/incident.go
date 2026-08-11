@@ -201,7 +201,7 @@ func newIncidentRunCmd(opts *Options) *cobra.Command {
 			ep.Duration = time.Since(start).Round(time.Millisecond).String()
 
 			if outDir == "" {
-				outDir = filepath.Join("episodes", time.Now().UTC().Format("2006-01-02_15-04-05"))
+				outDir = filepath.Join("episodes", time.Now().UTC().Format("2006-01-02-150405"))
 			}
 			if err := os.MkdirAll(outDir, 0o750); err != nil {
 				return err

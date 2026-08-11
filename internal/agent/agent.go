@@ -300,23 +300,44 @@ func (s *Server) Serve(ctx context.Context) error {
 		IdleTimeout:       2 * time.Minute,
 	}
 
-	tlsMode := "disabled"
-	if s.cfg.TLSCert != "" && s.cfg.TLSKey != "" {
-		cfg := &tls.Config{MinVersion: tls.VersionTLS13}
-		tlsMode = "server"
-		if s.cfg.ClientCA != "" {
-			pool := x509.NewCertPool()
-			pem, err := os.ReadFile(s.cfg.ClientCA)
-			if err != nil {
-				return fmt.Errorf("read client CA: %w", err)
-			}
-			if !pool.AppendCertsFromPEM(pem) {
-				return fmt.Errorf("client CA %s contains no certificates", s.cfg.ClientCA)
-			}
-			cfg.ClientCAs = pool
-			cfg.ClientAuth = tls.RequireAndVerifyClientCert
-			tlsMode = "mutual"
+	// A partial TLS configuration is refused rather than served.
+	//
+	// -tls-cert and -tls-key without -client-ca gives server-only TLS: the
+	// traffic is encrypted and the caller is not verified at all, so anyone who
+	// can reach the port and holds the bearer token is admitted. The token is
+	// the same on every node, so one leak takes the cluster. The operator who
+	// left out one flag has no way to tell: the agent starts, the deploy works,
+	// and everything looks exactly as it does when it is configured correctly.
+	given := 0
+	for _, v := range []string{s.cfg.TLSCert, s.cfg.TLSKey, s.cfg.ClientCA} {
+		if v != "" {
+			given++
 		}
+	}
+	if given > 0 && given < 3 {
+		return fmt.Errorf(
+			"mutual TLS needs -tls-cert, -tls-key and -client-ca together; %s given.\n"+
+				"Without -client-ca the agent would encrypt the connection but verify\n"+
+				"nothing about the caller, which looks identical to a correct setup and\n"+
+				"is not one. Issue all three with `twinet node pki`, or pass -insecure\n"+
+				"to accept a bearer token over plain HTTP on a network you control",
+			describeTLSInputs(s.cfg))
+	}
+
+	tlsMode := "disabled"
+	if given == 3 {
+		cfg := &tls.Config{MinVersion: tls.VersionTLS13}
+		pool := x509.NewCertPool()
+		pem, err := os.ReadFile(s.cfg.ClientCA)
+		if err != nil {
+			return fmt.Errorf("read client CA: %w", err)
+		}
+		if !pool.AppendCertsFromPEM(pem) {
+			return fmt.Errorf("client CA %s contains no certificates", s.cfg.ClientCA)
+		}
+		cfg.ClientCAs = pool
+		cfg.ClientAuth = tls.RequireAndVerifyClientCert
+		tlsMode = "mutual"
 		srv.TLSConfig = cfg
 	} else {
 		// Refusing rather than warning. This API creates containers and
@@ -1042,4 +1063,22 @@ func LocalAddrs() []string {
 		}
 	}
 	return out
+}
+
+// describeTLSInputs names which of the three credentials were supplied, so the
+// operator is told what is missing rather than that something is.
+func describeTLSInputs(c Config) string {
+	var have []string
+	for _, f := range []struct {
+		flag, val string
+	}{
+		{"-tls-cert", c.TLSCert},
+		{"-tls-key", c.TLSKey},
+		{"-client-ca", c.ClientCA},
+	} {
+		if f.val != "" {
+			have = append(have, f.flag)
+		}
+	}
+	return strings.Join(have, " and ") + " only"
 }

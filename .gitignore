@@ -32,3 +32,9 @@ images/*/twinet-rtr
 # Python bytecode from running the NIKA adapter.
 __pycache__/
 *.pyc
+
+# Generated outputs. These are results, not source: they are produced by a
+# run against a live lab and belong with that run, not in the repository.
+reports/
+episodes/
+submissions/

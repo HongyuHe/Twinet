@@ -66,7 +66,8 @@ func TestMutualTLSRefusesAnUnknownClient(t *testing.T) {
 	bad := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{
 		RootCAs: pool, MinVersion: tls.VersionTLS13,
 	}}}
-	if _, err := bad.Get(srv.URL); err == nil {
+	if resp, err := bad.Get(srv.URL); err == nil {
+		resp.Body.Close()
 		t.Error("a client with no certificate was admitted to a privileged API")
 	}
 
@@ -84,7 +85,8 @@ func TestMutualTLSRefusesAnUnknownClient(t *testing.T) {
 	imposter := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{
 		Certificates: []tls.Certificate{otherCert}, RootCAs: pool, MinVersion: tls.VersionTLS13,
 	}}}
-	if _, err := imposter.Get(srv.URL); err == nil {
+	if resp, err := imposter.Get(srv.URL); err == nil {
+		resp.Body.Close()
 		t.Error("a certificate from an unrelated CA was admitted")
 	}
 }
