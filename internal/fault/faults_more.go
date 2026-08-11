@@ -641,13 +641,3 @@ func probeServiceHealth(ctx context.Context, e *Env, t Target, addr, port string
 	}
 	return n
 }
-
-// ospfAreaOf returns the network statement for a prefix as it currently stands,
-// so verification reports the area the router is in rather than the area the
-// fault meant to put it in.
-func ospfAreaOf(cfg, network string) string {
-	if l := matchingLine(cfg, "network "+network+" area "); l != "" {
-		return l
-	}
-	return network + " is not in OSPF at all"
-}

@@ -80,6 +80,13 @@ var skipped = map[string]string{
 	"Labels": "container labels carry the node and lab name, which vary by deployment",
 }
 
+// writeString ignores the error deliberately: the writer is a hash, which
+// cannot fail, and threading an error through every branch of a tree walk to
+// satisfy that would obscure what the walk does.
+func writeString(w io.Writer, s string) {
+	_, _ = io.WriteString(w, s)
+}
+
 func writeStruct(w io.Writer, indent string, v reflect.Value) {
 	t := v.Type()
 	for i := 0; i < t.NumField(); i++ {
@@ -100,23 +107,23 @@ func writeValue(w io.Writer, v reflect.Value) {
 	switch v.Kind() {
 	case reflect.Ptr, reflect.Interface:
 		if v.IsNil() {
-			io.WriteString(w, "nil")
+			writeString(w, "nil")
 			return
 		}
 		writeValue(w, v.Elem())
 	case reflect.Struct:
-		io.WriteString(w, "{")
+		writeString(w, "{")
 		writeStructInline(w, v)
-		io.WriteString(w, "}")
+		writeString(w, "}")
 	case reflect.Slice, reflect.Array:
-		io.WriteString(w, "[")
+		writeString(w, "[")
 		for i := 0; i < v.Len(); i++ {
 			if i > 0 {
-				io.WriteString(w, ",")
+				writeString(w, ",")
 			}
 			writeValue(w, v.Index(i))
 		}
-		io.WriteString(w, "]")
+		writeString(w, "]")
 	case reflect.Map:
 		// Sorted, so that Go's randomised map order does not make the hash of
 		// one topology differ from run to run -- which would reject every
@@ -125,15 +132,15 @@ func writeValue(w io.Writer, v reflect.Value) {
 		sort.Slice(keys, func(a, b int) bool {
 			return fmt.Sprint(keys[a].Interface()) < fmt.Sprint(keys[b].Interface())
 		})
-		io.WriteString(w, "{")
+		writeString(w, "{")
 		for i, k := range keys {
 			if i > 0 {
-				io.WriteString(w, ",")
+				writeString(w, ",")
 			}
 			fmt.Fprintf(w, "%v:", k.Interface())
 			writeValue(w, v.MapIndex(k))
 		}
-		io.WriteString(w, "}")
+		writeString(w, "}")
 	default:
 		fmt.Fprintf(w, "%v", v.Interface())
 	}
@@ -150,7 +157,7 @@ func writeStructInline(w io.Writer, v reflect.Value) {
 			continue
 		}
 		if i > 0 {
-			io.WriteString(w, ",")
+			writeString(w, ",")
 		}
 		fmt.Fprintf(w, "%s=", f.Name)
 		writeValue(w, v.Field(i))

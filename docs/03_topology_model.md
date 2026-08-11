@@ -267,7 +267,7 @@ containerlab or Kathará. It declares, per object, whether the address/config is
 `twinet validate` runs, and reports **all** failures at once with
 `file:line:col`:
 
-- schema conformance (the JSON Schema is *generated from the Go structs*, so it
+- schema conformance (`twinet schema` emits a JSON Schema reflected from the Go structs the manifest decodes into, so it
   cannot drift — a defect called out in the containerlab review);
 - referential integrity (every `switch:` referenced by an L2 host exists; every
   `peerings` endpoint names a real `external_ports` entry; every service

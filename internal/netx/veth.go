@@ -521,8 +521,13 @@ func joinVRF(link netlink.Link, name string, table int) error {
 // and there is nothing to enable.
 func enableMPLS(name string) error {
 	path := fmt.Sprintf("/proc/sys/net/mpls/conf/%s/input", name)
-	if _, err := os.Stat("/proc/sys/net/mpls"); err != nil {
+	if _, statErr := os.Stat("/proc/sys/net/mpls"); os.IsNotExist(statErr) {
 		return nil
+	} else if statErr != nil {
+		// Present but unreadable is a different thing from absent, and
+		// treating it as absent would turn a broken node into a lab that
+		// deploys cleanly and drops every labelled packet.
+		return fmt.Errorf("checking for label-switching support: %w", statErr)
 	}
 	if err := os.WriteFile(path, []byte("1"), 0o644); err != nil {
 		return fmt.Errorf("enabling label switching on %s: %w", name, err)

@@ -42,6 +42,7 @@ across a cluster and graded automatically.`,
 
 	root.AddCommand(
 		newValidateCmd(opts),
+		newSchemaCmd(),
 		newInspectCmd(opts),
 		newDeployCmd(opts),
 		newDestroyCmd(opts),
