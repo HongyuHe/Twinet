@@ -39,8 +39,16 @@ kinds:
     capabilities: [NET_ADMIN, NET_RAW]
 
 link_defaults:
-  bandwidth: 10mbit
-  delay: 10ms
+  # The assignment's numbers: 1mbit, 2.5ms, 50ms.
+  #
+  # They are not decoration. Question 2.5 asks the student to find the
+  # high-delay provider link and engineer traffic around it, and the answer is
+  # only visible because the slow link is 25ms against 2.5ms everywhere else --
+  # a factor of ten. Running the lab at 10ms made that factor two and a half,
+  # which is within the noise of a loaded cluster, so a student could do the
+  # exercise correctly and measure nothing.
+  bandwidth: 1mbit
+  delay: 2.5ms
   queue: 50ms
   # Every cross-node link is carried in a VXLAN tunnel, which adds 50 bytes.
   # This cluster's fabric does not accept jumbo frames, so the lab MTU is set

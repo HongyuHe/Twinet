@@ -210,10 +210,27 @@ func deconflictOverlays(ctx context.Context, c *client.Cluster, top *model.Topol
 	return moved
 }
 
-// warnVersionSkew reports nodes whose agent differs from this controller.
-func warnVersionSkew(ctx context.Context, c *client.Cluster, errOut interface {
-	Write([]byte) (int, error)
-}) {
+// checkVersionSkew refuses to deploy when a node's agent is not this build.
+//
+// It used to print a warning and carry on, on the reasonable-sounding grounds
+// that a version difference is usually harmless. It is not harmless here,
+// because the agent renders the device configuration. A controller that has
+// learned to emit a route distinguisher, or a VRF, or a label-switching stanza
+// hands the node a topology, and the node's older renderer produces the
+// configuration it already knew how to produce. Both halves report success.
+// The deploy says it converged, the manifest is right, the controller's own
+// tests pass, and the routers are configured differently from what anybody
+// asked for.
+//
+// That is not hypothetical: it cost an afternoon during the MPLS work, where
+// the controller emitted the right distinguisher and every router came up with
+// none, because the agents were four commits behind.
+//
+// A warning is the wrong shape for this. It appears in a stream of ordinary
+// output, everything downstream still reports success, and the person reading
+// it has no reason to think the result is invalid. Refusing is the only
+// response that cannot be missed.
+func checkVersionSkew(ctx context.Context, c *client.Cluster) error {
 	want := Version
 	var odd []string
 	for _, r := range c.Status(ctx) {
@@ -224,12 +241,17 @@ func warnVersionSkew(ctx context.Context, c *client.Cluster, errOut interface {
 			odd = append(odd, fmt.Sprintf("%s runs %s", r.Node, v))
 		}
 	}
-	if len(odd) > 0 {
-		sort.Strings(odd)
-		fmt.Fprintf(errOut, "  warning: this controller is %s but %s; "+
-			"re-run scripts/deploy_agents.sh before trusting the result\n",
-			want, strings.Join(odd, ", "))
+	if len(odd) == 0 {
+		return nil
 	}
+	sort.Strings(odd)
+	return fmt.Errorf("this controller is %s but %s.\n"+
+		"The node agent renders the device configuration, so a node running a "+
+		"different build produces different configuration from the same manifest, "+
+		"and nothing downstream reports it.\n"+
+		"Run scripts/deploy_agents.sh, or set TWINET_ALLOW_VERSION_SKEW=1 if you "+
+		"are certain the difference does not matter",
+		want, strings.Join(odd, ", "))
 }
 
 // redeployScopes re-applies the reference solution to specific autonomous
@@ -306,7 +328,12 @@ func deployCluster(ctx context.Context, top *model.Topology, tok string, req age
 	// A cluster running mixed binaries produces results that cannot be
 	// attributed to any one version, and the mismatch is otherwise invisible:
 	// every node reports success while behaving differently.
-	warnVersionSkew(ctx, c, errOut)
+	if err := checkVersionSkew(ctx, c); err != nil {
+		if os.Getenv("TWINET_ALLOW_VERSION_SKEW") == "" {
+			return err
+		}
+		fmt.Fprintf(errOut, "  warning (skew allowed): %v\n", err)
+	}
 
 	start := time.Now()
 	results := c.Apply(ctx, top, req)
