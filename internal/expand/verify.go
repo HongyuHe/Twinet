@@ -149,7 +149,28 @@ func (e *expander) verify() error {
 			continue
 		}
 		for _, i := range []*model.Iface{l.A, l.B} {
-			if i == nil || i.Addr4 == "" {
+			if i == nil {
+				continue
+			}
+			// A link with a subnet whose endpoint has no address is not a
+			// link anybody can use, and it is what an allocation failure
+			// looks like from here: the error was turned into an empty
+			// string, and every check downstream skips empty strings.
+			//
+			// The clearest case is a /32 written as a point-to-point subnet.
+			// There is no room in it for two hosts, both allocations fail,
+			// both addresses come out empty, the lab validates, and the two
+			// routers are deployed with nothing configured on the interface
+			// that joins them.
+			// A switch port is L2 and carries no address by design, which is
+			// what an exchange fabric is made of.
+			if i.Addr4 == "" {
+				if i.Device.Kind != model.KindSwitch {
+					add("device %s interface %s: no address could be allocated from the "+
+						"link subnet %s; there is not enough room in it for the interfaces "+
+						"it has to number",
+						i.Device.ID, i.Name, l.Subnet)
+				}
 				continue
 			}
 			a, err := netip.ParsePrefix(i.Addr4)

@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"sort"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -231,27 +230,10 @@ func deconflictOverlays(ctx context.Context, c *client.Cluster, top *model.Topol
 // it has no reason to think the result is invalid. Refusing is the only
 // response that cannot be missed.
 func checkVersionSkew(ctx context.Context, c *client.Cluster) error {
-	want := Version
-	var odd []string
-	for _, r := range c.Status(ctx) {
-		if r.Err != nil {
-			continue
-		}
-		if v := r.Value.Version; v != "" && v != want {
-			odd = append(odd, fmt.Sprintf("%s runs %s", r.Node, v))
-		}
-	}
-	if len(odd) == 0 {
-		return nil
-	}
-	sort.Strings(odd)
-	return fmt.Errorf("this controller is %s but %s.\n"+
-		"The node agent renders the device configuration, so a node running a "+
-		"different build produces different configuration from the same manifest, "+
-		"and nothing downstream reports it.\n"+
-		"Run scripts/deploy_agents.sh, or set TWINET_ALLOW_VERSION_SKEW=1 if you "+
-		"are certain the difference does not matter",
-		want, strings.Join(odd, ", "))
+	// The check itself lives on the cluster, where Apply can enforce it for
+	// every caller. This wrapper remains so the deploy path can report it
+	// before doing any other work.
+	return c.VersionSkew(ctx)
 }
 
 // redeployScopes re-applies the reference solution to specific autonomous

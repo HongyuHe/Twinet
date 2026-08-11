@@ -5,6 +5,8 @@ import (
 	"fmt"
 
 	"github.com/spf13/cobra"
+
+	"github.com/HongyuHe/twinet/internal/client"
 )
 
 // Version is stamped at build time by the release pipeline.
@@ -23,6 +25,11 @@ type Options struct {
 
 // Root builds the top-level command tree.
 func Root() *cobra.Command {
+	// Every cluster this process builds carries the version it expects its
+	// agents to be running. Set here, once, so that no command can construct
+	// one without it.
+	client.ExpectVersion = Version
+
 	opts := &Options{}
 
 	root := &cobra.Command{

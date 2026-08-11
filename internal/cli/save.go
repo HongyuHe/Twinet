@@ -473,7 +473,20 @@ func readBundle(p string) (Bundle, map[string][]byte, error) {
 			sig = sigOnly.Signature
 			continue
 		}
-		files[path.Base(name)] = body
+		// Two members whose base names differ only in case, or that differ
+		// only by directory, arrive here as one key. Consumers match
+		// configuration names case-insensitively, so the second one would
+		// quietly replace the first -- which is a way to substitute a file
+		// after it was signed.
+		key := path.Base(name)
+		for existing := range files {
+			if strings.EqualFold(existing, key) {
+				return b, nil, fmt.Errorf(
+					"archive contains both %q and %q, which name the same file; "+
+						"one of them would silently replace the other", existing, key)
+			}
+		}
+		files[key] = body
 	}
 
 	// The signature is checked before the checksums, because the checksums are
@@ -493,6 +506,23 @@ func readBundle(p string) (Bundle, map[string][]byte, error) {
 		sum := sha256.Sum256(body)
 		if hex.EncodeToString(sum[:]) != want {
 			return b, nil, fmt.Errorf("%s does not match the checksum recorded when it was saved", name)
+		}
+	}
+
+	// Every listed file has now been verified, but that is only half of what
+	// the signature has to mean. The signature covers the list; it does not
+	// cover a file that is in the archive and not in the list. Since the
+	// consumers apply every configuration they are handed, an unlisted file
+	// alongside a listed one is a way to replace a submission's contents after
+	// it was signed, without disturbing the signature at all.
+	//
+	// So the archive has to contain exactly what was signed: no more.
+	for name := range files {
+		if _, listed := b.Files[name]; !listed {
+			return b, nil, fmt.Errorf(
+				"archive contains %s, which is not in its signed manifest; "+
+					"the signature covers only the files the manifest lists, so an "+
+					"unlisted file is one nobody vouched for", name)
 		}
 	}
 	return b, files, nil

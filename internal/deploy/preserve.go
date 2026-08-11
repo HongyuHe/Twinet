@@ -47,6 +47,27 @@ func Capture(ctx context.Context, r rt.Runtime, d *model.Device, lab, topoHash s
 	}
 
 	var out []state.Snapshot
+	// A read that does not happen is not the same as a device with nothing to
+	// save, and the difference matters because the caller acts on the answer by
+	// destroying the container. Silently returning an empty set on a failed
+	// read is how a student's work is deleted by a routine image change.
+	//
+	// So failures are collected and returned. The caller may then decline to
+	// replace a container whose contents it could not read.
+	var missed []string
+	read := func(what string, cmd []string) (string, bool) {
+		res, err := r.Exec(ctx, d.Container, rt.ExecCmd{Cmd: cmd})
+		if err != nil {
+			missed = append(missed, fmt.Sprintf("%s could not be read: %v", what, err))
+			return "", false
+		}
+		if res.ExitCode != 0 {
+			missed = append(missed, fmt.Sprintf("%s could not be read: %s exited %d: %s",
+				what, cmd[0], res.ExitCode, firstLine(res.Stderr)))
+			return "", false
+		}
+		return res.Stdout, true
+	}
 	add := func(kind state.Kind, body string) {
 		body = strings.TrimSpace(body)
 		if body == "" {
@@ -61,36 +82,36 @@ func Capture(ctx context.Context, r rt.Runtime, d *model.Device, lab, topoHash s
 
 	switch d.Kind {
 	case model.KindRouter:
-		res, err := r.Exec(ctx, d.Container, rt.ExecCmd{Cmd: []string{"vtysh", "-c", "show running-config"}})
-		if err == nil && res.ExitCode == 0 {
-			add(state.KindFRR, cleanRunningConfig(res.Stdout))
+		if body, ok := read("the routing configuration",
+			[]string{"vtysh", "-c", "show running-config"}); ok {
+			add(state.KindFRR, cleanRunningConfig(body))
 		}
 		// Tunnels are configured with ip(8) rather than through FRR, so they
 		// are captured separately or the 6in4 exercise would be lost.
-		if res, err := r.Exec(ctx, d.Container, rt.ExecCmd{
-			Cmd: []string{"sh", "-c", "ip -d tunnel show 2>/dev/null; ip -6 route show 2>/dev/null"},
-		}); err == nil && res.ExitCode == 0 {
-			add(state.KindTunnels, res.Stdout)
+		if body, ok := read("the tunnels", []string{"sh", "-c",
+			"ip -d tunnel show 2>/dev/null; ip -6 route show 2>/dev/null"}); ok {
+			add(state.KindTunnels, body)
 		}
-		if res, err := r.Exec(ctx, d.Container, rt.ExecCmd{
-			Cmd: []string{"sh", "-c", "ip -o addr show; echo ---; ip -o link show type vlan"},
-		}); err == nil && res.ExitCode == 0 {
-			add(state.KindAddrs, res.Stdout)
+		if body, ok := read("the addresses", []string{"sh", "-c",
+			"ip -o addr show; echo ---; ip -o link show type vlan"}); ok {
+			add(state.KindAddrs, body)
 		}
 
 	case model.KindHost:
-		if res, err := r.Exec(ctx, d.Container, rt.ExecCmd{
-			Cmd: []string{"sh", "-c", "ip -o addr show; echo ---; ip -o route show; echo ---; ip -o -6 route show"},
-		}); err == nil && res.ExitCode == 0 {
-			add(state.KindAddrs, res.Stdout)
+		if body, ok := read("the addresses and routes", []string{"sh", "-c",
+			"ip -o addr show; echo ---; ip -o route show; echo ---; ip -o -6 route show"}); ok {
+			add(state.KindAddrs, body)
 		}
 
 	case model.KindSwitch:
 		// ovs-vsctl show is human-oriented; the port/VLAN facts are what a
 		// restore needs, so they are captured in a directly replayable form.
-		if res, err := r.Exec(ctx, d.Container, rt.ExecCmd{Cmd: []string{"sh", "-c", switchCapture}}); err == nil && res.ExitCode == 0 {
-			add(state.KindOVS, res.Stdout)
+		if body, ok := read("the switch ports", []string{"sh", "-c", switchCapture}); ok {
+			add(state.KindOVS, body)
 		}
+	}
+	if len(missed) > 0 {
+		return out, fmt.Errorf("%s", strings.Join(missed, "; "))
 	}
 	return out, nil
 }
@@ -109,7 +130,8 @@ func (e *Engine) CaptureAll(ctx context.Context, top *model.Topology, store *sta
 		snaps, err := Capture(ctx, e.Runtime, d, top.Name, top.Hash)
 		if err != nil {
 			problems = append(problems, fmt.Sprintf("%s: %v", d.ID, err))
-			continue
+			// Whatever was read is still stored: a partial snapshot is worth
+			// more than none, and the failure is reported either way.
 		}
 		for _, s := range snaps {
 			changed, err := store.Put(s)

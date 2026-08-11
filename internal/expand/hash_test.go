@@ -294,3 +294,92 @@ func TestParallelLinksGetSeparateIdentities(t *testing.T) {
 			"to whichever replied last", a.ID, l1.A.MAC)
 	}
 }
+
+// Some of what a lab means is not in any device, link or AS.
+//
+// The RPKI trust anchor is the case that proved it. Which ASes are deliberately
+// left without a ROA, and which hold one for somebody else's prefix, is the
+// whole content of that exercise: the student's job is to notice exactly those
+// and drop them. Both lists live on the lab, and the hash walked only the
+// compiled topology -- so a course author could move an AS from "valid" to
+// "not found", inverting the expected answer, and the identity would not move.
+func TestTheHashMovesWhenTheLabsOwnDeclarationsChange(t *testing.T) {
+	cases := []struct {
+		what   string
+		why    string
+		change func(*model.Lab)
+	}{
+		{
+			what: "an AS is deliberately left without a ROA",
+			why: "a student who accepts only explicitly-valid routes now drops it; " +
+				"that is the answer the exercise is testing for",
+			change: func(l *model.Lab) { l.RPKI.NotFound = append(l.RPKI.NotFound, 2) },
+		},
+		{
+			what: "an AS is given a ROA for somebody else's prefix",
+			why:  "whoever announces it now looks like a hijacker to anyone validating",
+			change: func(l *model.Lab) {
+				if l.RPKI.Invalid == nil {
+					l.RPKI.Invalid = map[int]string{}
+				}
+				l.RPKI.Invalid[7] = "11.128.0.0/9"
+			},
+		},
+		{
+			what:   "the addressing plan changes",
+			why:    "every address in the lab moves, so no saved configuration still applies",
+			change: func(l *model.Lab) { l.Addressing.ASBlock = "{{ add .AS 100 }}.0.0.0/8" },
+		},
+		{
+			what: "a scripted misconfiguration is added",
+			why:  "the lab now contains a fault the submission was not written against",
+			change: func(l *model.Lab) {
+				if l.Behaviours == nil {
+					l.Behaviours = map[string]*model.Behaviour{}
+				}
+				l.Behaviours["surprise"] = &model.Behaviour{Kind: "link-down"}
+			},
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.what, func(t *testing.T) {
+			base := TopologyHash(loadFixture(t))
+			l, err := manifest.Load("../../examples/cos461")
+			if err != nil {
+				t.Fatal(err)
+			}
+			c.change(l.Lab)
+			res, err := Expand(l.Lab)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := TopologyHash(res.Topology); got == base {
+				t.Errorf("the hash did not move when %s.\n%s.\n"+
+					"Work done against the old exercise would be accepted against the "+
+					"new one and graded as though the answer had not changed.", c.what, c.why)
+			}
+		})
+	}
+}
+
+// And still not for where it runs, which the lab also declares.
+func TestTheHashIgnoresTheClusterTheLabIsDeployedOn(t *testing.T) {
+	base := TopologyHash(loadFixture(t))
+
+	l, err := manifest.Load("../../examples/cos461")
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.Lab.Placement.Strategy = "single-node"
+	l.Lab.Placement.Nodes = nil
+	l.Lab.Access.Listen = ":41000"
+	res, err := Expand(l.Lab)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := TopologyHash(res.Topology); got != base {
+		t.Errorf("changing which machines run the lab changed its identity (%s -> %s); "+
+			"a submission made on a laptop could not be graded on the cluster", base, got)
+	}
+}

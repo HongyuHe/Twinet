@@ -160,3 +160,40 @@ func verifierSource(t *testing.T, name string) (string, bool) {
 	}
 	return "", false
 }
+
+// The exported Verify answers "is this fault still present". Nothing outside
+// this package can say so: wantSymptom is unexported, so every external caller
+// gets whatever the zero value means.
+//
+// The zero value means "wait for the network to have recovered". So a caller
+// asking whether the fault was still there was being told whether it had gone
+// away, and a symptom-aware verifier would report a perfectly working fault as
+// absent. This is the worst failure available to a benchmark: the episode still
+// looks valid, and its ground truth is inverted.
+func TestVerifyAsksWhetherTheFaultIsStillThere(t *testing.T) {
+	seen := make(chan bool, 1)
+	Register(&Fault{
+		Name:     "test.records_what_it_was_asked",
+		Category: CatMisconfig,
+		Describe: "records the direction it was asked to verify",
+		Inject:   func(context.Context, *Env, Target) (State, error) { return nil, nil },
+		Resolve:  func(context.Context, *Env, Target, State) error { return nil },
+		Verify: func(_ context.Context, e *Env, _ Target, _ State) (Evidence, error) {
+			seen <- e.wantSymptom
+			return Evidence{Verified: true}, nil
+		},
+	})
+
+	env := &Env{} // exactly what an external caller can build
+	if _, err := Verify(context.Background(), env, &Injection{
+		Fault: "test.records_what_it_was_asked",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := <-seen; !got {
+		t.Fatal("the public Verify asked whether the network had recovered.\n" +
+			"It is called to confirm a fault is still doing its job, so a " +
+			"symptom-aware verifier would report a working fault as absent and " +
+			"an absent one as present -- and the episode would still look valid.")
+	}
+}

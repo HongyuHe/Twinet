@@ -284,7 +284,55 @@ func (n *Node) Underlay(ctx context.Context, peer string) (agent.UnderlayRespons
 // Cluster is the set of agents backing one lab.
 type Cluster struct {
 	Nodes []*Node
+
+	// RequireVersion is the build every node must be running.
+	//
+	// It is checked inside Apply rather than by the callers, because it was
+	// checked by one caller and there turned out to be three. Grading called
+	// Apply directly and so ran happily against a cluster of mixed binaries --
+	// which is the one place it matters most, since the output is somebody's
+	// mark and cannot be attributed to any particular version of the software
+	// that produced it.
+	//
+	// Empty means unchecked, which is what tests and single-node use want.
+	RequireVersion string
 }
+
+// VersionSkew reports the nodes not running the expected build.
+func (c *Cluster) VersionSkew(ctx context.Context) error {
+	if c.RequireVersion == "" {
+		return nil
+	}
+	var odd []string
+	for _, r := range c.Status(ctx) {
+		if r.Err != nil {
+			continue
+		}
+		if v := r.Value.Version; v != "" && v != c.RequireVersion {
+			odd = append(odd, fmt.Sprintf("%s runs %s", r.Node, v))
+		}
+	}
+	if len(odd) == 0 {
+		return nil
+	}
+	sort.Strings(odd)
+	return fmt.Errorf("this controller is %s but %s.\n"+
+		"The node agent renders the device configuration, so a node running a "+
+		"different build produces different configuration from the same manifest, "+
+		"and nothing downstream reports it.\n"+
+		"Run scripts/deploy_agents.sh, or set TWINET_ALLOW_VERSION_SKEW=1 if you "+
+		"are certain the difference does not matter",
+		c.RequireVersion, strings.Join(odd, ", "))
+}
+
+// ExpectVersion is the build every agent is expected to be running.
+//
+// It is a package variable set once at start-up rather than a parameter,
+// because every cluster must carry it and there are eight places that build
+// one. A parameter is a thing the ninth caller forgets, and forgetting it
+// yields a cluster that silently accepts mixed builds -- which is how grading
+// came to run without the check while deployment had it.
+var ExpectVersion string
 
 // NewCluster builds a cluster client from a lab's placement configuration.
 func NewCluster(lab *model.Lab, token string) *Cluster {
@@ -346,7 +394,7 @@ func fileExists(p string) bool {
 
 // NewClusterTLS builds a cluster client with explicit TLS material.
 func NewClusterTLS(lab *model.Lab, token string, t TLS) *Cluster {
-	c := &Cluster{}
+	c := &Cluster{RequireVersion: ExpectVersion}
 	for _, n := range lab.Placement.Nodes {
 		addr := n.Addr
 		if addr == "" {
@@ -406,6 +454,13 @@ func (c *Cluster) Status(ctx context.Context) []NodeResult[agent.StatusResponse]
 // the same VXLAN identifier and address the right peer. It then acts only on
 // what is placed on itself.
 func (c *Cluster) Apply(ctx context.Context, top *model.Topology, req agent.ApplyRequest) []NodeResult[agent.ApplyResponse] {
+	if err := c.VersionSkew(ctx); err != nil && os.Getenv("TWINET_ALLOW_VERSION_SKEW") == "" {
+		out := make([]NodeResult[agent.ApplyResponse], 0, len(c.Nodes))
+		for _, n := range c.Nodes {
+			out = append(out, NodeResult[agent.ApplyResponse]{Node: n.Name, Err: err})
+		}
+		return out
+	}
 	wire := agent.Serialise(top)
 	peers := map[string]string{}
 	for _, n := range top.Lab.Placement.Nodes {
@@ -593,12 +648,30 @@ func (c *Cluster) MigrateState(ctx context.Context, top *model.Topology) (moved 
 				src, err, len(devices), src))
 			continue
 		}
+		// A device the source had nothing for is reported, not ignored. Most
+		// of the time it means what it says -- an untouched device, a staff
+		// machine, a lab that was only just deployed -- but it is also exactly
+		// what a failed capture looks like from here, and the two are worth
+		// distinguishing before a container is rebuilt from the manifest.
+		if len(exp.Missing) > 0 {
+			sort.Strings(exp.Missing)
+			problems = append(problems, fmt.Sprintf(
+				"%s had no saved work for %s; if those devices were configured, that "+
+					"configuration is not being carried and will be lost when they are "+
+					"rebuilt from the manifest",
+				src, strings.Join(exp.Missing, ", ")))
+		}
+
 		// Group by destination, because devices leaving one node need not all
 		// arrive at the same one.
 		byDest := map[string][]agent.WireSnapshot{}
 		for _, s := range exp.Snapshots {
 			d, ok := top.Device(s.Device)
 			if !ok {
+				problems = append(problems, fmt.Sprintf(
+					"%s sent saved work for %s, which is not in this lab; it is being "+
+						"dropped rather than placed somewhere it does not belong",
+					src, s.Device))
 				continue
 			}
 			byDest[d.Node] = append(byDest[d.Node], s)

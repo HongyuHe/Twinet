@@ -298,9 +298,17 @@ if the manifest that created it is no longer available.`,
 			if err := eng.Destroy(cmd.Context(), name); err != nil {
 				return err
 			}
+			// What is left behind is collected rather than warned about. A
+			// leftover bridge or a stale placement record is not visible in
+			// `docker ps`, so the next deployment inherits it and fails in a
+			// way that has nothing to do with the cause -- and "removed 212
+			// containers" scrolling past is not something anybody re-reads.
+			var left []string
 			if !keep && len(vnis) > 0 {
 				if err := eng.DestroyOverlays(vnis); err != nil {
-					fmt.Fprintf(cmd.ErrOrStderr(), "warning: overlay cleanup: %v\n", err)
+					left = append(left, fmt.Sprintf("the overlay bridges and tunnels are "+
+						"still in place (%v); the next deployment will find them and may "+
+						"reuse them for a different lab", err))
 				}
 			}
 			// The record describes containers that no longer exist. Leaving it
@@ -309,10 +317,16 @@ if the manifest that created it is no longer available.`,
 			if top != nil {
 				if err := os.Remove(filepath.Join(labPrivateDir(top), place.RecordName)); err != nil &&
 					!errors.Is(err, os.ErrNotExist) {
-					fmt.Fprintf(cmd.ErrOrStderr(), "warning: clearing the placement record: %v\n", err)
+					left = append(left, fmt.Sprintf("the placement record could not be "+
+						"cleared (%v); the next deployment will be pinned to the "+
+						"arrangement chosen for the lab that has just been removed", err))
 				}
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), "removed %d containers of lab %q\n", len(cs), name)
+			if len(left) > 0 {
+				return fmt.Errorf("the containers are gone but the lab is not fully "+
+					"removed:\n  %s", strings.Join(left, "\n  "))
+			}
 			return nil
 		},
 	}

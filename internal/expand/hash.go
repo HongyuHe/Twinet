@@ -51,6 +51,48 @@ func canonicalise(w io.Writer, top *model.Topology) {
 		fmt.Fprintf(w, "as %d\n", asn)
 		writeStruct(w, "  ", reflect.ValueOf(*as))
 	}
+	// Services are walked here, and not reached through the device that hosts
+	// them, because their configuration decides how the network behaves and
+	// the device does not carry it.
+	//
+	// The RPKI validator is the clearest case. Which ASes are deliberately
+	// left without a ROA, and which have a deliberately wrong one, is the
+	// entire content of that exercise -- the student's task is to notice
+	// exactly those and drop the routes. Both lists live in the service's
+	// spec. Without this, a course author could move an AS from "valid" to
+	// "not found", inverting the expected answer, and the hash would not
+	// move: work done against one exercise would be accepted and graded
+	// against a different one, with nothing anywhere reporting a mismatch.
+	// The lab's own declarations are hashed as well, because some of them
+	// decide how the network behaves and never appear in a device, a link or
+	// an AS.
+	//
+	// The RPKI trust anchor is the case that proved it. Which ASes are
+	// deliberately left without a ROA, and which hold one for somebody else's
+	// prefix, is the entire content of that exercise -- the student's job is
+	// to notice exactly those. Both lists live on the lab. Without this, a
+	// course author could move an AS from "valid" to "not found", inverting
+	// the expected answer, and the hash would not move: work done against one
+	// exercise would be accepted and graded against a different one, with
+	// nothing anywhere reporting a mismatch.
+	//
+	// It is a structural walk with named exclusions rather than a list of the
+	// fields that matter, for the same reason the rest of this file is: a list
+	// of what matters is correct when written and silently wrong afterwards.
+	if top.Lab != nil {
+		writeString(w, "lab\n")
+		writeStruct(w, "  ", reflect.ValueOf(*top.Lab))
+	}
+
+	names := make([]string, 0, len(top.Services))
+	for n := range top.Services {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		fmt.Fprintf(w, "service %s\n", n)
+		writeStruct(w, "  ", reflect.ValueOf(*top.Services[n]))
+	}
 }
 
 // skipped names fields that must not contribute to the hash.
@@ -78,6 +120,13 @@ var skipped = map[string]string{
 	// the machine it was made on.
 	"Node":   "which cluster machine holds the device; placement is not topology",
 	"Labels": "container labels carry the node and lab name, which vary by deployment",
+
+	// Lab fields that describe the deployment rather than the exercise. The
+	// same lab must hash identically on a laptop and on a twelve-node cluster,
+	// or a submission could only ever be graded on the machine it was made on.
+	"Placement": "which machines run the lab, and how many; not part of the exercise",
+	"Dir":       "the directory the manifest was read from",
+	"Access":    "how students reach their devices: ports and keys, not topology",
 }
 
 // writeString ignores the error deliberately: the writer is a hash, which

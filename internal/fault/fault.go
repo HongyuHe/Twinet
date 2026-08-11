@@ -568,6 +568,19 @@ func Verify(ctx context.Context, env *Env, inj *Injection) (Evidence, error) {
 	if !ok {
 		return Evidence{}, fmt.Errorf("no fault named %q", inj.Fault)
 	}
+	// The question being asked is "is the fault still present", so the symptom
+	// is what verification must wait for.
+	//
+	// This is not incidental. The field defaults to false, which means "wait
+	// for the network to recover", and a caller who builds an Env and calls
+	// this function -- which is every caller outside injection, since the
+	// field is unexported and they cannot set it -- was asking whether the
+	// fault had gone away while believing they were asking whether it was
+	// there. A symptom-aware verifier would then report a working fault as
+	// absent and an absent one as present. For a benchmark whose entire value
+	// is the correctness of its ground truth, that is the worst available
+	// failure: the episode still looks valid.
+	env.wantSymptom = true
 	return f.Verify(ctx, env, inj.Target, inj.State)
 }
 

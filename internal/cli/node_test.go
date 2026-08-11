@@ -20,23 +20,23 @@ import (
 // behaviour, so the person reading it has no reason to believe the result is
 // invalid. Refusing is the only response that cannot be missed.
 func TestAVersionMismatchRefusesRatherThanWarns(t *testing.T) {
-	if _, err := os.Stat("../../internal/cli/node.go"); err != nil {
-		t.Skip("source not available")
-	}
+	// The behaviour is tested where it lives, in
+	// client.TestApplyRefusesAClusterOfMixedBuilds: a node reporting a
+	// different build causes Apply to refuse rather than warn.
+	//
+	// What is checked here is that the deploy path still asks before doing any
+	// other work, so the operator is told at the start rather than after the
+	// underlay has been built.
 	src, err := os.ReadFile("node.go")
 	if err != nil {
 		t.Fatal(err)
 	}
 	body := string(src)
+	if !strings.Contains(body, "checkVersionSkew(ctx, c)") {
+		t.Error("the deploy path no longer checks for mixed builds before it starts; " +
+			"Apply will still refuse, but only after the underlay has been built")
+	}
 	if strings.Contains(body, "func warnVersionSkew") {
-		t.Error("version skew is still reported as a warning; a node rendering " +
-			"different configuration from the same manifest must stop the deploy")
-	}
-	if !strings.Contains(body, "func checkVersionSkew") {
-		t.Error("no version check refuses the deploy")
-	}
-	if !strings.Contains(body, "TWINET_ALLOW_VERSION_SKEW") {
-		t.Error("no documented way to proceed deliberately; people will patch the " +
-			"check out instead, which is worse")
+		t.Error("version skew is reported as a warning again")
 	}
 }

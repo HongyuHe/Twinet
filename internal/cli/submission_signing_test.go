@@ -1,8 +1,15 @@
 package cli
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -149,5 +156,115 @@ func TestTheSignedBytesAreStable(t *testing.T) {
 		if got := string(bundleBytes(b)); got != first {
 			t.Fatal("the signed bytes vary between runs, so archives would be rejected at random")
 		}
+	}
+}
+
+// A signature over a list of files says nothing about a file that is not in
+// the list. The archive is read by code that applies every configuration it is
+// handed, so an unlisted file travelling alongside a listed one is a way to
+// change what gets graded while leaving the signature perfectly valid.
+//
+// This is the shape of the attack: the manifest lists and signs R.conf, and
+// the archive also carries r.conf, which nobody signed. The restore path
+// matches configuration names case-insensitively, so the unsigned one wins.
+func TestAnArchiveMayContainOnlyWhatItSigned(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("TWINET_PKI", t.TempDir())
+
+	honest := map[string]string{"R1.conf": "router bgp 1\n"}
+	smuggled := map[string]string{
+		"an unlisted file":       "r1.conf",
+		"a plausible extra file": "R2.conf",
+		"a shell script":         "setup.sh",
+	}
+
+	for what, extra := range smuggled {
+		t.Run(what, func(t *testing.T) {
+			p := filepath.Join(dir, strings.ReplaceAll(what, " ", "_")+".tar.gz")
+			writeBundleWithExtra(t, p, honest, extra, "router bgp 666\n")
+
+			_, _, err := readBundle(p)
+			if err == nil {
+				t.Fatalf("an archive carrying %s alongside its signed files was accepted.\n"+
+					"The signature covers the manifest's list, so a file outside that list "+
+					"is one nobody vouched for -- and the code that consumes the archive "+
+					"applies every configuration it is given.", extra)
+			}
+			if !strings.Contains(err.Error(), "signed manifest") &&
+				!strings.Contains(err.Error(), "name the same file") {
+				t.Fatalf("refused for the wrong reason: %v", err)
+			}
+		})
+	}
+
+	// The same archive without the extra file must still be accepted, or this
+	// is a check that refuses everything and proves nothing.
+	p := filepath.Join(dir, "clean.tar.gz")
+	writeBundleWithExtra(t, p, honest, "", "")
+	if _, files, err := readBundle(p); err != nil {
+		t.Fatalf("an honest archive was refused, so the check above is worthless: %v", err)
+	} else if len(files) != 1 {
+		t.Fatalf("expected the one signed file back, got %d", len(files))
+	}
+}
+
+// writeBundleWithExtra builds a properly signed archive and then adds one
+// unsigned member to it, which is exactly what an attacker can do with a
+// submission they were legitimately given.
+func writeBundleWithExtra(t *testing.T, p string, listed map[string]string, extraName, extraBody string) {
+	t.Helper()
+	// A real key in a temporary directory, so the archive is signed the way a
+	// genuine one is and the signature that survives the tampering is a
+	// signature this platform would accept.
+	key, err := submissionKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	b := Bundle{
+		Lab: "cos461", AS: 3, Group: "group3", Topology: "abc123",
+		TakenAt: time.Now().UTC().Truncate(time.Second),
+		Files:   map[string]string{},
+	}
+	for name, body := range listed {
+		sum := sha256.Sum256([]byte(body))
+		b.Files[name] = hex.EncodeToString(sum[:])
+	}
+	sig := signBundle(b, key)
+
+	f, err := os.Create(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = f.Close() }()
+	gz := gzip.NewWriter(f)
+	tw := tar.NewWriter(gz)
+
+	add := func(name, body string) {
+		if err := tw.WriteHeader(&tar.Header{
+			Name: name, Mode: 0o644, Size: int64(len(body)), Typeflag: tar.TypeReg,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write([]byte(body)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mj, err := bundleJSON(b, sig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	add("manifest.json", string(mj))
+	for name, body := range listed {
+		add(name, body)
+	}
+	if extraName != "" {
+		add(extraName, extraBody)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
