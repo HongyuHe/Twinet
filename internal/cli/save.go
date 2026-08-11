@@ -282,11 +282,22 @@ func captureCommands(ctx context.Context, exec func(context.Context, string, []s
 func captureSwitch(ctx context.Context, exec func(context.Context, string, []string) (execResult, error),
 	d *model.Device) string {
 
+	// The spaces matter. ovs-vsctl prints a trunk list as "[10, 20]", and
+	// emitting that verbatim produces "trunks=10, 20" -- which the shell splits
+	// on the space, so the port is set to carry VLAN 10 only and the second
+	// VLAN is silently dropped. Restoring such an archive left one VLAN
+	// unreachable across the trunk, which presents as hosts that cannot see
+	// each other for no visible reason. Removing the spaces is the whole fix,
+	// and it cost an afternoon to find from the far end.
 	script := `for p in $(ovs-vsctl list-ports br0 2>/dev/null); do
-  tag=$(ovs-vsctl get port "$p" tag 2>/dev/null | tr -d '[]')
-  trunks=$(ovs-vsctl get port "$p" trunks 2>/dev/null | tr -d '[]')
-  [ -n "$tag" ] && [ "$tag" != "" ] && echo "ovs-vsctl set port $p tag=$tag"
-  [ -n "$trunks" ] && [ "$trunks" != "" ] && echo "ovs-vsctl set port $p trunks=$trunks"
+  tag=$(ovs-vsctl get port "$p" tag 2>/dev/null | tr -d '[] ')
+  trunks=$(ovs-vsctl get port "$p" trunks 2>/dev/null | tr -d '[] ')
+  mode=$(ovs-vsctl get port "$p" vlan_mode 2>/dev/null | tr -d '"')
+  [ -n "$tag" ] && echo "ovs-vsctl set port $p tag=$tag"
+  if [ -n "$trunks" ]; then
+    [ "$mode" != "[]" ] && [ -n "$mode" ] && echo "ovs-vsctl set port $p vlan_mode=$mode"
+    echo "ovs-vsctl set port $p trunks=$trunks"
+  fi
 done`
 	res, err := exec(ctx, d.ID, []string{"sh", "-c", script})
 	if err != nil || res.ExitCode != 0 || strings.TrimSpace(res.Stdout) == "" {

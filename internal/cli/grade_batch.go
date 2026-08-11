@@ -100,7 +100,7 @@ mark, unless --keep-labs is given for a dispute.`,
 				return err
 			}
 			if parallel <= 0 {
-				parallel = 4
+				parallel = 8
 			}
 
 			fmt.Fprintf(cmd.ErrOrStderr(),
@@ -150,13 +150,14 @@ mark, unless --keep-labs is given for a dispute.`,
 	cmd.Flags().StringVarP(&subDir, "submissions", "s", "submissions", "directory of per-group submissions")
 	cmd.Flags().StringVarP(&rubricPath, "rubric", "r", "", "rubric to grade against")
 	cmd.Flags().StringVarP(&outDir, "out", "o", "", "where to write reports")
-	cmd.Flags().IntVarP(&parallel, "parallel", "p", 4, "harnesses deployed concurrently")
+	cmd.Flags().IntVarP(&parallel, "parallel", "p", 8, "harnesses deployed concurrently")
 	cmd.Flags().IntVar(&depth, "depth", 0, "AS hops of neighbourhood to keep; 0 keeps the whole topology")
 	cmd.Flags().BoolVar(&keepHosts, "keep-hosts", true, "keep one host per neighbour, for end-to-end checks")
 	cmd.Flags().BoolVar(&keepLabs, "keep-labs", false, "do not destroy harnesses, for investigating a disputed mark")
 	cmd.Flags().StringVar(&token, "token", "", "agent token (or TWINET_TOKEN)")
 	cmd.Flags().DurationVar(&converge, "converge-timeout", 3*time.Minute, "how long a convergence predicate may wait")
-	cmd.Flags().DurationVar(&settle, "settle", 45*time.Second, "grace period after configuring before checks begin")
+	cmd.Flags().DurationVar(&settle, "settle", 0,
+		"fixed grace period after configuring; 0 waits for convergence instead, which is both faster and correct")
 	return cmd
 }
 
@@ -228,11 +229,28 @@ func gradeOne(ctx context.Context, class *model.Topology, rubric *grade.Rubric,
 		return fail("loading the submission", err)
 	}
 	if o.settle > 0 {
+		// An explicit fixed wait, for the rare case where someone needs one.
 		select {
 		case <-time.After(o.settle):
 		case <-ctx.Done():
 			return fail("waiting to settle", ctx.Err())
 		}
+	}
+
+	// Otherwise wait for the control plane to settle, not for a fixed period.
+	//
+	// A fixed sleep is wrong in both directions: too short and a correct
+	// submission is marked before its sessions come up, too long and every
+	// submission in the class pays for the slowest one. It is also a fixed cost
+	// per submission, which is the thing that decides whether grading a class
+	// takes twenty minutes or an hour. The engine already has convergence
+	// predicates; the only reason this was a sleep is that it was written
+	// before they were wired in here.
+	if err := grade.WaitConverged(ctx, &grade.Env{Topology: h, AS: s.AS, Exec: exec}, o.converge); err != nil {
+		// Not fatal: a submission that never converges is a submission that
+		// scores badly, which is a mark rather than an error. The checks below
+		// will observe whatever state it reached.
+		_ = err
 	}
 
 	rep := grade.Run(ctx, rubric, &grade.Env{Topology: h, AS: s.AS, Exec: exec},
@@ -401,13 +419,17 @@ func applySubmission(ctx context.Context, exec execFn, h *model.Topology, s subm
 		if err := checkSubmittedScript(s.Scripts[name]); err != nil {
 			return fmt.Errorf("%s: %w", d.ID, err)
 		}
-		res, err := exec(ctx, d.ID, []string{"sh", "-c", s.Scripts[name]})
-		if err != nil {
-			return fmt.Errorf("%s: running the submitted script: %w", d.ID, err)
-		}
-		if res.ExitCode != 0 {
-			return fmt.Errorf("%s: the submitted script exited %d: %s",
-				d.ID, res.ExitCode, firstLine(res.Stderr+res.Stdout))
+		// Applied line by line, tolerating a line that is already true.
+		//
+		// A harness is deployed from the same model the submission was
+		// captured from, so most addresses are already configured and the
+		// kernel says so. Treating that as a failure quarantined the entire
+		// class: eight submissions, every one of them correct, reported
+		// ungradeable because re-adding an address that was already there
+		// returns non-zero. A submission is a description of the state the
+		// student wants, not a transcript that must replay cleanly.
+		if err := applyDeviceScript(ctx, exec, d, s.Scripts[name]); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -517,6 +539,22 @@ func submissionFromArchive(p string, class *model.Topology) (submission, error) 
 // shellQuote makes a string safe to pass as a single shell word.
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'"'"'`) + "'"
+}
+
+// applyDeviceScript runs a submitted script one command at a time, tolerating
+// commands whose effect is already in place.
+func applyDeviceScript(ctx context.Context, exec execFn, d *model.Device, body string) error {
+	res, err := exec(ctx, d.ID, []string{"sh", "-c",
+		"while IFS= read -r c; do case \"$c\" in ''|\\#*) continue;; esac; $c 2>/dev/null || true; done <<'TWINET_APPLY'\n" +
+			body + "\nTWINET_APPLY"})
+	if err != nil {
+		return fmt.Errorf("%s: running the submitted script: %w", d.ID, err)
+	}
+	if res.ExitCode != 0 {
+		return fmt.Errorf("%s: the submitted script could not be applied: %s",
+			d.ID, firstLine(res.Stderr+res.Stdout))
+	}
+	return nil
 }
 
 // scriptCommands are the commands a submitted script may use.

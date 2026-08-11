@@ -232,6 +232,44 @@ func warnVersionSkew(ctx context.Context, c *client.Cluster, errOut interface {
 	}
 }
 
+// redeployScopes re-applies the reference solution to specific autonomous
+// systems, which is how a wave's submissions are cleared before the next wave.
+func redeployScopes(ctx context.Context, top *model.Topology, token string, scopes []string) error {
+	tok, err := tokenFor(token)
+	if err != nil {
+		return err
+	}
+	c := client.NewCluster(top.Lab, tok)
+	// A full apply, not one restricted to the systems being restored.
+	//
+	// Restricting it looks like the efficient choice and is wrong: an inter-AS
+	// link belongs to the peering scope rather than to either system, so a
+	// restricted apply rebuilds a router without rewiring its external links.
+	// The router comes back with almost no interfaces, its neighbours see
+	// sessions that never establish, and the cause is three steps removed from
+	// the symptom. The apply is idempotent and takes about half a minute when
+	// nothing has changed, which is a small price for not having to reason
+	// about which scopes a change can reach.
+	_ = scopes
+	results := c.Apply(ctx, top, agent.ApplyRequest{
+		Mode:       "solve",
+		PullPolicy: "if-missing",
+		Workers:    8,
+		Generation: time.Now().UTC().Format("20060102T150405.000"),
+	})
+	for _, r := range results {
+		if r.Err != nil {
+			return r.Err
+		}
+		for scope, msgs := range r.Value.Failures {
+			if len(msgs) > 0 {
+				return fmt.Errorf("%s: %s", scope, firstLine(msgs[0]))
+			}
+		}
+	}
+	return nil
+}
+
 func deployCluster(ctx context.Context, top *model.Topology, tok string, req agent.ApplyRequest, out, errOut interface {
 	Write([]byte) (int, error)
 }) error {

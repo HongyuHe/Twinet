@@ -33,6 +33,7 @@ can quote the routing-table entry that was wrong rather than saying "FAIL".`,
 	cmd.AddCommand(
 		newGradeRunCmd(opts),
 		newGradeBatchCmd(opts),
+		newGradeClassCmd(opts),
 		newGradeChecksCmd(),
 		newGradeValidateCmd(),
 	)

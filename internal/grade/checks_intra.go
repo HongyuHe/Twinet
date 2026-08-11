@@ -491,8 +491,8 @@ func checkVLANIsolation(ctx context.Context, env *Env) Result {
 		case hops == 1:
 			passed++
 		default:
-			fmt.Fprintf(&detail, "VLAN %d: %s reaches %s in %d hops; hosts in one VLAN must be adjacent\n",
-				v, src.Name, dst.Name, hops)
+			fmt.Fprintf(&detail, "VLAN %d: %s %s; hosts in one VLAN must be adjacent\n",
+				v, src.Name, describeReach(dst.Name, hops))
 		}
 	}
 
@@ -507,8 +507,8 @@ func checkVLANIsolation(ctx context.Context, env *Env) Result {
 		case hops >= 2:
 			passed++
 		default:
-			fmt.Fprintf(&detail, "%s reaches %s in %d hop; different VLANs must be separated at layer 2\n",
-				src.Name, dst.Name, hops)
+			fmt.Fprintf(&detail, "%s %s; different VLANs must be separated at layer 2\n",
+				src.Name, describeReach(dst.Name, hops))
 		}
 	}
 
@@ -582,10 +582,31 @@ func traceHops(ctx context.Context, env *Env, src, dst *model.Device) (int, erro
 	return countTracerouteHops(res.Stdout, addr), nil
 }
 
+// describeReach turns a hop count into something that is true.
+//
+// Zero means the destination never replied, and calling that "0 hops" reads as
+// "directly adjacent" -- the exact opposite of what was observed. A student
+// told their isolated hosts are adjacent will look for a VLAN misconfiguration
+// that is not there.
+func describeReach(dst string, hops int) string {
+	if hops <= 0 {
+		return fmt.Sprintf("cannot reach %s at all", dst)
+	}
+	if hops == 1 {
+		return fmt.Sprintf("reaches %s directly, in 1 hop", dst)
+	}
+	return fmt.Sprintf("reaches %s in %d hops", dst, hops)
+}
+
 var hopRe = regexp.MustCompile(`^\s*(\d+)\s+(\S+)`)
 
 // countTracerouteHops returns the hop number at which the destination replied,
 // or zero if it never did.
+//
+// Callers must treat zero as "no reply", not as "zero hops away". Reporting it
+// as a hop count produces a message that says the opposite of what happened --
+// two hosts that cannot reach each other at all are described as directly
+// adjacent -- and sends whoever reads it looking for the wrong fault.
 func countTracerouteHops(out, dst string) int {
 	for _, line := range strings.Split(out, "\n") {
 		m := hopRe.FindStringSubmatch(line)

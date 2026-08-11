@@ -226,6 +226,16 @@ func (r *Renderer) rpkiReadyCommands(d *model.Device) []deploy.Command {
 func (r *Renderer) switchCommands(d *model.Device) []deploy.Command {
 	br := "br0"
 	cmds := []deploy.Command{
+		// Wait for the database before touching it. ovs-vsctl against an
+		// ovsdb that has not finished starting fails, and the deployment
+		// carries on: the container is up, its ports exist as interfaces, and
+		// there is no bridge -- so an entire exchange fabric forwards nothing
+		// while every router attached to it reports its session merely Active.
+		// That is a very expensive silence to debug from the router's end.
+		{Args: []string{"sh", "-c",
+			"for i in $(seq 1 30); do ovs-vsctl --timeout=2 show >/dev/null 2>&1 && exit 0; sleep 1; done; " +
+				"echo 'the switch database did not start' >&2; exit 1"},
+			Describe: "wait for the switch database"},
 		{Args: []string{"sh", "-c", "ovs-vsctl --may-exist add-br " + br},
 			Describe: "create the OVS bridge"},
 		{Args: []string{"sh", "-c", "ip link set " + br + " up"},
@@ -242,6 +252,24 @@ func (r *Renderer) switchCommands(d *model.Device) []deploy.Command {
 	}
 	if r.modeFor(d) == ModeSolve {
 		cmds = append(cmds, r.switchSolution(d, br)...)
+	}
+	// Prove the bridge exists and carries every port it was given. Without
+	// this the deployment reports success on a switch that silently forwards
+	// nothing, which presents at the routers as sessions that never establish.
+	var want []string
+	for _, i := range d.Ifaces {
+		if i.Link != nil {
+			want = append(want, i.Name)
+		}
+	}
+	if len(want) > 0 {
+		cmds = append(cmds, deploy.Command{
+			Describe: "check the bridge carries every port",
+			Args: []string{"sh", "-c", fmt.Sprintf(
+				"have=$(ovs-vsctl list-ports %s 2>/dev/null | wc -l); "+
+					"[ \"$have\" -ge %d ] || { echo \"bridge %s has $have of %d ports\" >&2; exit 1; }",
+				br, len(want), br, len(want))},
+		})
 	}
 	return cmds
 }
