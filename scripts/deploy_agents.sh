@@ -66,13 +66,18 @@ for n in "${NODES[@]}"; do
     # line wholesale would be simpler and would silently drop the flags already
     # there -- -underlay-dev among them, whose absence surfaces much later as a
     # tunnel sourced from the wrong interface.
-    strip_re='s# -tls-cert [^ ]*##; s# -tls-key [^ ]*##; s# -client-ca [^ ]*##'
+    # Without --pki the unit is left exactly as it is. Rewriting it to remove
+    # the TLS flags would mean that rolling out a new binary silently downgrades
+    # a mutually authenticated cluster to a bearer token over plain HTTP -- an
+    # upgrade that takes the security away, with nothing in its output saying
+    # so. Removing TLS has to be asked for.
     if [ -n "$PKI" ]; then
+        strip_re='s# -tls-cert [^ ]*##; s# -tls-key [^ ]*##; s# -client-ca [^ ]*##'
         add=' -tls-cert /etc/twinet/pki/server_cert.pem -tls-key /etc/twinet/pki/server_key.pem -client-ca /etc/twinet/pki/ca_cert.pem'
+        unit_cmd="sed -i -e '${strip_re}' -e '\#^ExecStart=#s#\$#${add}#' /etc/systemd/system/twinetd.service"
     else
-        add=''
+        unit_cmd="true"
     fi
-    unit_cmd="sed -i -e '${strip_re}' -e '\#^ExecStart=#s#\$#${add}#' /etc/systemd/system/twinetd.service"
 
     if [ "$n" = "$(hostname -s)" ]; then
         sudo systemctl stop twinetd || true

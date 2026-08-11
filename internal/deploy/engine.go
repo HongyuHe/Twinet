@@ -417,6 +417,21 @@ func (e *Engine) PruneOrphans(ctx context.Context, top *model.Topology) ([]strin
 		if c.Labels[LabelNode] != "" && c.Labels[LabelNode] != e.Node && !elsewhere[c.Name] {
 			continue
 		}
+		// Capture before removing. An orphan is usually a device that moved to
+		// another node or left the manifest, and in both cases it may hold a
+		// student's work -- the only copy of it. Removing first and asking
+		// later is not recoverable, and the loss is silent: the deployment
+		// reports success, the container is gone, and nobody discovers what
+		// was in it until someone asks for a mark.
+		//
+		// Refusing is the right failure. A lab with one stale container is a
+		// nuisance; a lab that has quietly eaten a group's configuration is
+		// not something an apology fixes.
+		if err := e.captureOrphan(ctx, top, c); err != nil {
+			return removed, fmt.Errorf(
+				"refusing to remove %s: its configuration could not be captured (%w). "+
+					"Destroy the lab explicitly if it is genuinely disposable", c.Name, err)
+		}
 		if err := e.Runtime.Remove(ctx, c.Name, true); err != nil {
 			return removed, fmt.Errorf("remove orphan %s: %w", c.Name, err)
 		}
@@ -424,6 +439,44 @@ func (e *Engine) PruneOrphans(ctx context.Context, top *model.Topology) ([]strin
 	}
 	sort.Strings(removed)
 	return removed, nil
+}
+
+// captureOrphan snapshots a container that is about to be removed.
+//
+// A container with no state store configured is removed without capture,
+// because there is nowhere to put the snapshot and blocking every prune on a
+// store nobody configured would make the platform unusable. That is a
+// deliberate trade and it is recorded here rather than left implicit.
+func (e *Engine) captureOrphan(ctx context.Context, top *model.Topology, c runtime.Container) error {
+	if e.State == nil {
+		return nil
+	}
+	// The device is gone from the topology, so its identity comes from the
+	// labels the deployment stamped on it.
+	id := c.Labels[LabelDevice]
+	if id == "" {
+		return nil
+	}
+	d, ok := top.Device(id)
+	if !ok {
+		// Not in the manifest any more, which is exactly why it is an orphan.
+		// A minimal stand-in is enough for the capture, which reads the
+		// container rather than the model.
+		d = &model.Device{ID: id, Container: c.Name, Kind: model.DeviceKind(c.Labels[LabelKind])}
+	}
+	if d.Kind == "" {
+		d.Kind = model.KindRouter
+	}
+	snaps, err := Capture(ctx, e.Runtime, d, top.Name, top.Hash)
+	if err != nil {
+		return err
+	}
+	for _, snap := range snaps {
+		if _, err := e.State.Put(snap); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // PruneOverlays removes VXLAN bridges and tunnels this node no longer needs.

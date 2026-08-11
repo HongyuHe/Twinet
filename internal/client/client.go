@@ -39,6 +39,9 @@ type Node struct {
 	// tls is the client configuration the raw attach stream reuses, so the
 	// streaming path cannot end up weaker than the request path.
 	tls *tls.Config
+	// cfgErr is a credential that could not be loaded, surfaced on first use
+	// rather than swallowed at construction.
+	cfgErr error
 }
 
 // TLS carries the client's mutual-TLS material.
@@ -58,17 +61,36 @@ func NewNodeTLS(name, addr, token string, t TLS) *Node {
 		DialContext:         (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
 		MaxIdleConnsPerHost: 8,
 	}
-	var streamCfg *tls.Config
+	var (
+		streamCfg *tls.Config
+		cfgErr    error
+	)
 	if t.Cert != "" && t.Key != "" {
 		scheme = "https://"
 		cfg := &tls.Config{MinVersion: tls.VersionTLS13}
-		if cert, err := tls.LoadX509KeyPair(t.Cert, t.Key); err == nil {
+
+		// A certificate that will not load is recorded, not ignored. Silently
+		// continuing without it produces a handshake the far side rejects for
+		// reasons that look like a network problem, and the operator's actual
+		// mistake -- a path, a permission -- is nowhere in the message. Worse,
+		// swallowing it is how a cluster ends up believing it is authenticated
+		// when it is not.
+		cert, err := tls.LoadX509KeyPair(t.Cert, t.Key)
+		if err != nil {
+			cfgErr = fmt.Errorf("client certificate %s: %w", t.Cert, err)
+		} else {
 			cfg.Certificates = []tls.Certificate{cert}
 		}
-		if t.CA != "" {
-			if pem, err := os.ReadFile(t.CA); err == nil {
+		if t.CA != "" && cfgErr == nil {
+			pem, err := os.ReadFile(t.CA)
+			switch {
+			case err != nil:
+				cfgErr = fmt.Errorf("cluster CA %s: %w", t.CA, err)
+			default:
 				pool := x509.NewCertPool()
-				if pool.AppendCertsFromPEM(pem) {
+				if !pool.AppendCertsFromPEM(pem) {
+					cfgErr = fmt.Errorf("cluster CA %s contains no usable certificate", t.CA)
+				} else {
 					cfg.RootCAs = pool
 				}
 			}
@@ -81,7 +103,7 @@ func NewNodeTLS(name, addr, token string, t TLS) *Node {
 	}
 	return &Node{
 		Name: name, Addr: strings.TrimRight(addr, "/"), Token: token,
-		tls: streamCfg,
+		tls: streamCfg, cfgErr: cfgErr,
 		http: &http.Client{
 			Timeout:   30 * time.Minute, // a large apply legitimately takes a while
 			Transport: tr,
@@ -90,6 +112,9 @@ func NewNodeTLS(name, addr, token string, t TLS) *Node {
 }
 
 func (n *Node) do(ctx context.Context, method, path string, body, out any) error {
+	if n.cfgErr != nil {
+		return fmt.Errorf("node %s: %w", n.Name, n.cfgErr)
+	}
 	var rdr io.Reader
 	if body != nil {
 		buf, err := json.Marshal(body)

@@ -59,6 +59,11 @@ type Config struct {
 	// container replacement and node reboots, because it is the only copy of
 	// work a class cannot recreate.
 	StateDir string
+	// Insecure allows the agent to serve without mutual TLS on an address
+	// other than loopback. It exists so a development cluster is possible, and
+	// it must be asked for: the failure mode of a warning is that everything
+	// works and nobody ever revisits it.
+	Insecure bool
 	TLSCert  string
 	TLSKey   string
 	ClientCA string
@@ -68,15 +73,17 @@ type Config struct {
 func Main(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("twinetd", flag.ContinueOnError)
 	var (
-		node    = fs.String("node", hostShortName(), "this node's name, as used in the manifest")
-		listen  = fs.String("listen", ":7200", "address to serve the agent API on")
-		token   = fs.String("token", os.Getenv("TWINET_TOKEN"), "shared secret the control plane must present")
-		uip     = fs.String("underlay-ip", "", "VTEP source address for cross-node links")
-		udev    = fs.String("underlay-dev", "", "interface to source tunnels from")
-		sdir    = fs.String("state-dir", "/var/lib/twinet/state", "where student configuration snapshots are kept")
-		cert    = fs.String("tls-cert", os.Getenv("TWINET_TLS_CERT"), "server certificate (enables TLS)")
-		key     = fs.String("tls-key", os.Getenv("TWINET_TLS_KEY"), "server private key")
-		cacert  = fs.String("client-ca", os.Getenv("TWINET_CLIENT_CA"), "CA that signs permitted client certificates (enables mutual TLS)")
+		node   = fs.String("node", hostShortName(), "this node's name, as used in the manifest")
+		listen = fs.String("listen", ":7200", "address to serve the agent API on")
+		token  = fs.String("token", os.Getenv("TWINET_TOKEN"), "shared secret the control plane must present")
+		uip    = fs.String("underlay-ip", "", "VTEP source address for cross-node links")
+		udev   = fs.String("underlay-dev", "", "interface to source tunnels from")
+		sdir   = fs.String("state-dir", "/var/lib/twinet/state", "where student configuration snapshots are kept")
+		cert   = fs.String("tls-cert", os.Getenv("TWINET_TLS_CERT"), "server certificate (enables TLS)")
+		key    = fs.String("tls-key", os.Getenv("TWINET_TLS_KEY"), "server private key")
+		cacert = fs.String("client-ca", os.Getenv("TWINET_CLIENT_CA"), "CA that signs permitted client certificates (enables mutual TLS)")
+		insec  = fs.Bool("insecure", os.Getenv("TWINET_INSECURE") == "1",
+			"serve without mutual TLS on a non-loopback address (development only)")
 		verbose = fs.Bool("verbose", false, "debug logging")
 		version = fs.Bool("version", false, "print the version and exit")
 	)
@@ -102,7 +109,7 @@ func Main(ctx context.Context, args []string) error {
 
 	s, err := New(Config{
 		Node: *node, Listen: *listen, Token: *token,
-		UnderlayIP: *uip, UnderlayDev: *udev, StateDir: *sdir,
+		UnderlayIP: *uip, UnderlayDev: *udev, StateDir: *sdir, Insecure: *insec,
 		TLSCert: *cert, TLSKey: *key, ClientCA: *cacert,
 	})
 	if err != nil {
@@ -211,6 +218,26 @@ func (s *Server) rehydrate() {
 	}
 }
 
+// loopbackOnly reports whether an address is reachable only from this machine.
+func loopbackOnly(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func insecureReason(cfg Config) string {
+	if cfg.Insecure {
+		return "-insecure was passed"
+	}
+	return "listening on loopback only"
+}
+
 // acquire takes the operation lease for one lab, refusing rather than queueing
 // so a caller learns immediately that something else is mid-flight on that lab.
 // Operations on other labs are unaffected.
@@ -282,8 +309,25 @@ func (s *Server) Serve(ctx context.Context) error {
 		}
 		srv.TLSConfig = cfg
 	} else {
-		slog.Warn("the agent is serving plain HTTP with only a bearer token; " +
-			"pass -tls-cert, -tls-key and -client-ca for mutual TLS before exposing it beyond a trusted network")
+		// Refusing rather than warning. This API creates containers and
+		// rewires hosts, and a bearer token over plain HTTP is replayable by
+		// anyone who sees one request, identical on every node so one leak
+		// takes the cluster, and leaves the agent unauthenticated to the
+		// caller -- so anything that can occupy the port collects tokens.
+		//
+		// A warning does not survive contact with a working cluster: it scrolls
+		// past once, everything functions, and the insecure configuration
+		// becomes permanent because nothing ever forces the question again.
+		if !s.cfg.Insecure && !loopbackOnly(s.cfg.Listen) {
+			return fmt.Errorf(
+				"refusing to serve %s without mutual TLS.\n"+
+					"This API can create privileged containers and rewire hosts.\n"+
+					"Issue credentials with `twinet node pki` and pass -tls-cert, -tls-key\n"+
+					"and -client-ca, or pass -insecure to accept a bearer token over plain\n"+
+					"HTTP on a network you control", s.cfg.Listen)
+		}
+		slog.Warn("serving plain HTTP with only a bearer token",
+			"listen", s.cfg.Listen, "reason", insecureReason(s.cfg))
 	}
 
 	errc := make(chan error, 1)
@@ -529,11 +573,24 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 	if req.Prune && !req.DryRun && !rep.Failed() {
 		gone, err := eng.PruneOrphans(r.Context(), top)
 		if err != nil {
+			// Surfaced to the caller, not just logged. A prune that refused to
+			// remove a container because it could not capture what was inside
+			// is exactly the thing an operator has to see: the lab is fine, and
+			// something is holding work nobody can account for. A warning in
+			// the agent's journal is not seen by the person running the deploy.
 			slog.Warn("pruning containers", "err", err)
+			if resp.Failures == nil {
+				resp.Failures = map[string][]string{}
+			}
+			resp.Failures["prune"] = append(resp.Failures["prune"], err.Error())
 		}
 		resp.Pruned = gone
 		if overlays, err := eng.PruneOverlays(top); err != nil {
 			slog.Warn("pruning overlays", "err", err)
+			if resp.Failures == nil {
+				resp.Failures = map[string][]string{}
+			}
+			resp.Failures["prune"] = append(resp.Failures["prune"], err.Error())
 		} else {
 			resp.Pruned = append(resp.Pruned, overlays...)
 		}
