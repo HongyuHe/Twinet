@@ -86,6 +86,14 @@ type WireIface struct {
 	Parent string `json:"parent,omitempty"`
 	Role   string `json:"role"`
 	LinkID string `json:"link_id,omitempty"`
+	// VRF is the virtual routing table this interface belongs to.
+	//
+	// It has to cross the wire, and it was the missing piece: the controller
+	// rendered `interface X vrf Y` correctly while the node put the interface
+	// in the main table, because the node's copy of the model had no VRF at
+	// all. Nothing reported a problem -- the daemon was configured for a table
+	// the kernel did not have, and every customer's routes quietly shared one.
+	VRF string `json:"vrf,omitempty"`
 }
 
 // WireLink is one link.
@@ -122,6 +130,12 @@ type WireAS struct {
 	BlockV6    string   `json:"block_v6,omitempty"`
 	Routers    []string `json:"routers,omitempty"`
 	Devices    []string `json:"devices,omitempty"`
+	// MPLS and VRFs carry the advanced course's declarations, which the node
+	// needs in order to create the kernel routing tables and the renderer
+	// needs in order to configure them.
+	MPLSEnabled bool                     `json:"mpls_enabled,omitempty"`
+	MPLSCore    []string                 `json:"mpls_core,omitempty"`
+	VRFs        map[string]model.VRFSpec `json:"vrfs,omitempty"`
 }
 
 // WireSvc is one auxiliary service.
@@ -168,7 +182,7 @@ func Serialise(top *model.Topology) *Wire {
 			wi := WireIface{
 				Name: i.Name, MAC: i.MAC, Addr4: i.Addr4, Addr6: i.Addr6,
 				Owner: string(i.Owner), VLAN: i.VLAN, Trunk: i.Trunk,
-				Parent: i.Parent, Role: string(i.Role),
+				Parent: i.Parent, Role: string(i.Role), VRF: i.VRF,
 			}
 			if i.Link != nil {
 				wi.LinkID = i.Link.ID
@@ -198,6 +212,13 @@ func Serialise(top *model.Topology) *Wire {
 			ASN: as.ASN, Role: string(as.Role), Region: as.Region,
 			Template: as.Template, OwnerGroup: as.OwnerGroup,
 			Block: as.Block, BlockV6: as.BlockV6,
+			MPLSEnabled: as.MPLS.Enabled, MPLSCore: as.MPLS.Core,
+		}
+		if len(as.VRFs) > 0 {
+			wa.VRFs = map[string]model.VRFSpec{}
+			for n, v := range as.VRFs {
+				wa.VRFs[n] = *v
+			}
 		}
 		for _, r := range as.Routers {
 			wa.Routers = append(wa.Routers, r.ID)
@@ -267,7 +288,7 @@ func (w *Wire) Rehydrate() (*model.Topology, error) {
 			ifc := &model.Iface{
 				Device: d, Name: wi.Name, MAC: wi.MAC, Addr4: wi.Addr4, Addr6: wi.Addr6,
 				Owner: model.ConfigOwner(wi.Owner), VLAN: wi.VLAN, Trunk: wi.Trunk,
-				Parent: wi.Parent, Role: model.IfaceRole(wi.Role),
+				Parent: wi.Parent, Role: model.IfaceRole(wi.Role), VRF: wi.VRF,
 			}
 			d.Ifaces = append(d.Ifaces, ifc)
 			ifaceOf[wd.ID+"|"+wi.Name] = ifc
@@ -307,6 +328,14 @@ func (w *Wire) Rehydrate() (*model.Topology, error) {
 			Template: wa.Template, OwnerGroup: wa.OwnerGroup,
 			Block: wa.Block, BlockV6: wa.BlockV6,
 			ExtPorts: map[string]*model.ExtPortBinding{},
+			MPLS:     model.MPLSSpec{Enabled: wa.MPLSEnabled, Core: wa.MPLSCore},
+		}
+		if len(wa.VRFs) > 0 {
+			as.VRFs = map[string]*model.VRFSpec{}
+			for n, v := range wa.VRFs {
+				vv := v
+				as.VRFs[n] = &vv
+			}
 		}
 		for _, id := range wa.Routers {
 			d, ok := top.Devices[id]

@@ -182,14 +182,32 @@ func (n *Node) Apply(ctx context.Context, req agent.ApplyRequest) (agent.ApplyRe
 
 // Destroy removes a lab from the node.
 func (n *Node) Destroy(ctx context.Context, lab string, vnis []uint32) error {
-	return n.do(ctx, http.MethodPost, "/v1/destroy",
-		agent.DestroyRequest{Lab: lab, VNIs: vnis}, nil)
+	return n.destroy(ctx, agent.DestroyRequest{Lab: lab, VNIs: vnis})
 }
 
 // DestroyEphemeral removes a disposable lab and discards its saved state.
 func (n *Node) DestroyEphemeral(ctx context.Context, lab string, vnis []uint32) error {
-	return n.do(ctx, http.MethodPost, "/v1/destroy",
-		agent.DestroyRequest{Lab: lab, VNIs: vnis, Ephemeral: true}, nil)
+	return n.destroy(ctx, agent.DestroyRequest{Lab: lab, VNIs: vnis, Ephemeral: true})
+}
+
+// destroy sends the request and turns a partial cleanup into an error.
+//
+// The agent used to answer "destroyed" whatever happened to the overlays, so a
+// node that could not remove a tunnel logged a warning locally and told the
+// controller everything was fine. The identifiers stayed allocated, and the
+// next lab deriving the same one joined its traffic to a lab that was supposed
+// to be gone.
+func (n *Node) destroy(ctx context.Context, req agent.DestroyRequest) error {
+	var resp agent.DestroyResponse
+	if err := n.do(ctx, http.MethodPost, "/v1/destroy", req, &resp); err != nil {
+		return err
+	}
+	if len(resp.Problems) > 0 {
+		return fmt.Errorf("%s was only partially removed, so its network identifiers are "+
+			"still in use and a later lab could collide with them: %s",
+			req.Lab, strings.Join(resp.Problems, "; "))
+	}
+	return nil
 }
 
 // Exec runs a command in a container on the node.
@@ -274,20 +292,50 @@ func NewCluster(lab *model.Lab, token string) *Cluster {
 		Key:  os.Getenv("TWINET_TLS_KEY"),
 		CA:   os.Getenv("TWINET_CA"),
 	}
-	// Fall back to the material the lab itself issued. Requiring an operator to
-	// export three environment variables before anything works is how a cluster
-	// ends up running without them: the insecure path is the one that needs no
-	// setup, so it becomes the path everyone uses.
-	if t.Cert == "" && lab != nil && lab.Dir != "" {
-		dir := filepath.Join(lab.Dir, ".twinet", "pki")
-		cert := filepath.Join(dir, "controller_cert.pem")
-		key := filepath.Join(dir, "controller_key.pem")
-		ca := filepath.Join(dir, "ca_cert.pem")
-		if fileExists(cert) && fileExists(key) && fileExists(ca) {
-			t = TLS{Cert: cert, Key: key, CA: ca}
+	// Fall back to material issued for the lab, and then to material issued for
+	// the cluster. Requiring an operator to export three environment variables
+	// before anything works is how a cluster ends up running without them: the
+	// insecure path is the one that needs no setup, so it becomes the path
+	// everyone uses.
+	//
+	// The cluster-wide location matters as much as the per-lab one. A node
+	// agent trusts one certificate authority, so a second lab on the same
+	// cluster has no way to be trusted unless its own directory happens to
+	// contain a copy -- and until somebody copies the files by hand, every
+	// command against that lab fails with "client sent an HTTP request to an
+	// HTTPS server", which names neither the cause nor the cure.
+	if t.Cert == "" {
+		for _, dir := range pkiSearchPath(lab) {
+			cert := filepath.Join(dir, "controller_cert.pem")
+			key := filepath.Join(dir, "controller_key.pem")
+			ca := filepath.Join(dir, "ca_cert.pem")
+			if fileExists(cert) && fileExists(key) && fileExists(ca) {
+				t = TLS{Cert: cert, Key: key, CA: ca}
+				break
+			}
 		}
 	}
 	return NewClusterTLS(lab, token, t)
+}
+
+// pkiSearchPath lists where mutual-TLS material may live, nearest first.
+//
+// The lab's own directory wins, so a lab issued its own authority keeps using
+// it. After that comes the cluster's, because the certificate authority is a
+// property of the cluster the agents run on and not of any one lab.
+func pkiSearchPath(lab *model.Lab) []string {
+	var dirs []string
+	if lab != nil && lab.Dir != "" {
+		dirs = append(dirs, filepath.Join(lab.Dir, ".twinet", "pki"))
+	}
+	if d := os.Getenv("TWINET_PKI"); d != "" {
+		dirs = append(dirs, d)
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		dirs = append(dirs, filepath.Join(home, ".twinet", "pki"))
+	}
+	dirs = append(dirs, "/etc/twinet/pki")
+	return dirs
 }
 
 func fileExists(p string) bool {

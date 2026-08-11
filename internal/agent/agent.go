@@ -581,7 +581,13 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mu.Lock()
-	s.current[top.Name] = top
+	// A dry run changed nothing on this node, so it must not become what the
+	// node believes it is hosting. Recording it made the agent claim a lab it
+	// had never built: `node status` reported its hash, and a later destroy
+	// would try to capture student work from containers that did not exist.
+	if !req.DryRun {
+		s.current[top.Name] = top
+	}
 	if s.peers == nil {
 		s.peers = map[string]map[string]string{}
 	}
@@ -678,6 +684,18 @@ type DestroyRequest struct {
 	Ephemeral bool `json:"ephemeral,omitempty"`
 }
 
+// DestroyResponse reports what was removed and what could not be.
+//
+// Problems is the important field. A destroy that says "destroyed" while
+// leaving overlays behind keeps their identifiers allocated, and the next lab
+// to derive the same one finds it occupied -- which joins two labs' traffic
+// together with nothing to indicate it happened.
+type DestroyResponse struct {
+	Status   string   `json:"status"`
+	Lab      string   `json:"lab"`
+	Problems []string `json:"problems,omitempty"`
+}
+
 func (s *Server) handleDestroy(w http.ResponseWriter, r *http.Request) {
 	var req DestroyRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -724,13 +742,24 @@ func (s *Server) handleDestroy(w http.ResponseWriter, r *http.Request) {
 	// the ones it does not -- which belong to the lab it collided with. And a
 	// lab whose manifest is gone entirely can still be cleaned up, because the
 	// node knows what it owns without being told.
+	// Cleanup failures are collected and returned, not just logged.
+	//
+	// A destroy that reports "destroyed" while leaving tunnels behind is worse
+	// than one that fails: the VNIs stay allocated, and the next lab to derive
+	// the same identifier finds them occupied and silently joins two labs'
+	// traffic. The caller has to be told, and a warning in this node's log is
+	// not telling the caller.
+	var problems []string
 	owned, err := netx.ListOverlaysOfLab(req.Lab)
 	if err != nil {
 		slog.Warn("listing this lab's overlays", "lab", req.Lab, "err", err)
+		problems = append(problems, fmt.Sprintf("%s: could not list overlays: %v", s.cfg.Node, err))
 	}
 	if len(owned) > 0 {
 		if err := eng.DestroyOverlays(owned); err != nil {
 			slog.Warn("overlay cleanup incomplete", "lab", req.Lab, "err", err)
+			problems = append(problems, fmt.Sprintf("%s: %d overlay(s) left behind: %v",
+				s.cfg.Node, len(owned), err))
 		}
 	}
 	// Identifiers the caller supplied are honoured only where they are
@@ -748,6 +777,8 @@ func (s *Server) handleDestroy(w http.ResponseWriter, r *http.Request) {
 			if len(safeVNIs) > 0 {
 				if err := eng.DestroyOverlays(safeVNIs); err != nil {
 					slog.Warn("overlay cleanup incomplete", "lab", req.Lab, "err", err)
+					problems = append(problems, fmt.Sprintf("%s: %d unowned overlay(s) left behind: %v",
+						s.cfg.Node, len(safeVNIs), err))
 				}
 			}
 		}
@@ -768,7 +799,11 @@ func (s *Server) handleDestroy(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	delete(s.current, req.Lab)
 	s.mu.Unlock()
-	writeJSON(w, map[string]string{"status": "destroyed", "lab": req.Lab})
+	status := "destroyed"
+	if len(problems) > 0 {
+		status = "incomplete"
+	}
+	writeJSON(w, DestroyResponse{Status: status, Lab: req.Lab, Problems: problems})
 }
 
 // ExecRequest runs a command inside a container on this node.

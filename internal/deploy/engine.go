@@ -366,7 +366,7 @@ func (e *Engine) restoreIfNeeded(ctx context.Context, top *model.Topology, d *mo
 
 // replayPending restores a device's captured configuration if one was pending.
 func (e *Engine) replayPending(ctx context.Context, top *model.Topology, d *model.Device) error {
-	if _, pending := e.pendingRestore.LoadAndDelete(d.ID); !pending {
+	if _, pending := e.pendingRestore.Load(d.ID); !pending {
 		return nil
 	}
 	if e.State == nil {
@@ -374,11 +374,21 @@ func (e *Engine) replayPending(ctx context.Context, top *model.Topology, d *mode
 	}
 	ok, err := Restore(ctx, e.Runtime, d, top.Name, e.State)
 	if err != nil {
+		// The marker stays. It used to be taken with LoadAndDelete, before the
+		// restore was attempted, so a restore that failed for any transient
+		// reason -- the container not yet accepting commands, a busy node --
+		// left nothing to say the device still needed one. The next deploy saw
+		// a device that existed, no pending work, and converged happily on a
+		// router with none of its student's configuration. The failure was
+		// reported once and then became invisible.
+		//
 		// A failed restore is loud: the snapshot is still on disk, and an
 		// operator must know that this device came back empty.
 		return fmt.Errorf("%s was recreated but its saved configuration could not be replayed "+
-			"(the snapshot is safe in the state store): %w", d.ID, err)
+			"(the snapshot is safe in the state store, and the device is still marked "+
+			"as needing one): %w", d.ID, err)
 	}
+	e.pendingRestore.Delete(d.ID)
 	_ = ok
 	return nil
 }
@@ -673,6 +683,17 @@ func (e *Engine) endpoint(top *model.Topology, i *model.Iface, nsPath string, l 
 		MTU:     linkMTU(l),
 		Altname: alloc.LinkAltname(top.Name, l.ID),
 		Up:      true,
+	}
+	// A customer-facing interface belongs to that customer's routing table.
+	// This is a kernel device, not only an FRR setting: without it the
+	// addresses land in the main table, and two customers using the same
+	// private prefix silently overwrite each other's routes.
+	if i.VRF != "" {
+		if as, ok := top.ASes[i.Device.ASN]; ok {
+			if v := as.VRFs[i.VRF]; v != nil {
+				ep.VRF, ep.VRFTable = i.VRF, v.Table
+			}
+		}
 	}
 	// Addresses are applied only for interfaces the platform owns. Those the
 	// student owns are left bare on purpose: configuring them is the exercise.
