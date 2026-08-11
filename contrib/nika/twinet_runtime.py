@@ -25,6 +25,8 @@ import subprocess
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
+from nika.runtime.base import LabRuntime
+
 
 class TwinetError(RuntimeError):
     """The controller could not be run, or refused the request.
@@ -54,8 +56,18 @@ class _Container:
         self.status = self._runtime.node_status(self.name)
 
 
-class TwinetRuntime:
-    """A LabRuntime over a Twinet lab."""
+class TwinetRuntime(LabRuntime):
+    """A LabRuntime over a Twinet lab.
+
+    It subclasses NIKA's own base class rather than merely presenting the same
+    method names. That is not a formality. ``LabRuntime`` inherits
+    ``ExecSemanticOpsMixin``, which implements roughly fifty semantic
+    operations -- interface state, addresses, tc, nft, FRR, DHCP, processes --
+    by delegating through ``lab_api``. A duck-typed class gets none of them, so
+    the adapter satisfied every check anyone thought to write while NIKA's
+    problem classes, which call those operations rather than ``exec``, could not
+    run against it at all.
+    """
 
     def __init__(
         self,
@@ -63,8 +75,28 @@ class TwinetRuntime:
         binary: str | None = None,
         token: str | None = None,
         timeout: float = 60.0,
+        dialect: str | None = None,
     ) -> None:
         self.manifest = manifest
+        # NIKA's problem classes dispatch on the backend name with a literal
+        # match, and raise RuntimeCapabilityError on anything that is not
+        # "kathara" or "containerlab". A runtime can implement the protocol
+        # perfectly and still be refused by every problem, which is what
+        # happened here.
+        #
+        # What that dispatch actually selects is a device dialect: interface
+        # naming ("e1-1" on containerlab, "eth0" everywhere else) and whether
+        # the router is SR Linux or FRR. Twinet is Linux network namespaces
+        # running FRR with eth0-style names, which is the "kathara" arm in
+        # every respect the dispatch cares about.
+        #
+        # So the dialect is declared, not hidden. The default reports the truth
+        # -- "twinet" -- and problems will refuse it. Setting dialect="kathara",
+        # or TWINET_NIKA_DIALECT, asks the adapter to present the arm whose
+        # behaviour is correct for these devices. It is opt-in because a
+        # runtime that silently misnames itself is how a harness comes to
+        # believe it measured something it did not.
+        self.dialect = dialect or os.environ.get("TWINET_NIKA_DIALECT") or ""
         self.binary = binary or os.environ.get("TWINET_BIN") or shutil.which("twinet") or "twinet"
         self.token = token or os.environ.get("TWINET_TOKEN", "")
         self.timeout = timeout
@@ -75,7 +107,7 @@ class TwinetRuntime:
 
     @property
     def backend(self) -> str:
-        return "twinet"
+        return self.dialect or "twinet"
 
     @property
     def lab_name(self) -> str:
@@ -88,7 +120,7 @@ class TwinetRuntime:
             self._nodes = [n["name"] for n in self._nodes_payload()["nodes"]]
         return list(self._nodes)
 
-    def exec(self, host_name: str, command: str, timeout: float = 10) -> str:
+    def exec(self, node: str, cmd: str, *, timeout: float = 10.0) -> str:
         """Run a shell command in a device and return its output.
 
         The command goes to a shell inside the container, because NIKA writes
@@ -98,16 +130,105 @@ class TwinetRuntime:
         which one produced it.
         """
         res = self._json(
-            ["runtime", "exec", host_name, "--", "sh", "-c", command],
+            ["runtime", "exec", node, "--", "sh", "-c", cmd],
             timeout=max(timeout, 5) + 10,
         )
         if res.get("error"):
-            raise TwinetError(f"{host_name}: {res['error']}")
+            raise TwinetError(f"{node}: {res['error']}")
         return (res.get("stdout") or "") + (res.get("stderr") or "")
 
     def exec_cmd(self, host_name: str, command: str, timeout: float = 10) -> str:
         """Alias for :meth:`exec`, for the adapter that expects this name."""
         return self.exec(host_name, command, timeout=timeout)
+
+    # ---- lab lifecycle --------------------------------------------------
+
+    def deploy(self) -> None:
+        """Bring the lab up, converging whatever is already running.
+
+        Twinet's deploy is idempotent, so this satisfies "deploy if it is not
+        already running" without a separate existence check that could race
+        against another harness.
+        """
+        self._run(["deploy"], timeout=self.timeout * 10)
+        self._nodes = None
+        self._lab_name = None
+
+    def destroy(self) -> None:
+        """Tear the lab down."""
+        self._run(["destroy", "--yes"], timeout=self.timeout * 10)
+        self._nodes = None
+
+    def exists(self) -> bool:
+        """Report whether any device of the lab is running.
+
+        A lab that is declared but has nothing running is not deployed, so this
+        asks the cluster rather than reading the manifest -- the manifest is
+        present whether or not anything was ever started.
+        """
+        try:
+            nodes = self._nodes_payload().get("nodes") or []
+        except TwinetError:
+            return False
+        if not nodes:
+            return False
+        # Ask about one device rather than reading a field of the listing.
+        # The listing is compiled from the manifest and describes what the lab
+        # should contain, so every device appears in it whether or not anything
+        # was ever started; a status taken from there reported a lab as running
+        # before it had been deployed even once.
+        for n in nodes[:3]:
+            try:
+                if self.node_status(n["name"]) in ("running", "paused"):
+                    return True
+            except TwinetError:
+                continue
+        return False
+
+    def inspect(self, *, with_status: bool = False) -> list[dict[str, Any]]:
+        """Return one row per container, shaped like ``list_lab_containers``.
+
+        Run state is only fetched when asked for. Reading it means one call per
+        device, which on a class-scale lab is a couple of hundred round trips,
+        and every caller that only wants names and images would pay for it.
+        Callers that need status ask for it, or use :meth:`node_status`.
+        """
+        rows: list[dict[str, Any]] = []
+        for n in self._nodes_payload().get("nodes") or []:
+            name = n.get("name") or ""
+            status = "unknown"
+            if with_status:
+                try:
+                    status = self.node_status(name)
+                except TwinetError:
+                    status = "unknown"
+            rows.append(
+                {
+                    "name": name,
+                    "container_name": n.get("container") or name,
+                    "lab_name": self.lab_name,
+                    "status": status,
+                    "image": n.get("image") or "",
+                    "node": n.get("node") or "",
+                }
+            )
+        return rows
+
+    def get_connected_devices(self, node: str) -> list[str]:
+        """Return the devices directly linked to ``node``.
+
+        The base class returns nothing when a backend has no topology to
+        consult, which makes localisation scoring look uniformly wrong rather
+        than unavailable. Twinet knows its own links, so it answers.
+        """
+        out: list[str] = []
+        for link in self._nodes_payload().get("links") or []:
+            a, b = link.get("a"), link.get("b")
+            if a == node and b and b not in out:
+                out.append(b)
+            elif b == node and a and a not in out:
+                out.append(a)
+        return out
 
     def get_container(self, node: str) -> _Container:
         c = _Container(name=node, _runtime=self)

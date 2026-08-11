@@ -226,8 +226,12 @@ operations that faults call: `set_interface_state`, `get_host_ip`,
 `add_nft_drop_rule`, `tc_set_netem`, `frr_get_bgp_asn_number`, `kill_process`,
 and so on.
 
-Twinet will expose these through a thin adapter, so NIKA's existing fault
-implementations run unmodified against a Twinet lab:
+Twinet exposes these through an adapter that subclasses NIKA's `LabRuntime`, so
+NIKA's existing fault implementations run against a Twinet lab. They run
+unmodified, but only once the runtime is told to present the `kathara` device
+dialect: NIKA's problem classes dispatch on a literal backend name and refuse
+anything they do not recognise, whatever the runtime implements. See
+`contrib/nika/README.md`.
 
 ```
 NIKA problem  ──▶  LabRuntime (twinet)  ──▶  twinetd API        ──▶  device

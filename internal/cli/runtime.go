@@ -55,17 +55,40 @@ func newRuntimeNodesCmd(opts *Options) *cobra.Command {
 				AS        int    `json:"as"`
 				Node      string `json:"node"`
 				Container string `json:"container"`
+				Image     string `json:"image,omitempty"`
+			}
+			// Links are part of this payload because a harness that scores
+			// fault localisation has to know which devices are adjacent. Left
+			// out, NIKA's get_connected_devices returns nothing for every
+			// device, and a localisation that named a correct neighbour scores
+			// the same as one that named a router in another continent.
+			type link struct {
+				A     string `json:"a"`
+				B     string `json:"b"`
+				AIf   string `json:"a_iface"`
+				BIf   string `json:"b_iface"`
+				InfAS bool   `json:"inter_as,omitempty"`
 			}
 			out := struct {
 				Lab   string `json:"lab"`
 				Hash  string `json:"topology_hash"`
 				Nodes []node `json:"nodes"`
+				Links []link `json:"links"`
 			}{Lab: top.Name, Hash: top.Hash}
 
 			for _, d := range top.SortedDevices() {
 				out.Nodes = append(out.Nodes, node{
 					Name: d.ID, Kind: string(d.Kind), AS: d.ASN,
-					Node: d.Node, Container: d.Container,
+					Node: d.Node, Container: d.Container, Image: d.Image,
+				})
+			}
+			for _, l := range top.Links {
+				if l.A == nil || l.B == nil || l.A.Device == nil || l.B.Device == nil {
+					continue
+				}
+				out.Links = append(out.Links, link{
+					A: l.A.Device.ID, B: l.B.Device.ID,
+					AIf: l.A.Name, BIf: l.B.Name, InfAS: l.InterAS,
 				})
 			}
 			return json.NewEncoder(cmd.OutOrStdout()).Encode(out)
