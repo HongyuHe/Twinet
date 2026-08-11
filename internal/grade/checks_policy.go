@@ -240,10 +240,11 @@ func checkTrafficEngineering(ctx context.Context, env *Env) Result {
 			if i.Link == nil || !i.Link.InterAS || i.Peer == nil || i.Peer.Addr4 == "" {
 				continue
 			}
-			rel := i.Link.Rel
-			if i.Link.B == i {
-				rel = rel.Inverse()
-			}
+			// What the neighbour is to us. Derived in one place, because the
+			// same two lines written out here, in the renderer and in the
+			// other checks were all inverted in the same direction -- so the
+			// wrong answer was self-consistent and scored full marks.
+			rel := i.Link.PeerRelationship(i)
 			d := parseMillis(i.Link.Props.Delay)
 			if d > maxDelay {
 				maxDelay = d

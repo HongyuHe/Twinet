@@ -182,3 +182,56 @@ func routeMapBody(cfg, name string) string {
 	}
 	return strings.Join(out, "\n")
 }
+
+// The policy applied to a neighbour must be named after what that neighbour is
+// to us, not after what we are to it.
+//
+// Getting this backwards inverts the economics of the whole network: a customer
+// prefers its provider over its own customers, paying for traffic it was being
+// paid to carry, and a provider refuses to give its customer full transit. It
+// was backwards, and because the grading checks derived the relationship the
+// same way, the inverted configuration was the one that scored full marks.
+func TestPolicyIsNamedAfterTheNeighbourNotOurselves(t *testing.T) {
+	top := courseTopology(t)
+
+	checked := 0
+	for _, d := range top.SortedDevices() {
+		if d.Kind != model.KindRouter {
+			continue
+		}
+		cfg, err := Router(top, d)
+		if err != nil {
+			t.Fatalf("%s: %v", d.ID, err)
+		}
+		body := cfg.Platform + cfg.Expected
+
+		for _, i := range d.Ifaces {
+			if i.Link == nil || !i.Link.InterAS || i.Peer == nil || i.Peer.Addr4 == "" {
+				continue
+			}
+			want := i.Link.PeerRelationship(i)
+			addr := addrOf(i.Peer.Addr4)
+
+			var applied string
+			for _, line := range strings.Split(body, "\n") {
+				f := strings.Fields(strings.TrimSpace(line))
+				if len(f) == 5 && f[0] == "neighbor" && f[1] == addr && f[2] == "route-map" && f[4] == "in" {
+					applied = f[3]
+				}
+			}
+			if applied == "" {
+				continue
+			}
+			checked++
+			wantSuffix := strings.ToUpper(string(want))
+			if !strings.HasSuffix(applied, wantSuffix) {
+				t.Errorf("%s applies %s to %s, but that neighbour is our %s",
+					d.ID, applied, addr, want)
+			}
+		}
+	}
+	if checked == 0 {
+		t.Fatal("no inter-AS policy was inspected, so this proves nothing")
+	}
+	t.Logf("checked %d inter-AS import policies", checked)
+}

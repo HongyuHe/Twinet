@@ -233,6 +233,31 @@ type Link struct {
 	Owner ConfigOwner
 }
 
+// PeerRelationship returns what the far side of this link is to the near side.
+//
+// Link.Rel is stated from A's point of view and says what A *is* to B, so
+// deriving "what my neighbour is to me" needs two steps, and getting either
+// wrong inverts the economics of the whole network. Doing it in one place is
+// the point: the same two lines were written out separately in the renderer,
+// in three grading checks and in the policy analyser, and one of them being
+// backwards is not visible in any single file.
+//
+// It was backwards. A customer applied its customer-import policy to its
+// provider, preferring the expensive path over the free one -- and because the
+// grading checks derived the relationship the same way, the inverted answer was
+// the one that scored full marks and a correct Gao-Rexford implementation would
+// have been marked wrong.
+func (l *Link) PeerRelationship(near *Iface) Relationship {
+	if l == nil {
+		return RelPeer
+	}
+	if near == l.A {
+		// A is the Rel of B, so B is the inverse of that to A.
+		return l.Rel.Inverse()
+	}
+	return l.Rel
+}
+
 // Endpoints returns the two interfaces in deterministic order.
 func (l *Link) Endpoints() (*Iface, *Iface) { return l.A, l.B }
 

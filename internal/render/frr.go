@@ -225,12 +225,11 @@ func renderBGP(top *model.Topology, as *model.AS, d *model.Device) string {
 		if peerAddr == "" {
 			continue
 		}
+		// What the neighbour is to us, which is what the import and export
+		// policies are named after.
 		rel := model.RelPeer
 		if i.Link != nil {
-			rel = i.Link.Rel
-			if i.Link.B == i {
-				rel = rel.Inverse()
-			}
+			rel = i.Link.PeerRelationship(i)
 		}
 		exts = append(exts, ext{
 			addr: peerAddr, asn: peerASN, rel: rel,
