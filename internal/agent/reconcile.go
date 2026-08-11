@@ -8,6 +8,7 @@ import (
 
 	"github.com/HongyuHe/twinet/internal/deploy"
 	"github.com/HongyuHe/twinet/internal/model"
+	"github.com/HongyuHe/twinet/internal/render"
 	rt "github.com/HongyuHe/twinet/internal/runtime"
 )
 
@@ -113,12 +114,27 @@ func (s *Server) repairLab(ctx context.Context, top *model.Topology, broken []*m
 	for i, d := range broken {
 		names[i] = d.ID
 	}
-	slog.Warn("devices came back with an empty network namespace; rewiring",
-		"lab", top.Name, "devices", strings.Join(names, ","))
+	slog.Warn("devices are not as the lab says they should be; repairing",
+		"lab", top.Name, "devices", strings.Join(names, ","),
+		"reason", s.brokenBecause(ctx, broken[0]))
 
+	// The engine needs a renderer.
+	//
+	// Without one, configure() returns success having done nothing, so a
+	// repaired router came back with its cables and none of its configuration:
+	// no addresses on the VLAN sub-interfaces, no tunnel, and FRR not running.
+	// The device then had enough interfaces to look healthy to the detector
+	// below, so it was never revisited. A restarted router stayed broken
+	// forever while the logs said it had been repaired.
+	//
+	// Platform mode, never solve: this rebuilds what Twinet owns. Anything the
+	// student wrote comes back from the snapshot store instead, which is the
+	// only copy of it that exists.
 	eng := &deploy.Engine{
 		Runtime: s.rt, Node: s.cfg.Node, State: s.store,
-		UnderlayIP: s.cfg.UnderlayIP, UnderlayDev: s.cfg.UnderlayDev,
+		Renderer:     render.New(top, render.ModePlatform),
+		UnderlayIP:   s.cfg.UnderlayIP,
+		UnderlayDev:  s.cfg.UnderlayDev,
 		PeerUnderlay: s.peerUnderlay(top.Name),
 	}
 	for _, d := range broken {
@@ -131,38 +147,91 @@ func (s *Server) repairLab(ctx context.Context, top *model.Topology, broken []*m
 				"device", d.ID, "err", err)
 			continue
 		}
-		slog.Info("device rewired and its configuration put back", "device", d.ID)
+		// Confirmed, not assumed. A repair that reports success without being
+		// checked is how the previous version of this loop claimed to have
+		// fixed routers it had left with no addresses and no routing daemon.
+		if why := s.brokenBecause(ctx, d); why != "" {
+			slog.Error("device is still not right after being repaired",
+				"device", d.ID, "reason", why)
+			continue
+		}
+		slog.Info("device repaired and its configuration put back", "device", d.ID)
 	}
 }
 
-// hasLostItsWiring reports whether a running container is missing interfaces
-// the lab says it should have.
+// hasLostItsWiring reports whether a running container is missing something the
+// lab says it should have.
 //
-// Only a container that should have interfaces and has none is treated as
-// broken. A partially wired device is left alone: it is far more likely to be a
-// deploy in progress than a failure, and rewiring underneath one would be worse
-// than waiting for the next tick.
+// Counting interfaces is not enough, and believing it was hid a real failure:
+// a repaired router had its cables back and nothing else -- no addresses, no
+// VLAN sub-interfaces, no tunnel, and no routing daemon -- but the count said
+// it was fine, so it was never looked at again. The check therefore asks for
+// each thing separately and reports a device as broken if any of them is
+// missing.
 func (s *Server) hasLostItsWiring(ctx context.Context, d *model.Device) bool {
-	want := 0
+	return s.brokenBecause(ctx, d) != ""
+}
+
+// brokenBecause names the first thing a device is missing, or "" if it is well.
+func (s *Server) brokenBecause(ctx context.Context, d *model.Device) string {
+	want := map[string]bool{}
 	for _, i := range d.Ifaces {
-		if i.Link != nil {
-			want++
+		if i.Link != nil || i.VLAN > 0 {
+			want[i.Name] = true
 		}
 	}
-	if want == 0 {
-		return false
+	if len(want) == 0 {
+		return ""
 	}
 	c, err := s.rt.Inspect(ctx, d.Container)
 	if err != nil || !c.State.Joinable() {
-		return false
+		return ""
 	}
+
 	res, err := s.rt.Exec(ctx, d.Container, rt.ExecCmd{
-		Cmd: []string{"sh", "-c", "ip -o link show 2>/dev/null | wc -l"}})
+		Cmd: []string{"sh", "-c", `ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1`}})
 	if err != nil || res.ExitCode != 0 {
-		return false
+		return ""
 	}
-	// lo and the kernel's own sit0 are always present and are not wiring.
-	return strings.TrimSpace(res.Stdout) == "2" || strings.TrimSpace(res.Stdout) == "1"
+	have := map[string]bool{}
+	for _, n := range strings.Fields(res.Stdout) {
+		have[n] = true
+	}
+	// A device with none of its interfaces is unambiguously broken. A device
+	// missing some of them is far more likely to be a deploy in progress, and
+	// rewiring underneath one would be worse than waiting for the next tick.
+	present := 0
+	for n := range want {
+		if have[n] {
+			present++
+		}
+	}
+	switch {
+	case present == 0:
+		return "it has none of its interfaces"
+	case present < len(want):
+		// Not acted on, but worth saying: a device that stays here is stuck.
+		return ""
+	}
+
+	// The interfaces are there. A router still needs its daemons: after a
+	// restart the namespace is new and FRR is not running in it, and vtysh
+	// cannot reach anything.
+	if d.Kind == model.KindRouter {
+		if r, err := s.rt.Exec(ctx, d.Container, rt.ExecCmd{
+			Cmd: []string{"sh", "-c", "vtysh -c 'show version' >/dev/null 2>&1 && echo up"}}); err == nil &&
+			!strings.Contains(r.Stdout, "up") {
+			return "its routing daemons are not answering"
+		}
+	}
+	if d.Kind == model.KindSwitch {
+		if r, err := s.rt.Exec(ctx, d.Container, rt.ExecCmd{
+			Cmd: []string{"sh", "-c", "ovs-vsctl list-br 2>/dev/null | grep -c ."}}); err == nil &&
+			strings.TrimSpace(r.Stdout) == "0" {
+			return "it has no bridge"
+		}
+	}
+	return ""
 }
 
 // peerUnderlay returns the VTEP addresses recorded for a lab.

@@ -672,13 +672,20 @@ func TestASubmissionSurvivesSaveAndRestore(t *testing.T) {
 // black hole in the middle of an assignment, and the first thing the student
 // suspects is their own configuration.
 func TestARestartedContainerRewiresItself(t *testing.T) {
-	const device = "svc/matrix"
+	// A router, not a service container.
+	//
+	// This test used to restart svc/matrix and count its interfaces, and it
+	// passed while the repair was leaving routers with their cables and
+	// nothing else: no addresses, no VLAN sub-interfaces, no tunnel and no
+	// routing daemon. The count said eleven, so nothing was ever revisited. A
+	// router is the hardest case and the one that matters, and the assertions
+	// below are about whether it works rather than how many devices it has.
+	const device = "as5/ATL"
 	container := containerFor(t, device)
 
-	before := interfaceCount(t, container)
-	if before < 3 {
-		t.Fatalf("%s started this test with %d interfaces; it is not wired to begin with",
-			device, before)
+	before := routerHealth(t, device)
+	if before.links < 3 || !before.frr {
+		t.Fatalf("%s started this test unhealthy (%+v); it proves nothing", device, before)
 	}
 
 	if out, err := exec.Command("sudo", "docker", "restart", container).CombinedOutput(); err != nil {
@@ -693,17 +700,44 @@ func TestARestartedContainerRewiresItself(t *testing.T) {
 
 	// The node repairs itself on its own schedule; no deploy is run here,
 	// because the whole point is that nobody has to.
-	deadline := time.Now().Add(3 * time.Minute)
+	deadline := time.Now().Add(4 * time.Minute)
+	var last routerState
 	for time.Now().Before(deadline) {
-		if interfaceCount(t, container) >= before {
-			t.Logf("%s rewired itself with no intervention", device)
+		last = routerHealth(t, device)
+		if last.links >= before.links && last.addrs >= before.addrs &&
+			last.vlans >= before.vlans && last.tunnels >= before.tunnels && last.frr {
+			t.Logf("%s repaired itself with no intervention: %+v", device, last)
 			return
 		}
-		time.Sleep(5 * time.Second)
+		time.Sleep(10 * time.Second)
 	}
-	t.Fatalf("%s still had %d of its %d interfaces three minutes after restarting; "+
-		"a device that restarts stays disconnected until a human notices",
-		device, interfaceCount(t, container), before)
+	t.Fatalf("%s was still not itself four minutes after restarting: had %+v, wanted %+v. "+
+		"A device that restarts stays broken until a human notices, and the first thing "+
+		"the student suspects is their own configuration", device, last, before)
+}
+
+// routerState is what a router must have for the lab to be true of it.
+type routerState struct {
+	links, addrs, vlans, tunnels int
+	frr                          bool
+}
+
+// routerHealth asks the device itself, because the platform's own opinion of
+// whether it repaired something is exactly what is under test.
+func routerHealth(t *testing.T, device string) routerState {
+	t.Helper()
+	out, _ := twinet(t, "exec", "-m", labDir(t), device, "--", "sh", "-c",
+		"ip -o link show | wc -l; "+
+			"ip -o -4 addr show | grep -vc ' lo '; "+
+			"ip -o link show type vlan | wc -l; "+
+			"ip -d tunnel show 2>/dev/null | grep -vc '^sit0'; "+
+			"vtysh -c 'show version' >/dev/null 2>&1 && echo up || echo down")
+	f := strings.Fields(out)
+	if len(f) < 5 {
+		return routerState{}
+	}
+	n := func(i int) int { v, _ := strconv.Atoi(f[i]); return v }
+	return routerState{links: n(0), addrs: n(1), vlans: n(2), tunnels: n(3), frr: f[4] == "up"}
 }
 
 func interfaceCount(t *testing.T, container string) int {

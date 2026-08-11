@@ -447,33 +447,6 @@ func init() {
 	})
 
 	Register(&Fault{
-		Name: "icmp_acl_block", Category: CatMisconfig, Needs: []Capability{CapNFT},
-		Symptom:  "Some destinations do not respond to ping, though other traffic works.",
-		Describe: "A firewall rule drops ICMP echo requests.",
-		Inject: func(ctx context.Context, e *Env, t Target) (State, error) {
-			// iptables rather than nft: every Twinet image ships it, and a
-			// fault that depends on a tool the target lacks is not a fault, it
-			// is a broken benchmark case.
-			if _, err := e.Sh(ctx, t.DeviceID(),
-				"iptables -w -A INPUT -p icmp --icmp-type echo-request -j DROP"); err != nil {
-				return nil, err
-			}
-			return State{"rule": "INPUT -p icmp --icmp-type echo-request -j DROP"}, nil
-		},
-		Verify: func(ctx context.Context, e *Env, t Target, s State) (Evidence, error) {
-			out, code := e.Try(ctx, t.DeviceID(),
-				"iptables -w -C INPUT -p icmp --icmp-type echo-request -j DROP 2>&1 && echo present")
-			return Evidence{Verified: code == 0 && strings.Contains(out, "present"),
-				Expected: "an ICMP drop rule", Observed: firstLine(out)}, nil
-		},
-		Resolve: func(ctx context.Context, e *Env, t Target, s State) error {
-			_, err := e.Sh(ctx, t.DeviceID(),
-				"iptables -w -D INPUT -p icmp --icmp-type echo-request -j DROP 2>/dev/null || true")
-			return err
-		},
-	})
-
-	Register(&Fault{
 		Name: "bgp_missing_route_advertisement", Category: CatMisconfig, Needs: []Capability{CapFRR},
 		Symptom:  "One network has become unreachable from the rest of the Internet.",
 		Describe: "The AS stopped originating its own prefix, so nobody can route to it.",

@@ -25,6 +25,13 @@ type aclBlock struct {
 func init() {
 	blocks := []aclBlock{
 		{
+			name:     "icmp_acl_block",
+			match:    "-p icmp --icmp-type echo-request",
+			symptom:  "Some destinations do not respond to ping, though other traffic works.",
+			describe: "A firewall rule discards ICMP echo requests.",
+			needs:    []Capability{CapNFT},
+		},
+		{
 			name:     "bgp_acl_block",
 			match:    "-p tcp --dport 179",
 			symptom:  "A router's peering sessions will not come up, though the links are fine.",
@@ -117,26 +124,39 @@ func init() {
 // benchmark case unreproducible.
 func injectACL(ctx context.Context, e *Env, t Target, match string) (State, error) {
 	chains := []string{"INPUT", "OUTPUT"}
+	// A rule identical to one the student already wrote cannot be told apart
+	// from it, and resolving used to delete every copy: the injection removed
+	// the student's own firewall rule and the baseline check did not notice,
+	// because it compares sets of lines and a duplicate line is one line.
+	//
+	// The injected rule therefore carries a comment nobody else will have
+	// written. The value is random per injection and recorded only in the
+	// controller, so it identifies the rule without announcing what it is.
+	mark, err := randomCookie()
+	if err != nil {
+		return nil, err
+	}
+	tag := fmt.Sprintf("-m comment --comment %s", strings.TrimPrefix(mark, "0x"))
 	for _, c := range chains {
 		if _, err := e.Sh(ctx, t.DeviceID(),
-			fmt.Sprintf("iptables -w -A %s %s -j DROP", c, match)); err != nil {
+			fmt.Sprintf("iptables -w -A %s %s %s -j DROP", c, match, tag)); err != nil {
 			// Roll back whatever was installed, or the device is left in a
 			// state that is neither faulted nor clean.
 			for _, done := range chains {
 				_, _ = e.Sh(ctx, t.DeviceID(),
-					fmt.Sprintf("iptables -w -D %s %s -j DROP 2>/dev/null || true", done, match))
+					fmt.Sprintf("iptables -w -D %s %s %s -j DROP 2>/dev/null || true", done, match, tag))
 			}
 			return nil, err
 		}
 	}
-	return State{"match": match, "chains": strings.Join(chains, " ")}, nil
+	return State{"match": match, "tag": tag, "chains": strings.Join(chains, " ")}, nil
 }
 
 func verifyACL(ctx context.Context, e *Env, t Target, s State) (Evidence, error) {
 	var missing []string
 	for _, c := range strings.Fields(s["chains"]) {
 		if _, code := e.Try(ctx, t.DeviceID(),
-			fmt.Sprintf("iptables -w -C %s %s -j DROP", c, s["match"])); code != 0 {
+			fmt.Sprintf("iptables -w -C %s %s %s -j DROP", c, s["match"], s["tag"])); code != 0 {
 			missing = append(missing, c)
 		}
 	}
@@ -155,20 +175,22 @@ func describeACL(missing []string, chains string) string {
 }
 
 func resolveACL(ctx context.Context, e *Env, t Target, s State) error {
-	if s["match"] == "" {
-		return fmt.Errorf("no rule was recorded, so the fault cannot be undone")
+	if s["match"] == "" || s["tag"] == "" {
+		return fmt.Errorf("this fault's rule was not recorded with an identifier, so it "+
+			"cannot be told apart from a rule the student wrote; removing by match would "+
+			"delete theirs too (device %s)", t.DeviceID())
 	}
 	for _, c := range strings.Fields(s["chains"]) {
-		// -D removes one matching rule; loop so a double injection cannot
-		// leave a copy behind that keeps the fault alive after it is resolved.
+		// Only rules carrying this injection's own marker are removed, and only
+		// as many as it installed.
 		for i := 0; i < 8; i++ {
 			if _, code := e.Try(ctx, t.DeviceID(),
-				fmt.Sprintf("iptables -w -D %s %s -j DROP", c, s["match"])); code != 0 {
+				fmt.Sprintf("iptables -w -D %s %s %s -j DROP", c, s["match"], s["tag"])); code != 0 {
 				break
 			}
 		}
 		if _, code := e.Try(ctx, t.DeviceID(),
-			fmt.Sprintf("iptables -w -C %s %s -j DROP", c, s["match"])); code == 0 {
+			fmt.Sprintf("iptables -w -C %s %s %s -j DROP", c, s["match"], s["tag"])); code == 0 {
 			return fmt.Errorf("the drop rule is still present in %s after removal", c)
 		}
 	}

@@ -44,3 +44,37 @@ func TestFaultsLeaveNoMarkersInsideTheContainer(t *testing.T) {
 		}
 	}
 }
+
+// A fault must not be identifiable by a constant that appears in this
+// repository. An agent being benchmarked can reasonably be assumed to have read
+// the source; if the marker is the same on every injection, it can list the
+// switch's flows, find the one carrying the known value, and read the answer off
+// it without diagnosing anything.
+func TestFaultMarkersAreNotConstant(t *testing.T) {
+	seen := map[string]bool{}
+	for i := 0; i < 32; i++ {
+		c, err := randomCookie()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if seen[c] {
+			t.Fatalf("randomCookie repeated %s within %d draws; the same marker on two "+
+				"injections is a tell across episodes", c, i+1)
+		}
+		seen[c] = true
+		if len(c) < 10 {
+			t.Errorf("marker %q is short enough to stand out among real cookies", c)
+		}
+	}
+	// And the constant it replaced must be gone.
+	files, _ := filepath.Glob("faults*.go")
+	for _, f := range files {
+		src, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(src), "0x7714e7") {
+			t.Errorf("%s still carries the fixed cookie that gave the fault away", f)
+		}
+	}
+}

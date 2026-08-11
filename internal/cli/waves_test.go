@@ -162,3 +162,44 @@ func TestAFailedRestoreHoldsTheRemainingWaves(t *testing.T) {
 			len(sum.Quarantined()))
 	}
 }
+
+// Restoring one wave must not reinstall the reference solution on every other
+// autonomous system in the lab.
+//
+// It used to. The restore discarded its scope argument and ran an
+// authoritative solve over the whole topology, so a student whose neighbour
+// failed to load had their own work replaced by the model answer and was then
+// marked on it: ten out of ten for a submission nobody had read, with nothing
+// flagged for review. Verified on the live cluster before the fix -- a marker
+// planted in AS 5 was gone after restoring AS 3 -- and after it, where the
+// marker survived.
+func TestRestoringOneWaveDoesNotTouchTheOthers(t *testing.T) {
+	only := restoreScopes([]string{"as3", "as7"})
+
+	for _, want := range []string{"as3", "as7"} {
+		if !contains(only, want) {
+			t.Errorf("the restore does not cover %s, which it was asked to restore", want)
+		}
+	}
+	// The peering scope must be included: an inter-AS link belongs to neither
+	// system, so leaving it out rebuilds a router without rewiring its
+	// external links.
+	if !contains(only, "peering") {
+		t.Error("the restore omits the peering scope, so external links are not rewired")
+	}
+	// And nothing else may be touched.
+	for _, forbidden := range []string{"as4", "as5", "as6", "as8", "as9", "as10"} {
+		if contains(only, forbidden) {
+			t.Errorf("restoring as3 and as7 would also overwrite %s", forbidden)
+		}
+	}
+}
+
+func contains(v []string, s string) bool {
+	for _, x := range v {
+		if x == s {
+			return true
+		}
+	}
+	return false
+}

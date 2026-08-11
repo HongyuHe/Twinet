@@ -2,6 +2,8 @@ package fault
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"strings"
 )
@@ -17,9 +19,27 @@ import (
 // therefore consume the real resource -- processor time, memory, socket
 // backlog -- and are undone by releasing it.
 
-// faultCookie marks every flow rule an injection installs, so a resolve can
-// remove exactly those and nothing else.
-const faultCookie = "0x7714e7"
+// randomCookie returns a per-injection identifier for a flow rule.
+//
+// A fixed constant was used here, and it is spelled out in this repository:
+// anything that has read the source -- which for an agent being benchmarked is
+// a realistic assumption -- can list the switch's flows, see the one carrying
+// the known cookie, and read the fault straight off it without diagnosing
+// anything. Even without the source, the same value on every injection is a
+// tell across episodes.
+//
+// The value is recorded in the controller's injection record, which is the only
+// place that needs it, and nothing about it identifies the framework.
+func randomCookie() (string, error) {
+	var b [6]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("generating a flow cookie: %w", err)
+	}
+	// Leading nibble forced non-zero so the value is a plausible controller
+	// cookie rather than one that stands out by being short.
+	b[0] |= 0x10
+	return "0x" + hex.EncodeToString(b[:]), nil
+}
 
 func init() {
 	// ---- routing --------------------------------------------------------
@@ -309,12 +329,16 @@ func init() {
 			// cookie-less match that happens not to apply, nothing at all. The
 			// first silently breaks the switch; the second leaves the fault in
 			// place while reporting that it was resolved.
-			if _, err := e.Sh(ctx, t.DeviceID(), fmt.Sprintf(
-				"ovs-ofctl add-flow %s 'cookie=%s,priority=60000,in_port=%s,actions=drop'",
-				br, faultCookie, port)); err != nil {
+			cookie, err := randomCookie()
+			if err != nil {
 				return nil, err
 			}
-			return State{"bridge": br, "port": port}, nil
+			if _, err := e.Sh(ctx, t.DeviceID(), fmt.Sprintf(
+				"ovs-ofctl add-flow %s 'cookie=%s,priority=60000,in_port=%s,actions=drop'",
+				br, cookie, port)); err != nil {
+				return nil, err
+			}
+			return State{"bridge": br, "port": port, "cookie": cookie}, nil
 		},
 		Verify: func(ctx context.Context, e *Env, t Target, s State) (Evidence, error) {
 			out, _, err := e.TryE(ctx, t.DeviceID(), "ovs-ofctl dump-flows "+s["bridge"])
@@ -328,11 +352,16 @@ func init() {
 			}, nil
 		},
 		Resolve: func(ctx context.Context, e *Env, t Target, s State) error {
-			if s["bridge"] == "" {
-				return fmt.Errorf("no bridge was recorded for this fault")
+			// Refuse rather than delete by an empty cookie. "cookie=/-1" is a
+			// wildcard: it would remove every flow on the bridge, including the
+			// lab's own, and report success.
+			if s["bridge"] == "" || s["cookie"] == "" {
+				return fmt.Errorf("no bridge and cookie were recorded for this fault, "+
+					"so the rule it installed cannot be identified; removing by match would "+
+					"take the switch's own rules with it (device %s)", t.DeviceID())
 			}
 			_, err := e.Sh(ctx, t.DeviceID(), fmt.Sprintf(
-				"ovs-ofctl del-flows %s 'cookie=%s/-1'", s["bridge"], faultCookie))
+				"ovs-ofctl del-flows %s 'cookie=%s/-1'", s["bridge"], s["cookie"]))
 			return err
 		},
 	})
@@ -354,12 +383,16 @@ func init() {
 			// IN_PORT is the explicit "send it back where it came from" action,
 			// which OVS otherwise refuses to do. Without it there is no loop,
 			// and the fault would install a rule that changes nothing.
-			if _, err := e.Sh(ctx, t.DeviceID(), fmt.Sprintf(
-				"ovs-ofctl add-flow %s 'cookie=%s,priority=59000,in_port=%s,actions=IN_PORT'",
-				br, faultCookie, port)); err != nil {
+			cookie, err := randomCookie()
+			if err != nil {
 				return nil, err
 			}
-			return State{"bridge": br, "port": port}, nil
+			if _, err := e.Sh(ctx, t.DeviceID(), fmt.Sprintf(
+				"ovs-ofctl add-flow %s 'cookie=%s,priority=59000,in_port=%s,actions=IN_PORT'",
+				br, cookie, port)); err != nil {
+				return nil, err
+			}
+			return State{"bridge": br, "port": port, "cookie": cookie}, nil
 		},
 		Verify: func(ctx context.Context, e *Env, t Target, s State) (Evidence, error) {
 			out, _, err := e.TryE(ctx, t.DeviceID(), "ovs-ofctl dump-flows "+s["bridge"])
@@ -373,11 +406,16 @@ func init() {
 			}, nil
 		},
 		Resolve: func(ctx context.Context, e *Env, t Target, s State) error {
-			if s["bridge"] == "" {
-				return fmt.Errorf("no bridge was recorded for this fault")
+			// Refuse rather than delete by an empty cookie. "cookie=/-1" is a
+			// wildcard: it would remove every flow on the bridge, including the
+			// lab's own, and report success.
+			if s["bridge"] == "" || s["cookie"] == "" {
+				return fmt.Errorf("no bridge and cookie were recorded for this fault, "+
+					"so the rule it installed cannot be identified; removing by match would "+
+					"take the switch's own rules with it (device %s)", t.DeviceID())
 			}
 			_, err := e.Sh(ctx, t.DeviceID(), fmt.Sprintf(
-				"ovs-ofctl del-flows %s 'cookie=%s/-1'", s["bridge"], faultCookie))
+				"ovs-ofctl del-flows %s 'cookie=%s/-1'", s["bridge"], s["cookie"]))
 			return err
 		},
 	})

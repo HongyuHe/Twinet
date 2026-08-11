@@ -239,22 +239,35 @@ func redeployScopes(ctx context.Context, top *model.Topology, token string, scop
 	if err != nil {
 		return err
 	}
+	if len(scopes) == 0 {
+		return fmt.Errorf("no scopes were given to restore")
+	}
 	c := client.NewCluster(top.Lab, tok)
-	// A full apply, not one restricted to the systems being restored.
+
+	// The apply is restricted to the systems being restored, plus the peering
+	// and service scopes.
 	//
-	// Restricting it looks like the efficient choice and is wrong: an inter-AS
-	// link belongs to the peering scope rather than to either system, so a
-	// restricted apply rebuilds a router without rewiring its external links.
-	// The router comes back with almost no interfaces, its neighbours see
-	// sessions that never establish, and the cause is three steps removed from
-	// the symptom. The apply is idempotent and takes about half a minute when
-	// nothing has changed, which is a small price for not having to reason
-	// about which scopes a change can reach.
-	_ = scopes
+	// It used to discard its argument and run an authoritative solve over the
+	// whole topology. That reinstalled the reference solution on every
+	// autonomous system in the lab, including submissions that had loaded
+	// successfully and were about to be graded. A student whose neighbour
+	// failed to load had their work replaced by the model answer and was then
+	// marked on it -- ten out of ten for a submission nobody had read, with
+	// nothing flagged for review. That is the most damaging thing a grading
+	// system can do, and it is invisible in the report.
+	//
+	// The peering scope is included because an inter-AS link belongs to
+	// neither system: leaving it out rebuilds a router without rewiring its
+	// external links, and the router comes back with almost no interfaces
+	// while its neighbours see sessions that never establish. Including it
+	// rewires links without touching any other system's configuration, because
+	// only the create and configure stages carry an AS scope.
+	only := restoreScopes(scopes)
 	results := c.Apply(ctx, top, agent.ApplyRequest{
 		Mode:       "solve",
 		PullPolicy: "if-missing",
 		Workers:    8,
+		OnlySteps:  only,
 		Generation: time.Now().UTC().Format("20060102T150405.000"),
 	})
 	for _, r := range results {
@@ -333,4 +346,14 @@ func deployCluster(ctx context.Context, top *model.Topology, tok string, req age
 		return fmt.Errorf("%d node(s) reported problems; re-run deploy to converge", failed)
 	}
 	return nil
+}
+
+// restoreScopes is the set of deployment scopes a restore must cover: the
+// systems named, and the scopes that hold what connects them.
+//
+// Nothing else may appear here. Every extra scope is another student's work
+// overwritten with the reference solution.
+func restoreScopes(scopes []string) []string {
+	out := append([]string{}, scopes...)
+	return append(out, "peering", "services")
 }
