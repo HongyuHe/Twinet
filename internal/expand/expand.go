@@ -10,8 +10,6 @@
 package expand
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"sort"
 	"strconv"
@@ -234,7 +232,33 @@ func (e *expander) expandOneAS(asn int, spec model.ASSpec) error {
 		if !ok {
 			return fmt.Errorf("external_ports.%s references unknown router %q", pn, ep.Router)
 		}
-		as.ExtPorts[pn] = &model.ExtPortBinding{Name: pn, Router: r}
+		as.ExtPorts[pn] = &model.ExtPortBinding{Name: pn, Router: r, VRF: ep.VRF}
+	}
+
+	// Label switching and virtual routing tables, carried onto the topology so
+	// the renderer and the grader read the same declaration rather than each
+	// interpreting the template themselves.
+	as.MPLS = tpl.MPLS
+	if len(tpl.VRFs) > 0 {
+		as.VRFs = map[string]*model.VRFSpec{}
+		table := 100
+		for _, n := range sortedKeys(tpl.VRFs) {
+			v := *tpl.VRFs[n]
+			if v.Table == 0 {
+				// Assigned in name order so the number is the same on every
+				// router of the AS and on every run: a VRF whose table
+				// number differed between two routers would be two different
+				// tables with one name.
+				v.Table = table
+			}
+			table++
+			as.VRFs[n] = &v
+			for _, port := range v.Attach {
+				if b, ok := as.ExtPorts[port]; ok {
+					b.VRF = n
+				}
+			}
+		}
 	}
 
 	// Per-router L3 hosts.
@@ -590,9 +614,11 @@ func (e *expander) expandOnePeering(pl model.PeeringLink) error {
 	// Two groups agree the exact addresses between themselves, so only the
 	// subnet is mandated on an ordinary inter-AS link.
 	aIf := &model.Iface{Device: aR, Name: aName, Role: model.RoleInterAS,
-		Addr4: aAddr, Owner: ownerOf(aAS, owner), Prescribed: false, Subnet: subnet}
+		Addr4: aAddr, Owner: ownerOf(aAS, owner), Prescribed: false, Subnet: subnet,
+		VRF: vrfOfPort(aAS, pl.APort)}
 	bIf := &model.Iface{Device: bR, Name: bName, Role: model.RoleInterAS,
-		Addr4: bAddr, Owner: ownerOf(bAS, owner), Prescribed: false, Subnet: subnet}
+		Addr4: bAddr, Owner: ownerOf(bAS, owner), Prescribed: false, Subnet: subnet,
+		VRF: vrfOfPort(bAS, pl.BPort)}
 	aR.AddIface(aIf)
 	bR.AddIface(bIf)
 
@@ -624,6 +650,21 @@ func extIfaceName(peer *model.AS, asn int, peerRouter string) string {
 		n = n[:ifaceNameMax]
 	}
 	return n
+}
+
+// vrfOfPort returns the virtual routing table an external port belongs to.
+//
+// A customer-facing interface is enslaved to the customer's table rather than
+// the provider's, which is the whole mechanism by which two customers using the
+// same private address space can both be carried.
+func vrfOfPort(as *model.AS, port string) string {
+	if port == "" {
+		return ""
+	}
+	if b, ok := as.ExtPorts[port]; ok {
+		return b.VRF
+	}
+	return ""
 }
 
 func (e *expander) resolveEndpoint(as *model.AS, port, router string) (*model.Device, error) {
@@ -815,18 +856,7 @@ func (e *expander) stampLabels() {
 // computeHash stamps a content hash of the expanded topology, so a running
 // deployment can be compared against a manifest without re-deriving anything.
 func (e *expander) computeHash() {
-	h := sha256.New()
-	for _, d := range e.top.SortedDevices() {
-		fmt.Fprintf(h, "d|%s|%s|%s|%s|%s\n", d.ID, d.Kind, d.Image, d.Hostname, d.Container)
-		for _, i := range d.Ifaces {
-			fmt.Fprintf(h, "  i|%s|%s|%s|%s|%d|%v|%s\n", i.Name, i.MAC, i.Addr4, i.Addr6, i.VLAN, i.Trunk, i.Owner)
-		}
-	}
-	for _, l := range e.top.Links {
-		fmt.Fprintf(h, "l|%s|%s|%s|%s|%s|%s|%d\n", l.ID, l.Kind, l.Subnet,
-			l.Props.Bandwidth, l.Props.Delay, l.Props.Queue, l.VNI)
-	}
-	e.top.Hash = hex.EncodeToString(h.Sum(nil))[:16]
+	e.top.Hash = TopologyHash(e.top)
 }
 
 func (e *expander) ownerGroup(asn int, spec model.ASSpec) string {
