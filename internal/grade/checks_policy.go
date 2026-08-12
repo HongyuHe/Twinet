@@ -320,7 +320,13 @@ func checkIXPCommunities(ctx context.Context, env *Env) Result {
 	sort.Strings(strangers)
 
 	// (ii) The in-region filter must be applied to what arrives from the
-	// route server, and the list it matches on must exist and select something.
+	// route server, the list it matches on must exist and select something,
+	// and -- the part that decides it -- no route whose path crosses an
+	// in-region system may actually be in this AS's table via the exchange.
+	//
+	// The configuration half alone gave the mark for a route-map that matched
+	// an empty list, or one attached in the wrong direction. The table is what
+	// the question is about.
 	inbound := cfg.appliedBody(ixpPeer, "in")
 	filters := false
 	var emptyList string
@@ -330,6 +336,13 @@ func checkIXPCommunities(ctx context.Context, env *Env) Result {
 		} else {
 			emptyList = name
 		}
+	}
+	admitted, aerr := inRegionRoutesViaIXP(ctx, env, ixpRouter.Name, ixpPeer)
+	if aerr != nil {
+		return Errored("policy.ixp_communities", aerr)
+	}
+	if len(admitted) > 0 {
+		filters = false
 	}
 
 	unapplied := ""
@@ -342,6 +355,10 @@ func checkIXPCommunities(ctx context.Context, env *Env) Result {
 	case len(tagged) == 0 && strings.Contains(out, "set community "+prefix):
 		unapplied = fmt.Sprintf("a route-map sets %s<member> but it is not applied outbound to %s",
 			prefix, ixpPeer)
+	case len(admitted) > 0:
+		unapplied = fmt.Sprintf("%d route(s) whose path crosses a system in this region "+
+			"were accepted from the exchange anyway: %s",
+			len(admitted), strings.Join(truncate(admitted, 4), "; "))
 	case !filters && emptyList != "":
 		unapplied = fmt.Sprintf("the inbound route-map matches AS-path list %q, which has "+
 			"no terms, so it never matches anything", emptyList)
@@ -627,11 +644,25 @@ func checkTrafficEngineering(ctx context.Context, env *Env) Result {
 			continue
 		}
 		checks++
-		sp := medianLocalPref(ctx, env, s.addr)
-		fp := medianLocalPref(ctx, env, f.addr)
-		if fp > sp {
+		sp, sn := medianLocalPref(ctx, env, s.addr)
+		fp, fn := medianLocalPref(ctx, env, f.addr)
+		switch {
+		case sn == 0:
+			// Receiving nothing from the slow neighbour used to read as local
+			// preference zero, which is lower than anything and so counted as
+			// correctly deprioritised. The question explicitly forbids
+			// filtering: the slow neighbour has to stay usable as a backup.
+			fmt.Fprintf(&detail,
+				"outbound: nothing at all is received from the slow %s (AS%d); it must stay "+
+					"available as a backup, so deprioritise it rather than filter it\n",
+				rel, s.asn)
+		case fn == 0:
+			fmt.Fprintf(&detail,
+				"outbound: nothing at all is received from the fast %s (AS%d), so it cannot "+
+					"be preferred over anything\n", rel, f.asn)
+		case fp > sp:
 			passed++
-		} else {
+		default:
 			fmt.Fprintf(&detail,
 				"outbound: routes from the fast %s (AS%d, local preference %d) should be preferred over the slow one (AS%d, %d)\n",
 				rel, f.asn, fp, s.asn, sp)
@@ -789,7 +820,15 @@ func advertisedRoutes(ctx context.Context, env *Env, router, peer string) (bgpRo
 	return adv, nil
 }
 
-func medianLocalPref(ctx context.Context, env *Env, peer string) int {
+// medianLocalPref returns the median local preference of the routes learned
+// from a peer, and how many there were.
+//
+// The count is not decoration. Returning zero for a peer that sent nothing made
+// "no routes at all" indistinguishable from "local preference zero", which is
+// lower than anything and so counted as correctly deprioritised -- awarding the
+// mark for filtering the neighbour out, which is the one thing this question
+// forbids.
+func medianLocalPref(ctx context.Context, env *Env, peer string) (int, int) {
 	var prefs []int
 	for _, r := range env.Routers() {
 		tbl, err := bgpTable(ctx, env, r.Name)
@@ -807,10 +846,10 @@ func medianLocalPref(ctx context.Context, env *Env, peer string) int {
 		}
 	}
 	if len(prefs) == 0 {
-		return 0
+		return 0, 0
 	}
 	sort.Ints(prefs)
-	return prefs[len(prefs)/2]
+	return prefs[len(prefs)/2], len(prefs)
 }
 
 // checkRPKIInvalidRejected verifies that a route whose origin is RPKI-invalid
@@ -1220,4 +1259,58 @@ func fieldAfter(line, key string) string {
 		}
 	}
 	return ""
+}
+
+// inRegionRoutesViaIXP names the routes this AS accepted from the exchange
+// whose path crosses a system in its own region.
+//
+// The question asks for those to be refused: an in-region network should be
+// reached directly, not across the exchange. Whether they are refused is a fact
+// about the table, and reading the route-map instead gave the mark to a filter
+// attached to nothing.
+func inRegionRoutesViaIXP(ctx context.Context, env *Env, router, ixpPeer string) ([]string, error) {
+	me, ok := env.Topology.ASes[env.AS]
+	if !ok || me.Region == "" {
+		// Without regions in the model there is nothing to be in or out of.
+		return nil, nil
+	}
+	inRegion := map[int]bool{}
+	for asn, as := range env.Topology.ASes {
+		if asn != env.AS && as.Region == me.Region && as.Role == model.RoleStudent {
+			inRegion[asn] = true
+		}
+	}
+	if len(inRegion) == 0 {
+		return nil, nil
+	}
+
+	tbl, err := bgpTable(ctx, env, router)
+	if err != nil {
+		return nil, fmt.Errorf("reading %s's table to see what the exchange got through: %w",
+			router, err)
+	}
+	var bad []string
+	for prefix, entries := range tbl.Table() {
+		for _, e := range entries {
+			viaIXP := false
+			for _, nh := range e.Nexthops {
+				if nh.IP == ixpPeer {
+					viaIXP = true
+				}
+			}
+			if !viaIXP && e.NextHop != ixpPeer {
+				continue
+			}
+			for _, f := range strings.Fields(e.Path) {
+				n, err := strconv.Atoi(f)
+				if err != nil || !inRegion[n] {
+					continue
+				}
+				bad = append(bad, fmt.Sprintf("%s (path %q)", prefix, strings.TrimSpace(e.Path)))
+				break
+			}
+		}
+	}
+	sort.Strings(bad)
+	return uniq(bad), nil
 }

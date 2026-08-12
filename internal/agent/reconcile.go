@@ -74,6 +74,21 @@ func (s *Server) reconcileOnce(ctx context.Context) {
 		// running", for a sweep that in the normal case finds nothing to do.
 		// Reading a container's interface list changes nothing, so it does not
 		// need to exclude anyone.
+		// A lab whose containers have all gone is a lab that was removed, and
+		// this node was never told. Its record kept the repair loop trying to
+		// rewire devices whose peers no longer exist, once a minute, for as
+		// long as the node was up -- four such labs were found on one cluster,
+		// with 461 leftover overlay devices between them.
+		//
+		// Forgetting it is safe in the only direction that matters: if the lab
+		// is redeployed, the deployment sends the topology again.
+		if s.labIsGone(ctx, top) {
+			slog.Info("forgetting a lab whose containers have all been removed",
+				"lab", name)
+			s.forgetLab(name)
+			continue
+		}
+
 		broken := s.survey(ctx, top)
 		if len(broken) == 0 {
 			continue
@@ -384,4 +399,53 @@ func (s *Server) repairSucceeded(lab, id string) {
 	s.mu.Lock()
 	delete(s.repairFails, repairKey(lab, id))
 	s.mu.Unlock()
+}
+
+// labIsGone reports whether none of a lab's devices on this node still exist.
+//
+// "None at all" rather than "some", deliberately. A lab midway through being
+// deployed, or one whose containers are stopped, must not be forgotten -- the
+// record is what a restart needs in order to bring them back. Only a lab with
+// nothing left of it on this node is one that has been removed.
+func (s *Server) labIsGone(ctx context.Context, top *model.Topology) bool {
+	mine := 0
+	for _, d := range top.Devices {
+		if d.Node != s.cfg.Node {
+			continue
+		}
+		mine++
+		c, err := s.rt.Inspect(ctx, d.Container)
+		if err != nil {
+			// Unreadable is not absent, and guessing here would throw away the
+			// record of a live lab because the runtime was busy.
+			return false
+		}
+		if c.State != rt.StateAbsent {
+			return false
+		}
+	}
+	return mine > 0
+}
+
+// forgetLab drops everything this node remembers about a lab.
+func (s *Server) forgetLab(name string) {
+	s.mu.Lock()
+	delete(s.current, name)
+	delete(s.modes, name)
+	delete(s.ungraded, name)
+	delete(s.peers, name)
+	delete(s.exempt, name)
+	for k := range s.repairFails {
+		if strings.HasPrefix(k, name+"|") {
+			delete(s.repairFails, k)
+		}
+	}
+	store := s.store
+	s.mu.Unlock()
+
+	if store != nil {
+		if err := store.ForgetTopology(name); err != nil {
+			slog.Warn("removing the record of a lab that is gone", "lab", name, "err", err)
+		}
+	}
 }

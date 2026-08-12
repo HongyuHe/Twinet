@@ -20,6 +20,7 @@ import (
 	"github.com/HongyuHe/twinet/internal/client"
 	"github.com/HongyuHe/twinet/internal/deploy"
 	"github.com/HongyuHe/twinet/internal/model"
+	"github.com/HongyuHe/twinet/internal/netx"
 	"github.com/HongyuHe/twinet/internal/place"
 	"github.com/HongyuHe/twinet/internal/plan"
 	"github.com/HongyuHe/twinet/internal/render"
@@ -291,8 +292,31 @@ if the manifest that created it is no longer available.`,
 			if err != nil {
 				return err
 			}
-			if len(cs) == 0 {
+			// The overlays are looked for before concluding there is nothing
+			// here. A lab can have no containers left and still own hundreds of
+			// VXLAN devices -- that is exactly the state an earlier destroy
+			// left behind -- and "nothing to remove" was then untrue in the
+			// most expensive way, because the identifiers stayed in use and the
+			// next lab deriving the same ones would have joined its traffic to
+			// a lab that no longer exists.
+			var strayVNIs []uint32
+			if top == nil && !keep {
+				if owned, oerr := netx.ListOverlaysOfLab(name); oerr == nil {
+					strayVNIs = owned
+				}
+			}
+			if len(cs) == 0 && len(strayVNIs) == 0 {
 				fmt.Fprintf(cmd.OutOrStdout(), "nothing to remove for lab %q\n", name)
+				return nil
+			}
+			if len(cs) == 0 {
+				eng := &deploy.Engine{Runtime: rt, Node: "local"}
+				if err := eng.DestroyOverlays(strayVNIs); err != nil {
+					return fmt.Errorf("removing the overlays of lab %q: %w", name, err)
+				}
+				fmt.Fprintf(cmd.OutOrStdout(),
+					"lab %q had no containers left, and %d overlay object(s) that it still "+
+						"owned have been removed\n", name, len(strayVNIs))
 				return nil
 			}
 			if !yes {
@@ -341,6 +365,16 @@ if the manifest that created it is no longer available.`,
 			// `docker ps`, so the next deployment inherits it and fails in a
 			// way that has nothing to do with the cause -- and "removed 212
 			// containers" scrolling past is not something anybody re-reads.
+			// Without a manifest there are no VNIs to remove, and the overlays
+			// were simply left behind: 461 VXLAN devices across three nodes
+			// were found belonging to four labs whose containers had been
+			// removed weeks earlier. They carry the owning lab's name on the
+			// device itself, which is exactly so that this is possible without
+			// consulting anything.
+			if top == nil && !keep {
+				vnis = append(vnis, strayVNIs...)
+			}
+
 			var left []string
 			if !keep && len(vnis) > 0 {
 				if err := eng.DestroyOverlays(vnis); err != nil {
