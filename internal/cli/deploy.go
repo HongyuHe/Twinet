@@ -122,7 +122,16 @@ after a partial failure, a reboot, or a topology edit.`,
 					PullPolicy: pull,
 					Workers:    workers,
 					DryRun:     dryRun,
-					Prune:      prune && only == "",
+					// A deployment that moves an autonomous system to a
+					// different machine must remove it from the old one.
+					//
+					// Pruning was opt-in, and the engine's own comment says
+					// what that costs: the moved system runs on both nodes and
+					// announces the same prefix from two places, which is a
+					// fault nobody would think to look for because both halves
+					// look correct. A move is exactly when it matters, so a
+					// move now prunes whether it was asked for or not.
+					Prune:      (prune || rebalance) && only == "",
 					Generation: time.Now().UTC().Format("20060102T150405"),
 					OnlySteps:  scope,
 				}, cmd.OutOrStdout(), cmd.ErrOrStderr())
@@ -219,7 +228,8 @@ after a partial failure, a reboot, or a topology edit.`,
 	cmd.Flags().BoolVar(&overcommit, "overcommit", false,
 		"deploy even though a node is asked for more than it declares room for")
 	cmd.Flags().BoolVar(&rebalance, "rebalance", false,
-		"recompute placement from scratch; every AS that moves has its containers rebuilt")
+		"recompute placement from scratch; every AS that moves has its containers rebuilt "+
+			"and removed from the node it left")
 	return cmd
 }
 
