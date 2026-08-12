@@ -307,6 +307,7 @@ The lab must already be deployed with --solve.`,
 				// had actually measured.
 				lastWave := i+1 == len(waves)
 				if !keepLoaded || !lastWave {
+					restored := loaded
 					if err := restoreWave(cmd.Context(), opts, top, loaded, token); err != nil {
 						// Carrying on would grade every later wave against this
 						// wave's work and report the results as if they were
@@ -322,6 +323,18 @@ The lab must already be deployed with --solve.`,
 								quarantine(waves[i+1:], rubric.MaxTotal(), contaminated)...)
 						}
 						break
+					}
+					// Putting the reference back is not finished when the
+					// configuration is installed; it is finished when the
+					// routes it produces have reached the rest of the lab.
+					//
+					// The restore returned as soon as FRR answered, and the
+					// next wave then waited only on its own system -- so the
+					// next student was graded across a neighbour that was
+					// still reconverging, and lost marks for it. Waiting here
+					// charges that time to nobody's submission.
+					if !lastWave {
+						waitWave(cmd.Context(), top, exec, restored, converge)
 					}
 				}
 			}

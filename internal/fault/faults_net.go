@@ -439,6 +439,17 @@ func init() {
 			if err != nil {
 				return nil, err
 			}
+			// Everything the configuration says about this neighbour is
+			// captured first.
+			//
+			// Undoing this fault removes the neighbour and adds it back, and
+			// `no neighbor X` in FRR deletes *all* of it -- the route-maps
+			// bound to it, its address-family settings, everything. Re-adding
+			// `neighbor X remote-as N` restored the session and nothing else,
+			// so the router came back with no policy at all on that session
+			// and leaked every route it knew to a provider. The fault reported
+			// a clean resolve, and the lab was quietly wrong from then on.
+			base, af := neighborConfig(ctx, e, t, peer)
 			if err := e.VtyshConfig(ctx, t.DeviceID(), "configure terminal",
 				fmt.Sprintf("router bgp %d", t.AS),
 				fmt.Sprintf("no neighbor %s remote-as %d", peer, asn),
@@ -446,7 +457,8 @@ func init() {
 				"end"); err != nil {
 				return nil, err
 			}
-			return State{"peer": peer, "asn": fmt.Sprint(asn)}, nil
+			return State{"peer": peer, "asn": fmt.Sprint(asn),
+				"cfg": strings.Join(base, "\n"), "cfgaf": strings.Join(af, "\n")}, nil
 		},
 		Verify: func(ctx context.Context, e *Env, t Target, s State) (Evidence, error) {
 			// The claim is that this one session stops establishing. Checking
@@ -473,14 +485,64 @@ func init() {
 			if s["peer"] == "" {
 				return fmt.Errorf("no peer was recorded for this fault")
 			}
-			return e.VtyshConfig(ctx, t.DeviceID(), "configure terminal",
-				fmt.Sprintf("router bgp %d", t.AS),
+			cmds := []string{"configure terminal", fmt.Sprintf("router bgp %d", t.AS),
 				fmt.Sprintf("no neighbor %s", s["peer"]),
-				fmt.Sprintf("neighbor %s remote-as %s", s["peer"], s["asn"]),
-				"end")
+				fmt.Sprintf("neighbor %s remote-as %s", s["peer"], s["asn"])}
+			for _, l := range splitNonEmpty(s["cfg"]) {
+				if strings.Contains(l, "remote-as") {
+					continue
+				}
+				cmds = append(cmds, l)
+			}
+			if af := splitNonEmpty(s["cfgaf"]); len(af) > 0 {
+				cmds = append(cmds, "address-family ipv4 unicast")
+				cmds = append(cmds, af...)
+				cmds = append(cmds, "exit-address-family")
+			}
+			cmds = append(cmds, "end")
+			return e.VtyshConfig(ctx, t.DeviceID(), cmds...)
 		},
 	})
+}
 
+// neighborConfig returns every configuration line naming a neighbour, split
+// into the ones that live directly under `router bgp` and the ones that live
+// inside an address family.
+//
+// Restoring a neighbour means restoring all of it. The route-maps bound to a
+// session are what stop a router handing every route it knows to a provider,
+// and they live in the address-family block.
+func neighborConfig(ctx context.Context, e *Env, t Target, peer string) (base, af []string) {
+	out, code := e.Try(ctx, t.DeviceID(), "vtysh -c 'show running-config'")
+	if code != 0 {
+		return nil, nil
+	}
+	inAF := false
+	for _, line := range strings.Split(out, "\n") {
+		l := strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(l, "address-family "):
+			inAF = true
+			continue
+		case l == "exit-address-family":
+			inAF = false
+			continue
+		case strings.HasPrefix(l, "router "):
+			inAF = false
+		}
+		if !strings.HasPrefix(l, "neighbor "+peer+" ") {
+			continue
+		}
+		if inAF {
+			af = append(af, l)
+		} else {
+			base = append(base, l)
+		}
+	}
+	return base, af
+}
+
+func init() {
 	Register(&Fault{
 		Name: "bgp_missing_route_advertisement", Category: CatMisconfig, Needs: []Capability{CapFRR},
 		Symptom:  "One network has become unreachable from the rest of the Internet.",
