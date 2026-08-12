@@ -179,16 +179,22 @@ run, instead of reporting cascading failures.
 
 ## 7. Output
 
-- `reports/<id>.json` — every check, score, evidence, timings, lab fingerprint.
-- `reports/<id>.html` — human-readable feedback with the evidence inline
-  (the RIB entry that was wrong, the traceroute that took the wrong path).
+What is written today:
+
+- `<group>.json` — every check, score, evidence, timings, lab fingerprint and
+  the version of Twinet that produced it. Self-contained, so an appeal is
+  answered by reading it.
+- `<group>.txt` — the same thing as human-readable feedback, with the evidence
+  inline: the table entry that was wrong, the address that could not be
+  reached, the command that produced it.
 - `summary.csv` — one row per student, one column per question; drops straight
-  into Canvas/Gradescope.
-- `summary.html` — class-wide dashboard: distribution per question, the most
-  common failure modes, which check is failing for the most students (directly
-  useful for deciding what to re-teach).
-- `reports/<id>.twinetlab` — the exact grading lab, replayable with
-  the report is self-contained JSON, so an appeal is answered by reading it.
+  into Canvas or Gradescope.
+
+Not written, and previously listed here as though they were: an HTML report per
+student, an HTML class dashboard, and a `.twinetlab` replay bundle. The JSON and
+text carry the same evidence, and the CSV is what an LMS ingests, so nothing is
+unusable without them -- but they were described in the present tense and did
+not exist, which is the kind of claim this document exists not to make.
 
 ## 8. Formative use
 

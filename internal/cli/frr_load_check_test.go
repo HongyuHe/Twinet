@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/HongyuHe/twinet/internal/model"
 	"github.com/HongyuHe/twinet/internal/render"
@@ -30,6 +31,12 @@ func TestASubmissionThatKillsADaemonDoesNotLoad(t *testing.T) {
 		}
 	}
 	d := &model.Device{ID: "as3/ATL", Name: "ATL", Kind: model.KindRouter}
+
+	// The real budget gives a loaded node time to start FRR; here the daemon
+	// is never coming back, and the test is about the verdict, not the wait.
+	restore := frrStartWait
+	frrStartWait = 100 * time.Millisecond
+	defer func() { frrStartWait = restore }()
 
 	err := loadFRRConfig(context.Background(), exec, d, "router ospf\n network 3.0.0.0/8 area 0\n")
 	if err == nil {

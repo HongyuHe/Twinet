@@ -171,7 +171,7 @@ Kubernetes to NIKA's existing backend rather than duplicating it.**
 
 ### 4.2 What is implemented
 
-All 39 shared types round-trip against a live cluster in
+All 40 shared types round-trip against a live cluster in
 `TestEveryFaultRoundTrips`: each is injected, verified to have taken effect,
 resolved, and then verified to be gone *and* to have left the device as it was
 found (§4.3).
@@ -365,13 +365,13 @@ for the command. Do not edit these by hand — regenerate them.
 
 | | Count |
 | --- | --- |
-| Registered in Twinet | 41 |
+| Registered in Twinet | 42 |
 | NIKA types total | 60 |
-| **Covered** | **39** |
-| Not yet covered | 21 |
+| **Covered** | **40** |
+| Not yet covered | 20 |
 
-The 21 are not arbitrary: each needs a substrate the lab does not run — six P4,
-five DHCP, four Kubernetes, three SDN southbound, and three others. They are
+The 20 are not arbitrary: each needs a substrate the lab does not run — six P4,
+five DHCP, four Kubernetes, three SDN southbound, and two others. They are
 absent because the substrates are, and adding a fault against a service that
 does not exist would produce an episode with no symptom, which is worse than an
 absent fault because it looks like a working one.

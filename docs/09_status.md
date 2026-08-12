@@ -153,6 +153,30 @@ someone has checked.
 | The 20 unimplemented NIKA fault types | M8 | 15 need a substrate Twinet does not emulate (6 P4/BMv2, 4 Kubernetes, 3 SDN-southbound, 2 others); adding them means adding that substrate. The other 5 are the DHCP family. See [10](10_fault_injection.md) §4.1, which explains why DHCP in particular is a design change rather than a fault to add |
 | DHCP, web and load-balancer services, traffic generation | M8 | Prerequisites for nine of those |
 
+### Grading a hundred students is not yet practical in the fair mode
+
+Measured: 4m 56s per submission, one at a time, almost all of it waiting for
+OSPF and then BGP to settle -- twice, once for the submission and once for the
+reference put back after it. A hundred students is therefore over eight hours.
+
+That is a real limit and it is stated here rather than in a footnote. Three
+things would move it, in the order they are worth doing:
+
+1. **A per-submission harness with synthetic neighbours.** The convergence wait
+   exists because a submission is graded inside the whole internet. A harness of
+   the student's AS plus test doubles for its neighbours converges in seconds
+   rather than minutes. It is designed (§4 of [06](06_grading.md)) and not built;
+   the private-harness mode that does exist deploys a real neighbourhood and
+   takes about twelve minutes a submission, which is worse, and eight at once
+   saturates this cluster.
+2. **Restoring only what the submission touched.** The reference is currently
+   put back over the whole AS, which costs a second convergence. A submission
+   names the devices it changed.
+3. **`--per-wave`.** It exists and works, and batches submissions no two of
+   which are within two systems of each other. It is off by default because that
+   is a heuristic about the peering graph and not a proof of isolation, and
+   marks are not the place to trade correctness for time without being asked.
+
 ## Measurements
 
 | Metric | Value |

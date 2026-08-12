@@ -551,46 +551,31 @@ func (c *Cluster) stampImageIDs(ctx context.Context, top *model.Topology) {
 	//
 	// A node that has not pulled an image yet is not a disagreement: it has no
 	// opinion, and the deployment is about to give it one.
-	seen := map[string]string{}
-	disagree := map[string][]string{}
+	answers := map[string]map[string]string{}
 	if len(c.Nodes) == 0 {
 		// A lab that runs on this machine alone. Asking the local daemon is
 		// the same question; leaving the field empty here would recreate every
 		// container of a single-node lab on the next deploy, which is the bug
 		// this exists to stop, just on one machine instead of a cluster.
+		local := map[string]string{}
 		d := rt.NewDocker()
 		for _, ref := range list {
 			if id, err := d.ImageDigest(ctx, ref); err == nil {
-				seen[ref] = id
+				local[ref] = id
 			}
 		}
+		answers["local"] = local
 	}
 	for _, n := range c.Nodes {
 		got, err := n.ImageDigests(ctx, list)
 		if err != nil {
 			continue
 		}
-		for ref, id := range got {
-			if id == "" {
-				continue
-			}
-			if seen[ref] == "" {
-				seen[ref] = id
-				continue
-			}
-			if seen[ref] != id {
-				disagree[ref] = append(disagree[ref],
-					fmt.Sprintf("%s has %s", n.Name, short(id)))
-			}
-		}
+		answers[n.Name] = got
 	}
-	// Where the nodes disagree, no identity is stamped. The spec hash then
-	// omits it, which leaves the containers alone rather than replacing them
-	// with one node's idea of the image and not another's; the deploy command
-	// checks the same thing and refuses outright, which is the louder and
-	// better answer when a person is present to hear it.
+
+	seen, disagree := agreedDigests(answers)
 	for ref, who := range disagree {
-		delete(seen, ref)
 		slog.Warn("nodes do not agree on what an image is, so its identity is not being "+
 			"used; deploy will refuse until they match",
 			"image", ref, "disagreement", strings.Join(who, ", "))
@@ -600,6 +585,59 @@ func (c *Cluster) stampImageIDs(ctx context.Context, top *model.Topology) {
 			d.ImageID = seen[d.Image]
 		}
 	}
+}
+
+// agreedDigests reduces each node's answer to the identity they all give, and
+// reports the images they do not agree on.
+//
+// Where the nodes disagree, no identity is returned for that image. Picking one
+// node's answer is how half a class ends up marked on a different build from
+// the other half, with every report saying the deployment is current; leaving
+// it out instead makes the spec hash omit it, so the containers are left alone.
+// The deploy command checks the same thing and refuses outright, which is the
+// better answer when there is a person present to hear it.
+//
+// A node that has not pulled an image yet is not a disagreement: it has no
+// opinion, and the deployment is about to give it one.
+func agreedDigests(answers map[string]map[string]string) (map[string]string, map[string][]string) {
+	byRef := map[string]map[string]string{} // image -> node -> digest
+	for node, got := range answers {
+		for ref, id := range got {
+			if id == "" {
+				continue
+			}
+			if byRef[ref] == nil {
+				byRef[ref] = map[string]string{}
+			}
+			byRef[ref][node] = id
+		}
+	}
+
+	seen := map[string]string{}
+	disagree := map[string][]string{}
+	for ref, byNode := range byRef {
+		nodes := make([]string, 0, len(byNode))
+		for n := range byNode {
+			nodes = append(nodes, n)
+		}
+		sort.Strings(nodes)
+
+		first := byNode[nodes[0]]
+		agreed := true
+		var who []string
+		for _, n := range nodes {
+			who = append(who, fmt.Sprintf("%s has %s", n, short(byNode[n])))
+			if byNode[n] != first {
+				agreed = false
+			}
+		}
+		if agreed {
+			seen[ref] = first
+			continue
+		}
+		disagree[ref] = who
+	}
+	return seen, disagree
 }
 
 // short abbreviates a digest for a message a person has to read.

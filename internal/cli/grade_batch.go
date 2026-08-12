@@ -489,21 +489,47 @@ func loadFRRConfig(ctx context.Context, exec execFn, d *model.Device, body strin
 	// network in which its routers could not learn a route -- against a lab
 	// that looked healthy. Every process the daemons file enables is now
 	// checked by name.
-	res, err = exec(ctx, d.ID, []string{"sh", "-c",
-		"sleep 2; for d in " + strings.Join(render.EnabledDaemons(), " ") +
-			"; do pidof \"$d\" >/dev/null 2>&1 || printf '%s ' \"$d\"; done"})
-	if err != nil {
-		return fmt.Errorf("checking that frr came up: %w", err)
+	// Polled rather than slept on.
+	//
+	// A fixed two-second wait is a guess about how long FRR takes to bind, and
+	// on a node running two hundred containers it is sometimes wrong -- so a
+	// perfectly good submission was quarantined for being slow. Waiting for the
+	// answer instead is both faster in the common case and correct in the rare
+	// one; the deadline is what keeps a genuinely rejected configuration from
+	// hanging the run.
+	probe := "for d in " + strings.Join(render.EnabledDaemons(), " ") +
+		"; do pidof \"$d\" >/dev/null 2>&1 || printf '%s ' \"$d\"; done"
+	deadline := time.Now().Add(frrStartWait)
+	var down []string
+	for {
+		res, err = exec(ctx, d.ID, []string{"sh", "-c", probe})
+		if err != nil {
+			return fmt.Errorf("checking that frr came up: %w", err)
+		}
+		down = strings.Fields(res.Stdout)
+		if len(down) == 0 {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
 	}
-	if down := strings.Fields(res.Stdout); len(down) > 0 {
-		return fmt.Errorf("frr did not come up on the submitted configuration: %s "+
-			"%s not running, which usually means %s rejected a line of it",
-			strings.Join(down, ", "),
-			map[bool]string{true: "is", false: "are"}[len(down) == 1],
-			map[bool]string{true: "it", false: "they"}[len(down) == 1])
-	}
-	return nil
+	return fmt.Errorf("frr did not come up on the submitted configuration within %s: %s "+
+		"%s not running, which usually means %s rejected a line of it",
+		frrStartWait, strings.Join(down, ", "),
+		map[bool]string{true: "is", false: "are"}[len(down) == 1],
+		map[bool]string{true: "it", false: "they"}[len(down) == 1])
 }
+
+// frrStartWait bounds how long a submission's routing daemons are given to
+// bind. Long enough for a loaded node, short enough that a rejected
+// configuration is reported rather than waited on.
+var frrStartWait = 30 * time.Second
 
 // submissionFromArchive reads a submission out of a `twinet save` archive.
 //
