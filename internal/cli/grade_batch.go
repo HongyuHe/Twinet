@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -218,7 +219,18 @@ func gradeOne(ctx context.Context, class *model.Topology, rubric *grade.Rubric,
 		// consumes the cluster that the rest of the class is waiting for.
 		tctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Minute)
 		defer cancel()
-		_ = destroyLab(tctx, c, h)
+		if err := destroyLab(tctx, c, h); err != nil {
+			// Reported, not discarded. A harness that fails to come down keeps
+			// its containers and its overlay identifiers, and at class scale a
+			// handful of those exhaust the cluster -- after which every later
+			// submission fails for reasons that have nothing to do with its
+			// author. Four abandoned labs and 351 leftover overlay devices
+			// were found on this cluster, and nothing had ever said so.
+			slog.Error("a grading harness could not be removed; it is still using this "+
+				"cluster's containers and network identifiers, and must be removed by hand "+
+				"with `twinet destroy --lab <name>` before the next class-scale run",
+				"lab", h.Name, "submission", s.Group, "err", err)
+		}
 	}()
 
 	if err := deployQuiet(ctx, c, h, s.AS); err != nil {

@@ -93,12 +93,24 @@ func checkSixIn4(ctx context.Context, env *Env) Result {
 		if err != nil {
 			return Errored("tunnel.sixin4", err)
 		}
-		if name := configuredTunnel(out.Stdout); name != "" {
-			tunnels[d] = name
-		} else {
+		name := configuredTunnel(out.Stdout)
+		if name == "" {
 			missing = append(missing, fmt.Sprintf("%s has no configured 6in4 tunnel "+
 				"(the kernel's own sit0 does not count: it has no endpoints)", gw.Name))
+			continue
 		}
+		// The endpoints must be the two gateways' own loopbacks, not merely
+		// two addresses.
+		//
+		// Any pair made the check pass, so a tunnel between two interface
+		// addresses -- which breaks the moment either link does, and is not
+		// what the question asks for -- scored the same as the answer. The
+		// loopback is the point: it is reachable by any interior path.
+		if why := tunnelEndpointsWrong(out.Stdout, name, gw, gateways, domains, d); why != "" {
+			missing = append(missing, fmt.Sprintf("%s: %s", gw.Name, why))
+			continue
+		}
+		tunnels[d] = name
 	}
 
 	// And IPv6 must actually get across *through the tunnel*.
@@ -1320,4 +1332,55 @@ func inRegionRoutesViaIXP(ctx context.Context, env *Env, router, ixpPeer string)
 	}
 	sort.Strings(bad)
 	return uniq(bad), nil
+}
+
+// tunnelEndpointsWrong reports why a tunnel's endpoints are not the two
+// gateways' loopbacks, or "" if they are.
+func tunnelEndpointsWrong(out, name string, gw *model.Device,
+	gateways map[string]*model.Device, domains []string, self string) string {
+
+	line := lineContaining(out, name+":")
+	if line == "" {
+		return ""
+	}
+	local := fieldAfter(line, "local")
+	remote := fieldAfter(line, "remote")
+
+	want := ""
+	if lo, ok := gw.IfaceByName("lo"); ok {
+		want = ipOnly(lo.Addr4)
+	}
+	if want != "" && local != want {
+		return fmt.Sprintf("its tunnel is sourced from %s, not its loopback %s; a tunnel "+
+			"anchored to an interface address stops working when that link does", local, want)
+	}
+
+	var peer *model.Device
+	for _, d := range domains {
+		if d != self {
+			peer = gateways[d]
+		}
+	}
+	if peer == nil {
+		return ""
+	}
+	wantRemote := ""
+	if lo, ok := peer.IfaceByName("lo"); ok {
+		wantRemote = ipOnly(lo.Addr4)
+	}
+	if wantRemote != "" && remote != wantRemote {
+		return fmt.Sprintf("its tunnel points at %s, not %s's loopback %s",
+			remote, peer.Name, wantRemote)
+	}
+	return ""
+}
+
+// lineContaining returns the first line of output that mentions a string.
+func lineContaining(out, want string) string {
+	for _, l := range strings.Split(out, "\n") {
+		if strings.Contains(l, want) {
+			return strings.TrimSpace(l)
+		}
+	}
+	return ""
 }

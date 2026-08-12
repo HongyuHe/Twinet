@@ -153,6 +153,41 @@ someone has checked.
 | The 20 unimplemented NIKA fault types | M8 | 15 need a substrate Twinet does not emulate (6 P4/BMv2, 4 Kubernetes, 3 SDN-southbound, 2 others); adding them means adding that substrate. The other 5 are the DHCP family. See [10](10_fault_injection.md) §4.1, which explains why DHCP in particular is a design change rather than a fault to add |
 | DHCP, web and load-balancer services, traffic generation | M8 | Prerequisites for nine of those |
 
+### Addresses the assignment lets students choose
+
+The COS-461 wiki leaves the layer-2 datacentre addresses and the inter-AS
+peering addresses to the students, to be agreed with their neighbours. Twinet
+allocates both from its own plan and grades against that plan, and the reference
+neighbours are configured with those addresses.
+
+So a group that picks its own DCS addressing, or negotiates different eBGP
+addresses with a neighbour, is marked wrong for an answer the assignment
+permits -- and in the eBGP case cannot bring the session up at all, because the
+other end is a rendered reference that expects the planned address.
+
+This is a real divergence from the assignment as written, not a bug in the
+checks: making it right means discovering the addresses a submission actually
+used and configuring its neighbours from them. Until it is done, a course using
+Twinet has to prescribe the addressing, which the manifest already does.
+
+### Grading checks that are narrower than their questions
+
+Recorded here rather than implied to be complete:
+
+- `tunnel.sixin4` tests one host in each datacentre and one direction. A
+  submission that configures one VLAN and not another, or the forward path and
+  not the reverse, can still score the point. It does now check that the tunnel
+  is 6in4 rather than any encapsulation, and that its endpoints are the two
+  gateways' loopbacks.
+- `policy.ixp_communities` accepts any non-empty set of real member communities.
+  It checks that the exchange relayed the announcement and that no in-region
+  route was accepted, but not that the tagged set is exactly the members the
+  assignment intends.
+- The end-to-end discrimination suite covers q1.2, q2.1 and q2.3. The remaining
+  questions are covered by unit tests and by the reference scoring 10/10, which
+  is weaker: it shows the checks accept a correct answer, not that they reject
+  every wrong one.
+
 ### Grading a hundred students is not yet practical in the fair mode
 
 Measured: 4m 56s per submission, one at a time, almost all of it waiting for
