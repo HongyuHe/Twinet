@@ -220,6 +220,13 @@ func (n *Node) Hold(ctx context.Context, lab, holder, token string, seconds int)
 		agent.HoldRequest{Lab: lab, Holder: holder, Token: token, Seconds: seconds}, &resp)
 }
 
+// Exempt tells the node to leave a device alone, or to look after it again.
+func (n *Node) Exempt(ctx context.Context, lab, device, id string, on bool) error {
+	var resp struct{}
+	return n.do(ctx, http.MethodPost, "/v1/exempt",
+		agent.ExemptRequest{Lab: lab, Device: device, ID: id, On: on}, &resp)
+}
+
 // Exec runs a command in a container on the node.
 func (n *Node) Exec(ctx context.Context, req agent.ExecRequest) (agent.ExecResponse, error) {
 	var resp agent.ExecResponse

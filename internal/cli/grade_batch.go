@@ -725,18 +725,66 @@ func wipeDeviceState(ctx context.Context, exec execFn, d *model.Device) error {
 }
 
 // verifyWiped reads a device back and reports what the reset failed to remove.
+//
+// Every section ends in a sentinel rather than in the exit status of a
+// pipeline. The first version of this ended with a `grep` for stale routes, and
+// grep exits 1 when it finds nothing -- which is the desired state. So a device
+// that had been reset perfectly reported "the reset could not be checked", and
+// a class run quarantined all eight submissions. Absence is the answer here,
+// and an absence probe must not signal failure by finding nothing.
+//
+// The sentinel is what distinguishes "nothing left" from "the probe never
+// ran": if the last line is missing, the device could not be read, and that is
+// reported as its own condition rather than as a clean device.
 func verifyWiped(ctx context.Context, exec execFn, d *model.Device) error {
-	const probe = `echo "--tunnels"; ip -d tunnel show 2>/dev/null | grep -v '^sit0:' | cut -d: -f1
-echo "--routes"; ip -o -4 route show 2>/dev/null | grep -v " proto "
-echo "--routes6"; ip -o -6 route show 2>/dev/null | grep -v " proto " | grep -v "^fe80"`
+	var b strings.Builder
+	b.WriteString("echo '--tunnels'\n")
+	b.WriteString("ip -d tunnel show 2>/dev/null | grep -v '^sit0:' | cut -d: -f1 || true\n")
+	b.WriteString("echo '--routes'\n")
+	b.WriteString(`ip -o -4 route show 2>/dev/null | grep -v " proto " || true` + "\n")
+	b.WriteString("echo '--routes6'\n")
+	b.WriteString(`ip -o -6 route show 2>/dev/null | grep -v " proto " | grep -v "^fe80" || true` + "\n")
+	// The addresses the platform owns are put back by the reset, and a
+	// submission can leave others behind. Both were cleared with errors
+	// suppressed, so neither was ever confirmed.
+	b.WriteString("echo '--addrs'\n")
+	for _, i := range d.Ifaces {
+		if i.Name == "" || i.Name == "lo" {
+			continue
+		}
+		fmt.Fprintf(&b, "ip -o -4 addr show dev %s 2>/dev/null | "+
+			`awk '{print "%s " $4}' || true`+"\n", i.Name, i.Name)
+	}
+	// A switch's VLAN assignments are a submitted answer too, and clearing them
+	// was equally unchecked.
+	b.WriteString("echo '--vlans'\n")
+	b.WriteString("if command -v ovs-vsctl >/dev/null 2>&1; then " +
+		"for br in $(ovs-vsctl list-br 2>/dev/null); do " +
+		"for p in $(ovs-vsctl list-ports \"$br\" 2>/dev/null); do " +
+		"t=$(ovs-vsctl get port \"$p\" tag 2>/dev/null | tr -d '[]\" '); " +
+		"k=$(ovs-vsctl get port \"$p\" trunks 2>/dev/null | tr -d '[]\" '); " +
+		"[ -n \"$t\" ] && [ \"$t\" != '[]' ] && echo \"$p tag=$t\"; " +
+		"[ -n \"$k\" ] && [ \"$k\" != '[]' ] && echo \"$p trunks=$k\"; " +
+		"done; done; fi || true\n")
+	b.WriteString("echo '--done'\n")
+	b.WriteString("exit 0\n")
 
-	res, err := exec(ctx, d.ID, []string{"sh", "-c", probe})
+	res, err := exec(ctx, d.ID, []string{"sh", "-c", b.String()})
 	if err != nil {
 		return fmt.Errorf("%s: checking that the previous submission was cleared: %w", d.ID, err)
 	}
-	if res.ExitCode != 0 {
-		return fmt.Errorf("%s: checking that the previous submission was cleared: %s",
-			d.ID, firstLine(res.Stderr+res.Stdout))
+	if !strings.Contains(res.Stdout, "--done") {
+		return fmt.Errorf("%s: checking that the previous submission was cleared did not "+
+			"finish (exit %d): %s", d.ID, res.ExitCode, firstLine(res.Stderr+res.Stdout))
+	}
+
+	// What the platform's own addressing should be, so an address that belongs
+	// there is not reported as somebody's leftover.
+	want := map[string]bool{}
+	for _, i := range d.Ifaces {
+		if i.Owner == model.OwnerPlatform && i.Addr4 != "" {
+			want[i.Name+" "+i.Addr4] = true
+		}
 	}
 
 	var left []string
@@ -755,6 +803,12 @@ echo "--routes6"; ip -o -6 route show 2>/dev/null | grep -v " proto " | grep -v 
 			left = append(left, "tunnel "+line)
 		case "routes", "routes6":
 			left = append(left, "route "+line)
+		case "addrs":
+			if !want[line] {
+				left = append(left, "address "+line)
+			}
+		case "vlans":
+			left = append(left, "vlan "+line)
 		}
 	}
 	if len(left) == 0 {
@@ -943,7 +997,58 @@ func readSubmissions(dir string, class *model.Topology) ([]submission, error) {
 		subs = append(subs, sub)
 	}
 	sort.Slice(subs, func(i, j int) bool { return subs[i].Group < subs[j].Group })
+	if err := refuseDuplicates(subs); err != nil {
+		return nil, err
+	}
 	return subs, nil
+}
+
+// refuseDuplicates rejects a submission set in which two entries claim the same
+// group or the same autonomous system.
+//
+// Both were accepted, and both lost work silently. Two archives for one group
+// wrote their reports to the same filename, so whichever was graded second
+// overwrote the first and nothing said which had survived. Two submissions for
+// one AS were silently dropped down to one by the wave planner, and in batch
+// mode were given the same harness name and could be deployed into the same
+// lab at once.
+//
+// There is no correct guess available here. "Latest wins" is a policy about
+// late submissions that belongs to a course, not to a grader, and picking one
+// silently is how a student is marked on an attempt they did not intend to
+// hand in. So it stops, names both, and lets a person decide.
+func refuseDuplicates(subs []submission) error {
+	byGroup := map[string][]string{}
+	byAS := map[int][]string{}
+	for _, s := range subs {
+		key := strings.ToLower(s.Group)
+		byGroup[key] = append(byGroup[key], s.Group)
+		byAS[s.AS] = append(byAS[s.AS], s.Group)
+	}
+
+	var problems []string
+	for g, all := range byGroup {
+		if len(all) > 1 {
+			problems = append(problems, fmt.Sprintf(
+				"%d submissions claim to be group %q", len(all), g))
+		}
+	}
+	for as, groups := range byAS {
+		if len(groups) > 1 {
+			sort.Strings(groups)
+			problems = append(problems, fmt.Sprintf(
+				"AS %d is claimed by %s", as, strings.Join(groups, ", ")))
+		}
+	}
+	if len(problems) == 0 {
+		return nil
+	}
+	sort.Strings(problems)
+	return fmt.Errorf("this set of submissions is ambiguous, so nothing was graded:\n  %s\n"+
+		"Two submissions for one system cannot both be graded against the same lab, and "+
+		"choosing between them is a decision about late work that belongs to whoever "+
+		"runs the course. Remove or rename the ones that should not count",
+		strings.Join(problems, "\n  "))
 }
 
 // execFn runs a command inside a device of a harness. It matches the shape the

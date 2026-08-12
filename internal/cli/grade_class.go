@@ -230,7 +230,29 @@ The lab must already be deployed with --solve.`,
 
 				got := gradeWave(cmd.Context(), top, rubric, loaded, exec, converge, parallel,
 					cmd.ErrOrStderr())
-				reports = append(reports, got...)
+
+				// Checked again, after the wave rather than only before it.
+				//
+				// A wave takes about five minutes and the lease has ninety
+				// seconds left when loss is declared, so a hold lost during
+				// loading, convergence or grading would have been noticed only
+				// at the start of the next wave -- by which time the nodes had
+				// been repairing devices underneath this one for minutes, and
+				// its marks were about to be released. A submission graded
+				// while the reference solution is being written back over it
+				// looks like a good submission.
+				select {
+				case <-held.Lost:
+					contaminated = fmt.Sprintf("the nodes stopped holding this lab off "+
+						"from automatic repair while this wave was being graded: %s",
+						held.Reason())
+					reports = append(reports, quarantine(waves[i:], rubric.MaxTotal(), contaminated)...)
+				default:
+					reports = append(reports, got...)
+				}
+				if contaminated != "" {
+					break
+				}
 
 				if !keepLoaded {
 					if err := restoreWave(cmd.Context(), opts, top, loaded, token); err != nil {

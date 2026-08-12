@@ -157,8 +157,11 @@ type Server struct {
 	// holds are labs an external operation has asked this node to leave alone.
 	holds map[string]*hold
 
-	// repairFails counts consecutive failed repairs per device.
+	// repairFails counts consecutive failed repairs, keyed by lab and device.
 	repairFails map[string]int
+
+	// exempt records, per lab, the devices that are broken on purpose.
+	exempt map[string]*exemptions
 }
 
 // lease records an in-flight mutating operation on one lab.
@@ -183,6 +186,7 @@ func New(cfg Config) (*Server, error) {
 		holds:   map[string]*hold{},
 
 		repairFails: map[string]int{},
+		exempt:      map[string]*exemptions{},
 	}
 	if cfg.StateDir != "" {
 		st, err := state.Open(cfg.StateDir)
@@ -232,6 +236,7 @@ func (s *Server) rehydrate() {
 		}
 		s.current[top.Name] = top
 		s.rememberHow(top.Name, wt.Mode, wt.Ungraded)
+		s.loadExemptions(top.Name)
 		if wt.PeerUnderlay != nil {
 			if s.peers == nil {
 				s.peers = map[string]map[string]string{}
@@ -321,6 +326,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	mux.HandleFunc("POST /v1/destroy", s.auth(s.handleDestroy))
 	mux.HandleFunc("POST /v1/exec", s.auth(s.handleExec))
 	mux.HandleFunc("POST /v1/hold", s.auth(s.handleHold))
+	mux.HandleFunc("POST /v1/exempt", s.auth(s.handleExempt))
 	mux.HandleFunc("POST /v1/lifecycle", s.auth(s.handleLifecycle))
 	mux.HandleFunc("POST /v1/reshape", s.auth(s.handleReshape))
 	mux.HandleFunc("GET /v1/images", s.auth(s.handleImages))

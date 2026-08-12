@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/HongyuHe/twinet/internal/deploy"
-	"github.com/HongyuHe/twinet/internal/fault"
 	"github.com/HongyuHe/twinet/internal/model"
 	"github.com/HongyuHe/twinet/internal/render"
 	rt "github.com/HongyuHe/twinet/internal/runtime"
@@ -97,6 +96,13 @@ func (s *Server) survey(ctx context.Context, top *model.Topology) []*model.Devic
 		if d.Node != s.cfg.Node {
 			continue
 		}
+		// A device that was broken on purpose is not a device to repair. The
+		// record lives on this node rather than in the container, because a
+		// marker inside the device under test tells an agent being evaluated
+		// on root-cause analysis that a fault was injected.
+		if s.isExempt(top.Name, d.ID) {
+			continue
+		}
 		if s.hasLostItsWiring(ctx, d) {
 			broken = append(broken, d)
 		}
@@ -164,7 +170,7 @@ func (s *Server) repairLab(ctx context.Context, top *model.Topology, broken []*m
 		PeerUnderlay: s.peerUnderlay(top.Name),
 	}
 	for _, d := range broken {
-		if s.givingUpOn(d.ID) {
+		if s.givingUpOn(top.Name, d.ID) {
 			continue
 		}
 		// A router whose cables are all present and whose daemons have died
@@ -181,22 +187,22 @@ func (s *Server) repairLab(ctx context.Context, top *model.Topology, broken []*m
 			continue
 		}
 		if err := eng.RewireDevice(ctx, top, d); err != nil {
-			s.repairFailed(d.ID, "rewiring failed", err)
+			s.repairFailed(top.Name, d.ID, "rewiring failed", err)
 			continue
 		}
 		if _, err := deploy.Restore(ctx, s.rt, d, top.Name, s.store); err != nil {
-			s.repairFailed(d.ID, "configuration could not be put back after rewiring", err)
+			s.repairFailed(top.Name, d.ID, "configuration could not be put back after rewiring", err)
 			continue
 		}
 		// Confirmed, not assumed. A repair that reports success without being
 		// checked is how the previous version of this loop claimed to have
 		// fixed routers it had left with no addresses and no routing daemon.
 		if why := s.brokenBecause(ctx, d); why != "" {
-			s.repairFailed(d.ID, "device is still not right after being repaired",
+			s.repairFailed(top.Name, d.ID, "device is still not right after being repaired",
 				errors.New(why))
 			continue
 		}
-		s.repairSucceeded(d.ID)
+		s.repairSucceeded(top.Name, d.ID)
 		slog.Info("device repaired and its configuration put back", "device", d.ID)
 	}
 }
@@ -246,18 +252,6 @@ func (s *Server) brokenBecause(ctx context.Context, d *model.Device) string {
 	}
 	c, err := s.rt.Inspect(ctx, d.Container)
 	if err != nil || !c.State.Joinable() {
-		return ""
-	}
-	// A device that was broken on purpose is not a device to repair.
-	//
-	// Stopping a routing daemon is a supported fault, and this loop restarted
-	// it within the minute -- so a diagnosis episode left open for an agent to
-	// work on lost its fault while the recorded ground truth went on saying it
-	// was live, and every answer graded against that truth was wrong. The mark
-	// is written by the injector and removed when the fault is resolved, so it
-	// lasts exactly as long as the fault does.
-	if r, err := s.rt.Exec(ctx, d.Container, rt.ExecCmd{
-		Cmd: []string{"test", "-f", fault.InjectedMarker}}); err == nil && r.ExitCode == 0 {
 		return ""
 	}
 
@@ -355,29 +349,39 @@ func (s *Server) startDaemons(ctx context.Context, d *model.Device) error {
 // looked after again without anything having to be restarted.
 const repairAttemptsBeforeGivingUp = 3
 
-func (s *Server) givingUpOn(id string) bool {
+// repairKey identifies a device within its lab.
+//
+// Keying on the device alone was wrong in a way that only shows up at class
+// scale: every private grading harness contains as3/ATL, and so does the class
+// lab. Three failed repairs in an abandoned harness therefore switched off
+// self-repair for the real device of the same name, in the lab a class is
+// being taught in, and nothing said so.
+func repairKey(lab, id string) string { return lab + "|" + id }
+
+func (s *Server) givingUpOn(lab, id string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.repairFails[id] >= repairAttemptsBeforeGivingUp
+	return s.repairFails[repairKey(lab, id)] >= repairAttemptsBeforeGivingUp
 }
 
-func (s *Server) repairFailed(id, what string, err error) {
+func (s *Server) repairFailed(lab, id, what string, err error) {
+	k := repairKey(lab, id)
 	s.mu.Lock()
-	s.repairFails[id]++
-	n := s.repairFails[id]
+	s.repairFails[k]++
+	n := s.repairFails[k]
 	s.mu.Unlock()
 
-	slog.Error(what, "device", id, "err", err, "attempt", n)
+	slog.Error(what, "lab", lab, "device", id, "err", err, "attempt", n)
 	if n == repairAttemptsBeforeGivingUp {
 		slog.Error("giving up on repairing this device; it will be left as it is until "+
 			"something deploys or removes it. A device whose peers no longer exist cannot "+
 			"be rewired, and a lab in that state needs removing rather than repairing",
-			"device", id, "attempts", n)
+			"lab", lab, "device", id, "attempts", n)
 	}
 }
 
-func (s *Server) repairSucceeded(id string) {
+func (s *Server) repairSucceeded(lab, id string) {
 	s.mu.Lock()
-	delete(s.repairFails, id)
+	delete(s.repairFails, repairKey(lab, id))
 	s.mu.Unlock()
 }

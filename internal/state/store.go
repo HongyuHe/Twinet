@@ -307,6 +307,25 @@ func (s *Store) Topology(lab string) ([]byte, error) {
 	return os.ReadFile(filepath.Join(s.root, safe(lab), "topology.json"))
 }
 
+// PutExemptions records the devices of a lab that are broken on purpose.
+//
+// It lives on the node, beside the lab's other state, and deliberately not
+// inside the containers. A marker in the device under test tells an agent being
+// evaluated on root-cause analysis both that a fault was injected and which
+// one, which is the whole answer.
+func (s *Store) PutExemptions(lab string, raw []byte) error {
+	dir := filepath.Join(s.root, safe(lab))
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	return writeAtomic(filepath.Join(dir, "exempt.json"), raw, 0o600)
+}
+
+// Exemptions returns the recorded exemptions for a lab, if there are any.
+func (s *Store) Exemptions(lab string) ([]byte, error) {
+	return os.ReadFile(filepath.Join(s.root, safe(lab), "exempt.json"))
+}
+
 // Labs lists every lab the store knows about, which after a restart is how the
 // agent rediscovers what this node is hosting.
 func (s *Store) Labs() ([]string, error) {

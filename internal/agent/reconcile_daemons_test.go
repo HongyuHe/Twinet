@@ -5,7 +5,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/HongyuHe/twinet/internal/fault"
 	"github.com/HongyuHe/twinet/internal/model"
 	"github.com/HongyuHe/twinet/internal/render"
 	rt "github.com/HongyuHe/twinet/internal/runtime"
@@ -28,9 +27,6 @@ func (f *fakeRuntime) Inspect(context.Context, string) (rt.Container, error) {
 func (f *fakeRuntime) Exec(_ context.Context, _ string, c rt.ExecCmd) (rt.ExecResult, error) {
 	body := strings.Join(c.Cmd, " ")
 	switch {
-	case strings.Contains(body, "test -f "+fault.InjectedMarker):
-		// Nothing was injected here; the device is broken by accident.
-		return rt.ExecResult{ExitCode: 1}, nil
 	case strings.Contains(body, "ip -o link show"):
 		return rt.ExecResult{Stdout: f.links}, nil
 	case strings.Contains(body, "frrinit.sh start"):

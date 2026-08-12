@@ -1,8 +1,11 @@
 package cli
 
 import (
+	"context"
+
 	"encoding/json"
 	"fmt"
+	"github.com/HongyuHe/twinet/internal/client"
 	"os"
 	"path/filepath"
 	"sort"
@@ -539,9 +542,45 @@ func faultEnv(cmd *cobra.Command, top *model.Topology, token string) (*fault.Env
 	if err != nil {
 		return nil, err
 	}
+	exempt, err := exemptFunc(top, token)
+	if err != nil {
+		return nil, err
+	}
 	return &fault.Env{
 		Topology: top, Exec: exec, Lifecycle: life,
-		Reshape: reshape, NodeState: nodeState,
+		Reshape: reshape, NodeState: nodeState, Exempt: exempt,
+	}, nil
+}
+
+// exemptFunc returns a function that tells the node hosting a device to leave
+// it alone while a fault is live.
+//
+// The record is kept on the node rather than in the container. A marker inside
+// the device under test tells an agent being evaluated on root-cause analysis
+// both that a fault was injected and, if it names the fault, what the answer
+// is -- readable with `cat`, which makes the benchmark worthless.
+func exemptFunc(top *model.Topology, token string) (
+	func(context.Context, string, string, bool) error, error) {
+
+	if !clustered(top) {
+		// No agent, so no repair loop to exclude.
+		return nil, nil
+	}
+	tok, err := tokenFor(token)
+	if err != nil {
+		return nil, err
+	}
+	cl := client.NewCluster(top.Lab, tok)
+	return func(ctx context.Context, deviceID, injectionID string, on bool) error {
+		d, ok := top.Device(deviceID)
+		if !ok {
+			return fmt.Errorf("no device %q", deviceID)
+		}
+		n, ok := cl.Node(d.Node)
+		if !ok {
+			return fmt.Errorf("device %s is on unknown node %q", deviceID, d.Node)
+		}
+		return n.Exempt(ctx, top.Name, deviceID, injectionID, on)
 	}, nil
 }
 

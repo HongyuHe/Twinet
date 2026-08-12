@@ -59,22 +59,23 @@ func TestAHoldIsCappedAndCanBeDropped(t *testing.T) {
 // minute forever fills the log and hides the labs that can be repaired.
 func TestRepairsThatCannotSucceedAreGivenUpOn(t *testing.T) {
 	s := &Server{repairFails: map[string]int{}}
+	const lab = "cos461"
 	id := "as9/CHI_host"
 	for i := 0; i < repairAttemptsBeforeGivingUp; i++ {
-		if s.givingUpOn(id) {
+		if s.givingUpOn(lab, id) {
 			t.Fatalf("gave up after %d attempts, before trying %d times",
 				i, repairAttemptsBeforeGivingUp)
 		}
-		s.repairFailed(id, "rewiring failed", context.DeadlineExceeded)
+		s.repairFailed(lab, id, "rewiring failed", context.DeadlineExceeded)
 	}
-	if !s.givingUpOn(id) {
+	if !s.givingUpOn(lab, id) {
 		t.Errorf("still retrying after %d consecutive failures", repairAttemptsBeforeGivingUp)
 	}
-	if s.givingUpOn("as9/MSP_host") {
+	if s.givingUpOn(lab, "as9/MSP_host") {
 		t.Error("giving up on one device also gave up on another")
 	}
-	s.repairSucceeded(id)
-	if s.givingUpOn(id) {
+	s.repairSucceeded(lab, id)
+	if s.givingUpOn(lab, id) {
 		t.Error("a device that was repaired is still being ignored")
 	}
 }
