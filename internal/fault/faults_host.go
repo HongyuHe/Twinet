@@ -74,15 +74,17 @@ func init() {
 			return State{"iface": iface, "addr": addr, "wrong": wrong, "routes": routes}, nil
 		},
 		Verify: func(ctx context.Context, e *Env, t Target, s State) (Evidence, error) {
-			iface, addr, err := hostAddr(e, t)
-			if err != nil {
-				return Evidence{}, err
-			}
-			out, _ := e.Try(ctx, t.DeviceID(), "ip -o -4 addr show dev "+iface)
-			return Evidence{
-				Verified: !strings.Contains(out, strings.SplitN(addr, "/", 2)[0]),
-				Expected: "an address other than " + addr, Observed: strings.TrimSpace(out),
-			}, nil
+			// The injected address must be *there*, not merely the correct one
+			// absent.
+			//
+			// Absence was the whole test, and a probe that could not run, or
+			// an interface that no longer exists, satisfies it. After a
+			// container restart the ground truth then said "this host has the
+			// wrong address" while the real fault was that it had no wiring at
+			// all -- and an agent scored against that truth is being marked on
+			// a question nobody asked. Transport failures are no longer
+			// swallowed either.
+			return injectedAddressPresent(ctx, e, t, s)
 		},
 		Resolve: func(ctx context.Context, e *Env, t Target, s State) error {
 			if s["addr"] == "" {
@@ -120,13 +122,8 @@ func init() {
 			return State{"iface": iface, "addr": addr, "wrong": bad, "routes": routes}, nil
 		},
 		Verify: func(ctx context.Context, e *Env, t Target, s State) (Evidence, error) {
-			iface, addr, err := hostAddr(e, t)
-			if err != nil {
-				return Evidence{}, err
-			}
-			out, _ := e.Try(ctx, t.DeviceID(), "ip -o -4 addr show dev "+iface)
-			return Evidence{Verified: !strings.Contains(out, addr),
-				Expected: "a prefix length other than " + addr, Observed: strings.TrimSpace(out)}, nil
+			// Present, not merely absent: see host_incorrect_ip.
+			return injectedAddressPresent(ctx, e, t, s)
 		},
 		Resolve: func(ctx context.Context, e *Env, t Target, s State) error {
 			if s["addr"] == "" {
@@ -436,4 +433,37 @@ func restoreRoutes(ctx context.Context, e *Env, t Target, saved string) error {
 		}
 	}
 	return nil
+}
+
+// injectedAddressPresent confirms the address a fault installed is on the
+// interface it installed it on.
+//
+// These verifiers used to check that the *correct* address was absent, which a
+// probe that could not run also satisfies, and so does an interface that no
+// longer exists. After a container restart the ground truth then said "this
+// host has the wrong address" while the real fault was that it had no wiring at
+// all, and an agent scored against that truth is being marked on a question
+// nobody asked.
+func injectedAddressPresent(ctx context.Context, e *Env, t Target, s State) (Evidence, error) {
+	iface, wrong := s["iface"], s["wrong"]
+	if iface == "" || wrong == "" {
+		return Evidence{}, fmt.Errorf("this fault did not record what it changed, so it "+
+			"cannot be verified on %s", t.DeviceID())
+	}
+	out, code, err := e.TryE(ctx, t.DeviceID(), "ip -o -4 addr show dev "+iface)
+	if err != nil {
+		return Evidence{}, err
+	}
+	if code != 0 || strings.TrimSpace(out) == "" {
+		return Evidence{
+			Verified: false,
+			Expected: wrong + " on " + iface,
+			Observed: fmt.Sprintf("%s could not be read, so nothing can be concluded about it", iface),
+		}, nil
+	}
+	return Evidence{
+		Verified: strings.Contains(out, wrong),
+		Expected: wrong + " on " + iface,
+		Observed: strings.TrimSpace(out),
+	}, nil
 }

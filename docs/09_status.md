@@ -27,7 +27,7 @@ missed it is recorded as a miss.
 | Cross-node VXLAN | done | 50.22 ms measured for a 25 ms configured delay, 9 µs jitter, no duplicates |
 | AS-granular placement | done | 13.4 % of links cross the fabric; `twinet inspect --placement` |
 | Underlay MTU verification | done | `twinet node check` refuses a lab that would not fit and names the MTU to use |
-| Grading engine: rubric, 22 registered checks, structured reports | done | the COS-461 rubric uses 18 of them; 8 systems graded in **79 s**; JSON, text and CSV output |
+| Grading engine: rubric, 23 registered checks, structured reports | done | the COS-461 rubric uses 20 of them; 8 systems graded in **79 s**; JSON, text and CSV output |
 | Reference solution (`--solve`) | done | scores **10.00 / 10.00** against its own rubric, verified end to end and re-checked by `make e2e` |
 | Container images | done | `hyhe/twinet-{router,host,switch,svc}` |
 | Reference solution | **10.00 / 10.00** | verified end to end on the live cluster; a rubric whose reference cannot score full marks is unfalsifiable, and every student who loses that mark loses it to the platform |

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/HongyuHe/twinet/internal/model"
@@ -25,6 +26,9 @@ type frrConfig struct {
 	neighborMaps map[string]map[string]string // addr -> direction -> map name
 	// neighborAttrs records other per-neighbour settings, e.g. "route-reflector-client".
 	neighborAttrs map[string][]string
+	// localAS is the AS number the BGP process runs as, which is what tells an
+	// internal session from an external one.
+	localAS int
 }
 
 func parseFRR(cfg string) *frrConfig {
@@ -38,13 +42,22 @@ func parseFRR(cfg string) *frrConfig {
 	for _, line := range strings.Split(cfg, "\n") {
 		t := strings.TrimSpace(line)
 		fields := strings.Fields(t)
+		if len(fields) == 3 && fields[0] == "router" && fields[1] == "bgp" {
+			if n, err := strconv.Atoi(fields[2]); err == nil {
+				f.localAS = n
+			}
+		}
 		switch {
 		case len(fields) >= 3 && fields[0] == "route-map":
 			// "route-map NAME permit 10"
+			//
+			// The header is kept with the body. Without it a caller reading a
+			// map cannot tell a deny clause from a permit one, and the
+			// direction of a clause is what decides what it does: a check
+			// looking only for "match rpki invalid" gave the mark to a permit
+			// clause, which lets the very routes the question is about through.
 			currentMap = fields[1]
-			if _, ok := f.routeMaps[currentMap]; !ok {
-				f.routeMaps[currentMap] = nil
-			}
+			f.routeMaps[currentMap] = append(f.routeMaps[currentMap], t)
 			continue
 		case t == "exit" || t == "!" || t == "":
 			currentMap = ""
@@ -208,4 +221,51 @@ func (c *frrConfig) asPathListLen(name string) int {
 		}
 	}
 	return n
+}
+
+// externalNeighbours lists the neighbours in another autonomous system.
+//
+// A route-map that guards against invalid origins has to be attached to the
+// sessions that bring routes in from outside; one attached to nothing, or to an
+// internal session, does not run on anything that could be invalid.
+func (f *frrConfig) externalNeighbours() []string {
+	var out []string
+	for addr, attrs := range f.neighborAttrs {
+		body := strings.Join(attrs, "\n")
+		if !strings.Contains(body, "remote-as") {
+			continue
+		}
+		// "remote-as internal" and "remote-as <own asn>" are iBGP.
+		if strings.Contains(body, "remote-as internal") {
+			continue
+		}
+		if f.localAS != 0 && strings.Contains(body, fmt.Sprintf("remote-as %d", f.localAS)) {
+			continue
+		}
+		out = append(out, addr)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// denyMatches reports whether a route-map body contains a deny clause that
+// matches the given condition.
+//
+// The direction of a clause is what decides what it does. Looking only for the
+// words of the match awarded the mark to a permit clause, which lets the very
+// routes the question is about straight through.
+func denyMatches(body, condition string) bool {
+	deny := false
+	for _, line := range strings.Split(body, "\n") {
+		t := strings.TrimSpace(strings.ToLower(line))
+		switch {
+		case strings.HasPrefix(t, "route-map "):
+			deny = strings.Contains(t, " deny ")
+		case strings.HasPrefix(t, "match ") && deny:
+			if strings.Contains(t, strings.ToLower(condition)) {
+				return true
+			}
+		}
+	}
+	return false
 }

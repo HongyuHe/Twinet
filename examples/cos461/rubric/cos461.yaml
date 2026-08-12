@@ -15,9 +15,14 @@ questions:
     title: Layer-2 connectivity and VLANs
     points: 1
     checks:
+      # Both datacentres. Only DCS was checked, so a student could leave DCN
+      # entirely unconfigured and still receive the whole point.
       - check: l2.vlan_isolation
-        weight: 1.0
+        weight: 0.5
         args: {domain: DCS}
+      - check: l2.vlan_isolation
+        weight: 0.5
+        args: {domain: DCN}
 
   - id: q1.2
     title: IP addressing and OSPF

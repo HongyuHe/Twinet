@@ -119,7 +119,7 @@ func (s *Server) survey(ctx context.Context, top *model.Topology) []*model.Devic
 		if s.isExempt(top.Name, d.ID) {
 			continue
 		}
-		if s.hasLostItsWiring(ctx, d) {
+		if s.hasLostItsWiring(ctx, top.Name, d) {
 			broken = append(broken, d)
 		}
 	}
@@ -134,7 +134,7 @@ func (s *Server) repairLab(ctx context.Context, top *model.Topology, broken []*m
 	// is now fine would undo work rather than restore it.
 	still := make([]*model.Device, 0, len(broken))
 	for _, d := range broken {
-		if s.hasLostItsWiring(ctx, d) {
+		if s.hasLostItsWiring(ctx, top.Name, d) {
 			still = append(still, d)
 		}
 	}
@@ -149,7 +149,7 @@ func (s *Server) repairLab(ctx context.Context, top *model.Topology, broken []*m
 	}
 	slog.Warn("devices are not as the lab says they should be; repairing",
 		"lab", top.Name, "devices", strings.Join(names, ","),
-		"reason", s.brokenBecause(ctx, broken[0]))
+		"reason", s.brokenBecause(ctx, top.Name, broken[0]))
 
 	// The engine needs a renderer.
 	//
@@ -194,7 +194,7 @@ func (s *Server) repairLab(ctx context.Context, top *model.Topology, broken []*m
 		// re-render its configuration in platform mode, which in a lab
 		// deployed at the reference throws the reference solution away -- a
 		// far worse outcome than the fault being repaired.
-		if why := s.brokenBecause(ctx, d); strings.HasPrefix(why, daemonsDown) {
+		if why := s.brokenBecause(ctx, top.Name, d); strings.HasPrefix(why, daemonsDown) {
 			if err := s.startDaemons(ctx, d); err != nil {
 				slog.Error("routing daemons could not be started", "device", d.ID, "err", err)
 				continue
@@ -213,7 +213,7 @@ func (s *Server) repairLab(ctx context.Context, top *model.Topology, broken []*m
 		// Confirmed, not assumed. A repair that reports success without being
 		// checked is how the previous version of this loop claimed to have
 		// fixed routers it had left with no addresses and no routing daemon.
-		if why := s.brokenBecause(ctx, d); why != "" {
+		if why := s.brokenBecause(ctx, top.Name, d); why != "" {
 			s.repairFailed(top.Name, d.ID, "device is still not right after being repaired",
 				errors.New(why))
 			continue
@@ -251,12 +251,12 @@ func (s *Server) missingDaemons(ctx context.Context, d *model.Device) string {
 // it was fine, so it was never looked at again. The check therefore asks for
 // each thing separately and reports a device as broken if any of them is
 // missing.
-func (s *Server) hasLostItsWiring(ctx context.Context, d *model.Device) bool {
-	return s.brokenBecause(ctx, d) != ""
+func (s *Server) hasLostItsWiring(ctx context.Context, lab string, d *model.Device) bool {
+	return s.brokenBecause(ctx, lab, d) != ""
 }
 
 // brokenBecause names the first thing a device is missing, or "" if it is well.
-func (s *Server) brokenBecause(ctx context.Context, d *model.Device) string {
+func (s *Server) brokenBecause(ctx context.Context, lab string, d *model.Device) string {
 	want := map[string]bool{}
 	for _, i := range d.Ifaces {
 		if i.Link != nil || i.VLAN > 0 {
@@ -302,7 +302,7 @@ func (s *Server) brokenBecause(ctx context.Context, d *model.Device) string {
 		//
 		// So it is given time to be a deploy, and repaired if it is not. The
 		// count is per device, and cleared as soon as the device is whole.
-		if s.partiallyWiredFor(d.ID) < partialWiringGrace {
+		if s.partiallyWiredFor(lab, d.ID) < partialWiringGrace {
 			return ""
 		}
 		missing := make([]string, 0, len(want)-present)
@@ -314,7 +314,7 @@ func (s *Server) brokenBecause(ctx context.Context, d *model.Device) string {
 		sort.Strings(missing)
 		return "it is missing " + strings.Join(missing, ", ")
 	}
-	s.wholeAgain(d.ID)
+	s.wholeAgain(lab, d.ID)
 
 	// The interfaces are there. A router still needs its daemons: after a
 	// restart the namespace is new and FRR is not running in it.
@@ -460,6 +460,11 @@ func (s *Server) forgetLab(name string) {
 			delete(s.repairFails, k)
 		}
 	}
+	for k := range s.partial {
+		if strings.HasPrefix(k, name+"|") {
+			delete(s.partial, k)
+		}
+	}
 	store := s.store
 	s.mu.Unlock()
 
@@ -480,19 +485,27 @@ const partialWiringGrace = 3
 
 // partiallyWiredFor counts consecutive surveys in which a device has been
 // missing some of its interfaces.
-func (s *Server) partiallyWiredFor(id string) int {
+// Keyed by lab and device, like the repair counter beside it.
+//
+// Device identifiers repeat by design: every private grading harness contains
+// as3/ATL and so does the class lab. Keyed on the device alone, one lab's
+// surveys advanced another's count and one lab's recovery cleared it, so a
+// device could be rewired during its own deployment or never repaired at all,
+// depending on what else the node happened to be running.
+func (s *Server) partiallyWiredFor(lab, id string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.partial == nil {
 		s.partial = map[string]int{}
 	}
-	s.partial[id]++
-	return s.partial[id]
+	k := repairKey(lab, id)
+	s.partial[k]++
+	return s.partial[k]
 }
 
 // wholeAgain forgets that a device was ever partially wired.
-func (s *Server) wholeAgain(id string) {
+func (s *Server) wholeAgain(lab, id string) {
 	s.mu.Lock()
-	delete(s.partial, id)
+	delete(s.partial, repairKey(lab, id))
 	s.mu.Unlock()
 }

@@ -72,7 +72,7 @@ func TestARouterWithZebraAloneIsNotHealthy(t *testing.T) {
 	s := &Server{rt: f}
 	s.cfg.Node = "node-0"
 
-	why := s.brokenBecause(context.Background(), routerWithTwoCables())
+	why := s.brokenBecause(context.Background(), "cos461", routerWithTwoCables())
 	if why == "" {
 		t.Fatal("a router running only zebra was reported healthy. OSPF and BGP " +
 			"cannot come up on it, and the failure will appear on its neighbours.")
@@ -100,7 +100,7 @@ func TestARouterRunningEverythingIsHealthy(t *testing.T) {
 	s := &Server{rt: f}
 	s.cfg.Node = "node-0"
 
-	if why := s.brokenBecause(context.Background(), routerWithTwoCables()); why != "" {
+	if why := s.brokenBecause(context.Background(), "cos461", routerWithTwoCables()); why != "" {
 		t.Errorf("a healthy router was reported broken: %q", why)
 	}
 }
@@ -122,7 +122,7 @@ func TestDeadDaemonsAreStartedRatherThanTheDeviceRebuilt(t *testing.T) {
 	if !f.started {
 		t.Error("frrinit.sh was never run")
 	}
-	if why := s.brokenBecause(context.Background(), routerWithTwoCables()); why != "" {
+	if why := s.brokenBecause(context.Background(), "cos461", routerWithTwoCables()); why != "" {
 		t.Errorf("the router is still reported broken after the repair: %q", why)
 	}
 }
@@ -145,12 +145,12 @@ func TestADeviceMissingOneCableIsEventuallyRepaired(t *testing.T) {
 	s.cfg.Node = "node-0"
 
 	for i := 1; i < partialWiringGrace; i++ {
-		if why := s.brokenBecause(context.Background(), routerWithTwoCables()); why != "" {
+		if why := s.brokenBecause(context.Background(), "cos461", routerWithTwoCables()); why != "" {
 			t.Fatalf("survey %d reported the device broken (%q); a deploy in progress "+
 				"would be rewired underneath itself", i, why)
 		}
 	}
-	why := s.brokenBecause(context.Background(), routerWithTwoCables())
+	why := s.brokenBecause(context.Background(), "cos461", routerWithTwoCables())
 	if why == "" {
 		t.Fatal("a device that has been missing an interface across every survey is " +
 			"still reported healthy, so nothing will ever put the cable back")
@@ -169,13 +169,13 @@ func TestADeviceThatRecoversStartsAgain(t *testing.T) {
 	s := &Server{rt: f, partial: map[string]int{}}
 	s.cfg.Node = "node-0"
 
-	s.brokenBecause(context.Background(), routerWithTwoCables())
+	s.brokenBecause(context.Background(), "cos461", routerWithTwoCables())
 	f.links = "lo\nport_BOS\nport_CHI\n"
-	if why := s.brokenBecause(context.Background(), routerWithTwoCables()); why != "" {
+	if why := s.brokenBecause(context.Background(), "cos461", routerWithTwoCables()); why != "" {
 		t.Fatalf("a fully wired device was reported broken: %q", why)
 	}
 	f.links = "lo\nport_BOS\n"
-	if why := s.brokenBecause(context.Background(), routerWithTwoCables()); why != "" {
+	if why := s.brokenBecause(context.Background(), "cos461", routerWithTwoCables()); why != "" {
 		t.Errorf("a device that had recovered and then lost a cable again was reported "+
 			"broken on the first survey (%q); the count should have restarted", why)
 	}

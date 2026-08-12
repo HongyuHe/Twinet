@@ -56,6 +56,7 @@ func newGradeClassCmd(opts *Options) *cobra.Command {
 		converge   time.Duration
 		parallel   int
 		keepLoaded bool
+		skipAttest bool
 		perWave    int
 	)
 	cmd := &cobra.Command{
@@ -135,6 +136,10 @@ The lab must already be deployed with --solve.`,
 			// on which machine a system was placed on. `grade batch` held such
 			// marks for review and this did not, so the mode meant for marking
 			// a class was the one without the check.
+			// Recorded on every report, not only in batch mode. An image tag
+			// is not an identity, and a mark that cannot be traced to the
+			// software that produced it cannot be defended on appeal.
+			classImages := labImages(cmd.Context(), top, token)
 			if bad := imageDisagreements(cmd.Context(), top, token); len(bad) > 0 {
 				return fmt.Errorf("the nodes of this cluster do not agree on what these "+
 					"images are:\n  %s\nA mark would then depend on which machine a "+
@@ -149,6 +154,27 @@ The lab must already be deployed with --solve.`,
 			if bad := unhealthyRouters(cmd.Context(), exec, top); len(bad) > 0 {
 				return notReadyToGrade("router(s) in this lab are not running their "+
 					"routing processes", bad, opts.Manifest)
+			}
+
+			// The lab must actually be the reference solution.
+			//
+			// Interfaces present and routing processes alive is not the same
+			// claim: a lab deployed in platform mode passes both, with every
+			// student system blank. The whole method rests on grading each
+			// submission against a correct internet, and the cheapest way to
+			// know the internet is correct is to mark it -- so it is graded,
+			// and anything short of full marks stops the run.
+			//
+			// It costs about eighty seconds against the forty minutes a class
+			// takes, and it is the difference between marks that mean
+			// something and marks nobody can defend.
+			if !skipAttest {
+				fmt.Fprintf(cmd.ErrOrStderr(),
+					"checking that this lab is the reference solution before grading anybody\n")
+				if err := attestReference(cmd.Context(), top, rubric, exec, converge,
+					parallel, opts.Manifest); err != nil {
+					return err
+				}
 			}
 
 			var waves [][]submission
@@ -246,7 +272,7 @@ The lab must already be deployed with --solve.`,
 				waitWave(cmd.Context(), top, exec, loaded, converge)
 
 				got := gradeWave(cmd.Context(), top, rubric, loaded, exec, converge, parallel,
-					cmd.ErrOrStderr())
+					classImages, cmd.ErrOrStderr())
 
 				// Checked again, after the wave rather than only before it.
 				//
@@ -324,6 +350,9 @@ The lab must already be deployed with --solve.`,
 	cmd.Flags().IntVarP(&parallel, "parallel", "p", 16, "submissions graded concurrently within a wave")
 	cmd.Flags().IntVar(&perWave, "per-wave", 1,
 		"submissions loaded into the lab at once; above 1 trades provable isolation for speed")
+	cmd.Flags().BoolVar(&skipAttest, "skip-reference-check", false,
+		"do not grade the reference solution first; only for a lab you have just checked "+
+			"by hand, since every mark depends on it being correct")
 	cmd.Flags().BoolVar(&keepLoaded, "keep-loaded", false,
 		"leave the final wave's submissions in the lab afterwards, for investigating a "+
 			"disputed mark; earlier waves are still put back")
@@ -460,6 +489,7 @@ func waitWave(ctx context.Context, top *model.Topology, exec execFn,
 
 func gradeWave(ctx context.Context, top *model.Topology, rubric *grade.Rubric,
 	wave []submission, exec execFn, converge time.Duration, parallel int,
+	classImages map[string]string,
 	progress interface{ Write([]byte) (int, error) }) []*grade.Report {
 
 	out := make([]*grade.Report, len(wave))
@@ -479,6 +509,7 @@ func gradeWave(ctx context.Context, top *model.Topology, rubric *grade.Rubric,
 			rep.Submission = s.Group
 			rep.Lab = top.Name
 			rep.Controller = Version
+			rep.Images = classImages
 			out[i] = rep
 
 			mu.Lock()
@@ -572,4 +603,69 @@ func capWaves(waves [][]submission, max int) [][]submission {
 		}
 	}
 	return out
+}
+
+// attestReference grades the lab as it stands and refuses if it is not the
+// reference solution.
+//
+// Every mark a class run produces is a measurement of one submission against
+// the rest of the internet. If the rest of the internet is not the answer, the
+// measurement is of something else, and nothing in the reports would say so:
+// a lab deployed in platform mode has every interface, every routing process
+// and every student system blank, and the preconditions above all pass.
+func attestReference(ctx context.Context, top *model.Topology, rubric *grade.Rubric,
+	exec execFn, converge time.Duration, parallel int, manifest string) error {
+
+	var (
+		mu   sync.Mutex
+		bad  []string
+		wg   sync.WaitGroup
+		sem  = make(chan struct{}, atLeastOne(parallel))
+		seen int
+	)
+	for _, asn := range top.SortedASNs() {
+		as := top.ASes[asn]
+		if as == nil || as.Role != model.RoleStudent {
+			continue
+		}
+		seen++
+		wg.Add(1)
+		go func(asn int) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			rep := grade.Run(ctx, rubric, &grade.Env{Topology: top, AS: asn, Exec: exec},
+				grade.RunOptions{ConvergeTimeout: converge, Parallel: 4})
+			if rep.Total < rubric.MaxTotal() {
+				mu.Lock()
+				bad = append(bad, fmt.Sprintf("AS %d scores %.2f of %.2f",
+					asn, rep.Total, rubric.MaxTotal()))
+				mu.Unlock()
+			}
+		}(asn)
+	}
+	wg.Wait()
+
+	if seen == 0 {
+		return fmt.Errorf("this lab has no student systems to grade")
+	}
+	if len(bad) == 0 {
+		return nil
+	}
+	sort.Strings(bad)
+	return fmt.Errorf("this lab is not the reference solution, so nothing can be graded "+
+		"against it:\n  %s\nEvery mark is a measurement of one submission against the rest "+
+		"of the internet, and if the rest of it is not the answer the measurement is of "+
+		"something else -- with nothing in the reports able to say so.\nRun `twinet deploy "+
+		"-m %s --solve` and check it reported no problems. Pass --skip-reference-check only "+
+		"for a lab you have just checked by hand",
+		strings.Join(bad, "\n  "), manifest)
+}
+
+// atLeastOne keeps a concurrency limit usable when the caller passed zero.
+func atLeastOne(n int) int {
+	if n < 1 {
+		return 1
+	}
+	return n
 }

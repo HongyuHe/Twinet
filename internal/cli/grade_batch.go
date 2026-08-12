@@ -1368,3 +1368,16 @@ func imageDisagreements(ctx context.Context, top *model.Topology, token string) 
 	sort.Strings(bad)
 	return bad
 }
+
+// labImages resolves the digest of every image a lab uses, for the provenance
+// recorded beside a mark.
+func labImages(ctx context.Context, top *model.Topology, token string) map[string]string {
+	if !clustered(top) {
+		return nil
+	}
+	tok, err := tokenFor(token)
+	if err != nil {
+		return nil
+	}
+	return imageDigests(ctx, client.NewCluster(top.Lab, tok), top)
+}

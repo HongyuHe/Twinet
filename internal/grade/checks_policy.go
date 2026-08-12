@@ -447,6 +447,7 @@ type ixpRoute struct {
 // readIXPRoute asks the route server what it has, rather than asking the
 // student's router what it meant to send.
 func readIXPRoute(ctx context.Context, env *Env, rsDevice, prefix string, out *ixpRoute) error {
+	_ = env
 	var raw struct {
 		Prefix       string `json:"prefix"`
 		AdvertisedTo map[string]struct {
@@ -484,9 +485,26 @@ func readIXPRoute(ctx context.Context, env *Env, rsDevice, prefix string, out *i
 	if raw.Prefix == "" || len(raw.Paths) == 0 {
 		return nil
 	}
-	out.present = true
+	// Only the path this AS sent directly.
+	//
+	// The route server may hold several paths to the same prefix -- ours, and
+	// the same prefix relayed onward by other members, which carry *their*
+	// communities. Unioning them meant a system that had stopped announcing
+	// altogether could pass on a neighbour's tags. `rxedFromRsClient` with an
+	// AS path of exactly this AS is the announcement we made.
+	me := strconv.Itoa(env.AS)
 	for _, p := range raw.Paths {
+		if !p.RxedFromRSClient {
+			continue
+		}
+		if strings.TrimSpace(p.ASPath.String) != me {
+			continue
+		}
+		out.present = true
 		out.communities = append(out.communities, p.Community.List...)
+	}
+	if !out.present {
+		return nil
 	}
 	for _, m := range raw.AdvertisedTo {
 		// The route server names each client by hostname, which carries the AS.
@@ -878,18 +896,46 @@ func checkRPKIInvalidRejected(ctx context.Context, env *Env) Result {
 		})
 	}
 
-	// Look for a route-map that acts on the invalid state.
+	// The clause must deny, and it must be attached to a session that brings
+	// routes in from outside.
+	//
+	// Any occurrence of the words "match rpki invalid" used to count -- in a
+	// permit clause, in a route-map nothing applies, in a comment-like
+	// fragment. A hard-coded prefix filter plus an unused clause earned full
+	// credit for policy that never ran.
 	rejects := false
+	var unattached []string
 	for _, r := range env.Routers() {
 		out, err := env.Vtysh(ctx, r.Name, "show running-config")
 		if err != nil {
 			continue
 		}
-		low := strings.ToLower(out)
-		if strings.Contains(low, "match rpki invalid") {
-			rejects = true
+		cfg := parseFRR(out)
+		for _, peer := range cfg.externalNeighbours() {
+			body := cfg.appliedBody(peer, "in")
+			if denyMatches(body, "rpki invalid") {
+				rejects = true
+				break
+			}
+		}
+		if rejects {
 			break
 		}
+		if strings.Contains(strings.ToLower(out), "match rpki invalid") {
+			unattached = append(unattached, r.Name)
+		}
+	}
+	if !rejects && len(unattached) > 0 {
+		sort.Strings(unattached)
+		return Partial("rpki.invalid_rejected", 0.4, Evidence{
+			Expected: "a deny clause matching `rpki invalid`, applied inbound on the sessions " +
+				"that bring routes in from outside",
+			Observed: fmt.Sprintf("%s match on the invalid state, but not in a deny clause "+
+				"applied inbound to an external neighbour", strings.Join(unattached, ", ")),
+			Hint: "a route-map that is not attached to a session does not run; check " +
+				"`neighbor <addr> route-map <name> in`",
+			Command: "show running-config",
+		})
 	}
 	if !rejects {
 		return Partial("rpki.invalid_rejected", 0.4, Evidence{
@@ -1088,12 +1134,13 @@ func roaPrefixes(ctx context.Context, env *Env) (map[string]bool, error) {
 		if err != nil {
 			continue
 		}
-		for _, line := range strings.Split(text, "\n") {
-			for _, f := range strings.Fields(line) {
-				if strings.Count(f, ".") == 3 && strings.Contains(f, "/") {
-					out[f] = true
-				}
-			}
+		// The table prints the address and the prefix length in separate
+		// columns -- "6.0.0.0   8 -   8   6" -- and never as "6.0.0.0/8".
+		// Looking for a slash therefore matched nothing at all, so every
+		// system appeared to have no ROA and the check quietly became a test
+		// that this AS holds a route to every other one.
+		for k := range parseROATable(text) {
+			out[k] = true
 		}
 		return out, nil
 	}
@@ -1383,4 +1430,21 @@ func lineContaining(out, want string) string {
 		}
 	}
 	return ""
+}
+
+// parseROATable reads `show rpki prefix-table` as FRR prints it: the address
+// and the prefix length in separate columns, never joined by a slash.
+func parseROATable(text string) map[string]bool {
+	out := map[string]bool{}
+	for _, line := range strings.Split(text, "\n") {
+		f := strings.Fields(line)
+		if len(f) < 2 || strings.Count(f[0], ".") != 3 {
+			continue
+		}
+		if _, err := strconv.Atoi(f[1]); err != nil {
+			continue
+		}
+		out[f[0]+"/"+f[1]] = true
+	}
+	return out
 }

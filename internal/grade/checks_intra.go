@@ -567,7 +567,14 @@ func checkVLANIsolation(ctx context.Context, env *Env) Result {
 		case hops < 2:
 			fmt.Fprintf(&detail, "%s %s; different VLANs must be separated at layer 2\n",
 				src.Name, describeReach(dst.Name, hops))
-		case first != "" && !deviceHasAddr(gateway, first):
+		case first == "":
+			// A first hop that did not answer is not a first hop that was the
+			// gateway. This fell through to success, so a path through a
+			// silent wrong router scored the point.
+			fmt.Fprintf(&detail, "%s reaches %s across VLANs, but nothing answered at the "+
+				"first hop, so it cannot be shown to have gone through %s\n",
+				src.Name, dst.Name, gateway.Name)
+		case !deviceHasAddr(gateway, first):
 			fmt.Fprintf(&detail, "%s reaches %s across VLANs, but its first hop is %s, "+
 				"which is not %s; traffic between VLANs must be routed by the gateway\n",
 				src.Name, dst.Name, first, gateway.Name)

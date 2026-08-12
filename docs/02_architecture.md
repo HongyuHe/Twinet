@@ -118,8 +118,11 @@ twinet.kind=router         twinet.owner=group12 twinet.node=node-1
 twinet.manifest-hash=9f3c… twinet.role=student  twinet.link-id=…
 ```
 
-`twinet inspect` is a label query fanned out across agents — it needs no local
-files and works from any machine with the manifest. Orphaned veths carry an
+`twinet inspect` renders what the manifest says the lab is -- its devices,
+links, addressing and placement. It reads the manifest, not the cluster: it is
+how you see what *would* be deployed, and `twinet node status` and `twinet
+attach` are how you see what is. (It was described here as a label query fanned
+out across the agents, which it is not.) Orphaned veths carry an
 `altname` derived from the link ID so cleanup is possible even if a container
 died.
 

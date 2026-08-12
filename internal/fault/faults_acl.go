@@ -141,6 +141,19 @@ func injectACL(ctx context.Context, e *Env, t Target, match string) (State, erro
 	before := map[string]int{}
 	for _, c := range chains {
 		before[c] = countACL(ctx, e, t, c, match)
+		// A rule that is already there means this fault changes nothing.
+		//
+		// The count was recorded and not acted on, so injecting onto a device
+		// that already dropped this traffic appended a duplicate, verified
+		// happily -- `iptables -C` finds either copy -- and produced an episode
+		// whose ground truth named a cause that was not the reason anything
+		// was broken. A benchmark is worth nothing if the fault it records was
+		// not the change that caused the symptom.
+		if before[c] > 0 {
+			return nil, fmt.Errorf("%s already has a rule in %s dropping %q, so injecting "+
+				"another would change nothing while claiming to be the cause",
+				t.DeviceID(), c, match)
+		}
 	}
 
 	var installed []string
@@ -167,15 +180,35 @@ func injectACL(ctx context.Context, e *Env, t Target, match string) (State, erro
 
 // countACL counts how many rules in a chain drop this match.
 func countACL(ctx context.Context, e *Env, t Target, chain, match string) int {
+	// Counted by what the rule looks like once installed, not by the text that
+	// installs it.
+	//
+	// A rule added as "-p icmp --icmp-type echo-request" is listed as
+	// "-p icmp -m icmp --icmp-type 8", so searching for the input form matched
+	// nothing: the count was always zero, and the guard that refuses to inject
+	// onto a device already dropping this traffic never fired.
 	out, code := e.Try(ctx, t.DeviceID(),
-		fmt.Sprintf("iptables -w -S %s 2>/dev/null | grep -c -- %s || true",
-			chain, shellQuoteFault(match+" -j DROP")))
+		fmt.Sprintf("iptables -w -S %s 2>/dev/null", chain))
 	if code != 0 {
 		return -1
 	}
-	n, err := strconv.Atoi(strings.TrimSpace(out))
-	if err != nil {
-		return -1
+	want := specTokens(match)
+	n := 0
+	for _, line := range strings.Split(out, "\n") {
+		t := strings.TrimSpace(line)
+		if !strings.HasPrefix(t, "-A ") || !strings.HasSuffix(t, "-j DROP") {
+			continue
+		}
+		all := true
+		for _, w := range want {
+			if !strings.Contains(t, w) {
+				all = false
+				break
+			}
+		}
+		if all {
+			n++
+		}
 	}
 	return n
 }

@@ -254,9 +254,16 @@ func newIncidentRunCmd(opts *Options) *cobra.Command {
 					// Removed from the record only once it is actually gone,
 					// so anything that failed to resolve stays listed and can
 					// be found later.
+					// Removed by identifier, not by name and device.
+					//
+					// A scenario may inject the same fault type on the same
+					// device twice. Matching on those removed whichever record
+					// came first, so resolving one deleted the other's entry --
+					// and if that one then failed to resolve, it was live with
+					// nothing on disk saying so, which is the state this record
+					// exists to make impossible.
 					for j, l := range ledger {
-						if l.Fault == injected[i].Fault &&
-							l.Target.DeviceID() == injected[i].Target.DeviceID() {
+						if l.ID == injected[i].ID {
 							ledger = append(ledger[:j], ledger[j+1:]...)
 							break
 						}
