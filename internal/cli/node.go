@@ -278,6 +278,8 @@ func redeployScopes(ctx context.Context, top *model.Topology, token string, scop
 		Workers:    8,
 		OnlySteps:  only,
 		Generation: time.Now().UTC().Format("20060102T150405.000"),
+		// Grading holds the lab, and this is grading putting a system back.
+		Hold: currentHoldToken(),
 	})
 	for _, r := range results {
 		if r.Err != nil {

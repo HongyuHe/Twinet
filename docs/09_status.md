@@ -170,6 +170,19 @@ checks: making it right means discovering the addresses a submission actually
 used and configuring its neighbours from them. Until it is done, a course using
 Twinet has to prescribe the addressing, which the manifest already does.
 
+### Moving an autonomous system between machines is not atomic
+
+`--rebalance` recomputes placement and now removes each system from the node it
+left. The two halves are still independent: each node applies and prunes for
+itself. If the destination fails and the source succeeds, the system is removed
+from the node that had it; if the destination succeeds and the source fails for
+some unrelated reason, the system runs on both and announces its prefix twice.
+
+Both are recoverable by re-running the deployment, and neither can happen to a
+lab nobody is rebalancing -- but a two-phase commit, creating and confirming
+every destination before pruning any source, is what would make it safe, and it
+is not built.
+
 ### Grading checks that are narrower than their questions
 
 Recorded here rather than implied to be complete:
@@ -219,7 +232,8 @@ things would move it, in the order they are worth doing:
 
 | Metric | Value |
 |---|---|
-| 12-AS lab, 211 containers, 291 links, 3 nodes | 83 s |
+| 12-AS lab, 212 containers, 299 links, 3 nodes (current topology) | **44-58 s** |
+| The same lab as it was measured earlier, at 211 containers and 291 links | 83 s -- superseded; the topology and the deployment path have both changed since |
 | Same lab, single node | not attempted; 4-AS/57-container demo takes 64 s |
 | Cross-node link RTT (25 ms configured) | 50.22 ms, σ 9 µs |
 | Links kept local by AS-granular placement, 84-AS lab | **89.7 %** (302 of 2927 cross) |

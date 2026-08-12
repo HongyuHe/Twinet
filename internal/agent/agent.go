@@ -537,6 +537,10 @@ func (s *Server) handleContainers(w http.ResponseWriter, r *http.Request) {
 
 // ApplyRequest carries the slice of a topology this node is responsible for.
 type ApplyRequest struct {
+	// Hold is the caller's grading-hold token, if it has one. A lab that is
+	// held refuses changes from anybody else.
+	Hold string `json:"hold,omitempty"`
+
 	Topology   *Wire  `json:"topology"`
 	Mode       string `json:"mode"`
 	PullPolicy string `json:"pull_policy"`
@@ -582,6 +586,10 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 	top, err := req.Topology.Rehydrate()
 	if err != nil {
 		httpError(w, http.StatusBadRequest, fmt.Errorf("rehydrate topology: %w", err))
+		return
+	}
+	if why := s.refuseMutationIfHeld(top.Name, req.Hold, "this deployment"); why != "" {
+		httpError(w, http.StatusConflict, errors.New(why))
 		return
 	}
 	if err := s.acquire(top.Name, "apply"); err != nil {
@@ -753,6 +761,9 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 
 // DestroyRequest asks the node to remove a lab.
 type DestroyRequest struct {
+	// Hold is the caller's grading-hold token, if it has one.
+	Hold string `json:"hold,omitempty"`
+
 	Lab  string   `json:"lab"`
 	VNIs []uint32 `json:"vnis,omitempty"`
 	// Force skips the pre-destroy snapshot of student work.
@@ -787,6 +798,10 @@ func (s *Server) handleDestroy(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Lab == "" {
 		httpError(w, http.StatusBadRequest, errors.New("a lab name is required"))
+		return
+	}
+	if why := s.refuseMutationIfHeld(req.Lab, req.Hold, "removing it"); why != "" {
+		httpError(w, http.StatusConflict, errors.New(why))
 		return
 	}
 	if err := s.acquire(req.Lab, "destroy"); err != nil {
@@ -975,6 +990,9 @@ func (s *Server) handleReshape(w http.ResponseWriter, r *http.Request) {
 
 // LifecycleRequest asks the agent to change a container's run state.
 type LifecycleRequest struct {
+	// Hold is the caller's grading-hold token, if it has one.
+	Hold string `json:"hold,omitempty"`
+
 	Container string `json:"container"`
 	// Action is one of state, pause, unpause, stop, start or restart.
 	Action string `json:"action"`
@@ -989,6 +1007,14 @@ func (s *Server) handleLifecycle(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Container == "" || req.Action == "" {
 		httpError(w, http.StatusBadRequest, errors.New("container and action are both required"))
+		return
+	}
+	// Stopping or restarting a container of a lab somebody is grading changes
+	// the marks: a restarted router loses its namespace and comes back with
+	// nothing, and the submission that was about to be measured is gone.
+	if why := s.refuseMutationIfHeld(s.labOfContainer(req.Container), req.Hold,
+		"changing a container's run state"); why != "" {
+		httpError(w, http.StatusConflict, errors.New(why))
 		return
 	}
 	c, err := s.rt.Inspect(r.Context(), req.Container)

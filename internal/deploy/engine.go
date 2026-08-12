@@ -518,9 +518,23 @@ func (e *Engine) captureOrphan(ctx context.Context, top *model.Topology, c runti
 	if e.State == nil {
 		return nil
 	}
+	// Nothing is captured while the reference solution is what is on the
+	// device: the snapshot would be the answer filed as the student's work.
+	if e.WritesReference {
+		return nil
+	}
 	// The device is gone from the topology, so its identity comes from the
 	// labels the deployment stamped on it.
-	id := c.Labels[LabelDevice]
+	//
+	// The *canonical* identifier, not the short name. Every autonomous system
+	// in these labs has a router called ATL, so keying on the name filed
+	// as3/ATL's configuration and as4/ATL's under the same "ATL" -- one
+	// overwriting the other, and neither findable by the identifier a restore
+	// looks up.
+	id := c.Labels[LabelDeviceID]
+	if id == "" {
+		id = c.Labels[LabelDevice]
+	}
 	if id == "" {
 		return nil
 	}

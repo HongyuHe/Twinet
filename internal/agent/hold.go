@@ -172,3 +172,33 @@ func (s *Server) refuseIfHeldByAnother(container, token string) string {
 		"that finishes, because a change made now would land in somebody's marks",
 		lab, h.holder)
 }
+
+// refuseMutationIfHeld reports why an operation on a named lab must be refused,
+// or "" if it may proceed.
+//
+// The hold stopped the repair loop, and then interactive access, and left every
+// other way of changing a lab open. A second `twinet deploy --solve` run by
+// anybody, a destroy, a container restart -- each could overwrite a submission
+// with the reference while it was being marked, and none of them closes the
+// grader's lease, so the run would go on and release the marks.
+//
+// The holder is exempt: grading restores each system between submissions
+// through this same door.
+func (s *Server) refuseMutationIfHeld(lab, token, what string) string {
+	if lab == "" {
+		return ""
+	}
+	s.mu.Lock()
+	h, ok := s.holds[lab]
+	if ok && time.Now().After(h.until) {
+		delete(s.holds, lab)
+		ok = false
+	}
+	s.mu.Unlock()
+	if !ok || h.token == "" || h.token == token {
+		return ""
+	}
+	return fmt.Sprintf("lab %q is being graded by %s, so %s is refused: a change made now "+
+		"would land in somebody's marks with nothing in the report able to say so",
+		lab, h.holder, what)
+}

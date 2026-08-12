@@ -334,7 +334,23 @@ The lab must already be deployed with --solve.`,
 					// still reconverging, and lost marks for it. Waiting here
 					// charges that time to nobody's submission.
 					if !lastWave {
-						waitWave(cmd.Context(), top, exec, restored, converge)
+						// The outcome matters here, unlike after loading.
+						//
+						// A submission that will not converge is a mark; a
+						// *reference* system that will not converge after being
+						// put back is the next student being measured across a
+						// neighbour that is not the answer, and their own
+						// system can look perfectly stable while it happens.
+						if bad := waitWaveErrs(cmd.Context(), top, exec, restored, converge); len(bad) > 0 {
+							contaminated = fmt.Sprintf(
+								"after putting %s back to the reference it did not converge: %s",
+								groupNames(restored), strings.Join(bad, "; "))
+							fmt.Fprintf(cmd.ErrOrStderr(), "\n  %s\n  the remaining waves are "+
+								"held for review\n", contaminated)
+							reports = append(reports,
+								quarantine(waves[i+1:], rubric.MaxTotal(), contaminated)...)
+							break
+						}
 					}
 				}
 			}
@@ -483,6 +499,36 @@ func independentWaves(top *model.Topology, subs []submission) [][]submission {
 }
 
 // waitWave waits for the whole wave's control planes together.
+// waitWaveErrs waits for a wave to converge and says which systems did not.
+//
+// waitWave discards the outcome deliberately: a submission that never
+// converges is a bad mark, not an error. Putting the reference back is the
+// other case, and it needed the answer.
+func waitWaveErrs(ctx context.Context, top *model.Topology, exec execFn,
+	wave []submission, timeout time.Duration) []string {
+
+	var (
+		mu  sync.Mutex
+		bad []string
+		wg  sync.WaitGroup
+	)
+	for _, s := range wave {
+		wg.Add(1)
+		go func(s submission) {
+			defer wg.Done()
+			if err := grade.WaitConverged(ctx,
+				&grade.Env{Topology: top, AS: s.AS, Exec: exec}, timeout); err != nil {
+				mu.Lock()
+				bad = append(bad, fmt.Sprintf("AS %d: %v", s.AS, err))
+				mu.Unlock()
+			}
+		}(s)
+	}
+	wg.Wait()
+	sort.Strings(bad)
+	return bad
+}
+
 func waitWave(ctx context.Context, top *model.Topology, exec execFn,
 	wave []submission, timeout time.Duration) {
 

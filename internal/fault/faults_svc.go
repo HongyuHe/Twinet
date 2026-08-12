@@ -73,6 +73,21 @@ func init() {
 			// there, or one another injection had added -- and report a clean
 			// undo, because the fingerprint compares sets of lines and cannot
 			// see a rule it removed that was never its own.
+			// Nothing may already be dropping these queries.
+			//
+			// Verification asks whether a rule dropping port 53 exists, which
+			// a rule that was already there satisfies -- so injecting onto a
+			// resolver somebody had already firewalled reported success while
+			// changing nothing, and the episode's ground truth named a cause
+			// that was not the reason anything was broken.
+			for _, proto := range []string{"udp", "tcp"} {
+				if n := countACL(ctx, e, t, "INPUT", fmt.Sprintf("-p %s --dport 53", proto)); n > 0 {
+					return nil, fmt.Errorf("%s already drops %s queries to port 53, so this "+
+						"fault would change nothing while claiming to be the cause",
+						t.DeviceID(), proto)
+				}
+			}
+
 			var done []string
 			for _, proto := range []string{"udp", "tcp"} {
 				if _, err := e.Sh(ctx, t.DeviceID(), fmt.Sprintf(

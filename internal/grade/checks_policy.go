@@ -916,7 +916,22 @@ func checkRPKIInvalidRejected(ctx context.Context, env *Env) Result {
 			continue
 		}
 		cfg := parseFRR(out)
-		for _, peer := range cfg.externalNeighbours() {
+		peers := cfg.externalNeighbours()
+		if len(peers) == 0 {
+			continue
+		}
+		// A router that brings routes in from outside needs its own validator
+		// session. Validation state is per router: one with no cache sees
+		// every route as not-found, so an invalid origin arriving there is
+		// accepted and its invalid table is empty -- which the table check
+		// below reads as "nothing invalid was selected". Aggregating the
+		// cache across the AS made one connected router vouch for all of them.
+		if !strings.Contains(out, "rpki cache ") {
+			exposed = append(exposed, r.Name+" (no validator session, so nothing arriving "+
+				"here can be invalid)")
+			continue
+		}
+		for _, peer := range peers {
 			if denyMatches(cfg.appliedBody(peer, "in"), "rpki invalid") {
 				protected = append(protected, r.Name+" "+peer)
 				continue

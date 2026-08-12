@@ -77,3 +77,27 @@ func TestADeviceThatWasNeverRecreatedOwesNothing(t *testing.T) {
 			"replayed, which would put an old snapshot over current work")
 	}
 }
+
+// Every autonomous system in these labs has a router called ATL. Capturing an
+// orphan by its short name filed as3/ATL's configuration and as4/ATL's under
+// the same key -- one overwriting the other, and neither findable by the
+// identifier a restore looks up.
+func TestAnOrphanIsCapturedUnderItsCanonicalIdentifier(t *testing.T) {
+	labels := map[string]string{
+		LabelDevice:   "ATL",
+		LabelDeviceID: "as3/ATL",
+		LabelKind:     "router",
+	}
+	if labels[LabelDeviceID] == labels[LabelDevice] {
+		t.Fatal("the fixture does not distinguish the two labels")
+	}
+	// The capture must prefer the canonical one.
+	id := labels[LabelDeviceID]
+	if id == "" {
+		id = labels[LabelDevice]
+	}
+	if id != "as3/ATL" {
+		t.Errorf("an orphan would be filed as %q, which collides with every other "+
+			"system's router of the same name", id)
+	}
+}

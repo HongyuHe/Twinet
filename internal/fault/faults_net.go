@@ -439,6 +439,17 @@ func init() {
 			if err != nil {
 				return nil, err
 			}
+			// The session must be up before it is broken.
+			//
+			// Verification waits for it to stop being established, which a
+			// session that was never established satisfies immediately -- so
+			// the fault reported success on a peering that was already down
+			// for some other reason, and the recorded cause was not the reason.
+			if out, _ := e.Try(ctx, t.DeviceID(), "vtysh -c 'show bgp summary'"); !peerEstablished(out, peer) {
+				return nil, fmt.Errorf("the session with %s on %s is not established to "+
+					"begin with, so breaking it would change nothing while claiming to be "+
+					"the cause", peer, t.DeviceID())
+			}
 			// Everything the configuration says about this neighbour is
 			// captured first.
 			//

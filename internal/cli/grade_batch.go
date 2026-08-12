@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -147,7 +148,20 @@ mark, unless --keep-labs is given for a dispute.`,
 			fmt.Fprintln(cmd.OutOrStdout())
 			fmt.Fprint(cmd.OutOrStdout(), summary.Text())
 			fmt.Fprintf(cmd.OutOrStdout(), "\nreports written to %s\n", outDir)
-			return releaseGuard(summary, cmd.ErrOrStderr())
+			if err := releaseGuard(summary, cmd.ErrOrStderr()); err != nil {
+				return err
+			}
+			// A harness left behind keeps its containers and its overlay
+			// identifiers. At class scale a handful of those exhaust the
+			// cluster, and every later submission then fails for reasons that
+			// have nothing to do with its author -- so this cannot exit zero.
+			if TeardownFailed() {
+				return fmt.Errorf("the marks are written, but at least one grading harness " +
+					"could not be removed and is still using this cluster's containers and " +
+					"network identifiers; the failures are named above. Remove them with " +
+					"`twinet destroy --lab <name>` before the next run")
+			}
+			return nil
 		},
 	}
 	cmd.Flags().StringVarP(&subDir, "submissions", "s", "submissions", "directory of per-group submissions")
@@ -220,6 +234,7 @@ func gradeOne(ctx context.Context, class *model.Topology, rubric *grade.Rubric,
 		tctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Minute)
 		defer cancel()
 		if err := destroyLab(tctx, c, h); err != nil {
+			teardownFailed.Store(true)
 			// Reported, not discarded. A harness that fails to come down keeps
 			// its containers and its overlay identifiers, and at class scale a
 			// handful of those exhaust the cluster -- after which every later
@@ -1368,6 +1383,16 @@ func imageDisagreements(ctx context.Context, top *model.Topology, token string) 
 	sort.Strings(bad)
 	return bad
 }
+
+// teardownFailed records that a grading harness could not be removed.
+//
+// It was logged and the run exited zero, so a class-scale run could leave a
+// handful of labs consuming the cluster and report success -- after which later
+// submissions fail for reasons that have nothing to do with their authors.
+var teardownFailed atomic.Bool
+
+// TeardownFailed reports whether any harness was left behind.
+func TeardownFailed() bool { return teardownFailed.Load() }
 
 // labImages resolves the digest of every image a lab uses, for the provenance
 // recorded beside a mark.
