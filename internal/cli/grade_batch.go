@@ -481,16 +481,26 @@ func loadFRRConfig(ctx context.Context, exec execFn, d *model.Device, body strin
 	}
 
 	// A daemon that rejected the file exits, and FRR's own start script does
-	// not fail when that happens. Asking vtysh which daemons answered is the
-	// only reliable signal, and it is also the feedback the student needs.
+	// not fail when that happens, so the daemons have to be counted.
+	//
+	// This used to ask `vtysh -c "show version"`, which answers as long as any
+	// one daemon is up. A submission whose OSPF configuration was rejected
+	// therefore loaded successfully with ospfd dead, and was then marked on a
+	// network in which its routers could not learn a route -- against a lab
+	// that looked healthy. Every process the daemons file enables is now
+	// checked by name.
 	res, err = exec(ctx, d.ID, []string{"sh", "-c",
-		"sleep 2; vtysh -c 'show version' >/dev/null 2>&1 && vtysh -c 'show running-config' | head -1"})
+		"sleep 2; for d in " + strings.Join(render.EnabledDaemons(), " ") +
+			"; do pidof \"$d\" >/dev/null 2>&1 || printf '%s ' \"$d\"; done"})
 	if err != nil {
 		return fmt.Errorf("checking that frr came up: %w", err)
 	}
-	if res.ExitCode != 0 {
-		return fmt.Errorf("frr did not come up on the submitted configuration: %s",
-			firstLine(res.Stdout+res.Stderr))
+	if down := strings.Fields(res.Stdout); len(down) > 0 {
+		return fmt.Errorf("frr did not come up on the submitted configuration: %s "+
+			"%s not running, which usually means %s rejected a line of it",
+			strings.Join(down, ", "),
+			map[bool]string{true: "is", false: "are"}[len(down) == 1],
+			map[bool]string{true: "it", false: "they"}[len(down) == 1])
 	}
 	return nil
 }

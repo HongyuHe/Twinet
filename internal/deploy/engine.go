@@ -361,15 +361,58 @@ func (e *Engine) restoreIfNeeded(ctx context.Context, top *model.Topology, d *mo
 	// devices that are not there yet. It is therefore deferred to the configure
 	// stage; this records that it is pending.
 	e.pendingRestore.Store(d.ID, true)
+	e.markRestorePending(ctx, d)
 	return nil
+}
+
+// restoreMarker is written inside a device that has been recreated and not yet
+// had its saved configuration replayed.
+//
+// Pendingness used to live only in a map on the engine, which exists for the
+// length of one request. If the node's agent was restarted, killed by the OOM
+// killer, or simply upgraded between creating a container and configuring it,
+// the fact that a student's configuration was still waiting to be replayed went
+// with it. The next deploy saw a container that existed and nothing marking it,
+// so it converged happily on an empty router. The work was still in the state
+// store, and nothing would ever look for it again.
+//
+// The marker lives where the consequence lives. A container that comes back
+// without its configuration carries the note saying so, so any later deploy
+// finds it, whatever happened to the process that created it.
+const restoreMarker = "/etc/twinet/restore-pending"
+
+func (e *Engine) markRestorePending(ctx context.Context, d *model.Device) {
+	// Best effort: the in-memory marker covers this request, and failing to
+	// write the file must not fail a deployment. What it costs is the ability
+	// to recover from a crash, which is exactly what the in-memory marker
+	// cannot do either.
+	_, _ = e.Runtime.Exec(ctx, d.Container, runtime.ExecCmd{Cmd: []string{"sh", "-c",
+		"mkdir -p /etc/twinet && echo 'this device was recreated and its saved " +
+			"configuration has not been replayed yet' > " + restoreMarker}})
+}
+
+func (e *Engine) clearRestorePending(ctx context.Context, d *model.Device) {
+	_, _ = e.Runtime.Exec(ctx, d.Container, runtime.ExecCmd{
+		Cmd: []string{"rm", "-f", restoreMarker}})
+}
+
+// restoreIsPending reports whether this device still owes a restore, from
+// either the marker this request left or one a previous run left behind.
+func (e *Engine) restoreIsPending(ctx context.Context, d *model.Device) bool {
+	if _, ok := e.pendingRestore.Load(d.ID); ok {
+		return true
+	}
+	res, err := e.Runtime.Exec(ctx, d.Container, runtime.ExecCmd{
+		Cmd: []string{"test", "-f", restoreMarker}})
+	return err == nil && res.ExitCode == 0
 }
 
 // replayPending restores a device's captured configuration if one was pending.
 func (e *Engine) replayPending(ctx context.Context, top *model.Topology, d *model.Device) error {
-	if _, pending := e.pendingRestore.Load(d.ID); !pending {
+	if e.State == nil || !studentOwned(top, d) {
 		return nil
 	}
-	if e.State == nil {
+	if !e.restoreIsPending(ctx, d) {
 		return nil
 	}
 	ok, err := Restore(ctx, e.Runtime, d, top.Name, e.State)
@@ -389,6 +432,7 @@ func (e *Engine) replayPending(ctx context.Context, top *model.Topology, d *mode
 			"as needing one): %w", d.ID, err)
 	}
 	e.pendingRestore.Delete(d.ID)
+	e.clearRestorePending(ctx, d)
 	_ = ok
 	return nil
 }

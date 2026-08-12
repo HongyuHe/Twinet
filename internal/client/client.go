@@ -479,6 +479,28 @@ func (c *Cluster) Apply(ctx context.Context, top *model.Topology, req agent.Appl
 		}
 		return out
 	}
+	// Stamp the image identities before serialising, if the caller has not.
+	//
+	// The container spec hash includes the digest a device's image reference
+	// resolves to, so that rebuilding a tag in place is noticed. Only the
+	// deploy command used to resolve it. Every other caller -- and there are
+	// three, grading's restore between submissions among them -- sent a
+	// topology with the field empty, computed a different hash for containers
+	// that had not changed at all, and so destroyed and recreated every
+	// container in scope.
+	//
+	// Measured on a three-node lab: grading two submissions recreated 89 of
+	// 212 containers, and the next ordinary deploy recreated 172 of them,
+	// because the two callers disagreed permanently. Recreating a container
+	// empties its network namespace, which is why submissions failed to load
+	// with "Cannot find device port_BOS", and leaves it with the image's own
+	// FRR daemons file, which is why routers were found with no bgpd and no
+	// ospfd. Both were blamed on students.
+	//
+	// It is resolved here because this is the one door every deployment goes
+	// through, which is the same reason the version check lives here.
+	c.stampImageIDs(ctx, top)
+
 	wire := agent.Serialise(top)
 	peers := map[string]string{}
 	for _, n := range top.Lab.Placement.Nodes {
@@ -492,6 +514,63 @@ func (c *Cluster) Apply(ctx context.Context, top *model.Topology, req agent.Appl
 		r.PeerUnderlay = peers
 		return n.Apply(ctx, r)
 	})
+}
+
+// stampImageIDs fills in the digest each image reference resolves to, for any
+// device whose identity the caller has not already established.
+//
+// Best effort by design: an image nobody has pulled yet has no digest, and a
+// first deployment must still be possible. What matters is that every caller
+// arrives at the same answer, not that the answer is always known.
+func (c *Cluster) stampImageIDs(ctx context.Context, top *model.Topology) {
+	refs := map[string]bool{}
+	for _, d := range top.Devices {
+		if d.Image != "" && d.ImageID == "" {
+			refs[d.Image] = true
+		}
+	}
+	if len(refs) == 0 {
+		return
+	}
+	list := make([]string, 0, len(refs))
+	for r := range refs {
+		list = append(list, r)
+	}
+	sort.Strings(list)
+
+	// Nodes are asked in a fixed order and the first non-empty answer wins, so
+	// that two callers resolving at the same moment agree even while a pull is
+	// in flight on one node. Whether the nodes agree with each other is a
+	// separate question, checked by the deploy command, which can refuse.
+	seen := map[string]string{}
+	if len(c.Nodes) == 0 {
+		// A lab that runs on this machine alone. Asking the local daemon is
+		// the same question; leaving the field empty here would recreate every
+		// container of a single-node lab on the next deploy, which is the bug
+		// this exists to stop, just on one machine instead of a cluster.
+		d := rt.NewDocker()
+		for _, ref := range list {
+			if id, err := d.ImageDigest(ctx, ref); err == nil {
+				seen[ref] = id
+			}
+		}
+	}
+	for _, n := range c.Nodes {
+		got, err := n.ImageDigests(ctx, list)
+		if err != nil {
+			continue
+		}
+		for ref, id := range got {
+			if id != "" && seen[ref] == "" {
+				seen[ref] = id
+			}
+		}
+	}
+	for _, d := range top.Devices {
+		if d.ImageID == "" {
+			d.ImageID = seen[d.Image]
+		}
+	}
 }
 
 // Destroy removes the lab from every node.
