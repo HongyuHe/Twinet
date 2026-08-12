@@ -88,8 +88,10 @@ the hostname.
 - `twinetd` as a systemd service; `twinet node bootstrap|status`; mTLS.
 - gRPC API and typed client; exec brokering for the gateway.
 - Cross-node VXLAN links (deterministic VNI, static FDB, uniform MTU).
-- `internal/place`: AS-granular bin-packing + cross-node edge minimisation;
-  stable placement; `twinet inspect placement`.
+- `internal/place`: AS-granular partitioning that minimises cross-node edges;
+  stable placement; `twinet inspect placement`. (Not bin-packing: the objective
+  is the cut, not the fit, and calling it bin-packing sends a reader looking for
+  a first-fit-decreasing loop that is not there.)
 - Node sysctls/modules applied automatically.
 - **M3-1 validation task:** confirm `eno2` supports MTU 9000 on all nodes;
   otherwise pin lab MTU to 1450 uniformly.

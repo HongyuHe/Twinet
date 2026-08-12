@@ -274,11 +274,20 @@ Twinet also exposes faults directly, so an incident can be run without NIKA:
 ```bash
 twinet fault list                          # every registered fault type
 twinet fault inject ospf-adjacency-lost    # apply, then verify it manifested
-twinet fault verify ospf-adjacency-lost
+twinet fault verify ospf-adjacency-lost    # is it *still* doing what it claims
 twinet fault resolve ospf-adjacency-lost
 twinet fault status --json                 # what is currently injected
 twinet incident run --scenario incidents/ospf.yaml --agent <endpoint>
 ```
+
+`twinet fault verify` is worth using and easy to overlook. Injection verifies
+once, but a lab runs for a long time afterwards: an interface comes back up, a
+daemon is restarted, a student repairs the thing by accident, a container is
+replaced and the fault goes with it. An evaluation that assumes the fault is
+still present scores an agent's conclusion against a network that no longer has
+the problem — which is worse than having no fault at all, because the episode
+looks valid and its ground truth is wrong. Re-verify before scoring, or on a
+timer for a long-running episode.
 
 An **incident** is the reproducible unit: a lab manifest, a baseline, a set of
 faults, and the ground truth. `twinet incident run` builds the lab, establishes
