@@ -301,15 +301,34 @@ if the manifest that created it is no longer available.`,
 				return nil
 			}
 
-			store, err := localStore(top)
+			// Without a manifest there is no topology, and everything below
+			// used to dereference one. `twinet destroy --lab NAME` -- the one
+			// path the command's own help recommends for a lab whose manifest
+			// is gone -- panicked with a nil pointer before removing anything.
+			//
+			// The containers carry their own identity in their labels, which is
+			// what makes the command possible at all, so the devices are
+			// reconstructed from them and the same preservation guarantee
+			// holds either way.
+			if top == nil {
+				fmt.Fprintf(cmd.ErrOrStderr(),
+					"no manifest, so this removes lab %q from this machine only. "+
+						"A lab spread over a cluster keeps running everywhere else; "+
+						"destroy it with its manifest, or run this on each node.\n", name)
+			}
+			store, err := destroyStore(top)
 			if err != nil {
 				return err
+			}
+			devTop := top
+			if devTop == nil {
+				devTop = topologyFromLabels(name, cs)
 			}
 			eng := &deploy.Engine{Runtime: rt, Node: "local", State: store}
 			// Capture before removing. A destroy that discards a student's
 			// configuration without recording it is unrecoverable, and the
 			// person running it is usually not the person who loses the work.
-			if n, err := eng.CaptureAll(cmd.Context(), top, store); err != nil {
+			if n, err := eng.CaptureAll(cmd.Context(), devTop, store); err != nil {
 				return fmt.Errorf("refusing to destroy %s: its configuration could not be captured first: %w", name, err)
 			} else if n > 0 {
 				fmt.Fprintf(cmd.OutOrStdout(), "captured %d configuration snapshots before destroy\n", n)
@@ -931,4 +950,60 @@ func serviceNameOf(top *model.Topology, device string) string {
 		}
 	}
 	return device
+}
+
+// destroyStore opens the snapshot store to capture into before a destroy.
+//
+// With a manifest that is the store beside it. Without one there is nowhere
+// obvious, so it goes under the working directory -- the alternative was
+// dereferencing a topology that is not there, which is what this command did.
+func destroyStore(top *model.Topology) (*state.Store, error) {
+	if top != nil {
+		return localStore(top)
+	}
+	dir := filepath.Join(".twinet", "state")
+	st, err := state.Open(dir)
+	if err != nil {
+		return nil, fmt.Errorf("open state store %s: %w", dir, err)
+	}
+	return st, nil
+}
+
+// topologyFromLabels reconstructs just enough of a topology to capture what the
+// containers hold, from the labels they carry.
+//
+// It is not the lab: there are no links, and no addresses. It is the set of
+// devices, their kinds and their autonomous systems, which is what capturing
+// configuration needs and all that a container can tell us about itself.
+func topologyFromLabels(lab string, cs []runtime.Container) *model.Topology {
+	top := &model.Topology{
+		Name:    lab,
+		Lab:     &model.Lab{Metadata: model.Meta{Name: lab}},
+		Devices: map[string]*model.Device{},
+		ASes:    map[int]*model.AS{},
+	}
+	for _, c := range cs {
+		id := c.Labels[deploy.LabelDeviceID]
+		if id == "" {
+			continue
+		}
+		asn, _ := strconv.Atoi(c.Labels[deploy.LabelAS])
+		d := &model.Device{
+			ID:        id,
+			Name:      c.Labels[deploy.LabelDevice],
+			Kind:      model.DeviceKind(c.Labels[deploy.LabelKind]),
+			ASN:       asn,
+			Container: c.Name,
+		}
+		top.Devices[id] = d
+		if asn > 0 {
+			as, ok := top.ASes[asn]
+			if !ok {
+				as = &model.AS{ASN: asn}
+				top.ASes[asn] = as
+			}
+			as.Devices = append(as.Devices, d)
+		}
+	}
+	return top
 }
