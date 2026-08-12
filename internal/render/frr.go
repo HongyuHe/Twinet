@@ -424,7 +424,7 @@ func slowLinkPolicy(as *model.AS, rels map[model.Relationship]bool, rpki bool) s
 			continue
 		}
 		up := strings.ToUpper(string(rel))
-		b.WriteString(inboundMap("LP-SLOW-"+up, rel, base[rel]-50, rpki))
+		b.WriteString(inboundMap("LP-SLOW-"+up, rel, base[rel]-slowLinkPenalty, rpki))
 		// The export mirrors the fast neighbour of the same class exactly, and
 		// adds only the prepend. Anything else is filtering: withholding a
 		// prefix from the slow neighbour that the fast one receives removes
@@ -682,12 +682,29 @@ func localPrefFor(rel model.Relationship) int {
 // accepted only what is explicitly valid would black-hole most of the real
 // internet, and a check testing only for rejection would award full marks for
 // exactly that mistake.
+// notFoundPenalty is how much a route with no ROA is deprioritised, and
+// slowLinkPenalty how much a route across a deliberately slow link is. They
+// must differ, or the two policies cancel: see inboundMap.
+const (
+	notFoundPenalty = 25
+	slowLinkPenalty = 50
+)
+
 func inboundMap(name string, rel model.Relationship, pref int, rpki bool) string {
 	var b strings.Builder
 	if rpki {
 		fmt.Fprintf(&b, "route-map %s deny 5\n match rpki invalid\nexit\n", name)
+		// The not-found penalty is smaller than the slow-link one.
+		//
+		// Both were 50, and the two collided: the system this lab deliberately
+		// leaves without a ROA is somebody's *fast* customer, so its routes
+		// arrived at 300-50 while the slow customer's arrived at 300-50 as
+		// well, and the reference solution stopped preferring the fast
+		// neighbour it had just been configured to prefer. Keeping the
+		// penalties different keeps the two answers independent, which is what
+		// the two questions are.
 		fmt.Fprintf(&b, "route-map %s permit 10\n match rpki notfound\n set local-preference %d\n set community 1:%d\nexit\n",
-			name, pref-50, communityFor(rel))
+			name, pref-notFoundPenalty, communityFor(rel))
 	}
 	fmt.Fprintf(&b, "route-map %s permit 20\n set local-preference %d\n set community 1:%d\nexit\n!\n",
 		name, pref, communityFor(rel))

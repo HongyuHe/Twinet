@@ -903,8 +903,13 @@ func checkRPKIInvalidRejected(ctx context.Context, env *Env) Result {
 	// permit clause, in a route-map nothing applies, in a comment-like
 	// fragment. A hard-coded prefix filter plus an unused clause earned full
 	// credit for policy that never ran.
-	rejects := false
-	var unattached []string
+	// Every session that brings routes in from outside, not just one.
+	//
+	// The search stopped at the first protected session, so an AS that guarded
+	// one border router and left the rest accepting invalid origins scored the
+	// same as one that guarded all of them. An invalid route only has to get in
+	// once.
+	var protected, exposed []string
 	for _, r := range env.Routers() {
 		out, err := env.Vtysh(ctx, r.Name, "show running-config")
 		if err != nil {
@@ -912,18 +917,34 @@ func checkRPKIInvalidRejected(ctx context.Context, env *Env) Result {
 		}
 		cfg := parseFRR(out)
 		for _, peer := range cfg.externalNeighbours() {
-			body := cfg.appliedBody(peer, "in")
-			if denyMatches(body, "rpki invalid") {
-				rejects = true
-				break
+			if denyMatches(cfg.appliedBody(peer, "in"), "rpki invalid") {
+				protected = append(protected, r.Name+" "+peer)
+				continue
 			}
+			exposed = append(exposed, r.Name+" "+peer)
 		}
-		if rejects {
-			break
+	}
+	rejects := len(protected) > 0 && len(exposed) == 0
+	var unattached []string
+	if len(exposed) > 0 {
+		sort.Strings(exposed)
+		hint := "a route-map that is not attached to a session does not run; check " +
+			"`neighbor <addr> route-map <name> in` on every external session"
+		score := 0.4
+		if len(protected) > 0 {
+			score = 0.5
+			hint = "some sessions are guarded and some are not; an invalid route only has " +
+				"to arrive on one of them"
 		}
-		if strings.Contains(strings.ToLower(out), "match rpki invalid") {
-			unattached = append(unattached, r.Name)
-		}
+		return Partial("rpki.invalid_rejected", score, Evidence{
+			Expected: "a deny clause matching `rpki invalid`, applied inbound on every " +
+				"session that brings routes in from outside",
+			Observed: fmt.Sprintf("%d of %d external session(s) accept invalid origins",
+				len(exposed), len(exposed)+len(protected)),
+			Detail:  strings.Join(truncate(exposed, 6), "\n"),
+			Hint:    hint,
+			Command: "show running-config",
+		})
 	}
 	if !rejects && len(unattached) > 0 {
 		sort.Strings(unattached)
