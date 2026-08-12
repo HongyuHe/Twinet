@@ -211,13 +211,38 @@ func (r *Registry) Conflicts() []Conflict {
 				}
 				break
 			}
-			if r.isExempt(a.Prefix) || r.isExempt(b.Prefix) {
+			if r.exemptPair(a.Prefix, b.Prefix) {
 				continue
 			}
 			out = append(out, Conflict{A: a, B: b})
 		}
 	}
 	return out
+}
+
+// exemptPair reports whether an overlap between two claims is the intended one.
+//
+// An aggregate exists to contain things, so a claim inside it is not a
+// conflict. But that is the only overlap it excuses. The rule used to be "skip
+// if either side is exempt", which also excused two aggregates overlapping each
+// other -- so an AS given 10.0.0.0/8 and another given 10.0.0.0/9 both
+// validated, and every address in the second AS belonged to the first as well.
+// That is the single worst thing an addressing plan can do, and it was the one
+// overlap the checker was guaranteed not to report.
+func (r *Registry) exemptPair(a, b netip.Prefix) bool {
+	aEx, bEx := r.isExempt(a), r.isExempt(b)
+	switch {
+	case aEx && bEx:
+		// Two aggregates. Always a conflict: neither is inside the other by
+		// arrangement, and if one is, the arrangement is the mistake.
+		return false
+	case aEx:
+		return a.Bits() < b.Bits() || a == b
+	case bEx:
+		return b.Bits() < a.Bits() || a == b
+	default:
+		return false
+	}
 }
 
 func (r *Registry) isExempt(p netip.Prefix) bool {

@@ -2,6 +2,7 @@ package ipam
 
 import (
 	"net/netip"
+	"strings"
 	"testing"
 )
 
@@ -158,4 +159,51 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// An aggregate exists to contain things, so a subnet inside it is not a
+// conflict. That is the only overlap it excuses.
+//
+// The rule used to be "skip the pair if either side is exempt", which also
+// excused two aggregates overlapping each other. So an autonomous system given
+// 10.0.0.0/8 and another given 10.0.0.0/9 both validated, and every address in
+// the second belonged to the first as well — the single worst thing an
+// addressing plan can do, and the one overlap the checker was guaranteed not to
+// report.
+func TestTwoAutonomousSystemsCannotShareAddressSpace(t *testing.T) {
+	r := NewRegistry()
+	one := netip.MustParsePrefix("10.0.0.0/8")
+	two := netip.MustParsePrefix("10.0.0.0/9")
+	r.Exempt(one)
+	r.Claim(one, "AS 1 aggregate", "as_block")
+	r.Exempt(two)
+	r.Claim(two, "AS 2 aggregate", "as_block")
+
+	c := r.Conflicts()
+	if len(c) == 0 {
+		t.Fatal("two autonomous systems were given overlapping address space and " +
+			"nothing said so.\nEvery address in the second belongs to the first as " +
+			"well, so routes for one are routes for the other and the lab cannot " +
+			"work — while both manifests validate cleanly.")
+	}
+	if !strings.Contains(c[0].String(), "AS 1") || !strings.Contains(c[0].String(), "AS 2") {
+		t.Errorf("the conflict does not name both autonomous systems: %s", c[0])
+	}
+}
+
+// And a subnet inside its own AS's aggregate must still be silent, or every
+// real lab fails to validate.
+func TestASubnetInsideItsOwnAggregateIsNotAConflict(t *testing.T) {
+	r := NewRegistry()
+	agg := netip.MustParsePrefix("10.0.0.0/8")
+	r.Exempt(agg)
+	r.Claim(agg, "AS 1 aggregate", "as_block")
+	r.Claim(netip.MustParsePrefix("10.0.1.0/24"), "link as1/A-as1/B", "intra_as")
+	r.Claim(netip.MustParsePrefix("10.0.2.0/24"), "link as1/B-as1/C", "intra_as")
+
+	if c := r.Conflicts(); len(c) != 0 {
+		t.Fatalf("a subnet inside its own aggregate was reported as a conflict: %v.\n"+
+			"That is what the aggregate is for, and a check that refuses every real "+
+			"lab gets switched off.", c)
+	}
 }
