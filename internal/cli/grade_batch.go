@@ -859,3 +859,51 @@ func readSubmissions(dir string, class *model.Topology) ([]submission, error) {
 // grading engine expects, so a harness and the shared lab are graded by exactly
 // the same code path.
 type execFn = func(ctx context.Context, deviceID string, cmd []string) (rt.ExecResult, error)
+
+// unhealthyRouters names the routers that are not running the routing
+// processes the lab gave them, with what each is missing.
+//
+// It is the precondition for grading anybody. A router with no ospfd has no
+// symptom of its own: it simply stops answering, and what shows up is its
+// *neighbours* failing to converge -- so the marks land on students whose work
+// is correct, naming an autonomous system that is not the one at fault. That
+// has happened three times during development, and each time it cost hours,
+// because every configuration involved was right.
+//
+// Checking 212 routers costs a few seconds. Grading a class against a broken
+// lab costs an hour and produces marks that have to be thrown away.
+func unhealthyRouters(ctx context.Context, exec execFn, top *model.Topology) []string {
+	var (
+		mu  sync.Mutex
+		bad []string
+		wg  sync.WaitGroup
+	)
+	sem := make(chan struct{}, 32)
+	script := "miss=''; for p in " + strings.Join(render.EnabledDaemons(), " ") +
+		"; do pidof \"$p\" >/dev/null 2>&1 || miss=\"$miss $p\"; done; echo \"$miss\""
+	for _, d := range top.SortedDevices() {
+		if d.Kind != model.KindRouter {
+			continue
+		}
+		wg.Add(1)
+		go func(d *model.Device) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			res, err := exec(ctx, d.ID, []string{"sh", "-c", script})
+			if err != nil || res.ExitCode != 0 {
+				// Unreachable is a different problem, and reporting it here as
+				// a dead daemon would send someone looking in the wrong place.
+				return
+			}
+			if missing := strings.TrimSpace(res.Stdout); missing != "" {
+				mu.Lock()
+				bad = append(bad, d.ID+" ("+missing+")")
+				mu.Unlock()
+			}
+		}(d)
+	}
+	wg.Wait()
+	sort.Strings(bad)
+	return bad
+}

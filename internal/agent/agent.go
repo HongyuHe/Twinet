@@ -131,6 +131,9 @@ type Server struct {
 	// -- and a single slot would make each new deployment forget the previous
 	// one, so a later destroy could no longer capture the work it holds.
 	current map[string]*model.Topology
+	// modes records what each lab was applied as, so a repair rebuilds what
+	// the lab is rather than what it started as.
+	modes map[string]string
 	// peers records the VTEP address of every other node, per lab, so that a
 	// cross-node link can be rebuilt without waiting for the controller to
 	// send the map again.
@@ -216,6 +219,10 @@ func (s *Server) rehydrate() {
 			continue
 		}
 		s.current[top.Name] = top
+		if s.modes == nil {
+			s.modes = map[string]string{}
+		}
+		s.modes[top.Name] = wt.Mode
 		if wt.PeerUnderlay != nil {
 			if s.peers == nil {
 				s.peers = map[string]map[string]string{}
@@ -589,6 +596,10 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 	// would try to capture student work from containers that did not exist.
 	if !req.DryRun {
 		s.current[top.Name] = top
+		if s.modes == nil {
+			s.modes = map[string]string{}
+		}
+		s.modes[top.Name] = req.Mode
 	}
 	if s.peers == nil {
 		s.peers = map[string]map[string]string{}
@@ -609,6 +620,7 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		// a cross-node link without the controller.
 		wt := req.Topology
 		wt.PeerUnderlay = req.PeerUnderlay
+		wt.Mode = req.Mode
 		if raw, err := json.Marshal(wt); err == nil {
 			if err := s.store.PutTopology(top.Name, raw); err != nil {
 				slog.Warn("recording the applied topology", "lab", top.Name, "err", err)

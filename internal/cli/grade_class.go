@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -114,6 +115,24 @@ The lab must already be deployed with --solve.`,
 			}
 			if parallel <= 0 {
 				parallel = 16
+			}
+
+			// Nobody is graded against a lab that is not working.
+			if bad := unhealthyRouters(cmd.Context(), exec, top); len(bad) > 0 {
+				shown := bad
+				if len(shown) > 8 {
+					shown = shown[:8]
+				}
+				return fmt.Errorf("%d router(s) in this lab are not running their routing "+
+					"processes, so nothing can be graded against it yet:\n  %s%s\n"+
+					"A router with no routing process has no symptom of its own -- its "+
+					"neighbours fail to converge, and the marks land on students whose work "+
+					"is correct.\nRun `twinet deploy -m %s --solve` to start them, and note "+
+					"that a node busy with something else refuses the deploy, so check that "+
+					"it reported no problems before grading",
+					len(bad), strings.Join(shown, "\n  "),
+					map[bool]string{true: fmt.Sprintf("\n  ... and %d more", len(bad)-len(shown))}[len(bad) > len(shown)],
+					opts.Manifest)
 			}
 
 			var waves [][]submission

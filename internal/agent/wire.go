@@ -31,6 +31,13 @@ type Wire struct {
 	// must be able to do: a container that restarts at three in the morning
 	// cannot wait for a controller to come round again.
 	PeerUnderlay map[string]string `json:"peer_underlay,omitempty"`
+	// Mode is what the lab was applied as, "platform" or "solve".
+	//
+	// The node has to remember it. Its repair loop re-renders a device that
+	// has lost its wiring, and re-rendering in platform mode a lab that was
+	// deployed solved deletes the reference solution from that router --
+	// quietly, as a side effect of a repair that reports success.
+	Mode string `json:"mode,omitempty"`
 	// LabSpec is the manifest itself, carried whole.
 	//
 	// Reconstructing a minimal Lab on the far side and copying across the few

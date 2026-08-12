@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"strings"
 	"time"
@@ -127,17 +128,39 @@ func (s *Server) repairLab(ctx context.Context, top *model.Topology, broken []*m
 	// below, so it was never revisited. A restarted router stayed broken
 	// forever while the logs said it had been repaired.
 	//
-	// Platform mode, never solve: this rebuilds what Twinet owns. Anything the
-	// student wrote comes back from the snapshot store instead, which is the
-	// only copy of it that exists.
+	// Rendered in whatever mode the lab was applied with.
+	//
+	// It was always platform mode, on the reasoning that anything a student
+	// wrote comes back from the snapshot store. That is right for a teaching
+	// lab and wrong for a lab deployed at the reference, which is what every
+	// grading run uses: repairing one router there re-rendered it without the
+	// reference solution, so a class was graded against a network in which
+	// some systems had quietly stopped being the answer they were meant to be.
+	// Nothing reported it, because the repair itself succeeded.
+	s.mu.Lock()
+	mode := s.modes[top.Name]
+	s.mu.Unlock()
 	eng := &deploy.Engine{
 		Runtime: s.rt, Node: s.cfg.Node, State: s.store,
-		Renderer:     render.New(top, render.ModePlatform),
+		Renderer:     render.New(top, render.Mode(mode)),
 		UnderlayIP:   s.cfg.UnderlayIP,
 		UnderlayDev:  s.cfg.UnderlayDev,
 		PeerUnderlay: s.peerUnderlay(top.Name),
 	}
 	for _, d := range broken {
+		// A router whose cables are all present and whose daemons have died
+		// needs the daemons started, not the device rebuilt. Rewiring it would
+		// re-render its configuration in platform mode, which in a lab
+		// deployed at the reference throws the reference solution away -- a
+		// far worse outcome than the fault being repaired.
+		if why := s.brokenBecause(ctx, d); strings.HasPrefix(why, daemonsDown) {
+			if err := s.startDaemons(ctx, d); err != nil {
+				slog.Error("routing daemons could not be started", "device", d.ID, "err", err)
+				continue
+			}
+			slog.Info("routing daemons restarted", "device", d.ID)
+			continue
+		}
 		if err := eng.RewireDevice(ctx, top, d); err != nil {
 			slog.Error("rewiring failed", "device", d.ID, "err", err)
 			continue
@@ -157,6 +180,25 @@ func (s *Server) repairLab(ctx context.Context, top *model.Topology, broken []*m
 		}
 		slog.Info("device repaired and its configuration put back", "device", d.ID)
 	}
+}
+
+// daemonsDown prefixes the reason a router is broken when the only thing wrong
+// with it is that its routing processes are not running. The repair for that is
+// to start them, not to rewire the device, so the two cases are told apart.
+const daemonsDown = "these routing daemons are not running:"
+
+// missingDaemons names the routing processes a router should be running and is
+// not, or "" when they are all there.
+func (s *Server) missingDaemons(ctx context.Context, d *model.Device) string {
+	script := "miss=''; for p in " + strings.Join(render.EnabledDaemons(), " ") +
+		"; do pidof \"$p\" >/dev/null 2>&1 || miss=\"$miss $p\"; done; echo \"$miss\""
+	r, err := s.rt.Exec(ctx, d.Container, rt.ExecCmd{Cmd: []string{"sh", "-c", script}})
+	if err != nil || r.ExitCode != 0 {
+		// Not reachable is not the same as not running, and guessing here
+		// would have the loop rewiring devices because a node was busy.
+		return ""
+	}
+	return strings.TrimRight(strings.TrimLeft(r.Stdout, " "), " \n")
 }
 
 // hasLostItsWiring reports whether a running container is missing something the
@@ -215,13 +257,17 @@ func (s *Server) brokenBecause(ctx context.Context, d *model.Device) string {
 	}
 
 	// The interfaces are there. A router still needs its daemons: after a
-	// restart the namespace is new and FRR is not running in it, and vtysh
-	// cannot reach anything.
+	// restart the namespace is new and FRR is not running in it.
+	//
+	// Each daemon is asked for by name. This used to run `vtysh -c "show
+	// version"`, which answers as long as *any* daemon is up -- so a router
+	// with zebra alive and ospfd and bgpd dead was reported healthy and never
+	// looked at again. Thirty-odd routers were found in exactly that state,
+	// and the only symptom was students being marked down for neighbours that
+	// had no routing process.
 	if d.Kind == model.KindRouter {
-		if r, err := s.rt.Exec(ctx, d.Container, rt.ExecCmd{
-			Cmd: []string{"sh", "-c", "vtysh -c 'show version' >/dev/null 2>&1 && echo up"}}); err == nil &&
-			!strings.Contains(r.Stdout, "up") {
-			return "its routing daemons are not answering"
+		if missing := s.missingDaemons(ctx, d); missing != "" {
+			return daemonsDown + missing
 		}
 	}
 	if d.Kind == model.KindSwitch {
@@ -239,4 +285,24 @@ func (s *Server) peerUnderlay(lab string) map[string]string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.peers[lab]
+}
+
+// startDaemons brings FRR back up on a router whose processes have died.
+//
+// Safe on a student's router because FRR reads its configuration from the file
+// it was given, so starting a dead daemon restores what was there rather than
+// replacing it.
+func (s *Server) startDaemons(ctx context.Context, d *model.Device) error {
+	script := strings.Join([]string{
+		"for p in $(ps -ef | awk '/watchfrr/ && !/awk/ {print $1}'); do kill $p 2>/dev/null || true; done",
+		"rm -f /var/run/frr/*.pid /var/run/frr/*.vty 2>/dev/null || true",
+		"/usr/lib/frr/frrinit.sh start >/dev/null 2>&1 || true",
+	}, "\n")
+	if _, err := s.rt.Exec(ctx, d.Container, rt.ExecCmd{Cmd: []string{"sh", "-c", script}}); err != nil {
+		return err
+	}
+	if missing := s.missingDaemons(ctx, d); missing != "" {
+		return fmt.Errorf("still not running:%s", missing)
+	}
+	return nil
 }
