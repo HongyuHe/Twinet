@@ -187,3 +187,25 @@ func runningConfigs(ctx context.Context, env *Env) (map[string]string, error) {
 	}
 	return cfgs, nil
 }
+
+// asPathListLen counts the terms of a named AS-path access-list.
+//
+// A route-map that matches a list nobody defined, or one with no terms, never
+// matches anything -- and the check that only looked for the words "match
+// as-path" gave full marks for exactly that.
+func (c *frrConfig) asPathListLen(name string) int {
+	n := 0
+	for _, line := range strings.Split(c.raw, "\n") {
+		f := strings.Fields(strings.TrimSpace(line))
+		// bgp as-path access-list NAME seq N permit|deny REGEX
+		if len(f) >= 5 && f[0] == "bgp" && f[1] == "as-path" && f[2] == "access-list" && f[3] == name {
+			n++
+			continue
+		}
+		// ip as-path access-list NAME permit|deny REGEX
+		if len(f) >= 5 && f[0] == "ip" && f[1] == "as-path" && f[2] == "access-list" && f[3] == name {
+			n++
+		}
+	}
+	return n
+}

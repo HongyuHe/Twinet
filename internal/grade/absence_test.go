@@ -28,7 +28,7 @@ func twoRouterAS() *model.Topology {
 // what vtysh does when FRR is not running: the container is reachable, so this
 // is not an infrastructure failure and the central tracker will not catch it.
 func execFunc(reply map[string]string) func(context.Context, string, []string) (rt.ExecResult, error) {
-	return func(_ context.Context, deviceID string, _ []string) (rt.ExecResult, error) {
+	return func(_ context.Context, deviceID string, cmd []string) (rt.ExecResult, error) {
 		name := deviceID
 		if i := strings.LastIndexByte(deviceID, '/'); i >= 0 {
 			name = deviceID[i+1:]
@@ -36,6 +36,19 @@ func execFunc(reply map[string]string) func(context.Context, string, []string) (
 		out, ok := reply[name]
 		if !ok {
 			return rt.ExecResult{ExitCode: 1, Stderr: "Exiting: failed to connect to any daemons."}, nil
+		}
+		// A router that answers answers every question. The checks read tables
+		// as well as configuration, and a fixture that returns the running
+		// configuration to `show ip bgp json` makes a check look broken when it
+		// is the fixture that is silent.
+		body := strings.Join(cmd, " ")
+		switch {
+		case strings.Contains(body, "bgp json"), strings.Contains(body, "bgp ipv4 unicast json"):
+			return rt.ExecResult{Stdout: `{"routes":{}}`}, nil
+		case strings.Contains(body, "show ip route"):
+			return rt.ExecResult{Stdout: "{}"}, nil
+		case strings.Contains(body, "rpki prefix-table"):
+			return rt.ExecResult{Stdout: "RPKI/RTR prefix table\n"}, nil
 		}
 		return rt.ExecResult{ExitCode: 0, Stdout: out}, nil
 	}

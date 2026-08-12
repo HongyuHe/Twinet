@@ -84,9 +84,11 @@ questions:
     depends_on: [q2.1]
     checks:
       - check: bgp.ebgp_established
-        weight: 0.5
+        weight: 0.4
+      - check: bgp.next_hop_self
+        weight: 0.2
       - check: bgp.own_prefix_only
-        weight: 0.5
+        weight: 0.4
 
   - id: q2.3
     title: Business relationships

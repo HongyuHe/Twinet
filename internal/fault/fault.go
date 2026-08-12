@@ -391,8 +391,13 @@ func Inject(ctx context.Context, env *Env, name string, t Target) (*Injection, e
 		base = fingerprint(ctx, env, t.DeviceID())
 	}
 
+	// Marked before the fault goes in, so the nodes' repair loop cannot see a
+	// broken device in the window between breaking it and recording why.
+	markInjected(ctx, env, t.DeviceID(), name)
+
 	state, err := f.Inject(ctx, env, t)
 	if err != nil {
+		clearInjected(ctx, env, t.DeviceID(), name)
 		return nil, fmt.Errorf("inject %s: %w", name, err)
 	}
 	if base != "" {
@@ -420,6 +425,7 @@ func Inject(ctx context.Context, env *Env, name string, t Target) (*Injection, e
 			return inj, fmt.Errorf("inject %s: verification failed (%w) and rollback also failed (%v)",
 				name, err, rerr)
 		}
+		clearInjected(ctx, env, t.DeviceID(), name)
 		return nil, fmt.Errorf("inject %s: could not verify it took effect, so it was rolled back: %w", name, err)
 	}
 	inj.Evidence = ev
@@ -428,6 +434,7 @@ func Inject(ctx context.Context, env *Env, name string, t Target) (*Injection, e
 			return inj, fmt.Errorf("inject %s: did not take effect (%s) and rollback failed (%v)",
 				name, ev.Detail, rerr)
 		}
+		clearInjected(ctx, env, t.DeviceID(), name)
 		return nil, fmt.Errorf("inject %s: it did not take effect, so it was rolled back: %s", name, ev.Detail)
 	}
 	return inj, nil
@@ -504,6 +511,11 @@ func Resolve(ctx context.Context, env *Env, inj *Injection) error {
 				inj.Fault, inj.Target.DeviceID(), r, alsoFailed(undoErr))
 		}
 	}
+	// The fault is gone and the device is as it was found, so the nodes may
+	// look after it again. Cleared last: while any doubt remained, the device
+	// was better left exempt than repaired by something that does not know
+	// what it is looking at.
+	clearInjected(ctx, env, inj.Target.DeviceID(), inj.Fault)
 	return nil
 }
 

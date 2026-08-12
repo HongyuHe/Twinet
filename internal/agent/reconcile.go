@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/HongyuHe/twinet/internal/deploy"
+	"github.com/HongyuHe/twinet/internal/fault"
 	"github.com/HongyuHe/twinet/internal/model"
 	"github.com/HongyuHe/twinet/internal/render"
 	rt "github.com/HongyuHe/twinet/internal/runtime"
@@ -245,6 +246,18 @@ func (s *Server) brokenBecause(ctx context.Context, d *model.Device) string {
 	}
 	c, err := s.rt.Inspect(ctx, d.Container)
 	if err != nil || !c.State.Joinable() {
+		return ""
+	}
+	// A device that was broken on purpose is not a device to repair.
+	//
+	// Stopping a routing daemon is a supported fault, and this loop restarted
+	// it within the minute -- so a diagnosis episode left open for an agent to
+	// work on lost its fault while the recorded ground truth went on saying it
+	// was live, and every answer graded against that truth was wrong. The mark
+	// is written by the injector and removed when the fault is resolved, so it
+	// lasts exactly as long as the fault does.
+	if r, err := s.rt.Exec(ctx, d.Container, rt.ExecCmd{
+		Cmd: []string{"test", "-f", fault.InjectedMarker}}); err == nil && r.ExitCode == 0 {
 		return ""
 	}
 

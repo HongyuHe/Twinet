@@ -2,6 +2,7 @@ package grade
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strconv"
@@ -263,66 +264,282 @@ func checkIXPCommunities(ctx context.Context, env *Env) Result {
 		})
 	}
 
-	// (i) Communities must be set on what leaves towards the route server.
-	// A "set community" anywhere else changes nothing the exchange can see.
-	outbound := cfg.appliedBody(ixpPeer, "out")
+	// (i) What the exchange actually did with our announcement.
+	//
+	// Reading the configuration was not enough, and saying so cost a point of
+	// nothing: any `set community 140:...` outbound and any `match as-path`
+	// inbound passed, so `set community 140:999` -- naming a member that does
+	// not exist -- and a route-map matching an empty AS-path list scored full
+	// marks for policy that does nothing at all.
+	//
+	// The route server is the authority here. It holds what we sent it, the
+	// communities that survived our outbound policy, and the list of members it
+	// relayed the route to. None of that can be produced by configuration that
+	// is not attached to the session.
+	members := ixpMembers(env.Topology, ixp)
+	own := as.Block
+	rs, rsOK := routeServerDevice(env.Topology, ixp)
+	if !rsOK {
+		return Errored("policy.ixp_communities",
+			fmt.Errorf("the route server of exchange %d is not in the lab", ixp))
+	}
+
+	var seen ixpRoute
+	relayErr := readIXPRoute(ctx, env, rs.ID, own, &seen)
+	if relayErr != nil {
+		return Errored("policy.ixp_communities", relayErr)
+	}
+	if !seen.present {
+		return Fail("policy.ixp_communities", Evidence{
+			Expected: fmt.Sprintf("the exchange to hold %s, learned from AS %d", own, env.AS),
+			Observed: "the route server has no route to it from this AS",
+			Hint:     "the exchange can only relay an announcement it has been sent",
+			Command:  fmt.Sprintf("show bgp ipv4 unicast %s json (on the route server)", own),
+		})
+	}
+
 	prefix := strconv.Itoa(ixp) + ":"
-	var tagged []string
-	for _, line := range strings.Split(outbound, "\n") {
-		t := strings.TrimSpace(line)
-		if !strings.HasPrefix(t, "set community") {
+	var tagged, strangers []string
+	for _, c := range seen.communities {
+		if !strings.HasPrefix(c, prefix) {
 			continue
 		}
-		for _, f := range strings.Fields(t) {
-			if strings.HasPrefix(f, prefix) {
-				tagged = append(tagged, f)
-			}
+		asn, err := strconv.Atoi(strings.TrimPrefix(c, prefix))
+		if err != nil {
+			strangers = append(strangers, c)
+			continue
 		}
+		if !members[asn] {
+			strangers = append(strangers, c)
+			continue
+		}
+		tagged = append(tagged, c)
 	}
 	sort.Strings(tagged)
 	tagged = uniq(tagged)
+	sort.Strings(strangers)
 
 	// (ii) The in-region filter must be applied to what arrives from the
-	// route server, and must actually match on AS path.
+	// route server, and the list it matches on must exist and select something.
 	inbound := cfg.appliedBody(ixpPeer, "in")
-	filters := strings.Contains(inbound, "match as-path")
+	filters := false
+	var emptyList string
+	for _, name := range asPathMatches(inbound) {
+		if n := cfg.asPathListLen(name); n > 0 {
+			filters = true
+		} else {
+			emptyList = name
+		}
+	}
 
 	unapplied := ""
-	if len(tagged) == 0 && strings.Contains(out, "set community "+prefix) {
-		unapplied = fmt.Sprintf("a route-map sets %s<member> but it is not applied outbound to %s", prefix, ixpPeer)
-	} else if !filters && strings.Contains(out, "match as-path") {
+	switch {
+	case len(tagged) == 0 && len(strangers) > 0:
+		unapplied = fmt.Sprintf("the announcement carries %s, which name%s no member of "+
+			"exchange %d, so the exchange relayed it to nobody",
+			strings.Join(strangers, " "),
+			map[bool]string{true: "s", false: ""}[len(strangers) == 1], ixp)
+	case len(tagged) == 0 && strings.Contains(out, "set community "+prefix):
+		unapplied = fmt.Sprintf("a route-map sets %s<member> but it is not applied outbound to %s",
+			prefix, ixpPeer)
+	case !filters && emptyList != "":
+		unapplied = fmt.Sprintf("the inbound route-map matches AS-path list %q, which has "+
+			"no terms, so it never matches anything", emptyList)
+	case !filters && strings.Contains(out, "match as-path"):
 		unapplied = fmt.Sprintf("an AS-path filter exists but is not applied inbound from %s", ixpPeer)
+	}
+
+	// The exchange relays to exactly the members named. Anything else means the
+	// communities are not doing what the question asks.
+	relayed := make([]string, 0, len(seen.advertisedTo))
+	for _, asn := range seen.advertisedTo {
+		relayed = append(relayed, prefix+strconv.Itoa(asn))
+	}
+	sort.Strings(relayed)
+	relayed = uniq(relayed)
+
+	// The exchange relaying it to nobody is the whole failure, however the
+	// configuration reads. A route tagged only with values that name no member
+	// -- `set community 140:999` is the obvious one -- leaves the announcement
+	// sitting in the route server reaching no one, and the earlier version of
+	// this check called that full marks because the words were present.
+	if len(seen.advertisedTo) == 0 {
+		return Fail("policy.ixp_communities", Evidence{
+			Expected: fmt.Sprintf("the exchange to relay %s to the members named in its communities", own),
+			Observed: fmt.Sprintf("the exchange holds it but relayed it to no member at all%s",
+				map[bool]string{true: "", false: " (communities on it: " + strings.Join(seen.communities, " ") + ")"}[len(seen.communities) == 0]),
+			Hint: fmt.Sprintf("the exchange relays to member X only if the announcement carries %s%s, "+
+				"and only members of this exchange count", prefix, "X"),
+			Detail:  unapplied,
+			Command: fmt.Sprintf("show bgp ipv4 unicast %s json (on the route server)", own),
+		})
 	}
 
 	switch {
 	case len(tagged) > 0 && filters:
 		return Pass("policy.ixp_communities", Evidence{
-			Observed: fmt.Sprintf("tags %d exchange communities towards %s and filters arrivals on AS path",
-				len(tagged), ixpPeer),
-			Detail: strings.Join(tagged, " "),
+			Observed: fmt.Sprintf("the exchange holds %s from this AS tagged %s and relayed it "+
+				"to %d member(s); arrivals are filtered on AS path",
+				own, strings.Join(tagged, " "), len(seen.advertisedTo)),
+			Detail:  "relayed to " + strings.Join(relayed, " "),
+			Command: fmt.Sprintf("show bgp ipv4 unicast %s json (on the route server)", own),
 		})
 	case len(tagged) > 0:
 		return Partial("policy.ixp_communities", 0.5, Evidence{
 			Expected: "communities set for out-of-region members, and in-region announcements refused",
-			Observed: fmt.Sprintf("communities set (%s) but no AS-path filter is applied inbound from %s",
+			Observed: fmt.Sprintf("the exchange sees %s but nothing filters arrivals from %s on AS path",
 				strings.Join(tagged, " "), ixpPeer),
 			Hint:    "part (ii) asks you to deny announcements whose path contains an in-region AS",
 			Detail:  unapplied,
 			Command: "show running-config",
 		})
 	default:
-		obs := "none set on the session with the route server"
+		obs := "the exchange sees no member communities on our announcement"
 		if unapplied != "" {
 			obs = unapplied
 		}
 		return Fail("policy.ixp_communities", Evidence{
-			Expected: fmt.Sprintf("community values of the form %s<member>, set outbound towards %s", prefix, ixpPeer),
+			Expected: fmt.Sprintf("community values of the form %s<member>, on what the exchange receives from us", prefix),
 			Observed: obs,
 			Hint: fmt.Sprintf("the exchange relays an announcement to member X only if it carries %s%s",
 				prefix, "X"),
-			Command: "show running-config",
+			Command: fmt.Sprintf("show bgp ipv4 unicast %s json (on the route server)", own),
 		})
 	}
+}
+
+// ixpRoute is what the exchange's route server holds for one prefix.
+type ixpRoute struct {
+	present      bool
+	communities  []string
+	advertisedTo []int
+}
+
+// readIXPRoute asks the route server what it has, rather than asking the
+// student's router what it meant to send.
+func readIXPRoute(ctx context.Context, env *Env, rsDevice, prefix string, out *ixpRoute) error {
+	var raw struct {
+		Prefix       string `json:"prefix"`
+		AdvertisedTo map[string]struct {
+			Hostname string `json:"hostname"`
+		} `json:"advertisedTo"`
+		Paths []struct {
+			RxedFromRSClient bool `json:"rxedFromRsClient"`
+			Community        struct {
+				List []string `json:"list"`
+			} `json:"community"`
+			ASPath struct {
+				String string `json:"string"`
+			} `json:"aspath"`
+		} `json:"paths"`
+	}
+	res, err := env.Probe(ctx, rsDevice, []string{"vtysh", "-c",
+		fmt.Sprintf("show bgp ipv4 unicast %s json", prefix)})
+	if err != nil {
+		return fmt.Errorf("asking the route server of the exchange about %s: %w", prefix, err)
+	}
+	if res.ExitCode != 0 {
+		return fmt.Errorf("asking the route server of the exchange about %s: exited %d: %s",
+			prefix, res.ExitCode, firstLine(res.Stderr))
+	}
+	body := strings.TrimSpace(res.Stdout)
+	if body == "" || strings.HasPrefix(body, "%") {
+		return nil
+	}
+	if err := json.Unmarshal([]byte(body), &raw); err != nil {
+		// An absent prefix prints a human message rather than JSON, which is
+		// not a failure to read the route server: it is the route server
+		// saying it has no such route.
+		return nil //nolint:nilerr // no JSON means no such prefix
+	}
+	if raw.Prefix == "" || len(raw.Paths) == 0 {
+		return nil
+	}
+	out.present = true
+	for _, p := range raw.Paths {
+		out.communities = append(out.communities, p.Community.List...)
+	}
+	for _, m := range raw.AdvertisedTo {
+		// The route server names each client by hostname, which carries the AS.
+		if i := strings.LastIndex(m.Hostname, ".as"); i >= 0 {
+			if asn, err := strconv.Atoi(m.Hostname[i+3:]); err == nil {
+				out.advertisedTo = append(out.advertisedTo, asn)
+			}
+		}
+	}
+	sort.Ints(out.advertisedTo)
+	return nil
+}
+
+// ixpMembers is the set of AS numbers attached to one exchange.
+func ixpMembers(top *model.Topology, ixp int) map[int]bool {
+	out := map[int]bool{}
+	for _, l := range top.Links {
+		for _, side := range []*model.Iface{l.A, l.B} {
+			if side == nil || side.Device == nil {
+				continue
+			}
+			if side.Device.ASN != ixp {
+				continue
+			}
+			for _, other := range []*model.Iface{l.A, l.B} {
+				if other == nil || other.Device == nil || other.Device.ASN == ixp {
+					continue
+				}
+				out[other.Device.ASN] = true
+			}
+		}
+	}
+	// Members reached over a shared segment rather than a point-to-point link.
+	for _, l := range top.Links {
+		if l.Segment == "" {
+			continue
+		}
+		atIXP := false
+		for _, l2 := range top.Links {
+			if l2.Segment != l.Segment {
+				continue
+			}
+			for _, side := range []*model.Iface{l2.A, l2.B} {
+				if side != nil && side.Device != nil && side.Device.ASN == ixp {
+					atIXP = true
+				}
+			}
+		}
+		if !atIXP {
+			continue
+		}
+		for _, side := range []*model.Iface{l.A, l.B} {
+			if side != nil && side.Device != nil && side.Device.ASN != ixp && side.Device.ASN > 0 {
+				out[side.Device.ASN] = true
+			}
+		}
+	}
+	return out
+}
+
+// routeServerDevice finds the router of an exchange.
+func routeServerDevice(top *model.Topology, ixp int) (*model.Device, bool) {
+	as, ok := top.ASes[ixp]
+	if !ok {
+		return nil, false
+	}
+	for _, d := range as.Routers {
+		return d, true
+	}
+	return nil, false
+}
+
+// asPathMatches lists the AS-path access-lists a route-map body matches on.
+func asPathMatches(body string) []string {
+	var out []string
+	for _, line := range strings.Split(body, "\n") {
+		f := strings.Fields(strings.TrimSpace(line))
+		if len(f) >= 3 && f[0] == "match" && f[1] == "as-path" {
+			out = append(out, f[2])
+		}
+	}
+	return out
 }
 
 // checkTrafficEngineering verifies the answer to the "one of your links is
@@ -726,17 +943,110 @@ func checkRPKINotFoundPreserved(ctx context.Context, env *Env) Result {
 			}
 		}
 	}
-	if len(denies) == 0 {
-		return Pass("rpki.notfound_preserved", Evidence{
-			Observed: "routes without a ROA are still accepted"})
+	if len(denies) > 0 {
+		sort.Strings(denies)
+		return Fail("rpki.notfound_preserved", Evidence{
+			Expected: "not-found routes remain usable",
+			Observed: fmt.Sprintf("%d route-map(s) deny them", len(denies)),
+			Detail:   strings.Join(denies, "\n"),
+			Hint:     "most of the Internet has no ROA; rejecting not-found would cut you off from it",
+		})
 	}
-	sort.Strings(denies)
-	return Fail("rpki.notfound_preserved", Evidence{
-		Expected: "not-found routes remain usable",
-		Observed: fmt.Sprintf("%d route-map(s) deny them", len(denies)),
-		Detail:   strings.Join(denies, "\n"),
-		Hint:     "most of the Internet has no ROA; rejecting not-found would cut you off from it",
-	})
+
+	// The text search above only catches the obvious spelling. A clause that
+	// denies everything, or that permits only what is valid and falls off the
+	// end of the route-map, drops every not-found route without the words
+	// "match rpki notfound" appearing anywhere -- and used to pass.
+	//
+	// So the table is read. Every other system whose block has no ROA is a
+	// route this AS must still hold; if one is missing, the filtering is too
+	// broad whatever it is written as, and the missing prefix is named.
+	missing, checked, err := missingNotFoundRoutes(ctx, env)
+	if err != nil {
+		return Errored("rpki.notfound_preserved", err)
+	}
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		return Fail("rpki.notfound_preserved", Evidence{
+			Expected: "routes to systems that have published no ROA are still accepted",
+			Observed: fmt.Sprintf("%d of %d such prefix(es) are absent from this AS's table",
+				len(missing), checked),
+			Detail: strings.Join(truncate(missing, 6), "\n"),
+			Hint: "most of the Internet has no ROA; a policy that keeps only what is valid " +
+				"cuts you off from it, however it is written",
+			Command: "show bgp ipv4 unicast rpki notfound",
+		})
+	}
+	if checked == 0 {
+		return Pass("rpki.notfound_preserved", Evidence{
+			Observed: "no route-map denies not-found routes",
+			Detail: "no other system in this lab announces a prefix without a ROA, so " +
+				"there was no not-found route to lose"})
+	}
+	return Pass("rpki.notfound_preserved", Evidence{
+		Observed: fmt.Sprintf("all %d prefix(es) without a ROA are still in this AS's table", checked),
+		Command:  "show bgp ipv4 unicast rpki notfound"})
+}
+
+// missingNotFoundRoutes names the prefixes this AS should hold and does not,
+// among those whose origin has published no ROA.
+func missingNotFoundRoutes(ctx context.Context, env *Env) ([]string, int, error) {
+	covered, err := roaPrefixes(ctx, env)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	// One router's table is enough: iBGP carries the AS's view, and a prefix
+	// filtered at the border is absent from all of them.
+	var router string
+	for _, r := range env.Routers() {
+		router = r.Name
+		break
+	}
+	if router == "" {
+		return nil, 0, fmt.Errorf("AS %d has no router to read", env.AS)
+	}
+	tbl, err := bgpTable(ctx, env, router)
+	if err != nil {
+		return nil, 0, err
+	}
+	have := tbl.Table()
+
+	var missing []string
+	checked := 0
+	for asn, as := range env.Topology.ASes {
+		if asn == env.AS || as.Block == "" || as.Role == model.RoleIXP {
+			continue
+		}
+		if covered[as.Block] {
+			continue
+		}
+		checked++
+		if _, ok := have[as.Block]; !ok {
+			missing = append(missing, fmt.Sprintf("%s (AS %d) is not in the table", as.Block, asn))
+		}
+	}
+	return missing, checked, nil
+}
+
+// roaPrefixes is the set of prefixes the validator has a ROA for.
+func roaPrefixes(ctx context.Context, env *Env) (map[string]bool, error) {
+	out := map[string]bool{}
+	for _, r := range env.Routers() {
+		text, err := env.Vtysh(ctx, r.Name, "show rpki prefix-table")
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(text, "\n") {
+			for _, f := range strings.Fields(line) {
+				if strings.Count(f, ".") == 3 && strings.Contains(f, "/") {
+					out[f] = true
+				}
+			}
+		}
+		return out, nil
+	}
+	return out, nil
 }
 
 // rpkiConfigured reports whether any router has an RPKI cache configured.

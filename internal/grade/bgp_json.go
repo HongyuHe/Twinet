@@ -41,6 +41,10 @@ type bgpRoute struct {
 	} `json:"nexthops"`
 	// NextHop is the `advertised-routes` form.
 	NextHop string `json:"nextHop"`
+	// PathFrom is "internal" for a route another router of this AS advertised,
+	// and "external" for one learned over an eBGP session directly. It is what
+	// tells a next-hop-self fault from a normal connected next hop.
+	PathFrom string `json:"pathFrom"`
 
 	Community *struct {
 		String string `json:"string"`
