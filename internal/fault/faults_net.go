@@ -449,7 +449,15 @@ func init() {
 			// so the router came back with no policy at all on that session
 			// and leaked every route it knew to a provider. The fault reported
 			// a clean resolve, and the lab was quietly wrong from then on.
-			base, af := neighborConfig(ctx, e, t, peer)
+			base, af, cerr := neighborConfig(ctx, e, t, peer)
+			if cerr != nil {
+				// Injecting without having captured what this neighbour holds
+				// means resolving cannot put it back, and undoing this fault
+				// deletes the neighbour outright -- so the router would come
+				// back with no policy on that session and leak every route it
+				// knows. Better not to inject at all.
+				return nil, cerr
+			}
 			if err := e.VtyshConfig(ctx, t.DeviceID(), "configure terminal",
 				fmt.Sprintf("router bgp %d", t.AS),
 				fmt.Sprintf("no neighbor %s remote-as %d", peer, asn),
@@ -512,10 +520,14 @@ func init() {
 // Restoring a neighbour means restoring all of it. The route-maps bound to a
 // session are what stop a router handing every route it knows to a provider,
 // and they live in the address-family block.
-func neighborConfig(ctx context.Context, e *Env, t Target, peer string) (base, af []string) {
-	out, code := e.Try(ctx, t.DeviceID(), "vtysh -c 'show running-config'")
+func neighborConfig(ctx context.Context, e *Env, t Target, peer string) (base, af []string, err error) {
+	out, code, err := e.TryE(ctx, t.DeviceID(), "vtysh -c 'show running-config'")
+	if err != nil {
+		return nil, nil, err
+	}
 	if code != 0 {
-		return nil, nil
+		return nil, nil, fmt.Errorf("%s: its configuration could not be read, so what this "+
+			"fault would delete could not be captured first", t.DeviceID())
 	}
 	inAF := false
 	for _, line := range strings.Split(out, "\n") {
@@ -539,7 +551,7 @@ func neighborConfig(ctx context.Context, e *Env, t Target, peer string) (base, a
 			base = append(base, l)
 		}
 	}
-	return base, af
+	return base, af, nil
 }
 
 func init() {

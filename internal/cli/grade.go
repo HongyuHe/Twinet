@@ -277,7 +277,8 @@ func execFunc(ctx context.Context, top *model.Topology, token string) (
 		if !ok {
 			return runtime.ExecResult{}, fmt.Errorf("device %s is on unknown node %q", deviceID, d.Node)
 		}
-		r, err := n.Exec(ctx, agent.ExecRequest{Container: d.Container, Cmd: cmd})
+		r, err := n.Exec(ctx, agent.ExecRequest{
+			Container: d.Container, Cmd: cmd, Hold: currentHoldToken()})
 		return runtime.ExecResult{ExitCode: r.ExitCode, Stdout: r.Stdout, Stderr: r.Stderr}, err
 	}, nil
 }

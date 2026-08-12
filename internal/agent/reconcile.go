@@ -180,10 +180,11 @@ func (s *Server) repairLab(ctx context.Context, top *model.Topology, broken []*m
 	s.mu.Unlock()
 	eng := &deploy.Engine{
 		Runtime: s.rt, Node: s.cfg.Node, State: s.store,
-		Renderer:     renderer(top, render.Mode(mode), ungraded),
-		UnderlayIP:   s.cfg.UnderlayIP,
-		UnderlayDev:  s.cfg.UnderlayDev,
-		PeerUnderlay: s.peerUnderlay(top.Name),
+		Renderer:        renderer(top, render.Mode(mode), ungraded),
+		WritesReference: render.Mode(mode) == render.ModeSolve,
+		UnderlayIP:      s.cfg.UnderlayIP,
+		UnderlayDev:     s.cfg.UnderlayDev,
+		PeerUnderlay:    s.peerUnderlay(top.Name),
 	}
 	for _, d := range broken {
 		if s.givingUpOn(top.Name, d.ID) {

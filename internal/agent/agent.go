@@ -595,10 +595,11 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		mode = render.ModePlatform
 	}
 	eng := &deploy.Engine{
-		Runtime:    s.rt,
-		Node:       s.cfg.Node,
-		PullPolicy: rt.PullPolicy(req.PullPolicy),
-		Renderer:   renderer(top, mode, req.Ungraded),
+		Runtime:         s.rt,
+		Node:            s.cfg.Node,
+		PullPolicy:      rt.PullPolicy(req.PullPolicy),
+		Renderer:        renderer(top, mode, req.Ungraded),
+		WritesReference: mode == render.ModeSolve,
 		// Solve mode installs the reference solution, which is the one case
 		// where the rendered configuration must overwrite what is there.
 		Authoritative: mode == render.ModeSolve && req.Ungraded == 0,
@@ -721,7 +722,18 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 
 	// Snapshot student work at the end of every successful apply, so the most
 	// recent copy is never older than the last time anyone touched the lab.
-	if s.store != nil && !req.DryRun {
+	//
+	// Except when the apply *wrote* the reference solution. What is on those
+	// routers is then the answer, not anybody's work, and capturing it files
+	// the answer as the student's own saved configuration -- to be replayed
+	// onto their router the next time a container is recreated, or handed back
+	// when the lab is redeployed for teaching. Measured on this cluster: a
+	// snapshot of as5/CHI held the complete reference iBGP, OSPF, exchange and
+	// policy configuration.
+	//
+	// A grading run solves the lab constantly, so this is not a corner case;
+	// it is what every class run would do to every student.
+	if s.store != nil && !req.DryRun && req.Mode != string(render.ModeSolve) {
 		if n, err := eng.CaptureAll(r.Context(), top, s.store); err != nil {
 			slog.Warn("capturing student configuration", "err", err, "saved", n)
 		} else if n > 0 {
@@ -879,6 +891,10 @@ func (s *Server) handleDestroy(w http.ResponseWriter, r *http.Request) {
 
 // ExecRequest runs a command inside a container on this node.
 type ExecRequest struct {
+	// Hold is the caller's grading-hold token, if it has one. A lab that is
+	// held refuses commands from anybody else.
+	Hold string `json:"hold,omitempty"`
+
 	Container string   `json:"container"`
 	Cmd       []string `json:"cmd"`
 	// Owner, when set, must match the container's twinet.owner label. This is
@@ -1031,6 +1047,12 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Container == "" || len(req.Cmd) == 0 {
 		httpError(w, http.StatusBadRequest, errors.New("container and cmd are both required"))
+		return
+	}
+	// Running a command inside a lab somebody is grading would land in
+	// somebody's marks. The grader passes its own hold token and is admitted.
+	if why := s.refuseIfHeldByAnother(req.Container, req.Hold); why != "" {
+		httpError(w, http.StatusConflict, errors.New(why))
 		return
 	}
 	c, err := s.rt.Inspect(r.Context(), req.Container)

@@ -31,14 +31,46 @@ func init() {
 			return State{"iface": iface, "addr": addr, "routes": routes}, nil
 		},
 		Verify: func(ctx context.Context, e *Env, t Target, s State) (Evidence, error) {
-			iface, addr, err := hostAddr(e, t)
+			// The interface must exist and be readable before its lack of an
+			// address means anything.
+			//
+			// This asked whether the address was absent from output it did not
+			// check it had received. A container that came back with no
+			// interfaces at all satisfies that, and so does a probe that never
+			// ran -- so the ground truth said "this host's address was removed"
+			// while the real failure was that it had no wiring, and an agent
+			// diagnosing it was being marked against a cause that was not
+			// there.
+			iface, addr := s["iface"], s["addr"]
+			if iface == "" || addr == "" {
+				return Evidence{}, fmt.Errorf("this fault did not record what it removed, "+
+					"so it cannot be verified on %s", t.DeviceID())
+			}
+			out, code, err := e.TryE(ctx, t.DeviceID(), "ip -o link show dev "+iface)
 			if err != nil {
 				return Evidence{}, err
 			}
-			out, _ := e.Try(ctx, t.DeviceID(), "ip -o -4 addr show dev "+iface)
-			gone := !strings.Contains(out, strings.SplitN(addr, "/", 2)[0])
+			if code != 0 || strings.TrimSpace(out) == "" {
+				return Evidence{
+					Verified: false,
+					Expected: "no address on " + iface,
+					Observed: iface + " does not exist, which is a different fault entirely",
+				}, nil
+			}
+			addrs, code, err := e.TryE(ctx, t.DeviceID(), "ip -o -4 addr show dev "+iface)
+			if err != nil {
+				return Evidence{}, err
+			}
+			if code != 0 {
+				return Evidence{
+					Verified: false,
+					Expected: "no address on " + iface,
+					Observed: "the interface could not be read, so nothing can be concluded",
+				}, nil
+			}
+			gone := !strings.Contains(addrs, strings.SplitN(addr, "/", 2)[0])
 			return Evidence{Verified: gone, Expected: "no address on " + iface,
-				Observed: strings.TrimSpace(out)}, nil
+				Observed: strings.TrimSpace(addrs)}, nil
 		},
 		Resolve: func(ctx context.Context, e *Env, t Target, s State) error {
 			if s["addr"] == "" {

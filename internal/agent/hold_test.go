@@ -1,7 +1,10 @@
 package agent
 
 import (
+	"strings"
+
 	"context"
+	"github.com/HongyuHe/twinet/internal/model"
 	"testing"
 	"time"
 )
@@ -77,5 +80,60 @@ func TestRepairsThatCannotSucceedAreGivenUpOn(t *testing.T) {
 	s.repairSucceeded(lab, id)
 	if s.givingUpOn(lab, id) {
 		t.Error("a device that was repaired is still being ignored")
+	}
+}
+
+// A hold is how a grading run says "leave this lab to me". It stopped the
+// node's own repair loop and nothing else, so while a class was being marked a
+// student could still open a shell on a router: read the reference solution off
+// their neighbours, change the submission about to be graded, or break a system
+// somebody else's mark depended on. None of it would appear in the marks.
+func TestInteractiveAccessIsRefusedWhileALabIsGraded(t *testing.T) {
+	s := &Server{
+		holds:   map[string]*hold{},
+		current: map[string]*model.Topology{"cos461": {Name: "cos461"}},
+	}
+	const container = "twinet-cos461-as3-atl"
+
+	if why := s.refuseIfHeldByAnother(container, ""); why != "" {
+		t.Fatalf("access to a lab nobody is grading was refused: %s", why)
+	}
+
+	s.applyHold(HoldRequest{Lab: "cos461", Holder: "grading (pid 42)",
+		Token: "tok", Seconds: 60})
+
+	why := s.refuseIfHeldByAnother(container, "")
+	if why == "" {
+		t.Fatal("a student can open a shell on a lab that is being graded")
+	}
+	if !strings.Contains(why, "cos461") || !strings.Contains(why, "pid 42") {
+		t.Errorf("the refusal does not say which lab or who holds it: %q", why)
+	}
+
+	// The grader reaches the containers through this same door.
+	if why := s.refuseIfHeldByAnother(container, "tok"); why != "" {
+		t.Errorf("the holder was locked out of the lab it is grading: %s", why)
+	}
+	// Another lab on the same node is unaffected.
+	if why := s.refuseIfHeldByAnother("twinet-advnet-as1-zuri", ""); why != "" {
+		t.Errorf("holding one lab refused access to another: %s", why)
+	}
+}
+
+// The longest matching lab name wins, or a private grading harness would be
+// mistaken for the class lab it is named after.
+func TestAHarnessIsNotMistakenForTheClassLab(t *testing.T) {
+	s := &Server{
+		holds: map[string]*hold{},
+		current: map[string]*model.Topology{
+			"cos461":             {Name: "cos461"},
+			"cos461-g3-groupabc": {Name: "cos461-g3-groupabc"},
+		},
+	}
+	if got := s.labOfContainer("twinet-cos461-g3-groupabc-as3-atl"); got != "cos461-g3-groupabc" {
+		t.Errorf("the container was attributed to lab %q", got)
+	}
+	if got := s.labOfContainer("twinet-cos461-as3-atl"); got != "cos461" {
+		t.Errorf("the container was attributed to lab %q", got)
 	}
 }

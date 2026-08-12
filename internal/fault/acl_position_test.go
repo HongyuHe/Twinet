@@ -58,3 +58,18 @@ func TestARuleNamedByProtocolIsFound(t *testing.T) {
 			"installed it could not be undone", got)
 	}
 }
+
+// The port is part of what makes a rule that rule. Without it, "-p udp --dport
+// 53" matched any UDP drop rule, and removing "the last one" could remove a
+// rule this injection never added.
+func TestAPortIsPartOfTheRuleIdentity(t *testing.T) {
+	const listing = `-P INPUT ACCEPT
+-A INPUT -p udp -m udp --dport 123 -j DROP
+-A INPUT -p udp -m udp --dport 53 -j DROP
+`
+	got := lastMatchingPosition(listing, "INPUT", specTokens("-p udp --dport 53"))
+	if got != 2 {
+		t.Errorf("the DNS rule was located at position %d, not 2; resolving would have "+
+			"removed the rule for port 123 instead", got)
+	}
+}

@@ -335,6 +335,14 @@ func specTokens(spec string) []string {
 				out = append(out, f[i+1])
 				i++
 			}
+		case "--dport", "--sport":
+			// The port is part of what makes the rule this rule. Without it,
+			// "-p udp --dport 53" matched any UDP drop rule at all, and
+			// removing "the last one" could remove somebody else's.
+			if i+1 < len(f) {
+				out = append(out, f[i]+" "+f[i+1])
+				i++
+			}
 		}
 	}
 	return out

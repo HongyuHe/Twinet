@@ -66,6 +66,10 @@ type Engine struct {
 	PullPolicy runtime.PullPolicy
 	// Renderer produces per-device configuration. Optional.
 	Renderer Renderer
+	// WritesReference says this deployment installs the reference solution, so
+	// what ends up on a student-owned device is the answer rather than their
+	// work, and must never be captured as theirs.
+	WritesReference bool
 	// UnderlayIP is this node's VTEP source address.
 	UnderlayIP string
 	// UnderlayDev optionally pins the tunnel source interface.
@@ -337,6 +341,15 @@ func (e *Engine) ensureContainer(ctx context.Context, top *model.Topology, d *mo
 // captureBeforeReplace snapshots a student-owned device before it is destroyed.
 func (e *Engine) captureBeforeReplace(ctx context.Context, top *model.Topology, d *model.Device) error {
 	if e.State == nil || !studentOwned(top, d) {
+		return nil
+	}
+	// Not while the reference solution is what is on the device.
+	//
+	// Capturing then files the answer as the student's own saved
+	// configuration, to be replayed onto their router the next time a
+	// container is recreated. A grading run solves the lab constantly, so this
+	// would happen to every student on every class run.
+	if e.WritesReference {
 		return nil
 	}
 	snaps, err := Capture(ctx, e.Runtime, d, top.Name, top.Hash)

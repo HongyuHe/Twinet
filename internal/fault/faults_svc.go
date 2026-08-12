@@ -65,13 +65,27 @@ func init() {
 			// Dropped rather than rejected: a rejection produces an immediate
 			// error, which is a much easier thing to diagnose than a timeout,
 			// and the timeout is what the symptom describes.
+			//
+			// Appended rather than inserted, and one at a time with rollback,
+			// so that resolving can remove exactly the rules this injection
+			// added. It used to insert both and then, on resolve, delete
+			// *every* rule dropping port 53 -- including one that was already
+			// there, or one another injection had added -- and report a clean
+			// undo, because the fingerprint compares sets of lines and cannot
+			// see a rule it removed that was never its own.
+			var done []string
 			for _, proto := range []string{"udp", "tcp"} {
 				if _, err := e.Sh(ctx, t.DeviceID(), fmt.Sprintf(
-					"iptables -w -I INPUT -p %s --dport 53 -j DROP", proto)); err != nil {
+					"iptables -w -A INPUT -p %s --dport 53 -j DROP", proto)); err != nil {
+					for _, p := range done {
+						_, _ = e.Try(ctx, t.DeviceID(), fmt.Sprintf(
+							"iptables -w -D INPUT -p %s --dport 53 -j DROP", p))
+					}
 					return nil, err
 				}
+				done = append(done, proto)
 			}
-			return State{"device": t.DeviceID()}, nil
+			return State{"device": t.DeviceID(), "protos": strings.Join(done, " ")}, nil
 		},
 		Verify: func(ctx context.Context, e *Env, t Target, s State) (Evidence, error) {
 			out, _, err := e.TryE(ctx, t.DeviceID(), "iptables -w -S INPUT")
@@ -86,12 +100,24 @@ func init() {
 			}, nil
 		},
 		Resolve: func(ctx context.Context, e *Env, t Target, s State) error {
-			_, err := e.Sh(ctx, t.DeviceID(), strings.Join([]string{
-				"for p in udp tcp; do",
-				"  while iptables -w -D INPUT -p $p --dport 53 -j DROP 2>/dev/null; do :; done",
-				"done",
-			}, "\n"))
-			return err
+			protos := strings.Fields(s["protos"])
+			if len(protos) == 0 {
+				protos = []string{"udp", "tcp"}
+			}
+			// Exactly one copy per protocol, and the last one, which is the
+			// one this injection appended.
+			for _, p := range protos {
+				pos := lastMatchingRule(ctx, e, t, "INPUT",
+					fmt.Sprintf("-p %s --dport 53", p))
+				if pos <= 0 {
+					continue
+				}
+				if _, err := e.Sh(ctx, t.DeviceID(),
+					fmt.Sprintf("iptables -w -D INPUT %d", pos)); err != nil {
+					return err
+				}
+			}
+			return nil
 		},
 	})
 

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -117,4 +118,57 @@ func (s *Server) heldBy(lab string) string {
 		return "an external operation"
 	}
 	return h.holder
+}
+
+// labOfContainer recovers the lab a container belongs to from its name.
+//
+// Containers are named "twinet-<lab>-<...>", and every lab this node hosts is
+// known, so the longest matching lab name is the owner. Matching the longest is
+// what tells "cos461" from "cos461-g3-groupX".
+func (s *Server) labOfContainer(name string) string {
+	const prefix = "twinet-"
+	if !strings.HasPrefix(name, prefix) {
+		return ""
+	}
+	rest := name[len(prefix):]
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	best := ""
+	for lab := range s.current {
+		if strings.HasPrefix(rest, lab+"-") && len(lab) > len(best) {
+			best = lab
+		}
+	}
+	return best
+}
+
+// refuseIfHeldByAnother reports why an interactive request must be refused, or
+// "" if it may proceed.
+//
+// A hold is how a grading run says "leave this lab to me". It stopped the
+// node's own repair loop and nothing else, so while a class was being marked a
+// student could still open a shell on a router -- read the reference solution
+// off their neighbours, change the submission that was about to be graded, or
+// break a system somebody else's mark depended on. None of that would appear
+// anywhere in the marks.
+//
+// The holder is exempt: grading reaches the containers through this same door.
+func (s *Server) refuseIfHeldByAnother(container, token string) string {
+	lab := s.labOfContainer(container)
+	if lab == "" {
+		return ""
+	}
+	s.mu.Lock()
+	h, ok := s.holds[lab]
+	if ok && time.Now().After(h.until) {
+		delete(s.holds, lab)
+		ok = false
+	}
+	s.mu.Unlock()
+	if !ok || h.token == "" || h.token == token {
+		return ""
+	}
+	return fmt.Sprintf("lab %q is being graded by %s; interactive access is refused until "+
+		"that finishes, because a change made now would land in somebody's marks",
+		lab, h.holder)
 }

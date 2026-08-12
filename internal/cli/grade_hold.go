@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -84,6 +85,9 @@ func holdLab(ctx context.Context, top *model.Topology, token string, out io.Writ
 		return nil, err
 	}
 	id := hex.EncodeToString(idBytes[:])
+	// Recorded where the exec path can find it: a lab this process is holding
+	// must still admit this process's own commands.
+	setHoldToken(id)
 	holder := fmt.Sprintf("grading (pid %d)", os.Getpid())
 
 	ask := func(ctx context.Context, secs int) error {
@@ -154,6 +158,7 @@ func holdLab(ctx context.Context, top *model.Topology, token string, out io.Writ
 		release: func() {
 			close(stop)
 			<-done
+			setHoldToken("")
 			// Hand the lab back rather than waiting for the lease to lapse, so
 			// a device that breaks a second after grading ends is repaired
 			// then and not three minutes later.
@@ -162,4 +167,28 @@ func holdLab(ctx context.Context, top *model.Topology, token string, out io.Writ
 			_ = ask(rel, 0)
 		},
 	}, nil
+}
+
+// The grading hold token of this process, if it holds one.
+//
+// A package-level value rather than a parameter threaded through every call:
+// the exec function is built once and handed to two dozen checks, and a token
+// that has to be passed by hand is one a future caller forgets, at which point
+// grading locks itself out of the lab it is grading.
+var (
+	holdTokenMu sync.RWMutex
+	holdToken   string
+)
+
+func setHoldToken(t string) {
+	holdTokenMu.Lock()
+	holdToken = t
+	holdTokenMu.Unlock()
+}
+
+// currentHoldToken returns this process's hold token, or "".
+func currentHoldToken() string {
+	holdTokenMu.RLock()
+	defer holdTokenMu.RUnlock()
+	return holdToken
 }

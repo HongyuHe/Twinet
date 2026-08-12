@@ -649,10 +649,36 @@ func attestReference(ctx context.Context, top *model.Topology, rubric *grade.Rub
 			defer func() { <-sem }()
 			rep := grade.Run(ctx, rubric, &grade.Env{Topology: top, AS: asn, Exec: exec},
 				grade.RunOptions{ConvergeTimeout: converge, Parallel: 4})
-			if rep.Total < rubric.MaxTotal() {
+
+			// Full marks is not enough on its own.
+			//
+			// A check that could not run is excluded and the remaining weights
+			// are rescaled, so a question can score full marks with half its
+			// checks errored -- and the report says so, in NeedsReview, which
+			// this ignored. An attestation that accepts a report the grader has
+			// marked untrustworthy is not an attestation.
+			var why string
+			switch {
+			case rep.Total < rubric.MaxTotal():
+				why = fmt.Sprintf("scores %.2f of %.2f", rep.Total, rubric.MaxTotal())
+			case rep.NeedsReview:
+				why = "scores full marks but is flagged for review"
+				if rep.Err != "" {
+					why += ": " + firstLine(rep.Err)
+				}
+			default:
+				for _, q := range rep.Questions {
+					for _, r := range q.Results {
+						if r.Status != grade.StatusPass {
+							why = fmt.Sprintf("scores full marks, but %s did not pass (%s)",
+								r.Check, r.Status)
+						}
+					}
+				}
+			}
+			if why != "" {
 				mu.Lock()
-				bad = append(bad, fmt.Sprintf("AS %d scores %.2f of %.2f",
-					asn, rep.Total, rubric.MaxTotal()))
+				bad = append(bad, fmt.Sprintf("AS %d %s", asn, why))
 				mu.Unlock()
 			}
 		}(asn)
