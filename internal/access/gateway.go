@@ -320,12 +320,28 @@ func (s *Server) run(ctx context.Context, ch ssh.Channel, sess Session, cmd []st
 		// An interactive login lands in a menu rather than on a fixed router,
 		// because a group has eight of them and guessing which one is wanted
 		// is worse than asking.
-		chosen, err := s.chooseDevice(ch, sess)
-		if err != nil {
-			return 1
+		// The menu is a loop, not a single question.
+		//
+		// A group has eight routers and three hosts, and the work moves
+		// between them constantly. Leaving the device shell used to drop the
+		// connection, so looking at a neighbour meant a fresh ssh, a fresh
+		// password, and a fresh menu -- roughly the tax the legacy platform's
+		// `goto` built-in existed to remove. Coming back here instead is the
+		// same thing without a command to learn.
+		for {
+			chosen, err := s.chooseDevice(ch, sess)
+			if err != nil {
+				return 0
+			}
+			code, err := s.cfg.Exec.Shell(ctx, chosen,
+				[]string{"/bin/sh", "-lc", "exec /bin/bash 2>/dev/null || exec /bin/sh"},
+				ch, ch, ch.Stderr(), tty, rows, cols)
+			if err != nil {
+				fmt.Fprintf(ch.Stderr(), "twinet: %v\r\n", err)
+				return 1
+			}
+			_ = code
 		}
-		device = chosen
-		cmd = []string{"/bin/sh", "-lc", "exec /bin/bash 2>/dev/null || exec /bin/sh"}
 	} else if name, rest, ok := splitDevicePrefix(cmd); ok {
 		// "ssh group3@gw MSP show ip route" targets one device directly, which
 		// is what a script wants.
@@ -413,6 +429,26 @@ func (s *Server) chooseDevice(ch ssh.Channel, sess Session) (string, error) {
 		case '\r', '\n':
 			fmt.Fprint(ch, "\r\n")
 			choice := strings.TrimSpace(string(line))
+			line = nil
+			switch {
+			case choice == "":
+				fmt.Fprintf(ch, "Device number or name: ")
+				continue
+			case choice == "exit" || choice == "quit" || choice == "logout":
+				return "", fmt.Errorf("goodbye")
+			case choice == "help" || choice == "?":
+				s.printHelp(ch)
+				fmt.Fprintf(ch, "Device number or name: ")
+				continue
+			case choice == "status":
+				s.printStatus(ch, sess)
+				fmt.Fprintf(ch, "Device number or name: ")
+				continue
+			case strings.HasPrefix(choice, "goto "):
+				// Accepted because people who used the legacy platform will
+				// type it. It does the same thing as naming the device.
+				choice = strings.TrimSpace(strings.TrimPrefix(choice, "goto "))
+			}
 			var idx int
 			if _, err := fmt.Sscanf(choice, "%d", &idx); err == nil && idx >= 1 && idx <= len(devs) {
 				return devs[idx-1].ID, nil
@@ -420,8 +456,8 @@ func (s *Server) chooseDevice(ch ssh.Channel, sess Session) (string, error) {
 			if id, err := s.resolve(sess, choice); err == nil {
 				return id, nil
 			}
-			fmt.Fprintf(ch, "No such device. Device number or name: ")
-			line = nil
+			fmt.Fprintf(ch, "No such device. Type `help` for what else you can do here.\r\n")
+			fmt.Fprintf(ch, "Device number or name: ")
 		case 0x7f, 0x08:
 			if len(line) > 0 {
 				line = line[:len(line)-1]
@@ -434,6 +470,48 @@ func (s *Server) chooseDevice(ch ssh.Channel, sess Session) (string, error) {
 			_, _ = ch.Write(buf[:1])
 		}
 	}
+}
+
+// printHelp says what can be typed at the menu.
+//
+// Written out rather than left to be discovered, because the alternative is a
+// student typing a device name at a prompt that gives no indication anything
+// else is possible, and concluding the gateway is broken when it says "no such
+// device".
+func (s *Server) printHelp(ch io.Writer) {
+	fmt.Fprint(ch, "\r\n"+
+		"  <number> or <name>   open a shell on that device\r\n"+
+		"  goto <name>          the same thing, spelled the way the old platform spelled it\r\n"+
+		"  status               whether each of your devices is running\r\n"+
+		"  help                 this\r\n"+
+		"  exit                 close the connection\r\n"+
+		"\r\n"+
+		"Leaving a device shell brings you back here rather than disconnecting.\r\n"+
+		"\r\n"+
+		"From outside, `ssh <you>@<gateway> <DEVICE> <command>` runs one command\r\n"+
+		"on one device, which is what a script wants.\r\n\r\n")
+}
+
+// printStatus reports whether each of the session's devices is running.
+//
+// A student whose router is not running sees every command fail in a way that
+// looks like their configuration is wrong. Being able to ask is the difference
+// between a minute and an afternoon.
+func (s *Server) printStatus(ch io.Writer, sess Session) {
+	devs := s.devices(sess.AS)
+	fmt.Fprintf(ch, "\r\n")
+	for _, d := range devs {
+		state := "running"
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		code, err := s.cfg.Exec.Shell(ctx, d.ID, []string{"true"},
+			nil, io.Discard, io.Discard, false, 0, 0)
+		cancel()
+		if err != nil || code != 0 {
+			state = "NOT RUNNING"
+		}
+		fmt.Fprintf(ch, "  %-12s %-8s %s\r\n", d.Name, d.Kind, state)
+	}
+	fmt.Fprintf(ch, "\r\n")
 }
 
 // splitDevicePrefix recognises a possible "DEVICE rest of command".

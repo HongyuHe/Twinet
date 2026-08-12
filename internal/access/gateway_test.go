@@ -1,7 +1,10 @@
 package access
 
 import (
+	"context"
 	"encoding/base64"
+	"errors"
+	"io"
 	"strings"
 	"testing"
 )
@@ -162,4 +165,72 @@ func TestANonDeviceFirstWordStaysPartOfTheCommand(t *testing.T) {
 	if _, err := s.resolve(Session{AS: 3}, name); err == nil {
 		t.Error("a word that is not a device resolved to one")
 	}
+}
+
+// The menu used to be a single question: choose a device, and leaving that
+// device's shell dropped the connection. A group has eight routers and three
+// hosts and the work moves between them constantly, so looking at a neighbour
+// meant a fresh ssh, a fresh password and a fresh menu. That is the tax the
+// legacy platform's `goto` built-in existed to remove.
+//
+// These check what can now be typed at the prompt.
+func TestTheMenuAnswersMoreThanADeviceName(t *testing.T) {
+	top := twoASTopology()
+	s := &Server{cfg: Config{Topology: top, Exec: everythingRuns{}}}
+	sess := Session{AS: 3, Group: "group3"}
+
+	t.Run("status reports each device", func(t *testing.T) {
+		var out strings.Builder
+		s.printStatus(&out, sess)
+		got := out.String()
+		for _, d := range s.devices(3) {
+			if !strings.Contains(got, d.Name) {
+				t.Errorf("status does not mention %s, which the student owns", d.Name)
+			}
+		}
+		if !strings.Contains(got, "running") {
+			t.Error("status does not say whether anything is running, which is the " +
+				"question it exists to answer: a student whose router is stopped sees " +
+				"every command fail as though their configuration were wrong")
+		}
+	})
+
+	t.Run("status notices a device that is not running", func(t *testing.T) {
+		s := &Server{cfg: Config{Topology: top, Exec: nothingRuns{}}}
+		var out strings.Builder
+		s.printStatus(&out, sess)
+		if !strings.Contains(out.String(), "NOT RUNNING") {
+			t.Error("every device is reported as running even though none of them are; " +
+				"a status that always says the same thing is worse than none")
+		}
+	})
+
+	t.Run("help lists what else works", func(t *testing.T) {
+		var out strings.Builder
+		s.printHelp(&out)
+		got := out.String()
+		for _, w := range []string{"goto", "status", "help", "exit"} {
+			if !strings.Contains(got, w) {
+				t.Errorf("help does not mention %q, so nobody will find it", w)
+			}
+		}
+		if !strings.Contains(got, "brings you back here") {
+			t.Error("help does not say that leaving a device returns to the menu, " +
+				"which is the change most worth knowing about")
+		}
+	})
+}
+
+type everythingRuns struct{}
+
+func (everythingRuns) Shell(context.Context, string, []string, io.Reader,
+	io.Writer, io.Writer, bool, int, int) (int, error) {
+	return 0, nil
+}
+
+type nothingRuns struct{}
+
+func (nothingRuns) Shell(context.Context, string, []string, io.Reader,
+	io.Writer, io.Writer, bool, int, int) (int, error) {
+	return 1, errors.New("no such container")
 }

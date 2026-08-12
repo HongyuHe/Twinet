@@ -145,7 +145,7 @@ someone has checked.
 | Item | Milestone | Note |
 |---|---|---|
 | Serving the matrix, looking glass and web UI | M2 | The collectors and the analysis are implemented and tested; nothing yet serves their output, so a student cannot open a looking glass. This is the largest remaining gap in the student-facing workflow |
-| Gateway `goto` / `save` / SFTP | M2 | The gateway authenticates and scopes exec; the convenience verbs the old system had are not there |
+| Gateway `save` / SFTP | M2 | `goto`, `status` and `help` are there, and leaving a device shell now returns to the menu rather than dropping the connection. `save` from inside the gateway and SFTP file transfer are not; students collect work with `twinet save` from outside |
 | Krill as a live RPKI publication point | M2 | The lab serves an RTR feed derived from the topology, which is what the exercise needs; a real publication point with per-AS validators is the fuller version |
 | COS-461 Q2.6 stub-AS hijack scenarios | M7 | The RPKI machinery is in place and the check is honest; the scripted hijack scenarios are not written |
 | Diff-and-converge `apply` | M4 | Deploy is idempotent and now self-healing, but does not compute a minimal change plan |
