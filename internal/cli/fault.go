@@ -282,6 +282,21 @@ func newFaultResolveCmd(opts *Options) *cobra.Command {
 			if err != nil {
 				return err
 			}
+
+			// Held across the read, the resolving and the write.
+			//
+			// Injection takes this lock and resolution did not, so an
+			// injection running concurrently was read, resolved from under
+			// the other command, or overwritten by the record it wrote from
+			// the copy it had read before this one started. Either way a fault
+			// ends up live in the lab with nothing on disk saying so, which
+			// makes it unresolvable except by hand.
+			unlock, err := lockInjections(top)
+			if err != nil {
+				return err
+			}
+			defer unlock()
+
 			injections, err := loadInjections(top)
 			if err != nil {
 				return err

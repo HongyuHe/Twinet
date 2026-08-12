@@ -155,6 +155,33 @@ func newIncidentRunCmd(opts *Options) *cobra.Command {
 
 			// Inject, remembering each success so a partial failure can still
 			// be unwound: a lab left half-broken is worse than one never used.
+			//
+			// Each success is also written to the lab's injection record
+			// before the next one is attempted. That record is what `twinet
+			// fault status` reads and what `twinet fault resolve --all`
+			// undoes, and until this was done the list lived only in this
+			// process: an interrupted run, a lost connection, or a scenario
+			// held open with --keep left faults live in the lab with nothing
+			// on disk saying which, so the only way to find them was to know
+			// what had been run.
+			unlockInj, err := lockInjections(top)
+			if err != nil {
+				return err
+			}
+			ledger, err := loadInjections(top)
+			if err != nil {
+				unlockInj()
+				return err
+			}
+			journal := func(inj *fault.Injection) {
+				ledger = append(ledger, inj)
+				if err := saveInjections(top, ledger); err != nil {
+					fmt.Fprintf(cmd.ErrOrStderr(),
+						"warning: %s is live but could not be recorded (%v); "+
+							"`twinet fault resolve --all` will not undo it\n", inj.Fault, err)
+				}
+			}
+
 			var injected []*fault.Injection
 			for _, fs := range sc.Faults {
 				inj, err := fault.Inject(cmd.Context(), env, fs.Type, fs.Target)
@@ -163,6 +190,7 @@ func newIncidentRunCmd(opts *Options) *cobra.Command {
 					fmt.Fprintf(cmd.ErrOrStderr(), "injection failed: %v\n", err)
 					break
 				}
+				journal(inj)
 				injected = append(injected, inj)
 				ep.Truth = append(ep.Truth, inj.Truth)
 				if f, ok := fault.Lookup(fs.Type); ok {
@@ -194,10 +222,25 @@ func newIncidentRunCmd(opts *Options) *cobra.Command {
 					if err := fault.Resolve(cmd.Context(), env, injected[i]); err != nil {
 						fmt.Fprintf(cmd.ErrOrStderr(), "resolve: %v\n", err)
 						ep.Err = err.Error()
+						continue
+					}
+					// Removed from the record only once it is actually gone,
+					// so anything that failed to resolve stays listed and can
+					// be found later.
+					for j, l := range ledger {
+						if l.Fault == injected[i].Fault &&
+							l.Target.DeviceID() == injected[i].Target.DeviceID() {
+							ledger = append(ledger[:j], ledger[j+1:]...)
+							break
+						}
+					}
+					if err := saveInjections(top, ledger); err != nil {
+						fmt.Fprintf(cmd.ErrOrStderr(), "warning: updating the injection record: %v\n", err)
 					}
 				}
 				ep.Resolved = ep.Err == ""
 			}
+			unlockInj()
 			ep.Duration = time.Since(start).Round(time.Millisecond).String()
 
 			if outDir == "" {
