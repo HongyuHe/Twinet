@@ -9,13 +9,12 @@ import "testing"
 //
 // The listing is parsed and the last matching position removed instead.
 func TestTheInjectedRuleIsFoundByPositionNotBySpecification(t *testing.T) {
-	const listing = `Chain INPUT (policy ACCEPT)
-num  target     prot opt source               destination
-1    DROP       icmp --  0.0.0.0/0            0.0.0.0/0            icmptype 8
-2    ACCEPT     tcp  --  0.0.0.0/0            0.0.0.0/0
-3    DROP       icmp --  0.0.0.0/0            0.0.0.0/0            icmptype 8
+	const listing = `-P INPUT ACCEPT
+-A INPUT -p icmp -m icmp --icmp-type 8 -j DROP
+-A INPUT -p tcp -j ACCEPT
+-A INPUT -p icmp -m icmp --icmp-type 8 -j DROP
 `
-	got := lastMatchingPosition(listing, specTokens("-p icmp -m icmp --icmp-type 8"))
+	got := lastMatchingPosition(listing, "INPUT", specTokens("-p icmp -m icmp --icmp-type 8"))
 	if got != 3 {
 		t.Errorf("the injected rule was located at position %d, not 3. Removing the "+
 			"first match would delete the rule the student wrote and leave the "+
@@ -24,11 +23,10 @@ num  target     prot opt source               destination
 }
 
 func TestARuleThatIsNotThereHasNoPosition(t *testing.T) {
-	const listing = `Chain INPUT (policy ACCEPT)
-num  target     prot opt source               destination
-1    ACCEPT     tcp  --  0.0.0.0/0            0.0.0.0/0
+	const listing = `-P INPUT ACCEPT
+-A INPUT -p tcp -j ACCEPT
 `
-	if got := lastMatchingPosition(listing, specTokens("-p icmp")); got != 0 {
+	if got := lastMatchingPosition(listing, "INPUT", specTokens("-p icmp")); got != 0 {
 		t.Errorf("a chain with no matching rule reported position %d", got)
 	}
 }
@@ -44,5 +42,19 @@ func TestASpecificationIsReducedToWhatAListingShows(t *testing.T) {
 			t.Errorf("%q is an option flag or its argument, which a listing does not show "+
 				"in that form, so matching on it would never find the rule", g)
 		}
+	}
+}
+
+// The human listing renders the protocol as a number -- an OSPF rule appears as
+// "89", not "ospf" -- so matching a specification against it failed for every
+// rule named by protocol, and the fault could not be removed at all. That is
+// how three OSPF faults were left live on a lab.
+func TestARuleNamedByProtocolIsFound(t *testing.T) {
+	const listing = `-P INPUT ACCEPT
+-A INPUT -p ospf -j DROP
+`
+	if got := lastMatchingPosition(listing, "INPUT", specTokens("-p ospf")); got != 1 {
+		t.Errorf("an OSPF drop rule was located at position %d, not 1; the fault that "+
+			"installed it could not be undone", got)
 	}
 }

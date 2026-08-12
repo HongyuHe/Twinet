@@ -281,32 +281,37 @@ func describeACL(missing []string, chains string) string {
 // indistinguishable by specification and the injected one is always the later.
 func lastMatchingRule(ctx context.Context, e *Env, t Target, chain, match string) int {
 	out, code := e.Try(ctx, t.DeviceID(),
-		fmt.Sprintf("iptables -w -L %s --line-numbers -n 2>/dev/null", chain))
+		fmt.Sprintf("iptables -w -S %s 2>/dev/null", chain))
 	if code != 0 {
 		return 0
 	}
-	return lastMatchingPosition(out, specTokens(match))
+	return lastMatchingPosition(out, chain, specTokens(match))
 }
 
-// lastMatchingPosition parses an iptables listing and returns the position of
-// the last DROP rule that mentions every one of the given values.
-func lastMatchingPosition(out string, want []string) int {
-	last := 0
+// lastMatchingPosition returns the position of the last DROP rule in a chain
+// that mentions every one of the given values.
+//
+// It reads `iptables -S`, not `iptables -L`. The human listing renders the
+// protocol as a number -- an OSPF rule appears as "89", not "ospf" -- so
+// matching the specification against it failed for every rule named by
+// protocol, and the fault could not be removed at all. `-S` prints rules in
+// the same syntax they were added with, and the Nth "-A <chain>" line is
+// rule N.
+func lastMatchingPosition(out, chain string, want []string) int {
+	n, last := 0, 0
+	prefix := "-A " + chain + " "
 	for _, line := range strings.Split(out, "\n") {
-		f := strings.Fields(line)
-		if len(f) < 2 {
+		t := strings.TrimSpace(line)
+		if !strings.HasPrefix(t, prefix) {
 			continue
 		}
-		n, err := strconv.Atoi(f[0])
-		if err != nil {
-			continue
-		}
-		if !strings.Contains(line, "DROP") {
+		n++
+		if !strings.HasSuffix(t, "-j DROP") {
 			continue
 		}
 		all := true
 		for _, w := range want {
-			if !strings.Contains(line, w) {
+			if !strings.Contains(t, w) {
 				all = false
 				break
 			}
