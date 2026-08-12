@@ -211,6 +211,14 @@ func (n *Node) destroy(ctx context.Context, req agent.DestroyRequest) error {
 	return nil
 }
 
+// Hold asks the node's repair loop to leave a lab alone for a while. Seconds of
+// zero drops the hold.
+func (n *Node) Hold(ctx context.Context, lab, holder string, seconds int) error {
+	var resp struct{}
+	return n.do(ctx, http.MethodPost, "/v1/hold",
+		agent.HoldRequest{Lab: lab, Holder: holder, Seconds: seconds}, &resp)
+}
+
 // Exec runs a command in a container on the node.
 func (n *Node) Exec(ctx context.Context, req agent.ExecRequest) (agent.ExecResponse, error) {
 	var resp agent.ExecResponse
@@ -498,6 +506,14 @@ func (c *Cluster) Destroy(ctx context.Context, lab string, vnis []uint32) []Node
 func (c *Cluster) DestroyEphemeral(ctx context.Context, lab string, vnis []uint32) []NodeResult[struct{}] {
 	return fanOut(ctx, c.Nodes, func(ctx context.Context, n *Node) (struct{}, error) {
 		return struct{}{}, n.DestroyEphemeral(ctx, lab, vnis)
+	})
+}
+
+// Hold asks every node to leave a lab alone. Failures are returned per node so
+// a caller can decide whether to go ahead without one.
+func (c *Cluster) Hold(ctx context.Context, lab, holder string, seconds int) []NodeResult[struct{}] {
+	return fanOut(ctx, c.Nodes, func(ctx context.Context, n *Node) (struct{}, error) {
+		return struct{}{}, n.Hold(ctx, lab, holder, seconds)
 	})
 }
 

@@ -150,6 +150,12 @@ type Server struct {
 	// whole cluster, which is exactly what makes grading a class one submission
 	// at a time instead of many.
 	ops map[string]*lease
+
+	// holds are labs an external operation has asked this node to leave alone.
+	holds map[string]*hold
+
+	// repairFails counts consecutive failed repairs per device.
+	repairFails map[string]int
 }
 
 // lease records an in-flight mutating operation on one lab.
@@ -171,6 +177,9 @@ func New(cfg Config) (*Server, error) {
 		cfg: cfg, rt: engine, started: time.Now(),
 		current: map[string]*model.Topology{},
 		ops:     map[string]*lease{},
+		holds:   map[string]*hold{},
+
+		repairFails: map[string]int{},
 	}
 	if cfg.StateDir != "" {
 		st, err := state.Open(cfg.StateDir)
@@ -290,6 +299,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	mux.HandleFunc("POST /v1/apply", s.auth(s.handleApply))
 	mux.HandleFunc("POST /v1/destroy", s.auth(s.handleDestroy))
 	mux.HandleFunc("POST /v1/exec", s.auth(s.handleExec))
+	mux.HandleFunc("POST /v1/hold", s.auth(s.handleHold))
 	mux.HandleFunc("POST /v1/lifecycle", s.auth(s.handleLifecycle))
 	mux.HandleFunc("POST /v1/reshape", s.auth(s.handleReshape))
 	mux.HandleFunc("GET /v1/images", s.auth(s.handleImages))

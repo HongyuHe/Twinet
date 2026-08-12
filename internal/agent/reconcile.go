@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -57,6 +58,14 @@ func (s *Server) reconcileOnce(ctx context.Context) {
 
 	for name, top := range labs {
 		if top == nil {
+			continue
+		}
+		// An external operation -- grading, most often -- has asked to be left
+		// alone with this lab. It is deliberately manipulating devices, and a
+		// device mid-manipulation is indistinguishable from a broken one.
+		if who := s.heldBy(name); who != "" {
+			slog.Debug("leaving lab alone while it is held",
+				"lab", name, "holder", who)
 			continue
 		}
 		// The survey runs without the lab lock. Holding it for the whole scan
@@ -148,6 +157,9 @@ func (s *Server) repairLab(ctx context.Context, top *model.Topology, broken []*m
 		PeerUnderlay: s.peerUnderlay(top.Name),
 	}
 	for _, d := range broken {
+		if s.givingUpOn(d.ID) {
+			continue
+		}
 		// A router whose cables are all present and whose daemons have died
 		// needs the daemons started, not the device rebuilt. Rewiring it would
 		// re-render its configuration in platform mode, which in a lab
@@ -162,22 +174,22 @@ func (s *Server) repairLab(ctx context.Context, top *model.Topology, broken []*m
 			continue
 		}
 		if err := eng.RewireDevice(ctx, top, d); err != nil {
-			slog.Error("rewiring failed", "device", d.ID, "err", err)
+			s.repairFailed(d.ID, "rewiring failed", err)
 			continue
 		}
 		if _, err := deploy.Restore(ctx, s.rt, d, top.Name, s.store); err != nil {
-			slog.Error("configuration could not be put back after rewiring",
-				"device", d.ID, "err", err)
+			s.repairFailed(d.ID, "configuration could not be put back after rewiring", err)
 			continue
 		}
 		// Confirmed, not assumed. A repair that reports success without being
 		// checked is how the previous version of this loop claimed to have
 		// fixed routers it had left with no addresses and no routing daemon.
 		if why := s.brokenBecause(ctx, d); why != "" {
-			slog.Error("device is still not right after being repaired",
-				"device", d.ID, "reason", why)
+			s.repairFailed(d.ID, "device is still not right after being repaired",
+				errors.New(why))
 			continue
 		}
+		s.repairSucceeded(d.ID)
 		slog.Info("device repaired and its configuration put back", "device", d.ID)
 	}
 }
@@ -305,4 +317,48 @@ func (s *Server) startDaemons(ctx context.Context, d *model.Device) error {
 		return fmt.Errorf("still not running:%s", missing)
 	}
 	return nil
+}
+
+// Repairs that cannot succeed are attempted a few times and then left alone.
+//
+// A lab that is half removed -- the routers gone, their attached hosts still
+// running -- cannot be rewired: the other end of every cable is a container
+// that no longer exists. The loop retried each of those devices every minute
+// for as long as the node was up, filling the log with identical failures and
+// doing the work of a full survey on a lab nobody was using. Four such labs
+// were found on one node, left behind by grading runs whose cleanup had not
+// finished, and the noise made the one lab that was genuinely broken hard to
+// see.
+//
+// Giving up is recorded once, loudly, naming the device. It is not silence:
+// somebody has to remove the remains, and the message says so. A later
+// successful repair clears the count, so a device that recovers by itself is
+// looked after again without anything having to be restarted.
+const repairAttemptsBeforeGivingUp = 3
+
+func (s *Server) givingUpOn(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.repairFails[id] >= repairAttemptsBeforeGivingUp
+}
+
+func (s *Server) repairFailed(id, what string, err error) {
+	s.mu.Lock()
+	s.repairFails[id]++
+	n := s.repairFails[id]
+	s.mu.Unlock()
+
+	slog.Error(what, "device", id, "err", err, "attempt", n)
+	if n == repairAttemptsBeforeGivingUp {
+		slog.Error("giving up on repairing this device; it will be left as it is until "+
+			"something deploys or removes it. A device whose peers no longer exist cannot "+
+			"be rewired, and a lab in that state needs removing rather than repairing",
+			"device", id, "attempts", n)
+	}
+}
+
+func (s *Server) repairSucceeded(id string) {
+	s.mu.Lock()
+	delete(s.repairFails, id)
+	s.mu.Unlock()
 }

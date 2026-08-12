@@ -117,6 +117,16 @@ The lab must already be deployed with --solve.`,
 				parallel = 16
 			}
 
+			// Ask the nodes to leave this lab to us for the duration. This must
+			// come before the health check below: that check reads every
+			// router, and a repair loop rewiring one underneath it would make
+			// it report a problem that does not exist.
+			release, err := holdLab(cmd.Context(), top, token, cmd.ErrOrStderr())
+			if err != nil {
+				return err
+			}
+			defer release()
+
 			// Nobody is graded against a lab that is not working.
 			if bad := unhealthyRouters(cmd.Context(), exec, top); len(bad) > 0 {
 				shown := bad
@@ -163,7 +173,15 @@ The lab must already be deployed with --solve.`,
 
 				loaded := make([]submission, 0, len(wave))
 				for _, s := range wave {
-					err := resetToStudentStart(cmd.Context(), exec, top, s.AS)
+					// Wait for the lab to stop moving before touching it. A
+					// deploy or a repair rewires by removing an interface and
+					// adding it back, and a submission loaded during that
+					// instant fails on its first line for a reason that has
+					// nothing to do with its author.
+					err := waitForASWiring(cmd.Context(), exec, top, s.AS)
+					if err == nil {
+						err = resetToStudentStart(cmd.Context(), exec, top, s.AS)
+					}
 					if err == nil {
 						err = applySubmission(cmd.Context(), exec, top, s)
 					}

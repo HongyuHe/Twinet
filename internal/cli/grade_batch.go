@@ -907,3 +907,92 @@ func unhealthyRouters(ctx context.Context, exec execFn, top *model.Topology) []s
 	sort.Strings(bad)
 	return bad
 }
+
+// wiringWait bounds how long loading a submission waits for the lab to finish
+// moving underneath it.
+const wiringWait = 90 * time.Second
+
+// waitForWiring blocks until every device has the interfaces the lab says it
+// has, or gives up and says which one does not.
+//
+// Removing an interface and adding it back is how the platform rewires a
+// device, so for a moment during any deploy or repair the interface genuinely
+// is not there. A submission loaded in that moment failed on its first line --
+// `ip addr replace ... dev port_BOS: Cannot find device "port_BOS"` -- and its
+// owner was held for review for something that had nothing to do with them.
+// Seven of eight students in one class run were quarantined this way.
+//
+// Waiting is the right response because the condition is temporary by
+// construction: whatever removed the interface is in the middle of putting it
+// back. Waiting forever is not, because the same message is what a genuinely
+// misconfigured lab produces, and a grading run that hangs silently is worse
+// than one that stops and says why. So it waits, briefly, and then reports the
+// device and the interface it gave up on.
+func waitForWiring(ctx context.Context, exec execFn, devices []*model.Device, limit time.Duration) error {
+	deadline := time.Now().Add(limit)
+	for {
+		missing, err := firstMissingIface(ctx, exec, devices)
+		if err != nil || missing == "" {
+			return err
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("%s after waiting %s. Something is rewiring this lab -- "+
+				"a deploy, or a node repairing a device -- or the interface is genuinely "+
+				"absent and the lab needs redeploying", missing, limit)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
+	}
+}
+
+// firstMissingIface names a device interface the lab expects and the container
+// does not have, or "" if they all agree.
+func firstMissingIface(ctx context.Context, exec execFn, devices []*model.Device) (string, error) {
+	for _, d := range devices {
+		want := map[string]bool{}
+		for _, i := range d.Ifaces {
+			if i.Name != "" && i.Name != "lo" && (i.Link != nil || i.VLAN > 0) {
+				want[i.Name] = true
+			}
+		}
+		if len(want) == 0 {
+			continue
+		}
+		res, err := exec(ctx, d.ID, []string{"sh", "-c",
+			`ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1`})
+		if err != nil {
+			return "", fmt.Errorf("%s: checking its interfaces: %w", d.ID, err)
+		}
+		if res.ExitCode != 0 {
+			continue
+		}
+		have := map[string]bool{}
+		for _, n := range strings.Fields(res.Stdout) {
+			have[n] = true
+		}
+		names := make([]string, 0, len(want))
+		for n := range want {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		for _, n := range names {
+			if !have[n] {
+				return fmt.Sprintf("%s has no interface %s", d.ID, n), nil
+			}
+		}
+	}
+	return "", nil
+}
+
+// waitForASWiring waits for one autonomous system's devices to have the
+// interfaces the lab says they have.
+func waitForASWiring(ctx context.Context, exec execFn, top *model.Topology, asn int) error {
+	as, ok := top.ASes[asn]
+	if !ok {
+		return fmt.Errorf("AS %d is not in the harness", asn)
+	}
+	return waitForWiring(ctx, exec, as.Devices, wiringWait)
+}
