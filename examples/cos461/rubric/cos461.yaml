@@ -49,8 +49,13 @@ questions:
     depends_on: [q1.2]
     checks:
       # Exactly the three paths the assignment prescribes, and no others.
+      #
+      # Both directions. The question asks for load balancing between ATL and
+      # BOS, and a submission can produce it one way and not the other -- OSPF
+      # costs are per interface, so the reverse path is a separate answer that
+      # was going unmarked.
       - check: ospf.ecmp_paths
-        weight: 1.0
+        weight: 0.5
         args:
           a: ATL
           b: BOS
@@ -59,6 +64,16 @@ questions:
             - [ATL, BOS]
             - [ATL, PHY, NYC, BOS]
             - [ATL, PHY, BOS]
+      - check: ospf.ecmp_paths
+        weight: 0.5
+        args:
+          a: BOS
+          b: ATL
+          exclusive: true
+          paths:
+            - [BOS, ATL]
+            - [BOS, NYC, PHY, ATL]
+            - [BOS, PHY, ATL]
 
   - id: q1.4
     title: IPv6 addressing and 6in4 tunnels
@@ -122,7 +137,9 @@ questions:
     points: 1
     depends_on: [q2.2]
     checks:
+      - check: rpki.roa_published
+        weight: 0.3
       - check: rpki.invalid_rejected
-        weight: 0.6
-      - check: rpki.notfound_preserved
         weight: 0.4
+      - check: rpki.notfound_preserved
+        weight: 0.3

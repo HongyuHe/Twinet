@@ -1268,15 +1268,26 @@ func fieldAfter(line, key string) string {
 // reached directly, not across the exchange. Whether they are refused is a fact
 // about the table, and reading the route-map instead gave the mark to a filter
 // attached to nothing.
+//
+// The session is asked, not the next hop. At an exchange with a route server
+// the next hop of a relayed route is the *originating member's* address, not
+// the route server's, so selecting by next hop finds nothing at all and the
+// check passes for everybody -- vacuous in exactly the way it was written to
+// stop. `show ip bgp neighbors <rs> routes` is what the router itself
+// considers to have come from that session, after policy.
 func inRegionRoutesViaIXP(ctx context.Context, env *Env, router, ixpPeer string) ([]string, error) {
 	me, ok := env.Topology.ASes[env.AS]
 	if !ok || me.Region == "" {
 		// Without regions in the model there is nothing to be in or out of.
 		return nil, nil
 	}
+	// Every other system in this region counts, staff ASes included: the
+	// controlled announcers the exercise uses to test the filter are exactly
+	// the ones a student's policy must refuse, and excluding them left the
+	// check testing only the systems that had no reason to be there.
 	inRegion := map[int]bool{}
 	for asn, as := range env.Topology.ASes {
-		if asn != env.AS && as.Region == me.Region && as.Role == model.RoleStudent {
+		if asn != env.AS && as.Region == me.Region && as.Role != model.RoleIXP {
 			inRegion[asn] = true
 		}
 	}
@@ -1284,26 +1295,22 @@ func inRegionRoutesViaIXP(ctx context.Context, env *Env, router, ixpPeer string)
 		return nil, nil
 	}
 
-	tbl, err := bgpTable(ctx, env, router)
+	var got bgpRouteJSON
+	out, err := env.Vtysh(ctx, router,
+		fmt.Sprintf("show ip bgp neighbors %s routes json", ixpPeer))
 	if err != nil {
-		return nil, fmt.Errorf("reading %s's table to see what the exchange got through: %w",
-			router, err)
+		return nil, fmt.Errorf("reading what %s accepted from the exchange: %w", router, err)
 	}
+	if err := jsonUnmarshalLoose(out, &got); err != nil {
+		return nil, fmt.Errorf("reading what %s accepted from the exchange: %w", router, err)
+	}
+
 	var bad []string
-	for prefix, entries := range tbl.Table() {
+	for prefix, entries := range got.Table() {
 		for _, e := range entries {
-			viaIXP := false
-			for _, nh := range e.Nexthops {
-				if nh.IP == ixpPeer {
-					viaIXP = true
-				}
-			}
-			if !viaIXP && e.NextHop != ixpPeer {
-				continue
-			}
 			for _, f := range strings.Fields(e.Path) {
-				n, err := strconv.Atoi(f)
-				if err != nil || !inRegion[n] {
+				n, cerr := strconv.Atoi(f)
+				if cerr != nil || !inRegion[n] {
 					continue
 				}
 				bad = append(bad, fmt.Sprintf("%s (path %q)", prefix, strings.TrimSpace(e.Path)))

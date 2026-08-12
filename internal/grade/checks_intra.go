@@ -404,26 +404,43 @@ func checkECMP(ctx context.Context, env *Env) Result {
 		}
 	}
 
-	// Exclusivity: the source must use only the first hops the prescribed
-	// paths need, so a fourth path carrying traffic is caught.
+	// Exclusivity: at *every* router the prescribed paths pass through, the
+	// only next hops toward the destination are the ones those paths use.
+	//
+	// This used to look at the source alone, so a fourth path that diverges
+	// further along -- at PHY, say -- was invisible: the source's next hops
+	// were exactly right, and traffic was still taking a route the assignment
+	// does not prescribe. The question is which paths carry traffic, and that
+	// is decided at each hop, not at the first.
 	var extra []string
 	if exclusive {
-		allowed := map[string]bool{}
+		allowed := map[string][]string{}
 		for _, p := range wantPaths {
-			if len(p) > 1 {
-				allowed["port_"+p[1]] = true
+			for i := 0; i+1 < len(p); i++ {
+				allowed[p[i]] = append(allowed[p[i]], "port_"+p[i+1])
 			}
 		}
-		hops, _ := fetch(from)
-		for h := range hops {
-			if !allowed[h] {
-				extra = append(extra, h)
+		for _, router := range sortedKeysOfStrings(allowed) {
+			hops, err := fetch(router)
+			if err != nil {
+				fmt.Fprintf(&detail, "%s could not be read, so the paths through it could "+
+					"not be checked (%v)\n", router, err)
+				extra = append(extra, router+": unreadable")
+				continue
+			}
+			ok := map[string]bool{}
+			for _, h := range allowed[router] {
+				ok[h] = true
+			}
+			for h := range hops {
+				if !ok[h] {
+					extra = append(extra, router+" via "+h)
+					fmt.Fprintf(&detail, "%s also forwards toward %s over %s, which no "+
+						"prescribed path uses\n", router, to, h)
+				}
 			}
 		}
 		sort.Strings(extra)
-		for _, x := range extra {
-			fmt.Fprintf(&detail, "%s also forwards over %s, which no prescribed path uses\n", from, x)
-		}
 	}
 
 	got := make([]string, 0)
@@ -752,4 +769,15 @@ func ratio(got, want int) float64 {
 		got = 0
 	}
 	return float64(got) / float64(want)
+}
+
+// sortedKeysOfStrings returns a map's keys in order, so a report reads the same
+// way twice.
+func sortedKeysOfStrings(m map[string][]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
