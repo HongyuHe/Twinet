@@ -267,6 +267,21 @@ func gradeOne(ctx context.Context, class *model.Topology, rubric *grade.Rubric,
 	rep.Images = imageDigests(ctx, c, h)
 	rep.Controller = Version
 
+	// Nodes that disagree about what an image is means this mark was produced
+	// by whichever build happened to be on whichever node this AS landed on.
+	// Recording that in the provenance and releasing the mark anyway is the
+	// worst of both: the evidence is there and nobody is told to look at it.
+	for ref, id := range rep.Images {
+		if !strings.HasPrefix(id, "DISAGREEMENT") {
+			continue
+		}
+		rep.NeedsReview = true
+		rep.Err = appendNote(rep.Err, fmt.Sprintf(
+			"the nodes of this cluster do not agree on what %s is (%s), so this mark was "+
+				"produced by whichever build was on whichever node this system was placed "+
+				"on; make the images match and grade again", ref, strings.TrimPrefix(id, "DISAGREEMENT: ")))
+	}
+
 	// A reduced harness can fail a correct submission for a reason the student
 	// cannot see: a check that names a peer, or a route from a particular
 	// origin, cannot pass if that AS was sliced away. The mark is still
@@ -1307,4 +1322,12 @@ func notReadyToGrade(what string, bad []string, manifest string) error {
 		"--solve` to put it right, and note that a node busy with something else refuses "+
 		"the deploy, so check that it reported no problems before grading",
 		len(bad), what, strings.Join(shown, "\n  "), tail, manifest)
+}
+
+// appendNote joins report notes without losing either.
+func appendNote(have, add string) string {
+	if have == "" {
+		return add
+	}
+	return have + "; " + add
 }

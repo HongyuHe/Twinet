@@ -64,35 +64,64 @@ func TestFaultsLeaveNoMarkersInsideTheContainer(t *testing.T) {
 	}
 }
 
-// A fault must not be identifiable by a constant that appears in this
-// repository. An agent being benchmarked can reasonably be assumed to have read
-// the source; if the marker is the same on every injection, it can list the
-// switch's flows, find the one carrying the known value, and read the answer off
-// it without diagnosing anything.
-func TestFaultMarkersAreNotConstant(t *testing.T) {
-	seen := map[string]bool{}
-	for i := 0; i < 32; i++ {
-		c, err := randomCookie()
-		if err != nil {
-			t.Fatal(err)
-		}
-		if seen[c] {
-			t.Fatalf("randomCookie repeated %s within %d draws; the same marker on two "+
-				"injections is a tell across episodes", c, i+1)
-		}
-		seen[c] = true
-		if len(c) < 10 {
-			t.Errorf("marker %q is short enough to stand out among real cookies", c)
-		}
+// A fault must not be identifiable by anything it writes into the device.
+//
+// An agent being benchmarked can reasonably be assumed to have read this source.
+// The switches in this lab carry exactly one flow -- "cookie=0x0, priority=0,
+// actions=NORMAL" -- so a rule with a non-zero cookie, or a priority in the
+// tens of thousands, can be picked out of a flow dump instantly and the fault
+// read off it without diagnosing anything.
+//
+// A fault should look like the misconfiguration it is imitating.
+func TestFlowRulesDoNotAdvertiseThemselves(t *testing.T) {
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatal(err)
 	}
-	// And the constant it replaced must be gone.
-	files, _ := filepath.Glob("faults*.go")
+	tells := []struct {
+		pattern *regexp.Regexp
+		why     string
+	}{
+		{regexp.MustCompile(`cookie=(?:0x)?[1-9a-fA-F]`),
+			"a non-zero flow cookie, which nothing else in these labs sets"},
+		{regexp.MustCompile(`priority=[1-9][0-9]{4,}`),
+			"a priority far outside anything a person would write by hand"},
+		{regexp.MustCompile(`--comment\s`),
+			"a firewall rule comment, which marks the injected rule as not the student's"},
+	}
 	for _, f := range files {
+		if strings.HasSuffix(f, "_test.go") {
+			continue
+		}
 		src, err := os.ReadFile(f)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if strings.Contains(string(src), "0x7714e7") {
+		for i, line := range strings.Split(string(src), "\n") {
+			if strings.HasPrefix(strings.TrimSpace(line), "//") {
+				continue
+			}
+			for _, tell := range tells {
+				if m := tell.pattern.FindString(line); m != "" {
+					t.Errorf("%s:%d writes %q into the device under test: %s",
+						f, i+1, m, tell.why)
+				}
+			}
+		}
+	}
+
+	// And the constant that started all this must still be gone. Assembled
+	// rather than written out, so this test does not trip over itself.
+	gone := "0x" + "7714e7"
+	for _, f := range files {
+		if strings.HasSuffix(f, "_test.go") {
+			continue
+		}
+		src, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(src), gone) {
 			t.Errorf("%s still carries the fixed cookie that gave the fault away", f)
 		}
 	}

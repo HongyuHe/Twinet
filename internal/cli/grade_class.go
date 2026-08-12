@@ -259,7 +259,16 @@ The lab must already be deployed with --solve.`,
 					break
 				}
 
-				if !keepLoaded {
+				// --keep-loaded means the *last* wave stays in the lab, which
+				// is what its description says and what investigating a
+				// disputed mark needs. It used to skip the restore after every
+				// wave, so the second submission was graded on top of the
+				// first, the third on top of both, and the marks drifted
+				// further from the truth the longer the run went on -- with
+				// nothing in the report saying which student's work each mark
+				// had actually measured.
+				lastWave := i+1 == len(waves)
+				if !keepLoaded || !lastWave {
 					if err := restoreWave(cmd.Context(), opts, top, loaded, token); err != nil {
 						// Carrying on would grade every later wave against this
 						// wave's work and report the results as if they were
@@ -304,7 +313,8 @@ The lab must already be deployed with --solve.`,
 	cmd.Flags().IntVar(&perWave, "per-wave", 1,
 		"submissions loaded into the lab at once; above 1 trades provable isolation for speed")
 	cmd.Flags().BoolVar(&keepLoaded, "keep-loaded", false,
-		"leave the last wave's submissions in the lab, for investigating a disputed mark")
+		"leave the final wave's submissions in the lab afterwards, for investigating a "+
+			"disputed mark; earlier waves are still put back")
 	return cmd
 }
 

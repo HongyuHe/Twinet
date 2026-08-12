@@ -86,11 +86,18 @@ func newGradeRunCmd(opts *Options) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "run",
 		Short: "Grade the autonomous systems of a running lab",
-		Long: `Grades one or more ASes of a deployed lab and writes structured reports.
+		Long: `Grades one or more ASes of a deployed lab exactly as they are, and writes
+structured reports.
 
-Submissions are graded concurrently, and every wait is a convergence predicate
-rather than a fixed sleep, so a whole class completes in minutes rather than
-the hours a sleep-driven serial grader takes.`,
+This is a diagnostic, not the way to mark a class. It reads whatever is in the
+lab right now: it does not put anybody's system back to the reference first, so
+each system is measured across its neighbours in whatever state they happen to
+be in, and one student's broken configuration lowers their neighbours' marks.
+
+Use it to check the reference solution, to investigate one submission, or to see
+where a lab stands. To mark a class, use "twinet grade class", which loads one
+submission at a time onto a blank system with the rest of the internet at the
+reference, and holds the nodes off from repairing anything while it does.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			top, err := loadAndPlace(opts)
 			if err != nil {
@@ -109,12 +116,31 @@ the hours a sleep-driven serial grader takes.`,
 				return err
 			}
 
+			// The nodes are asked to leave the lab alone for this too. Reading
+			// a system takes seconds, but a repair rewiring a device in the
+			// middle of it re-renders configuration, and in a solved lab that
+			// is the reference being written over whatever is there -- which
+			// this command would then report as the answer.
+			held, herr := holdLab(cmd.Context(), top, token, cmd.ErrOrStderr())
+			if herr != nil {
+				return herr
+			}
+			defer held.Release()
+
 			targets := asList
 			if len(targets) == 0 {
 				for _, asn := range top.SortedASNs() {
 					if top.ASes[asn].Role == model.RoleStudent {
 						targets = append(targets, asn)
 					}
+				}
+				if len(targets) > 1 {
+					fmt.Fprintf(cmd.ErrOrStderr(),
+						"reading all %d systems as they stand. These are not class marks: "+
+							"nothing has been put back to the reference, so each system is "+
+							"measured across its neighbours in whatever state they are in, and "+
+							"one broken submission lowers its neighbours' scores.\nUse "+
+							"`twinet grade class` to mark a class.\n", len(targets))
 				}
 			}
 			if len(targets) == 0 {
