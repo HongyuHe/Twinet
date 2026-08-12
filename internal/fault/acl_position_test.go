@@ -73,3 +73,34 @@ func TestAPortIsPartOfTheRuleIdentity(t *testing.T) {
 			"removed the rule for port 123 instead", got)
 	}
 }
+
+// Every learned BGP path prints "Local host: <addr>, Local port: 179", so
+// looking for the word "Local" anywhere was true whenever the prefix was in
+// the table at all. For a hijack of a real neighbour's prefix that is always,
+// and the fault could then never be resolved: its own verification insisted it
+// was still present after the configuration had been removed.
+func TestALearnedPathIsNotMistakenForALocalOrigin(t *testing.T) {
+	const learned = `BGP routing table entry for 3.0.0.0/8, version 62
+Paths: (2 available, best #1, table default)
+  3
+    179.3.5.1 from 179.3.5.1 (3.151.0.1)
+      Origin IGP, metric 0, localpref 250, valid, external, best
+      Last update: Wed Aug 12 07:00:00 2026
+      Local host: 179.3.5.2, Local port: 179
+`
+	if locallyOriginated(learned) {
+		t.Error("a prefix learned from a neighbour was read as one this router originates, " +
+			"so the hijack fault could never be resolved")
+	}
+
+	const originated = `BGP routing table entry for 3.0.0.0/8, version 63
+Paths: (1 available, best #1, table default)
+  Local
+    0.0.0.0 from 0.0.0.0 (5.152.0.1)
+      Origin IGP, metric 0, weight 32768, valid, sourced, local, best
+`
+	if !locallyOriginated(originated) {
+		t.Error("a prefix this router originates was not recognised, so the hijack would " +
+			"report that it had not taken effect")
+	}
+}

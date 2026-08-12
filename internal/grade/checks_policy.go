@@ -931,6 +931,16 @@ func checkRPKIInvalidRejected(ctx context.Context, env *Env) Result {
 				"here can be invalid)")
 			continue
 		}
+		// Configured is not connected. A router whose cache is declared but
+		// unreachable sees every arriving route as not-found, accepts invalid
+		// origins, and has an empty invalid table -- which the table half of
+		// this check reads as success. Liveness was aggregated across the
+		// autonomous system, so one healthy router vouched for all of them.
+		if conn, _ := env.Vtysh(ctx, r.Name, "show rpki cache-connection"); !strings.Contains(conn, "Connected") {
+			exposed = append(exposed, r.Name+" (its validator session is configured but not "+
+				"connected, so nothing arriving here can be invalid)")
+			continue
+		}
 		for _, peer := range peers {
 			if denyMatches(cfg.appliedBody(peer, "in"), "rpki invalid") {
 				protected = append(protected, r.Name+" "+peer)

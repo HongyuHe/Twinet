@@ -632,6 +632,17 @@ func vlanList(d *model.Device) string {
 // deviceFacts writes a machine-readable description of the device into the
 // container, so tooling inside it (the student shell, save/restore, the
 // grader's probes) never has to guess or re-derive the topology.
+//
+// It deliberately omits the addressing of interfaces the *student* owns.
+//
+// This file listed every prescribed address, including the ones a student is
+// meant to configure themselves. For a teaching lab that is only mildly
+// unhelpful. For the root-cause benchmark it is the answer: three of the
+// end-host faults change an address, and an agent could find them by comparing
+// this file with `ip addr` instead of diagnosing anything -- an oracle no other
+// backend in the comparison has. What the platform configured is still
+// described, because that is what the container's own tooling needs and it is
+// not what anybody is being asked to work out.
 func deviceFacts(top *model.Topology, d *model.Device) []byte {
 	var b strings.Builder
 	b.WriteString("{\n")
@@ -648,8 +659,12 @@ func deviceFacts(top *model.Topology, d *model.Device) []byte {
 		if ifc.Peer != nil {
 			peer = ifc.Peer.Device.ID + ":" + ifc.Peer.Name
 		}
+		addr4, addr6 := ifc.Addr4, ifc.Addr6
+		if ifc.Owner != model.OwnerPlatform {
+			addr4, addr6 = "", ""
+		}
 		fmt.Fprintf(&b, "    {\"name\": %q, \"role\": %q, \"owner\": %q, \"addr4\": %q, \"addr6\": %q, \"vlan\": %d, \"peer\": %q}",
-			ifc.Name, ifc.Role, ifc.Owner, ifc.Addr4, ifc.Addr6, ifc.VLAN, peer)
+			ifc.Name, ifc.Role, ifc.Owner, addr4, addr6, ifc.VLAN, peer)
 		if i < len(d.Ifaces)-1 {
 			b.WriteString(",")
 		}

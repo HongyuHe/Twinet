@@ -264,6 +264,16 @@ type Fault struct {
 	Verify func(ctx context.Context, env *Env, t Target, s State) (Evidence, error)
 	// Resolve undoes the fault using the state Inject returned.
 	Resolve func(ctx context.Context, env *Env, t Target, s State) error
+	// Precondition returns why this fault would change nothing on this target,
+	// or "" if it may be injected.
+	//
+	// A fault whose symptom is already present verifies without having done
+	// anything, and the episode then records a cause that is not the reason
+	// anything is broken -- which makes every answer graded against it wrong.
+	// It is declared per fault rather than derived by running the verifier
+	// backwards, because the verifiers that poll for a transition wait out
+	// their whole symptom window to conclude that nothing is wrong yet.
+	Precondition func(ctx context.Context, env *Env, t Target) (string, error)
 }
 
 // Truth builds the ground truth for an application of this fault.
@@ -386,6 +396,32 @@ func Inject(ctx context.Context, env *Env, name string, t Target) (*Injection, e
 		} else if t.AS != d.ASN {
 			return nil, fmt.Errorf("device %s belongs to AS %d, not AS %d",
 				d.ID, d.ASN, t.AS)
+		}
+	}
+
+	// The symptom must not already be there.
+	//
+	// Verification asks whether the fault's predicate is true afterwards, and
+	// a predicate that was already true is satisfied by doing nothing at all.
+	// Injecting `link_down` on an interface that was already down, or
+	// `frr_service_down` where FRR had already died, therefore reported
+	// success -- and the episode's ground truth then named a cause that was
+	// not the reason anything was broken. Every answer graded against that
+	// truth is wrong, and it is the failure this benchmark cannot tolerate.
+	//
+	// A fault declares its own precondition rather than the engine running the
+	// verifier backwards. Running the verifier was tried and is far too
+	// expensive: the ones that poll for a transition wait out their whole
+	// symptom window before concluding that nothing is wrong yet, which turned
+	// a ninety-second suite into one that does not finish. A precondition is a
+	// single cheap question the fault already knows how to ask.
+	if f.Precondition != nil {
+		if why, perr := f.Precondition(ctx, env, t); perr != nil {
+			return nil, fmt.Errorf("inject %s: its precondition could not be checked: %w",
+				name, perr)
+		} else if why != "" {
+			return nil, fmt.Errorf("inject %s: %s, so injecting would change nothing while "+
+				"claiming to be the cause", name, why)
 		}
 	}
 

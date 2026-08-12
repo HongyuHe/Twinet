@@ -14,6 +14,17 @@ func init() {
 	// ---- link failures -------------------------------------------------
 	Register(&Fault{
 		Name: "link_down", Category: CatLink, Needs: []Capability{CapInterface},
+		Precondition: func(ctx context.Context, e *Env, t Target) (string, error) {
+			iface, err := faultIface(e, t)
+			if err != nil {
+				return "", err
+			}
+			out, _ := e.Try(ctx, t.DeviceID(), "ip -o link show dev "+iface)
+			if out != "" && !strings.Contains(out, "state UP") && !strings.Contains(out, "UP,") {
+				return iface + " on " + t.DeviceID() + " is already down", nil
+			}
+			return "", nil
+		},
 		Symptom:  "Users report connectivity issues to other hosts.",
 		Describe: "An interface was administratively shut down.",
 		Inject: func(ctx context.Context, e *Env, t Target) (State, error) {
@@ -153,6 +164,13 @@ func init() {
 	// ---- node errors ----------------------------------------------------
 	Register(&Fault{
 		Name: "frr_service_down", Category: CatNodeError, Needs: []Capability{CapService, CapFRR},
+		Precondition: func(ctx context.Context, e *Env, t Target) (string, error) {
+			out, _ := e.Try(ctx, t.DeviceID(), procRunning("/bgpd")+" && echo running || echo stopped")
+			if strings.Contains(out, "stopped") {
+				return "FRR is not running on " + t.DeviceID() + " to begin with", nil
+			}
+			return "", nil
+		},
 		Symptom:  "Users report connectivity issues to other hosts in the network.",
 		Describe: "The routing daemon was stopped, so the router stops participating in OSPF and BGP.",
 		Inject: func(ctx context.Context, e *Env, t Target) (State, error) {
@@ -665,15 +683,16 @@ func init() {
 				func(c context.Context) (string, error) {
 					return e.Vtysh(c, t.DeviceID(), "show bgp ipv4 unicast "+victim)
 				},
-				func(o string) bool { return strings.Contains(o, "Local") })
+				func(o string) bool { return locallyOriginated(o) })
 			if err != nil {
 				return Evidence{}, err
 			}
+			got := locallyOriginated(out)
 			originated := firstLine(out)
-			if !strings.Contains(out, "Local") {
+			if !got {
 				originated = "the router is not originating " + victim
 			}
-			return Evidence{Verified: strings.Contains(out, "Local"),
+			return Evidence{Verified: got,
 				Expected: "AS " + fmt.Sprint(t.AS) + " originates " + victim,
 				Observed: originated}, nil
 		},
@@ -1018,4 +1037,24 @@ func ospfPeerOnNetwork(e *Env, t Target, subnet string) (string, error) {
 	}
 	return "", fmt.Errorf("no link on %s carries subnet %s, so the adjacency the fault "+
 		"changed cannot be identified", d.ID, subnet)
+}
+
+// locallyOriginated reports whether `show bgp <prefix>` shows a path this
+// router originates itself.
+//
+// It used to look for the word "Local" anywhere in the output, and every
+// learned path prints "Local host: <addr>, Local port: 179". So the check was
+// true whenever the prefix was in the table at all -- which for a hijack of a
+// real neighbour's prefix is always. The fault could then never be resolved:
+// its own verification insisted it was still present after the configuration
+// had been removed. That happened on this cluster and needed a hand repair.
+//
+// FRR prints a locally originated path as a line containing only "Local".
+func locallyOriginated(out string) bool {
+	for _, line := range strings.Split(out, "\n") {
+		if strings.TrimSpace(line) == "Local" {
+			return true
+		}
+	}
+	return false
 }

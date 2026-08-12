@@ -204,11 +204,23 @@ func Run(ctx context.Context, r *Rubric, env *Env, opts RunOptions) *Report {
 		// skip the wait before a later one that depends on more state.
 		if q.Converge {
 			if err := waitForScope(ctx, env, q.ConvergeScope, opts.ConvergeTimeout); err != nil {
+				// A network that will not settle is usually the submission.
+				//
+				// This flagged the whole report for review, and the release
+				// guard then withheld every mark on it -- so a student whose
+				// OSPF was simply not configured had their entire paper held
+				// back rather than marked, which is a worse answer than the
+				// low mark their work earns. The code elsewhere says exactly
+				// this: student non-convergence is a mark, not an outage.
+				//
+				// It is recorded as a warning on the report either way, so a
+				// marker reading it sees that the network had not settled. Only
+				// an infrastructure failure -- a node that could not be reached
+				// -- withholds the mark, and that is tracked separately.
 				rep.Warnings = append(rep.Warnings,
 					fmt.Sprintf("the network had not settled before %s: %v", q.ID, err))
-				qr.NeedsReview = true
-				qr.Note = "the control plane had not converged when this was assessed"
-				rep.NeedsReview = true
+				qr.Note = "the control plane had not converged when this was assessed, " +
+					"which is usually the submission's own doing"
 			}
 		}
 

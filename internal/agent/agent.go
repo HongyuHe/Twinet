@@ -817,7 +817,17 @@ func (s *Server) handleDestroy(w http.ResponseWriter, r *http.Request) {
 	if s.store != nil && !req.Force && !req.Ephemeral {
 		s.mu.Lock()
 		top := s.current[req.Lab]
+		solved := s.modes[req.Lab] == string(render.ModeSolve)
 		s.mu.Unlock()
+		// Not while the reference solution is what is on the devices.
+		//
+		// Capture was stopped on the apply path and not here, so destroying a
+		// solved grading lab -- which is every lab a class run touches -- still
+		// filed the answer as each student's saved configuration, to be
+		// replayed the next time anything recreated their container.
+		if solved {
+			top = nil
+		}
 		if top != nil {
 			if n, err := eng.CaptureAll(r.Context(), top, s.store); err != nil {
 				httpError(w, http.StatusConflict, fmt.Errorf(
@@ -947,6 +957,9 @@ func (s *Server) handleImages(w http.ResponseWriter, r *http.Request) {
 // different queue from the one the topology describes, and every later
 // measurement on it is quietly wrong.
 type ReshapeRequest struct {
+	// Hold is the caller's grading-hold token, if it has one.
+	Hold string `json:"hold,omitempty"`
+
 	Container string       `json:"container"`
 	Iface     string       `json:"iface"`
 	Shaping   netx.Shaping `json:"shaping"`
@@ -961,6 +974,14 @@ func (s *Server) handleReshape(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Container == "" || req.Iface == "" {
 		httpError(w, http.StatusBadRequest, errors.New("container and iface are both required"))
+		return
+	}
+	// Changing a link's delay or bandwidth during a class run changes the
+	// marks on the traffic-engineering question, and nothing in the report
+	// would say the network had been reshaped underneath it.
+	if why := s.refuseMutationIfHeld(s.labOfContainer(req.Container), req.Hold,
+		"reshaping a link"); why != "" {
+		httpError(w, http.StatusConflict, errors.New(why))
 		return
 	}
 	c, err := s.rt.Inspect(r.Context(), req.Container)
