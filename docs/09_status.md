@@ -23,11 +23,11 @@ missed it is recorded as a miss.
 | Staged deployment DAG with per-scope failure isolation | done | `internal/plan`; tests assert stage ordering, real concurrency, and that one broken AS does not stop a class |
 | Convergence predicates in place of sleeps | done | `internal/plan.Wait`, `internal/grade/converge.go` |
 | Single-node deployment | done | 4-AS demo: 57 devices, 74 links, 64 s |
-| Node agent and cluster fabric | done | 12-AS lab: 211 devices, 291 links across 3 nodes in **83 s**, zero failures |
+| Node agent and cluster fabric | done | 12-AS lab: 212 devices, 299 links across 3 nodes in **58 s**, zero failures |
 | Cross-node VXLAN | done | 50.22 ms measured for a 25 ms configured delay, 9 µs jitter, no duplicates |
 | AS-granular placement | done | 13.4 % of links cross the fabric; `twinet inspect --placement` |
 | Underlay MTU verification | done | `twinet node check` refuses a lab that would not fit and names the MTU to use |
-| Grading engine: rubric, 17 checks, structured reports | done | 3 submissions in **31 s**; JSON, text and CSV output |
+| Grading engine: rubric, 22 registered checks, structured reports | done | the COS-461 rubric uses 18 of them; 8 systems graded in **79 s**; JSON, text and CSV output |
 | Reference solution (`--solve`) | done | scores **10.00 / 10.00** against its own rubric, verified end to end and re-checked by `make e2e` |
 | Container images | done | `hyhe/twinet-{router,host,switch,svc}` |
 | Reference solution | **10.00 / 10.00** | verified end to end on the live cluster; a rubric whose reference cannot score full marks is unfalsifiable, and every student who loses that mark loses it to the platform |

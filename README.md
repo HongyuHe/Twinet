@@ -12,9 +12,11 @@ group for the Internet to work.
 > **Status: under construction.** The design is in [`docs/`](docs/); what is
 > built and measured so far is in [`docs/09_status.md`](docs/09_status.md).
 >
-> A twelve-AS lab of 211 containers and 291 links currently deploys across three
-> machines in 83 seconds, and a rubric-driven grading run completes a submission
-> in about ten seconds.
+> A twelve-AS lab of 212 containers and 299 links currently deploys across three
+> machines in 58 seconds. Grading a system that is already converged takes about
+> ten seconds of checks; grading a *submission* takes about five minutes, almost
+> all of it waiting for the network to settle after the submission is loaded and
+> again after the reference is put back.
 
 ## What it is for
 

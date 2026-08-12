@@ -470,7 +470,12 @@ func overlayOwner(vxName string) (string, bool, error) {
 		if _, ok := err.(netlink.LinkNotFoundError); ok {
 			return "", false, nil
 		}
-		return "", false, nil
+		// Anything else is reported. Returning "there is no overlay" for a
+		// lookup that failed for some other reason turns a transient error
+		// into permission to take an identifier another lab is using, and
+		// joining two labs' traffic together is not a failure anybody
+		// diagnoses quickly.
+		return "", false, fmt.Errorf("look up %s: %w", vxName, err)
 	}
 	return ownerFromAlias(l.Attrs().Alias), true, nil
 }

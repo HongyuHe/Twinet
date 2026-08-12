@@ -1166,14 +1166,24 @@ func countROAs(out string) int {
 // `ip -d tunnel show` always lists the kernel's sit0 with "remote any local
 // any"; it is not the student's work and matching it awards the mark before
 // the exercise is begun.
+//
+// The encapsulation is checked, not just the endpoints. The question asks for
+// IPv6 over IPv4 -- protocol 41, a SIT device, printed by iproute2 as
+// "ipv6/ip". A GRE tunnel between the same two addresses also carries the
+// traffic and also moves the counters, so accepting any tunnel with two
+// endpoints gave the mark for a different answer to a different question.
 func configuredTunnel(out string) string {
 	for _, line := range strings.Split(out, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || !strings.Contains(line, "remote ") || !strings.Contains(line, "local ") {
 			continue
 		}
-		name := strings.TrimSuffix(strings.Fields(line)[0], ":")
+		fields := strings.Fields(line)
+		name := strings.TrimSuffix(fields[0], ":")
 		if name == "sit0" || name == "" {
+			continue
+		}
+		if len(fields) < 2 || fields[1] != "ipv6/ip" {
 			continue
 		}
 		if fieldAfter(line, "remote") == "any" || fieldAfter(line, "local") == "any" {

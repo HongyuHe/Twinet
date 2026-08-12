@@ -567,6 +567,9 @@ func resolveImageIDs(ctx context.Context, top *model.Topology, token string) err
 			if err := sameEverywhere(byRef); err != nil {
 				return err
 			}
+			if err := allOrNoneHaveIt(byRef, list, len(cl.Nodes)); err != nil {
+				return err
+			}
 		}
 	} else {
 		rt := runtime.NewDocker()
@@ -592,6 +595,43 @@ func resolveImageIDs(ctx context.Context, top *model.Topology, token string) err
 // The alternative is to deploy anyway and let each student run whatever build
 // happens to be on the node their AS landed on. Nothing downstream can detect
 // that, and no report would mention it.
+// allOrNoneHaveIt refuses a deployment in which some nodes hold an image and
+// others do not.
+//
+// A node without the image is about to pull it, and the tag may have been
+// rebuilt since the others pulled theirs -- so the deployment stamps the old
+// digest into every container's specification while one node quietly runs new
+// software. Nothing downstream can tell, and a student's mark then depends on
+// which machine their autonomous system was placed on.
+//
+// Nobody having it is the ordinary first deployment and is allowed: they will
+// all pull the same tag within seconds of each other, and the next deployment
+// resolves and agrees.
+func allOrNoneHaveIt(byRef map[string]map[string]string, refs []string, nodes int) error {
+	if nodes <= 1 {
+		return nil
+	}
+	var problems []string
+	for _, ref := range refs {
+		have := len(byRef[ref])
+		if have == 0 || have == nodes {
+			continue
+		}
+		problems = append(problems, fmt.Sprintf(
+			"  %s is on %d of %d nodes (%s)", ref, have, nodes,
+			strings.Join(sortedKeysOf(byRef[ref]), ", ")))
+	}
+	if len(problems) == 0 {
+		return nil
+	}
+	return fmt.Errorf("some nodes hold these images and some do not:\n%s\n"+
+		"The nodes without them are about to pull, and if the tag has been rebuilt "+
+		"since the others pulled theirs, half the lab runs different software while "+
+		"every report says one thing. Pull on every node first (`docker pull <image>` "+
+		"on each), or refer to the image by digest so the tag cannot move",
+		strings.Join(problems, "\n"))
+}
+
 func sameEverywhere(byRef map[string]map[string]string) error {
 	var problems []string
 	for _, ref := range sortedKeysOf(byRef) {

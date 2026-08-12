@@ -279,8 +279,15 @@ over a student's work while it is being marked.
 asking. It is a lease with a deadline, not a switch: a grader that is killed
 stops renewing, and the nodes resume looking after the lab by themselves within
 three minutes. Nobody has to remember to turn repairs back on, and no crash can
-leave them off. A node that refuses the request says so and grading continues,
-because an agent too old to know the call should not make the command unusable.
+leave them off.
+
+Every node must agree, and grading refuses to start if one will not hold. A
+hold on two nodes of three is not a hold: the devices of a lab this size are
+spread across all of them, and the third node's repair loop rewires its share
+regardless. If the hold lapses partway through a run -- two renewals failing in
+a row -- the wave being graded and everything after it is held for review rather
+than marked, because from that moment nothing can say whether a mark measures
+the student's work or the reference being written back over it.
 
 Loading also waits, briefly, for the interfaces the lab says a device has. Any
 deploy rewires by removing an interface and adding it back, so the condition is

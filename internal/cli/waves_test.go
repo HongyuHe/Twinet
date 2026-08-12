@@ -279,3 +279,36 @@ func TestSubmissionsSharingATransitAreNotGradedTogether(t *testing.T) {
 		}
 	}
 }
+
+// --per-wave N means at most N at a time. It used to mean "as many as the
+// colouring allows", so --per-wave 2 and --per-wave 100 behaved identically
+// and an operator asking for a cautious amount of parallelism got all of it.
+func TestPerWaveLimitsHowManyRunTogether(t *testing.T) {
+	wide := [][]submission{
+		{{Group: "a", AS: 1}, {Group: "b", AS: 2}, {Group: "c", AS: 3}, {Group: "d", AS: 4}, {Group: "e", AS: 5}},
+		{{Group: "f", AS: 6}},
+	}
+	got := capWaves(wide, 2)
+	for i, w := range got {
+		if len(w) > 2 {
+			t.Errorf("wave %d has %d submissions, more than the 2 that were asked for", i, len(w))
+		}
+	}
+	total := 0
+	for _, w := range got {
+		total += len(w)
+	}
+	if total != 6 {
+		t.Errorf("%d submissions survived the split, not 6; someone would go unmarked", total)
+	}
+	if len(got) != 4 {
+		t.Errorf("6 submissions capped at 2 gave %d waves, want 4", len(got))
+	}
+}
+
+func TestPerWaveLeavesSmallWavesAlone(t *testing.T) {
+	in := [][]submission{{{Group: "a", AS: 1}}, {{Group: "b", AS: 2}}}
+	if got := capWaves(in, 8); len(got) != 2 {
+		t.Errorf("waves already smaller than the cap were split into %d", len(got))
+	}
+}

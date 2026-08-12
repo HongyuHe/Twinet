@@ -282,7 +282,15 @@ func gradeOne(ctx context.Context, class *model.Topology, rubric *grade.Rubric,
 	return rep
 }
 
-// imageDigests resolves every image the lab uses to the digest in use.
+// imageDigests resolves every image the lab uses to the digest in use, for the
+// provenance recorded beside a mark.
+//
+// It used to take the first node that answered and stop. Nodes drift, and when
+// they do a student's routers run whichever build landed on whichever node
+// their AS was placed on -- so the report stated one image identity for marks
+// produced by two. An image the nodes do not agree on is recorded as exactly
+// that, because a provenance line that quietly names one of two builds is worse
+// than one that says the question has no single answer.
 func imageDigests(ctx context.Context, c *client.Cluster, top *model.Topology) map[string]string {
 	seen := map[string]bool{}
 	var refs []string
@@ -293,12 +301,43 @@ func imageDigests(ctx context.Context, c *client.Cluster, top *model.Topology) m
 		}
 	}
 	sort.Strings(refs)
+
+	byRef := map[string]map[string]string{}
 	for _, n := range c.Nodes {
-		if got, err := n.ImageDigests(ctx, refs); err == nil && len(got) > 0 {
-			return got
+		got, err := n.ImageDigests(ctx, refs)
+		if err != nil {
+			continue
+		}
+		for ref, id := range got {
+			if id == "" {
+				continue
+			}
+			if byRef[ref] == nil {
+				byRef[ref] = map[string]string{}
+			}
+			byRef[ref][n.Name] = id
 		}
 	}
-	return nil
+
+	out := map[string]string{}
+	for ref, perNode := range byRef {
+		nodes := sortedKeysOf(perNode)
+		first := perNode[nodes[0]]
+		agreed := true
+		var parts []string
+		for _, n := range nodes {
+			parts = append(parts, fmt.Sprintf("%s on %s", shortID(perNode[n]), n))
+			if perNode[n] != first {
+				agreed = false
+			}
+		}
+		if agreed {
+			out[ref] = first
+			continue
+		}
+		out[ref] = "DISAGREEMENT: " + strings.Join(parts, "; ")
+	}
+	return out
 }
 
 // missingASes reports which ASes of the class topology a harness left out.

@@ -141,12 +141,17 @@ The lab must already be deployed with --solve.`,
 
 			var waves [][]submission
 			if perWave > 1 {
-				waves = independentWaves(top, subs)
+				// --per-wave N means at most N at a time, and it used to mean
+				// "as many as the colouring allows": --per-wave 2 and
+				// --per-wave 100 behaved identically, so an operator asking for
+				// a cautious amount of parallelism silently got all of it.
+				waves = capWaves(independentWaves(top, subs), perWave)
 				fmt.Fprintf(cmd.ErrOrStderr(),
-					"grading %d submission(s) in %d wave(s); within a wave no two submissions "+
-						"are within two systems of each other.\nThat is a heuristic, not a proof of "+
-						"isolation: run without --per-wave for marks that are final.\n",
-					len(subs), len(waves))
+					"grading %d submission(s) in %d wave(s), at most %d at a time; within a "+
+						"wave no two submissions are within two systems of each other.\nThat is "+
+						"a heuristic, not a proof of isolation: run without --per-wave for marks "+
+						"that are final.\n",
+					len(subs), len(waves), perWave)
 			} else {
 				for _, s := range subs {
 					waves = append(waves, []submission{s})
@@ -521,6 +526,28 @@ func joinComma(v []string) string {
 			out += ", "
 		}
 		out += s
+	}
+	return out
+}
+
+// capWaves splits waves so none is larger than the operator asked for.
+//
+// The colouring decides which submissions may share a wave; this decides how
+// many actually do. They are different questions, and conflating them meant
+// --per-wave N ignored N entirely.
+func capWaves(waves [][]submission, max int) [][]submission {
+	if max <= 0 {
+		return waves
+	}
+	var out [][]submission
+	for _, w := range waves {
+		for len(w) > max {
+			out = append(out, w[:max])
+			w = w[max:]
+		}
+		if len(w) > 0 {
+			out = append(out, w)
+		}
 	}
 	return out
 }

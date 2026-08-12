@@ -516,18 +516,27 @@ func checkVLANIsolation(ctx context.Context, env *Env) Result {
 	}
 
 	// Across VLANs: reachable, but through the gateway.
+	//
+	// "Two hops or more" was the whole test, and it is satisfied by any path
+	// that is not direct -- including one that bypasses the gateway entirely,
+	// which is the misconfiguration the question is about. The first hop must
+	// be the gateway, and it is now checked by address.
 	if len(vlans) >= 2 {
 		src, dst := hosts[vlans[0]][0], hosts[vlans[1]][0]
 		total++
-		hops, err := traceHops(ctx, env, src, dst)
+		hops, first, err := traceFirstHop(ctx, env, src, dst)
 		switch {
 		case err != nil:
 			fmt.Fprintf(&detail, "%s cannot reach %s across VLANs (%v)\n", src.Name, dst.Name, err)
-		case hops >= 2:
-			passed++
-		default:
+		case hops < 2:
 			fmt.Fprintf(&detail, "%s %s; different VLANs must be separated at layer 2\n",
 				src.Name, describeReach(dst.Name, hops))
+		case first != "" && !deviceHasAddr(gateway, first):
+			fmt.Fprintf(&detail, "%s reaches %s across VLANs, but its first hop is %s, "+
+				"which is not %s; traffic between VLANs must be routed by the gateway\n",
+				src.Name, dst.Name, first, gateway.Name)
+		default:
+			passed++
 		}
 	}
 
@@ -599,6 +608,52 @@ func traceHops(ctx context.Context, env *Env, src, dst *model.Device) (int, erro
 		return 0, err
 	}
 	return countTracerouteHops(res.Stdout, addr), nil
+}
+
+// traceFirstHop reports how many hops away a destination is and the address
+// that answered first, which is what says *through what* the traffic went.
+func traceFirstHop(ctx context.Context, env *Env, src, dst *model.Device) (int, string, error) {
+	addr := firstAddr(dst)
+	if addr == "" {
+		return 0, "", fmt.Errorf("%s has no address configured", dst.Name)
+	}
+	res, err := env.Probe(ctx, src.ID, []string{"traceroute", "-n", "-q", "1", "-w", "2", "-m", "8", addr})
+	if err != nil {
+		return 0, "", err
+	}
+	return countTracerouteHops(res.Stdout, addr), firstTracerouteHop(res.Stdout), nil
+}
+
+// firstTracerouteHop returns the address that answered at hop 1, or "" if
+// nothing did.
+func firstTracerouteHop(out string) string {
+	for _, line := range strings.Split(out, "\n") {
+		m := hopRe.FindStringSubmatch(line)
+		if m == nil || m[1] != "1" {
+			continue
+		}
+		if m[2] == "*" {
+			return ""
+		}
+		return m[2]
+	}
+	return ""
+}
+
+// deviceHasAddr reports whether an address belongs to a device.
+func deviceHasAddr(d *model.Device, addr string) bool {
+	if d == nil {
+		return false
+	}
+	for _, i := range d.Ifaces {
+		if i.Addr4 != "" && ipOnly(i.Addr4) == addr {
+			return true
+		}
+		if i.Addr6 != "" && ipOnly(i.Addr6) == addr {
+			return true
+		}
+	}
+	return false
 }
 
 // describeReach turns a hop count into something that is true.

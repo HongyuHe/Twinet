@@ -393,6 +393,7 @@ func checkNoTransit(ctx context.Context, env *Env) Result {
 
 	// For each non-customer neighbour, look at what we advertise to them.
 	var leaks []string
+	var silent []string
 	var unreadable []string
 	checked := 0
 	for _, r := range routers {
@@ -409,9 +410,11 @@ func checkNoTransit(ctx context.Context, env *Env) Result {
 				continue
 			}
 			checked++
+			sawOwn := false
 			for prefix, entries := range adv.Table() {
 				if own != "" && prefix == own {
 					announced++
+					sawOwn = true
 				}
 				for _, e := range entries {
 					// A route we originate has an empty path and may go anywhere.
@@ -427,6 +430,10 @@ func checkNoTransit(ctx context.Context, env *Env) Result {
 							r.Name, prefix, src, strings.TrimSpace(e.Path), rel, addr))
 					}
 				}
+			}
+			if !sawOwn {
+				silent = append(silent, fmt.Sprintf("%s advertises nothing of its own to the %s at %s",
+					r.Name, rel, addr))
 			}
 		}
 	}
@@ -453,10 +460,28 @@ func checkNoTransit(ctx context.Context, env *Env) Result {
 			Command: "show ip bgp neighbors <addr> advertised-routes",
 		})
 	}
+	// Reaching one neighbour is not reaching the internet.
+	//
+	// This counted advertisements in total, so a policy that announced the
+	// prefix to a single provider and denied every other peer and provider
+	// passed with full marks -- an AS almost nobody can reach, marked the same
+	// as one that is correctly connected. Each session is now asked separately.
+	if len(silent) > 0 && len(leaks) == 0 {
+		sort.Strings(silent)
+		return Partial("policy.no_transit_for_peers", 0.5, Evidence{
+			Expected: "your own prefix advertised to every peer and provider, and nothing learned from them",
+			Observed: fmt.Sprintf("nothing leaks, but %d of %d non-customer sessions carry "+
+				"nothing of your own", len(silent), checked),
+			Detail: strings.Join(truncate(silent, 5), "\n"),
+			Hint: "an export policy that denies everything leaks nothing, but the networks " +
+				"behind those sessions cannot reach you at all",
+			Command: "show ip bgp neighbors <addr> advertised-routes",
+		})
+	}
 	if len(leaks) == 0 {
 		return Pass("policy.no_transit_for_peers", Evidence{
-			Observed: fmt.Sprintf("no leaks across %d neighbour views; own prefix advertised to %d of them",
-				checked, announced)})
+			Observed: fmt.Sprintf("no leaks across %d neighbour views; own prefix advertised to all of them",
+				checked)})
 	}
 	sort.Strings(leaks)
 	if len(leaks) > 12 {

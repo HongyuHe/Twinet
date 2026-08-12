@@ -377,6 +377,6 @@ does not exist would produce an episode with no symptom, which is worse than an
 absent fault because it looks like a working one.
 
 Every registered fault is exercised against the live cluster by `make e2e`,
-which injects and resolves all thirty-seven in about thirty-six seconds. A fault
+which injects and resolves all forty-two in about a minute. A fault
 that cannot be undone is treated as a failure there, because an episode that
 contaminates the next one is worse than an episode that never ran.
