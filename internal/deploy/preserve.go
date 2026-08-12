@@ -437,6 +437,10 @@ func fieldAfter(line, key string) string {
 }
 
 // studentOwned reports whether a device holds configuration a student wrote.
+// StudentOwned reports whether a device's configuration belongs to a student,
+// which is what decides whether it is captured before being destroyed.
+func StudentOwned(top *model.Topology, d *model.Device) bool { return studentOwned(top, d) }
+
 func studentOwned(top *model.Topology, d *model.Device) bool {
 	as, ok := top.ASes[d.ASN]
 	if !ok {

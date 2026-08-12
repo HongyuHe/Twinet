@@ -146,12 +146,18 @@ func (s *Server) repairLab(ctx context.Context, top *model.Topology, broken []*m
 	// reference solution, so a class was graded against a network in which
 	// some systems had quietly stopped being the answer they were meant to be.
 	// Nothing reported it, because the repair itself succeeded.
+	// The mode alone is not enough. A private grading harness is deployed
+	// solved *except* for the one system being marked, which keeps the
+	// platform's starting configuration; replaying only "solve" rebuilds that
+	// system holding the reference answer, for the student whose work is being
+	// marked against it, and reports the repair as a success.
 	s.mu.Lock()
 	mode := s.modes[top.Name]
+	ungraded := s.ungraded[top.Name]
 	s.mu.Unlock()
 	eng := &deploy.Engine{
 		Runtime: s.rt, Node: s.cfg.Node, State: s.store,
-		Renderer:     render.New(top, render.Mode(mode)),
+		Renderer:     renderer(top, render.Mode(mode), ungraded),
 		UnderlayIP:   s.cfg.UnderlayIP,
 		UnderlayDev:  s.cfg.UnderlayDev,
 		PeerUnderlay: s.peerUnderlay(top.Name),

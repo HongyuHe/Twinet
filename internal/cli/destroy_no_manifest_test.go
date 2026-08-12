@@ -67,4 +67,21 @@ func TestDevicesAreRebuiltFromContainerLabels(t *testing.T) {
 	if top.Name != "cos461" {
 		t.Errorf("lab name is %q", top.Name)
 	}
+
+	// Capturing selects devices by node and by whether the system is a
+	// student's. Reconstructed devices used to have neither, so CaptureAll
+	// matched nothing: `destroy --lab` reported "captured 0 snapshots" and
+	// removed a term's work having saved none of it.
+	eng := &deploy.Engine{Node: "local"}
+	if got := len(top.DevicesOnNode(eng.Node)); got != 3 {
+		t.Errorf("capturing looks for devices on node %q and finds %d of %d; "+
+			"a destroy would save nothing before removing them",
+			eng.Node, got, len(top.Devices))
+	}
+	for _, id := range []string{"as3/ATL", "as3/ATL_host"} {
+		if !deploy.StudentOwned(top, top.Devices[id]) {
+			t.Errorf("%s is not treated as a student's, so its configuration would "+
+				"be discarded rather than captured", id)
+		}
+	}
 }

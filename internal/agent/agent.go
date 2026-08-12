@@ -134,6 +134,9 @@ type Server struct {
 	// modes records what each lab was applied as, so a repair rebuilds what
 	// the lab is rather than what it started as.
 	modes map[string]string
+
+	// ungraded is the AS each lab exempted from the reference solution, if any.
+	ungraded map[string]int
 	// peers records the VTEP address of every other node, per lab, so that a
 	// cross-node link can be rebuilt without waiting for the controller to
 	// send the map again.
@@ -228,10 +231,7 @@ func (s *Server) rehydrate() {
 			continue
 		}
 		s.current[top.Name] = top
-		if s.modes == nil {
-			s.modes = map[string]string{}
-		}
-		s.modes[top.Name] = wt.Mode
+		s.rememberHow(top.Name, wt.Mode, wt.Ungraded)
 		if wt.PeerUnderlay != nil {
 			if s.peers == nil {
 				s.peers = map[string]map[string]string{}
@@ -279,6 +279,27 @@ func (s *Server) acquire(lab, kind string) error {
 	}
 	s.ops[lab] = &lease{kind: kind, at: time.Now()}
 	return nil
+}
+
+// rememberHow records how a lab was deployed, so a repair rebuilds what the lab
+// is rather than what the software would build from scratch.
+//
+// Both halves are needed and they are recorded together. A private grading
+// harness is deployed solved except for the one system being marked; replaying
+// only the mode rebuilds that system with the reference answer on it, for the
+// student whose work is being marked against it. Recording them in one place
+// means a caller cannot record half of it.
+//
+// The caller holds s.mu.
+func (s *Server) rememberHow(lab, mode string, ungraded int) {
+	if s.modes == nil {
+		s.modes = map[string]string{}
+	}
+	if s.ungraded == nil {
+		s.ungraded = map[string]int{}
+	}
+	s.modes[lab] = mode
+	s.ungraded[lab] = ungraded
 }
 
 func (s *Server) release(lab string) {
@@ -606,10 +627,7 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 	// would try to capture student work from containers that did not exist.
 	if !req.DryRun {
 		s.current[top.Name] = top
-		if s.modes == nil {
-			s.modes = map[string]string{}
-		}
-		s.modes[top.Name] = req.Mode
+		s.rememberHow(top.Name, req.Mode, req.Ungraded)
 	}
 	if s.peers == nil {
 		s.peers = map[string]map[string]string{}
@@ -625,22 +643,40 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 	// anything to capture.
 	// A dry run changed nothing, so recording it would make the node claim to
 	// host a lab that was never built.
+	var recordFailure string
 	if s.store != nil && !req.DryRun {
 		// The peer map travels with the lab so a node that restarts can rebuild
 		// a cross-node link without the controller.
 		wt := req.Topology
 		wt.PeerUnderlay = req.PeerUnderlay
 		wt.Mode = req.Mode
-		if raw, err := json.Marshal(wt); err == nil {
-			if err := s.store.PutTopology(top.Name, raw); err != nil {
-				slog.Warn("recording the applied topology", "lab", top.Name, "err", err)
-			}
+		wt.Ungraded = req.Ungraded
+		raw, err := json.Marshal(wt)
+		if err == nil {
+			err = s.store.PutTopology(top.Name, raw)
+		}
+		if err != nil {
+			// Reported to the caller, not merely journaled.
+			//
+			// This is the record that tells a restarted agent the node hosts
+			// anything at all. Without it the node comes back believing it is
+			// empty: nothing is repaired, and the next destroy removes a
+			// class's work without capturing it, because there is no topology
+			// saying there was anything to capture. An operator who is told
+			// the deploy succeeded has no reason to look in the journal.
+			slog.Error("recording the applied topology", "lab", top.Name, "err", err)
+			recordFailure = fmt.Sprintf("the deployment was applied but this node could "+
+				"not record it (%v); if this agent restarts it will believe the node is "+
+				"empty, and nothing here will be repaired or preserved", err)
 		}
 	}
 
 	resp := ApplyResponse{
 		Node: s.cfg.Node, Steps: p.Len(),
 		DurationMS: rep.Duration.Milliseconds(),
+	}
+	if recordFailure != "" {
+		resp.Failures = map[string][]string{"state": {recordFailure}}
 	}
 
 	// Pruning happens only after a clean run and only when asked, so a partial

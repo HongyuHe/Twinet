@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
@@ -121,28 +120,23 @@ The lab must already be deployed with --solve.`,
 			// come before the health check below: that check reads every
 			// router, and a repair loop rewiring one underneath it would make
 			// it report a problem that does not exist.
-			release, err := holdLab(cmd.Context(), top, token, cmd.ErrOrStderr())
+			held, err := holdLab(cmd.Context(), top, token, cmd.ErrOrStderr())
 			if err != nil {
 				return err
 			}
-			defer release()
+			defer held.Release()
 
-			// Nobody is graded against a lab that is not working.
+			// Nobody is graded against a lab that is not working. Both halves
+			// matter: a router with no routing process and a device with a
+			// missing cable are invisible where they are and expensive
+			// somewhere else, on somebody else's mark.
+			if bad := miswiredDevices(cmd.Context(), exec, top); len(bad) > 0 {
+				return notReadyToGrade("device(s) in this lab do not have the interfaces "+
+					"the lab says they have", bad, opts.Manifest)
+			}
 			if bad := unhealthyRouters(cmd.Context(), exec, top); len(bad) > 0 {
-				shown := bad
-				if len(shown) > 8 {
-					shown = shown[:8]
-				}
-				return fmt.Errorf("%d router(s) in this lab are not running their routing "+
-					"processes, so nothing can be graded against it yet:\n  %s%s\n"+
-					"A router with no routing process has no symptom of its own -- its "+
-					"neighbours fail to converge, and the marks land on students whose work "+
-					"is correct.\nRun `twinet deploy -m %s --solve` to start them, and note "+
-					"that a node busy with something else refuses the deploy, so check that "+
-					"it reported no problems before grading",
-					len(bad), strings.Join(shown, "\n  "),
-					map[bool]string{true: fmt.Sprintf("\n  ... and %d more", len(bad)-len(shown))}[len(bad) > len(shown)],
-					opts.Manifest)
+				return notReadyToGrade("router(s) in this lab are not running their "+
+					"routing processes", bad, opts.Manifest)
 			}
 
 			var waves [][]submission
@@ -169,6 +163,21 @@ The lab must already be deployed with --solve.`,
 			contaminated := ""
 
 			for i, wave := range waves {
+				// If the nodes have stopped leaving this lab alone, everything
+				// from here on is being graded against a lab something else is
+				// changing. That is not a slow run or a bad mark, it is an
+				// unknown one, so the rest is held for review rather than
+				// scored.
+				select {
+				case <-held.Lost:
+					contaminated = fmt.Sprintf("the nodes stopped holding this lab off "+
+						"from automatic repair partway through: %s", held.Reason())
+					reports = append(reports, quarantine(waves[i:], rubric.MaxTotal(), contaminated)...)
+				default:
+				}
+				if contaminated != "" {
+					break
+				}
 				fmt.Fprintf(cmd.ErrOrStderr(), "\nwave %d/%d: %s\n", i+1, len(waves), groupNames(wave))
 
 				loaded := make([]submission, 0, len(wave))

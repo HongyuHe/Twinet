@@ -3,6 +3,7 @@ package agent
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"time"
 )
@@ -30,7 +31,12 @@ import (
 // and that nobody notices until something else breaks months later.
 type hold struct {
 	holder string
-	until  time.Time
+	// token is proof of ownership. Without one, any caller could renew or drop
+	// a hold another grading run is relying on -- and the second caller would
+	// be told it had succeeded. Two graders on one lab is a mistake, but it
+	// must be a loud one.
+	token string
+	until time.Time
 }
 
 // HoldRequest asks for, renews, or drops a hold.
@@ -41,6 +47,8 @@ type HoldRequest struct {
 	Holder string `json:"holder"`
 	// Seconds is how long the hold should last from now. Zero drops it.
 	Seconds int `json:"seconds"`
+	// Token identifies the holder across calls.
+	Token string `json:"token,omitempty"`
 }
 
 // maxHoldSeconds bounds a single lease. A caller that wants longer renews,
@@ -57,26 +65,40 @@ func (s *Server) handleHold(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, errors.New("a lab name is required"))
 		return
 	}
-	s.applyHold(req)
+	if err := s.applyHold(req); err != nil {
+		httpError(w, http.StatusConflict, err)
+		return
+	}
 	writeJSON(w, struct{}{})
 }
 
-// applyHold takes, renews or drops a hold. The cap lives here rather than in
-// the handler so it cannot be bypassed by a future second caller.
-func (s *Server) applyHold(req HoldRequest) {
+// applyHold takes, renews or drops a hold, and refuses if somebody else has it.
+//
+// The cap lives here rather than in the handler so it cannot be bypassed by a
+// future second caller.
+func (s *Server) applyHold(req HoldRequest) error {
 	if req.Seconds > maxHoldSeconds {
 		req.Seconds = maxHoldSeconds
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if cur, ok := s.holds[req.Lab]; ok && time.Now().Before(cur.until) &&
+		cur.token != "" && cur.token != req.Token {
+		return fmt.Errorf("lab %q is already held by %s for another %s; two operations "+
+			"grading or repairing the same lab at once would each undo the other's work",
+			req.Lab, cur.holder, time.Until(cur.until).Round(time.Second))
+	}
 	if req.Seconds <= 0 {
 		delete(s.holds, req.Lab)
-		return
+		return nil
 	}
 	s.holds[req.Lab] = &hold{
 		holder: req.Holder,
+		token:  req.Token,
 		until:  time.Now().Add(time.Duration(req.Seconds) * time.Second),
 	}
+	return nil
 }
 
 // heldBy names what is holding a lab, or "" if the repair loop may proceed.

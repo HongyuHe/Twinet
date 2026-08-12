@@ -685,7 +685,62 @@ func wipeDeviceState(ctx context.Context, exec execFn, d *model.Device) error {
 		return fmt.Errorf("%s: clearing the previous submission: %s",
 			d.ID, firstLine(res.Stderr+res.Stdout))
 	}
-	return nil
+	// The script above suppresses every individual error and ends with
+	// `exit 0`, deliberately: a route that another line already removed, or an
+	// interface a student never addressed, must not stop the reset. But that
+	// makes its exit status worthless as evidence, and the thing it is evidence
+	// *for* is that the next student is being graded on their own work rather
+	// than on the last one's.
+	//
+	// So the device is read back. Anything the reset was supposed to remove and
+	// did not is reported, by name, and grading stops rather than marking
+	// somebody against a system still carrying somebody else's tunnels.
+	return verifyWiped(ctx, exec, d)
+}
+
+// verifyWiped reads a device back and reports what the reset failed to remove.
+func verifyWiped(ctx context.Context, exec execFn, d *model.Device) error {
+	const probe = `echo "--tunnels"; ip -d tunnel show 2>/dev/null | grep -v '^sit0:' | cut -d: -f1
+echo "--routes"; ip -o -4 route show 2>/dev/null | grep -v " proto "
+echo "--routes6"; ip -o -6 route show 2>/dev/null | grep -v " proto " | grep -v "^fe80"`
+
+	res, err := exec(ctx, d.ID, []string{"sh", "-c", probe})
+	if err != nil {
+		return fmt.Errorf("%s: checking that the previous submission was cleared: %w", d.ID, err)
+	}
+	if res.ExitCode != 0 {
+		return fmt.Errorf("%s: checking that the previous submission was cleared: %s",
+			d.ID, firstLine(res.Stderr+res.Stdout))
+	}
+
+	var left []string
+	section := ""
+	for _, line := range strings.Split(res.Stdout, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "--") {
+			section = strings.TrimPrefix(line, "--")
+			continue
+		}
+		switch section {
+		case "tunnels":
+			left = append(left, "tunnel "+line)
+		case "routes", "routes6":
+			left = append(left, "route "+line)
+		}
+	}
+	if len(left) == 0 {
+		return nil
+	}
+	sort.Strings(left)
+	if len(left) > 6 {
+		left = append(left[:6], fmt.Sprintf("... and %d more", len(left)-6))
+	}
+	return fmt.Errorf("%s still carries the previous submission's work after being reset "+
+		"(%s). Grading the next submission here would mark it on somebody else's "+
+		"configuration", d.ID, strings.Join(left, "; "))
 }
 
 // scriptCommands are the commands a submitted script may use.
@@ -902,8 +957,23 @@ func unhealthyRouters(ctx context.Context, exec execFn, top *model.Topology) []s
 			defer func() { <-sem }()
 			res, err := exec(ctx, d.ID, []string{"sh", "-c", script})
 			if err != nil || res.ExitCode != 0 {
-				// Unreachable is a different problem, and reporting it here as
-				// a dead daemon would send someone looking in the wrong place.
+				// A router that cannot be read is not a router that is well.
+				// This used to return quietly, so a stopped container, an
+				// unreachable node or a failing exec all counted as healthy and
+				// the class was graded against them -- the students who lost
+				// marks were the neighbours of whatever could not be seen.
+				//
+				// It is reported as its own condition rather than as a dead
+				// daemon, so nobody is sent to look in the wrong place.
+				detail := "could not be read"
+				if err != nil {
+					detail = fmt.Sprintf("could not be read: %v", err)
+				} else if line := firstLine(res.Stderr + res.Stdout); line != "" {
+					detail = "could not be read: " + line
+				}
+				mu.Lock()
+				bad = append(bad, d.ID+" ("+detail+")")
+				mu.Unlock()
 				return
 			}
 			if missing := strings.TrimSpace(res.Stdout); missing != "" {
@@ -958,6 +1028,45 @@ func waitForWiring(ctx context.Context, exec execFn, devices []*model.Device, li
 	}
 }
 
+// miswiredDevices names every device of the lab that does not have the
+// interfaces the lab says it has, or cannot be read at all.
+//
+// This is a precondition for grading anybody, for the same reason the daemon
+// sweep is. A device with a missing cable produces no symptom of its own: its
+// neighbours fail to reach through it, and the marks land on whoever owns
+// them. Checking two hundred devices costs a few seconds against the forty
+// minutes a class run costs.
+func miswiredDevices(ctx context.Context, exec execFn, top *model.Topology) []string {
+	var (
+		mu  sync.Mutex
+		bad []string
+		wg  sync.WaitGroup
+	)
+	sem := make(chan struct{}, 32)
+	for _, d := range top.SortedDevices() {
+		wg.Add(1)
+		go func(d *model.Device) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			what, err := firstMissingIface(ctx, exec, []*model.Device{d})
+			switch {
+			case err != nil:
+				mu.Lock()
+				bad = append(bad, fmt.Sprintf("%s (could not be read: %v)", d.ID, err))
+				mu.Unlock()
+			case what != "":
+				mu.Lock()
+				bad = append(bad, what)
+				mu.Unlock()
+			}
+		}(d)
+	}
+	wg.Wait()
+	sort.Strings(bad)
+	return bad
+}
+
 // firstMissingIface names a device interface the lab expects and the container
 // does not have, or "" if they all agree.
 func firstMissingIface(ctx context.Context, exec execFn, devices []*model.Device) (string, error) {
@@ -977,7 +1086,8 @@ func firstMissingIface(ctx context.Context, exec execFn, devices []*model.Device
 			return "", fmt.Errorf("%s: checking its interfaces: %w", d.ID, err)
 		}
 		if res.ExitCode != 0 {
-			continue
+			return "", fmt.Errorf("%s: listing its interfaces exited %d: %s",
+				d.ID, res.ExitCode, firstLine(res.Stderr+res.Stdout))
 		}
 		have := map[string]bool{}
 		for _, n := range strings.Fields(res.Stdout) {
@@ -1005,4 +1115,26 @@ func waitForASWiring(ctx context.Context, exec execFn, top *model.Topology, asn 
 		return fmt.Errorf("AS %d is not in the harness", asn)
 	}
 	return waitForWiring(ctx, exec, as.Devices, wiringWait)
+}
+
+// notReadyToGrade explains why a lab cannot be graded yet, and what to do.
+//
+// It is one function because the two preconditions -- routing processes and
+// wiring -- have the same shape, the same consequence and the same remedy, and
+// because the remedy has a step people miss: a deploy that collided with
+// something else on a node reports it and exits non-zero, having left that
+// node's devices created but unconfigured.
+func notReadyToGrade(what string, bad []string, manifest string) error {
+	shown := bad
+	tail := ""
+	if len(shown) > 8 {
+		shown = shown[:8]
+		tail = fmt.Sprintf("\n  ... and %d more", len(bad)-len(shown))
+	}
+	return fmt.Errorf("%d %s, so nothing can be graded against it yet:\n  %s%s\n"+
+		"A broken device has no symptom of its own -- its neighbours fail to converge, "+
+		"and the marks land on students whose work is correct.\nRun `twinet deploy -m %s "+
+		"--solve` to put it right, and note that a node busy with something else refuses "+
+		"the deploy, so check that it reported no problems before grading",
+		len(bad), what, strings.Join(shown, "\n  "), tail, manifest)
 }

@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -213,10 +214,10 @@ func (n *Node) destroy(ctx context.Context, req agent.DestroyRequest) error {
 
 // Hold asks the node's repair loop to leave a lab alone for a while. Seconds of
 // zero drops the hold.
-func (n *Node) Hold(ctx context.Context, lab, holder string, seconds int) error {
+func (n *Node) Hold(ctx context.Context, lab, holder, token string, seconds int) error {
 	var resp struct{}
 	return n.do(ctx, http.MethodPost, "/v1/hold",
-		agent.HoldRequest{Lab: lab, Holder: holder, Seconds: seconds}, &resp)
+		agent.HoldRequest{Lab: lab, Holder: holder, Token: token, Seconds: seconds}, &resp)
 }
 
 // Exec runs a command in a container on the node.
@@ -538,11 +539,20 @@ func (c *Cluster) stampImageIDs(ctx context.Context, top *model.Topology) {
 	}
 	sort.Strings(list)
 
-	// Nodes are asked in a fixed order and the first non-empty answer wins, so
-	// that two callers resolving at the same moment agree even while a pull is
-	// in flight on one node. Whether the nodes agree with each other is a
-	// separate question, checked by the deploy command, which can refuse.
+	// Nodes are asked in a fixed order, and they must agree.
+	//
+	// Taking the first answer and moving on is how a lab ends up running two
+	// different builds at once: one node is rebuilt, a push half-succeeds, a
+	// pull is interrupted, and from then on a student's routers run whichever
+	// image landed on whichever node their AS was placed on. That was measured
+	// on this cluster -- all four images differed between node-0 and the other
+	// two -- while every report said the deployment was current. A mark that
+	// depends on where a container was scheduled is not a mark.
+	//
+	// A node that has not pulled an image yet is not a disagreement: it has no
+	// opinion, and the deployment is about to give it one.
 	seen := map[string]string{}
+	disagree := map[string][]string{}
 	if len(c.Nodes) == 0 {
 		// A lab that runs on this machine alone. Asking the local daemon is
 		// the same question; leaving the field empty here would recreate every
@@ -561,16 +571,44 @@ func (c *Cluster) stampImageIDs(ctx context.Context, top *model.Topology) {
 			continue
 		}
 		for ref, id := range got {
-			if id != "" && seen[ref] == "" {
+			if id == "" {
+				continue
+			}
+			if seen[ref] == "" {
 				seen[ref] = id
+				continue
+			}
+			if seen[ref] != id {
+				disagree[ref] = append(disagree[ref],
+					fmt.Sprintf("%s has %s", n.Name, short(id)))
 			}
 		}
+	}
+	// Where the nodes disagree, no identity is stamped. The spec hash then
+	// omits it, which leaves the containers alone rather than replacing them
+	// with one node's idea of the image and not another's; the deploy command
+	// checks the same thing and refuses outright, which is the louder and
+	// better answer when a person is present to hear it.
+	for ref, who := range disagree {
+		delete(seen, ref)
+		slog.Warn("nodes do not agree on what an image is, so its identity is not being "+
+			"used; deploy will refuse until they match",
+			"image", ref, "disagreement", strings.Join(who, ", "))
 	}
 	for _, d := range top.Devices {
 		if d.ImageID == "" {
 			d.ImageID = seen[d.Image]
 		}
 	}
+}
+
+// short abbreviates a digest for a message a person has to read.
+func short(id string) string {
+	id = strings.TrimPrefix(id, "sha256:")
+	if len(id) > 12 {
+		return id[:12]
+	}
+	return id
 }
 
 // Destroy removes the lab from every node.
@@ -590,9 +628,9 @@ func (c *Cluster) DestroyEphemeral(ctx context.Context, lab string, vnis []uint3
 
 // Hold asks every node to leave a lab alone. Failures are returned per node so
 // a caller can decide whether to go ahead without one.
-func (c *Cluster) Hold(ctx context.Context, lab, holder string, seconds int) []NodeResult[struct{}] {
+func (c *Cluster) Hold(ctx context.Context, lab, holder, token string, seconds int) []NodeResult[struct{}] {
 	return fanOut(ctx, c.Nodes, func(ctx context.Context, n *Node) (struct{}, error) {
-		return struct{}{}, n.Hold(ctx, lab, holder, seconds)
+		return struct{}{}, n.Hold(ctx, lab, holder, token, seconds)
 	})
 }
 

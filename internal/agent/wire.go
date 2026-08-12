@@ -38,6 +38,14 @@ type Wire struct {
 	// deployed solved deletes the reference solution from that router --
 	// quietly, as a side effect of a repair that reports success.
 	Mode string `json:"mode,omitempty"`
+	// Ungraded is the one AS that was left at the platform's own configuration
+	// while the rest of the lab was solved, for a private grading harness.
+	//
+	// It is recorded with the mode because a repair that replays only the mode
+	// rebuilds a solved renderer for every AS -- including this one, which is
+	// the student's. The device would come back holding the reference answer
+	// for the very system being marked, and nothing would say so.
+	Ungraded int `json:"ungraded_as,omitempty"`
 	// LabSpec is the manifest itself, carried whole.
 	//
 	// Reconstructing a minimal Lab on the far side and copying across the few

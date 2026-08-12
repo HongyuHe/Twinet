@@ -994,12 +994,28 @@ func topologyFromLabels(lab string, cs []runtime.Container) *model.Topology {
 			Kind:      model.DeviceKind(c.Labels[deploy.LabelKind]),
 			ASN:       asn,
 			Container: c.Name,
+			Owner:     c.Labels[deploy.LabelOwner],
+			// The node this device is on, as far as the engine reading it is
+			// concerned, is this one: these containers were found by asking
+			// this machine's daemon. Leaving it empty made CaptureAll -- which
+			// selects devices by node -- match nothing at all, so a destroy
+			// without a manifest reported "captured 0 snapshots" and removed a
+			// term's work. The engine that does the capturing is constructed
+			// with node "local", so that is what they are.
+			Node: "local",
 		}
 		top.Devices[id] = d
 		if asn > 0 {
 			as, ok := top.ASes[asn]
 			if !ok {
-				as = &model.AS{ASN: asn}
+				// Every reconstructed system is treated as a student's.
+				//
+				// Only student-owned devices are captured, and a container's
+				// labels do not record whose the AS was. Guessing "not a
+				// student's" means destroying work without saving it, which
+				// cannot be undone; guessing the other way costs some snapshots
+				// of the platform's own configuration, which cost nothing.
+				as = &model.AS{ASN: asn, Role: model.RoleStudent}
 				top.ASes[asn] = as
 			}
 			as.Devices = append(as.Devices, d)
