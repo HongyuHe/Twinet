@@ -174,16 +174,35 @@ func (r *Renderer) routerCommands(d *model.Device) []deploy.Command {
 		cmds = append(cmds, deploy.Command{
 			Describe: "check the routing daemons are running",
 			Args: []string{"sh", "-c", strings.Join([]string{
-				// A short wait: the daemons are being started a few commands
-				// earlier and take a moment to write their pid files.
+				// A short wait first: the daemons may be being started a few
+				// commands earlier and take a moment to write their pid files.
 				"for i in 1 2 3 4 5 6 7 8 9 10; do",
 				"  if pidof zebra >/dev/null 2>&1 && pidof bgpd >/dev/null 2>&1; then exit 0; fi",
 				"  sleep 1",
 				"done",
-				`echo "the routing daemons are not running: zebra=$(pidof zebra || echo none) ` +
-					`bgpd=$(pidof bgpd || echo none). This router has no routing process, so ` +
-					`every session with it will sit Active and the failure will appear on its ` +
-					`neighbours rather than here." >&2`,
+				// Then try to start them, because a daemon that has died is
+				// the common case and re-running the deploy is what an
+				// operator does about it. A router that only reports the
+				// problem leaves them with nothing to do but destroy the
+				// container, which loses the student's work.
+				//
+				// This is safe on a student's router: FRR reads its
+				// configuration from the file it was given, so starting a
+				// dead daemon restores what the student had rather than
+				// replacing it. Restarting a *live* one would not be safe,
+				// which is why this only runs when nothing is up.
+				"echo 'the routing daemons were not running; starting them' >&2",
+				"for p in $(ps -ef | awk '/watchfrr/ && !/awk/ {print $1}'); do kill $p 2>/dev/null || true; done",
+				"rm -f /var/run/frr/*.pid /var/run/frr/*.vty 2>/dev/null || true",
+				"/usr/lib/frr/frrinit.sh start >/dev/null 2>&1 || true",
+				"for i in 1 2 3 4 5 6 7 8 9 10; do",
+				"  if pidof zebra >/dev/null 2>&1 && pidof bgpd >/dev/null 2>&1; then exit 0; fi",
+				"  sleep 1",
+				"done",
+				`echo "the routing daemons are not running and could not be started: ` +
+					`zebra=$(pidof zebra || echo none) bgpd=$(pidof bgpd || echo none). ` +
+					`This router has no routing process, so every session with it will sit ` +
+					`Active and the failure will appear on its neighbours rather than here." >&2`,
 				"exit 1",
 			}, "\n")},
 		})

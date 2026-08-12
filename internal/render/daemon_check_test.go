@@ -38,7 +38,9 @@ func TestARouterWithNoRoutingDaemonFailsItsDeployment(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			what:    "nothing is running",
+			// Nothing running and starting them does not help: the stub
+			// frrinit.sh below is absent, so the start fails.
+			what:    "nothing is running and it cannot be started",
 			pidof:   "exit 1",
 			wantErr: true,
 		},
@@ -56,6 +58,12 @@ func TestARouterWithNoRoutingDaemonFailsItsDeployment(t *testing.T) {
 			if err := os.WriteFile(stub, []byte("#!/bin/sh\n"+c.pidof+"\n"), 0o755); err != nil {
 				t.Fatal(err)
 			}
+			// A stub ps, so the watchfrr sweep does not read the real
+			// process table of the machine running the test.
+			if err := os.WriteFile(filepath.Join(dir, "ps"),
+				[]byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+				t.Fatal(err)
+			}
 			cmd := exec.Command("sh", "-c", script)
 			cmd.Env = append(os.Environ(), "PATH="+dir+":"+os.Getenv("PATH"))
 			err := cmd.Run()
@@ -70,6 +78,52 @@ func TestARouterWithNoRoutingDaemonFailsItsDeployment(t *testing.T) {
 					"A check that refuses a healthy router gets switched off.", c.what, err)
 			}
 		})
+	}
+}
+
+// A daemon that has simply died is the common case, and the operator's response
+// is to re-run the deploy. If that only reported the problem again they would
+// have nothing left to do but destroy the container, which loses the student's
+// work — so the deploy starts it.
+func TestADeadDaemonIsStartedRatherThanOnlyReported(t *testing.T) {
+	script := daemonCheckScript(t)
+	dir := t.TempDir()
+
+	// pidof fails until frrinit.sh has been run, then succeeds: which is what
+	// starting a dead daemon looks like.
+	flag := filepath.Join(dir, "started")
+	write(t, filepath.Join(dir, "pidof"),
+		"#!/bin/sh\n[ -f "+flag+" ] && exit 0\nexit 1\n")
+	write(t, filepath.Join(dir, "ps"), "#!/bin/sh\nexit 0\n")
+
+	initDir := filepath.Join(dir, "usr", "lib", "frr")
+	if err := os.MkdirAll(initDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(initDir, "frrinit.sh"), "#!/bin/sh\ntouch "+flag+"\n")
+
+	// The script calls frrinit.sh by absolute path, so the test runs it with
+	// that path rewritten to the stub.
+	script = strings.ReplaceAll(script, "/usr/lib/frr/frrinit.sh",
+		filepath.Join(initDir, "frrinit.sh"))
+
+	cmd := exec.Command("sh", "-c", script)
+	cmd.Env = append(os.Environ(), "PATH="+dir+":"+os.Getenv("PATH"))
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("a router whose daemons had died failed its deployment instead of "+
+			"having them started: %v.\nRe-running the deploy is what an operator does "+
+			"about a dead daemon; if that only reports the problem again, the only "+
+			"remaining move is to destroy the container and lose the work in it.", err)
+	}
+	if _, err := os.Stat(flag); err != nil {
+		t.Error("frrinit.sh was never run, so the daemons were not started")
+	}
+}
+
+func write(t *testing.T, path, body string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
 	}
 }
 
