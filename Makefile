@@ -136,8 +136,11 @@ install: build
 	install -m 0755 $(BIN)/twinet /usr/local/bin/twinet
 	install -m 0755 $(BIN)/twinetd /usr/local/bin/twinetd
 
+# The test binary is version-stamped exactly like the real one. Without this it
+# reports itself as "dev" and every test that talks to a cluster refuses on
+# version skew -- against agents built from this very tree.
 e2e: build
-	$(GO) test -count=1 -tags e2e ./test/e2e/...
+	$(GO) test -count=1 -tags e2e -ldflags '$(LDFLAGS)' ./test/e2e/...
 
 clean:
 	rm -rf $(BIN)

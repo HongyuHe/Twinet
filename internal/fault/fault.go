@@ -458,7 +458,8 @@ func Inject(ctx context.Context, env *Env, name string, t Target) (*Injection, e
 				name, ev.Detail, rerr)
 		}
 		_ = env.exempt(ctx, t.DeviceID(), injID, false)
-		return nil, fmt.Errorf("inject %s: it did not take effect, so it was rolled back: %s", name, ev.Detail)
+		return nil, fmt.Errorf("inject %s: it did not take effect, so it was rolled back: %s",
+			name, evidenceDetail(ev))
 	}
 	return inj, nil
 }

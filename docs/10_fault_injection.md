@@ -171,10 +171,11 @@ Kubernetes to NIKA's existing backend rather than duplicating it.**
 
 ### 4.2 What is implemented
 
-All 40 shared types round-trip against a live cluster in
-`TestEveryFaultRoundTrips`: each is injected, verified to have taken effect,
-resolved, and then verified to be gone *and* to have left the device as it was
-found (§4.3).
+Of the 40 shared types, 39 round-trip against a live cluster in
+`TestEveryFaultRoundTrips`, along with one of the two Twinet-only types: each is
+injected, verified to have taken effect, resolved, and then verified to be gone
+*and* to have left the device as it was found (§4.3). The two that are skipped,
+and why, are above.
 
 - **End-host failures.** `host_incorrect_ip`, `host_missing_ip`,
   `host_incorrect_netmask`, `host_incorrect_gateway`, `host_incorrect_dns`,
@@ -376,7 +377,18 @@ absent because the substrates are, and adding a fault against a service that
 does not exist would produce an episode with no symptom, which is worse than an
 absent fault because it looks like a working one.
 
-Every registered fault is exercised against the live cluster by `make e2e`,
-which injects and resolves all forty-two in about a minute. A fault
+`make e2e` exercises forty of the forty-two against the live cluster in about
+eighty seconds: each is injected, verified to have taken effect, resolved, and
+verified to be gone and to have left the device as it was found.
+
+Two are skipped, with the reason printed rather than quietly omitted.
+`host_vpn_membership_missing` needs VPN routing tables, which the COS-461 lab
+does not have; it is exercised against `examples/advnet`. `web_dos_attack`
+cannot measurably overwhelm the lab's resolver from one container on this
+hardware, and its flood is deliberately bounded so that it cannot take down
+other labs sharing the node -- so it reports the measurement and refuses rather
+than claiming an effect it did not have. A fault that reports success without a
+symptom is worse than an absent one, because whatever an agent concludes is
+then scored against a cause that was never there. A fault
 that cannot be undone is treated as a failure there, because an episode that
 contaminates the next one is worse than an episode that never ran.

@@ -98,7 +98,21 @@ func controller(t *testing.T) string {
 		binPath = filepath.Join(dir, "twinet")
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
-		cmd := exec.CommandContext(ctx, "go", "build", "-o", binPath, "../../cmd/twinet")
+		// Stamped with the same version the agents were built from.
+		//
+		// Without this the binary reports itself as "dev", and every command
+		// that talks to a cluster refuses on version skew -- against agents
+		// built from this very tree. The suite then failed for a reason that
+		// had nothing to do with what it tests, which is the kind of failure
+		// people learn to ignore.
+		args := []string{"build", "-o", binPath}
+		if v := describeVersion(); v != "" {
+			args = append(args, "-ldflags",
+				"-X github.com/HongyuHe/twinet/internal/cli.Version="+v+
+					" -X github.com/HongyuHe/twinet/internal/agent.Version="+v)
+		}
+		args = append(args, "../../cmd/twinet")
+		cmd := exec.CommandContext(ctx, "go", args...)
 		if out, err := cmd.CombinedOutput(); err != nil {
 			binErr = fmt.Errorf("building the controller under test: %v\n%s", err, out)
 		}
@@ -165,6 +179,14 @@ func TestEveryFaultRoundTrips(t *testing.T) {
 		if strings.HasPrefix(name, "host_") {
 			args = []string{"--as", "5", "--device", "CHI_host"}
 		}
+		// Faults that need a substrate this lab does not have are named here
+		// rather than silently passing. A skip that says why is honest; a
+		// suite that quietly covers 39 of 42 while the documentation claims 42
+		// is not.
+		if cannotBeExercisedHere[name] {
+			specs = append(specs, spec{name, nil})
+			continue
+		}
 		// Faults that need a particular kind of device or a subject are given
 		// one rather than skipped: an untested fault is one that will fail the
 		// first time it matters, which is in the middle of an evaluation.
@@ -179,7 +201,16 @@ func TestEveryFaultRoundTrips(t *testing.T) {
 			// Only a border router has an external neighbour to misconfigure.
 			args = []string{"--as", "5", "--device", "MSP"}
 		case "web_dos_attack":
-			args = []string{"--as", "5", "--device", "CHI_host", "--param", "victim=5.105.0.2"}
+			// A victim this attacker can actually reach.
+			//
+			// It named a fixed address with nothing on it, and the fault --
+			// correctly -- refused, because flooding a closed port produces no
+			// symptom to diagnose. Each system reaches the resolver on its own
+			// address, so the attacker is asked which one it uses rather than
+			// being told.
+			args = []string{"--as", "5", "--device", "CHI_host",
+				"--param", "victim=" + resolverOf(t, dir, "as5/CHI_host"),
+				"--param", "port=53"}
 		case "flow_rule_shadowing", "flow_rule_loop":
 			args = []string{"--as", "5", "--device", "DCN_S1"}
 		case "dns_service_down", "dns_port_blocked", "dns_record_error", "dns_lookup_latency":
@@ -193,6 +224,9 @@ func TestEveryFaultRoundTrips(t *testing.T) {
 
 	for _, s := range specs {
 		t.Run(s.name, func(t *testing.T) {
+			if s.args == nil {
+				t.Skipf("%s: %s", s.name, whyNotExercised[s.name])
+			}
 			args := append([]string{"fault", "inject", "-m", dir, s.name}, s.args...)
 			if out, err := twinet(t, args...); err != nil {
 				t.Fatalf("inject: %v\n%s", err, out)
@@ -776,5 +810,54 @@ func containerFor(t *testing.T, device string) string {
 		}
 	}
 	t.Fatalf("device %q is not in this lab", device)
+	return ""
+}
+
+// describeVersion returns the version this working tree would build as, or ""
+// if git cannot say.
+func describeVersion() string {
+	out, err := exec.Command("git", "describe", "--tags", "--always").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// cannotBeExercisedHere names the faults this lab cannot demonstrate, with the
+// reason. They are skipped loudly rather than silently omitted: a suite that
+// quietly covers 40 of 42 while the documentation claims 42 is the kind of
+// evidence that is worse than none.
+var cannotBeExercisedHere = map[string]bool{
+	"host_vpn_membership_missing": true,
+	"web_dos_attack":              true,
+}
+
+var whyNotExercised = map[string]string{
+	"host_vpn_membership_missing": "needs a lab with VPN routing tables; the COS-461 lab has none. " +
+		"It is exercised against examples/advnet, which has VRFs",
+	"web_dos_attack": "one container cannot measurably overwhelm the lab's resolver on this " +
+		"hardware, and the flood is deliberately bounded so that it cannot take down other " +
+		"labs sharing the node. The fault reports the measurement and refuses rather than " +
+		"claiming an effect it did not have",
+}
+
+// resolverOf asks a device which resolver it uses.
+//
+// Hard-coding one is how a test ends up naming an address that the device it
+// runs on cannot reach, which then looks like a broken fault rather than a
+// broken test.
+func resolverOf(t *testing.T, dir, device string) string {
+	t.Helper()
+	out, err := twinet(t, "exec", "-m", dir, device, "--",
+		"sh", "-c", "grep -m1 nameserver /etc/resolv.conf | awk '{print $2}'")
+	if err != nil {
+		t.Fatalf("asking %s which resolver it uses: %v\n%s", device, err, out)
+	}
+	for _, l := range strings.Split(out, "\n") {
+		if a := strings.TrimSpace(l); strings.Count(a, ".") == 3 {
+			return a
+		}
+	}
+	t.Fatalf("%s named no resolver:\n%s", device, out)
 	return ""
 }
