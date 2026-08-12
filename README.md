@@ -55,6 +55,21 @@ group for the Internet to work.
 | [Implementation status](docs/09_status.md) | What is built and verified, with measurements |
 | [Fault injection and RCA](docs/10_fault_injection.md) | Injecting the NIKA fault taxonomy to assess AI agents at root-cause analysis |
 
+## Which branch to use
+
+`main` carries released versions and moves only when something has been built,
+tested and run on a real cluster. If you are teaching a course from Twinet, use
+a tag on `main` and nothing else.
+
+`dev` is where the work happens, and it will be broken from time to time. It is
+merged into `main` when a body of work is finished rather than commit by
+commit, so that nobody's class is disrupted by a change made in the middle of
+someone else's afternoon.
+
+```sh
+git clone --branch v0.1.0 https://github.com/HongyuHe/Twinet
+```
+
 ## Credits
 
 Twinet builds on the ideas of the
