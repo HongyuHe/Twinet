@@ -257,7 +257,13 @@ The lab must already be deployed with --solve.`,
 	cmd.Flags().StringVarP(&rubricPath, "rubric", "r", "", "rubric to grade against")
 	cmd.Flags().StringVarP(&outDir, "out", "o", "", "where to write reports")
 	cmd.Flags().StringVar(&token, "token", "", "agent token")
-	cmd.Flags().DurationVar(&converge, "converge-timeout", 4*time.Minute, "how long a convergence predicate may wait")
+	// Five minutes, from measurement rather than taste: a clean run of eight
+	// submissions on a twelve-AS lab took 4m 56s per submission end to end,
+	// nearly all of it waiting for OSPF, then BGP sessions, then the BGP table
+	// to stop changing. A budget below that turns a slow lab into a bad mark,
+	// which is the most expensive kind of wrong answer this produces.
+	cmd.Flags().DurationVar(&converge, "converge-timeout", 5*time.Minute,
+		"how long a convergence predicate may wait")
 	cmd.Flags().IntVarP(&parallel, "parallel", "p", 16, "submissions graded concurrently within a wave")
 	cmd.Flags().IntVar(&perWave, "per-wave", 1,
 		"submissions loaded into the lab at once; above 1 trades provable isolation for speed")

@@ -167,8 +167,10 @@ someone has checked.
 | Grading, 3 submissions, 10 questions, 17 checks | 31 s |
 | Grading a class of 8 in waves, all scoring 10/10 | **22m 11s in 4 waves**, measured when the conflict relation was adjacency and submissions were loaded onto the solved lab. Both have since changed and this number is not comparable to anything current |
 | Waves needed for 8 student ASes / for 80, under `--per-wave 8` | **6 / 42** — the conflict relation is distance-two, so roughly one wave per two submissions. `--per-wave` is off by default; see [grading](06_grading.md) |
-| `grade class`, 6 real submissions, one at a time, 4-minute convergence budget | **70m 24s, 5 of 6 quarantined.** The cause was routers deployed with no routing daemon, since fixed; the run is being repeated |
-| Same, 2 submissions, 10-minute budget | 31m 15s; the surviving failure traced to a third router whose bgpd had died after deployment |
+| **`grade class`, 8 submissions, one at a time, 5-minute convergence budget** | **39m 29s, 8 of 8 scored 10/10, none quarantined** -- 4m 56s per submission, of which the checks themselves are seconds; the rest is waiting for OSPF, then BGP sessions, then the BGP table to stop changing, twice per submission (once for the submission, once for the reference put back after it). Every archive was saved from the reference, so anything below 10/10 would have been a Twinet defect |
+| Same 8 submissions, before the container-identity fix | 28m 12s, **7 of 8 quarantined**: grading recreated 89 of 212 containers, which empties their network namespaces, so loading failed on `Cannot find device port_BOS` |
+| Containers recreated while grading, before / after that fix | **89 / 0** |
+| Automatic repairs triggered on a lab while it was being graded, before / after the grading hold | **13 / 0** |
 | Grading 1 submission in its own private harness | ~12 minutes; measured, and the reason waves exist |
 | 8 private harnesses at once on 3 nodes | saturates the cluster; the failures are resource exhaustion, not marks |
 | **Class-scale deployment: 84 ASes, 2012 devices, 2927 links across 3 nodes** | **22m 38s, zero failures** |

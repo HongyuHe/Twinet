@@ -128,6 +128,19 @@ A node that reboots is repaired by re-running deploy, which recreates only that
 node's objects. There is no `docker_pid.map` to go stale and no `groups/`
 directory to drift.
 
+Idempotence is a property of the **container spec hash**, and it holds only if
+every caller computes that hash from the same information. The hash covers the
+digest a device's image reference resolves to, so that rebuilding a tag in place
+is noticed; for a long time only `twinet deploy` resolved that digest, and every
+other caller sent it empty. The two disagreed permanently, each replacing the
+containers the other had just made: grading two submissions recreated 89 of 212
+containers and the following deploy recreated 172, both reporting success.
+Recreating a container empties its network namespace and reverts its FRR daemons
+file to the image default, so the visible symptoms were missing interfaces and
+routers with no BGP -- neither of which points at the cause. The digest is now
+resolved in `Cluster.Apply`, the single door every deployment passes through,
+which is also where the version check lives after the same mistake.
+
 The only durable on-disk artifacts are the **lab directory** (per-device
 rendered configs, saved student configs, TLS material, DNS zones) — which is
 data the operator or student owns, not control-plane bookkeeping — and an

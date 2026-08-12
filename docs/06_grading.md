@@ -253,6 +253,35 @@ is marked correct for work they did not do, with nothing in the report able to
 say so, because a correct router looks identical however it came to be correct.
 Blanking first makes an omission read as an omission.
 
+### Nothing else may touch the lab while it is being graded
+
+Each node runs a loop that repairs devices which have lost their wiring, and
+grading is indistinguishable from that fault while it is working: it blanks an
+autonomous system back to the state its owner started from, which is a device
+with no addresses and no routing configuration, and then loads somebody's work
+onto it.
+
+The loop believed what it saw. In one recorded run it rewired thirteen devices
+of the lab being graded; rewiring removes an interface and adds it back, so the
+submission being loaded at that moment failed with `Cannot find device
+port_BOS`, and seven of eight students were held for review. The marks that
+survive that are worse than the ones that do not, because in a lab deployed at
+the reference a repair also re-renders configuration -- the model answer written
+over a student's work while it is being marked.
+
+`grade class` therefore asks every node to leave the lab alone, and keeps
+asking. It is a lease with a deadline, not a switch: a grader that is killed
+stops renewing, and the nodes resume looking after the lab by themselves within
+three minutes. Nobody has to remember to turn repairs back on, and no crash can
+leave them off. A node that refuses the request says so and grading continues,
+because an agent too old to know the call should not make the command unusable.
+
+Loading also waits, briefly, for the interfaces the lab says a device has. Any
+deploy rewires by removing an interface and adding it back, so the condition is
+temporary by construction -- but the wait is bounded, because a genuinely absent
+interface produces the same symptom and a run that hangs silently is worse than
+one that stops and names the device.
+
 ### Trading isolation for speed, deliberately
 
 `--per-wave N` loads several submissions at once, batched so that no two members
