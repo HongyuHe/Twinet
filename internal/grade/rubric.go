@@ -292,6 +292,22 @@ func runChecks(ctx context.Context, q QuestionSpec, env *Env, opts RunOptions) [
 			if fail := e.infraSeen.failure(); fail != nil && res.Status != StatusError {
 				res = Errored(cs.Check, fail)
 			}
+
+			// A check whose own deadline expired did not finish looking.
+			//
+			// Cancellation and deadline errors are deliberately excluded from
+			// the infrastructure tracker, because a convergence predicate
+			// timing out is a legitimate finding about the submission. But the
+			// *check's* context expiring is not: it means the grader ran out
+			// of time, and several checks absorb that into a zero or a partial
+			// score. That is an outage turned into a mark, which is exactly
+			// what the tracker above exists to prevent.
+			if cctx.Err() != nil && res.Status != StatusError {
+				res = Errored(cs.Check, fmt.Errorf(
+					"this check ran out of time after %s, so what it found is what it had "+
+						"managed to look at rather than a judgement about the submission: %w",
+					opts.CheckTimeout, cctx.Err()))
+			}
 			results[i] = res
 		}(i, c, cs)
 	}

@@ -223,6 +223,20 @@ func newFaultInjectCmd(opts *Options) *cobra.Command {
 
 			inj, err := fault.Inject(cmd.Context(), env, args[0], target)
 			if err != nil {
+				// A failed injection can still leave a live fault: when
+				// verification fails and the rollback fails too, Inject
+				// reports both and hands back what it created. Discarding it
+				// left the device broken with nothing on disk saying so, and
+				// its exemption from automatic repair still in place -- so
+				// nothing would fix it and nothing would find it.
+				if inj != nil {
+					if serr := saveInjections(top, append(existing, inj)); serr != nil {
+						return fmt.Errorf("%w; it is still live, and recording it failed too "+
+							"(%v), so it must be undone by hand on %s", err, serr, target.DeviceID())
+					}
+					return fmt.Errorf("%w; it is still live and has been recorded, so "+
+						"`twinet fault resolve --all` will try again", err)
+				}
 				return err
 			}
 			if err := saveInjections(top, append(existing, inj)); err != nil {

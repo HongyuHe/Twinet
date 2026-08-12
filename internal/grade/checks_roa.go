@@ -18,6 +18,13 @@ func init() {
 // checkROAPublished verifies that this AS's prefix is covered by a ROA naming
 // this AS as its origin.
 //
+// Whether this is worth marks depends on the course. In a lab where the
+// platform publishes every system's ROA -- which is what the COS-461 example
+// does, so that everybody else's routes validate -- it would award the mark to
+// everybody for something nobody did, and it is left out of that rubric for
+// exactly that reason. It belongs in a rubric where publication is the
+// student's own action.
+//
 // The exercise asks students to publish a ROA for their own address block, and
 // nothing checked it. The other RPKI checks are about *reacting* to validation
 // state -- refusing invalid routes, keeping not-found ones -- and they can all

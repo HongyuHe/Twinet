@@ -200,6 +200,15 @@ func newIncidentRunCmd(opts *Options) *cobra.Command {
 			for _, fs := range sc.Faults {
 				inj, err := fault.Inject(cmd.Context(), env, fs.Type, fs.Target)
 				if err != nil {
+					// A failed injection that still left something live hands
+					// it back. Record it before giving up, or the lab is
+					// contaminated with nothing on disk naming the cause.
+					if inj != nil {
+						if jerr := journal(inj); jerr != nil {
+							fmt.Fprintf(cmd.ErrOrStderr(), "%v\n", jerr)
+						}
+						injected = append(injected, inj)
+					}
 					ep.Err = err.Error()
 					fmt.Fprintf(cmd.ErrOrStderr(), "injection failed: %v\n", err)
 					break

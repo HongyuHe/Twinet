@@ -343,6 +343,40 @@ func checkGaoRexford(ctx context.Context, env *Env) Result {
 			fmt.Fprintf(&detail, "a customer's routes (%d) must be preferred over a provider's (%d)\n", cust, prov)
 		}
 	}
+	// Every relationship this AS actually has must be represented.
+	//
+	// Only the classes that happened to be visible were compared, so an AS
+	// whose provider routes had all been filtered away was marked on
+	// customer-versus-peer alone and passed -- the ordering it was asked about
+	// was never observed. What relationships exist is in the topology, so it
+	// does not have to be inferred from what survived.
+	var absent []string
+	for rel, present := range map[model.Relationship]bool{
+		model.RelCustomer: hasCust, model.RelPeer: hasPeer, model.RelProvider: hasProv,
+	} {
+		if present {
+			continue
+		}
+		for _, r := range relOf {
+			if r == rel {
+				absent = append(absent, string(rel))
+				break
+			}
+		}
+	}
+	if len(absent) > 0 {
+		sort.Strings(absent)
+		return Partial("policy.gao_rexford", ratio(passed, maxInt(checks, 1))*0.5, Evidence{
+			Expected: "customer routes preferred over peers', and peers' over providers'",
+			Observed: fmt.Sprintf("this AS has %s neighbour(s), but no route from them is in "+
+				"its table, so the ordering they are part of could not be observed",
+				strings.Join(absent, " and ")),
+			Detail: detail.String(),
+			Hint: "a relationship whose routes are all filtered away cannot be shown to be " +
+				"ranked correctly; accept them and rank them",
+			Command: "show ip bgp json",
+		})
+	}
 	if checks == 0 {
 		return Errored("policy.gao_rexford",
 			fmt.Errorf("no routes were learned from enough distinct relationships to compare"))
@@ -608,4 +642,11 @@ func jsonUnmarshalLoose(s string, out any) error {
 		return fmt.Errorf("empty output")
 	}
 	return json.Unmarshal([]byte(s), out)
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }

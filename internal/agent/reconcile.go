@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"time"
 
@@ -292,9 +293,28 @@ func (s *Server) brokenBecause(ctx context.Context, d *model.Device) string {
 	case present == 0:
 		return "it has none of its interfaces"
 	case present < len(want):
-		// Not acted on, but worth saying: a device that stays here is stuck.
-		return ""
+		// A device missing some of its interfaces is usually a deploy in
+		// progress, and rewiring underneath one would be worse than waiting.
+		// But it used to wait for ever: the state was recognised, named in a
+		// comment, and then reported as healthy, so a device that lost one
+		// cable of six stayed that way until somebody redeployed. Its
+		// neighbours failed to reach through it, and the marks landed on them.
+		//
+		// So it is given time to be a deploy, and repaired if it is not. The
+		// count is per device, and cleared as soon as the device is whole.
+		if s.partiallyWiredFor(d.ID) < partialWiringGrace {
+			return ""
+		}
+		missing := make([]string, 0, len(want)-present)
+		for n := range want {
+			if !have[n] {
+				missing = append(missing, n)
+			}
+		}
+		sort.Strings(missing)
+		return "it is missing " + strings.Join(missing, ", ")
 	}
+	s.wholeAgain(d.ID)
 
 	// The interfaces are there. A router still needs its daemons: after a
 	// restart the namespace is new and FRR is not running in it.
@@ -448,4 +468,31 @@ func (s *Server) forgetLab(name string) {
 			slog.Warn("removing the record of a lab that is gone", "lab", name, "err", err)
 		}
 	}
+}
+
+// partialWiringGrace is how many surveys a device may be missing some of its
+// interfaces before it is treated as broken rather than as mid-deployment.
+//
+// Three surveys is three minutes, which is longer than any deploy takes to
+// wire one device and far shorter than the "until somebody notices" that this
+// replaced.
+const partialWiringGrace = 3
+
+// partiallyWiredFor counts consecutive surveys in which a device has been
+// missing some of its interfaces.
+func (s *Server) partiallyWiredFor(id string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.partial == nil {
+		s.partial = map[string]int{}
+	}
+	s.partial[id]++
+	return s.partial[id]
+}
+
+// wholeAgain forgets that a device was ever partially wired.
+func (s *Server) wholeAgain(id string) {
+	s.mu.Lock()
+	delete(s.partial, id)
+	s.mu.Unlock()
 }

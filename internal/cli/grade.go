@@ -126,6 +126,19 @@ reference, and holds the nodes off from repairing anything while it does.`,
 				return herr
 			}
 			defer held.Release()
+			defer func() {
+				// If the nodes stopped holding the lab partway, what was read
+				// afterwards may be a repair in progress rather than the lab.
+				select {
+				case <-held.Lost:
+					fmt.Fprintf(cmd.ErrOrStderr(),
+						"\nwarning: the nodes stopped holding this lab off from automatic "+
+							"repair during this run (%s), so anything read after that moment "+
+							"may be a repair in progress rather than the lab as deployed\n",
+						held.Reason())
+				default:
+				}
+			}()
 
 			targets := asList
 			if len(targets) == 0 {

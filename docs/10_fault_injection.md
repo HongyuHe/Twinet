@@ -278,7 +278,7 @@ twinet fault inject ospf-adjacency-lost    # apply, then verify it manifested
 twinet fault verify ospf-adjacency-lost    # is it *still* doing what it claims
 twinet fault resolve ospf-adjacency-lost
 twinet fault status --json                 # what is currently injected
-twinet incident run --scenario incidents/ospf.yaml --agent <endpoint>
+twinet incident run --scenario incidents/ospf.yaml   # inject, record, resolve
 ```
 
 `twinet fault verify` is worth using and easy to overlook. Injection verifies
@@ -291,11 +291,17 @@ looks valid and its ground truth is wrong. Re-verify before scoring, or on a
 timer for a long-running episode.
 
 An **incident** is the reproducible unit: a lab manifest, a baseline, a set of
-faults, and the ground truth. `twinet incident run` builds the lab, establishes
-the baseline, injects, verifies, hands an endpoint to the agent, and scores the
-diagnosis. It is the same machinery as `twinet grade`, pointed at a different
-question: not "did the student configure this correctly" but "did the agent
-work out what was wrong".
+faults, and the ground truth.
+
+`twinet incident run` today records a baseline of the deployed lab, injects the
+scenario's faults, verifies each took effect, waits, resolves them, and writes
+an episode: the ground truth, the symptoms an agent would be told, and the
+timings. What it does **not** do, despite the `--agent` flag shown above, is
+hand the lab to an agent and score a diagnosis. There is no agent endpoint, no
+diagnosis format and no scoring; an evaluation harness has to drive the agent
+itself and compare against the recorded truth. That is the remaining piece
+between this and "the same machinery as `twinet grade`, pointed at a different
+question".
 
 ## 6. Consequences for the rest of the plan
 
@@ -380,6 +386,16 @@ absent fault because it looks like a working one.
 `make e2e` exercises forty of the forty-two against the live cluster in about
 eighty seconds: each is injected, verified to have taken effect, resolved, and
 verified to be gone and to have left the device as it was found.
+
+Where a fault's mechanism differs from NIKA's, it is recorded rather than
+implied to be identical. `link_detach` drops traffic in both directions on an
+interface; NIKA's `link_failure` deletes the interface. Twinet does not delete
+it, because removing a veth end from inside the namespace cannot be undone from
+there, and a fault that cannot be undone destroys the lab rather than perturbing
+it. The symptom an agent is given describes what is actually there -- traffic
+disappearing across a link whose interface is up and addressed -- because a
+benchmark that describes evidence the agent will not find is worse than one that
+describes none.
 
 Two are skipped, with the reason printed rather than quietly omitted.
 `host_vpn_membership_missing` needs VPN routing tables, which the COS-461 lab

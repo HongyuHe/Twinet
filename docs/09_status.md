@@ -37,7 +37,7 @@ missed it is recorded as a miss.
 | Save and restore | done | `twinet save` archives every group work with the topology hash and per-file checksums; restore refuses an archive from a different topology or one edited after it was taken |
 | Per-submission grading harnesses | done | `twinet grade batch` gives each submission a private lab in which every AS but one is solved; verified with two submissions graded concurrently across three nodes |
 | NIKA LabRuntime adapter | done, with one caveat | `TwinetRuntime` subclasses NIKA's `LabRuntime` and implements all ten abstract methods, so the ~50 semantic operations of `ExecSemanticOpsMixin` work; verified live on the three-node cluster, including driving an unmodified `LinkFailure` problem through inject and verify. The caveat: NIKA's problem classes select behaviour with a literal `match` on the backend name and refuse anything that is not `kathara` or `containerlab`, so the runtime must be constructed with `dialect="kathara"` — the arm that is correct for Linux/FRR/eth0 devices. Without it, every problem raises `RuntimeCapabilityError`. See `contrib/nika/README.md`. |
-| Fault injection engine | partial | **42 registered, of which 40 are NIKA's** (NIKA publishes 60). Of the 20 not implemented, 15 need a substrate Twinet does not emulate — 6 P4/BMv2, 4 Kubernetes, 3 SDN-southbound, 2 others — and **5 are applicable and merely unbuilt**: the DHCP family. All 42 inject, verify, resolve, and are then checked to have left the device exactly as they found it; `make e2e` runs the full round trip in 54 s. See [10](10_fault_injection.md) §4.1 |
+| Fault injection engine | partial | **42 registered, of which 40 are NIKA's** (NIKA publishes 60). Of the 20 not implemented, 15 need a substrate Twinet does not emulate — 6 P4/BMv2, 4 Kubernetes, 3 SDN-southbound, 2 others — and **5 are applicable and merely unbuilt**: the DHCP family. 40 of the 42 inject, verify, resolve, and are then checked to have left the device exactly as they found it, in about 80 s of `make e2e`; the other two are skipped by name with reasons (one needs a lab with VRFs, one cannot measurably overwhelm the resolver from a single container). See [10](10_fault_injection.md) §4.1 |
 | Faults are reversible, and proved to be | done | The engine fingerprints a device before and after injecting and requires resolving to leave neither what it added nor a hole where something it removed used to be. Introducing the check immediately found five faults that satisfied their own predicate while leaving the device broken |
 | Fault secrecy | verified | No fault writes a self-identifying path into the device under test. A test reads the fault sources and fails on any such path; it found one on its first run |
 | Self-healing wiring | done | A container that restarts comes back with an empty network namespace. Each node now notices within a minute and rebuilds that device's links and configuration. Measured: `svc/matrix` went 10 interfaces → 2 → 10, repaired 0.8 s after detection, with no deploy run |
@@ -183,10 +183,13 @@ Recorded here rather than implied to be complete:
   It checks that the exchange relayed the announcement and that no in-region
   route was accepted, but not that the tagged set is exactly the members the
   assignment intends.
-- The end-to-end discrimination suite covers q1.2, q2.1 and q2.3. The remaining
-  questions are covered by unit tests and by the reference scoring 10/10, which
-  is weaker: it shows the checks accept a correct answer, not that they reject
-  every wrong one.
+- The end-to-end discrimination suite covers q1.2, q2.1 and q2.3. The rest rest
+  on the reference scoring 10/10 and on the checks having been shown to
+  discriminate by hand -- q2.4 against a forged community, q2.2 against
+  next-hop-self removed across an AS, q1.3 against static routes. That is
+  weaker than a suite: it shows the checks accept a correct answer and rejected
+  one wrong one, not that they reject every wrong one, and nothing re-runs those
+  demonstrations.
 
 ### Grading a hundred students is not yet practical in the fair mode
 

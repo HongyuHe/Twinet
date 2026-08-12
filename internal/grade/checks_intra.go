@@ -332,6 +332,7 @@ func checkECMP(ctx context.Context, env *Env) Result {
 
 	// Cache each router's next hops toward the destination.
 	nextHops := map[string]map[string]bool{}
+	other := map[string]bool{}
 	fetch := func(router string) (map[string]bool, error) {
 		if v, ok := nextHops[router]; ok {
 			return v, nil
@@ -343,6 +344,17 @@ func checkECMP(ctx context.Context, env *Env) Result {
 		set := map[string]bool{}
 		for _, e := range routes[target] {
 			if !e.Selected && !e.Installed {
+				continue
+			}
+			// The protocol is what the question is about.
+			//
+			// It was decoded and then ignored, so three static routes over the
+			// prescribed interfaces earned full marks for a question that asks
+			// for equal-cost paths produced by OSPF costs. Hand-installed
+			// routes do not react to a link failing, which is the entire point
+			// of the exercise, and the two were indistinguishable in the mark.
+			if e.Protocol != "" && e.Protocol != "ospf" {
+				other[e.Protocol] = true
 				continue
 			}
 			for _, nh := range e.Nexthops {
@@ -358,12 +370,19 @@ func checkECMP(ctx context.Context, env *Env) Result {
 	if hops, err := fetch(from); err != nil {
 		return Errored("ospf.ecmp_paths", err)
 	} else if len(hops) == 0 {
+		observed := "no route at all"
+		if len(other) > 0 {
+			observed = fmt.Sprintf("a route learned by %s rather than OSPF",
+				strings.Join(sortedKeysOfBool(other), ", "))
+		}
 		return Fail("ospf.ecmp_paths", Evidence{
-			Expected: fmt.Sprintf("%d equal-cost paths from %s to %s", len(wantPaths), from, to),
-			Observed: "no route at all",
+			Expected: fmt.Sprintf("%d equal-cost paths from %s to %s, learned by OSPF",
+				len(wantPaths), from, to),
+			Observed: observed,
 			Detail:   fmt.Sprintf("%s has no route to %s (%s)", from, to, target),
-			Hint:     "OSPF must be converged before load balancing can be assessed",
-			Command:  "show ip route json",
+			Hint: "the paths have to come from OSPF costs; a hand-installed route does " +
+				"not move when a link fails, which is what this question is about",
+			Command: "show ip route json",
 		})
 	}
 
@@ -774,6 +793,16 @@ func ratio(got, want int) float64 {
 // sortedKeysOfStrings returns a map's keys in order, so a report reads the same
 // way twice.
 func sortedKeysOfStrings(m map[string][]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// sortedKeysOfBool returns a set's members in order.
+func sortedKeysOfBool(m map[string]bool) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {
 		out = append(out, k)

@@ -205,13 +205,21 @@ func resolveACL(ctx context.Context, e *Env, t Target, s State) error {
 			"without guessing (device %s)", t.DeviceID())
 	}
 	for _, c := range strings.Fields(s["chains"]) {
-		// Exactly one copy, which is exactly how many were added. Removing
-		// every matching rule would delete a student's own identical rule
-		// along with this one, and the baseline comparison would not notice
-		// because it compares sets of lines.
-		if _, code := e.Try(ctx, t.DeviceID(),
-			fmt.Sprintf("iptables -w -D %s %s -j DROP", c, s["match"])); code != 0 {
+		// The rule is removed by position, not by specification.
+		//
+		// `iptables -D <chain> <spec>` deletes the *first* rule matching the
+		// specification. The injected rule is appended, so if the device
+		// already had an identical one, deleting by specification removes the
+		// student's and leaves ours -- and the counts still match, so nothing
+		// notices. Deleting the last matching position removes the one that
+		// was added.
+		pos := lastMatchingRule(ctx, e, t, c, s["match"])
+		if pos <= 0 {
 			// Already gone is not a failure; the checks below decide.
+			continue
+		}
+		if _, code := e.Try(ctx, t.DeviceID(),
+			fmt.Sprintf("iptables -w -D %s %d", c, pos)); code != 0 {
 			continue
 		}
 		want, err := strconv.Atoi(s["before/"+c])
@@ -231,4 +239,65 @@ func describeACL(missing []string, chains string) string {
 		return fmt.Sprintf("the rule is present in %s", chains)
 	}
 	return "the rule is absent from " + strings.Join(missing, " and ")
+}
+
+// lastMatchingRule returns the position of the last rule in a chain that drops
+// this match, or 0 if there is none.
+//
+// Position rather than specification, because two identical rules are
+// indistinguishable by specification and the injected one is always the later.
+func lastMatchingRule(ctx context.Context, e *Env, t Target, chain, match string) int {
+	out, code := e.Try(ctx, t.DeviceID(),
+		fmt.Sprintf("iptables -w -L %s --line-numbers -n 2>/dev/null", chain))
+	if code != 0 {
+		return 0
+	}
+	return lastMatchingPosition(out, specTokens(match))
+}
+
+// lastMatchingPosition parses an iptables listing and returns the position of
+// the last DROP rule that mentions every one of the given values.
+func lastMatchingPosition(out string, want []string) int {
+	last := 0
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		if len(f) < 2 {
+			continue
+		}
+		n, err := strconv.Atoi(f[0])
+		if err != nil {
+			continue
+		}
+		if !strings.Contains(line, "DROP") {
+			continue
+		}
+		all := true
+		for _, w := range want {
+			if !strings.Contains(line, w) {
+				all = false
+				break
+			}
+		}
+		if all {
+			last = n
+		}
+	}
+	return last
+}
+
+// specTokens reduces an iptables specification to the values that also appear
+// in a rule listing: addresses and protocol names, not option flags.
+func specTokens(spec string) []string {
+	var out []string
+	f := strings.Fields(spec)
+	for i := 0; i < len(f); i++ {
+		switch f[i] {
+		case "-p", "-s", "-d":
+			if i+1 < len(f) {
+				out = append(out, f[i+1])
+				i++
+			}
+		}
+	}
+	return out
 }

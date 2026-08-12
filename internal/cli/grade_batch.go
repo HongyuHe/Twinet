@@ -1343,3 +1343,28 @@ func appendNote(have, add string) string {
 	}
 	return have + "; " + add
 }
+
+// imageDisagreements names the images this cluster's nodes do not agree on.
+//
+// An image tag is not an identity: rebuilt in place it is different software
+// under the same name. When two nodes hold different builds, a student's
+// routers run whichever one landed on the node their system was placed on, and
+// every report says the deployment is current.
+func imageDisagreements(ctx context.Context, top *model.Topology, token string) []string {
+	if !clustered(top) {
+		return nil
+	}
+	tok, err := tokenFor(token)
+	if err != nil {
+		return nil
+	}
+	c := client.NewCluster(top.Lab, tok)
+	var bad []string
+	for ref, id := range imageDigests(ctx, c, top) {
+		if strings.HasPrefix(id, "DISAGREEMENT") {
+			bad = append(bad, ref+": "+strings.TrimPrefix(id, "DISAGREEMENT: "))
+		}
+	}
+	sort.Strings(bad)
+	return bad
+}

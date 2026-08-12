@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -130,6 +131,17 @@ The lab must already be deployed with --solve.`,
 			// matter: a router with no routing process and a device with a
 			// missing cable are invisible where they are and expensive
 			// somewhere else, on somebody else's mark.
+			// Nodes that disagree about a container image mean a mark depends
+			// on which machine a system was placed on. `grade batch` held such
+			// marks for review and this did not, so the mode meant for marking
+			// a class was the one without the check.
+			if bad := imageDisagreements(cmd.Context(), top, token); len(bad) > 0 {
+				return fmt.Errorf("the nodes of this cluster do not agree on what these "+
+					"images are:\n  %s\nA mark would then depend on which machine a "+
+					"student's system happened to be placed on, and nothing in the report "+
+					"could say so. Make them match -- `docker pull` on each node, or refer "+
+					"to the image by digest -- and grade again", strings.Join(bad, "\n  "))
+			}
 			if bad := miswiredDevices(cmd.Context(), exec, top); len(bad) > 0 {
 				return notReadyToGrade("device(s) in this lab do not have the interfaces "+
 					"the lab says they have", bad, opts.Manifest)

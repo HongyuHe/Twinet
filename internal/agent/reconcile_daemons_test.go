@@ -126,3 +126,57 @@ func TestDeadDaemonsAreStartedRatherThanTheDeviceRebuilt(t *testing.T) {
 		t.Errorf("the router is still reported broken after the repair: %q", why)
 	}
 }
+
+// A device missing some of its interfaces is usually a deploy in progress, so
+// it is given time. But it used to be given for ever: the state was recognised,
+// named in a comment, and reported as healthy, so a device that lost one cable
+// of six stayed that way until somebody redeployed. Its neighbours failed to
+// reach through it and the marks landed on them.
+func TestADeviceMissingOneCableIsEventuallyRepaired(t *testing.T) {
+	f := &fakeRuntime{
+		// port_CHI is gone; port_BOS is still there.
+		links:   "lo\nport_BOS\n",
+		running: map[string]bool{},
+	}
+	for _, d := range render.EnabledDaemons() {
+		f.running[d] = true
+	}
+	s := &Server{rt: f, partial: map[string]int{}}
+	s.cfg.Node = "node-0"
+
+	for i := 1; i < partialWiringGrace; i++ {
+		if why := s.brokenBecause(context.Background(), routerWithTwoCables()); why != "" {
+			t.Fatalf("survey %d reported the device broken (%q); a deploy in progress "+
+				"would be rewired underneath itself", i, why)
+		}
+	}
+	why := s.brokenBecause(context.Background(), routerWithTwoCables())
+	if why == "" {
+		t.Fatal("a device that has been missing an interface across every survey is " +
+			"still reported healthy, so nothing will ever put the cable back")
+	}
+	if !strings.Contains(why, "port_CHI") {
+		t.Errorf("the reason does not name the missing interface: %q", why)
+	}
+}
+
+// A device that gets its interface back must not carry the count forward.
+func TestADeviceThatRecoversStartsAgain(t *testing.T) {
+	f := &fakeRuntime{links: "lo\nport_BOS\n", running: map[string]bool{}}
+	for _, d := range render.EnabledDaemons() {
+		f.running[d] = true
+	}
+	s := &Server{rt: f, partial: map[string]int{}}
+	s.cfg.Node = "node-0"
+
+	s.brokenBecause(context.Background(), routerWithTwoCables())
+	f.links = "lo\nport_BOS\nport_CHI\n"
+	if why := s.brokenBecause(context.Background(), routerWithTwoCables()); why != "" {
+		t.Fatalf("a fully wired device was reported broken: %q", why)
+	}
+	f.links = "lo\nport_BOS\n"
+	if why := s.brokenBecause(context.Background(), routerWithTwoCables()); why != "" {
+		t.Errorf("a device that had recovered and then lost a cable again was reported "+
+			"broken on the first survey (%q); the count should have restarted", why)
+	}
+}

@@ -360,8 +360,19 @@ func init() {
 
 	Register(&Fault{
 		Name: "link_detach", Category: CatLink, Needs: []Capability{CapIP},
-		Symptom:  "One link is completely gone; the interface is not even listed.",
-		Describe: "An interface was removed from its bridge, so the cable is effectively unplugged.",
+		Symptom:  "Traffic across one link disappears, though the interface is up and addressed.",
+		Describe: "An interface carries nothing in either direction, as though the cable were cut.",
+		// The symptom said "the interface is not even listed", and it is: this
+		// drops traffic rather than removing the device. An RCA benchmark that
+		// describes evidence the agent will not find is worse than one that
+		// describes none, because the agent spends its time looking for it.
+		//
+		// NIKA's link_failure deletes the interface. Twinet does not, because
+		// removing a veth end from inside the namespace cannot be undone from
+		// there, and a fault that cannot be undone destroys the lab rather than
+		// perturbing it. See docs/10 for what that means for the coverage
+		// claim.
+		//
 		// Distinct from link_down: the interface stays up and configured, so a
 		// student or an agent looking at `ip link` sees nothing wrong on this
 		// side. The traffic simply has nowhere to go.

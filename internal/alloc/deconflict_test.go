@@ -86,3 +86,37 @@ func TestRedeployKeepsTheSameIdentifiers(t *testing.T) {
 		}
 	}
 }
+
+// A lab that had to move a colliding identifier must be given the same
+// replacement every time it is deployed.
+//
+// The candidate search refused any identifier already in use, including the
+// one this lab had been given on the previous deploy -- which is in use by the
+// very link being re-placed. So each deploy chose a different identifier, tore
+// down the tunnel and built a new one, and a cross-node link went down for as
+// long as that took on a lab nothing had changed about.
+func TestARemappedIdentifierIsStableAcrossDeploys(t *testing.T) {
+	const lab, link = "cos461", "as3/ATL:port_BOS|as4/CHI:port_ATL"
+
+	original := VNI(lab, link, 0)
+	// Somebody else holds the identifier this link would derive.
+	world := map[uint32]string{original: "someone-else"}
+
+	first, moved := Deconflict(lab, map[string]uint32{link: original}, world)
+	if moved != 1 {
+		t.Fatalf("a colliding identifier was not moved (%d)", moved)
+	}
+	got := first[link]
+	if got == original {
+		t.Fatal("the collision was not resolved")
+	}
+
+	// The next deploy: the world now shows that identifier as ours.
+	world[got] = lab
+	second, _ := Deconflict(lab, map[string]uint32{link: original}, world)
+	if second[link] != got {
+		t.Errorf("the same link was given %d and then %d. Every deploy would destroy "+
+			"and rebuild this tunnel, taking the link down each time on a lab nothing "+
+			"had changed about", got, second[link])
+	}
+}

@@ -162,6 +162,10 @@ type Server struct {
 
 	// exempt records, per lab, the devices that are broken on purpose.
 	exempt map[string]*exemptions
+
+	// partial counts consecutive surveys in which a device has been missing
+	// some, but not all, of its interfaces.
+	partial map[string]int
 }
 
 // lease records an in-flight mutating operation on one lab.
@@ -187,6 +191,7 @@ func New(cfg Config) (*Server, error) {
 
 		repairFails: map[string]int{},
 		exempt:      map[string]*exemptions{},
+		partial:     map[string]int{},
 	}
 	if cfg.StateDir != "" {
 		st, err := state.Open(cfg.StateDir)
