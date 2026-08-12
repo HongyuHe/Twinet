@@ -237,7 +237,12 @@ func checkVersionSkew(ctx context.Context, c *client.Cluster) error {
 }
 
 // redeployScopes re-applies the reference solution to specific autonomous
-// systems, which is how a wave's submissions are cleared before the next wave.
+// systems, which is how a submission is cleared once it has been graded.
+//
+// Returning a system to the state a *student* starts from is a different job,
+// done per device by resetToStudentStart: it must not touch anything outside
+// the one system, because everything else in the lab is the reference the next
+// submission will be graded against.
 func redeployScopes(ctx context.Context, top *model.Topology, token string, scopes []string) error {
 	tok, err := tokenFor(token)
 	if err != nil {

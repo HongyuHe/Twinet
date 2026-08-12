@@ -85,8 +85,9 @@ func (e *expander) verify() error {
 			add("AS %d: as_block %q is not a prefix: %v", asn, as.Block, err)
 			continue
 		}
-		reg.Exempt(p.Masked())
-		reg.Claim(p, fmt.Sprintf("AS %d aggregate", asn), ipam.FieldASBlock)
+		scope := fmt.Sprintf("as%d", asn)
+		reg.Exempt(p.Masked(), scope)
+		reg.Claim(p, fmt.Sprintf("AS %d aggregate", asn), ipam.FieldASBlock, scope)
 	}
 	// Links in a shared segment intentionally share one subnet, so they are
 	// claimed once, by segment, rather than once per cable.
@@ -108,10 +109,10 @@ func (e *expander) verify() error {
 				continue
 			}
 			segments[l.Segment] = l.Subnet
-			reg.Claim(p, "segment "+l.Segment, subnetField(l))
+			reg.Claim(p, "segment "+l.Segment, subnetField(l), linkScope(l))
 			continue
 		}
-		reg.Claim(p, "link "+l.ID, subnetField(l))
+		reg.Claim(p, "link "+l.ID, subnetField(l), linkScope(l))
 	}
 	for _, c := range reg.Conflicts() {
 		add("%s", c.String())
@@ -222,8 +223,8 @@ func subnetField(l *model.Link) string {
 // two links between the same pair of devices, which happens when a reduced
 // staff-run AS carries every external port on a single router.
 //
-// Names are disambiguated in link-identity order so the result is stable
-// regardless of the order the manifest happens to list peerings in.
+// Names are disambiguated in link-content order so the result is stable
+// regardless of the order the manifest happens to list the parallel links in.
 func (e *expander) uniquifyIfaceNames() {
 	for _, d := range e.top.SortedDevices() {
 		byName := map[string][]*model.Iface{}
@@ -234,8 +235,13 @@ func (e *expander) uniquifyIfaceNames() {
 			if len(group) < 2 {
 				continue
 			}
-			sort.Slice(group, func(a, b int) bool {
-				return linkKeyOf(group[a]) < linkKeyOf(group[b])
+			// SliceStable, not Slice: two genuinely interchangeable parallel
+			// links (identical endpoints, names and addresses) produce equal
+			// keys, and a stable sort leaves them in the order they were built
+			// so the suffixing is deterministic. Their addresses are identical
+			// anyway, so which one keeps the bare name is unobservable.
+			sort.SliceStable(group, func(a, b int) bool {
+				return linkIdentityKey(group[a]) < linkIdentityKey(group[b])
 			})
 			for n, i := range group[1:] {
 				suffix := fmt.Sprintf("_%d", n+2)
@@ -281,9 +287,71 @@ func (e *expander) reidentifyLinks() {
 	}
 }
 
-func linkKeyOf(i *model.Iface) string {
-	if i.Link != nil {
-		return i.Link.ID
+// linkIdentityKey orders two interfaces that share a name on one device by the
+// content of the links they terminate, not by an identity those links have not
+// been given yet.
+//
+// uniquifyIfaceNames runs before reidentifyLinks, so two parallel links between
+// the same pair of devices still carry the same link ID at this point -- the ID
+// is derived from the interface names, and the names are what we are about to
+// make unique. Ordering the collision by that ID therefore orders it by an
+// already-tied key, and the tie fell to whichever link the manifest listed
+// first. Swapping two parallel links in the source then swapped which interface
+// kept the bare name and which was suffixed, and with it the address each one
+// was left holding -- so a student's saved submission, which records those
+// addresses, silently stopped matching the lab it was taken from.
+//
+// The key is built from the link's own distinguishing content: both endpoints'
+// device, declared interface name, declared address and VRF, plus the declared
+// subnets and segment. It is assembled canonically -- the two endpoints are
+// sorted -- so it does not depend on which end the manifest called A. Two links
+// that differ in any of this sort the same way under every manifest ordering;
+// two that differ in none are genuinely interchangeable and their identical
+// addresses make the outcome the same whichever is suffixed.
+func linkIdentityKey(i *model.Iface) string {
+	l := i.Link
+	if l == nil {
+		return "iface\x00" + i.Name
 	}
-	return i.Name
+	ends := []string{endpointIdentity(l.A), endpointIdentity(l.B)}
+	sort.Strings(ends)
+	return strings.Join(append(ends, l.Subnet, l.SubnetV6, l.Segment), "\x00")
+}
+
+// endpointIdentity is the distinguishing content of one end of a link: where it
+// lands and what it was declared to carry.
+func endpointIdentity(i *model.Iface) string {
+	if i == nil {
+		return ""
+	}
+	dev := ""
+	if i.Device != nil {
+		dev = i.Device.ID
+	}
+	return strings.Join([]string{dev, i.Name, i.Addr4, i.Addr6, i.VRF}, "\x1f")
+}
+
+// linkScope names the autonomous system a link's subnet belongs to, or "" when
+// it belongs to no single one.
+//
+// The case that matters is a link between two different systems: its addresses
+// are part of neither side's aggregate, so no aggregate should excuse an
+// overlap with it. A link from a system to a lab-global service is a different
+// thing despite also joining two ASNs -- the service has no address space of
+// its own and is numbered out of the system it attaches to, by design.
+func linkScope(l *model.Link) string {
+	if l.A == nil || l.B == nil || l.A.Device == nil || l.B.Device == nil {
+		return ""
+	}
+	a, b := l.A.Device.ASN, l.B.Device.ASN
+	switch {
+	case a != 0 && b != 0 && a != b:
+		return ""
+	case a != 0:
+		return fmt.Sprintf("as%d", a)
+	case b != 0:
+		return fmt.Sprintf("as%d", b)
+	default:
+		return ""
+	}
 }

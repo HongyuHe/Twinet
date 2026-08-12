@@ -21,6 +21,7 @@ import (
 	"github.com/HongyuHe/twinet/internal/grade"
 	"github.com/HongyuHe/twinet/internal/harness"
 	"github.com/HongyuHe/twinet/internal/model"
+	"github.com/HongyuHe/twinet/internal/render"
 	rt "github.com/HongyuHe/twinet/internal/runtime"
 )
 
@@ -547,14 +548,131 @@ func shellQuote(s string) string {
 // applyDeviceScript runs a submitted script one command at a time, tolerating
 // commands whose effect is already in place.
 func applyDeviceScript(ctx context.Context, exec execFn, d *model.Device, body string) error {
-	res, err := exec(ctx, d.ID, []string{"sh", "-c",
-		"while IFS= read -r c; do case \"$c\" in ''|\\#*) continue;; esac; $c 2>/dev/null || true; done <<'TWINET_APPLY'\n" +
-			body + "\nTWINET_APPLY"})
+	// Every line's exit status is examined.
+	//
+	// The runner used to end each command with `|| true`, so a script in which
+	// every single line failed still reported success and the student was
+	// marked on state that was never installed. It swallowed a real bug too:
+	// the leading "-" that marks an optional line was passed to the shell as
+	// part of the command, so `-ip tunnel del gre1` ran as a command called
+	// "-ip", failed, was ignored -- and then `ip tunnel add gre1` failed
+	// because the tunnel it was supposed to have removed was still there. The
+	// 6in4 answer could not be restored from a student's own archive.
+	//
+	// The marker is stripped here, and only a line carrying it may fail.
+	runner := strings.Join([]string{
+		"rc=0",
+		"while IFS= read -r c; do",
+		`  case "$c" in ''|\#*) continue;; esac`,
+		"  opt=0",
+		`  case "$c" in -*) opt=1; c=${c#-};; esac`,
+		`  if ! err=$($c 2>&1 >/dev/null); then`,
+		`    if [ "$opt" = 0 ]; then`,
+		`      echo "$c: $err" >&2`,
+		"      rc=1",
+		"    fi",
+		"  fi",
+		"done <<'TWINET_APPLY'",
+		body,
+		"TWINET_APPLY",
+		"exit $rc",
+	}, "\n")
+
+	res, err := exec(ctx, d.ID, []string{"sh", "-c", runner})
 	if err != nil {
 		return fmt.Errorf("%s: running the submitted script: %w", d.ID, err)
 	}
 	if res.ExitCode != 0 {
 		return fmt.Errorf("%s: the submitted script could not be applied: %s",
+			d.ID, firstLine(res.Stderr+res.Stdout))
+	}
+	return nil
+}
+
+// resetToStudentStart returns one autonomous system to the state its owner was
+// given: the platform's own addressing, the starting FRR configuration, and
+// none of the kernel state a submission's scripts install.
+//
+// A submission has to be loaded onto this, not onto the solved lab. The
+// difference decides what an omission means. A submission carries the files the
+// student wrote; a router they never touched, or a file their archive does not
+// contain, keeps whatever was already in the container -- and in a lab deployed
+// at the reference that is the model answer. The student scores for a router
+// they never configured, and the report cannot tell anyone it happened, because
+// from the grader's side a correct router looks the same however it got that
+// way.
+func resetToStudentStart(ctx context.Context, exec execFn, top *model.Topology, asn int) error {
+	as, ok := top.ASes[asn]
+	if !ok {
+		return fmt.Errorf("AS %d is not in the harness", asn)
+	}
+	devices := append([]*model.Device{}, as.Devices...)
+	sort.Slice(devices, func(i, j int) bool { return devices[i].ID < devices[j].ID })
+	for _, d := range devices {
+		if err := wipeDeviceState(ctx, exec, d); err != nil {
+			return err
+		}
+		if d.Kind != model.KindRouter {
+			continue
+		}
+		cfg, err := render.Router(top, d)
+		if err != nil {
+			return fmt.Errorf("%s: rendering the starting configuration: %w", d.ID, err)
+		}
+		if err := loadFRRConfig(ctx, exec, d, cfg.Platform); err != nil {
+			return fmt.Errorf("%s: restoring the starting configuration: %w", d.ID, err)
+		}
+	}
+	return nil
+}
+
+// wipeDeviceState removes what a submission can install and puts back what the
+// platform owns, without recreating the container.
+func wipeDeviceState(ctx context.Context, exec execFn, d *model.Device) error {
+	lines := []string{
+		// Tunnels first: deleting one takes the routes through it as well.
+		`ip -d tunnel show 2>/dev/null | while read -r l; do ` +
+			`case "$l" in sit0:*) continue;; esac; n=${l%%:*}; ` +
+			`[ -n "$n" ] && ip tunnel del "$n" 2>/dev/null; done`,
+		// Routes with no proto are the hand-installed ones, which is exactly
+		// what distinguishes a student's work from a routing daemon's.
+		`ip -o -4 route show | grep -v " proto " | while read -r r; do ` +
+			`ip route del $r 2>/dev/null; done`,
+		`ip -o -6 route show 2>/dev/null | grep -v " proto " | grep -v "^fe80" | ` +
+			`while read -r r; do ip -6 route del $r 2>/dev/null; done`,
+		// A switch's VLAN assignments are a submitted answer too.
+		`if command -v ovs-vsctl >/dev/null 2>&1; then ` +
+			`for b in $(ovs-vsctl list-br 2>/dev/null); do ` +
+			`for p in $(ovs-vsctl list-ports "$b" 2>/dev/null); do ` +
+			`ovs-vsctl clear port "$p" tag 2>/dev/null; ` +
+			`ovs-vsctl clear port "$p" trunks 2>/dev/null; done; done; fi`,
+	}
+	// Addresses are flushed per interface and the planned ones put back, rather
+	// than flushed wholesale: in the state a student starts from, the platform
+	// has already addressed the interfaces it owns, and a deployment is what
+	// puts those back. Doing it here means the reset does not depend on one.
+	for _, i := range d.Ifaces {
+		if i.Name == "" || i.Name == "lo" {
+			continue
+		}
+		lines = append(lines, fmt.Sprintf("ip addr flush dev %s scope global 2>/dev/null", i.Name))
+		if i.Owner != model.OwnerPlatform {
+			continue
+		}
+		if i.Addr4 != "" {
+			lines = append(lines, fmt.Sprintf("ip addr replace %s dev %s 2>/dev/null", i.Addr4, i.Name))
+		}
+		if i.Addr6 != "" {
+			lines = append(lines, fmt.Sprintf("ip -6 addr replace %s dev %s 2>/dev/null", i.Addr6, i.Name))
+		}
+	}
+	lines = append(lines, "exit 0")
+	res, err := exec(ctx, d.ID, []string{"sh", "-c", strings.Join(lines, "\n")})
+	if err != nil {
+		return fmt.Errorf("%s: clearing the previous submission: %w", d.ID, err)
+	}
+	if res.ExitCode != 0 {
+		return fmt.Errorf("%s: clearing the previous submission: %s",
 			d.ID, firstLine(res.Stderr+res.Stdout))
 	}
 	return nil

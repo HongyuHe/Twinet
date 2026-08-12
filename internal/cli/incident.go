@@ -173,13 +173,27 @@ func newIncidentRunCmd(opts *Options) *cobra.Command {
 				unlockInj()
 				return err
 			}
-			journal := func(inj *fault.Injection) {
+			// A fault that could not be recorded is undone rather than left
+			// live. Warning and carrying on recreated the exact defect this
+			// record exists to close: an interruption, or a scenario held open
+			// with --keep, leaves a fault in the lab that nothing on disk
+			// mentions, so `twinet fault resolve --all` cannot find it and the
+			// next class to use the cluster inherits it with no way to know
+			// why their network is broken.
+			journal := func(inj *fault.Injection) error {
 				ledger = append(ledger, inj)
 				if err := saveInjections(top, ledger); err != nil {
-					fmt.Fprintf(cmd.ErrOrStderr(),
-						"warning: %s is live but could not be recorded (%v); "+
-							"`twinet fault resolve --all` will not undo it\n", inj.Fault, err)
+					ledger = ledger[:len(ledger)-1]
+					if rerr := fault.Resolve(cmd.Context(), env, inj); rerr != nil {
+						return fmt.Errorf("%s is live, could not be recorded (%v), and could "+
+							"not be undone either (%v). It is still in the lab and nothing on "+
+							"disk says so: resolve it by hand before using this lab again",
+							inj.Fault, err, rerr)
+					}
+					return fmt.Errorf("%s could not be recorded (%w), so it has been undone "+
+						"rather than left live with no record of it", inj.Fault, err)
 				}
+				return nil
 			}
 
 			var injected []*fault.Injection
@@ -190,7 +204,11 @@ func newIncidentRunCmd(opts *Options) *cobra.Command {
 					fmt.Fprintf(cmd.ErrOrStderr(), "injection failed: %v\n", err)
 					break
 				}
-				journal(inj)
+				if jerr := journal(inj); jerr != nil {
+					ep.Err = jerr.Error()
+					fmt.Fprintf(cmd.ErrOrStderr(), "%v\n", jerr)
+					break
+				}
 				injected = append(injected, inj)
 				ep.Truth = append(ep.Truth, inj.Truth)
 				if f, ok := fault.Lookup(fs.Type); ok {

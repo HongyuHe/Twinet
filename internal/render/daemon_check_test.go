@@ -49,6 +49,20 @@ func TestARouterWithNoRoutingDaemonFailsItsDeployment(t *testing.T) {
 			pidof:   `case "$1" in zebra) exit 0;; *) exit 1;; esac`,
 			wantErr: true,
 		},
+		{
+			// The check used to look for zebra and bgpd only, so this router
+			// passed its deployment. OSPF would then never converge, iBGP
+			// would never come up because the loopbacks were unreachable, and
+			// the report said every device was healthy.
+			what:    "everything is up except ospfd",
+			pidof:   `case "$1" in ospfd) exit 1;; *) exit 0;; esac`,
+			wantErr: true,
+		},
+		{
+			what:    "everything is up except ldpd, which carries the VPN labels",
+			pidof:   `case "$1" in ldpd) exit 1;; *) exit 0;; esac`,
+			wantErr: true,
+		},
 	}
 
 	for _, c := range cases {
@@ -78,6 +92,29 @@ func TestARouterWithNoRoutingDaemonFailsItsDeployment(t *testing.T) {
 					"A check that refuses a healthy router gets switched off.", c.what, err)
 			}
 		})
+	}
+}
+
+// The daemons a router is checked for have to be the daemons it was told to
+// run. Listing them a second time in the checking code is how they drift apart.
+func TestEveryEnabledDaemonIsChecked(t *testing.T) {
+	script := daemonCheckScript(t)
+	enabled := EnabledDaemons()
+	if len(enabled) < 3 {
+		t.Fatalf("only %d daemons parsed out of the daemons file: %v", len(enabled), enabled)
+	}
+	for _, d := range enabled {
+		if !strings.Contains(script, d) {
+			t.Errorf("%s is enabled in the daemons file but the deployment never "+
+				"checks whether it is running", d)
+		}
+	}
+	for _, off := range []string{"ripd", "isisd", "pimd", "babeld"} {
+		for _, on := range enabled {
+			if on == off {
+				t.Errorf("%s is disabled in the daemons file but was parsed as enabled", off)
+			}
+		}
 	}
 }
 

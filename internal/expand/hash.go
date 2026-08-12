@@ -33,17 +33,23 @@ import (
 // the hash wrong rather than more complete.
 func canonicalise(w io.Writer, top *model.Topology) {
 	for _, d := range top.SortedDevices() {
-		fmt.Fprintf(w, "device %s\n", d.ID)
+		writeString(w, "device ")
+		writeBlob(w, d.ID)
+		writeString(w, "\n")
 		writeStruct(w, "  ", reflect.ValueOf(*d))
 		for _, i := range d.Ifaces {
-			fmt.Fprintf(w, "  iface %s\n", i.Name)
+			writeString(w, "  iface ")
+			writeBlob(w, i.Name)
+			writeString(w, "\n")
 			writeStruct(w, "    ", reflect.ValueOf(*i))
 		}
 	}
 	links := append([]*model.Link(nil), top.Links...)
 	sort.Slice(links, func(a, b int) bool { return links[a].ID < links[b].ID })
 	for _, l := range links {
-		fmt.Fprintf(w, "link %s\n", l.ID)
+		writeString(w, "link ")
+		writeBlob(w, l.ID)
+		writeString(w, "\n")
 		writeStruct(w, "  ", reflect.ValueOf(*l))
 	}
 	for _, asn := range top.SortedASNs() {
@@ -90,7 +96,9 @@ func canonicalise(w io.Writer, top *model.Topology) {
 	}
 	sort.Strings(names)
 	for _, n := range names {
-		fmt.Fprintf(w, "service %s\n", n)
+		writeString(w, "service ")
+		writeBlob(w, n)
+		writeString(w, "\n")
 		writeStruct(w, "  ", reflect.ValueOf(*top.Services[n]))
 	}
 }
@@ -136,6 +144,21 @@ func writeString(w io.Writer, s string) {
 	_, _ = io.WriteString(w, s)
 }
 
+// writeBlob writes s as a length-counted field: its byte length, a colon, then
+// the bytes themselves.
+//
+// This is the whole fix for the collision. The old encoding joined elements
+// with a delimiter and left the reader to split on it, so a single element
+// containing that delimiter -- command ["a,b"] -- was indistinguishable from
+// two elements -- ["a","b"]. Once the length is written ahead of the bytes,
+// nothing inside the bytes can be mistaken for a boundary, and no two distinct
+// values can share an encoding. Every variable-length thing below (a field
+// name, a scalar's text, a whole struct) is emitted through here.
+func writeBlob(w io.Writer, s string) {
+	fmt.Fprintf(w, "%d:", len(s))
+	writeString(w, s)
+}
+
 func writeStruct(w io.Writer, indent string, v reflect.Value) {
 	t := v.Type()
 	for i := 0; i < t.NumField(); i++ {
@@ -146,30 +169,40 @@ func writeStruct(w io.Writer, indent string, v reflect.Value) {
 		if _, ok := skipped[f.Name]; ok {
 			continue
 		}
-		fmt.Fprintf(w, "%s%s=", indent, f.Name)
+		writeString(w, indent)
+		writeBlob(w, f.Name)
+		writeString(w, "=")
 		writeValue(w, v.Field(i))
-		fmt.Fprintln(w)
+		writeString(w, "\n")
 	}
 }
 
+// writeValue writes v in a form that is injective: distinct values never share
+// an encoding. Every value is tagged with its kind and every variable-length
+// payload is length-counted, so the type and the exact bytes can always be
+// recovered from the output. A slice writes its element count first, which is
+// what makes a one-element slice provably different from a two-element one even
+// when the elements concatenate to the same characters.
 func writeValue(w io.Writer, v reflect.Value) {
 	switch v.Kind() {
 	case reflect.Ptr, reflect.Interface:
 		if v.IsNil() {
-			writeString(w, "nil")
+			writeString(w, "n;")
 			return
 		}
+		writeString(w, "p;")
 		writeValue(w, v.Elem())
 	case reflect.Struct:
-		writeString(w, "{")
+		writeString(w, "s{")
 		writeStructInline(w, v)
 		writeString(w, "}")
 	case reflect.Slice, reflect.Array:
-		writeString(w, "[")
+		// The element count is written before the elements. Without it a
+		// one-element slice holding a delimiter would encode like a
+		// two-element slice; with it the two can never match, and each element
+		// is itself self-delimiting.
+		fmt.Fprintf(w, "l%d[", v.Len())
 		for i := 0; i < v.Len(); i++ {
-			if i > 0 {
-				writeString(w, ",")
-			}
 			writeValue(w, v.Index(i))
 		}
 		writeString(w, "]")
@@ -181,17 +214,19 @@ func writeValue(w io.Writer, v reflect.Value) {
 		sort.Slice(keys, func(a, b int) bool {
 			return fmt.Sprint(keys[a].Interface()) < fmt.Sprint(keys[b].Interface())
 		})
-		writeString(w, "{")
-		for i, k := range keys {
-			if i > 0 {
-				writeString(w, ",")
-			}
-			fmt.Fprintf(w, "%v:", k.Interface())
+		fmt.Fprintf(w, "m%d{", len(keys))
+		for _, k := range keys {
+			writeValue(w, k)
+			writeString(w, ":")
 			writeValue(w, v.MapIndex(k))
 		}
 		writeString(w, "}")
 	default:
-		fmt.Fprintf(w, "%v", v.Interface())
+		// Scalars: tag with the kind so a string "1" and an int 1 cannot share
+		// an encoding, then length-count the text so a scalar whose printed
+		// form contains a delimiter is still unambiguous.
+		fmt.Fprintf(w, "%s:", v.Kind())
+		writeBlob(w, fmt.Sprintf("%v", v.Interface()))
 	}
 }
 
@@ -205,11 +240,10 @@ func writeStructInline(w io.Writer, v reflect.Value) {
 		if _, ok := skipped[f.Name]; ok {
 			continue
 		}
-		if i > 0 {
-			writeString(w, ",")
-		}
-		fmt.Fprintf(w, "%s=", f.Name)
+		writeBlob(w, f.Name)
+		writeString(w, "=")
 		writeValue(w, v.Field(i))
+		writeString(w, ";")
 	}
 }
 

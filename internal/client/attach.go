@@ -2,6 +2,7 @@ package client
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -9,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/url"
+	"strconv"
 	"strings"
 )
 
@@ -53,6 +55,9 @@ func (n *Node) Attach(ctx context.Context, container string, cmd []string,
 	q := url.Values{}
 	q.Set("container", container)
 	q.Set("cmd", string(raw))
+	// Ask for the exit status. Without it this function returned 0 whatever
+	// the command did.
+	q.Set("status", "1")
 	if tty {
 		q.Set("tty", "1")
 		q.Set("rows", fmt.Sprint(rows))
@@ -107,6 +112,53 @@ func (n *Node) Attach(ctx context.Context, container string, cmd []string,
 			_ = hc.CloseWrite()
 		}
 	}()
-	_, _ = io.Copy(stdout, br)
-	return 0, nil
+	tw := &exitTrailerWriter{w: stdout}
+	_, _ = io.Copy(tw, br)
+	return tw.finish(), nil
 }
+
+// exitTrailerWriter passes a stream through while holding back just enough of
+// the tail to recognise the exit-status trailer the agent appends.
+//
+// Holding back a few bytes is safe for an interactive session because the
+// trailer is only ever the last thing on the stream, and the amount retained is
+// smaller than a single line: a terminal cannot notice.
+type exitTrailerWriter struct {
+	w    io.Writer
+	tail []byte
+}
+
+// keep is the most that can ever be part of a trailer: its introducer plus the
+// digits of any exit status and the newline.
+const keep = len(attachExitTrailer) + 8
+
+func (e *exitTrailerWriter) Write(p []byte) (int, error) {
+	n := len(p)
+	e.tail = append(e.tail, p...)
+	if len(e.tail) > keep {
+		flush := e.tail[:len(e.tail)-keep]
+		if _, err := e.w.Write(flush); err != nil {
+			return 0, err
+		}
+		e.tail = append([]byte{}, e.tail[len(e.tail)-keep:]...)
+	}
+	return n, nil
+}
+
+// finish writes what is left and returns the exit status the trailer carried,
+// or zero when there was none -- which is what an agent too old to send one
+// produces, and is why the cluster refuses to run against mixed builds.
+func (e *exitTrailerWriter) finish() int {
+	body, code := e.tail, 0
+	if i := bytes.LastIndex(body, []byte(attachExitTrailer)); i >= 0 {
+		if n, err := strconv.Atoi(strings.TrimSpace(
+			string(body[i+len(attachExitTrailer):]))); err == nil {
+			body, code = body[:i], n
+		}
+	}
+	_, _ = e.w.Write(body)
+	return code
+}
+
+// attachExitTrailer must match the agent's.
+const attachExitTrailer = "\x00twinet-exit:"

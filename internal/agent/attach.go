@@ -130,5 +130,32 @@ func (s *Server) handleAttach(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(stdin, conn)
 		_ = stdin.Close()
 	}()
-	_ = proc.Wait()
+	// The exit status is sent back as a trailer, because a hijacked connection
+	// carries bytes and nothing else: there is no header left to put it in.
+	//
+	// Without it every attached command reported success. `twinet exec` said 0
+	// for a command that failed, and the gateway's device list said every
+	// container was running because the probe it ran could not fail. A status
+	// display that cannot report a problem is worse than none, because it is
+	// believed.
+	//
+	// Only sent when asked for, so a client that does not know about it does
+	// not find a stray line at the end of an interactive session.
+	code := 0
+	if err := proc.Wait(); err != nil {
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			code = ee.ExitCode()
+		} else {
+			code = 1
+		}
+	}
+	if q.Get("status") == "1" {
+		fmt.Fprintf(conn, "%s%d\n", attachExitTrailer, code)
+	}
 }
+
+// attachExitTrailer introduces the exit status at the very end of an attach
+// stream. It begins with a NUL so it cannot be confused with a line a program
+// printed: a NUL is not something a terminal session emits.
+const attachExitTrailer = "\x00twinet-exit:"

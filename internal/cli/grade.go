@@ -171,6 +171,18 @@ the hours a sleep-driven serial grader takes.`,
 			if err := writeReports(outDir, summary); err != nil {
 				return err
 			}
+			// --json is a global flag, and this command accepted it and printed
+			// the human summary anyway. Anything parsing the output got prose
+			// where it expected an object, which is a confusing way to find out
+			// that a flag does nothing.
+			if opts.JSON {
+				enc := json.NewEncoder(cmd.OutOrStdout())
+				enc.SetIndent("", "  ")
+				if err := enc.Encode(summary); err != nil {
+					return err
+				}
+				return releaseGuard(summary, cmd.ErrOrStderr())
+			}
 			fmt.Fprintln(cmd.OutOrStdout())
 			fmt.Fprint(cmd.OutOrStdout(), summary.Text())
 			fmt.Fprintf(cmd.OutOrStdout(), "\nreports written to %s\n", outDir)

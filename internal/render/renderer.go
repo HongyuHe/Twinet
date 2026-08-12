@@ -174,10 +174,19 @@ func (r *Renderer) routerCommands(d *model.Device) []deploy.Command {
 		cmds = append(cmds, deploy.Command{
 			Describe: "check the routing daemons are running",
 			Args: []string{"sh", "-c", strings.Join([]string{
+				// The set comes from the daemons file, so a router is checked
+				// for every process it was told to run. Checking only zebra
+				// and bgpd let a router pass its deployment with ospfd dead,
+				// which is the same silence in a different daemon: OSPF never
+				// converges, and the report says the router is fine.
+				"daemons='" + strings.Join(EnabledDaemons(), " ") + "'",
+				"missing() { m=''; for d in $daemons; do",
+				"  pidof \"$d\" >/dev/null 2>&1 || m=\"$m $d\"",
+				"done; echo \"$m\"; }",
 				// A short wait first: the daemons may be being started a few
 				// commands earlier and take a moment to write their pid files.
 				"for i in 1 2 3 4 5 6 7 8 9 10; do",
-				"  if pidof zebra >/dev/null 2>&1 && pidof bgpd >/dev/null 2>&1; then exit 0; fi",
+				"  [ -z \"$(missing)\" ] && exit 0",
 				"  sleep 1",
 				"done",
 				// Then try to start them, because a daemon that has died is
@@ -189,20 +198,18 @@ func (r *Renderer) routerCommands(d *model.Device) []deploy.Command {
 				// This is safe on a student's router: FRR reads its
 				// configuration from the file it was given, so starting a
 				// dead daemon restores what the student had rather than
-				// replacing it. Restarting a *live* one would not be safe,
-				// which is why this only runs when nothing is up.
-				"echo 'the routing daemons were not running; starting them' >&2",
+				// replacing it.
+				"echo \"not running:$(missing) -- starting the routing daemons\" >&2",
 				"for p in $(ps -ef | awk '/watchfrr/ && !/awk/ {print $1}'); do kill $p 2>/dev/null || true; done",
-				"rm -f /var/run/frr/*.pid /var/run/frr/*.vty 2>/dev/null || true",
 				"/usr/lib/frr/frrinit.sh start >/dev/null 2>&1 || true",
 				"for i in 1 2 3 4 5 6 7 8 9 10; do",
-				"  if pidof zebra >/dev/null 2>&1 && pidof bgpd >/dev/null 2>&1; then exit 0; fi",
+				"  [ -z \"$(missing)\" ] && exit 0",
 				"  sleep 1",
 				"done",
-				`echo "the routing daemons are not running and could not be started: ` +
-					`zebra=$(pidof zebra || echo none) bgpd=$(pidof bgpd || echo none). ` +
-					`This router has no routing process, so every session with it will sit ` +
-					`Active and the failure will appear on its neighbours rather than here." >&2`,
+				`echo "these routing daemons are not running and could not be ` +
+					`started:$(missing). A router missing a routing process will ` +
+					`never converge, and the failure appears on its neighbours ` +
+					`rather than here." >&2`,
 				"exit 1",
 			}, "\n")},
 		})

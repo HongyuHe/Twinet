@@ -68,10 +68,15 @@ ci: ci-tools naming lint test build tidy-check
 	./bin/twinet validate -m examples/advnet
 	./bin/twinet grade validate examples/cos461/rubric/cos461.yaml
 	# The schema is generated, so it can only be trusted if something checks it
-	# still describes the manifests that exist.
+	# still describes the manifests that exist -- the root labs and every AS
+	# template, since a template ships unvalidated otherwise.
 	./bin/twinet schema > /tmp/twinet-lab.schema.json
 	@for m in examples/demo examples/cos461 examples/advnet examples/scale; do \
 		python3 scripts/check_schema.py /tmp/twinet-lab.schema.json $$m/twinet.yaml || exit 1; \
+		for t in $$m/templates/*.yaml; do \
+			[ -e "$$t" ] || continue; \
+			python3 scripts/check_schema.py --def ASTemplate /tmp/twinet-lab.schema.json $$t || exit 1; \
+		done; \
 	done
 	shellcheck scripts/*.sh
 	@echo "all CI gates passed"

@@ -6,11 +6,13 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 )
 
 // A submission archive says which group and which AS it belongs to, and carries
@@ -34,6 +36,7 @@ import (
 const (
 	bundleKeyFile = "submission_key.pem"
 	bundlePubFile = "submission_pub.pem"
+	bundleKeyLock = ".submission_key.lock"
 )
 
 // signBundle returns a detached signature over the bundle's identity and file
@@ -82,28 +85,85 @@ func verifyBundle(b Bundle, sig string, pub ed25519.PublicKey) bool {
 // It lives with the cluster's other credentials rather than in the lab
 // directory, because a key kept beside the archives it signs is worth as much
 // as no key: anyone who can edit an archive can re-sign it.
+//
+// `twinet save` runs eight collectors at once, and several machines may collect
+// at the same time, so the first-ever use is a load-or-create reached
+// concurrently. Done unlocked it is a race: two callers each generate a
+// different keypair and overwrite each other's halves, leaving a public key
+// that does not verify the private key the archives were signed with. Nothing
+// notices until grading, by which time the archives are collected and the cause
+// is gone. So the whole load-or-create is serialised by a cross-process file
+// lock, and a fresh keypair is installed by renaming temp files into place --
+// atomic within a filesystem -- and never overwritten once installed, so the
+// two halves are always the matched pair they were generated as.
 func submissionKey() (ed25519.PrivateKey, error) {
 	dir, err := credentialDir()
 	if err != nil {
 		return nil, err
 	}
-	path := filepath.Join(dir, bundleKeyFile)
-	if raw, err := os.ReadFile(path); err == nil {
-		blk, _ := pem.Decode(raw)
-		if blk == nil {
-			return nil, fmt.Errorf("%s is not a PEM key", path)
-		}
-		k, err := x509.ParsePKCS8PrivateKey(blk.Bytes)
-		if err != nil {
-			return nil, fmt.Errorf("%s: %w", path, err)
-		}
-		ed, ok := k.(ed25519.PrivateKey)
-		if !ok {
-			return nil, fmt.Errorf("%s is not an ed25519 key", path)
-		}
-		return ed, nil
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, err
 	}
+	unlock, err := lockCredentialDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 
+	priv, err := loadSubmissionKeyPair(dir)
+	if err == nil {
+		return priv, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		// The private half is present but unreadable, or present and not
+		// matching its public half. Regenerating would sign future archives
+		// with a key that cannot verify the ones already collected, so the
+		// operator is told rather than left with a mismatch nobody can explain.
+		return nil, err
+	}
+	return createSubmissionKeyPair(dir)
+}
+
+// loadSubmissionKeyPair reads an existing keypair and checks the halves match.
+//
+// A public half that does not correspond to the private half is exactly the
+// wreckage an earlier unlocked race left behind. It is reported as an error so
+// the mismatch is diagnosed here, at save time, rather than surfacing as an
+// unverifiable archive at grading time when nothing can be re-collected.
+func loadSubmissionKeyPair(dir string) (ed25519.PrivateKey, error) {
+	priv, err := existingSubmissionKey(dir)
+	if err != nil {
+		return nil, err
+	}
+	derived := priv.Public().(ed25519.PublicKey)
+	raw, err := os.ReadFile(filepath.Join(dir, bundlePubFile))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			// The private key implies the public one; install the missing half
+			// so a copied-in private key does not stay half a keypair.
+			if werr := writeSubmissionPublic(dir, derived); werr != nil {
+				return nil, werr
+			}
+			return priv, nil
+		}
+		return nil, err
+	}
+	pub, err := parsePublicKey(raw)
+	if err != nil {
+		return nil, err
+	}
+	if !derived.Equal(pub) {
+		return nil, fmt.Errorf("%s and %s in %s are not a pair: the stored public key does "+
+			"not verify the private key that would sign submissions. A previous unlocked save "+
+			"most likely generated two keypairs at once; delete both files and re-run `twinet "+
+			"save` to mint a fresh keypair, then re-collect any archives signed in between",
+			bundleKeyFile, bundlePubFile, dir)
+	}
+	return priv, nil
+}
+
+// createSubmissionKeyPair mints a keypair and installs both halves atomically.
+func createSubmissionKeyPair(dir string) (ed25519.PrivateKey, error) {
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		return nil, err
@@ -112,22 +172,72 @@ func submissionKey() (ed25519.PrivateKey, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, err
-	}
-	if err := os.WriteFile(path,
+	// The private half is written first, then the public. Either order is a
+	// matched pair -- a keypair is never overwritten -- and an unlocked reader
+	// that catches the create half-done either finds the matching public key or
+	// finds none and derives it from the private key, never a mismatched one.
+	if err := writeAtomic(dir, bundleKeyFile,
 		pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}), 0o600); err != nil {
 		return nil, err
 	}
-	pder, err := x509.MarshalPKIXPublicKey(pub)
-	if err != nil {
-		return nil, err
-	}
-	if err := os.WriteFile(filepath.Join(dir, bundlePubFile),
-		pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: pder}), 0o644); err != nil {
+	if err := writeSubmissionPublic(dir, pub); err != nil {
 		return nil, err
 	}
 	return priv, nil
+}
+
+// writeSubmissionPublic installs the verifying half.
+func writeSubmissionPublic(dir string, pub ed25519.PublicKey) error {
+	der, err := x509.MarshalPKIXPublicKey(pub)
+	if err != nil {
+		return err
+	}
+	return writeAtomic(dir, bundlePubFile,
+		pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der}), 0o644)
+}
+
+// lockCredentialDir takes a cross-process exclusive lock over the signing key's
+// load-or-create. A flock is held against the open file description, so two
+// goroutines in one process that each open the lock file exclude each other
+// exactly as two processes do -- which is what makes eight concurrent
+// collectors safe as well as two machines.
+func lockCredentialDir(dir string) (func(), error) {
+	f, err := os.OpenFile(filepath.Join(dir, bundleKeyLock), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	return func() {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = f.Close()
+	}, nil
+}
+
+// writeAtomic installs a file by writing a temporary file in the same directory
+// and renaming it into place. Rename is atomic within a filesystem, so a reader
+// sees either the old file or the whole new one and never a half-written key.
+func writeAtomic(dir, name string, data []byte, perm os.FileMode) error {
+	tmp, err := os.CreateTemp(dir, "."+name+".*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer func() { _ = os.Remove(tmpName) }()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(perm); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, filepath.Join(dir, name))
 }
 
 // submissionPublicKey loads the verifying half.
@@ -145,6 +255,11 @@ func submissionPublicKey() (ed25519.PublicKey, error) {
 		}
 		return nil, err
 	}
+	return parsePublicKey(raw)
+}
+
+// parsePublicKey decodes a PEM-encoded ed25519 public key.
+func parsePublicKey(raw []byte) (ed25519.PublicKey, error) {
 	blk, _ := pem.Decode(raw)
 	if blk == nil {
 		return nil, fmt.Errorf("submission public key is not PEM")

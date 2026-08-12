@@ -62,23 +62,57 @@ func Capture(ctx context.Context, r rt.Runtime, d *model.Device, lab, topoHash s
 			return "", false
 		}
 		if res.ExitCode != 0 {
-			// A router whose routing daemons are not running has no routing
-			// configuration left to lose: it is already gone, which is the
-			// thing being repaired. Refusing to replace such a container
-			// would preserve nothing and prevent the only fix, so this is
-			// reported as an empty capture rather than a failed one.
-			//
-			// The distinction is between "I could not look" and "I looked and
-			// the daemon is dead". Everything else is still a refusal.
-			if strings.Contains(res.Stderr, "failed to connect to any daemons") ||
-				strings.Contains(res.Stdout, "failed to connect to any daemons") {
-				return "", false
-			}
 			missed = append(missed, fmt.Sprintf("%s could not be read: %s exited %d: %s",
 				what, cmd[0], res.ExitCode, firstLine(res.Stderr)))
 			return "", false
 		}
 		return res.Stdout, true
+	}
+	// readFRRConfig captures the routing configuration, and is separate from the
+	// generic reader because a dead FRR is not a lost configuration.
+	//
+	// vtysh asks the running daemons for the configuration, so when they are
+	// not answering it fails -- but the student's work is a file on disk,
+	// /etc/frr/frr.conf, which is still there. Treating "the daemons are down"
+	// as "there is nothing to preserve" let the replacement delete that file.
+	// So when the daemons do not answer, the file is read directly; only if
+	// that read also fails is the configuration truly unreachable, and then the
+	// replacement is refused rather than allowed to destroy it.
+	readFRRConfig := func() (string, bool) {
+		res, err := r.Exec(ctx, d.Container,
+			rt.ExecCmd{Cmd: []string{"vtysh", "-c", "show running-config"}})
+		if err != nil {
+			missed = append(missed, fmt.Sprintf(
+				"the routing configuration of %s could not be read: %v", d.ID, err))
+			return "", false
+		}
+		if res.ExitCode == 0 {
+			return res.Stdout, true
+		}
+		if strings.Contains(res.Stderr, "failed to connect to any daemons") ||
+			strings.Contains(res.Stdout, "failed to connect to any daemons") {
+			fb, ferr := r.Exec(ctx, d.Container,
+				rt.ExecCmd{Cmd: []string{"cat", "/etc/frr/frr.conf"}})
+			if ferr == nil && fb.ExitCode == 0 {
+				return fb.Stdout, true
+			}
+			detail := ""
+			if ferr != nil {
+				detail = ferr.Error()
+			} else {
+				detail = fmt.Sprintf("cat exited %d: %s", fb.ExitCode, firstLine(fb.Stderr))
+			}
+			missed = append(missed, fmt.Sprintf(
+				"the routing configuration of %s could not be read: FRR is not answering and "+
+					"/etc/frr/frr.conf could not be read either (%s); replacing the container "+
+					"would destroy the student's configuration, so recover the file or bring "+
+					"FRR back before retrying", d.ID, detail))
+			return "", false
+		}
+		missed = append(missed, fmt.Sprintf(
+			"the routing configuration of %s could not be read: vtysh exited %d: %s",
+			d.ID, res.ExitCode, firstLine(res.Stderr)))
+		return "", false
 	}
 	add := func(kind state.Kind, body string) {
 		body = strings.TrimSpace(body)
@@ -94,8 +128,7 @@ func Capture(ctx context.Context, r rt.Runtime, d *model.Device, lab, topoHash s
 
 	switch d.Kind {
 	case model.KindRouter:
-		if body, ok := read("the routing configuration",
-			[]string{"vtysh", "-c", "show running-config"}); ok {
+		if body, ok := readFRRConfig(); ok {
 			add(state.KindFRR, cleanRunningConfig(body))
 		}
 		// Tunnels are configured with ip(8) rather than through FRR, so they

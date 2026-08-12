@@ -148,25 +148,39 @@ type Claim struct {
 	Prefix netip.Prefix
 	Owner  string // human-readable, e.g. "as12 link ATL--BOS"
 	Field  string // which plan expression produced it
+	// Scope names the autonomous system this claim belongs to, "as12", or is
+	// empty for a claim that belongs to no single system -- an inter-AS link,
+	// or a segment spanning two systems.
+	//
+	// Without it an aggregate excused any overlap it contained, whoever it
+	// belonged to, so AS 2 could address an internal link out of AS 1's block
+	// and the plan validated. Every packet for it would be drawn towards AS 1.
+	Scope string
 }
 
 // Registry accumulates claims and reports overlaps.
 type Registry struct {
 	claims []Claim
-	// exempt holds prefixes that are allowed to overlap, such as the per-AS
-	// aggregate /8 that legitimately contains all of that AS's subnets.
-	exempt []netip.Prefix
+	// exempt holds the aggregates, each with the system it belongs to: an
+	// aggregate contains its own system's subnets by design, and nobody
+	// else's by mistake.
+	exempt []Claim
 }
 
 // NewRegistry creates an empty registry.
 func NewRegistry() *Registry { return &Registry{} }
 
-// Exempt marks a prefix as an aggregate: other claims may fall inside it.
-func (r *Registry) Exempt(p netip.Prefix) { r.exempt = append(r.exempt, p.Masked()) }
+// Exempt marks a prefix as scope's aggregate: scope's own claims may fall
+// inside it.
+func (r *Registry) Exempt(p netip.Prefix, scope string) {
+	r.exempt = append(r.exempt, Claim{Prefix: p.Masked(), Scope: scope})
+}
 
 // Claim records a claim.
-func (r *Registry) Claim(p netip.Prefix, owner, field string) {
-	r.claims = append(r.claims, Claim{Prefix: p.Masked(), Owner: owner, Field: field})
+func (r *Registry) Claim(p netip.Prefix, owner, field, scope string) {
+	r.claims = append(r.claims, Claim{
+		Prefix: p.Masked(), Owner: owner, Field: field, Scope: scope,
+	})
 }
 
 // Conflict describes two claims that overlap.
@@ -211,7 +225,7 @@ func (r *Registry) Conflicts() []Conflict {
 				}
 				break
 			}
-			if r.exemptPair(a.Prefix, b.Prefix) {
+			if r.exemptPair(a, b) {
 				continue
 			}
 			out = append(out, Conflict{A: a, B: b})
@@ -229,29 +243,36 @@ func (r *Registry) Conflicts() []Conflict {
 // validated, and every address in the second AS belonged to the first as well.
 // That is the single worst thing an addressing plan can do, and it was the one
 // overlap the checker was guaranteed not to report.
-func (r *Registry) exemptPair(a, b netip.Prefix) bool {
-	aEx, bEx := r.isExempt(a), r.isExempt(b)
+func (r *Registry) exemptPair(a, b Claim) bool {
+	aEx, aOK := r.aggregateFor(a.Prefix)
+	bEx, bOK := r.aggregateFor(b.Prefix)
 	switch {
-	case aEx && bEx:
+	case aOK && bOK:
 		// Two aggregates. Always a conflict: neither is inside the other by
 		// arrangement, and if one is, the arrangement is the mistake.
 		return false
-	case aEx:
-		return a.Bits() < b.Bits() || a == b
-	case bEx:
-		return b.Bits() < a.Bits() || a == b
+	case aOK:
+		return contains(a.Prefix, b.Prefix) && aEx.Scope == b.Scope
+	case bOK:
+		return contains(b.Prefix, a.Prefix) && bEx.Scope == a.Scope
 	default:
 		return false
 	}
 }
 
-func (r *Registry) isExempt(p netip.Prefix) bool {
+// contains reports whether outer covers inner, including when they are equal:
+// an AS whose aggregate is exactly one subnet is unusual but not wrong.
+func contains(outer, inner netip.Prefix) bool {
+	return outer.Bits() <= inner.Bits() && outer.Contains(inner.Addr())
+}
+
+func (r *Registry) aggregateFor(p netip.Prefix) (Claim, bool) {
 	for _, e := range r.exempt {
-		if e == p {
-			return true
+		if e.Prefix == p {
+			return e, true
 		}
 	}
-	return false
+	return Claim{}, false
 }
 
 func overlaps(a, b netip.Prefix) bool {

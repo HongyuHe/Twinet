@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"compress/gzip"
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -80,6 +81,18 @@ lets that be told apart from a mistake, months later, in a dispute.`,
 				return err
 			}
 
+			// The signing key is minted or loaded once, here, before any
+			// collector starts. The load-or-create is safe to reach
+			// concurrently now, but doing it from eight workers still means
+			// eight first-time callers contending over one file; loading it
+			// once up front leaves the workers only ever reading a key that
+			// already exists, which is both simpler and impossible to race.
+			key, err := submissionKey()
+			if err != nil {
+				return fmt.Errorf("no key to sign submissions with (%w); an unsigned archive "+
+					"cannot be told apart from one written by hand", err)
+			}
+
 			var (
 				wg   sync.WaitGroup
 				mu   sync.Mutex
@@ -94,7 +107,7 @@ lets that be told apart from a mistake, months later, in a dispute.`,
 					sem <- struct{}{}
 					defer func() { <-sem }()
 
-					p, err := saveAS(cmd.Context(), top, asn, outDir, exec)
+					p, err := saveAS(cmd.Context(), top, asn, outDir, exec, key)
 					mu.Lock()
 					defer mu.Unlock()
 					if err != nil {
@@ -129,7 +142,7 @@ lets that be told apart from a mistake, months later, in a dispute.`,
 
 // saveAS writes one group's archive.
 func saveAS(ctx context.Context, top *model.Topology, asn int, outDir string,
-	exec func(context.Context, string, []string) (execResult, error)) (string, error) {
+	exec func(context.Context, string, []string) (execResult, error), key ed25519.PrivateKey) (string, error) {
 
 	as, ok := top.ASes[asn]
 	if !ok {
@@ -152,10 +165,13 @@ func saveAS(ctx context.Context, top *model.Topology, asn int, outDir string,
 		case model.KindRouter:
 			res, err := exec(ctx, d.ID, []string{"vtysh", "-c", "show running-config"})
 			if err != nil {
-				return "", fmt.Errorf("%s: %w", d.ID, err)
+				return "", fmt.Errorf("%s: its routing configuration could not be read: %w; "+
+					"re-run save once the device is reachable", d.ID, err)
 			}
 			if res.ExitCode != 0 {
-				return "", fmt.Errorf("%s: vtysh exited %d", d.ID, res.ExitCode)
+				return "", fmt.Errorf("%s: its routing configuration could not be read: "+
+					"vtysh exited %d: %s; re-run save once the device is reachable",
+					d.ID, res.ExitCode, firstLines(res.Stderr, 3))
 			}
 			contents[d.Name+".conf"] = []byte(cleanConfig(res.Stdout))
 
@@ -168,17 +184,29 @@ func saveAS(ctx context.Context, top *model.Topology, asn int, outDir string,
 			// gone. A student regraded from their own archive would lose the
 			// marks for three of the assignment's questions with nothing
 			// anywhere reporting that their work had not been loaded.
-			if sh := captureCommands(ctx, exec, d); sh != "" {
+			sh, err := captureCommands(ctx, exec, d)
+			if err != nil {
+				return "", err
+			}
+			if sh != "" {
 				contents[d.Name+".sh"] = []byte(sh)
 			}
 
 		case model.KindSwitch:
-			if sh := captureSwitch(ctx, exec, d); sh != "" {
+			sh, err := captureSwitch(ctx, exec, d)
+			if err != nil {
+				return "", err
+			}
+			if sh != "" {
 				contents[d.Name+".sh"] = []byte(sh)
 			}
 
 		case model.KindHost:
-			if sh := captureCommands(ctx, exec, d); sh != "" {
+			sh, err := captureCommands(ctx, exec, d)
+			if err != nil {
+				return "", err
+			}
+			if sh != "" {
 				contents[d.Name+".sh"] = []byte(sh)
 			}
 		}
@@ -206,11 +234,11 @@ func saveAS(ctx context.Context, top *model.Topology, asn int, outDir string,
 	// AS and every checksum are simply whatever the archive says they are: a
 	// student who edits a configuration recomputes the sha256 sitting next to
 	// it, and one who wants a better mark edits the group field.
-	key, err := submissionKey()
-	if err != nil {
-		return "", fmt.Errorf("no key to sign this submission with (%w); an unsigned archive "+
-			"cannot be told apart from one written by hand", err)
-	}
+	//
+	// The key is minted once, before any collector starts, and passed in. A
+	// worker that loaded it here would be one of eight racing the first-ever
+	// load-or-create, which is how the public and private halves end up from
+	// different keypairs and archives verify as untrusted at grading time.
 	meta, err := bundleJSON(b, signBundle(b, key))
 	if err != nil {
 		return "", err
@@ -254,8 +282,14 @@ func writeTar(tw *tar.Writer, name string, body []byte) error {
 // deliberately excluded: replaying it would fight the deployment rather than
 // restore the student's answer, and the two disagreeing is far harder to
 // diagnose than either alone.
+//
+// It returns ("", nil) for a device that genuinely had nothing to capture, and
+// ("", error) when the read itself failed. Collapsing the two into a bare ""
+// was the defect: a failed read of a host or a router's shell state was dropped
+// silently, and the save then checksummed and signed an archive missing the
+// student's work while reporting success.
 func captureCommands(ctx context.Context, exec func(context.Context, string, []string) (execResult, error),
-	d *model.Device) string {
+	d *model.Device) (string, error) {
 
 	// `replace` throughout, not `add`.
 	//
@@ -309,8 +343,14 @@ func captureCommands(ctx context.Context, exec func(context.Context, string, []s
 	}, "\n")
 
 	res, err := exec(ctx, d.ID, []string{"sh", "-c", script})
-	if err != nil || res.ExitCode != 0 {
-		return ""
+	if err != nil {
+		return "", fmt.Errorf("%s: its addresses, routes and tunnels could not be read: %w; "+
+			"re-run save once the device is reachable", d.ID, err)
+	}
+	if res.ExitCode != 0 {
+		return "", fmt.Errorf("%s: its addresses, routes and tunnels could not be read: "+
+			"sh exited %d: %s; re-run save once the device is reachable",
+			d.ID, res.ExitCode, firstLines(res.Stderr, 3))
 	}
 	var keep []string
 	for _, line := range strings.Split(res.Stdout, "\n") {
@@ -321,14 +361,18 @@ func captureCommands(ctx context.Context, exec func(context.Context, string, []s
 		keep = append(keep, t)
 	}
 	if len(keep) == 0 {
-		return ""
+		return "", nil
 	}
-	return "# captured from " + d.ID + "\n" + strings.Join(keep, "\n") + "\n"
+	return "# captured from " + d.ID + "\n" + strings.Join(keep, "\n") + "\n", nil
 }
 
 // captureSwitch renders a switch's port and VLAN configuration as commands.
+//
+// Like captureCommands it distinguishes ("", nil) -- a switch with no ports to
+// record -- from ("", error), a switch whose ports could not be read. A failed
+// read must fail the save rather than vanish into an archive that looks whole.
 func captureSwitch(ctx context.Context, exec func(context.Context, string, []string) (execResult, error),
-	d *model.Device) string {
+	d *model.Device) (string, error) {
 
 	// The spaces matter. ovs-vsctl prints a trunk list as "[10, 20]", and
 	// emitting that verbatim produces "trunks=10, 20" -- which the shell splits
@@ -348,10 +392,18 @@ func captureSwitch(ctx context.Context, exec func(context.Context, string, []str
   fi
 done`
 	res, err := exec(ctx, d.ID, []string{"sh", "-c", script})
-	if err != nil || res.ExitCode != 0 || strings.TrimSpace(res.Stdout) == "" {
-		return ""
+	if err != nil {
+		return "", fmt.Errorf("%s: its switch ports could not be read: %w; "+
+			"re-run save once the device is reachable", d.ID, err)
 	}
-	return "# captured from " + d.ID + "\n" + strings.TrimSpace(res.Stdout) + "\n"
+	if res.ExitCode != 0 {
+		return "", fmt.Errorf("%s: its switch ports could not be read: sh exited %d: %s; "+
+			"re-run save once the device is reachable", d.ID, res.ExitCode, firstLines(res.Stderr, 3))
+	}
+	if strings.TrimSpace(res.Stdout) == "" {
+		return "", nil
+	}
+	return "# captured from " + d.ID + "\n" + strings.TrimSpace(res.Stdout) + "\n", nil
 }
 
 // cleanConfig strips the preamble vtysh prints before a configuration, which it

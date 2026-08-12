@@ -105,17 +105,17 @@ func TestCidrHelpers(t *testing.T) {
 func TestRegistryConflicts(t *testing.T) {
 	r := NewRegistry()
 	agg := netip.MustParsePrefix("12.0.0.0/8")
-	r.Exempt(agg)
-	r.Claim(agg, "as12 aggregate", FieldASBlock)
-	r.Claim(netip.MustParsePrefix("12.0.1.0/24"), "as12 link a", FieldRouterRouter)
-	r.Claim(netip.MustParsePrefix("12.0.2.0/24"), "as12 link b", FieldRouterRouter)
+	r.Exempt(agg, "as12")
+	r.Claim(agg, "as12 aggregate", FieldASBlock, "as12")
+	r.Claim(netip.MustParsePrefix("12.0.1.0/24"), "as12 link a", FieldRouterRouter, "as12")
+	r.Claim(netip.MustParsePrefix("12.0.2.0/24"), "as12 link b", FieldRouterRouter, "as12")
 	if c := r.Conflicts(); len(c) != 0 {
 		t.Fatalf("unexpected conflicts under an exempt aggregate: %v", c)
 	}
 
 	r2 := NewRegistry()
-	r2.Claim(netip.MustParsePrefix("10.0.1.0/24"), "link a", FieldRouterRouter)
-	r2.Claim(netip.MustParsePrefix("10.0.1.128/25"), "link b", FieldRouterRouter)
+	r2.Claim(netip.MustParsePrefix("10.0.1.0/24"), "link a", FieldRouterRouter, "as1")
+	r2.Claim(netip.MustParsePrefix("10.0.1.128/25"), "link b", FieldRouterRouter, "as1")
 	c := r2.Conflicts()
 	if len(c) != 1 {
 		t.Fatalf("expected 1 conflict, got %d: %v", len(c), c)
@@ -132,7 +132,7 @@ func TestRegistryNoFalsePositives(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		r.Claim(netip.MustParsePrefix(p), "link", FieldInterAS)
+		r.Claim(netip.MustParsePrefix(p), "link", FieldInterAS, "")
 	}
 	if c := r.Conflicts(); len(c) != 0 {
 		t.Fatalf("disjoint subnets reported as conflicting: %v", c[:min(3, len(c))])
@@ -174,10 +174,10 @@ func TestTwoAutonomousSystemsCannotShareAddressSpace(t *testing.T) {
 	r := NewRegistry()
 	one := netip.MustParsePrefix("10.0.0.0/8")
 	two := netip.MustParsePrefix("10.0.0.0/9")
-	r.Exempt(one)
-	r.Claim(one, "AS 1 aggregate", "as_block")
-	r.Exempt(two)
-	r.Claim(two, "AS 2 aggregate", "as_block")
+	r.Exempt(one, "as1")
+	r.Claim(one, "AS 1 aggregate", "as_block", "as1")
+	r.Exempt(two, "as2")
+	r.Claim(two, "AS 2 aggregate", "as_block", "as2")
 
 	c := r.Conflicts()
 	if len(c) == 0 {
@@ -196,14 +196,61 @@ func TestTwoAutonomousSystemsCannotShareAddressSpace(t *testing.T) {
 func TestASubnetInsideItsOwnAggregateIsNotAConflict(t *testing.T) {
 	r := NewRegistry()
 	agg := netip.MustParsePrefix("10.0.0.0/8")
-	r.Exempt(agg)
-	r.Claim(agg, "AS 1 aggregate", "as_block")
-	r.Claim(netip.MustParsePrefix("10.0.1.0/24"), "link as1/A-as1/B", "intra_as")
-	r.Claim(netip.MustParsePrefix("10.0.2.0/24"), "link as1/B-as1/C", "intra_as")
+	r.Exempt(agg, "as1")
+	r.Claim(agg, "AS 1 aggregate", "as_block", "as1")
+	r.Claim(netip.MustParsePrefix("10.0.1.0/24"), "link as1/A-as1/B", "intra_as", "as1")
+	r.Claim(netip.MustParsePrefix("10.0.2.0/24"), "link as1/B-as1/C", "intra_as", "as1")
 
 	if c := r.Conflicts(); len(c) != 0 {
 		t.Fatalf("a subnet inside its own aggregate was reported as a conflict: %v.\n"+
 			"That is what the aggregate is for, and a check that refuses every real "+
 			"lab gets switched off.", c)
+	}
+}
+
+// The overlap an aggregate must never excuse is somebody else's subnet inside
+// it. Exemptions used to carry a prefix and no owner, so AS 2 numbering an
+// internal link out of AS 1's block validated cleanly -- and at runtime AS 1
+// announces the covering aggregate, so the rest of the world sends AS 2's
+// traffic to AS 1.
+func TestOneSystemCannotNumberALinkOutOfAnotherSystemsBlock(t *testing.T) {
+	r := NewRegistry()
+	one := netip.MustParsePrefix("10.0.0.0/8")
+	two := netip.MustParsePrefix("20.0.0.0/8")
+	r.Exempt(one, "as1")
+	r.Claim(one, "AS 1 aggregate", "as_block", "as1")
+	r.Exempt(two, "as2")
+	r.Claim(two, "AS 2 aggregate", "as_block", "as2")
+	// AS 2's own link, numbered by mistake out of AS 1's space.
+	r.Claim(netip.MustParsePrefix("10.0.1.0/24"), "link as2/A-as2/B", "intra_as", "as2")
+
+	got := r.Conflicts()
+	if len(got) == 0 {
+		t.Fatal("AS 2 numbered one of its links inside AS 1's block and the plan " +
+			"validated. AS 1 announces the covering aggregate, so that link is " +
+			"unreachable from anywhere outside AS 2.")
+	}
+	found := false
+	for _, c := range got {
+		if strings.Contains(c.String(), "as2/A-as2/B") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("the conflict reported does not name the offending link: %v", got)
+	}
+}
+
+// An inter-AS link belongs to neither side, so no aggregate should excuse an
+// overlap with it either.
+func TestAPeeringLinkInsideOneSidesBlockIsAConflict(t *testing.T) {
+	r := NewRegistry()
+	agg := netip.MustParsePrefix("10.0.0.0/8")
+	r.Exempt(agg, "as1")
+	r.Claim(agg, "AS 1 aggregate", "as_block", "as1")
+	r.Claim(netip.MustParsePrefix("10.9.9.0/30"), "link as1/A-as2/B", "inter_as", "")
+
+	if len(r.Conflicts()) == 0 {
+		t.Error("a peering subnet numbered inside one side's aggregate was accepted")
 	}
 }

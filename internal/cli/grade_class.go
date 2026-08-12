@@ -55,6 +55,7 @@ func newGradeClassCmd(opts *Options) *cobra.Command {
 		converge   time.Duration
 		parallel   int
 		keepLoaded bool
+		perWave    int
 	)
 	cmd := &cobra.Command{
 		Use:   "class",
@@ -63,14 +64,25 @@ func newGradeClassCmd(opts *Options) *cobra.Command {
 
 A private lab per submission isolates students perfectly and costs a full
 deployment each. This gets the same isolation far more cheaply: the lab is
-deployed once with every autonomous system solved, and submissions are loaded in
-waves of systems that are not neighbours. Everything a submission can see is
-then either its own work or the reference solution, which is exactly what a
-private harness provides.
+deployed once with every autonomous system solved, and one submission at a time
+is loaded into it. Everything that submission can see is then either its own
+work or the reference solution, which is exactly what a private harness
+provides -- and unlike a private harness it costs one system's reset rather
+than a whole deployment.
 
-The lab must already be deployed with --solve. Between waves, the systems just
-graded are returned to the reference, so no submission is ever marked against
-another's work.`,
+Before each submission is loaded, its system is returned to the state a student
+is given, so a router the submission does not mention is unconfigured rather
+than still holding the model answer. Afterwards the system goes back to the
+reference, so no submission is ever marked against another's work.
+
+--per-wave loads several submissions at once. It is faster and it is not
+provably isolated: submissions are batched so that no two are within two
+autonomous systems of each other, which is sound against every failure that has
+been demonstrated but is a heuristic, not a proof. Influence can travel three
+hops through two reference systems. Use it for a dry run; leave it alone when
+the marks are final.
+
+The lab must already be deployed with --solve.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			top, err := loadAndPlace(opts)
 			if err != nil {
@@ -104,10 +116,22 @@ another's work.`,
 				parallel = 16
 			}
 
-			waves := independentWaves(top, subs)
-			fmt.Fprintf(cmd.ErrOrStderr(),
-				"grading %d submission(s) in %d wave(s); within a wave no two submissions are neighbours\n",
-				len(subs), len(waves))
+			var waves [][]submission
+			if perWave > 1 {
+				waves = independentWaves(top, subs)
+				fmt.Fprintf(cmd.ErrOrStderr(),
+					"grading %d submission(s) in %d wave(s); within a wave no two submissions "+
+						"are within two systems of each other.\nThat is a heuristic, not a proof of "+
+						"isolation: run without --per-wave for marks that are final.\n",
+					len(subs), len(waves))
+			} else {
+				for _, s := range subs {
+					waves = append(waves, []submission{s})
+				}
+				fmt.Fprintf(cmd.ErrOrStderr(),
+					"grading %d submission(s), one at a time: everything else in the lab stays "+
+						"at the reference\n", len(subs))
+			}
 
 			start := time.Now()
 			var reports []*grade.Report
@@ -120,7 +144,11 @@ another's work.`,
 
 				loaded := make([]submission, 0, len(wave))
 				for _, s := range wave {
-					if err := applySubmission(cmd.Context(), exec, top, s); err != nil {
+					err := resetToStudentStart(cmd.Context(), exec, top, s.AS)
+					if err == nil {
+						err = applySubmission(cmd.Context(), exec, top, s)
+					}
+					if err != nil {
 						// A submission that failed partway through loading has
 						// left its AS in neither the reference state nor its
 						// own. Its neighbours in this wave are graded across
@@ -194,6 +222,8 @@ another's work.`,
 	cmd.Flags().StringVar(&token, "token", "", "agent token")
 	cmd.Flags().DurationVar(&converge, "converge-timeout", 4*time.Minute, "how long a convergence predicate may wait")
 	cmd.Flags().IntVarP(&parallel, "parallel", "p", 16, "submissions graded concurrently within a wave")
+	cmd.Flags().IntVar(&perWave, "per-wave", 1,
+		"submissions loaded into the lab at once; above 1 trades provable isolation for speed")
 	cmd.Flags().BoolVar(&keepLoaded, "keep-loaded", false,
 		"leave the last wave's submissions in the lab, for investigating a disputed mark")
 	return cmd

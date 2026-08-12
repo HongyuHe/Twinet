@@ -23,6 +23,31 @@ import (
 	"github.com/HongyuHe/twinet/internal/svc"
 )
 
+// EnabledDaemons is the set of routing processes FRR is told to start, read
+// out of the daemons file rather than listed a second time here. A deployment
+// checks for exactly these, so enabling a daemon and forgetting to check for it
+// is not something that can happen.
+func EnabledDaemons() []string {
+	var out []string
+	for _, line := range strings.Split(FRRDaemons, "\n") {
+		name, value, ok := strings.Cut(strings.TrimSpace(line), "=")
+		// The settings that are not daemons -- zebra_enable, vtysh_enable --
+		// are the ones with an underscore in the key.
+		if !ok || value != "yes" || strings.Contains(name, "_") {
+			continue
+		}
+		// Single-quoted into a shell command by the caller, so a name that
+		// could close the quote must not get that far. Nothing in the file
+		// looks like this today; the check is here so that editing the file
+		// cannot quietly turn into a shell injection.
+		if strings.ContainsAny(name, "'\\ \t$`\"") {
+			continue
+		}
+		out = append(out, name)
+	}
+	return out
+}
+
 // FRRDaemons is the /etc/frr/daemons file. Only the daemons the courses need
 // are enabled: every extra daemon is a process in every one of a thousand
 // containers.

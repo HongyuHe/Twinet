@@ -230,10 +230,33 @@ disputed mark, where isolation matters more than throughput.
 
 `twinet grade class` is the one to use for a class. It exploits the fact that a
 harness differs from the class lab in exactly one way — every autonomous system
-but one is the reference solution — so two submissions cannot affect each other
-unless a route can travel from one to the other. The lab is deployed once and
-submissions are loaded in waves chosen so that no two members of a wave are
-within two hops of each other in the peering graph.
+but one is the reference solution — so a submission graded on its own in that
+lab sees exactly what it would see in a private harness, at the cost of
+resetting one system rather than deploying a lab.
+
+That is what it does by default: one submission at a time. Nothing else in the
+lab is anything but the reference while a submission is being marked, so no
+student's mistake can reach another's marks. It is a property of the
+construction, not an argument about topology.
+
+### Loading the submission onto a blank system, not onto the answer
+
+Before a submission is loaded, its autonomous system is returned to the state a
+student is given: the platform's own addressing, the starting FRR
+configuration, and none of the tunnels, hand-written routes or VLAN assignments
+a previous submission installed.
+
+This matters more than it sounds. A submission is the set of files a student
+wrote. A router they never touched has no file in the archive. Loaded onto a lab
+deployed at the reference, that router keeps the model answer — and the student
+is marked correct for work they did not do, with nothing in the report able to
+say so, because a correct router looks identical however it came to be correct.
+Blanking first makes an omission read as an omission.
+
+### Trading isolation for speed, deliberately
+
+`--per-wave N` loads several submissions at once, batched so that no two members
+of a wave are within two hops of each other in the peering graph.
 
 Two hops, not one. Adjacency alone is not enough: with A — B — C, a route A
 originates reaches C through B, so a mistake in A can change what C is marked
@@ -245,22 +268,16 @@ this is what it costs, measured rather than assumed:
 | 8 student ASes | 6 | 1.3 |
 | 80 student ASes | 42 | 1.9 |
 
-An earlier version of this document claimed four waves regardless of class size,
-which was true of the adjacency-only rule it described and is not true of this
-one. The wave count does grow with the class — slowly, roughly one wave per two
-submissions — so the honest claim is that waves cost about half of what private
-harnesses cost, not that a class of a hundred costs what a class of eight does.
+So the speed-up is under a factor of two, and it is bought with a heuristic. A
+route can travel further than two hops through reference systems, so a
+sufficiently long path can still carry one submission's mistake into another's
+marks. In the COS-461 topology the reference systems between any two students
+filter and re-originate enough that this has not been observed, but it is not
+excluded by construction — which is why it is off by default. Use it for a dry
+run over a class, not for marks that are final.
 
-What has not changed is the isolation each wave provides, which is now stronger.
-
-### The limit of it
-
-Two hops is a heuristic, not a proof. A route can travel further than two hops
-through reference ASes, so a sufficiently long path can still carry one
-submission's mistake to another's harness. In the COS-461 topology the reference
-ASes between any two students filter and re-originate enough that this has not
-been observed, but it is not excluded by construction.
-
-`twinet grade batch` is the option that is airtight, at about twelve minutes per
-submission. Use it for a disputed mark, and for a class where the topology puts
-students within a few hops of each other along a path of pure transit.
+`twinet grade batch` deploys a private lab per submission, at about twelve
+minutes each. Default `grade class` gives the same isolation far more cheaply,
+so `batch` is for the case where the deployed lab itself is in doubt — a
+disputed mark, or a re-run that must not share anything with the class run,
+including the containers.

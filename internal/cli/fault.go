@@ -306,10 +306,30 @@ func newFaultResolveCmd(opts *Options) *cobra.Command {
 				return nil
 			}
 
+			// A bare fault name matches every injection of that kind, which is
+			// what someone undoing a single fault means. An identifier matches
+			// exactly one, which is what someone undoing one of several faults
+			// of the same kind in a scenario means -- and before identifiers
+			// existed there was no way to express it: resolving
+			// `interface_down` on one router resolved it everywhere.
+			if !all && len(args) > 0 {
+				matched := false
+				for _, inj := range injections {
+					if inj.ID == args[0] || inj.Fault == args[0] {
+						matched = true
+						break
+					}
+				}
+				if !matched {
+					return fmt.Errorf("nothing injected matches %q; `twinet fault status` "+
+						"lists what is live, with the identifier of each", args[0])
+				}
+			}
+
 			var keep []*fault.Injection
 			var resolved, failed int
 			for _, inj := range injections {
-				if !all && len(args) > 0 && inj.Fault != args[0] {
+				if !all && len(args) > 0 && inj.Fault != args[0] && inj.ID != args[0] {
 					keep = append(keep, inj)
 					continue
 				}
@@ -319,7 +339,8 @@ func newFaultResolveCmd(opts *Options) *cobra.Command {
 					failed++
 					continue
 				}
-				fmt.Fprintf(cmd.OutOrStdout(), "resolved %s on %s\n", inj.Fault, inj.Target.DeviceID())
+				fmt.Fprintf(cmd.OutOrStdout(), "resolved %s on %s (%s)\n",
+					inj.Fault, inj.Target.DeviceID(), inj.ID)
 				resolved++
 			}
 			if err := saveInjections(top, keep); err != nil {
@@ -384,6 +405,7 @@ scored against ground truth should verify first.`,
 			}
 
 			type row struct {
+				ID       string         `json:"id"`
 				Fault    string         `json:"fault"`
 				Target   string         `json:"target"`
 				Verified bool           `json:"verified"`
@@ -393,7 +415,7 @@ scored against ground truth should verify first.`,
 			var rows []row
 			gone := 0
 			for _, inj := range want {
-				r := row{Fault: inj.Fault, Target: inj.Target.DeviceID()}
+				r := row{ID: inj.ID, Fault: inj.Fault, Target: inj.Target.DeviceID()}
 				ev, err := fault.Verify(cmd.Context(), env, inj)
 				switch {
 				case err != nil:

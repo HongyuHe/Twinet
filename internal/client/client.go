@@ -303,13 +303,23 @@ func (c *Cluster) VersionSkew(ctx context.Context) error {
 	if c.RequireVersion == "" {
 		return nil
 	}
+	// A node that cannot be asked, and a node that answers without naming a
+	// build, both used to pass. Both are exactly the node this check exists to
+	// catch: an agent too old to report its version is by definition not the
+	// version this controller is, and a node that is unreachable now is a node
+	// whose configuration nobody has checked. Failing open here means the
+	// check reports agreement it never established.
 	var odd []string
 	for _, r := range c.Status(ctx) {
-		if r.Err != nil {
-			continue
-		}
-		if v := r.Value.Version; v != "" && v != c.RequireVersion {
-			odd = append(odd, fmt.Sprintf("%s runs %s", r.Node, v))
+		switch {
+		case r.Err != nil:
+			odd = append(odd, fmt.Sprintf("%s could not be asked which build it runs (%v)",
+				r.Node, r.Err))
+		case r.Value.Version == "":
+			odd = append(odd, fmt.Sprintf("%s does not report a build, so it is older "+
+				"than the agent that started reporting one", r.Node))
+		case r.Value.Version != c.RequireVersion:
+			odd = append(odd, fmt.Sprintf("%s runs %s", r.Node, r.Value.Version))
 		}
 	}
 	if len(odd) == 0 {

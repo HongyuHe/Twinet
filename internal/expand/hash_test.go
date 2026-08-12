@@ -149,6 +149,96 @@ func firstIface(top *model.Topology) *model.Iface {
 	return nil
 }
 
+// oneDeviceTopology builds the smallest topology the hash accepts: one router,
+// which the caller mutates. It exists so the encoding can be probed in
+// isolation, without a whole manifest whose other fields might mask a change.
+func oneDeviceTopology(mutate func(*model.Device)) *model.Topology {
+	d := &model.Device{ID: "as1/R", Name: "R", Kind: model.KindRouter, ASN: 1}
+	mutate(d)
+	return &model.Topology{
+		Name:     "probe",
+		Devices:  map[string]*model.Device{d.ID: d},
+		ASes:     map[int]*model.AS{},
+		Services: map[string]*model.Service{},
+	}
+}
+
+// The hash is the identity a submission is bound to: work saved against one lab
+// must be refused against another that behaves differently. That holds only if
+// the encoding is injective. The old one joined slice elements with a comma and
+// no escaping, so a single argument containing a comma was indistinguishable
+// from two arguments -- command ["a,b"], one program with a comma in its
+// argument, hashed identically to command ["a","b"], which runs two things. A
+// submission bound to one lab was silently accepted against the other.
+func TestTwoLabsThatDifferOnlyInCommandArgumentsHashDifferently(t *testing.T) {
+	joined := TopologyHash(oneDeviceTopology(func(d *model.Device) {
+		d.Command = []string{"a,b"}
+	}))
+	split := TopologyHash(oneDeviceTopology(func(d *model.Device) {
+		d.Command = []string{"a", "b"}
+	}))
+	if joined == split {
+		t.Fatalf("command [\"a,b\"] and command [\"a\",\"b\"] both hash to %s, yet one "+
+			"runs a single program with a comma in its argument and the other runs "+
+			"two things; a submission bound to one lab would be accepted against the "+
+			"other and graded as though nothing had changed", joined)
+	}
+}
+
+// The same class of collision lived in the map encoding, which joined entries
+// with a comma and keys to values with a colon, again without escaping. Two
+// environments a container would actually run under -- two variables {a=b, c=d}
+// versus one variable whose value contains the delimiters {a="b,c:d"} -- both
+// rendered to "{a:b,c:d}" and hashed alike.
+func TestTwoLabsWhoseMapDataDiffersOnlyAcrossDelimitersHashDifferently(t *testing.T) {
+	twoVars := TopologyHash(oneDeviceTopology(func(d *model.Device) {
+		d.Env = map[string]string{"a": "b", "c": "d"}
+	}))
+	oneVar := TopologyHash(oneDeviceTopology(func(d *model.Device) {
+		d.Env = map[string]string{"a": "b,c:d"}
+	}))
+	if twoVars == oneVar {
+		t.Fatalf("env {a=b, c=d} and env {a=\"b,c:d\"} both hash to %s, yet they set up "+
+			"different container environments; the delimiters between map entries "+
+			"are not escaped, so behaviourally different labs share an identity", twoVars)
+	}
+}
+
+// An injective encoding is worthless if it is not also deterministic: a hash
+// that varied from run to run would reject every archive, correct ones
+// included. Go randomises map iteration, so the encoding must sort map keys.
+// This packs a device with delimiter-heavy maps and slices -- exactly the
+// shapes the fix touches -- and requires the hash never to move across many
+// runs within one process, where the randomised seed differs each iteration.
+func TestTheHashOfDelimiterHeavyDataIsStableAcrossRuns(t *testing.T) {
+	build := func() *model.Topology {
+		return oneDeviceTopology(func(d *model.Device) {
+			d.Command = []string{"a,b", "c:d", "e"}
+			d.Env = map[string]string{
+				"PATH":  "/usr/bin:/bin",
+				"A":     "x,y,z",
+				"B":     "k=v;q=r",
+				"comma": ",",
+				"colon": ":",
+			}
+			d.Sysctls = map[string]string{
+				"net.ipv4.ip_forward":                "1",
+				"net.ipv6.conf.all.disable_ipv6":     "0",
+				"net.ipv4.conf.all.rp_filter":        "0",
+				"net.ipv4.fib_multipath_hash_policy": "1",
+			}
+		})
+	}
+	first := TopologyHash(build())
+	for i := 0; i < 50; i++ {
+		if got := TopologyHash(build()); got != first {
+			t.Fatalf("run %d hashed to %s, run 0 to %s: the encoding reads a map in Go's "+
+				"randomised order instead of sorting its keys, so it would reject "+
+				"archives at random", i, got, first)
+		}
+	}
+}
+
 func loadFixture(t *testing.T) *model.Topology {
 	t.Helper()
 	l, err := manifest.Load("../../examples/cos461")

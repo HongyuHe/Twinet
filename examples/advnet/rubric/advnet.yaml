@@ -40,6 +40,11 @@ questions:
     title: Keeping the customers apart
     points: 2
     converge: true
+    # Depends on carrying the customers. Isolation implemented as "the ping did
+    # not get through" is satisfied perfectly by a VPN where nothing works at
+    # all, so a submission that scored zero on q2 must not be able to earn these
+    # marks: a blocked probe only means isolation once traffic is known to flow.
+    depends_on: [q2]
     checks:
       # Equal in weight to carrying them. A provider that leaks one bank's
       # traffic into another's network has not partly solved the exercise;

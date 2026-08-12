@@ -142,9 +142,15 @@ func checkLDPAdjacencies(ctx context.Context, env *Env) Result {
 					d.Name, p.name))
 			}
 		}
-		// Labels must reach the kernel, not merely be negotiated.
+		// Labels must reach the kernel, not merely be negotiated. A table that
+		// cannot be read is the grader's failure, not the student's: silently
+		// reading the missing output as "labels are present" once let a router
+		// that installed nothing pass, so the read is required to succeed.
 		tbl, err := env.Vtysh(ctx, d.Name, "show mpls table")
-		if err == nil && !strings.Contains(tbl, "LDP") {
+		if err != nil {
+			return Errored("mpls.ldp_adjacencies", err)
+		}
+		if !strings.Contains(tbl, "LDP") {
 			problems = append(problems, fmt.Sprintf(
 				"%s has negotiated labels but installed none, so it forwards nothing on them", d.Name))
 		}
@@ -186,11 +192,20 @@ func checkVPNReachability(ctx context.Context, env *Env) Result {
 		}
 		for i := 0; i < len(sites); i++ {
 			for j := i + 1; j < len(sites); j++ {
-				tried++
-				a, b := sites[i], sites[j]
-				if !env.pings(ctx, a.host, b.addr) {
-					problems = append(problems, fmt.Sprintf(
-						"%s cannot reach %s (%s), both sites of %s", a.host, b.host, b.addr, name))
+				// Both directions: a VPN that carries a customer one way but
+				// not back is still broken, and a single-direction probe would
+				// report it as working.
+				for _, d := range directed(sites[i], sites[j]) {
+					tried++
+					reached, err := env.reaches(ctx, d.from.host, d.to.addr)
+					if err != nil {
+						return Errored("vpn.site_reachability", err)
+					}
+					if !reached {
+						problems = append(problems, fmt.Sprintf(
+							"%s cannot reach %s (%s), both sites of %s",
+							d.from.host, d.to.host, d.to.addr, name))
+					}
 				}
 			}
 		}
@@ -233,20 +248,70 @@ func checkVPNIsolation(ctx context.Context, env *Env) Result {
 	}
 	sort.Strings(names)
 
+	// Isolation is only worth anything over a VPN that actually carries
+	// traffic. "The ping was blocked" is equally true of a network where
+	// nothing works at all, so certifying isolation without first seeing one
+	// customer's own sites reach each other would award full marks to a dead
+	// network -- the very failure this exercise is built to provoke, recorded
+	// as a success. The rubric also makes this question depend on reachability;
+	// this is the same guarantee at the level of the check, so it holds when
+	// the check is run on its own.
+	carried, intraPairs := 0, 0
+	for _, sites := range groups {
+		for i := 0; i < len(sites); i++ {
+			for j := i + 1; j < len(sites); j++ {
+				for _, d := range directed(sites[i], sites[j]) {
+					intraPairs++
+					reached, err := env.reaches(ctx, d.from.host, d.to.addr)
+					if err != nil {
+						return Errored("vpn.isolation", err)
+					}
+					if reached {
+						carried++
+					}
+				}
+			}
+		}
+	}
+	if intraPairs > 0 && carried == 0 {
+		return Fail("vpn.isolation", Evidence{
+			Expected: "a working VPN whose sites reach each other, so that isolating it means something",
+			Observed: "no customer's own sites can reach each other at all",
+			Detail: "every isolation probe here is blocked because nothing is reachable, not because " +
+				"the tables are kept apart, and a dead network must not earn the isolation marks; " +
+				"get vpn.site_reachability passing first",
+			Command: "ping",
+		})
+	}
+
+	// Every site of one customer must fail to reach every site of another, in
+	// both directions: a table that leaks from only one branch, or only on the
+	// return path, is still a leak, and the first-site, one-direction probe
+	// this replaced walked straight past it.
 	var leaks []string
 	tried := 0
-	for i := 0; i < len(names); i++ {
-		for j := i + 1; j < len(names); j++ {
-			a, b := groups[names[i]][0], groups[names[j]][0]
-			tried++
-			if env.pings(ctx, a.host, b.addr) {
-				leaks = append(leaks, fmt.Sprintf(
-					"%s reached %s (%s): %s and %s are sharing a routing table",
-					a.host, b.host, b.addr, names[i], names[j]))
+	for x := 0; x < len(names); x++ {
+		for y := x + 1; y < len(names); y++ {
+			for _, a := range groups[names[x]] {
+				for _, b := range groups[names[y]] {
+					for _, d := range directed(a, b) {
+						tried++
+						reached, err := env.reaches(ctx, d.from.host, d.to.addr)
+						if err != nil {
+							return Errored("vpn.isolation", err)
+						}
+						if reached {
+							leaks = append(leaks, fmt.Sprintf(
+								"%s reached %s (%s): %s and %s are sharing a routing table",
+								d.from.host, d.to.host, d.to.addr, names[x], names[y]))
+						}
+					}
+				}
 			}
 		}
 	}
 	if len(leaks) > 0 {
+		sort.Strings(leaks)
 		return Fail("vpn.isolation", Evidence{
 			Expected: "customers cannot reach one another",
 			Observed: strings.Join(leaks, "; "),
@@ -254,8 +319,9 @@ func checkVPNIsolation(ctx context.Context, env *Env) Result {
 		})
 	}
 	return Pass("vpn.isolation", Evidence{
-		Expected: "customers are kept apart",
-		Observed: fmt.Sprintf("%d customer pair(s) mutually unreachable", tried),
+		Expected: "customers are kept apart, over a VPN that carries their traffic",
+		Observed: fmt.Sprintf("%d directed site pair(s) across %d customer(s) mutually unreachable",
+			tried, len(names)),
 	})
 }
 
@@ -390,14 +456,35 @@ func addrOnly(cidr string) string {
 	return cidr
 }
 
-// pings reports whether a device can reach an address.
+// directedPair is one ordered probe: from a site, to a site's address.
+type directedPair struct{ from, to sitePoint }
+
+// directed returns both orderings of a site pair.
 //
-// Several attempts, because a single loss on a shaped link would otherwise be
-// read as a routing failure and cost a student marks for the network's timing.
-func (e *Env) pings(ctx context.Context, device, addr string) bool {
-	res, err := e.Exec(ctx, device, []string{"ping", "-c", "3", "-W", "2", addr})
+// A VPN can carry a customer one way but not back, and a leak can appear in one
+// direction only, so probing a single ordering reports either as its opposite.
+func directed(a, b sitePoint) [2]directedPair {
+	return [2]directedPair{{from: a, to: b}, {from: b, to: a}}
+}
+
+// reaches reports whether a device can reach an address, keeping a path that is
+// blocked distinct from a probe that never ran.
+//
+// The distinction decides a mark, and in opposite directions on the two VPN
+// questions: a probe that could not execute looks like an unreachable site to
+// the reachability check and like a correctly blocked one to the isolation
+// check, so the same transport outage would cost marks on the first and award
+// them on the second. Going through Probe records the transport failure with
+// the machinery tracker, so it surfaces as an un-gradeable question rather than
+// either verdict being invented from it.
+//
+// Three echoes, because a single loss on a shaped link would otherwise read as
+// a routing failure and cost a student marks for the network's timing; ping
+// exits zero if any one of them is answered.
+func (e *Env) reaches(ctx context.Context, deviceID, addr string) (bool, error) {
+	res, err := e.Probe(ctx, deviceID, []string{"ping", "-c", "3", "-W", "2", addr})
 	if err != nil {
-		return false
+		return false, err
 	}
-	return res.ExitCode == 0
+	return res.ExitCode == 0, nil
 }

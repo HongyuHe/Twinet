@@ -160,13 +160,15 @@ someone has checked.
 | 12-AS lab, 211 containers, 291 links, 3 nodes | 83 s |
 | Same lab, single node | not attempted; 4-AS/57-container demo takes 64 s |
 | Cross-node link RTT (25 ms configured) | 50.22 ms, σ 9 µs |
-| Links kept local by AS-granular placement, 84-AS lab | **89.2 %** (315 of 2927 cross) |
+| Links kept local by AS-granular placement, 84-AS lab | **89.7 %** (302 of 2927 cross) |
 | — of which inter-AS links crossing | **111 of 283 (39 %)**, against 201 (71 %) before the partitioner |
 | — intra-AS links crossing | 0 of 2324, by construction |
 | Placement cost, 84 ASes / 2012 containers | < 1 s |
 | Grading, 3 submissions, 10 questions, 17 checks | 31 s |
-| Grading a class of 8 in waves, all scoring 10/10 | **22m 11s in 4 waves**, measured when the conflict relation was adjacency; re-measured under the distance-two rule below |
-| Waves needed for 8 student ASes / for 80 | **6 / 42** — the conflict relation is distance-two, not adjacency, so the count does grow with the class: roughly one wave per two submissions |
+| Grading a class of 8 in waves, all scoring 10/10 | **22m 11s in 4 waves**, measured when the conflict relation was adjacency and submissions were loaded onto the solved lab. Both have since changed and this number is not comparable to anything current |
+| Waves needed for 8 student ASes / for 80, under `--per-wave 8` | **6 / 42** — the conflict relation is distance-two, so roughly one wave per two submissions. `--per-wave` is off by default; see [grading](06_grading.md) |
+| `grade class`, 6 real submissions, one at a time, 4-minute convergence budget | **70m 24s, 5 of 6 quarantined.** The cause was routers deployed with no routing daemon, since fixed; the run is being repeated |
+| Same, 2 submissions, 10-minute budget | 31m 15s; the surviving failure traced to a third router whose bgpd had died after deployment |
 | Grading 1 submission in its own private harness | ~12 minutes; measured, and the reason waves exist |
 | 8 private harnesses at once on 3 nodes | saturates the cluster; the failures are resource exhaustion, not marks |
 | **Class-scale deployment: 84 ASes, 2012 devices, 2927 links across 3 nodes** | **22m 38s, zero failures** |

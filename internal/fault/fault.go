@@ -20,6 +20,8 @@ package fault
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"sort"
 	"strings"
@@ -321,6 +323,14 @@ func ByCategory() map[Category][]*Fault {
 
 // Injection is a fault applied to a target, with what it needs to undo itself.
 type Injection struct {
+	// ID identifies this injection, so one of several faults of the same kind
+	// can be undone without touching the others.
+	//
+	// Resolution used to match on the fault's name alone, so resolving
+	// `interface_down` on one router resolved it on every router it had been
+	// injected on -- including, in a scenario built from several faults of one
+	// kind, the ones that were meant to stay.
+	ID         string      `json:"id"`
 	Fault      string      `json:"fault"`
 	Target     Target      `json:"target"`
 	State      State       `json:"state,omitempty"`
@@ -334,6 +344,18 @@ type Injection struct {
 // Verification is not optional. An incident that failed to inject but is
 // presented to an agent as a puzzle produces a meaningless measurement, and in
 // that case the agent is right and the benchmark is wrong.
+// newInjectionID returns an identifier unique across every lab and machine, so
+// two controllers injecting at once cannot produce the same one.
+func newInjectionID() string {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// The clock is a poor unique identifier and a good last resort: the
+		// alternative is refusing to inject because the system has no entropy.
+		return fmt.Sprintf("t%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b[:])
+}
+
 func Inject(ctx context.Context, env *Env, name string, t Target) (*Injection, error) {
 	f, ok := Lookup(name)
 	if !ok {
@@ -385,6 +407,7 @@ func Inject(ctx context.Context, env *Env, name string, t Target) (*Injection, e
 		}
 	}
 	inj := &Injection{
+		ID:    newInjectionID(),
 		Fault: name, Target: t, State: state,
 		InjectedAt: time.Now().UTC(),
 		Truth:      f.Truth(t, ""),

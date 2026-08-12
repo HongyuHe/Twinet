@@ -22,6 +22,8 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+
+	"github.com/HongyuHe/twinet/internal/model"
 )
 
 // Schema is a JSON Schema document, in the subset this generator emits.
@@ -38,6 +40,23 @@ type Schema struct {
 	Items       *Schema            `json:"items,omitempty"`
 	AddProps    *Schema            `json:"additionalProperties,omitempty"`
 	Enum        []string           `json:"enum,omitempty"`
+
+	// OneOf lets a value match exactly one of several shapes. It is how a
+	// custom UnmarshalYAML that decodes more than one form is expressed: the
+	// compact link [A, B] and the mapping form are both accepted by the loader,
+	// so the schema has to accept both or it rejects manifests that work.
+	OneOf []*Schema `json:"oneOf,omitempty"`
+
+	// PropertyNames constrains an object's keys. It is emitted where the keys
+	// are a closed set -- the device kinds -- so that kinds.routr, which the
+	// decoder takes and then nothing ever looks up, is rejected rather than
+	// silently configuring nothing.
+	PropertyNames *Schema `json:"propertyNames,omitempty"`
+
+	// MinItems and MaxItems bound an array's length. They pin the compact link
+	// form to the two endpoints its UnmarshalYAML requires.
+	MinItems int `json:"minItems,omitempty"`
+	MaxItems int `json:"maxItems,omitempty"`
 
 	// Closed marks an object that accepts only the properties it names.
 	//
@@ -89,12 +108,81 @@ func Of(v any) *Schema {
 	}
 }
 
+// The manifest types carry three kinds of fact that reflection cannot recover
+// from the struct alone, and that a generated schema therefore has to be told:
+//
+//   - the fixed header strings apiVersion and kind, which identify which
+//     document a file is and are checked nowhere in the struct shape;
+//   - the closed sets whose members live in a Valid() switch rather than in a
+//     `jsonschema:"enum=..."` tag (DeviceKind, ASRole, Relationship); and
+//   - the extra YAML shapes a custom UnmarshalYAML accepts (the compact link,
+//     the bare-string provisioning rule).
+//
+// They are expressed in terms of the model's own exported constants, so each
+// literal still has a single definition in the model and these tables only
+// record where in the schema it belongs. Keeping them here rather than as
+// struct tags avoids a second edit to the model for what is schema metadata,
+// at the cost of listing the closed types in one place; a new member added to
+// one of those types without being added here is caught by the round-trip test
+// that every example the loader accepts must also validate.
+var (
+	// constFields names the fields whose value is a fixed string, per type.
+	constFields = map[reflect.Type]map[string]string{
+		reflect.TypeOf(model.Lab{}): {
+			"apiVersion": model.APIVersion,
+			"kind":       model.KindLab,
+		},
+		reflect.TypeOf(model.ASTemplate{}): {
+			"apiVersion": model.APIVersion,
+			"kind":       model.KindASTemplate,
+		},
+	}
+
+	// closedSets lists, per named type, the values the model treats as the
+	// whole set. Used both for a field of that type (an enum on the value) and
+	// for a map keyed by it (propertyNames on the object).
+	closedSets = map[reflect.Type][]string{
+		reflect.TypeOf(model.DeviceKind("")): {
+			string(model.KindRouter), string(model.KindHost),
+			string(model.KindSwitch), string(model.KindService),
+		},
+		reflect.TypeOf(model.ASRole("")): {
+			string(model.RoleStudent), string(model.RoleStaff), string(model.RoleIXP),
+		},
+		reflect.TypeOf(model.Relationship("")): {
+			string(model.RelProvider), string(model.RelCustomer), string(model.RelPeer),
+		},
+	}
+
+	// altForms lists the non-object shapes a type's UnmarshalYAML also decodes.
+	// The object shape is appended by the generator, producing a oneOf that
+	// matches exactly what the loader accepts.
+	altForms = map[reflect.Type][]*Schema{
+		reflect.TypeOf(model.InternalLink{}): {
+			// The compact [A, B] endpoint pair.
+			{Type: "array", Items: &Schema{Type: "string"}, MinItems: 2, MaxItems: 2},
+		},
+		reflect.TypeOf(model.ProvisionRule{}): {
+			// A bare device kind or well-known scope name.
+			{Type: "string"},
+		},
+	}
+)
+
 func (g *generator) walk(t reflect.Type) *Schema {
 	for t.Kind() == reflect.Ptr {
 		t = t.Elem()
 	}
 	switch t.Kind() {
 	case reflect.String:
+		if vals := closedSets[t]; len(vals) > 0 {
+			// A named string whose members live in a Valid() switch rather than
+			// in a tag -- a DeviceKind, ASRole or Relationship. Reflection sees
+			// only "string", so the set is recorded below; emitting it is what
+			// lets the schema reject a value the loader takes and later cannot
+			// resolve.
+			return &Schema{Type: "string", Enum: append([]string(nil), vals...)}
+		}
 		return &Schema{Type: "string"}
 	case reflect.Bool:
 		return &Schema{Type: "boolean"}
@@ -106,7 +194,14 @@ func (g *generator) walk(t reflect.Type) *Schema {
 	case reflect.Slice, reflect.Array:
 		return &Schema{Type: "array", Items: g.walk(t.Elem())}
 	case reflect.Map:
-		return &Schema{Type: "object", AddProps: g.walk(t.Elem())}
+		s := &Schema{Type: "object", AddProps: g.walk(t.Elem())}
+		if vals := closedSets[t.Key()]; len(vals) > 0 {
+			// The keys are a closed set, so a misspelling is a key the map
+			// silently absorbs and no code reads back. propertyNames rejects
+			// anything outside the set instead of validating it cleanly.
+			s.PropertyNames = &Schema{Enum: append([]string(nil), vals...)}
+		}
+		return s
 	case reflect.Interface:
 		// Deliberately unconstrained: a field typed `any` holds whatever the
 		// template engine produces, and pretending otherwise would reject
@@ -173,6 +268,15 @@ func (g *generator) structSchema(t reflect.Type) *Schema {
 			cp.Enum = vals
 			fs = &cp
 		}
+		if c, ok := constFields[t][key]; ok {
+			// apiVersion and kind say which document a file is; a wrong header
+			// decodes cleanly and then means the file is not the kind it
+			// claims. A single-valued enum is JSON Schema's const, and rejects
+			// it. It overrides any enum tag deliberately: this is the value.
+			cp := *fs
+			cp.Enum = []string{c}
+			fs = &cp
+		}
 		if doc := tagValue(f, "jsonschema", "description"); doc != "" {
 			// A copy, so a description on one use of a shared type does not
 			// leak onto every other use of it.
@@ -186,6 +290,17 @@ func (g *generator) structSchema(t reflect.Type) *Schema {
 		}
 	}
 	sort.Strings(s.Required)
+	if alts := altForms[t]; len(alts) > 0 {
+		// This type's UnmarshalYAML also decodes non-object forms, so the
+		// object schema alone would reject input the loader takes. Replace the
+		// definition with a oneOf of every shape the loader accepts, the object
+		// form last. References to #/$defs/<name> then resolve to the oneOf, so
+		// every use of the type accepts the same forms the decoder does.
+		forms := make([]*Schema, 0, len(alts)+1)
+		forms = append(forms, alts...)
+		forms = append(forms, s)
+		g.defs[name] = &Schema{OneOf: forms}
+	}
 	return &Schema{Ref: "#/$defs/" + name}
 }
 
