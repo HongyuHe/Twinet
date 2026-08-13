@@ -139,10 +139,15 @@ services:
 # The trust anchor's deliberate discrepancies. Declared, so an exercise can say
 # exactly which announcement is meant to be invalid rather than hoping one is.
 rpki:
-  # AS 9 has no ROA, which is the common case on the real internet. A student
+  # AS 1 has no ROA, which is the common case on the real internet. A student
   # who accepts only explicitly-valid routes would drop it, so this is what
   # catches a filter that has gone too far.
-  not_found: [9]
+  #
+  # A staff system rather than a student one. It used to be AS 9, whose owners
+  # were then exempted from the question about publishing a ROA -- 0.3 of a
+  # mark for something they were never asked to do, awarded automatically and
+  # invisibly, while every other group had to earn it.
+  not_found: [1]
   # AS 2 holds a ROA for a prefix inside AS 10's space. Whoever announces it
   # looks like a hijacker to anyone validating, and looks fine to anyone not.
   invalid:

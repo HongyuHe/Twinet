@@ -61,3 +61,25 @@ func TestRebalanceAndOnlyAreRefusedTogether(t *testing.T) {
 		t.Errorf("refused for the wrong reason: %v", err)
 	}
 }
+
+// Destroying a grading harness by name uses the class manifest to say which
+// machines to reach. Deleting the placement record then deletes the *class's*
+// record: the next deployment places a running lab again from scratch,
+// `inspect --placement` disagrees with what is actually running, and exec
+// answers 404 from the wrong nodes. Observed on this cluster.
+func TestDestroyingAHarnessKeepsTheClassPlacementRecord(t *testing.T) {
+	src, err := os.ReadFile("deploy.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(src)
+	i := strings.Index(body, "os.Remove(filepath.Join(labPrivateDir(top), place.RecordName))")
+	if i < 0 {
+		t.Fatal("the placement record is never removed, so a destroyed lab stays pinned")
+	}
+	before := body[:i]
+	if !strings.Contains(before[strings.LastIndex(before, "RunE:"):], "name != top.Name") {
+		t.Error("the placement record is removed whatever lab was destroyed, so cleaning up " +
+			"a grading harness deletes the class's own record")
+	}
+}

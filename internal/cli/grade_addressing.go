@@ -131,18 +131,20 @@ func adaptOnePeer(ctx context.Context, exec execFn, peer *model.Iface,
 		return ad, fmt.Errorf("the reference side has no planned address")
 	}
 	// The reference keeps the host part it was given where that fits, so the
-	// two ends stay recognisable; otherwise it takes the next address after
-	// the student's, which is inside the subnet by construction.
+	// two ends stay recognisable; otherwise it takes the first usable address
+	// of the subnet that is not the student's.
+	//
+	// "The next address after theirs" is wrong on a /30: a group peering on
+	// 10.34.0.2/30 would put the reference on 10.34.0.3, which is that
+	// network's broadcast address, and the session would never come up -- for
+	// an answer the assignment explicitly permits.
 	mine := netip.PrefixFrom(planned.Addr(), their.Bits())
 	if !their.Contains(planned.Addr()) || planned.Addr() == their.Addr() {
-		next := their.Addr().Next()
-		if next == their.Addr() || !their.Contains(next) {
-			return ad, fmt.Errorf("no address is left in %s for the other end", their)
+		other, err := otherEndOf(their)
+		if err != nil {
+			return ad, err
 		}
-		if next == their.Addr() {
-			next = next.Next()
-		}
-		mine = netip.PrefixFrom(next, their.Bits())
+		mine = netip.PrefixFrom(other, their.Bits())
 	}
 
 	dev := peer.Device.ID
@@ -303,4 +305,57 @@ func asnOfDevice(id string) string {
 		return id[2:i]
 	}
 	return ""
+}
+
+// otherEndOf picks the address at the far end of a point-to-point subnet.
+//
+// Usable addresses only: on anything shorter than a /31 the first address of
+// the network is the network itself and the last is its broadcast, and a
+// session to either never comes up.
+func otherEndOf(theirs netip.Prefix) (netip.Addr, error) {
+	net := theirs.Masked()
+	bits := theirs.Bits()
+	if bits >= 31 {
+		// A /31 has two addresses and both are usable; a /32 has nowhere to
+		// put the other end.
+		if bits == 32 {
+			return netip.Addr{}, fmt.Errorf("%s leaves no address for the other end", theirs)
+		}
+		a, b := net.Addr(), net.Addr().Next()
+		if theirs.Addr() == a {
+			return b, nil
+		}
+		return a, nil
+	}
+	first := net.Addr().Next()
+	last := lastUsable(net)
+	if !last.IsValid() || first.Compare(last) > 0 {
+		return netip.Addr{}, fmt.Errorf("%s leaves no address for the other end", theirs)
+	}
+	if theirs.Addr() != first {
+		return first, nil
+	}
+	if first == last {
+		return netip.Addr{}, fmt.Errorf("%s leaves no address for the other end", theirs)
+	}
+	return last, nil
+}
+
+// lastUsable returns the address before a network's broadcast address.
+func lastUsable(net netip.Prefix) netip.Addr {
+	if !net.Addr().Is4() {
+		return netip.Addr{}
+	}
+	a := net.Addr().As4()
+	mask := net.Bits()
+	host := uint32(1)<<(32-mask) - 1
+	v := uint32(a[0])<<24 | uint32(a[1])<<16 | uint32(a[2])<<8 | uint32(a[3])
+	bcast := v | host
+	if bcast == 0 {
+		return netip.Addr{}
+	}
+	last := bcast - 1
+	return netip.AddrFrom4([4]byte{
+		byte(last >> 24), byte(last >> 16), byte(last >> 8), byte(last),
+	})
 }

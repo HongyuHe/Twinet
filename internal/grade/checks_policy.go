@@ -229,6 +229,37 @@ func checkSixIn4(ctx context.Context, env *Env) Result {
 			if throughTunnel {
 				unreached = crossDatacentreGaps(ctx, env, hostsIn, domains)
 			}
+			// And the return path has to be encapsulated too.
+			//
+			// The counters were read on one gateway only, for one direction,
+			// while the result claimed the tunnel carried traffic "in both
+			// directions". A forward 6in4 route with a native IPv6 return path
+			// scored the whole point -- and half the answer is a tunnel that
+			// only works one way, which is not what the question asks for.
+			if throughTunnel && len(domains) >= 2 {
+				back := gateways[domains[1]]
+				bs, bd := hosts[domains[1]], hosts[domains[0]]
+				if back != nil && bs != nil && bd != nil && tunnels[domains[1]] != "" {
+					if addr := deviceAddr6(ctx, env, bd); addr != "" {
+						before := tunnelTx(ctx, env, back.ID, tunnels[domains[1]])
+						res, err := env.Probe(ctx, bs.ID,
+							[]string{"ping6", "-c", "3", "-W", "5", "-i", "0.3", addr})
+						after := tunnelTx(ctx, env, back.ID, tunnels[domains[1]])
+						switch {
+						case err != nil || res.ExitCode != 0:
+							throughTunnel = false
+							reach = fmt.Sprintf("%s cannot reach %s at %s over IPv6, so the "+
+								"tunnel carries traffic one way only", bs.Name, bd.Name, addr)
+						case after <= before:
+							throughTunnel = false
+							reach = fmt.Sprintf("IPv6 reaches %s from %s, but %s carried no "+
+								"packets during the test, so the return path is routed "+
+								"natively rather than encapsulated",
+								bd.Name, bs.Name, tunnels[domains[1]])
+						}
+					}
+				}
+			}
 		}
 	}
 

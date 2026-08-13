@@ -40,6 +40,13 @@ func (r *recorder) exec(_ context.Context, id string, cmd []string) (rt.ExecResu
 	if strings.Contains(body, "--done") {
 		return rt.ExecResult{Stdout: "--tunnels\n--routes\n--routes6\n--addrs\n--vlans\n--done\n"}, nil
 	}
+	// The trust anchor answers too. What a system has published is part of what
+	// the reset clears, and a fixture that returned nothing would read as "the
+	// anchor could not be asked" -- which is correct behaviour, and not what
+	// these tests are about.
+	if strings.Contains(body, "/roas") {
+		return rt.ExecResult{Stdout: "[]"}, nil
+	}
 	return rt.ExecResult{}, nil
 }
 

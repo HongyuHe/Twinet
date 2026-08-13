@@ -2,6 +2,7 @@ package grade
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -13,8 +14,19 @@ import (
 func twoRouterAS() *model.Topology {
 	top := &model.Topology{ASes: map[int]*model.AS{}}
 	as := &model.AS{ASN: 3}
-	for _, n := range []string{"ZURI", "GENE"} {
+	for j, n := range []string{"ZURI", "GENE"} {
 		d := &model.Device{Name: n, ASN: 3, Kind: model.KindRouter}
+		// An external session apiece, because a system with none has no
+		// forbidden networks to speak of and the checks about them say so
+		// rather than passing.
+		peer := &model.Iface{Addr4: fmt.Sprintf("179.3.%d.2/24", 4+j)}
+		i := &model.Iface{
+			Name: "ext", Addr4: fmt.Sprintf("179.3.%d.1/24", 4+j),
+			Peer: peer, Link: &model.Link{InterAS: true},
+		}
+		i.Link.A, i.Link.B = i, peer
+		i.Device, peer.Device = d, &model.Device{Name: "far", ASN: 4 + j, Kind: model.KindRouter}
+		d.Ifaces = append(d.Ifaces, i)
 		as.Routers = append(as.Routers, d)
 		as.Devices = append(as.Devices, d)
 	}

@@ -325,6 +325,19 @@ if the manifest that created it is no longer available.`,
 				// Leaving it pinned the next deployment to an arrangement
 				// chosen for a lab that is gone -- the single-node path
 				// removed it and this one returned first.
+				//
+				// Only when the lab being destroyed is the manifest's own.
+				// Destroying a grading harness by name uses the class manifest
+				// to say which machines to reach, and this then deleted the
+				// *class's* record: the next deployment placed a running lab
+				// again from scratch, `inspect --placement` disagreed with
+				// what was actually running, and exec against three systems
+				// answered 404 from the wrong nodes. Observed on this cluster.
+				if name != top.Name {
+					fmt.Fprintf(cmd.OutOrStdout(), "removed lab %q from %d nodes\n",
+						name, len(c.Nodes))
+					return nil
+				}
 				if err := os.Remove(filepath.Join(labPrivateDir(top), place.RecordName)); err != nil &&
 					!errors.Is(err, os.ErrNotExist) {
 					fmt.Fprintf(cmd.ErrOrStderr(), "note: the placement record could not be "+

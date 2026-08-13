@@ -17,14 +17,18 @@ func TestAReducedHarnessKeepsTheExchangeReachable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var rs *model.Device
+	// Every exchange in the harness, not whichever one a map iteration
+	// happened to yield: the system under test is a member of some and not of
+	// others, and checking a random one passes or fails by luck.
+	var exchanges []*model.Device
 	for _, d := range h.Devices {
-		as, ok := h.ASes[d.ASN]
-		if !ok || as.Role != model.RoleIXP {
-			continue
+		if as, ok := h.ASes[d.ASN]; ok && as.Role == model.RoleIXP {
+			exchanges = append(exchanges, d)
 		}
-		rs = d
-		break
+	}
+	var rs *model.Device
+	if len(exchanges) > 0 {
+		rs = exchanges[0]
 	}
 	if rs == nil {
 		t.Fatal("no exchange in the harness is still an exchange: the role is what tells " +
@@ -59,6 +63,23 @@ func TestAReducedHarnessKeepsTheExchangeReachable(t *testing.T) {
 			}
 		}
 	}
+	// Recomputed over every exchange, because membership differs.
+	segments = map[string]bool{}
+	for _, l := range h.Links {
+		if l.Segment == "" {
+			continue
+		}
+		for _, side := range []*model.Iface{l.A, l.B} {
+			if side == nil || side.Device == nil {
+				continue
+			}
+			for _, x := range exchanges {
+				if side.Device.ID == x.ID {
+					segments[l.Segment] = true
+				}
+			}
+		}
+	}
 	found := false
 	for _, l := range h.Links {
 		if l.Segment == "" || !segments[l.Segment] {
@@ -72,8 +93,10 @@ func TestAReducedHarnessKeepsTheExchangeReachable(t *testing.T) {
 	}
 	for _, d := range h.ASes[3].Devices {
 		for _, i := range d.Ifaces {
-			if i.Peer != nil && i.Peer.Device != nil && i.Peer.Device.ID == rs.ID {
-				found = true
+			for _, x := range exchanges {
+				if i.Peer != nil && i.Peer.Device != nil && i.Peer.Device.ID == x.ID {
+					found = true
+				}
 			}
 		}
 	}

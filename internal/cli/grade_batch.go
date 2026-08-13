@@ -25,6 +25,7 @@ import (
 	"github.com/HongyuHe/twinet/internal/model"
 	"github.com/HongyuHe/twinet/internal/render"
 	rt "github.com/HongyuHe/twinet/internal/runtime"
+	"github.com/HongyuHe/twinet/internal/svc"
 )
 
 // submission is one student group's work, on disk.
@@ -800,6 +801,55 @@ func resetToStudentStart(ctx context.Context, exec execFn, top *model.Topology, 
 		if err := loadFRRConfig(ctx, exec, d, cfg.Platform); err != nil {
 			return fmt.Errorf("%s: restoring the starting configuration: %w", d.ID, err)
 		}
+	}
+	// What this system published at the trust anchor is part of what it did,
+	// so it is part of what the reset removes.
+	//
+	// It was not, and publishing is not a line of configuration that wiping a
+	// device takes away: the previous occupant's authorisation -- the
+	// reference's, on the first submission of a run -- stayed at the anchor,
+	// and a submission that never published one inherited it and scored the
+	// mark for it.
+	return withdrawROAs(ctx, exec, top, as)
+}
+
+// withdrawROAs removes every authorisation this system holds at the trust
+// anchor, and confirms none is left.
+func withdrawROAs(ctx context.Context, exec execFn, top *model.Topology, as *model.AS) error {
+	addr := svc.RPKIAddrFor(top, as.ASN)
+	if addr == "" || len(as.Routers) == 0 {
+		return nil
+	}
+	r := rpkiFacingRouter(as)
+	held, err := publishedROAs(ctx, exec, top, as)
+	if err != nil {
+		// Unreadable is not empty. Carrying on would grade the next submission
+		// against whatever is still published, with nothing saying so.
+		return fmt.Errorf("AS %d: what it has published could not be read (%w), so it "+
+			"cannot be cleared before the next submission", as.ASN, err)
+	}
+	for _, v := range held {
+		body := fmt.Sprintf(`{"prefix":%q,"asn":%d,"withdraw":true}`, v.Prefix, v.ASN)
+		res, err := exec(ctx, r.ID, []string{"sh", "-c", fmt.Sprintf(
+			"curl -sf -m 5 -X POST http://%s%s/roas -d %s", addr, svc.PublishListen,
+			shellQuote(body))})
+		if err != nil {
+			return fmt.Errorf("AS %d: withdrawing %s: %w", as.ASN, v.Prefix, err)
+		}
+		if res.ExitCode != 0 {
+			return fmt.Errorf("AS %d: withdrawing %s: the trust anchor refused: %s",
+				as.ASN, v.Prefix, firstLine(res.Stderr+res.Stdout))
+		}
+	}
+	// Read back, because a withdrawal that quietly failed leaves the next
+	// submission holding somebody else's answer.
+	left, err := publishedROAs(ctx, exec, top, as)
+	if err != nil {
+		return fmt.Errorf("AS %d: what it has published could not be re-read: %w", as.ASN, err)
+	}
+	if len(left) > 0 {
+		return fmt.Errorf("AS %d still has %d authorisation(s) at the trust anchor after "+
+			"being cleared", as.ASN, len(left))
 	}
 	return nil
 }

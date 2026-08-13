@@ -219,7 +219,13 @@ func saveAS(ctx context.Context, top *model.Topology, asn int, outDir string,
 	// the group did: re-marking one in a private harness, whose trust anchor
 	// starts empty, lost the mark for the question about publishing. Measured
 	// at 9.70 out of 10 for a submission that had published correctly.
-	if roas := publishedROAs(ctx, exec, top, as); len(roas) > 0 {
+	roas, rerr := publishedROAs(ctx, exec, top, as)
+	if rerr != nil {
+		return "", fmt.Errorf("what AS %d has published at the trust anchor could not be "+
+			"read (%w); an archive without it would lose the mark for publishing when it "+
+			"is graded in a lab of its own", as.ASN, rerr)
+	}
+	if len(roas) > 0 {
 		if raw, err := json.MarshalIndent(roas, "", "  "); err == nil {
 			contents["roas.json"] = append(raw, '\n')
 		}
@@ -702,19 +708,26 @@ func firstLines(s string, n int) string {
 // Read from inside the lab, through one of the system's own routers, because
 // that is the only place the validator is reachable from -- and because the
 // answer is then exactly what the system itself can see.
-func publishedROAs(ctx context.Context, exec execFn, top *model.Topology, as *model.AS) []svc.VRP {
+func publishedROAs(ctx context.Context, exec execFn, top *model.Topology, as *model.AS) ([]svc.VRP, error) {
 	addr := svc.RPKIAddrFor(top, as.ASN)
-	if addr == "" {
-		return nil
+	if addr == "" || len(as.Routers) == 0 {
+		return nil, nil
 	}
-	for _, r := range as.Routers {
+	var last error
+	for _, r := range append([]*model.Device{rpkiFacingRouter(as)}, as.Routers...) {
 		res, err := exec(ctx, r.ID, []string{"sh", "-c",
 			fmt.Sprintf("curl -sf -m 5 http://%s%s/roas", addr, svc.PublishListen)})
-		if err != nil || res.ExitCode != 0 {
+		if err != nil {
+			last = err
+			continue
+		}
+		if res.ExitCode != 0 {
+			last = fmt.Errorf("%s: the trust anchor did not answer", r.ID)
 			continue
 		}
 		var all []svc.VRP
 		if err := json.Unmarshal([]byte(res.Stdout), &all); err != nil {
+			last = fmt.Errorf("%s: the trust anchor's answer could not be read: %w", r.ID, err)
 			continue
 		}
 		var mine []svc.VRP
@@ -723,9 +736,11 @@ func publishedROAs(ctx context.Context, exec execFn, top *model.Topology, as *mo
 				mine = append(mine, v)
 			}
 		}
-		return mine
+		// An empty list is an answer; nil with no error would be read as "not
+		// asked" by a caller that has to tell the two apart.
+		return mine, nil
 	}
-	return nil
+	return nil, last
 }
 
 // replayROAs publishes an archive's authorisations into the lab being graded.
@@ -738,25 +753,7 @@ func replayROAs(ctx context.Context, exec execFn, top *model.Topology, as *model
 	if addr == "" || len(roas) == 0 || len(as.Routers) == 0 {
 		return nil
 	}
-	// Published from the router the trust anchor is cabled to.
-	//
-	// Any router of the system can reach it once the interior routing is up,
-	// and this runs seconds after the configuration was installed, when it is
-	// not. Publishing from the directly-connected router needs no routing at
-	// all, so it does not depend on the very thing being marked.
-	r := as.Routers[0]
-	for _, d := range as.Devices {
-		if d.Kind != model.KindRouter {
-			continue
-		}
-		for _, i := range d.Ifaces {
-			if i.Peer != nil && i.Peer.Device != nil &&
-				i.Peer.Device.Kind == model.KindService &&
-				strings.Contains(strings.ToLower(i.Peer.Device.Name), "rpki") {
-				r = d
-			}
-		}
-	}
+	r := rpkiFacingRouter(as)
 	for _, v := range roas {
 		body := fmt.Sprintf(`{"prefix":%q,"max_length":%d,"asn":%d}`, v.Prefix, v.MaxLength, v.ASN)
 		// Retried, because this runs moments after the lab was built: the
@@ -783,4 +780,27 @@ func replayROAs(ctx context.Context, exec execFn, top *model.Topology, as *model
 		}
 	}
 	return nil
+}
+
+// rpkiFacingRouter returns the router the trust anchor is cabled to.
+//
+// Any router of the system can reach it once the interior routing is up, and
+// publishing happens seconds after a configuration is installed, when it is
+// not. Talking to the directly-connected router needs no routing at all, so it
+// does not depend on the very thing being marked.
+func rpkiFacingRouter(as *model.AS) *model.Device {
+	r := as.Routers[0]
+	for _, d := range as.Devices {
+		if d.Kind != model.KindRouter {
+			continue
+		}
+		for _, i := range d.Ifaces {
+			if i.Peer != nil && i.Peer.Device != nil &&
+				i.Peer.Device.Kind == model.KindService &&
+				strings.Contains(strings.ToLower(i.Peer.Device.Name), "rpki") {
+				r = d
+			}
+		}
+	}
+	return r
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/netip"
 	"sort"
 	"strconv"
 	"strings"
@@ -400,23 +401,16 @@ func checkGaoRexford(ctx context.Context, env *Env) Result {
 // route learned from a peer or a provider must not be handed to another peer or
 // provider, or the AS is providing free transit.
 func checkNoTransit(ctx context.Context, env *Env) Result {
-	routers := env.Routers()
 	relOf := map[string]model.Relationship{}
 	relOfASN := map[int]model.Relationship{}
-	for _, r := range routers {
-		for _, i := range r.Ifaces {
-			if i.Link == nil || !i.Link.InterAS || i.Peer == nil || i.Peer.Addr4 == "" {
-				continue
-			}
-			// What the neighbour is to us. Derived in one place, because the
-			// same two lines written out here, in the renderer and in the
-			// other checks were all inverted in the same direction -- so the
-			// wrong answer was self-consistent and scored full marks.
-			rel := i.Link.PeerRelationship(i)
-			relOf[env.PeerAddr(ctx, i)] = rel
-			if i.Peer.Device != nil {
-				relOfASN[i.Peer.Device.ASN] = rel
-			}
+	// What each neighbour is to us. Derived in one place, because the same two
+	// lines written out here, in the renderer and in the other checks were all
+	// inverted in the same direction -- so the wrong answer was self-consistent
+	// and scored full marks. The exchange is included: its members are peers.
+	for _, s := range externalSessions(ctx, env) {
+		relOf[s.Addr] = s.Rel
+		if s.ASN != 0 {
+			relOfASN[s.ASN] = s.Rel
 		}
 	}
 
@@ -441,17 +435,11 @@ func checkNoTransit(ctx context.Context, env *Env) Result {
 		rel    model.Relationship
 	}
 	var sessions []session
-	for _, r := range routers {
-		for _, i := range r.Ifaces {
-			if i.Link == nil || !i.Link.InterAS || i.Peer == nil || i.Peer.Addr4 == "" {
-				continue
-			}
-			rel := i.Link.PeerRelationship(i)
-			if rel == model.RelCustomer {
-				continue // a customer may receive everything
-			}
-			sessions = append(sessions, session{r.Name, env.PeerAddr(ctx, i), rel})
+	for _, s := range externalSessions(ctx, env) {
+		if s.Rel == model.RelCustomer {
+			continue // a customer may receive everything
 		}
+		sessions = append(sessions, session{s.Router, s.Addr, s.Rel})
 	}
 
 	// For each non-customer neighbour, look at what we advertise to them.
@@ -621,10 +609,20 @@ func checkNoForbiddenOSPF(ctx context.Context, env *Env) Result {
 	// Every router, or none: this check concludes from what it does not find,
 	// so a router it could not read is a router whose forbidden statements it
 	// would also not have found.
+	external := externalRangesOf(ctx, env)
+	if len(external.nets) == 0 {
+		// Which networks are forbidden is not a matter of opinion, but it is a
+		// matter of knowing what this system's sessions are. Not knowing means
+		// not concluding: passing here would award the mark for a rule that
+		// was applied to nothing.
+		return Errored("config.no_forbidden_ospf", fmt.Errorf(
+			"this system has no external session the grader can see, so which networks "+
+				"must stay out of its interior routing cannot be decided"))
+	}
 	cfgs, err := runningConfigs(ctx, env)
 	if err != nil {
 		return Fail("config.no_forbidden_ospf", Evidence{
-			Expected: "every router's configuration readable, with no 179.x or 180.x under router ospf",
+			Expected: "every router's configuration readable, with no inter-AS network under router ospf",
 			Observed: "some configurations could not be read",
 			Detail:   err.Error(),
 			Hint:     "make sure FRR is running on every router before submitting",
@@ -651,7 +649,13 @@ func checkNoForbiddenOSPF(ctx context.Context, env *Env) Result {
 			// The assignment is explicit that the inter-AS ranges must not be
 			// in OSPF: advertising them internally breaks eBGP next-hop
 			// resolution in confusing ways.
-			if strings.HasPrefix(t, "network 179.") || strings.HasPrefix(t, "network 180.") {
+			//
+			// Which ranges those are is read off the sessions this system
+			// actually has, not from the two prefixes the manifest happens to
+			// plan. A group that agreed a different peering range with their
+			// neighbour -- which the assignment lets them do -- could put it
+			// in OSPF and pass, while the rule exists precisely to stop that.
+			if external.matches(strings.TrimPrefix(t, "network ")) {
 				found = append(found, fmt.Sprintf("%s: %s", r.Name, t))
 			}
 		}
@@ -662,12 +666,90 @@ func checkNoForbiddenOSPF(ctx context.Context, env *Env) Result {
 	}
 	sort.Strings(found)
 	return Fail("config.no_forbidden_ospf", Evidence{
-		Expected: "no 179.x or 180.x networks under router ospf",
+		Expected: "no inter-AS network under router ospf",
 		Observed: fmt.Sprintf("%d such statement(s)", len(found)),
 		Detail:   strings.Join(found, "\n"),
 		Hint:     "external subnets belong to BGP, not to your interior routing protocol",
 		Command:  "show running-config",
 	})
+}
+
+// peerPlannedAddr is the address the manifest gave the far end of a link.
+func peerPlannedAddr(i *model.Iface) string {
+	if i.Peer == nil {
+		return ""
+	}
+	return i.Peer.Addr4
+}
+
+// externalRanges are the networks this system's external sessions are on.
+type externalRanges struct{ nets []netip.Prefix }
+
+// externalRangesOf reads them off the sessions rather than off the plan.
+func externalRangesOf(ctx context.Context, env *Env) externalRanges {
+	var out externalRanges
+	seen := map[string]bool{}
+	addrs := []string{}
+	for _, s := range externalSessions(ctx, env) {
+		addrs = append(addrs, s.Addr)
+	}
+	// The planned ranges as well as the ones in use.
+	//
+	// Reading only what is live would make the rule apply to nothing on a
+	// system whose sessions are all down -- which is the state a submission
+	// that put the inter-AS range into OSPF is quite likely to be in.
+	for _, r := range env.Routers() {
+		for _, i := range r.Ifaces {
+			if i.Link == nil || !i.Link.InterAS {
+				continue
+			}
+			// Both ends of the planned link. The plan is the right source
+			// here, and only here: this is about which networks are external,
+			// which the manifest defines, rather than about which address a
+			// group chose to peer on, which only the device knows.
+			for _, planned := range []string{i.Addr4, peerPlannedAddr(i)} {
+				if p, err := netip.ParsePrefix(planned); err == nil {
+					addrs = append(addrs, p.Addr().String())
+				}
+			}
+		}
+	}
+	for _, s := range addrs {
+		a, err := netip.ParseAddr(s)
+		if err != nil {
+			continue
+		}
+		// The neighbour's address with the local prefix length; the exact
+		// length matters less than the network, and any statement covering the
+		// neighbour's address is the one the rule is about.
+		for _, bits := range []int{24, 30, 31, 29, 28} {
+			p := netip.PrefixFrom(a, bits).Masked()
+			if !seen[p.String()] {
+				seen[p.String()] = true
+				out.nets = append(out.nets, p)
+			}
+		}
+	}
+	return out
+}
+
+// matches reports whether an OSPF network statement covers a session's network.
+func (e externalRanges) matches(stmt string) bool {
+	f := strings.Fields(stmt)
+	if len(f) == 0 {
+		return false
+	}
+	p, err := netip.ParsePrefix(f[0])
+	if err != nil {
+		return false
+	}
+	p = p.Masked()
+	for _, n := range e.nets {
+		if p.Contains(n.Addr()) || n.Contains(p.Addr()) {
+			return true
+		}
+	}
+	return false
 }
 
 func addrOf(cidr string) string {
@@ -702,4 +784,59 @@ func maxInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// externalSession is one BGP session this AS has with somebody outside it.
+type externalSession struct {
+	Router string
+	Addr   string
+	Rel    model.Relationship
+	ASN    int
+}
+
+// externalSessions lists every session with a neighbour outside this AS,
+// including the one with an exchange's route server.
+//
+// The exchange used to be missing from every policy check, because a member's
+// interface onto an exchange sits on a shared segment and the checks skipped
+// anything that was not a point-to-point inter-AS link. So the question those
+// checks exist to ask -- what may cross a session to somebody who is not a
+// customer -- was never asked about the exchange, which is exactly where
+// leaking a provider's route is the classic mistake and where the assignment
+// spends a whole question. A submission that leaked everything to the exchange
+// scored full marks for no transit.
+func externalSessions(ctx context.Context, env *Env) []externalSession {
+	var out []externalSession
+	for _, r := range env.Routers() {
+		for _, i := range r.Ifaces {
+			if i.Link == nil {
+				continue
+			}
+			switch {
+			case i.Role == model.RoleIXPLink:
+				// At an exchange the session is with the route server, and the
+				// members behind it are peers by definition: only this AS's own
+				// and its customers' routes may cross it.
+				addr, asn := routeServerOn(env.Topology, i)
+				if addr == "" {
+					continue
+				}
+				out = append(out, externalSession{r.Name, addr, model.RelPeer, asn})
+			case i.Link.InterAS && i.Peer != nil && i.Peer.Addr4 != "":
+				rel := i.Link.PeerRelationship(i)
+				asn := 0
+				if i.Peer.Device != nil {
+					asn = i.Peer.Device.ASN
+				}
+				out = append(out, externalSession{r.Name, env.PeerAddr(ctx, i), rel, asn})
+			}
+		}
+	}
+	sort.Slice(out, func(a, b int) bool {
+		if out[a].Router != out[b].Router {
+			return out[a].Router < out[b].Router
+		}
+		return out[a].Addr < out[b].Addr
+	})
+	return out
 }

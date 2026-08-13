@@ -574,7 +574,7 @@ func checkVLANIsolation(ctx context.Context, env *Env) Result {
 			fmt.Fprintf(&detail, "%s reaches %s across VLANs, but nothing answered at the "+
 				"first hop, so it cannot be shown to have gone through %s\n",
 				src.Name, dst.Name, gateway.Name)
-		case !deviceHasAddr(gateway, first):
+		case !deviceHoldsAddr(ctx, env, gateway, first):
 			fmt.Fprintf(&detail, "%s reaches %s across VLANs, but its first hop is %s, "+
 				"which is not %s; traffic between VLANs must be routed by the gateway\n",
 				src.Name, dst.Name, first, gateway.Name)
@@ -642,7 +642,7 @@ func checkInternalReachability(ctx context.Context, env *Env) Result {
 
 // traceHops counts the hops between two hosts.
 func traceHops(ctx context.Context, env *Env, src, dst *model.Device) (int, error) {
-	addr := firstAddr(dst)
+	addr := deviceAddr4(ctx, env, dst)
 	if addr == "" {
 		return 0, fmt.Errorf("%s has no address configured", dst.Name)
 	}
@@ -656,7 +656,7 @@ func traceHops(ctx context.Context, env *Env, src, dst *model.Device) (int, erro
 // traceFirstHop reports how many hops away a destination is and the address
 // that answered first, which is what says *through what* the traffic went.
 func traceFirstHop(ctx context.Context, env *Env, src, dst *model.Device) (int, string, error) {
-	addr := firstAddr(dst)
+	addr := deviceAddr4(ctx, env, dst)
 	if addr == "" {
 		return 0, "", fmt.Errorf("%s has no address configured", dst.Name)
 	}
@@ -681,6 +681,46 @@ func firstTracerouteHop(out string) string {
 		return m[2]
 	}
 	return ""
+}
+
+// deviceAddr4 returns the address a device actually has, falling back to the
+// one the manifest planned.
+//
+// The assignment lets a group choose their own datacentre addressing, and this
+// check pinged and traced towards the planned address: a group that used
+// another one was reported unreachable inside their own network, for an answer
+// the assignment permits.
+func deviceAddr4(ctx context.Context, env *Env, d *model.Device) string {
+	res, err := env.Exec(ctx, d.ID, []string{"sh", "-c",
+		"ip -o -4 addr show scope global 2>/dev/null | awk '{print $4}'"})
+	if err == nil && res.ExitCode == 0 {
+		for _, f := range strings.Fields(res.Stdout) {
+			if p, err := netip.ParsePrefix(f); err == nil && p.Addr().Is4() {
+				return p.Addr().String()
+			}
+		}
+	}
+	return firstAddr(d)
+}
+
+// deviceHoldsAddr reports whether a device actually holds an address.
+func deviceHoldsAddr(ctx context.Context, env *Env, d *model.Device, addr string) bool {
+	if d == nil || addr == "" {
+		return false
+	}
+	res, err := env.Exec(ctx, d.ID, []string{"sh", "-c",
+		"ip -o -4 addr show scope global 2>/dev/null | awk '{print $4}'"})
+	if err == nil && res.ExitCode == 0 {
+		for _, f := range strings.Fields(res.Stdout) {
+			if p, perr := netip.ParsePrefix(f); perr == nil && p.Addr().String() == addr {
+				return true
+			}
+		}
+		// The device answered and does not hold it. The plan is not consulted:
+		// this is about where the traffic actually went.
+		return false
+	}
+	return deviceHasAddr(d, addr)
 }
 
 // deviceHasAddr reports whether an address belongs to a device.

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"net/netip"
 	"strings"
 	"testing"
 
@@ -123,5 +124,36 @@ func TestNothingIsAdaptedWhenTheGroupUsedThePlannedAddress(t *testing.T) {
 	}
 	if ads, _, _ := adaptNeighbours(context.Background(), exec, top, 3); len(ads) != 0 {
 		t.Errorf("adapted %v for a group that used the planned address", ads)
+	}
+}
+
+// "The next address after theirs" is wrong on a /30: a group peering on
+// 10.34.0.2/30 would put the reference on 10.34.0.3, that network's broadcast
+// address, and the session would never come up -- for an answer the assignment
+// explicitly permits.
+func TestTheOtherEndIsAUsableAddress(t *testing.T) {
+	for _, c := range []struct {
+		theirs string
+		want   string
+	}{
+		{"10.34.0.1/30", "10.34.0.2"},
+		{"10.34.0.2/30", "10.34.0.1"},
+		{"10.34.0.1/24", "10.34.0.254"},
+		{"10.34.0.9/24", "10.34.0.1"},
+		{"10.34.0.0/31", "10.34.0.1"},
+		{"10.34.0.1/31", "10.34.0.0"},
+	} {
+		got, err := otherEndOf(netip.MustParsePrefix(c.theirs))
+		if err != nil {
+			t.Errorf("%s: %v", c.theirs, err)
+			continue
+		}
+		if got.String() != c.want {
+			t.Errorf("a group peering on %s would have the reference on %s, want %s",
+				c.theirs, got, c.want)
+		}
+	}
+	if _, err := otherEndOf(netip.MustParsePrefix("10.34.0.1/32")); err == nil {
+		t.Error("a /32 was given an other end, which does not exist")
 	}
 }
