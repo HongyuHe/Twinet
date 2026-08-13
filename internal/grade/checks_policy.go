@@ -3,6 +3,7 @@ package grade
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/HongyuHe/twinet/internal/model"
+	"github.com/HongyuHe/twinet/internal/svc"
 )
 
 // This file registers the remaining course checks: 6in4 tunnels, exchange
@@ -832,6 +834,12 @@ func advertisedPrefixes(ctx context.Context, env *Env, router, peer string) map[
 	return out
 }
 
+// errNoSuchNeighbour distinguishes "this router does not have that session"
+// from "the router could not be read". Both used to arrive as a bare error and
+// were dropped together, so a session that could not be assessed was indistinguishable
+// from one the student never configured.
+var errNoSuchNeighbour = errors.New("no such neighbour")
+
 func advertisedRoutes(ctx context.Context, env *Env, router, peer string) (bgpRouteJSON, error) {
 	var adv bgpRouteJSON
 	out, err := env.Vtysh(ctx, router,
@@ -841,6 +849,9 @@ func advertisedRoutes(ctx context.Context, env *Env, router, peer string) (bgpRo
 	}
 	if err := jsonUnmarshalLoose(out, &adv); err != nil {
 		return adv, fmt.Errorf("%s: could not read what is advertised to %s: %w", router, peer, err)
+	}
+	if adv.NoSuchNeighbour() {
+		return adv, fmt.Errorf("%s has no BGP session with %s: %w", router, peer, errNoSuchNeighbour)
 	}
 	if !adv.Decoded() {
 		// An unrecognised document must never pass for an empty table: that is
@@ -1033,8 +1044,19 @@ func checkRPKIInvalidRejected(ctx context.Context, env *Env) Result {
 		})
 	}
 	if len(selected) == 0 {
+		// Nothing selected means nothing only if there was something to
+		// reject. The lab declares a ROA held by one AS for a prefix inside
+		// another's space, and for a while nothing announced that prefix: no
+		// route anywhere in the lab was ever invalid, so "no invalid route is
+		// selected" was true of a router that had done nothing at all. The
+		// premise is checked where the student cannot influence it.
+		if why := hijackIsAnnounced(ctx, env); why != "" {
+			return Errored("rpki.invalid_rejected", fmt.Errorf(
+				"this lab is not announcing anything RPKI-invalid, so rejecting it "+
+					"cannot be observed and no verdict here would mean anything: %s", why))
+		}
 		return Pass("rpki.invalid_rejected", Evidence{
-			Observed: "validation is live and no RPKI-invalid route is selected",
+			Observed: "validation is live and the lab's invalid announcement is not selected",
 			Detail:   liveDetail + "\n" + detail})
 	}
 	return Partial("rpki.invalid_rejected", 0.6, Evidence{
@@ -1493,4 +1515,36 @@ func parseROATable(text string) map[string]bool {
 		out[f[0]+"/"+f[1]] = true
 	}
 	return out
+}
+
+// hijackIsAnnounced confirms the lab actually carries an RPKI-invalid
+// announcement, and returns why it does not when it does not.
+//
+// It asks the AS that originates it, which is staff-operated: a student can
+// neither remove the announcement nor fake it. Asking the student's own routers
+// would be circular -- a submission that correctly rejects the hijack has no
+// trace of it, which is exactly the state this is distinguishing from a lab
+// where the hijack was never announced.
+func hijackIsAnnounced(ctx context.Context, env *Env) string {
+	hijacker, prefix := svc.HijackOrigin(env.Topology)
+	if hijacker == 0 || prefix == "" {
+		return "no autonomous system is configured to originate a mis-attributed prefix"
+	}
+	as, ok := env.Topology.ASes[hijacker]
+	if !ok || len(as.Routers) == 0 {
+		return fmt.Sprintf("AS %d should originate %s but has no routers", hijacker, prefix)
+	}
+	var why []string
+	for _, r := range as.Routers {
+		res, err := env.Probe(ctx, r.ID, []string{"vtysh", "-c", "show bgp ipv4 unicast " + prefix})
+		if err != nil {
+			why = append(why, fmt.Sprintf("%s: %v", r.ID, err))
+			continue
+		}
+		if res.ExitCode == 0 && strings.Contains(res.Stdout, prefix) {
+			return ""
+		}
+		why = append(why, fmt.Sprintf("%s does not have %s in its table", r.ID, prefix))
+	}
+	return strings.Join(truncate(why, 3), "; ")
 }

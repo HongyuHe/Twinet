@@ -8,6 +8,7 @@ package deploy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -353,6 +354,17 @@ func (e *Engine) captureBeforeReplace(ctx context.Context, top *model.Topology, 
 		return nil
 	}
 	snaps, err := Capture(ctx, e.Runtime, d, top.Name, top.Hash)
+	if errors.Is(err, ErrNotRunning) {
+		// A stopped container still holds the student's work on its
+		// filesystem. Start it, read it, and only then allow the replacement.
+		// Refusing outright would strand the device instead, and going ahead
+		// would delete the work of whoever's router happened to be down.
+		if serr := e.Runtime.Start(ctx, d.Container); serr != nil {
+			return fmt.Errorf("refusing to replace %s: it is not running and could not be "+
+				"started to read its configuration: %w", d.ID, serr)
+		}
+		snaps, err = Capture(ctx, e.Runtime, d, top.Name, top.Hash)
+	}
 	if err != nil {
 		return fmt.Errorf("refusing to replace %s: its configuration could not be captured: %w", d.ID, err)
 	}

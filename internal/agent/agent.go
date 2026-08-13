@@ -312,6 +312,21 @@ func (s *Server) rememberHow(lab, mode string, ungraded int) {
 	s.ungraded[lab] = ungraded
 }
 
+// modeToPersist decides what mode is written to disk for a lab.
+//
+// Only an apply entitled to say how the lab was built writes it. A scoped or
+// failed one keeps whatever was already recorded, because the alternative is a
+// restarted agent believing a lab is at the reference when only one AS of it
+// ever was -- and a lab believed to be at the reference has its snapshotting
+// suppressed, so every student's work stops being preserved.
+func modeToPersist(authoritative bool, mode string, ungraded int,
+	prevMode string, prevUngraded int) (string, int) {
+	if authoritative {
+		return mode, ungraded
+	}
+	return prevMode, prevUngraded
+}
+
 func (s *Server) release(lab string) {
 	s.mu.Lock()
 	delete(s.ops, lab)
@@ -640,6 +655,16 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Whether this apply is entitled to say how the lab was built.
+	//
+	// The same condition guards the in-memory record and the one on disk. It
+	// used to guard only the first, so a scoped or failed `--solve --only
+	// as=3` left "solve" on disk with the in-memory record correctly untouched
+	// -- and an agent restart read the disk copy back, so the node came up
+	// believing an unsolved lab was the reference and stopped preserving
+	// anybody's work.
+	authoritative := len(req.OnlySteps) == 0 && !rep.Failed()
+
 	s.mu.Lock()
 	// A dry run changed nothing on this node, so it must not become what the
 	// node believes it is hosting. Recording it made the agent claim a lab it
@@ -654,7 +679,7 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		// other system's work. A partial failure did the same. The record is
 		// what tells destroy whose configuration is whose, and it has to mean
 		// what it says.
-		if len(req.OnlySteps) == 0 && !rep.Failed() {
+		if authoritative {
 			s.rememberHow(top.Name, req.Mode, req.Ungraded)
 		}
 	}
@@ -678,8 +703,11 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		// a cross-node link without the controller.
 		wt := req.Topology
 		wt.PeerUnderlay = req.PeerUnderlay
-		wt.Mode = req.Mode
-		wt.Ungraded = req.Ungraded
+		s.mu.Lock()
+		prevMode, prevUngraded := s.modes[top.Name], s.ungraded[top.Name]
+		s.mu.Unlock()
+		wt.Mode, wt.Ungraded = modeToPersist(authoritative,
+			req.Mode, req.Ungraded, prevMode, prevUngraded)
 		raw, err := json.Marshal(wt)
 		if err == nil {
 			err = s.store.PutTopology(top.Name, raw)

@@ -2,6 +2,7 @@ package deploy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -37,13 +38,29 @@ const switchCapture = `for p in $(ovs-vsctl list-ports br0 2>/dev/null); do
   echo "port $p tag=${tag} trunks=${trunks} mode=${mode}"
 done`
 
+// ErrNotRunning reports that a device's container exists but is not running, so
+// its contents could not be read.
+//
+// This used to be indistinguishable from "there was nothing to save": Capture
+// returned no snapshots and no error, and the caller that asks before
+// destroying a container took that at face value and destroyed it. A stopped
+// container still holds the student's work -- the configuration is a file on
+// its filesystem, not something the daemons are keeping in memory -- so the one
+// device most likely to be replaced, the one that had crashed, was the one
+// whose work was thrown away.
+var ErrNotRunning = errors.New("the container is not running")
+
 func Capture(ctx context.Context, r rt.Runtime, d *model.Device, lab, topoHash string) ([]state.Snapshot, error) {
 	c, err := r.Inspect(ctx, d.Container)
 	if err != nil {
 		return nil, err
 	}
-	if !c.State.Joinable() {
+	if c.State == rt.StateAbsent {
+		// There is genuinely nothing there to read.
 		return nil, nil
+	}
+	if !c.State.Joinable() {
+		return nil, fmt.Errorf("%s: %w", d.Container, ErrNotRunning)
 	}
 
 	var out []state.Snapshot
@@ -179,7 +196,12 @@ func (e *Engine) CaptureAll(ctx context.Context, top *model.Topology, store *sta
 			continue
 		}
 		snaps, err := Capture(ctx, e.Runtime, d, top.Name, top.Hash)
-		if err != nil {
+		if err != nil && !errors.Is(err, ErrNotRunning) {
+			// A stopped device is not a problem for a periodic backup: the
+			// snapshot already in the store is still the last thing that was
+			// on it, and nothing is lost by not overwriting it. It is a
+			// problem for the caller that is about to destroy the container,
+			// and that caller is the one that must not ignore it.
 			problems = append(problems, fmt.Sprintf("%s: %v", d.ID, err))
 			// Whatever was read is still stored: a partial snapshot is worth
 			// more than none, and the failure is reported either way.
@@ -293,9 +315,24 @@ func Restore(ctx context.Context, r rt.Runtime, d *model.Device, lab string, sto
 			if err := r.CopyTo(ctx, d.Container, "/etc/twinet/restore.conf", 0o600, body); err != nil {
 				return false, fmt.Errorf("copy saved configuration into %s: %w", d.ID, err)
 			}
+			// The file is removed whatever happens next.
+			//
+			// It stayed, and it holds a complete routing configuration. On a
+			// lab deployed at the reference that is the answer, sitting in
+			// /etc/twinet where any root shell can read it -- and root inside
+			// the container is exactly what a student has, and what an agent
+			// being evaluated on root-cause analysis has. It was found on
+			// sampled routers of three autonomous systems on this cluster.
+			//
+			// It is deleted in the same shell that loads it, so there is no
+			// window in which the process could die and leave it behind.
 			res, err := r.Exec(ctx, d.Container, rt.ExecCmd{
-				Cmd: []string{"sh", "-c", "vtysh -f /etc/twinet/restore.conf"}})
+				Cmd: []string{"sh", "-c",
+					"vtysh -f /etc/twinet/restore.conf; rc=$?; " +
+						"rm -f /etc/twinet/restore.conf; exit $rc"}})
 			if err != nil {
+				_, _ = r.Exec(ctx, d.Container, rt.ExecCmd{
+					Cmd: []string{"rm", "-f", "/etc/twinet/restore.conf"}})
 				return false, fmt.Errorf("restore %s: %w", d.ID, err)
 			}
 			if res.ExitCode != 0 {

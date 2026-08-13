@@ -3,8 +3,10 @@ package grade
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/HongyuHe/twinet/internal/model"
@@ -425,57 +427,97 @@ func checkNoTransit(ctx context.Context, env *Env) Result {
 	}
 	announced := 0
 
+	// Each router is asked about its own sessions, and only its own.
+	//
+	// Every router used to be asked about every inter-AS address in the AS, so
+	// most reads came back "no such neighbour" -- one router does not hold
+	// another's session -- and landed in the same bucket as a read that failed
+	// because the router could not be reached. Both were dropped, so a session
+	// that could not be assessed cost nothing, and an AS whose routers were
+	// mostly unreadable passed on the strength of the one that answered.
+	type session struct {
+		router string
+		addr   string
+		rel    model.Relationship
+	}
+	var sessions []session
+	for _, r := range routers {
+		for _, i := range r.Ifaces {
+			if i.Link == nil || !i.Link.InterAS || i.Peer == nil || i.Peer.Addr4 == "" {
+				continue
+			}
+			rel := i.Link.PeerRelationship(i)
+			if rel == model.RelCustomer {
+				continue // a customer may receive everything
+			}
+			sessions = append(sessions, session{r.Name, addrOf(i.Peer.Addr4), rel})
+		}
+	}
+
 	// For each non-customer neighbour, look at what we advertise to them.
 	var leaks []string
 	var silent []string
 	var unreadable []string
 	checked := 0
-	for _, r := range routers {
-		for addr, rel := range relOf {
-			if rel == model.RelCustomer {
-				continue // a customer may receive everything
-			}
-			adv, err := advertisedRoutes(ctx, env, r.Name, addr)
-			if err != nil {
-				// The session may simply not exist yet, which is a student
-				// finding; an unreadable document is ours, and is recorded so
-				// it cannot masquerade as a pass.
-				unreadable = append(unreadable, err.Error())
+	for _, sess := range sessions {
+		name, addr, rel := sess.router, sess.addr, sess.rel
+		adv, err := advertisedRoutes(ctx, env, name, addr)
+		if err != nil {
+			if errors.Is(err, errNoSuchNeighbour) {
+				// The student did not configure the session. That is a
+				// finding about them, and it is assessed: nothing of ours
+				// crosses a session that does not exist.
+				checked++
+				silent = append(silent, fmt.Sprintf(
+					"%s has no BGP session with the %s at %s, so nothing of yours reaches it",
+					name, rel, addr))
 				continue
 			}
-			checked++
-			sawOwn := false
-			for prefix, entries := range adv.Table() {
-				if own != "" && prefix == own {
-					announced++
-					sawOwn = true
-				}
-				for _, e := range entries {
-					// A route we originate has an empty path and may go anywhere.
-					if strings.TrimSpace(e.Path) == "" {
-						continue
-					}
-					// Otherwise it came from someone: if it came from a peer or
-					// provider, exporting it here is a leak.
-					src := sourceRelationship(e, relOf, relOfASN)
-					if src == model.RelPeer || src == model.RelProvider {
-						leaks = append(leaks, fmt.Sprintf(
-							"%s advertises %s (learned from a %s, path %q) to a %s at %s",
-							r.Name, prefix, src, strings.TrimSpace(e.Path), rel, addr))
-					}
-				}
+			// An unreadable document is ours, and is recorded so it cannot
+			// masquerade as a pass.
+			unreadable = append(unreadable, err.Error())
+			continue
+		}
+		checked++
+		sawOwn := false
+		for prefix, entries := range adv.Table() {
+			if own != "" && prefix == own {
+				announced++
+				sawOwn = true
 			}
-			if !sawOwn {
-				silent = append(silent, fmt.Sprintf("%s advertises nothing of its own to the %s at %s",
-					r.Name, rel, addr))
+			for _, e := range entries {
+				// A route we originate has an empty path and may go anywhere.
+				if strings.TrimSpace(e.Path) == "" {
+					continue
+				}
+				// Otherwise it came from someone: if it came from a peer or
+				// provider, exporting it here is a leak.
+				src := sourceRelationship(e, env.AS, relOf, relOfASN)
+				if src == model.RelPeer || src == model.RelProvider {
+					leaks = append(leaks, fmt.Sprintf(
+						"%s advertises %s (learned from a %s, path %q) to a %s at %s",
+						name, prefix, src, strings.TrimSpace(e.Path), rel, addr))
+				}
 			}
 		}
+		if !sawOwn {
+			silent = append(silent, fmt.Sprintf("%s advertises nothing of its own to the %s at %s",
+				name, rel, addr))
+		}
 	}
-	if checked == 0 {
+	// A session that could not be read has not been assessed, and a check that
+	// reports "no leaks" while some of the sessions it is about were never read
+	// is reporting on a question it did not finish asking.
+	if len(unreadable) > 0 {
 		sort.Strings(unreadable)
 		return Errored("policy.no_transit_for_peers", fmt.Errorf(
-			"no neighbour's advertised routes could be read, so nothing could be assessed: %s",
-			strings.Join(truncate(unreadable, 3), "; ")))
+			"%d of %d non-customer session(s) could not be read, so no verdict covers them: %s",
+			len(unreadable), len(sessions), strings.Join(truncate(unreadable, 3), "; ")))
+	}
+	if checked == 0 {
+		return Errored("policy.no_transit_for_peers", fmt.Errorf(
+			"this AS has no session with a peer or a provider, so the question of what "+
+				"may cross one cannot be assessed"))
 	}
 	// Advertising nothing is not the same as advertising correctly.
 	//
@@ -538,7 +580,7 @@ func checkNoTransit(ctx context.Context, env *Env) Result {
 // had an unknown source, no leak could ever be attributed, and a network
 // providing free transit to the entire internet passed the question about not
 // doing that.
-func sourceRelationship(e bgpRoute, relOf map[string]model.Relationship,
+func sourceRelationship(e bgpRoute, selfAS int, relOf map[string]model.Relationship,
 	relOfASN map[int]model.Relationship) model.Relationship {
 	for _, nh := range e.Nexthops {
 		if rel, ok := relOf[nh.IP]; ok {
@@ -553,7 +595,18 @@ func sourceRelationship(e bgpRoute, relOf map[string]model.Relationship,
 	// The AS path is the fallback, and for this question the better signal:
 	// an advertisement whose path begins with a neighbour is a route learned
 	// from that neighbour, whatever the next hop was rewritten to.
-	if f := strings.Fields(strings.TrimSpace(e.Path)); len(f) > 0 {
+	//
+	// Our own prepends are skipped first. The traffic-engineering question
+	// asks for `set as-path prepend <own> <own> <own>` towards a slow
+	// neighbour, so an advertisement leaving this AS reads "3 3 3 9" -- and
+	// reading only the first element found *ourselves*, which is in no
+	// relationship map, so the route's origin was unknown and a leak of a
+	// provider's route through a prepended session went unnoticed.
+	f := strings.Fields(strings.TrimSpace(e.Path))
+	for len(f) > 0 && f[0] == strconv.Itoa(selfAS) {
+		f = f[1:]
+	}
+	if len(f) > 0 {
 		var asn int
 		if _, err := fmt.Sscanf(f[0], "%d", &asn); err == nil {
 			if rel, ok := relOfASN[asn]; ok {

@@ -127,3 +127,29 @@ func TestTheFactsFileDoesNotCarryStudentAddressing(t *testing.T) {
 		t.Error("the interface itself is no longer described, which the student shell needs")
 	}
 }
+
+// The snapshot loader copied a complete routing configuration into
+// /etc/twinet/restore.conf and left it there. On a lab deployed at the
+// reference that is the answer, readable by any root shell -- which is what a
+// student has, and what an agent being evaluated on root-cause analysis has.
+// It was found on sampled routers of three autonomous systems on a live
+// cluster.
+func TestEveryDeploymentScrubsConfigurationLeftInTheDevice(t *testing.T) {
+	top := &model.Topology{Name: "cos461", Lab: &model.Lab{}}
+	d := &model.Device{ID: "as3/ATL", Name: "ATL", Kind: model.KindRouter, ASN: 3}
+
+	cmds, err := New(top, ModeSolve).Commands(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var all string
+	for _, c := range cmds {
+		all += strings.Join(c.Args, " ") + "\n"
+	}
+	for _, leak := range []string{"/etc/twinet/reference.conf", "/etc/twinet/restore.conf"} {
+		if !strings.Contains(all, leak) {
+			t.Errorf("no deployment step removes %s, so a lab already running keeps it -- "+
+				"and the labs that have been up longest are the exposed ones", leak)
+		}
+	}
+}

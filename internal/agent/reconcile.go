@@ -207,9 +207,20 @@ func (s *Server) repairLab(ctx context.Context, top *model.Topology, broken []*m
 			s.repairFailed(top.Name, d.ID, "rewiring failed", err)
 			continue
 		}
-		if _, err := deploy.Restore(ctx, s.rt, d, top.Name, s.store); err != nil {
-			s.repairFailed(top.Name, d.ID, "configuration could not be put back after rewiring", err)
-			continue
+		// Not while the lab is deployed at the reference.
+		//
+		// The deployment path has refused this for a while; the repair loop
+		// did it anyway. Replaying a student's snapshot over a solved router
+		// leaves that system holding somebody's old work while the class is
+		// being marked against it -- and every check on it passes, because it
+		// is a converged network, just not the answer. A repair runs
+		// unattended every few seconds, so this needed no unusual sequence of
+		// events to happen.
+		if !eng.WritesReference {
+			if _, err := deploy.Restore(ctx, s.rt, d, top.Name, s.store); err != nil {
+				s.repairFailed(top.Name, d.ID, "configuration could not be put back after rewiring", err)
+				continue
+			}
 		}
 		// Confirmed, not assumed. A repair that reports success without being
 		// checked is how the previous version of this loop claimed to have

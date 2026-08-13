@@ -127,8 +127,13 @@ func (r *Renderer) routerCommands(d *model.Device) []deploy.Command {
 	// it in place on every lab already running -- the classes that are exposed
 	// are exactly the ones that have been up longest. Remove it explicitly.
 	cmds = append(cmds, deploy.Command{
-		Describe: "remove any reference solution left by an earlier version",
-		Args:     []string{"sh", "-c", "rm -f /etc/twinet/reference.conf"},
+		Describe: "remove any configuration left in the device by an earlier version",
+		// restore.conf is the same problem found later: the snapshot loader
+		// copied a complete routing configuration in and left it there. On a
+		// lab deployed at the reference that is the answer, readable by any
+		// root shell -- which is what a student has, and what an agent being
+		// evaluated on root-cause analysis has.
+		Args: []string{"sh", "-c", "rm -f /etc/twinet/reference.conf /etc/twinet/restore.conf"},
 	})
 
 	// Solve mode installs the reference answer, so the running daemon must end

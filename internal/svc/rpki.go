@@ -275,3 +275,37 @@ func RPKIAddrFor(top *model.Topology, asn int) string {
 	}
 	return ""
 }
+
+// HijackOrigin returns the AS that deliberately announces a mis-ROA'd prefix,
+// and the prefix it announces.
+//
+// The manifest declares a ROA held by one AS for a prefix inside another's
+// space, so that an announcement of it is RPKI-invalid. A ROA on its own is
+// only half of that: nothing announced the prefix, so no route in the lab was
+// ever invalid, and the question "do you reject invalid announcements?" could
+// not be answered by looking at any router. Every submission passed it on the
+// strength of having written a route-map.
+//
+// The hijack is originated by a staff AS other than the ROA holder, so it
+// exists for every student regardless of what any student does, and no student
+// can withdraw it.
+func HijackOrigin(top *model.Topology) (int, string) {
+	if top.Lab == nil || len(top.Lab.RPKI.Invalid) == 0 {
+		return 0, ""
+	}
+	holders := map[int]bool{}
+	var prefix string
+	for holder, p := range top.Lab.RPKI.Invalid {
+		holders[holder] = true
+		if prefix == "" || p < prefix {
+			prefix = p
+		}
+	}
+	for _, asn := range top.SortedASNs() {
+		as := top.ASes[asn]
+		if as.Role == model.RoleStaff && !holders[asn] {
+			return asn, prefix
+		}
+	}
+	return 0, ""
+}

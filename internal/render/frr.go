@@ -326,6 +326,18 @@ func renderBGP(top *model.Topology, as *model.AS, d *model.Device) string {
 	if as.Role != model.RoleIXP {
 		fmt.Fprintf(&b, "  network %s\n", as.Block)
 	}
+	// The deliberate hijack the RPKI exercise is about.
+	//
+	// The manifest declares a ROA held by one AS for a prefix inside another's
+	// space. That is only half of an invalid announcement: without anybody
+	// announcing the prefix, no route in the lab was ever RPKI-invalid, so the
+	// question "do you reject invalid announcements?" could not be answered by
+	// looking at any router, and every submission passed it for having written
+	// a route-map. A staff AS other than the ROA holder announces it, so the
+	// invalid route exists for every student and no student can withdraw it.
+	if hijacker, prefix := svc.HijackOrigin(top); hijacker == as.ASN && prefix != "" {
+		fmt.Fprintf(&b, "  network %s\n", prefix)
+	}
 	for _, p := range peers {
 		fmt.Fprintf(&b, "  neighbor %s activate\n", p)
 		fmt.Fprintf(&b, "  neighbor %s next-hop-self\n", p)
