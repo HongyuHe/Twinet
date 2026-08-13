@@ -77,7 +77,7 @@ func init() {
 				return nil
 			}
 			if _, err := e.Sh(ctx, t.DeviceID(),
-				fmt.Sprintf("ip addr replace %s dev %s", s["addr"], s["iface"])); err != nil {
+				fmt.Sprintf("ip addr replace %s brd + dev %s", s["addr"], s["iface"])); err != nil {
 				return err
 			}
 			return restoreRoutes(ctx, e, t, s["routes"])
@@ -108,7 +108,7 @@ func init() {
 			// that takes longest to explain.
 			st := State{"iface": iface, "addr": addr, "wrong": wrong, "routes": routes}
 			if _, err := e.Sh(ctx, t.DeviceID(), fmt.Sprintf(
-				"ip addr del %s dev %s; ip addr add %s dev %s", addr, iface, wrong, iface)); err != nil {
+				"ip addr del %s dev %s; ip addr add %s brd + dev %s", addr, iface, wrong, iface)); err != nil {
 				return st, err
 			}
 			return st, nil
@@ -131,7 +131,7 @@ func init() {
 				return nil
 			}
 			if _, err := e.Sh(ctx, t.DeviceID(), fmt.Sprintf(
-				"ip addr del %s dev %s 2>/dev/null; ip addr replace %s dev %s",
+				"ip addr del %s dev %s 2>/dev/null; ip addr replace %s brd + dev %s",
 				s["wrong"], s["iface"], s["addr"], s["iface"])); err != nil {
 				return err
 			}
@@ -158,7 +158,7 @@ func init() {
 			// host_incorrect_ip.
 			st := State{"iface": iface, "addr": addr, "wrong": bad, "routes": routes}
 			if _, err := e.Sh(ctx, t.DeviceID(), fmt.Sprintf(
-				"ip addr del %s dev %s; ip addr add %s dev %s", addr, iface, bad, iface)); err != nil {
+				"ip addr del %s dev %s; ip addr add %s brd + dev %s", addr, iface, bad, iface)); err != nil {
 				return st, err
 			}
 			return st, nil
@@ -172,7 +172,7 @@ func init() {
 				return nil
 			}
 			if _, err := e.Sh(ctx, t.DeviceID(), fmt.Sprintf(
-				"ip addr del %s dev %s 2>/dev/null; ip addr replace %s dev %s",
+				"ip addr del %s dev %s 2>/dev/null; ip addr replace %s brd + dev %s",
 				s["wrong"], s["iface"], s["addr"], s["iface"])); err != nil {
 				return err
 			}
@@ -328,7 +328,7 @@ func init() {
 				return nil, err
 			}
 			if _, err := e.Sh(ctx, t.DeviceID(),
-				fmt.Sprintf("ip addr add %s dev %s", addr, iface)); err != nil {
+				fmt.Sprintf("ip addr add %s brd + dev %s", addr, iface)); err != nil {
 				return nil, err
 			}
 			return State{"iface": iface, "addr": addr, "routes": routes}, nil
@@ -336,9 +336,33 @@ func init() {
 		Verify: func(ctx context.Context, e *Env, t Target, s State) (Evidence, error) {
 			// The duplicate address must be present on the attacker, not merely
 			// some address: every host has one of those.
+			// Compared as addresses, not as text.
+			//
+			// A substring test says 5.105.0.1 is present on a device whose own
+			// address is 5.105.0.10 -- or, worse, on the device that holds
+			// 5.105.0.1 legitimately. The attacker's own address satisfied the
+			// check, so the fault verified as present after it had been
+			// resolved and the engine reported that the lab could not be put
+			// back. Measured on this cluster.
 			dup := strings.SplitN(s["addr"], "/", 2)[0]
 			out, _ := e.Try(ctx, t.DeviceID(), "ip -o -4 addr show")
-			return Evidence{Verified: dup != "" && strings.Contains(out, dup),
+			victim, verr := netip.ParseAddr(dup)
+			held := false
+			if verr == nil {
+				for _, line := range strings.Split(out, "\n") {
+					for _, f := range strings.Fields(line) {
+						p, err := netip.ParsePrefix(f)
+						if err != nil {
+							continue
+						}
+						if p.Addr() == victim && s["iface"] != "" &&
+							strings.Contains(line, " "+s["iface"]+" ") {
+							held = true
+						}
+					}
+				}
+			}
+			return Evidence{Verified: held,
 				Expected: "the victim's address " + dup + " also configured here",
 				Observed: strings.TrimSpace(out)}, nil
 		},

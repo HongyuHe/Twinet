@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"strings"
 	"testing"
 
@@ -272,5 +273,34 @@ func TestAFailedUndoThatLeavesTheFaultIsStillAFailure(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "refused the command") {
 		t.Errorf("the undo's own error is the likely reason and must be reported: %v", err)
+	}
+}
+
+// An address put back has to carry the same attributes it had, or the lab is
+// not where the injection found it.
+//
+// `ip addr add 5.105.0.1/24 dev eth0` records no broadcast address; the same
+// command with `brd +` records 5.105.0.255. Every address-changing fault
+// restored without it, so the baseline comparison reported -- correctly -- that
+// the device had not been put back, and an episode ended with the lab quietly
+// different from where it started.
+func TestAddressesArePutBackWithTheirBroadcast(t *testing.T) {
+	src, err := os.ReadFile("faults_host.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, line := range strings.Split(string(src), "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "//") {
+			continue
+		}
+		if !strings.Contains(line, "ip addr add ") && !strings.Contains(line, "ip addr replace ") {
+			continue
+		}
+		if strings.Contains(line, "brd +") {
+			continue
+		}
+		t.Errorf("faults_host.go:%d configures an address without `brd +`, so putting it "+
+			"back leaves the device differing from where the fault found it:\n  %s",
+			i+1, strings.TrimSpace(line))
 	}
 }

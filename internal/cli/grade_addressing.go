@@ -163,7 +163,7 @@ func adaptOnePeer(ctx context.Context, exec execFn, peer *model.Iface,
 			was.Addr())
 	}
 	lines := []string{
-		fmt.Sprintf("ip addr replace %s dev %s", mine, peer.Name),
+		fmt.Sprintf("ip addr replace %s brd + dev %s", mine, peer.Name),
 	}
 	res, err := exec(ctx, dev, []string{"sh", "-c", strings.Join(lines, "\n")})
 	if err != nil {

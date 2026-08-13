@@ -66,7 +66,7 @@ func TestTheReferenceAdaptsToTheAddressAGroupActuallyUsed(t *testing.T) {
 			ads, strings.Join(ran, "\n"))
 	}
 	all := strings.Join(ran, "\n")
-	if !strings.Contains(all, "ip addr replace 10.34.0.2/30 dev port_ATL") {
+	if !strings.Contains(all, "ip addr replace 10.34.0.2/30 brd + dev port_ATL") {
 		t.Errorf("the reference end was not given an address in the group's subnet:\n%s", all)
 	}
 	for _, want := range []string{

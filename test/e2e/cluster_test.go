@@ -211,6 +211,18 @@ func TestEveryFaultRoundTrips(t *testing.T) {
 			args = []string{"--as", "5", "--device", "CHI_host",
 				"--param", "victim=" + resolverOf(t, dir, "as5/CHI_host"),
 				"--param", "port=53"}
+		case "dhcp_missing_subnet":
+			// A gateway that serves more than one segment, because removing
+			// the only subnet of a server that has one is the service being
+			// down -- a different fault with a different symptom, and the
+			// injector refuses it. The datacentre gateway serves its two VLANs
+			// and its own host segment.
+			args = []string{"--as", "5", "--device", "BOS"}
+		case "dhcp_service_down", "dhcp_spoofed_gateway", "dhcp_spoofed_dns",
+			"dhcp_spoofed_subnet":
+			// Any router that serves a segment; the datacentre gateway is the
+			// one whose clients an episode would actually look at.
+			args = []string{"--as", "5", "--device", "BOS"}
 		case "flow_rule_shadowing", "flow_rule_loop":
 			args = []string{"--as", "5", "--device", "DCN_S1"}
 		case "dns_service_down", "dns_port_blocked", "dns_record_error", "dns_lookup_latency":

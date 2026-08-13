@@ -285,7 +285,7 @@ func (r *Renderer) routerCommands(d *model.Device) []deploy.Command {
 	// still starting.
 	if lo, ok := d.IfaceByName("lo"); ok && lo.Owner == model.OwnerPlatform && lo.Addr4 != "" {
 		cmds = append([]deploy.Command{{
-			Args:     []string{"sh", "-c", fmt.Sprintf("ip addr replace %s dev lo && ip link set lo up", lo.Addr4)},
+			Args:     []string{"sh", "-c", fmt.Sprintf("ip addr replace %s brd + dev lo && ip link set lo up", lo.Addr4)},
 			Describe: "configure loopback",
 		}}, cmds...)
 	}
@@ -653,7 +653,15 @@ func (r *Renderer) hostCommands(d *model.Device) []deploy.Command {
 	apply := func(i *model.Iface) {
 		if i.Addr4 != "" {
 			cmds = append(cmds, deploy.Command{
-				Args:     []string{"sh", "-c", fmt.Sprintf("ip addr replace %s dev %s", i.Addr4, i.Name)},
+				Args: []string{"sh", "-c", // brd + , so the address carries its broadcast attribute.
+					//
+					// Without it the kernel records no broadcast address, and a
+					// fault that removes and re-adds the address puts back
+					// something that differs from what it found -- which the
+					// baseline comparison then reports, correctly, as a lab that
+					// was not restored. Measured on this cluster: every
+					// address-changing fault left this residue behind.
+					fmt.Sprintf("ip addr replace %s brd + dev %s", i.Addr4, i.Name)},
 				Describe: "address " + i.Name,
 			})
 		}

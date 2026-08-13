@@ -852,7 +852,7 @@ func wipeDeviceState(ctx context.Context, exec execFn, d *model.Device) error {
 			continue
 		}
 		if i.Addr4 != "" {
-			lines = append(lines, fmt.Sprintf("ip addr replace %s dev %s 2>/dev/null", i.Addr4, i.Name))
+			lines = append(lines, fmt.Sprintf("ip addr replace %s brd + dev %s 2>/dev/null", i.Addr4, i.Name))
 		}
 		if i.Addr6 != "" {
 			lines = append(lines, fmt.Sprintf("ip -6 addr replace %s dev %s 2>/dev/null", i.Addr6, i.Name))
