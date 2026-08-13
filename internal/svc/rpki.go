@@ -73,6 +73,18 @@ func BuildRPKI(top *model.Topology, notFound []int, invalid map[int]string) *Pay
 		if as.Block == "" || skip[asn] {
 			continue
 		}
+		// A student's own ROA is a student's own action.
+		//
+		// The platform used to publish one for every autonomous system,
+		// including the ones whose owners are being asked to publish theirs.
+		// The exercise then had nothing left in it: every prefix was already
+		// authorised before anybody logged in, and the check that asks whether
+		// a system published a ROA could only be scored by giving everybody
+		// the mark for something nobody did. Student systems now start with no
+		// ROA and publish through the validator's own interface.
+		if as.Role == model.RoleStudent {
+			continue
+		}
 		pfx, err := netip.ParsePrefix(as.Block)
 		if err != nil {
 			continue

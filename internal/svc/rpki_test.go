@@ -6,10 +6,16 @@ import (
 	"net"
 	"net/netip"
 	"testing"
+
+	"github.com/HongyuHe/twinet/internal/model"
 	"time"
 )
 
-func TestPayloadCoversEveryASAndTheDeliberateExceptions(t *testing.T) {
+// The platform authorises the systems nobody is being marked on, and nothing
+// else. A student system's own ROA is the student's own action -- publishing it
+// for them leaves the exercise with nothing in it, and the check that asks
+// whether they did could only be scored by giving everybody the mark.
+func TestPayloadCoversTheSystemsNobodyIsMarkedOn(t *testing.T) {
 	top := loadLab(t)
 	// AS 5 has no ROA, AS 7 announces something AS 3 holds a ROA for.
 	p := BuildRPKI(top, []int{5}, map[int]string{3: "7.0.0.0/8"})
@@ -21,8 +27,16 @@ func TestPayloadCoversEveryASAndTheDeliberateExceptions(t *testing.T) {
 	if _, ok := byASN[5]; ok {
 		t.Error("AS 5 was meant to have no ROA, so a student who filters not-found routes is caught")
 	}
-	if len(byASN[3]) < 2 {
-		t.Errorf("AS 3 should hold a ROA for its own block and for the hijacked prefix, got %v", byASN[3])
+	// The declared discrepancy is the platform's, so it is published.
+	hijacked := false
+	for _, r := range byASN[3] {
+		if r.Prefix == "7.0.0.0/8" {
+			hijacked = true
+		}
+	}
+	if !hijacked {
+		t.Errorf("the declared invalid prefix is not authorised to anybody, so no "+
+			"announcement of it is invalid and the exercise has nothing in it: %v", byASN[3])
 	}
 	for asn, as := range top.ASes {
 		if as.Block == "" || asn == 5 {
@@ -34,8 +48,14 @@ func TestPayloadCoversEveryASAndTheDeliberateExceptions(t *testing.T) {
 				found = true
 			}
 		}
-		if !found {
-			t.Errorf("AS %d has no ROA for its own block %s, so its routes would be invalid", asn, as.Block)
+		student := as.Role == model.RoleStudent
+		if found && student {
+			t.Errorf("AS %d is a student system and the platform published its ROA for it, "+
+				"so the question of whether they published one cannot be asked", asn)
+		}
+		if !found && !student {
+			t.Errorf("AS %d is not a student system and has no ROA for its own block %s, "+
+				"so its routes are not-found to everybody", asn, as.Block)
 		}
 	}
 }

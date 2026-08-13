@@ -12,6 +12,7 @@ import (
 	"github.com/HongyuHe/twinet/internal/model"
 	"github.com/HongyuHe/twinet/internal/plan"
 	"github.com/HongyuHe/twinet/internal/runtime"
+	"github.com/HongyuHe/twinet/internal/svc"
 )
 
 // Mode selects how much configuration is applied.
@@ -312,9 +313,59 @@ func (r *Renderer) rpkiReadyCommands(d *model.Device) []deploy.Command {
 	if !hasRPKICache(r.Top, d) {
 		return nil
 	}
-	return []deploy.Command{{
+	cmds := []deploy.Command{{
 		Describe:    "connect to the origin validator",
 		Args:        []string{"sh", "-c", RPKIRefreshScript},
+		IgnoreError: true,
+	}}
+	cmds = append(cmds, r.roaPublishCommands(d)...)
+	return cmds
+}
+
+// roaPublishCommands issues this system's own ROA, in solve mode only.
+//
+// Publishing is the student's action -- the platform authorises nothing for a
+// student system -- so the reference solution has to perform it like anybody
+// else, or the reference would fail the very question it defines the answer to.
+//
+// An autonomous system the manifest declares as having no ROA is skipped: that
+// is the deliberate not-found case, and publishing for it would remove the one
+// thing it exists to teach.
+func (r *Renderer) roaPublishCommands(d *model.Device) []deploy.Command {
+	if r.modeFor(d) != ModeSolve {
+		return nil
+	}
+	as, ok := r.Top.ASes[d.ASN]
+	if !ok || as.Role != model.RoleStudent || as.Block == "" {
+		return nil
+	}
+	if r.Top.Lab != nil {
+		for _, n := range r.Top.Lab.RPKI.NotFound {
+			if n == d.ASN {
+				return nil
+			}
+		}
+	}
+	addr := svc.RPKIAddrFor(r.Top, d.ASN)
+	if addr == "" {
+		return nil
+	}
+	body := fmt.Sprintf(`{"prefix":%q,"asn":%d}`, as.Block, d.ASN)
+	return []deploy.Command{{
+		Describe: "authorise this system's prefix with the lab's trust anchor",
+		// Retried, because the validator and this router come up together and
+		// the publication interface may not be listening yet. Failing softly:
+		// a lab whose trust anchor is briefly unreachable is still a usable
+		// lab, and the graded check is what makes a missing authorisation
+		// visible where it matters.
+		Args: []string{"sh", "-c", strings.Join([]string{
+			"for i in 1 2 3 4 5 6 7 8 9 10; do",
+			fmt.Sprintf("  curl -sf -m 5 -X POST http://%s%s/roas -d '%s' >/dev/null 2>&1 && exit 0",
+				addr, svc.PublishListen, body),
+			"  sleep 3",
+			"done",
+			"echo 'the trust anchor did not accept this authorisation' >&2",
+		}, "\n")},
 		IgnoreError: true,
 	}}
 }

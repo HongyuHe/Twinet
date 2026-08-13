@@ -142,14 +142,16 @@ questions:
     points: 1
     depends_on: [q2.2]
     checks:
-      # rpki.roa_published is deliberately not scored here.
+      # Publication is the student's own action.
       #
-      # In this lab the platform publishes every system's ROA, so the check
-      # would award the mark to everybody for something nobody did. It exists,
-      # and it discriminates -- it fails a system whose prefix has no ROA, or
-      # one whose ROA names a different origin -- but it can only be worth
-      # marks in a course where publication is the student's own action.
+      # The platform used to publish every system's ROA, which made this check
+      # worthless: it would have awarded the mark to everybody for something
+      # nobody did, so it was left unscored. Student systems now start with no
+      # authorisation and issue their own through the lab's trust anchor, so
+      # the question can be asked and answered.
+      - check: rpki.roa_published
+        weight: 0.3
       - check: rpki.invalid_rejected
-        weight: 0.6
-      - check: rpki.notfound_preserved
         weight: 0.4
+      - check: rpki.notfound_preserved
+        weight: 0.3
