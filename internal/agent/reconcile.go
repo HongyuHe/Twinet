@@ -196,7 +196,7 @@ func (s *Server) repairLab(ctx context.Context, top *model.Topology, broken []*m
 		// deployed at the reference throws the reference solution away -- a
 		// far worse outcome than the fault being repaired.
 		if why := s.brokenBecause(ctx, top.Name, d); strings.HasPrefix(why, daemonsDown) {
-			if err := s.startDaemons(ctx, d); err != nil {
+			if err := s.startDaemons(ctx, top.Name, d); err != nil {
 				slog.Error("routing daemons could not be started", "device", d.ID, "err", err)
 				continue
 			}
@@ -242,8 +242,8 @@ const daemonsDown = "these routing daemons are not running:"
 
 // missingDaemons names the routing processes a router should be running and is
 // not, or "" when they are all there.
-func (s *Server) missingDaemons(ctx context.Context, d *model.Device) string {
-	script := "miss=''; for p in " + strings.Join(render.EnabledDaemons(), " ") +
+func (s *Server) missingDaemons(ctx context.Context, d *model.Device, as *model.AS) string {
+	script := "miss=''; for p in " + strings.Join(render.EnabledDaemonsFor(as), " ") +
 		"; do pidof \"$p\" >/dev/null 2>&1 || miss=\"$miss $p\"; done; echo \"$miss\""
 	r, err := s.rt.Exec(ctx, d.Container, rt.ExecCmd{Cmd: []string{"sh", "-c", script}})
 	if err != nil || r.ExitCode != 0 {
@@ -338,7 +338,7 @@ func (s *Server) brokenBecause(ctx context.Context, lab string, d *model.Device)
 	// and the only symptom was students being marked down for neighbours that
 	// had no routing process.
 	if d.Kind == model.KindRouter {
-		if missing := s.missingDaemons(ctx, d); missing != "" {
+		if missing := s.missingDaemons(ctx, d, s.asOf(lab, d)); missing != "" {
 			return daemonsDown + missing
 		}
 	}
@@ -364,7 +364,7 @@ func (s *Server) peerUnderlay(lab string) map[string]string {
 // Safe on a student's router because FRR reads its configuration from the file
 // it was given, so starting a dead daemon restores what was there rather than
 // replacing it.
-func (s *Server) startDaemons(ctx context.Context, d *model.Device) error {
+func (s *Server) startDaemons(ctx context.Context, lab string, d *model.Device) error {
 	script := strings.Join([]string{
 		"for p in $(ps -ef | awk '/watchfrr/ && !/awk/ {print $1}'); do kill $p 2>/dev/null || true; done",
 		"rm -f /var/run/frr/*.pid /var/run/frr/*.vty 2>/dev/null || true",
@@ -373,7 +373,7 @@ func (s *Server) startDaemons(ctx context.Context, d *model.Device) error {
 	if _, err := s.rt.Exec(ctx, d.Container, rt.ExecCmd{Cmd: []string{"sh", "-c", script}}); err != nil {
 		return err
 	}
-	if missing := s.missingDaemons(ctx, d); missing != "" {
+	if missing := s.missingDaemons(ctx, d, s.asOf(lab, d)); missing != "" {
 		return fmt.Errorf("still not running:%s", missing)
 	}
 	return nil
@@ -520,4 +520,21 @@ func (s *Server) wholeAgain(lab, id string) {
 	s.mu.Lock()
 	delete(s.partial, repairKey(lab, id))
 	s.mu.Unlock()
+}
+
+// asOf returns the autonomous system a device belongs to in a lab this node
+// currently holds, or nil when the node has no record of it. It exists so that
+// a per-AS decision -- which routing daemons should be running -- is made from
+// the same declaration the renderer used.
+func (s *Server) asOf(lab string, d *model.Device) *model.AS {
+	if d == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	top, ok := s.current[lab]
+	if !ok || top == nil {
+		return nil
+	}
+	return top.ASes[d.ASN]
 }

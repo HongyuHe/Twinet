@@ -401,6 +401,9 @@ type ASTemplate struct {
 	// the advanced course's BGP-free core exercise is built on.
 	MPLS MPLSSpec `yaml:"mpls,omitempty" json:"mpls,omitempty"`
 
+	// Multicast declares the PIM sparse-mode exercise for this AS.
+	Multicast MulticastSpec `yaml:"multicast,omitempty" json:"multicast,omitempty"`
+
 	// VRFs are the virtual routing tables this AS offers. Each is a separate
 	// routing table, so two customers using the same private address space can
 	// both be carried without either seeing the other.
@@ -422,6 +425,27 @@ type MPLSSpec struct {
 	// makes "BGP-free core" a checkable property rather than an aspiration:
 	// the grader can say which routers were meant to be free of it.
 	Core []string `yaml:"core,omitempty" json:"core,omitempty"`
+}
+
+// MulticastSpec turns on the PIM sparse-mode exercise for an AS.
+//
+// The advanced course's second exercise asks students to enable PIM on every
+// interface, IGMP on the host-facing ones, and to point every router at one
+// rendezvous point for a group range. All three are properties of the AS rather
+// than of a router, so they are declared here: the renderer builds the
+// reference from the same statement the grader marks against, and the figure in
+// the exercise cannot drift away from the running lab.
+type MulticastSpec struct {
+	// Enabled runs pimd and, in solve mode, configures the whole exercise.
+	Enabled bool `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	// RP names the router whose loopback is the rendezvous point.
+	RP string `yaml:"rp,omitempty" json:"rp,omitempty"`
+	// Groups is the multicast range the rendezvous point serves.
+	Groups string `yaml:"groups,omitempty" json:"groups,omitempty"`
+	// TestGroup is one address inside Groups that the grader uses: a receiver
+	// joins it, a source sends to it, and the tree is inspected. Naming it
+	// means the check and the exercise are talking about the same group.
+	TestGroup string `yaml:"test_group,omitempty" json:"test_group,omitempty"`
 }
 
 // VRFSpec describes one virtual routing and forwarding instance.

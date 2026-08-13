@@ -42,7 +42,9 @@ COPY twinet_motd /etc/twinet/motd
 # own: a client's first packet is a broadcast, and a server one hop away never
 # hears it -- which would give every fault about DHCP the same symptom.
 COPY twinet-dhcpd /usr/local/bin/twinet-dhcpd
-RUN chmod 0755 /usr/local/bin/twinet-entrypoint /usr/local/bin/twinet-dhcpd
+COPY twinet-mcast /usr/local/bin/twinet-mcast
+RUN chmod 0755 /usr/local/bin/twinet-entrypoint /usr/local/bin/twinet-dhcpd \
+        /usr/local/bin/twinet-mcast
 
 LABEL org.opencontainers.image.title="twinet-router" \
       org.opencontainers.image.description="FRR router for the Twinet teaching platform" \

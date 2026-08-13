@@ -1,0 +1,37 @@
+apiVersion: twinet.dev/v1
+kind: Lab
+metadata:
+  name: multicast
+  description: >
+    IP multicast with PIM sparse mode and IGMP, from the ETH advanced-networks
+    course.
+
+    One autonomous system, six routers, six hosts. The unicast network is built
+    and working before the student touches it; the exercise is to make a packet
+    sent to a group address reach exactly the hosts that asked for it, and no
+    others. That is checkable in a way "did you type the commands" is not: the
+    grader joins a group on one host, sends from another, and reads the
+    multicast forwarding tables of the routers in between.
+
+addressing:
+  as_block:        "{{ .AS }}.0.0.0/8"
+  inter_as:        "179.{{ .Low }}.{{ .High }}.0/24"
+  router_loopback: "{{ .AS }}.{{ add 150 .RouterID }}.0.1/32"
+  router_router:   "{{ .AS }}.0.{{ add 1 .LinkIndex }}.0/24"
+  router_host:     "{{ .AS }}.{{ add 100 .RouterID }}.0.0/24"
+
+autonomous_systems:
+  - list: [1]
+    template: campus
+    role: student
+
+access:
+  mode: gateway
+  listen: ":2024"
+
+placement:
+  strategy: pack-by-as
+  nodes:
+    - {name: node-0, addr: "10.0.1.1:7200", underlay_ip: 10.0.1.1, front: true}
+    - {name: node-1, addr: "10.0.1.2:7200", underlay_ip: 10.0.1.2}
+    - {name: node-2, addr: "10.0.1.3:7200", underlay_ip: 10.0.1.3}

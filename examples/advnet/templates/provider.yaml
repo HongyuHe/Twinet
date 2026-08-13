@@ -70,6 +70,23 @@ external_ports:
   cs_oerlikon:     {router: R2}
   cs_paradeplatz:  {router: R3}
 
+# What is given and what is the exercise.
+#
+# The interior addressing, OSPF and the plain iBGP mesh are handed out: the
+# exercise is not about building a network, it is about carrying two customers
+# across one that already works. What is left is label switching and the VPN --
+# LDP across the interior, VPNv4 between the edges, and the route targets that
+# decide which sites can reach which.
+#
+# This template was staff-owned and provisioned in full, which meant the lab
+# deployed with the answer already in it and nothing for a student to do. There
+# was no way to hand it out.
 provisioning:
   provisioned:
-    - scope: all
+    - scope: loopbacks
+    - scope: router_interfaces
+    - scope: host_addressing
+    - scope: ospf
+  student:
+    - mpls
+    - bgp

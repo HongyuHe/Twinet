@@ -240,6 +240,7 @@ func (e *expander) expandOneAS(asn int, spec model.ASSpec) error {
 	// the renderer and the grader read the same declaration rather than each
 	// interpreting the template themselves.
 	as.MPLS = tpl.MPLS
+	as.Multicast = tpl.Multicast
 	if len(tpl.VRFs) > 0 {
 		as.VRFs = map[string]*model.VRFSpec{}
 		table := 100
@@ -897,7 +898,7 @@ func compileProvisioning(as *model.AS, tpl *model.ASTemplate) {
 			for _, k := range []string{
 				model.DomainLoopbacks, model.DomainRouterInterfaces,
 				model.DomainHostAddressing, model.DomainL2, model.DomainOSPF,
-				model.DomainBGP, model.DomainMPLS,
+				model.DomainBGP, model.DomainMPLS, model.DomainMulticast,
 				model.DomainBGPPolicy, model.DomainIPv6, model.DomainRPKI,
 			} {
 				as.Provisioned[k] = true

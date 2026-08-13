@@ -27,9 +27,31 @@ import (
 // out of the daemons file rather than listed a second time here. A deployment
 // checks for exactly these, so enabling a daemon and forgetting to check for it
 // is not something that can happen.
-func EnabledDaemons() []string {
+func EnabledDaemons() []string { return daemonsIn(FRRDaemons) }
+
+// DaemonsFor returns the daemons file for a device: the base set, plus pimd
+// where the AS declares the multicast exercise.
+//
+// Per AS rather than everywhere. pimd is another process in every one of a
+// thousand containers, and a lab that is not about multicast should not pay for
+// it; but a lab that is about multicast cannot be configured at all without it,
+// and the exercise used to be undeployable for exactly that reason -- the
+// daemon was off, so `ip pim` was rejected on every router and there was
+// nothing to grade.
+func DaemonsFor(as *model.AS) string {
+	if as == nil || !as.Multicast.Enabled {
+		return FRRDaemons
+	}
+	out := strings.ReplaceAll(FRRDaemons, "pimd=no", "pimd=yes")
+	return out
+}
+
+// EnabledDaemonsFor is EnabledDaemons for one AS.
+func EnabledDaemonsFor(as *model.AS) []string { return daemonsIn(DaemonsFor(as)) }
+
+func daemonsIn(file string) []string {
 	var out []string
-	for _, line := range strings.Split(FRRDaemons, "\n") {
+	for _, line := range strings.Split(file, "\n") {
 		name, value, ok := strings.Cut(strings.TrimSpace(line), "=")
 		// The settings that are not daemons -- zebra_enable, vtysh_enable --
 		// are the ones with an underscore in the key.
@@ -157,6 +179,7 @@ func Router(top *model.Topology, d *model.Device) (RouterConfig, error) {
 	}
 	mpls := renderMPLS(as, d)
 	vrfBGP := renderVRFBGP(as, d)
+	mcast := renderMulticast(as, d)
 	// Per domain, not per AS.
 	//
 	// This was one decision for the whole router: either the AS was a staff one
@@ -179,6 +202,7 @@ func Router(top *model.Topology, d *model.Device) (RouterConfig, error) {
 	into(model.DomainBGP, bgp)
 	into(model.DomainMPLS, mpls)
 	into(model.DomainBGP, vrfBGP)
+	into(model.DomainMulticast, mcast)
 
 	return RouterConfig{Platform: plat.String(), Expected: exp.String()}, nil
 }
@@ -781,4 +805,71 @@ func dedupStrings(in []string) []string {
 		}
 	}
 	return out
+}
+
+// renderMulticast is the reference answer to the advanced course's PIM
+// exercise: multicast on every interface, IGMP where the hosts are, and one
+// rendezvous point for the declared group range.
+//
+// Written from the AS's declaration rather than from a fixture, so the figure
+// in the exercise, the reference solution and the grader all come from one
+// statement. The interface stanzas are emitted separately from the ones the
+// addressing produced because FRR merges repeated `interface` blocks, and
+// keeping them apart is what lets the addressing be handed out while the
+// multicast configuration is left for the student.
+func renderMulticast(as *model.AS, d *model.Device) string {
+	if as == nil || !as.Multicast.Enabled || !d.IsRouter() {
+		return ""
+	}
+	var b strings.Builder
+	for _, i := range d.Ifaces {
+		if i.Name == "" {
+			continue
+		}
+		fmt.Fprintf(&b, "interface %s\n ip pim\n", i.Name)
+		// IGMP belongs on the interfaces hosts are behind and nowhere else:
+		// the routers do not join groups, they route between the hosts that
+		// do, and the exercise says so explicitly.
+		if facesHosts(i) {
+			b.WriteString(" ip igmp\n")
+		}
+		b.WriteString("exit\n!\n")
+	}
+	rp := as.Multicast.RP
+	groups := as.Multicast.Groups
+	if rp != "" && groups != "" {
+		// The rendezvous point is addressed by its loopback, so it survives an
+		// interface going down while another path to it is still up. That is
+		// the reason the exercise gives, and it is the reason here.
+		if addr := loopbackAddrOf(as, rp); addr != "" {
+			fmt.Fprintf(&b, "ip pim rp %s %s\n!\n", addr, groups)
+		}
+	}
+	return b.String()
+}
+
+// facesHosts reports whether an interface has hosts behind it: a host link, or
+// a layer-2 access or trunk port into a segment the hosts are on.
+func facesHosts(i *model.Iface) bool {
+	switch i.Role {
+	case model.RoleHostLink, model.RoleL2Access, model.RoleL2Trunk:
+		return true
+	}
+	return false
+}
+
+// loopbackAddrOf returns the bare loopback address of a named router.
+func loopbackAddrOf(as *model.AS, router string) string {
+	for _, r := range as.Routers {
+		if r.Name != router {
+			continue
+		}
+		if lo, ok := r.IfaceByName("lo"); ok && lo.Addr4 != "" {
+			if i := strings.IndexByte(lo.Addr4, '/'); i > 0 {
+				return lo.Addr4[:i]
+			}
+			return lo.Addr4
+		}
+	}
+	return ""
 }

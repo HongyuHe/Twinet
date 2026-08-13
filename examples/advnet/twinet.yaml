@@ -73,10 +73,15 @@ addressing:
   inter_as:        "179.{{ .Low }}.{{ .High }}.0/24"
 
 autonomous_systems:
-  # Swisscom: the provider under study.
+  # Swisscom: the provider under study, and the system the student configures.
+  #
+  # A student role rather than a staff one. Every AS in this lab used to be
+  # staff-owned and deployed with the answer in it, so there was nothing to
+  # submit and nothing to grade: the roster, the submission archive and the
+  # grading harness all refuse a lab with no student systems in it.
   - list: [1]
     template: provider
-    role: staff
+    role: student
   # The four branches. Two banks, two sites each.
   #
   # They are separate autonomous systems rather than layer-2 sites because that

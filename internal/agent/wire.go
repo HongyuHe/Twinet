@@ -160,6 +160,11 @@ type WireAS struct {
 	// and nothing downstream would say so.
 	Provisioned       []string `json:"provisioned,omitempty"`
 	ProvisionedIfaces []string `json:"provisioned_ifaces,omitempty"`
+	// Multicast carries the PIM exercise's declaration. The node decides from
+	// it whether to run pimd and what the reference solution is, so a node that
+	// did not receive it would deploy a lab where the exercise cannot be
+	// configured at all.
+	Multicast model.MulticastSpec `json:"multicast,omitempty"`
 }
 
 // WireSvc is one auxiliary service.
@@ -238,6 +243,7 @@ func Serialise(top *model.Topology) *Wire {
 			Template: as.Template, OwnerGroup: as.OwnerGroup,
 			Block: as.Block, BlockV6: as.BlockV6,
 			MPLSEnabled: as.MPLS.Enabled, MPLSCore: as.MPLS.Core,
+			Multicast:         as.Multicast,
 			Provisioned:       sortedSetKeys(as.Provisioned),
 			ProvisionedIfaces: sortedSetKeys(as.ProvisionedIfaces),
 		}
@@ -357,6 +363,7 @@ func (w *Wire) Rehydrate() (*model.Topology, error) {
 			Block: wa.Block, BlockV6: wa.BlockV6,
 			ExtPorts:          map[string]*model.ExtPortBinding{},
 			MPLS:              model.MPLSSpec{Enabled: wa.MPLSEnabled, Core: wa.MPLSCore},
+			Multicast:         wa.Multicast,
 			Provisioned:       setOf(wa.Provisioned),
 			ProvisionedIfaces: setOf(wa.ProvisionedIfaces),
 		}

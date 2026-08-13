@@ -77,7 +77,8 @@ func (r *Renderer) Files(d *model.Device) (map[string]deploy.FileSpec, error) {
 		if r.modeFor(d) == ModeSolve {
 			body = cfg.Platform + cfg.Expected
 		}
-		out["/etc/frr/daemons"] = deploy.FileSpec{Content: []byte(FRRDaemons), Mode: 0o640}
+		out["/etc/frr/daemons"] = deploy.FileSpec{
+			Content: []byte(DaemonsFor(r.Top.ASes[d.ASN])), Mode: 0o640}
 		out["/etc/frr/frr.conf"] = deploy.FileSpec{Content: []byte(body), Mode: 0o640}
 		// A router that has hosts on a segment of its own serves them DHCP.
 		//
@@ -195,7 +196,7 @@ func (r *Renderer) routerCommands(d *model.Device) []deploy.Command {
 				// and bgpd let a router pass its deployment with ospfd dead,
 				// which is the same silence in a different daemon: OSPF never
 				// converges, and the report says the router is fine.
-				"daemons='" + strings.Join(EnabledDaemons(), " ") + "'",
+				"daemons='" + strings.Join(EnabledDaemonsFor(r.Top.ASes[d.ASN]), " ") + "'",
 				"missing() { m=''; for d in $daemons; do",
 				"  pidof \"$d\" >/dev/null 2>&1 || m=\"$m $d\"",
 				"done; echo \"$m\"; }",

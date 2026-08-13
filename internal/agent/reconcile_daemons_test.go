@@ -116,7 +116,7 @@ func TestDeadDaemonsAreStartedRatherThanTheDeviceRebuilt(t *testing.T) {
 	s := &Server{rt: f}
 	s.cfg.Node = "node-0"
 
-	if err := s.startDaemons(context.Background(), routerWithTwoCables()); err != nil {
+	if err := s.startDaemons(context.Background(), "lab", routerWithTwoCables()); err != nil {
 		t.Fatalf("starting the daemons: %v", err)
 	}
 	if !f.started {

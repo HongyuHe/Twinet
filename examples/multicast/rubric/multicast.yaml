@@ -1,0 +1,51 @@
+apiVersion: twinet.dev/v1
+kind: Rubric
+metadata:
+  name: multicast-pim
+  total: 4
+  notes: >
+    The ETH advanced-networks multicast exercise.
+
+    Two of the four marks are for configuration that can be read back, and two
+    for a packet that actually arrived. The split is deliberate: a student who
+    enabled PIM everywhere and pointed every router at the rendezvous point has
+    done the visible half of the work, and a network where nothing is delivered
+    has not solved the exercise.
+
+questions:
+  - id: q1
+    title: PIM and IGMP on the right interfaces
+    points: 1
+    converge: true
+    converge_scope: ospf
+    checks:
+      - check: multicast.pim_enabled
+        weight: 1.0
+
+  - id: q2
+    title: One rendezvous point for the group range
+    points: 1
+    converge: true
+    checks:
+      - check: multicast.rendezvous_point
+        weight: 1.0
+
+  - id: q3
+    title: A packet reaches the host that joined the group
+    points: 1
+    converge: true
+    checks:
+      - check: multicast.delivery
+        weight: 1.0
+
+  - id: q4
+    title: And no host that did not
+    points: 1
+    converge: true
+    # Isolation implemented as "nothing arrived" is satisfied perfectly by a
+    # network where nothing works at all, so a submission that delivered
+    # nothing must not be able to earn this mark.
+    depends_on: [q3]
+    checks:
+      - check: multicast.no_flooding
+        weight: 1.0

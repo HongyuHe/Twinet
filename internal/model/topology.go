@@ -54,8 +54,9 @@ type AS struct {
 	// MPLS and VRFs carry the advanced course's label-switching and
 	// virtual-routing configuration through to the renderer and the grader,
 	// so both work from the same declaration rather than from two.
-	MPLS MPLSSpec
-	VRFs map[string]*VRFSpec
+	MPLS      MPLSSpec
+	Multicast MulticastSpec
+	VRFs      map[string]*VRFSpec
 
 	// Provisioned is the compiled result of the template's provisioning
 	// declaration: the configuration domains Twinet configures even though this

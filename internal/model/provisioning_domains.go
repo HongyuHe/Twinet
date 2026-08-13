@@ -21,6 +21,7 @@ const (
 	DomainOSPF             = "ospf"
 	DomainBGP              = "bgp"
 	DomainMPLS             = "mpls"
+	DomainMulticast        = "multicast"
 	DomainAll              = "all"
 
 	// Domains that name real student work but that Twinet cannot hand out on
@@ -56,7 +57,7 @@ var domainAliases = map[string]string{
 func KnownDomains() []string {
 	out := []string{
 		DomainAll, DomainLoopbacks, DomainRouterInterfaces, DomainHostAddressing,
-		DomainL2, DomainOSPF, DomainBGP, DomainMPLS,
+		DomainL2, DomainOSPF, DomainBGP, DomainMPLS, DomainMulticast,
 		DomainBGPPolicy, DomainIPv6, DomainRPKI,
 	}
 	for a := range domainAliases {
@@ -73,7 +74,7 @@ func NormaliseDomain(s string) (string, bool) {
 	}
 	switch s {
 	case DomainAll, DomainLoopbacks, DomainRouterInterfaces, DomainHostAddressing,
-		DomainL2, DomainOSPF, DomainBGP, DomainMPLS,
+		DomainL2, DomainOSPF, DomainBGP, DomainMPLS, DomainMulticast,
 		DomainBGPPolicy, DomainIPv6, DomainRPKI:
 		return s, true
 	}
