@@ -292,6 +292,9 @@ func runChecks(ctx context.Context, q QuestionSpec, env *Env, opts RunOptions) [
 			// Each check gets its own environment so its arguments cannot leak
 			// into a sibling running concurrently.
 			e := *env
+			if e.peers == nil {
+				e.peers = &peerCache{addr: map[string]string{}}
+			}
 			e.Args = cs.Args
 			e.infraSeen = &infraTracker{}
 			res := runCheck(cctx, c, &e)

@@ -148,7 +148,7 @@ func checkEBGPEstablished(ctx context.Context, env *Env) Result {
 			if i.Peer == nil || i.Peer.Addr4 == "" {
 				continue
 			}
-			wanted = append(wanted, want{r.Name, addrOf(i.Peer.Addr4), i.Peer.Device.ASN})
+			wanted = append(wanted, want{r.Name, env.PeerAddr(ctx, i), i.Peer.Device.ASN})
 		}
 	}
 	if len(wanted) == 0 {
@@ -279,7 +279,7 @@ func checkGaoRexford(ctx context.Context, env *Env) Result {
 			// other checks were all inverted in the same direction -- so the
 			// wrong answer was self-consistent and scored full marks.
 			rel := i.Link.PeerRelationship(i)
-			relOf[addrOf(i.Peer.Addr4)] = rel
+			relOf[env.PeerAddr(ctx, i)] = rel
 		}
 	}
 	if len(relOf) == 0 {
@@ -413,7 +413,7 @@ func checkNoTransit(ctx context.Context, env *Env) Result {
 			// other checks were all inverted in the same direction -- so the
 			// wrong answer was self-consistent and scored full marks.
 			rel := i.Link.PeerRelationship(i)
-			relOf[addrOf(i.Peer.Addr4)] = rel
+			relOf[env.PeerAddr(ctx, i)] = rel
 			if i.Peer.Device != nil {
 				relOfASN[i.Peer.Device.ASN] = rel
 			}
@@ -450,7 +450,7 @@ func checkNoTransit(ctx context.Context, env *Env) Result {
 			if rel == model.RelCustomer {
 				continue // a customer may receive everything
 			}
-			sessions = append(sessions, session{r.Name, addrOf(i.Peer.Addr4), rel})
+			sessions = append(sessions, session{r.Name, env.PeerAddr(ctx, i), rel})
 		}
 	}
 

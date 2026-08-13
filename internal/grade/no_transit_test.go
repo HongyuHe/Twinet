@@ -1,6 +1,8 @@
 package grade
 
 import (
+	"os"
+	"strings"
 	"testing"
 
 	"github.com/HongyuHe/twinet/internal/model"
@@ -103,4 +105,29 @@ func TestUnreadableSessionsAreNotTreatedAsClean(t *testing.T) {
 	if table.NoSuchNeighbour() {
 		t.Error("an empty advertised-routes table was read as a missing session")
 	}
+}
+
+// The assignment lets a group choose their own datacentre addressing and agree
+// their own peering addresses with a neighbour. Reading either out of the plan
+// marks them wrong for an answer the assignment permits: the datacentre check
+// pings an address nobody configured, and the session check looks for a
+// neighbour at an address the two groups agreed not to use.
+func TestAddressesAreReadFromTheDevicesNotThePlan(t *testing.T) {
+	src := []byte(readFileForTest(t, "checks_policy.go") + readFileForTest(t, "checks_inter.go"))
+	for _, bad := range []string{"firstAddr6(dst)", "firstAddr6(h)", "addrOf(i.Peer.Addr4)"} {
+		if strings.Contains(string(src), bad) {
+			t.Errorf("a check still takes %s from the manifest rather than from the "+
+				"device, so a group that used the addressing the assignment lets them "+
+				"choose is marked wrong for it", bad)
+		}
+	}
+}
+
+func readFileForTest(t *testing.T, name string) string {
+	t.Helper()
+	b, err := os.ReadFile(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
 }

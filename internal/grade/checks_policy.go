@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/netip"
 	"regexp"
 	"sort"
 	"strconv"
@@ -143,7 +144,7 @@ func checkSixIn4(ctx context.Context, env *Env) Result {
 		case !sok || !dok:
 			reach = "could not find a host in each datacentre"
 		default:
-			addr := firstAddr6(dst)
+			addr := deviceAddr6(ctx, env, dst)
 			if addr == "" {
 				reach = fmt.Sprintf("%s has no IPv6 address configured", dst.Name)
 				break
@@ -172,7 +173,7 @@ func checkSixIn4(ctx context.Context, env *Env) Result {
 				if gw == nil || h == nil {
 					continue
 				}
-				if a := firstAddr6(h); a != "" {
+				if a := deviceAddr6(ctx, env, h); a != "" {
 					_, _ = env.Probe(ctx, gw.ID, []string{"ping6", "-c", "2", "-W", "3", a})
 				}
 			}
@@ -687,7 +688,7 @@ func checkTrafficEngineering(ctx context.Context, env *Env) Result {
 			if d > maxDelay {
 				maxDelay = d
 			}
-			neighbours = append(neighbours, nb{r.Name, addrOf(i.Peer.Addr4), i.Peer.Device.ASN, rel, i.Link.Props.Delay, false})
+			neighbours = append(neighbours, nb{r.Name, env.PeerAddr(ctx, i), i.Peer.Device.ASN, rel, i.Link.Props.Delay, false})
 		}
 	}
 	if len(neighbours) < 2 {
@@ -1299,6 +1300,26 @@ func rpkiConfigured(ctx context.Context, env *Env) (bool, string) {
 	return true, strings.Join(found, "\n")
 }
 
+// deviceAddr6 returns the IPv6 address a host actually has, falling back to the
+// one the manifest planned.
+//
+// The assignment lets a group choose their own datacentre addressing. Reading
+// it out of the plan marked a group wrong for an answer the assignment permits:
+// the check would ping an address nobody had configured and report the
+// datacentre unreachable.
+func deviceAddr6(ctx context.Context, env *Env, d *model.Device) string {
+	res, err := env.Exec(ctx, d.ID, []string{"sh", "-c",
+		"ip -o -6 addr show scope global 2>/dev/null | awk '{print $4}'"})
+	if err == nil && res.ExitCode == 0 {
+		for _, f := range strings.Fields(res.Stdout) {
+			if p, err := netip.ParsePrefix(f); err == nil && p.Addr().Is6() {
+				return p.Addr().String()
+			}
+		}
+	}
+	return firstAddr6(d)
+}
+
 func firstAddr6(d *model.Device) string {
 	for _, i := range d.Ifaces {
 		if i.Addr6 != "" {
@@ -1642,7 +1663,7 @@ func crossDatacentreGaps(ctx context.Context, env *Env, hostsIn map[string][]*mo
 			}
 			for _, src := range hostsIn[from] {
 				for _, dst := range hostsIn[to] {
-					addr := firstAddr6(dst)
+					addr := deviceAddr6(ctx, env, dst)
 					if addr == "" {
 						gaps = append(gaps, fmt.Sprintf("%s (%s) has no IPv6 address",
 							dst.Name, to))

@@ -224,6 +224,10 @@ The lab must already be deployed with --solve.`,
 				fmt.Fprintf(cmd.ErrOrStderr(), "\nwave %d/%d: %s\n", i+1, len(waves), groupNames(wave))
 
 				loaded := make([]submission, 0, len(wave))
+				// Undoing what was adapted for this wave's submissions. The
+				// next wave is graded against the reference as the manifest
+				// describes it, not against the last group's addressing.
+				var adapted []func(context.Context) error
 				for _, s := range wave {
 					// Wait for the lab to stop moving before touching it. A
 					// deploy or a repair rewires by removing an interface and
@@ -272,6 +276,28 @@ The lab must already be deployed with --solve.`,
 						})
 						continue
 					}
+					// The assignment lets neighbouring groups agree their own
+					// peering addresses. Twinet plans them, and the other end
+					// of every session is a rendered reference expecting the
+					// planned address -- so a group that agreed something else
+					// could not bring the session up at all and lost the marks
+					// for every question that depends on it. The reference is
+					// adapted to what they actually configured, and put back
+					// after the wave.
+					ads, undo, why := adaptNeighbours(cmd.Context(), exec, top, s.AS)
+					if len(ads) > 0 {
+						adapted = append(adapted, undo)
+						for _, ad := range ads {
+							fmt.Fprintf(cmd.ErrOrStderr(),
+								"  %s: %s, so %s was given %s and a session to %s\n",
+								s.Group, ad.Because, ad.Device, ad.Added, ad.Session)
+						}
+					}
+					for _, w := range why {
+						fmt.Fprintf(cmd.ErrOrStderr(),
+							"  %s: a neighbour could not be adapted to this submission's "+
+								"addressing (%s); the session it needs may not come up\n", s.Group, w)
+					}
 					loaded = append(loaded, s)
 				}
 				if contaminated != "" {
@@ -319,6 +345,24 @@ The lab must already be deployed with --solve.`,
 				// further from the truth the longer the run went on -- with
 				// nothing in the report saying which student's work each mark
 				// had actually measured.
+				// The neighbours go back to the manifest's addressing before
+				// anything else is graded against them.
+				for _, undo := range adapted {
+					if err := undo(cmd.Context()); err != nil {
+						fmt.Fprintf(cmd.ErrOrStderr(),
+							"\n  a neighbour adapted to this wave's addressing could not be "+
+								"put back (%v)\n  the remaining waves are held for review\n", err)
+						contaminated = fmt.Sprintf("a neighbour adapted to %s's addressing "+
+							"could not be put back: %v", groupNames(loaded), err)
+						reports = append(reports,
+							quarantine(waves[i+1:], rubric.MaxTotal(), contaminated)...)
+						break
+					}
+				}
+				if contaminated != "" {
+					break
+				}
+
 				lastWave := i+1 == len(waves)
 				if !keepLoaded || !lastWave {
 					restored := loaded

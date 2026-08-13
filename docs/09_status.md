@@ -157,18 +157,35 @@ someone has checked.
 
 The COS-461 wiki leaves the layer-2 datacentre addresses and the inter-AS
 peering addresses to the students, to be agreed with their neighbours. Twinet
-allocates both from its own plan and grades against that plan, and the reference
-neighbours are configured with those addresses.
+plans both, and used to grade against its plan: a group that chose its own DCS
+addressing was marked wrong for an answer the assignment permits, and a group
+that agreed different eBGP addresses with a neighbour could not bring the
+session up at all, because the other end was a rendered reference expecting the
+planned address.
 
-So a group that picks its own DCS addressing, or negotiates different eBGP
-addresses with a neighbour, is marked wrong for an answer the assignment
-permits -- and in the eBGP case cannot bring the session up at all, because the
-other end is a rendered reference that expects the planned address.
+Both are now discovered rather than assumed.
 
-This is a real divergence from the assignment as written, not a bug in the
-checks: making it right means discovering the addresses a submission actually
-used and configuring its neighbours from them. Until it is done, a course using
-Twinet has to prescribe the addressing, which the manifest already does.
+- Every check reads the addresses off the devices. The datacentre checks ping
+  what a host actually has; the session checks ask for the address the
+  neighbour actually holds on its end of the link, in the subnet the group
+  chose.
+- Before a wave is graded, the reference side of each inter-AS link is adapted
+  to whatever the submission configured: it is given an address in the group's
+  subnet and a session to theirs, built by copying its own configuration for
+  the planned address with the address substituted, so the relationship, the
+  policies and the route-maps are exactly what the reference would have used.
+  Everything is undone after the wave, and a failure to undo it quarantines the
+  remaining waves rather than grading them against the last group's addressing.
+
+Measured on the cluster with a signed submission that peers on 10.34.0.1/30
+instead of the planned 179.3.4.1/24: 8.96/10 before, losing marks on
+bgp.ebgp_established, policy.gao_rexford and policy.no_transit_for_peers;
+10.00/10 after, with the run reporting `AS 3 configured 10.34.0.1/30 on
+ext_4_BOS instead of the planned 179.3.4.1/24, so as4/BOS was given 10.34.0.2/30
+and a session to 10.34.0.1`.
+
+What is still prescribed: the exchange addressing, which is the exchange's own
+and not a bilateral agreement, and the service subnets.
 
 ### Moving an autonomous system between machines is not atomic
 
