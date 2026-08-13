@@ -93,6 +93,11 @@ func adaptNeighbours(ctx context.Context, exec execFn, top *model.Topology, as i
 		ad, err := adaptOnePeer(ctx, exec, theirs, mine.Addr4, chosen)
 		if err != nil {
 			problems = append(problems, fmt.Sprintf("%s: %v", theirs.Device.ID, err))
+			// A half-applied adaptation is still something to undo.
+			if ad.Device != "" {
+				ad.Because = "partially applied before it failed"
+				done = append(done, ad)
+			}
 			continue
 		}
 		ad.Because = fmt.Sprintf("AS %d configured %s on %s instead of the planned %s",
@@ -174,22 +179,32 @@ func adaptOnePeer(ctx context.Context, exec execFn, peer *model.Iface,
 	if res.ExitCode != 0 {
 		return ad, fmt.Errorf("addressing %s: %s", peer.Name, firstLine(res.Stderr+res.Stdout))
 	}
+	// Recorded the moment the address exists, not once the whole adaptation
+	// succeeded. If the session below fails to configure, this function returns
+	// an error -- and the address it added has to come off again, or the
+	// reference router keeps an address from the last submission's subnet and
+	// every submission graded after it is marked against a network that is no
+	// longer the reference.
+	ad = peerAdaptation{
+		Device: dev, Iface: peer.Name, Added: mine.String(), Session: their.Addr().String(),
+	}
 
 	cfg := strings.ReplaceAll(body, was.Addr().String(), their.Addr().String())
 	if err := vtyshConfigure(ctx, exec, dev, cfg); err != nil {
 		return ad, err
 	}
-	return peerAdaptation{
-		Device: dev, Iface: peer.Name, Added: mine.String(), Session: their.Addr().String(),
-	}, nil
+	return ad, nil
 }
 
 // undoOnePeer removes what adaptOnePeer added.
+//
+// The address comes off even when the session cannot be removed, because a
+// half-applied adaptation has an address and no session: refusing to continue
+// there would leave the address behind, which is the state that contaminates
+// every submission graded afterwards.
 func undoOnePeer(ctx context.Context, exec execFn, ad peerAdaptation) error {
-	if err := vtyshConfigure(ctx, exec, ad.Device, fmt.Sprintf(
-		"router bgp %s\n no neighbor %s\nexit", asnOfDevice(ad.Device), ad.Session)); err != nil {
-		return err
-	}
+	sessErr := vtyshConfigure(ctx, exec, ad.Device, fmt.Sprintf(
+		"router bgp %s\n no neighbor %s\nexit", asnOfDevice(ad.Device), ad.Session))
 	res, err := exec(ctx, ad.Device, []string{"sh", "-c",
 		fmt.Sprintf("ip addr del %s dev %s 2>/dev/null; exit 0", ad.Added, ad.Iface)})
 	if err != nil {
@@ -197,6 +212,14 @@ func undoOnePeer(ctx context.Context, exec execFn, ad peerAdaptation) error {
 	}
 	if res.ExitCode != 0 {
 		return fmt.Errorf("%s: removing %s: %s", ad.Device, ad.Added, firstLine(res.Stderr))
+	}
+	// Verified rather than assumed: an address that is still there is the
+	// whole failure this function exists to prevent.
+	if still, err := ifaceAddr4(ctx, exec, ad.Device, ad.Iface); err == nil && still == ad.Added {
+		return fmt.Errorf("%s still has %s on %s after it was removed", ad.Device, ad.Added, ad.Iface)
+	}
+	if sessErr != nil {
+		return fmt.Errorf("%s: removing the session to %s: %w", ad.Device, ad.Session, sessErr)
 	}
 	return nil
 }

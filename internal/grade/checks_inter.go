@@ -268,84 +268,129 @@ func checkGaoRexford(ctx context.Context, env *Env) Result {
 		return Errored("policy.gao_rexford", fmt.Errorf("AS %d has no routers", env.AS))
 	}
 
-	// Which neighbour address corresponds to which relationship, from the model.
+	// Which neighbour address corresponds to which relationship.
+	//
+	// Taken from externalSessions rather than rebuilt here, because rebuilding
+	// it here left the exchange out: a session with a route server is not a
+	// point-to-point inter-AS link, so every peer reached across an IXP was
+	// invisible to this check. An AS whose only peers are exchange members --
+	// which is most of them, and all of the ones the assignment cares about --
+	// was marked on customer-versus-provider alone.
 	relOf := map[string]model.Relationship{}
-	for _, r := range routers {
-		for _, i := range r.Ifaces {
-			if i.Link == nil || !i.Link.InterAS || i.Peer == nil || i.Peer.Addr4 == "" {
-				continue
-			}
-			// What the neighbour is to us. Derived in one place, because the
-			// same two lines written out here, in the renderer and in the
-			// other checks were all inverted in the same direction -- so the
-			// wrong answer was self-consistent and scored full marks.
-			rel := i.Link.PeerRelationship(i)
-			relOf[env.PeerAddr(ctx, i)] = rel
-		}
+	for _, sess := range externalSessions(ctx, env) {
+		relOf[sess.Addr] = sess.Rel
 	}
 	if len(relOf) == 0 {
 		return Errored("policy.gao_rexford", fmt.Errorf("AS %d has no external neighbours", env.AS))
 	}
 
-	// Observe the local preference applied to routes from each relationship.
-	prefs := map[model.Relationship][]int{}
+	// Every route, not a summary of them.
+	//
+	// This used to compare the median local preference of each relationship,
+	// which is a statement about most routes and about no particular one: an AS
+	// that set local-preference 200 on nine customer prefixes and left the
+	// tenth at the default passed, and so did one that ranked a whole peer
+	// correctly on average while preferring one of its routes over a
+	// customer's. Gao-Rexford is a rule about every route, so every route is
+	// where it is checked -- the worst customer route must still beat the best
+	// peer route, and the worst peer route the best provider route.
+	type observed struct {
+		pref   int
+		prefix string
+		via    string
+		router string
+	}
+	seen := map[model.Relationship][]observed{}
 	for _, r := range routers {
 		tbl, err := bgpTable(ctx, env, r.Name)
 		if err != nil {
 			continue
 		}
-		for _, entries := range tbl.Table() {
+		for prefix, entries := range tbl.Table() {
 			for _, e := range entries {
 				for _, nh := range e.Nexthops {
-					if rel, ok := relOf[nh.IP]; ok {
-						prefs[rel] = append(prefs[rel], e.LocalPref)
+					rel, ok := relOf[nh.IP]
+					if !ok {
+						continue
 					}
+					seen[rel] = append(seen[rel], observed{e.LocalPref, prefix, nh.IP, r.Name})
 				}
 			}
 		}
 	}
 
-	median := func(rel model.Relationship) (int, bool) {
-		v := prefs[rel]
+	worst := func(rel model.Relationship) (observed, bool) {
+		v := seen[rel]
 		if len(v) == 0 {
-			return 0, false
+			return observed{}, false
 		}
-		sort.Ints(v)
-		return v[len(v)/2], true
+		out := v[0]
+		for _, o := range v[1:] {
+			if o.pref < out.pref {
+				out = o
+			}
+		}
+		return out, true
 	}
-	cust, hasCust := median(model.RelCustomer)
-	peer, hasPeer := median(model.RelPeer)
-	prov, hasProv := median(model.RelProvider)
+	best := func(rel model.Relationship) (observed, bool) {
+		v := seen[rel]
+		if len(v) == 0 {
+			return observed{}, false
+		}
+		out := v[0]
+		for _, o := range v[1:] {
+			if o.pref > out.pref {
+				out = o
+			}
+		}
+		return out, true
+	}
 
+	custLo, hasCust := worst(model.RelCustomer)
+	peerLo, hasPeer := worst(model.RelPeer)
+	provLo, hasProv := worst(model.RelProvider)
+	custHi, _ := best(model.RelCustomer)
+	peerHi, _ := best(model.RelPeer)
+	provHi, _ := best(model.RelProvider)
+
+	span := func(lo, hi observed, ok bool, n int) string {
+		if !ok {
+			return "none"
+		}
+		if lo.pref == hi.pref {
+			return fmt.Sprintf("%d (%d route(s))", lo.pref, n)
+		}
+		return fmt.Sprintf("%d..%d (%d route(s))", lo.pref, hi.pref, n)
+	}
 	var detail strings.Builder
 	fmt.Fprintf(&detail, "observed local preference: customer=%s peer=%s provider=%s\n",
-		orNone(cust, hasCust), orNone(peer, hasPeer), orNone(prov, hasProv))
+		span(custLo, custHi, hasCust, len(seen[model.RelCustomer])),
+		span(peerLo, peerHi, hasPeer, len(seen[model.RelPeer])),
+		span(provLo, provHi, hasProv, len(seen[model.RelProvider])))
 
 	checks, passed := 0, 0
-	if hasCust && hasPeer {
-		checks++
-		if cust > peer {
-			passed++
-		} else {
-			fmt.Fprintf(&detail, "a customer's routes (%d) must be preferred over a peer's (%d)\n", cust, peer)
+	compare := func(hiRel, loRel model.Relationship, hiOK, loOK bool,
+		hiWorst, loBest observed) {
+
+		if !hiOK || !loOK {
+			return
 		}
-	}
-	if hasPeer && hasProv {
 		checks++
-		if peer > prov {
+		if hiWorst.pref > loBest.pref {
 			passed++
-		} else {
-			fmt.Fprintf(&detail, "a peer's routes (%d) must be preferred over a provider's (%d)\n", peer, prov)
+			return
 		}
+		fmt.Fprintf(&detail,
+			"every route from a %s must be preferred over every route from a %s, but "+
+				"%s carries local preference %d on %s (via %s) while %s carries %d on %s (via %s)\n",
+			hiRel, loRel,
+			hiWorst.router, hiWorst.pref, hiWorst.prefix, hiWorst.via,
+			loBest.router, loBest.pref, loBest.prefix, loBest.via)
 	}
-	if hasCust && hasProv {
-		checks++
-		if cust > prov {
-			passed++
-		} else {
-			fmt.Fprintf(&detail, "a customer's routes (%d) must be preferred over a provider's (%d)\n", cust, prov)
-		}
-	}
+	compare(model.RelCustomer, model.RelPeer, hasCust, hasPeer, custLo, peerHi)
+	compare(model.RelPeer, model.RelProvider, hasPeer, hasProv, peerLo, provHi)
+	compare(model.RelCustomer, model.RelProvider, hasCust, hasProv, custLo, provHi)
+
 	// Every relationship this AS actually has must be represented.
 	//
 	// Only the classes that happened to be visible were compared, so an AS
@@ -389,7 +434,7 @@ func checkGaoRexford(ctx context.Context, env *Env) Result {
 			Observed: strings.TrimSpace(detail.String())})
 	}
 	return Partial("policy.gao_rexford", ratio(passed, checks), Evidence{
-		Expected: "local preference customer > peer > provider",
+		Expected: "local preference customer > peer > provider, for every route",
 		Observed: fmt.Sprintf("%d of %d orderings correct", passed, checks),
 		Detail:   strings.TrimRight(detail.String(), "\n"),
 		Hint:     "set local-preference on import, per relationship, with a route-map",
@@ -442,8 +487,36 @@ func checkNoTransit(ctx context.Context, env *Env) Result {
 		sessions = append(sessions, session{s.Router, s.Addr, s.Rel})
 	}
 
+	// What this AS learned from its customers and selected. Gao-Rexford's
+	// export rule has two halves -- advertise your own prefixes and your
+	// customers' to everybody, and nothing else to a peer or a provider -- and
+	// only the second half was ever checked. An AS that accepted its customer's
+	// routes, used them, and told nobody else about them scored full marks
+	// while leaving that customer unreachable from the rest of the internet,
+	// which is the single most consequential thing a transit AS can get wrong.
+	custPrefixes := map[string]string{}
+	for _, r := range env.Routers() {
+		tbl, err := bgpTable(ctx, env, r.Name)
+		if err != nil {
+			continue
+		}
+		for prefix, entries := range tbl.Table() {
+			for _, e := range entries {
+				if !e.IsBest() {
+					continue
+				}
+				for _, nh := range e.Nexthops {
+					if relOf[nh.IP] == model.RelCustomer {
+						custPrefixes[prefix] = fmt.Sprintf("learned from a customer at %s", nh.IP)
+					}
+				}
+			}
+		}
+	}
+
 	// For each non-customer neighbour, look at what we advertise to them.
 	var leaks []string
+	var withheld []string
 	var silent []string
 	var unreadable []string
 	checked := 0
@@ -491,6 +564,21 @@ func checkNoTransit(ctx context.Context, env *Env) Result {
 		if !sawOwn {
 			silent = append(silent, fmt.Sprintf("%s advertises nothing of its own to the %s at %s",
 				name, rel, addr))
+		}
+		// The other half of the export rule.
+		//
+		// A customer's routes must reach the rest of the internet through you;
+		// that is what they are paying for. Withholding them is not a safe
+		// error, it is the transit service not being provided.
+		for prefix, why := range custPrefixes {
+			if _, ok := adv.Table()[prefix]; ok {
+				continue
+			}
+			// A route whose own next hop is this neighbour is not withheld
+			// from them, it is simply not sent back where it came from.
+			withheld = append(withheld, fmt.Sprintf(
+				"%s does not advertise %s (%s) to the %s at %s",
+				name, prefix, why, rel, addr))
 		}
 	}
 	// A session that could not be read has not been assessed, and a check that
@@ -542,10 +630,23 @@ func checkNoTransit(ctx context.Context, env *Env) Result {
 			Command: "show ip bgp neighbors <addr> advertised-routes",
 		})
 	}
+	if len(leaks) == 0 && len(withheld) > 0 {
+		sort.Strings(withheld)
+		return Partial("policy.no_transit_for_peers", 0.5, Evidence{
+			Expected: "your own and your customers' prefixes advertised to every peer and " +
+				"provider, and nothing learned from one",
+			Observed: fmt.Sprintf("nothing leaks, but %d customer route advertisement(s) are "+
+				"missing", len(withheld)),
+			Detail: strings.Join(truncate(withheld, 5), "\n"),
+			Hint: "a customer pays you to carry their prefixes to the rest of the internet; " +
+				"an export policy that sends only your own leaves them unreachable",
+			Command: "show ip bgp neighbors <addr> advertised-routes",
+		})
+	}
 	if len(leaks) == 0 {
 		return Pass("policy.no_transit_for_peers", Evidence{
-			Observed: fmt.Sprintf("no leaks across %d neighbour views; own prefix advertised to all of them",
-				checked)})
+			Observed: fmt.Sprintf("no leaks across %d neighbour views; own and customer "+
+				"prefixes advertised to all of them", checked)})
 	}
 	sort.Strings(leaks)
 	if len(leaks) > 12 {
@@ -757,13 +858,6 @@ func addrOf(cidr string) string {
 		return cidr[:i]
 	}
 	return cidr
-}
-
-func orNone(v int, ok bool) string {
-	if !ok {
-		return "none"
-	}
-	return fmt.Sprint(v)
 }
 
 // jsonUnmarshalLoose decodes JSON, tolerating the leading noise some vtysh

@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 )
 
 // gradeAS grades one autonomous system and returns the awarded mark per
@@ -195,6 +196,74 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 				}
 			},
 		},
+		{
+			// A mutation the previous check could not see.
+			//
+			// Gao-Rexford was assessed by comparing the *median* local
+			// preference of each relationship, which is a statement about most
+			// routes and about no particular one. Ranking a single customer
+			// prefix below a peer leaves both medians untouched, so the old
+			// check passed a routing table that violates the rule it is named
+			// after, and the mutation test above -- which detaches every import
+			// policy at once -- was too blunt to notice.
+			name:     "one customer prefix ranked below a peer",
+			question: "q2.3",
+			apply: func(t *testing.T) {
+				router, nbr, prefix := bestCustomerRoute(t, dir, 3)
+				rm := importRouteMap(t, dir, router, nbr)
+				if rm == "" {
+					t.Fatalf("%s has no import route-map on the session with %s, so this "+
+						"mutation has nothing to alter", router, nbr)
+				}
+				vtysh(t, dir, router, "configure terminal",
+					"ip prefix-list ONEROUTE seq 5 permit "+prefix,
+					"route-map "+rm+" permit 1",
+					" match ip address prefix-list ONEROUTE",
+					" set local-preference 150",
+					"end")
+				// A policy change applies to routes that arrive after it; the
+				// ones already in the table keep the preference they were given.
+				vtysh(t, dir, router, "clear bgp ipv4 unicast "+nbr+" in")
+				time.Sleep(8 * time.Second)
+			},
+		},
+		{
+			// The other half of the export rule, which was never checked.
+			//
+			// "No transit for peers" was assessed by counting leaks and by
+			// requiring the AS's own prefix to be advertised. An AS that
+			// accepted its customers' routes and told nobody about them leaked
+			// nothing and advertised its own prefix, so it passed -- while the
+			// customer it is paid to carry was unreachable from the rest of the
+			// internet.
+			name:     "a customer's prefix withheld from a provider",
+			question: "q2.3",
+			apply: func(t *testing.T) {
+				_, _, prefix := bestCustomerRoute(t, dir, 3)
+				// On whichever router holds a provider session, which is not
+				// necessarily the one that holds the customer: AS 3's customer
+				// sessions and its provider sessions are on different routers,
+				// and denying a customer prefix to another customer proves
+				// nothing, because a customer may receive everything.
+				router, prov := providerSession(t, dir, 3)
+				if prov == "" {
+					t.Fatal("AS 3 has no provider session, so nothing can be withheld")
+				}
+				t.Logf("withholding %s from the provider %s on %s", prefix, prov, router)
+				vtysh(t, dir, router, "configure terminal",
+					"ip prefix-list NOCUST seq 5 deny "+prefix,
+					"ip prefix-list NOCUST seq 10 permit 0.0.0.0/0 le 32",
+					"route-map WITHHOLD permit 10",
+					" match ip address prefix-list NOCUST",
+					"router bgp 3",
+					" address-family ipv4 unicast",
+					"  neighbor "+prov+" route-map WITHHOLD out",
+					" exit-address-family",
+					"end")
+				vtysh(t, dir, router, "clear bgp ipv4 unicast "+prov+" out")
+				time.Sleep(8 * time.Second)
+			},
+		},
 	}
 
 	for _, c := range cases {
@@ -286,4 +355,145 @@ func routersOf(t *testing.T, dir string, asn int) []string {
 		t.Fatalf("AS %d has no routers", asn)
 	}
 	return ids
+}
+
+// bestCustomerRoute finds a route a system learned from a customer: the
+// neighbour whose routes carry the highest local preference is, by the ordering
+// the question is about, a customer.
+func bestCustomerRoute(t *testing.T, dir string, as int) (router, nbr, prefix string) {
+	t.Helper()
+	bestPref := -1
+	for _, dev := range routersOf(t, dir, as) {
+		// Only sessions this router actually holds, and only ones with an
+		// import policy to alter. A route that arrived over iBGP carries the
+		// next hop of whichever router originated it into the system, which is
+		// not a neighbour of this one -- picking one of those found a "customer
+		// route" on a router with no customer session on it.
+		inMaps := importRouteMaps(t, dir, dev)
+		if len(inMaps) == 0 {
+			continue
+		}
+		out, err := twinet(t, "exec", "-m", dir, dev, "--", "vtysh", "-c", "show ip bgp json")
+		if err != nil {
+			continue
+		}
+		var tbl struct {
+			Routes map[string][]struct {
+				LocalPref int `json:"locPrf"`
+				Nexthops  []struct {
+					IP string `json:"ip"`
+				} `json:"nexthops"`
+				Path string `json:"path"`
+			} `json:"routes"`
+		}
+		if err := json.Unmarshal([]byte(trimToJSON(out)), &tbl); err != nil {
+			continue
+		}
+		for p, entries := range tbl.Routes {
+			for _, e := range entries {
+				if strings.TrimSpace(e.Path) == "" {
+					continue
+				}
+				for _, nh := range e.Nexthops {
+					if inMaps[nh.IP] == "" {
+						continue
+					}
+					if e.LocalPref > bestPref {
+						bestPref, router, nbr, prefix = e.LocalPref, dev, nh.IP, p
+					}
+				}
+			}
+		}
+	}
+	if router == "" {
+		t.Fatalf("AS %d has no external session with an import policy, so there is no "+
+			"customer route to alter", as)
+	}
+	t.Logf("customer route: %s learned %s from %s at local preference %d",
+		router, prefix, nbr, bestPref)
+	return router, nbr, prefix
+}
+
+// importRouteMaps maps each neighbour of a router to the route-map applied on
+// the way in, for the neighbours that have one.
+func importRouteMaps(t *testing.T, dir, router string) map[string]string {
+	t.Helper()
+	out, err := twinet(t, "exec", "-m", dir, router, "--", "vtysh", "-c", "show running-config")
+	if err != nil {
+		return nil
+	}
+	m := map[string]string{}
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(strings.TrimSpace(line))
+		if len(f) >= 5 && f[0] == "neighbor" && f[2] == "route-map" && f[4] == "in" {
+			m[f[1]] = f[3]
+		}
+	}
+	return m
+}
+
+// providerSession finds a session whose routes carry the lowest local
+// preference anywhere in the system, which by the ordering the question is
+// about is a provider, and says which router holds it.
+func providerSession(t *testing.T, dir string, as int) (router, addr string) {
+	t.Helper()
+	worst := 1 << 30
+	for _, dev := range routersOf(t, dir, as) {
+		sessions := importRouteMaps(t, dir, dev)
+		if len(sessions) == 0 {
+			continue
+		}
+		out, err := twinet(t, "exec", "-m", dir, dev, "--", "vtysh", "-c", "show ip bgp json")
+		if err != nil {
+			continue
+		}
+		var tbl struct {
+			Routes map[string][]struct {
+				LocalPref int `json:"locPrf"`
+				Nexthops  []struct {
+					IP string `json:"ip"`
+				} `json:"nexthops"`
+			} `json:"routes"`
+		}
+		if err := json.Unmarshal([]byte(trimToJSON(out)), &tbl); err != nil {
+			continue
+		}
+		for _, entries := range tbl.Routes {
+			for _, e := range entries {
+				for _, nh := range e.Nexthops {
+					if sessions[nh.IP] == "" {
+						continue
+					}
+					if e.LocalPref < worst {
+						worst, router, addr = e.LocalPref, dev, nh.IP
+					}
+				}
+			}
+		}
+	}
+	return router, addr
+}
+
+// importRouteMap returns the route-map applied on the way in from a neighbour.
+func importRouteMap(t *testing.T, dir, router, nbr string) string {
+	t.Helper()
+	out, err := twinet(t, "exec", "-m", dir, router, "--", "vtysh", "-c", "show running-config")
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(strings.TrimSpace(line))
+		if len(f) >= 5 && f[0] == "neighbor" && f[1] == nbr && f[2] == "route-map" && f[4] == "in" {
+			return f[3]
+		}
+	}
+	return ""
+}
+
+// trimToJSON drops anything the command printed before the JSON document.
+func trimToJSON(s string) string {
+	if i := strings.Index(s, "{"); i > 0 {
+		return s[i:]
+	}
+	return s
 }

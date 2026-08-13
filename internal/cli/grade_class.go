@@ -323,10 +323,23 @@ The lab must already be deployed with --solve.`,
 								s.Group, ad.Because, ad.Device, ad.Added, ad.Session)
 						}
 					}
-					for _, w := range why {
+					if len(why) > 0 {
+						// Held for review rather than marked. The session this
+						// submission is judged on cannot come up, for a reason
+						// that belongs to the grader and not to its author, and
+						// a low mark here is indistinguishable from a student
+						// who never configured the session at all.
 						fmt.Fprintf(cmd.ErrOrStderr(),
-							"  %s: a neighbour could not be adapted to this submission's "+
-								"addressing (%s); the session it needs may not come up\n", s.Group, w)
+							"  %s: held for review: a reference neighbour could not be "+
+								"adapted to this submission's peering addresses (%s)\n",
+							s.Group, strings.Join(why, "; "))
+						reports = append(reports, &grade.Report{
+							Submission: s.Group, AS: s.AS, MaxTotal: rubric.MaxTotal(),
+							NeedsReview: true,
+							Err: "a reference neighbour could not be adapted to this " +
+								"submission's peering addresses: " + strings.Join(why, "; "),
+						})
+						continue
 					}
 					loaded = append(loaded, s)
 				}

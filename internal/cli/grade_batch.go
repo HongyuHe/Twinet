@@ -260,6 +260,21 @@ func gradeOne(ctx context.Context, class *model.Topology, rubric *grade.Rubric,
 		}
 	}()
 
+	// A harness of this name may already exist, and if it does it is not
+	// empty.
+	//
+	// The name is a function of the lab, the AS and the group, so a regrade
+	// gets the same one -- and after --keep-labs or a teardown that failed,
+	// the containers from the previous attempt are still running with the
+	// previous submission's configuration on them. Applies are not
+	// authoritative on a node agent: they add what the plan says and leave
+	// what it does not mention, so a route, a tunnel, a ROA or a route-map
+	// from the last attempt survives into this one and the group is marked
+	// for work it did not submit this time.
+	if err := clearStaleHarness(ctx, c, h); err != nil {
+		return fail("clearing the previous attempt's harness", err)
+	}
+
 	if err := deployQuiet(ctx, c, h, s.AS); err != nil {
 		return fail("deploying the harness", err)
 	}
@@ -270,6 +285,41 @@ func gradeOne(ctx context.Context, class *model.Topology, rubric *grade.Rubric,
 	}
 	if err := applySubmission(ctx, exec, h, s); err != nil {
 		return fail("loading the submission", err)
+	}
+
+	// The reference side of every inter-AS link is moved to whatever addresses
+	// this group actually configured.
+	//
+	// The assignment lets a group pick its own peering addresses, and only
+	// class grading did this: a group that used its own /30 kept the reference
+	// on the planned address, so the session never came up and it lost the eBGP
+	// and policy marks for an answer the assignment explicitly permits --
+	// exactly the marks `grade batch` exists to award fairly.
+	ads, undoAdapt, why := adaptNeighbours(ctx, exec, h, s.AS)
+	if o.keepLab && len(ads) > 0 {
+		// Only matters when the lab outlives the run; otherwise the harness
+		// goes away and takes the adaptation with it.
+		defer func() {
+			uctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
+			defer cancel()
+			if err := undoAdapt(uctx); err != nil {
+				slog.Error("a peering adaptation could not be undone in a kept harness",
+					"lab", h.Name, "err", err)
+			}
+		}()
+	}
+	for _, ad := range ads {
+		slog.Info("adapted a reference peer to the submission's addressing",
+			"submission", s.Group, "why", ad.Because, "device", ad.Device,
+			"address", ad.Added, "session", ad.Session)
+	}
+	if len(why) > 0 {
+		// Not a mark. A reference peer that could not be moved means the
+		// session under test cannot come up for a reason that is the grader's,
+		// not the student's, and a zero here would be indistinguishable from a
+		// student who never configured it.
+		return fail("adapting the reference to this submission's peering addresses",
+			fmt.Errorf("%s", strings.Join(why, "; ")))
 	}
 	if o.settle > 0 {
 		// An explicit fixed wait, for the rare case where someone needs one.
@@ -1541,4 +1591,50 @@ func labImages(ctx context.Context, top *model.Topology, token string) map[strin
 		return nil
 	}
 	return imageDigests(ctx, client.NewCluster(top.Lab, tok), top)
+}
+
+// clearStaleHarness removes any earlier deployment of a harness before it is
+// used again, and refuses rather than grading on top of one it cannot remove.
+func clearStaleHarness(ctx context.Context, c *client.Cluster, h *model.Topology) error {
+	found, errs := c.Containers(ctx, h.Name)
+	if len(errs) > 0 {
+		// A node that cannot be asked might be the one holding the remains. It
+		// is not safe to assume otherwise.
+		var msgs []string
+		for _, e := range errs {
+			msgs = append(msgs, e.Error())
+		}
+		return fmt.Errorf("could not establish whether an earlier attempt is still "+
+			"deployed: %s", strings.Join(msgs, "; "))
+	}
+	if len(found) == 0 {
+		return nil
+	}
+	slog.Warn("an earlier deployment of this harness is still up and is being removed "+
+		"before the submission is loaded", "lab", h.Name, "containers", len(found))
+	if err := destroyLab(ctx, c, h); err != nil {
+		return err
+	}
+	// Verified, not assumed: destroy reports what it asked for, and a container
+	// that survived it is exactly the one that would carry the last attempt's
+	// configuration into this mark.
+	still, errs := c.Containers(ctx, h.Name)
+	if len(errs) > 0 {
+		var msgs []string
+		for _, e := range errs {
+			msgs = append(msgs, e.Error())
+		}
+		return fmt.Errorf("could not confirm the earlier attempt is gone: %s",
+			strings.Join(msgs, "; "))
+	}
+	if len(still) > 0 {
+		names := make([]string, 0, len(still))
+		for _, cn := range still {
+			names = append(names, cn.Name)
+		}
+		sort.Strings(names)
+		return fmt.Errorf("%d container(s) from an earlier attempt survived teardown: %s",
+			len(still), strings.Join(names, ", "))
+	}
+	return nil
 }
