@@ -35,6 +35,11 @@ func init() {
 		Run:      checkVPNReachability,
 	})
 	Register(&Check{
+		Name:     "vpn.label_switched",
+		Describe: "the customer's remote sites are reached over a two-label path, not by plain routing",
+		Run:      checkVPNLabelSwitched,
+	})
+	Register(&Check{
 		Name:     "vpn.isolation",
 		Describe: "one customer cannot reach another, whatever addresses they use",
 		Run:      checkVPNIsolation,
@@ -487,4 +492,176 @@ func (e *Env) reaches(ctx context.Context, deviceID, addr string) (bool, error) 
 		return false, err
 	}
 	return res.ExitCode == 0, nil
+}
+
+// checkVPNLabelSwitched asks how the customer's traffic is carried, not merely
+// whether it arrives.
+//
+// Reachability between two sites of one customer is the exercise's own test,
+// and it is satisfiable without doing the exercise: a provider that put every
+// customer prefix in the global table and let plain iBGP carry it would pass,
+// and so would one that wrote static routes. Neither is a VPN, and the
+// distinction is the entire subject of the assignment.
+//
+// So this reads what the forwarding table actually says. A prefix belonging to
+// a remote site must be installed in that customer's own routing table, learned
+// by BGP, and resolved through a stack of two labels: the transport label that
+// gets the packet across the interior, and the VPN label that tells the far
+// edge which customer it belongs to. A static route has no labels; a route in
+// the global table is not in the VRF; and a single label is a backbone path
+// with no VPN on it.
+func checkVPNLabelSwitched(ctx context.Context, env *Env) Result {
+	as, ok := env.Topology.ASes[env.AS]
+	if !ok || len(as.VRFs) == 0 {
+		return Errored("vpn.label_switched",
+			fmt.Errorf("AS %d declares no routing tables, so it carries no VPN customers", env.AS))
+	}
+	// Which prefixes belong to which customer, and which edges serve them.
+	type edge struct {
+		router string
+		vrf    string
+		remote []string // prefixes of the customer's other sites
+	}
+	var edges []edge
+	for _, d := range as.Routers {
+		byVRF := map[string]bool{}
+		for _, i := range d.Ifaces {
+			if i.VRF == "" || i.Peer == nil || i.Peer.Device == nil {
+				continue
+			}
+			byVRF[i.VRF] = true
+		}
+		for vrf := range byVRF {
+			// Every site of this customer that is not behind this edge.
+			mine := map[int]bool{}
+			for _, i := range d.Ifaces {
+				if i.VRF == vrf && i.Peer != nil && i.Peer.Device != nil {
+					mine[i.Peer.Device.ASN] = true
+				}
+			}
+			var remote []string
+			for _, other := range as.Routers {
+				if other.Name == d.Name {
+					continue
+				}
+				for _, i := range other.Ifaces {
+					if i.VRF != vrf || i.Peer == nil || i.Peer.Device == nil {
+						continue
+					}
+					peer := i.Peer.Device.ASN
+					if mine[peer] {
+						continue
+					}
+					if b := blockOf(env.Topology, peer); b != "" {
+						remote = append(remote, b)
+					}
+				}
+			}
+			sort.Strings(remote)
+			if len(remote) > 0 {
+				edges = append(edges, edge{d.Name, vrf, remote})
+			}
+		}
+	}
+	sort.Slice(edges, func(i, j int) bool {
+		if edges[i].router != edges[j].router {
+			return edges[i].router < edges[j].router
+		}
+		return edges[i].vrf < edges[j].vrf
+	})
+	if len(edges) == 0 {
+		return Errored("vpn.label_switched",
+			fmt.Errorf("no customer in this lab has a site behind another edge, so there is "+
+				"nothing for a VPN to carry"))
+	}
+
+	var problems []string
+	checked, labelled := 0, 0
+	for _, e := range edges {
+		for _, prefix := range e.remote {
+			checked++
+			var doc map[string][]struct {
+				Protocol string `json:"protocol"`
+				Selected bool   `json:"selected"`
+				Nexthops []struct {
+					IP     string `json:"ip"`
+					FIB    bool   `json:"fib"`
+					Labels []int  `json:"labels"`
+				} `json:"nexthops"`
+			}
+			cmd := fmt.Sprintf("show ip route vrf %s %s json", e.vrf, prefix)
+			if err := env.VtyshJSON(ctx, e.router, cmd, &doc); err != nil {
+				problems = append(problems, fmt.Sprintf(
+					"%s: %s is not in %s at all", e.router, prefix, e.vrf))
+				continue
+			}
+			entries, ok := doc[prefix]
+			if !ok || len(entries) == 0 {
+				problems = append(problems, fmt.Sprintf(
+					"%s: %s is not in %s", e.router, prefix, e.vrf))
+				continue
+			}
+			best := entries[0]
+			for _, x := range entries {
+				if x.Selected {
+					best = x
+				}
+			}
+			if best.Protocol != "bgp" {
+				problems = append(problems, fmt.Sprintf(
+					"%s carries %s in %s as a %s route; a VPN route is learned by BGP",
+					e.router, prefix, e.vrf, best.Protocol))
+				continue
+			}
+			// The stack, in the entry the kernel is actually using.
+			stack := 0
+			for _, nh := range best.Nexthops {
+				if !nh.FIB {
+					continue
+				}
+				if len(nh.Labels) > stack {
+					stack = len(nh.Labels)
+				}
+			}
+			switch {
+			case stack >= 2:
+				labelled++
+			case stack == 1:
+				problems = append(problems, fmt.Sprintf(
+					"%s reaches %s in %s with one label; a VPN route needs two -- a transport "+
+						"label across the interior and a VPN label the far edge reads",
+					e.router, prefix, e.vrf))
+			default:
+				problems = append(problems, fmt.Sprintf(
+					"%s reaches %s in %s with no label at all, so it is not being carried "+
+						"over the label-switched backbone", e.router, prefix, e.vrf))
+			}
+		}
+	}
+	sort.Strings(problems)
+	if len(problems) == 0 {
+		return Pass("vpn.label_switched", Evidence{
+			Expected: "each customer's remote sites reached over a two-label path",
+			Observed: fmt.Sprintf("%d remote prefix(es) across %d edge/table pair(s) resolve "+
+				"through a transport label and a VPN label", labelled, len(edges)),
+			Command: "show ip route vrf <table> <prefix> json",
+		})
+	}
+	return Partial("vpn.label_switched", ratio(labelled, maxInt(checked, 1)), Evidence{
+		Expected: "each customer's remote sites reached over a two-label path",
+		Observed: fmt.Sprintf("%d of %d remote prefix(es) are label-switched", labelled, checked),
+		Detail:   strings.Join(truncate(problems, 6), "\n"),
+		Hint: "the customer's routes must be carried as VPNv4 between the edges and resolved " +
+			"through the interior's LDP labels; reachability alone can be achieved without a VPN",
+		Command: "show ip route vrf <table> <prefix> json; show bgp ipv4 vpn",
+	})
+}
+
+// blockOf is the address block an AS was allocated, which is what its sites
+// advertise.
+func blockOf(top *model.Topology, asn int) string {
+	if as, ok := top.ASes[asn]; ok {
+		return as.Block
+	}
+	return ""
 }

@@ -44,3 +44,4 @@ images/svc/twinet-rtr
 images/router/twinet-dhcpd
 images/host/twinet-mcast
 images/router/twinet-mcast
+/twinet-mcast
