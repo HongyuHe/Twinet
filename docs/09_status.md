@@ -183,6 +183,23 @@ lab nobody is rebalancing -- but a two-phase commit, creating and confirming
 every destination before pruning any source, is what would make it safe, and it
 is not built.
 
+### The web interface
+
+`twinet web -m <lab>` serves three pages on the address the manifest's
+`builtin.web` service declares: an overview of the lab and the machines hosting
+it, the connectivity matrix between every pair of autonomous systems, and a
+looking glass that runs a fixed list of nine read-only commands on any router.
+Nothing on those pages can change a device.
+
+Until this existed, `builtin.web` was declared in the manifests, accepted by the
+schema, and served by nothing at all -- no container, no listener. Measured on
+the cluster: 90 of 90 pairs reachable, matrix taken in 1.4 s, looking glass
+answering from `as3/NYC`, and a command outside the list refused.
+
+What it does not have, and the original had: the time slider over historical
+snapshots, per-group VPN status, and the Krill proxy. The snapshots exist in the
+state store; nothing renders them yet.
+
 ### Grading checks that are narrower than their questions
 
 Recorded here rather than implied to be complete:

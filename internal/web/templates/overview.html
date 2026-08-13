@@ -1,0 +1,14 @@
+{{template "head" .}}
+<p>{{.Devices}} devices, {{.Links}} links.
+{{with .Matrix}}Last connectivity snapshot {{.Reachable}}/{{.Total}} pairs ({{pct .Percent}}), taken {{.TakenAt.Format "15:04:05 MST"}}.{{else}}No connectivity snapshot has been taken yet.{{end}}</p>
+{{with .Nodes}}
+<h2>Cluster</h2>
+<table><tr><th>node<th>state<th>version<th>containers<th>note</tr>
+{{range .}}<tr><td>{{.Name}}<td>{{.State}}<td>{{.Version}}<td>{{.Containers}}<td class="err">{{.Err}}</tr>{{end}}
+</table>
+{{end}}
+<h2>Autonomous systems</h2>
+<table><tr><th>AS<th>role<th>block<th>routers<th>hosts</tr>
+{{range .ASes}}<tr><td>{{.ASN}}<td>{{.Role}}<td>{{.Block}}<td>{{.Routers}}<td>{{.Hosts}}</tr>{{end}}
+</table>
+{{template "foot" .}}
