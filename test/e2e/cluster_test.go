@@ -125,7 +125,12 @@ func controller(t *testing.T) string {
 
 func twinet(t *testing.T, args ...string) (string, error) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	// Long enough for the slowest thing the suite runs, which is grading a
+	// system: the checks now read addresses off neighbouring devices and probe
+	// every datacentre host pair, and the five-minute limit killed the
+	// subprocess mid-run. A test that fails because its own deadline is shorter
+	// than the work teaches nothing about the work.
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Minute)
 	defer cancel()
 	bin := os.Getenv("TWINET_BIN")
 	if bin == "" {
@@ -453,9 +458,21 @@ func TestNamesResolveInsideTheLab(t *testing.T) {
 // because the number it prints looks like a grade.
 func solveAS(t *testing.T, dir string, as int) {
 	t.Helper()
-	if out, err := twinet(t, "deploy", "-m", dir, "--solve",
-		"--only", fmt.Sprintf("as=%d", as)); err != nil {
-		t.Fatalf("restoring AS %d to the reference solution: %v\n%s", as, err, out)
+	// A grading run that was killed leaves its hold behind until the lease
+	// lapses, and a deployment is refused while it is there -- correctly, since
+	// a change made during grading would land in somebody's marks. So this
+	// waits rather than failing: the refusal is the system working.
+	deadline := time.Now().Add(5 * time.Minute)
+	for {
+		out, err := twinet(t, "deploy", "-m", dir, "--solve",
+			"--only", fmt.Sprintf("as=%d", as))
+		if err == nil {
+			return
+		}
+		if !strings.Contains(out, "is being graded by") || time.Now().After(deadline) {
+			t.Fatalf("restoring AS %d to the reference solution: %v\n%s", as, err, out)
+		}
+		time.Sleep(15 * time.Second)
 	}
 }
 
