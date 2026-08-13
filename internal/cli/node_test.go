@@ -40,3 +40,24 @@ func TestAVersionMismatchRefusesRatherThanWarns(t *testing.T) {
 		t.Error("version skew is reported as a warning again")
 	}
 }
+
+// Rebalancing moves autonomous systems between machines, and pruning is what
+// removes them from the machine they left. A scope switches pruning off, so
+// asking for both is asking for a move whose old copy keeps running and keeps
+// announcing the same prefix -- and both halves look correct, which is why
+// nobody would think to look.
+func TestRebalanceAndOnlyAreRefusedTogether(t *testing.T) {
+	root := Root()
+	root.SetArgs([]string{"deploy", "-m", "../../examples/cos461", "--rebalance", "--only", "as=3"})
+	var out strings.Builder
+	root.SetOut(&out)
+	root.SetErr(&out)
+	err := root.Execute()
+	if err == nil {
+		t.Fatal("a rebalance scoped to one system was accepted, so the moved system runs " +
+			"on two machines at once and announces its prefix from both")
+	}
+	if !strings.Contains(err.Error(), "both places") {
+		t.Errorf("refused for the wrong reason: %v", err)
+	}
+}

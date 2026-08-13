@@ -34,17 +34,30 @@ can quote the routing-table entry that was wrong rather than saying "FAIL".`,
 		newGradeRunCmd(opts),
 		newGradeBatchCmd(opts),
 		newGradeClassCmd(opts),
-		newGradeChecksCmd(),
+		newGradeChecksCmd(opts),
 		newGradeValidateCmd(),
 	)
 	return cmd
 }
 
-func newGradeChecksCmd() *cobra.Command {
+func newGradeChecksCmd(opts *Options) *cobra.Command {
 	return &cobra.Command{
 		Use:   "checks",
 		Short: "List the checks a rubric may refer to",
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if opts.JSON {
+				// Only what a caller can use. A check carries the function
+				// that runs it, which does not serialise -- and encoding the
+				// whole struct failed at run time on a flag that is supposed
+				// to be the machine-readable one.
+				out := make([]map[string]string, 0)
+				for _, c := range grade.Checks() {
+					out = append(out, map[string]string{
+						"check": c.Name, "verifies": c.Describe,
+					})
+				}
+				return json.NewEncoder(cmd.OutOrStdout()).Encode(out)
+			}
 			w := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
 			fmt.Fprintln(w, "CHECK\tWHAT IT VERIFIES")
 			for _, c := range grade.Checks() {

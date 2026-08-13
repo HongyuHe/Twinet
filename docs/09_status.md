@@ -200,6 +200,21 @@ lab nobody is rebalancing -- but a two-phase commit, creating and confirming
 every destination before pruning any source, is what would make it safe, and it
 is not built.
 
+### The agent's listening address
+
+`scripts/deploy_agents.sh --bind-underlay` narrows the agent from every
+interface to the cluster fabric address it already announces as its own, taken
+from the unit rather than from an argument so it cannot disagree with what the
+rest of the cluster dials. The API is mutually authenticated either way -- a
+stranger who reaches the port can do nothing with it -- but a port open to the
+internet collects scans, and this one has no reason to answer anybody outside
+the fabric. Verified on this cluster: `LISTEN 10.0.1.1:7200`.
+
+The agent still runs as root with the host's network namespace and the Docker
+socket, because creating network namespaces, moving interfaces between them and
+building overlays is what it is for. The usual systemd sandboxing directives
+would each have to be disabled again, so none are claimed.
+
 ### The web interface
 
 `twinet web -m <lab>` serves three pages on the address the manifest's

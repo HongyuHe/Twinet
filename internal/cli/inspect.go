@@ -67,6 +67,12 @@ func newValidateCmd(opts *Options) *cobra.Command {
 				return err
 			}
 			s := res.Topology.Stats()
+			if opts.JSON {
+				return json.NewEncoder(cmd.OutOrStdout()).Encode(map[string]any{
+					"lab": l.Lab.Metadata.Name, "valid": true, "stats": s,
+					"warnings": len(diags.Items),
+				})
+			}
 			fmt.Fprintf(cmd.OutOrStdout(),
 				"%s is valid: %d ASes, %d devices (%d routers, %d hosts, %d switches), %d links (%d inter-AS), %d services\n",
 				l.Lab.Metadata.Name, s.ASes, s.Devices, s.Routers, s.Hosts, s.Switches, s.Links, s.InterAS, s.Services)

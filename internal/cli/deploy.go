@@ -48,6 +48,20 @@ func newDeployCmd(opts *Options) *cobra.Command {
 is actually running and creates only what is missing, so it is safe to re-run
 after a partial failure, a reboot, or a topology edit.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			// Rebalancing moves systems between machines, and pruning is what
+			// removes them from the machine they left. A scope switches
+			// pruning off, because a scoped deploy has not looked at the
+			// devices outside it and must not delete them -- so asking for
+			// both is asking for a move whose old copy is left running,
+			// announcing the same prefix from two places. Both halves then
+			// look correct, which is why nobody would think to look.
+			if rebalance && only != "" {
+				return fmt.Errorf("--rebalance moves autonomous systems between " +
+					"machines and --only stops the deployment from removing them " +
+					"from the machine they left, so the moved system would run in " +
+					"both places and announce its prefix from both. Rebalance the " +
+					"whole lab, or move nothing")
+			}
 			top, err := load(opts)
 			if err != nil {
 				return err
@@ -273,6 +287,16 @@ if the manifest that created it is no longer available.`,
 				for _, l := range top.Links {
 					vnis = append(vnis, l.VNI)
 				}
+			} else if t, err := loadAndPlace(opts); err == nil && clustered(t) {
+				// A name and a manifest together: the name says which lab, the
+				// manifest says which machines. Without this, naming a lab fell
+				// straight through to the local container runtime and tried to
+				// clean a cluster's lab up on this machine alone -- which is
+				// also the instruction this code prints when a grading harness
+				// fails to come down, so the documented recovery did not work.
+				// Three abandoned harnesses were found on this cluster and
+				// could not be removed with the command that names them.
+				top = t
 			}
 
 			if top != nil && clustered(top) {

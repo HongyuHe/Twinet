@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -61,6 +62,24 @@ func newNodeCmd(opts *Options) *cobra.Command {
 			}
 			c := client.NewCluster(top.Lab, tok)
 			results := c.Status(cmd.Context())
+
+			// --json is a global flag, and this command took it and printed a
+			// table anyway. A flag that is accepted and ignored is worse than
+			// one that is rejected: whatever was parsing the output got a table
+			// and no error.
+			if opts.JSON {
+				out := make([]map[string]any, 0, len(results))
+				for _, r := range results {
+					row := map[string]any{"node": r.Node}
+					if r.Err != nil {
+						row["error"] = r.Err.Error()
+					} else {
+						row["status"] = r.Value
+					}
+					out = append(out, row)
+				}
+				return json.NewEncoder(cmd.OutOrStdout()).Encode(out)
+			}
 
 			w := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
 			fmt.Fprintln(w, "NODE\tSTATE\tVERSION\tRUNTIME\tCPUS\tUNDERLAY\tCONTAINERS\tLAB")
