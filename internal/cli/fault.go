@@ -114,9 +114,14 @@ func loadInjections(top *model.Topology) ([]*fault.Injection, error) {
 
 func saveInjections(top *model.Topology, in []*fault.Injection) error {
 	p := injectionsPath(top)
-	if err := os.MkdirAll(filepath.Dir(p), 0o750); err != nil {
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
 		return err
 	}
+	// Narrowed every time, not only at creation: a lab directory made before
+	// this rule existed would otherwise stay group-readable for the rest of its
+	// life, and the agent account is in the invoking user's supplementary
+	// groups often enough that "0750" and "unreadable" are not the same thing.
+	sealLabState(top)
 	raw, err := json.MarshalIndent(in, "", "  ")
 	if err != nil {
 		return err

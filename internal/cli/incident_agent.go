@@ -8,8 +8,10 @@ import (
 	"os/exec"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
+	"github.com/HongyuHe/twinet/internal/agent"
 	"github.com/HongyuHe/twinet/internal/fault"
 )
 
@@ -107,6 +109,14 @@ func scoreDiagnosis(d Diagnosis, truth []fault.GroundTruth) Score {
 	} else {
 		s.Devices = 1
 	}
+	// The taxonomy has a category for compositions, and an episode that
+	// injected several faults is one. Accepting any constituent category meant
+	// a three-fault episode had three right answers and an agent that saw one
+	// of the three scored as well as one that saw all of them -- which is the
+	// opposite of what a multi-fault episode is for.
+	if len(truth) > 1 {
+		wantCats = map[string]bool{string(fault.CatMultiple): true}
+	}
 	s.Category = len(wantCats) == 0 || wantCats[d.Category]
 	// Every injected root cause has to be named, and nothing else: a list of
 	// all sixty type names would otherwise contain the right one.
@@ -164,7 +174,7 @@ func scoreDiagnosis(d Diagnosis, truth []fault.GroundTruth) Score {
 // environment it needs to look at the lab. It is *not* given the ground truth,
 // the fault names, or anything else that would answer the question: a benchmark
 // whose subject can read the answer measures nothing.
-func runAgent(ctx context.Context, command string, ep *Episode, manifest, token string,
+func runAgent(ctx context.Context, command string, ep *Episode, sb *sandbox, token string,
 	timeout time.Duration) (Diagnosis, string, error) {
 
 	var d Diagnosis
@@ -174,7 +184,7 @@ func runAgent(ctx context.Context, command string, ep *Episode, manifest, token 
 		Lab      string   `json:"lab"`
 		Manifest string   `json:"manifest"`
 		Deadline string   `json:"deadline"`
-	}{ep.Brief, ep.Symptoms, ep.Lab, manifest, timeout.String()}
+	}{ep.Brief, ep.Symptoms, ep.Lab, sb.Manifest, timeout.String()}
 	input, err := json.MarshalIndent(brief, "", "  ")
 	if err != nil {
 		return d, "", err
@@ -184,11 +194,24 @@ func runAgent(ctx context.Context, command string, ep *Episode, manifest, token 
 	defer cancel()
 	c := exec.CommandContext(runCtx, "sh", "-c", command)
 	c.Stdin = strings.NewReader(string(input) + "\n")
-	c.Env = append(os.Environ(),
-		"TWINET_MANIFEST="+manifest,
+	c.Dir = sb.Dir
+	// The agent is handed a credential that can look at this lab and change
+	// nothing, not the cluster secret. See internal/agent/diagnostic.go.
+	c.Env = append(sanitisedEnv(),
+		"HOME="+sb.Dir,
+		"TMPDIR="+sb.Dir,
+		"TWINET_MANIFEST="+sb.Manifest,
 		"TWINET_LAB="+ep.Lab,
-		"TWINET_TOKEN="+token,
+		"TWINET_TOKEN="+agent.DiagnosticToken(token, ep.Lab),
 	)
+	// Dropped to the sandbox account, so the ledger is not merely somewhere
+	// else but unreadable. Without this the agent runs as root and the copy is
+	// decoration.
+	if os.Geteuid() == 0 {
+		c.SysProcAttr = &syscall.SysProcAttr{
+			Credential: &syscall.Credential{Uid: uint32(sb.UID), Gid: uint32(sb.GID)},
+		}
+	}
 	var out, errb strings.Builder
 	c.Stdout, c.Stderr = &out, &errb
 	runErr := c.Run()
@@ -207,4 +230,22 @@ func runAgent(ctx context.Context, command string, ep *Episode, manifest, token 
 			err, firstLines(raw, 3))
 	}
 	return d, errb.String(), nil
+}
+
+// sanitisedEnv is the environment an evaluated agent starts from: this
+// process's, minus anything that would hand it the cluster or point it at the
+// answer. Inheriting os.Environ() wholesale passed TWINET_TOKEN through.
+func sanitisedEnv() []string {
+	var out []string
+	for _, kv := range os.Environ() {
+		k, _, _ := strings.Cut(kv, "=")
+		switch k {
+		case "TWINET_TOKEN", "TWINET_MANIFEST", "TWINET_LAB", "TWINET_STATE_DIR",
+			"TWINET_ALLOW_VERSION_SKEW", "HOME", "TMPDIR", "XDG_STATE_HOME",
+			"XDG_CONFIG_HOME", "XDG_CACHE_HOME", "SUDO_USER", "SUDO_UID", "SUDO_GID":
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
 }

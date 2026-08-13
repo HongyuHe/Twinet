@@ -340,11 +340,11 @@ func (s *Server) Serve(ctx context.Context) error {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/status", s.auth(s.handleStatus))
-	mux.HandleFunc("GET /v1/containers", s.auth(s.handleContainers))
+	mux.HandleFunc("GET /v1/status", s.authDiag(s.handleStatus))
+	mux.HandleFunc("GET /v1/containers", s.authDiag(s.handleContainers))
 	mux.HandleFunc("POST /v1/apply", s.auth(s.handleApply))
 	mux.HandleFunc("POST /v1/destroy", s.auth(s.handleDestroy))
-	mux.HandleFunc("POST /v1/exec", s.auth(s.handleExec))
+	mux.HandleFunc("POST /v1/exec", s.authDiag(s.handleExec))
 	mux.HandleFunc("POST /v1/hold", s.auth(s.handleHold))
 	mux.HandleFunc("POST /v1/exempt", s.auth(s.handleExempt))
 	mux.HandleFunc("POST /v1/lifecycle", s.auth(s.handleLifecycle))
@@ -533,11 +533,31 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if owners, err := netx.OverlayOwners(); err == nil {
 		resp.Overlays = owners
 	}
+	// A diagnostic caller is told about the node it is looking at and nothing
+	// about the rest of the cluster's business.
+	if scope, ok := diagScopeOf(r); ok {
+		resp.Overlays = nil
+		resp.Busy = nil
+		resp.Labs = nil
+		resp.Hash = ""
+		resp.Lab = ""
+		for _, l := range labs {
+			if l == scope {
+				resp.Lab, resp.Labs = scope, []string{scope}
+			}
+		}
+	}
 	writeJSON(w, resp)
 }
 
 func (s *Server) handleContainers(w http.ResponseWriter, r *http.Request) {
 	lab := r.URL.Query().Get("lab")
+	// A diagnostic caller sees its own lab and no other, whatever it asked
+	// for. Listing the cluster would tell it which other labs exist and, on a
+	// grading node, which harnesses are running.
+	if scope, ok := diagScopeOf(r); ok {
+		lab = scope
+	}
 	f := rt.Filter{All: true, Labels: map[string]string{deploy.LabelManaged: "true"}}
 	if lab != "" {
 		f.Labels[deploy.LabelLab] = lab
@@ -1179,6 +1199,22 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, errors.New("container and cmd are both required"))
 		return
 	}
+	// A diagnostic caller is something under evaluation. It may look at one
+	// lab, and it may only look: the hold token, other labs, and every command
+	// that could change a device are refused here rather than trusted to the
+	// caller's good manners.
+	diagLab, diagnostic := diagScopeOf(r)
+	if diagnostic {
+		if req.Hold != "" {
+			httpError(w, http.StatusForbidden,
+				errors.New("a diagnostic session may not present a grading hold"))
+			return
+		}
+		if err := ReadOnlyCommand(req.Cmd); err != nil {
+			httpError(w, http.StatusForbidden, err)
+			return
+		}
+	}
 	// Running a command inside a lab somebody is grading would land in
 	// somebody's marks. The grader passes its own hold token and is admitted.
 	if why := s.refuseIfHeldByAnother(req.Container, req.Hold); why != "" {
@@ -1201,6 +1237,12 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 	if req.Owner != "" && c.Labels[deploy.LabelOwner] != req.Owner {
 		httpError(w, http.StatusForbidden,
 			fmt.Errorf("%s belongs to %q, not %q", req.Container, c.Labels[deploy.LabelOwner], req.Owner))
+		return
+	}
+	if diagnostic && c.Labels[deploy.LabelLab] != diagLab {
+		httpError(w, http.StatusForbidden,
+			fmt.Errorf("this diagnostic session is scoped to lab %q; %s belongs to %q",
+				diagLab, req.Container, c.Labels[deploy.LabelLab]))
 		return
 	}
 	res, err := s.rt.Exec(r.Context(), req.Container, rt.ExecCmd{Cmd: req.Cmd})

@@ -31,6 +31,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	agentpkg "github.com/HongyuHe/twinet/internal/agent"
 )
 
 // TestMain refuses to run at all without a cluster, rather than letting every
@@ -984,7 +986,17 @@ func TestAnIncidentEvaluatesAndScoresAnAgent(t *testing.T) {
 	// harness rather than the agent. What it may see is the point: the brief
 	// arrives on standard input and the ground truth does not arrive at all.
 	agent := filepath.Join(out, "agent.sh")
-	script := "#!/bin/sh\ncat > " + filepath.Join(out, "brief.json") + "\n" +
+	// The agent runs as an unprivileged account now, so it needs somewhere it
+	// can actually write. t.TempDir() belongs to whoever ran the test.
+	briefPath := filepath.Join("/tmp", "twinet-e2e-brief-"+strconv.Itoa(os.Getpid())+".json")
+	if err := os.WriteFile(briefPath, nil, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(briefPath, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Remove(briefPath) }()
+	script := "#!/bin/sh\ncat > " + briefPath + "\n" +
 		"printf '%s\\n' '{\"is_anomaly\":true,\"faulty_devices\":[\"as3/NYC\"]," +
 		"\"root_cause_category\":\"misconfiguration\"," +
 		"\"root_cause_name\":[\"ospf_neighbor_missing\"]}'\n"
@@ -1031,7 +1043,7 @@ func TestAnIncidentEvaluatesAndScoresAnAgent(t *testing.T) {
 	}
 
 	// The agent must not be handed the answer.
-	brief, err := os.ReadFile(filepath.Join(out, "brief.json"))
+	brief, err := os.ReadFile(briefPath)
 	if err != nil {
 		t.Fatalf("the agent was given no brief at all: %v", err)
 	}
@@ -1041,4 +1053,133 @@ func TestAnIncidentEvaluatesAndScoresAnAgent(t *testing.T) {
 				"asked for:\n%s", leak, brief)
 		}
 	}
+}
+
+// A benchmark whose subject can read the answer measures nothing.
+//
+// The earlier arrangement kept the ground truth out of the agent's standard
+// input and then handed it TWINET_MANIFEST, which is the directory the ledger
+// lives in, and TWINET_TOKEN, which is the cluster. An agent that ran
+// "cat $TWINET_MANIFEST/.twinet/injections.json" scored a perfect 1.00 without
+// looking at the network at all, and the secrecy test passed because it only
+// ever inspected stdin.
+//
+// This runs an agent that does exactly that, plus everything else it can think
+// of, and requires all of it to fail.
+func TestAnAgentCannotReachTheAnswer(t *testing.T) {
+	dir := labDir(t)
+	scenario := filepath.Join(dir, "incidents", "ospf_adjacency_lost.yaml")
+	if _, err := os.Stat(scenario); err != nil {
+		t.Skipf("no scenario to run: %v", err)
+	}
+	out := t.TempDir()
+
+	loot := filepath.Join("/tmp", "twinet-e2e-loot-"+strconv.Itoa(os.Getpid())+".txt")
+	if err := os.WriteFile(loot, nil, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(loot, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Remove(loot) }()
+
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Every way in that has ever worked, and a few that have not.
+	script := strings.Join([]string{
+		"#!/bin/sh",
+		"cat > /dev/null",
+		"{",
+		"  echo '--- whoami'; id",
+		"  echo '--- manifest ledger'; cat \"$TWINET_MANIFEST/.twinet/injections.json\"",
+		"  echo '--- manifest dir ledger'; cat \"$(dirname \"$TWINET_MANIFEST\")/.twinet/injections.json\"",
+		"  echo '--- original lab'; cat " + abs + "/.twinet/injections.json",
+		"  echo '--- original creds'; cat " + abs + "/.twinet/credentials.txt",
+		"  echo '--- original roster'; cat " + abs + "/.twinet/roster.json",
+		"  echo '--- listing'; ls -la " + abs + "/.twinet/",
+		"  echo '--- search'; find / -name 'injections.json' -readable 2>/dev/null | head -20",
+		"  echo '--- episodes'; find / -name '*.json' -path '*episode*' -readable 2>/dev/null | head -5",
+		"  echo '--- docker'; docker ps --format '{{.Names}}' 2>&1 | head -3",
+		"} >> " + loot + " 2>&1",
+		// And the credential: it must not be able to change anything, or an
+		// agent can repair the fault and report a healthy network.
+		"printf '%s\\n' '{\"is_anomaly\":false}'",
+	}, "\n") + "\n"
+	agentPath := filepath.Join(out, "thief.sh")
+	if err := os.WriteFile(agentPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(out, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// The agent answers "nothing is wrong" about a lab with a fault in it, so
+	// it should score badly. If it scores well, it read the answer.
+	res, _ := twinet(t, "incident", "run", "-m", dir, "--scenario", scenario,
+		"--agent", "sh "+agentPath, "--agent-timeout", "3m", "-o", out)
+	t.Logf("incident output:\n%s", res)
+
+	stolen, err := os.ReadFile(loot)
+	if err != nil {
+		t.Fatalf("the adversarial agent did not run at all: %v", err)
+	}
+	got := string(stolen)
+	t.Logf("what the agent could reach:\n%s", got)
+	for _, secret := range []string{
+		"ospf_neighbor_missing", // the fault it was asked to diagnose
+		"faulty_devices",        // the shape of the ground truth record
+		"\"undo\"",              // how to reverse it, also in the ledger
+	} {
+		if strings.Contains(got, secret) {
+			t.Errorf("the agent read %q out of the filesystem, so the episode measures "+
+				"nothing:\n%s", secret, got)
+		}
+	}
+	if strings.Contains(got, "uid=0(root)") {
+		t.Error("the agent ran as root, so no file on this machine was out of its reach")
+	}
+
+	// And the credential it was given must be read-only and scoped to its own
+	// lab. Both are checked directly against a node agent rather than inferred.
+	tok := os.Getenv("TWINET_TOKEN")
+	if tok == "" {
+		t.Skip("no TWINET_TOKEN, so the credential cannot be checked")
+	}
+	diag := agentpkg.DiagnosticToken(tok, labName(t, dir))
+	if err := agentpkg.ReadOnlyCommand([]string{"vtysh", "-c", "configure terminal"}); err == nil {
+		t.Error("a diagnostic session may run vtysh configure, so it can repair its own incident")
+	}
+	if err := agentpkg.ReadOnlyCommand([]string{"ip", "link", "set", "eth0", "down"}); err == nil {
+		t.Error("a diagnostic session may run ip link set, so it can break the lab it is scored on")
+	}
+	if err := agentpkg.ReadOnlyCommand([]string{"sh", "-c", "rm -rf /"}); err == nil {
+		t.Error("a diagnostic session may run a shell")
+	}
+	if err := agentpkg.ReadOnlyCommand([]string{"vtysh", "-c", "show ip bgp summary"}); err != nil {
+		t.Errorf("a diagnostic session may not read the BGP table, which is the whole job: %v", err)
+	}
+	if _, ok := strings.CutPrefix(diag, "twdiag."); !ok {
+		t.Errorf("the diagnostic credential is not distinguishable from the cluster token: %q", diag)
+	}
+	if diag == tok {
+		t.Error("the agent was handed the cluster token")
+	}
+}
+
+// labName reads the deployed lab's name out of its manifest.
+func labName(t *testing.T, dir string) string {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(dir, "twinet.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		if s, ok := strings.CutPrefix(strings.TrimSpace(line), "name:"); ok {
+			return strings.TrimSpace(s)
+		}
+	}
+	t.Fatal("the manifest has no name")
+	return ""
 }

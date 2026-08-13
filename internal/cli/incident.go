@@ -2,6 +2,7 @@ package cli
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
 
+	"github.com/HongyuHe/twinet/internal/agent"
 	"github.com/HongyuHe/twinet/internal/fault"
 	"github.com/HongyuHe/twinet/internal/model"
 )
@@ -30,6 +32,14 @@ type Scenario struct {
 	Brief      string       `yaml:"brief,omitempty" json:"brief,omitempty"`
 	// Seed makes a time-varying fault replay exactly.
 	Seed int64 `yaml:"seed,omitempty" json:"seed,omitempty"`
+	// Control declares an episode that injects nothing.
+	//
+	// Without these, "is anything wrong?" is worth 0.2 for answering yes, and
+	// an agent that always answers yes collects it on every episode in the
+	// suite. A control is how the suite finds out whether an agent can tell a
+	// healthy network from a broken one; a benchmark made only of broken
+	// networks cannot.
+	Control bool `yaml:"control,omitempty" json:"control,omitempty"`
 }
 
 // ScenarioMeta names an incident.
@@ -73,7 +83,8 @@ func newIncidentCmd(opts *Options) *cobra.Command {
 truth. It is the unit an AI agent is measured on: the agent sees the reported
 symptoms and the live network, and never the answer.`,
 	}
-	cmd.AddCommand(newIncidentRunCmd(opts), newIncidentValidateCmd())
+	cmd.AddCommand(newIncidentRunCmd(opts), newIncidentValidateCmd(),
+		newIncidentCredentialCmd(opts))
 	return cmd
 }
 
@@ -108,8 +119,14 @@ func loadScenario(path string) (*Scenario, error) {
 	if s.Metadata.Name == "" {
 		return nil, fmt.Errorf("%s: the scenario has no name", path)
 	}
-	if len(s.Faults) == 0 {
-		return nil, fmt.Errorf("%s: the scenario injects no faults", path)
+	if len(s.Faults) == 0 && !s.Control {
+		return nil, fmt.Errorf("%s: the scenario injects no faults. If that is deliberate -- "+
+			"a healthy control, so that answering \"something is wrong\" is not free -- say "+
+			"so with `control: true`", path)
+	}
+	if len(s.Faults) > 0 && s.Control {
+		return nil, fmt.Errorf("%s: a control injects nothing, but this one injects %d fault(s)",
+			path, len(s.Faults))
 	}
 	var problems []string
 	for i, f := range s.Faults {
@@ -279,23 +296,39 @@ func newIncidentRunCmd(opts *Options) *cobra.Command {
 				// two harnesses scoring the same episode differently is not a
 				// benchmark.
 				if agentCmd != "" {
-					d, stderr, aerr := runAgent(cmd.Context(), agentCmd, ep,
-						opts.Manifest, token, agentTimeout)
-					ep.Diagnosis = &d
-					if aerr != nil {
-						ep.AgentErr = aerr.Error()
-						fmt.Fprintf(cmd.ErrOrStderr(), "the agent did not answer: %v\n", aerr)
-					} else {
-						sc := scoreDiagnosis(d, ep.Truth)
-						ep.Score = &sc
+					// An agent that crashed, timed out or printed nothing has
+					// not been evaluated, and an episode that reports no score
+					// used to exit successfully -- so a harness running a
+					// hundred episodes against a broken agent saw a hundred
+					// clean runs and no marks. It is an error now.
+					err := func() error {
+						sb, serr := newSandbox(top, opts.Manifest, sc.Metadata.Name)
+						if serr != nil {
+							return fmt.Errorf("preparing the agent sandbox: %w", serr)
+						}
+						defer sb.Remove()
+						d, stderr, aerr := runAgent(cmd.Context(), agentCmd, ep,
+							sb, token, agentTimeout)
+						if strings.TrimSpace(stderr) != "" {
+							ep.AgentLog = stderr
+						}
+						if aerr != nil {
+							ep.AgentErr = aerr.Error()
+							return fmt.Errorf("the agent did not answer: %w", aerr)
+						}
+						ep.Diagnosis = &d
+						mark := scoreDiagnosis(d, ep.Truth)
+						ep.Score = &mark
 						fmt.Fprintf(cmd.OutOrStdout(),
 							"\nthe agent scored %.2f of 1.00 "+
 								"(detected %v, devices %.2f, category %v, root cause %v)%s\n",
-							sc.Total, sc.Detected, sc.Devices, sc.Category, sc.RootCause,
-							map[bool]string{true: "", false: "; " + sc.Detail}[sc.Detail == ""])
-					}
-					if strings.TrimSpace(stderr) != "" {
-						ep.AgentLog = stderr
+							mark.Total, mark.Detected, mark.Devices, mark.Category, mark.RootCause,
+							map[bool]string{true: "", false: "; " + mark.Detail}[mark.Detail == ""])
+						return nil
+					}()
+					if err != nil {
+						ep.Err = err.Error()
+						fmt.Fprintf(cmd.ErrOrStderr(), "%v\n", err)
 					}
 				}
 			}
@@ -377,3 +410,38 @@ func newIncidentRunCmd(opts *Options) *cobra.Command {
 }
 
 var _ = model.DeviceID
+
+// newIncidentCredentialCmd mints the read-only credential an evaluated agent
+// runs with, so a harness outside this repository can drive an agent itself
+// without handing it the cluster.
+func newIncidentCredentialCmd(opts *Options) *cobra.Command {
+	var token string
+	cmd := &cobra.Command{
+		Use:   "credential",
+		Short: "mint a read-only, single-lab credential for an agent under evaluation",
+		Long: "An agent given TWINET_TOKEN can read every lab on the cluster, run anything " +
+			"in any container, take a grading hold, and destroy the evidence. This mints a " +
+			"credential that can look at one lab and change nothing: `twinet exec` and " +
+			"`twinet status` work with it, everything else is refused by the node agents.\n\n" +
+			"`twinet incident run --agent` uses one automatically; this is for harnesses that " +
+			"drive the agent themselves.",
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			top, err := loadAndPlace(opts)
+			if err != nil {
+				return err
+			}
+			if token == "" {
+				token = os.Getenv("TWINET_TOKEN")
+			}
+			if token == "" {
+				return errors.New("the cluster token is needed to derive a credential from it: " +
+					"pass --token or set TWINET_TOKEN")
+			}
+			fmt.Fprintln(cmd.OutOrStdout(), agent.DiagnosticToken(token, top.Name))
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&token, "token", "", "cluster agent token")
+	return cmd
+}
