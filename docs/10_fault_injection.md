@@ -139,7 +139,7 @@ plus one family that is a design change rather than a fault.
 |---|---:|---|
 | P4 / BMv2 | 6 | A `p4` device kind running BMv2 with a P4 program and a control plane |
 | Kubernetes | 4 | A Kubernetes node kind, or delegation to NIKA's existing backend |
-| DHCP | 5 | A DHCP server in the service image, and hosts that lease rather than are addressed |
+| DHCP | — | **implemented**: the gateway routers serve DHCP, and the five faults stop it, remove a subnet, or hand out the wrong gateway, resolver or pool |
 | VPN membership | — | **implemented**, once the advanced-networks lab gave the platform an L3VPN to break: `host_vpn_membership_missing` takes a customer-facing port out of its routing table |
 | SDN southbound | 3 | A `controller` device kind speaking OpenFlow to the OVS switches |
 | Other | 2 | `mpls_label_limit_exceeded`, `load_balancer_overload` |
@@ -156,12 +156,36 @@ force re-allocation left it unchanged again. A fault that configures something
 and changes nothing is worse than an absent one, so it is absent and counted as
 a gap.
 
-Twinet addresses every host statically from the plan, because the plan is also
-the grading key: a check can say "the address is not the one the assignment
-specifies" precisely because Twinet knows what that address is. Introducing DHCP
-means introducing an address Twinet did not choose, which the grader would then
-have to discover rather than know. That is a real design change, not a fault to
-add, and it is why the DHCP family is listed here rather than implemented.
+Twinet addresses every host statically from the plan, and DHCP is served
+alongside that rather than instead of it: the pool starts at .200, outside every
+planned address, so a lease can be taken without disturbing the addressing an
+exercise is about. That was the design change the DHCP family needed, and it is
+why it took a server rather than five injectors.
+
+The server runs on the gateway routers, not in a service container of its own. A
+client's first packet is a broadcast and a server one hop away never hears it,
+which would have given all five faults the same symptom -- "no address" --
+whatever was actually wrong. One socket per segment, bound to the device,
+because a DISCOVER carries no address to say which segment it came from:
+measured, a gateway serving three segments on one wildcard socket answered
+nobody.
+
+Their symptoms are proved in the end-to-end suite, which asks a real client for
+a lease over the same path a person would use: served by the gateway before
+anything is injected, no lease when the server is stopped, no lease on the
+segment whose subnet was removed, a lease from 3.103.0.254 when the gateway is
+spoofed, and served by the gateway again afterwards. The verifiers themselves
+read the server's process and configuration, which is deterministic; a client
+probe inside the verifier was tried and removed, because through that path it
+reported "no lease" for a fault whose symptom is a lease with the wrong
+contents, while the identical command through `twinet exec` obtained one every
+time. Evidence that cannot be explained is worse than none, because it reads as
+a symptom.
+
+A fault shared with the taxonomy also sits in the taxonomy's category, checked
+against a vendored copy (`internal/fault/nika_types.json`). Six did not, and the
+test meant to catch that checked only that each category was a member of the
+enum -- which every category is by construction.
 
 The P4 and SDN groups fit the device-kind model directly and are the natural
 next extension. The Kubernetes group is a poor fit: those are a container
@@ -334,7 +358,7 @@ Recording these here so they are not discovered late.
    time-varying. Reproducibility requires a seeded, recorded schedule rather
    than wall-clock randomness, so an episode can be replayed exactly.
 
-6. **New services are needed.** DHCP (four fault types), a web service and load
+6. **New services are needed.** A load balancer, and traffic generation. DHCP and the web service are now built. Originally this read: DHCP (four fault types), a web service and load
    balancer (three), and traffic generation (four) are prerequisites. These join
    the [05](05_services.md) list, motivated now by two consumers rather than one.
 
@@ -378,7 +402,7 @@ for the command. Do not edit these by hand — regenerate them.
 | Not yet covered | 20 |
 
 The 20 are not arbitrary: each needs a substrate the lab does not run — six P4,
-five DHCP, four Kubernetes, three SDN southbound, and two others. They are
+four Kubernetes, three SDN southbound, and two others. They are
 absent because the substrates are, and adding a fault against a service that
 does not exist would produce an episode with no symptom, which is worse than an
 absent fault because it looks like a working one.
