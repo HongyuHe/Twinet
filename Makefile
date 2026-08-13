@@ -139,8 +139,13 @@ install: build
 # The test binary is version-stamped exactly like the real one. Without this it
 # reports itself as "dev" and every test that talks to a cluster refuses on
 # version skew -- against agents built from this very tree.
+#
+# The timeout is set explicitly because the suite deploys labs, injects
+# forty-odd faults and grades a system against a live cluster; Go's ten-minute
+# default kills it partway through, and a killed run leaves a grading hold
+# behind that refuses the next thing anybody does to the lab.
 e2e: build
-	$(GO) test -count=1 -tags e2e -ldflags '$(LDFLAGS)' ./test/e2e/...
+	$(GO) test -count=1 -tags e2e -timeout 40m -ldflags '$(LDFLAGS)' ./test/e2e/...
 
 clean:
 	rm -rf $(BIN)

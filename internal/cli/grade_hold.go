@@ -162,9 +162,31 @@ func holdLab(ctx context.Context, top *model.Topology, token string, out io.Writ
 			// Hand the lab back rather than waiting for the lease to lapse, so
 			// a device that breaks a second after grading ends is repaired
 			// then and not three minutes later.
+			//
+			// Retried, and said out loud when it does not work. The result
+			// used to be discarded: a hand-back that failed left every node's
+			// repair loop switched off for the rest of the lease, and the next
+			// thing anybody did to the lab was refused with a message naming a
+			// process that had already exited. Measured after a class run --
+			// the lab stayed held for the full ten minutes.
 			rel, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 			defer cancel()
-			_ = ask(rel, 0)
+			var err error
+			for attempt := 0; attempt < 3; attempt++ {
+				if err = ask(rel, 0); err == nil {
+					return
+				}
+				select {
+				case <-rel.Done():
+					attempt = 3
+				case <-time.After(time.Second):
+				}
+			}
+			fmt.Fprintf(out, "warning: this lab could not be handed back: %v\n"+
+				"Repairs stay switched off on the nodes that did not answer until the "+
+				"lease lapses (at most %s), and anything done to the lab before then "+
+				"will be refused as belonging to this grading run.\n", err,
+				time.Duration(holdSeconds)*time.Second)
 		},
 	}, nil
 }
