@@ -1,19 +1,23 @@
 name: CI
 
-# Disabled on push and pull request, by request, while the implementation is
-# moving faster than the hosted runners are useful for.
+# On main only.
 #
-# The gates themselves are not disabled and have not been weakened: `make ci`
-# runs exactly what this workflow runs -- build, vet, race tests, golangci-lint
-# including its config verification, shellcheck, the naming check and manifest
-# validation -- and it is run before every commit. Re-enable by restoring the
-# push and pull_request triggers below; nothing else needs to change.
+# main is where a release lands, and a release is the thing an outside user
+# takes; it is worth a hosted runner's verdict. Development happens on `dev`,
+# which moves faster than a hosted runner is useful for and where `make ci`
+# already runs the same gates -- build, vet, race tests, golangci-lint including
+# its config verification, shellcheck, the naming check and manifest validation
+# -- before every commit. Running the same checks twice on every intermediate
+# commit buys nothing and delays the ones that matter.
 #
-# on:
-#   push:
-#     branches: [main]
-#   pull_request:
+# A pull request into main is also built, because that is the last point at
+# which a merge can be stopped.
 on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -68,11 +72,15 @@ jobs:
 
       - name: Validate the bundled labs
         run: |
-          ./bin/twinet validate -m examples/demo
-          ./bin/twinet validate -m examples/cos461
+          for lab in examples/*/; do
+            ./bin/twinet validate -m "$lab"
+          done
 
-      - name: Validate the bundled rubric
-        run: ./bin/twinet grade validate examples/cos461/rubric/cos461.yaml
+      - name: Validate the bundled rubrics
+        run: |
+          for rubric in examples/*/rubric/*.yaml; do
+            ./bin/twinet grade validate "$rubric"
+          done
 
   lint:
     name: Lint
