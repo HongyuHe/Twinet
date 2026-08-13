@@ -45,3 +45,38 @@ func TestARemoteASIsComparedAsAWholeNumber(t *testing.T) {
 		t.Error("a neighbour in AS 140 was not recognised across multiple lines")
 	}
 }
+
+// Route-maps are evaluated in sequence order, first match wins, and a clause
+// with no match statements matches everything. Asking only whether some deny
+// clause mentioned the condition made an accept-all policy score the marks for
+// filtering.
+func TestAnUnreachableDenyIsNotProtection(t *testing.T) {
+	acceptAll := "route-map RPKI-IN permit 10" + "\n" +
+		"route-map RPKI-IN deny 20" + "\n" +
+		" match rpki invalid" + "\n"
+	if denyMatches(acceptAll, "rpki invalid") {
+		t.Error("a permit clause that matches everything, followed by an unreachable deny, " +
+			"was counted as filtering invalid origins")
+	}
+
+	real := "route-map RPKI-IN deny 5" + "\n" +
+		" match rpki invalid" + "\n" +
+		"route-map RPKI-IN permit 10" + "\n"
+	if !denyMatches(real, "rpki invalid") {
+		t.Error("a deny clause reached before any permit was not recognised")
+	}
+
+	outOfOrder := "route-map RPKI-IN permit 20" + "\n" +
+		"route-map RPKI-IN deny 5" + "\n" +
+		" match rpki invalid" + "\n"
+	if !denyMatches(outOfOrder, "rpki invalid") {
+		t.Error("the clauses were judged in the order they were written rather than in " +
+			"sequence order, which is the order the router uses")
+	}
+
+	permitted := "route-map RPKI-IN permit 5" + "\n" +
+		" match rpki invalid" + "\n"
+	if denyMatches(permitted, "rpki invalid") {
+		t.Error("a clause that permits invalid origins was counted as denying them")
+	}
+}

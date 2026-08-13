@@ -8,6 +8,7 @@ import (
 
 	"github.com/HongyuHe/twinet/internal/model"
 	rt "github.com/HongyuHe/twinet/internal/runtime"
+	"github.com/HongyuHe/twinet/internal/state"
 )
 
 // markerRuntime remembers whether the marker file exists in each container.
@@ -99,5 +100,41 @@ func TestAnOrphanIsCapturedUnderItsCanonicalIdentifier(t *testing.T) {
 	if id != "as3/ATL" {
 		t.Errorf("an orphan would be filed as %q, which collides with every other "+
 			"system's router of the same name", id)
+	}
+}
+
+// Restoration exists so that a container recreated during teaching comes back
+// with the student's work. A deployment that installs the reference wants the
+// opposite: replaying the snapshot afterwards puts the student's old
+// configuration back on top of the answer, and a grading run then measures
+// every other submission against a lab that is not the reference -- while every
+// check on that system passes, because it is somebody's converged network.
+func TestASolveDeploymentDoesNotRestoreStudentWorkOverTheAnswer(t *testing.T) {
+	m := &markerRuntime{markers: map[string]bool{}}
+	top := &model.Topology{
+		Name:    "cos461",
+		Devices: map[string]*model.Device{},
+		ASes:    map[int]*model.AS{3: {ASN: 3, Role: model.RoleStudent}},
+	}
+	d := &model.Device{ID: "as3/ATL", Container: "twinet-cos461-as3-atl", ASN: 3}
+	top.Devices[d.ID] = d
+	top.ASes[3].Devices = []*model.Device{d}
+
+	solving := &Engine{Runtime: m, State: &state.Store{}, WritesReference: true}
+	if err := solving.restoreIfNeeded(context.Background(), top, d); err != nil {
+		t.Fatal(err)
+	}
+	if m.markers[d.Container] {
+		t.Error("a deployment writing the reference marked the device as owing a restore, " +
+			"so the student's old configuration would be replayed over the answer")
+	}
+
+	teaching := &Engine{Runtime: m, State: &state.Store{}}
+	if err := teaching.restoreIfNeeded(context.Background(), top, d); err != nil {
+		t.Fatal(err)
+	}
+	if !m.markers[d.Container] {
+		t.Error("an ordinary deployment no longer restores a recreated device, so a " +
+			"student's work is lost whenever a container is rebuilt")
 	}
 }

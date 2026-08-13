@@ -377,7 +377,19 @@ if the manifest that created it is no longer available.`,
 			// A destroy of a solved lab must not file the reference as each
 			// student's saved configuration. The cluster path was fixed and
 			// this one, which single-node labs use, was not.
-			eng := &deploy.Engine{Runtime: rt, Node: "local", State: store,
+			// The node the devices are actually placed on, not the string
+			// "local".
+			//
+			// CaptureAll selects devices by node, and with a manifest they are
+			// placed on the machine's real name -- so this matched nothing,
+			// captured nothing, reported "captured 0 snapshots" and then
+			// removed the containers. The reconstructed devices of the
+			// manifest-less path are the ones that are "local".
+			capNode := "local"
+			if top != nil {
+				capNode = localNode(top)
+			}
+			eng := &deploy.Engine{Runtime: rt, Node: capNode, State: store,
 				WritesReference: labWasSolved(top)}
 			// Capture before removing. A destroy that discards a student's
 			// configuration without recording it is unrecoverable, and the

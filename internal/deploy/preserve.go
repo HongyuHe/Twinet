@@ -166,6 +166,12 @@ func (e *Engine) CaptureAll(ctx context.Context, top *model.Topology, store *sta
 	if store == nil {
 		return 0, nil
 	}
+	// Never while the reference solution is what is on the devices. Enforced
+	// here as well as at the call sites, because there are five of them and
+	// each was fixed separately as it was found.
+	if e.WritesReference {
+		return 0, nil
+	}
 	saved := 0
 	var problems []string
 	for _, d := range top.DevicesOnNode(e.Node) {

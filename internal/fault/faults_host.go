@@ -98,12 +98,20 @@ func init() {
 			if err != nil {
 				return nil, err
 			}
-			_, err = e.Sh(ctx, t.DeviceID(), fmt.Sprintf(
-				"ip addr del %s dev %s; ip addr add %s dev %s", addr, iface, wrong, iface))
-			if err != nil {
-				return nil, err
+			// The undo is assembled before anything is changed, and returned
+			// even when the change fails.
+			//
+			// These do `del` then `add`. A failure between the two leaves the
+			// host with no address at all, and returning nil state meant the
+			// engine had nothing to undo and nothing to record -- an
+			// addressless host with an empty fault ledger, which is the state
+			// that takes longest to explain.
+			st := State{"iface": iface, "addr": addr, "wrong": wrong, "routes": routes}
+			if _, err := e.Sh(ctx, t.DeviceID(), fmt.Sprintf(
+				"ip addr del %s dev %s; ip addr add %s dev %s", addr, iface, wrong, iface)); err != nil {
+				return st, err
 			}
-			return State{"iface": iface, "addr": addr, "wrong": wrong, "routes": routes}, nil
+			return st, nil
 		},
 		Verify: func(ctx context.Context, e *Env, t Target, s State) (Evidence, error) {
 			// The injected address must be *there*, not merely the correct one
@@ -146,12 +154,14 @@ func init() {
 				return nil, fmt.Errorf("%q is not addr/len: %w", addr, err)
 			}
 			bad := netip.PrefixFrom(p.Addr(), 8).String()
-			_, err = e.Sh(ctx, t.DeviceID(), fmt.Sprintf(
-				"ip addr del %s dev %s; ip addr add %s dev %s", addr, iface, bad, iface))
-			if err != nil {
-				return nil, err
+			// The undo is returned even when the change fails: see
+			// host_incorrect_ip.
+			st := State{"iface": iface, "addr": addr, "wrong": bad, "routes": routes}
+			if _, err := e.Sh(ctx, t.DeviceID(), fmt.Sprintf(
+				"ip addr del %s dev %s; ip addr add %s dev %s", addr, iface, bad, iface)); err != nil {
+				return st, err
 			}
-			return State{"iface": iface, "addr": addr, "wrong": bad, "routes": routes}, nil
+			return st, nil
 		},
 		Verify: func(ctx context.Context, e *Env, t Target, s State) (Evidence, error) {
 			// Present, not merely absent: see host_incorrect_ip.

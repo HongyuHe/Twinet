@@ -261,15 +261,48 @@ func (f *frrConfig) externalNeighbours() []string {
 // words of the match awarded the mark to a permit clause, which lets the very
 // routes the question is about straight through.
 func denyMatches(body, condition string) bool {
-	deny := false
+	// Route-maps are evaluated in sequence order, first match wins, and a
+	// clause with no match statements matches everything.
+	//
+	// This walked the clauses in the order they appeared and asked only
+	// whether *some* deny clause mentioned the condition. So a permit at
+	// sequence 10 that matches every route, followed by a deny at 20 that
+	// matches invalid origins, counted as protection -- when the deny is
+	// unreachable and the policy accepts everything.
+	type clause struct {
+		seq     int
+		deny    bool
+		matches []string
+	}
+	var clauses []clause
+	cur := -1
 	for _, line := range strings.Split(body, "\n") {
 		t := strings.TrimSpace(strings.ToLower(line))
 		switch {
 		case strings.HasPrefix(t, "route-map "):
-			deny = strings.Contains(t, " deny ")
-		case strings.HasPrefix(t, "match ") && deny:
-			if strings.Contains(t, strings.ToLower(condition)) {
-				return true
+			f := strings.Fields(t)
+			seq := 0
+			if len(f) >= 4 {
+				seq, _ = strconv.Atoi(f[3])
+			}
+			clauses = append(clauses, clause{seq: seq, deny: len(f) >= 3 && f[2] == "deny"})
+			cur = len(clauses) - 1
+		case strings.HasPrefix(t, "match ") && cur >= 0:
+			clauses[cur].matches = append(clauses[cur].matches, t)
+		}
+	}
+	sort.SliceStable(clauses, func(i, j int) bool { return clauses[i].seq < clauses[j].seq })
+
+	want := strings.ToLower(condition)
+	for _, c := range clauses {
+		// A clause with no match statements matches everything, so nothing
+		// after it is ever reached.
+		if len(c.matches) == 0 {
+			return false
+		}
+		for _, m := range c.matches {
+			if strings.Contains(m, want) {
+				return c.deny
 			}
 		}
 	}

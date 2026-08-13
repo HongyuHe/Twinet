@@ -370,6 +370,19 @@ func (e *Engine) restoreIfNeeded(ctx context.Context, top *model.Topology, d *mo
 	if e.State == nil || !studentOwned(top, d) {
 		return nil
 	}
+	// Not when this deployment is writing the reference solution.
+	//
+	// Restoration exists so that a container recreated during teaching comes
+	// back with the student's work. A deployment that installs the reference
+	// wants the opposite: replaying the snapshot afterwards puts the student's
+	// old configuration back on top of the answer, and a grading run then
+	// measures every other submission against a lab that is not the reference
+	// -- while every check on that system passes, because it is somebody's
+	// converged network. The snapshot stays in the store for the platform-mode
+	// deployment that wants it.
+	if e.WritesReference {
+		return nil
+	}
 	// Restoration must happen after the interfaces exist, or addresses land on
 	// devices that are not there yet. It is therefore deferred to the configure
 	// stage; this records that it is pending.
@@ -423,6 +436,10 @@ func (e *Engine) restoreIsPending(ctx context.Context, d *model.Device) bool {
 // replayPending restores a device's captured configuration if one was pending.
 func (e *Engine) replayPending(ctx context.Context, top *model.Topology, d *model.Device) error {
 	if e.State == nil || !studentOwned(top, d) {
+		return nil
+	}
+	// See restoreIfNeeded: the reference is not something to restore over.
+	if e.WritesReference {
 		return nil
 	}
 	if !e.restoreIsPending(ctx, d) {

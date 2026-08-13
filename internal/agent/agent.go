@@ -647,7 +647,16 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 	// would try to capture student work from containers that did not exist.
 	if !req.DryRun {
 		s.current[top.Name] = top
-		s.rememberHow(top.Name, req.Mode, req.Ungraded)
+		// Only a complete, successful solve makes the whole lab solved.
+		//
+		// `--solve --only as=3` restricts what runs and then recorded the
+		// entire lab as solved, so a later destroy skipped capturing every
+		// other system's work. A partial failure did the same. The record is
+		// what tells destroy whose configuration is whose, and it has to mean
+		// what it says.
+		if len(req.OnlySteps) == 0 && !rep.Failed() {
+			s.rememberHow(top.Name, req.Mode, req.Ungraded)
+		}
 	}
 	if s.peers == nil {
 		s.peers = map[string]map[string]string{}

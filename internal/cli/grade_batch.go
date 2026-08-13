@@ -774,9 +774,18 @@ func wipeDeviceState(ctx context.Context, exec execFn, d *model.Device) error {
 	// has already addressed the interfaces it owns, and a deployment is what
 	// puts those back. Doing it here means the reset does not depend on one.
 	for _, i := range d.Ifaces {
-		if i.Name == "" || i.Name == "lo" {
+		if i.Name == "" {
 			continue
 		}
+		// The loopback is included.
+		//
+		// It was skipped, and a restart of FRR does not flush kernel
+		// addresses, so every submission inherited the previous one's loopback
+		// -- and the reference's, on the first run. That is marks for
+		// addressing nobody did, and an OSPF and iBGP fabric that comes up
+		// because the addresses the student was asked to configure are already
+		// there. Flushing global scope leaves 127.0.0.1, which is link-local
+		// to the host and not anybody's answer.
 		lines = append(lines, fmt.Sprintf("ip addr flush dev %s scope global 2>/dev/null", i.Name))
 		if i.Owner != model.OwnerPlatform {
 			continue
@@ -835,7 +844,7 @@ func verifyWiped(ctx context.Context, exec execFn, d *model.Device) error {
 	// suppressed, so neither was ever confirmed.
 	b.WriteString("echo '--addrs'\n")
 	for _, i := range d.Ifaces {
-		if i.Name == "" || i.Name == "lo" {
+		if i.Name == "" {
 			continue
 		}
 		fmt.Fprintf(&b, "ip -o -4 addr show dev %s 2>/dev/null | "+
@@ -892,6 +901,10 @@ func verifyWiped(ctx context.Context, exec execFn, d *model.Device) error {
 		case "routes", "routes6":
 			left = append(left, "route "+line)
 		case "addrs":
+			if strings.HasSuffix(line, " 127.0.0.1/8") {
+				// The kernel's own, on every device, always.
+				continue
+			}
 			if !want[line] {
 				left = append(left, "address "+line)
 			}
