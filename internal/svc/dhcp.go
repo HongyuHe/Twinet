@@ -489,7 +489,16 @@ const DHCPConfigPath = "/etc/twinet/dhcp.json"
 // puts back exactly what the deployment started -- and so that neither writes
 // the path out again where it would become a marker inside the device telling
 // an agent that a fault was injected here.
-const DHCPStartCommand = "nohup twinet-dhcpd -config " + DHCPConfigPath +
+// Whatever is already running is stopped first.
+//
+// Two servers on one segment answer the same client with different
+// configurations, and which one it hears is a race: a client asking for a lease
+// during a fault got no address at all, because the copy the deployment started
+// and the copy a fault's resolve started were both listening. Starting is
+// therefore idempotent, and a fault that restarts the server leaves one.
+const DHCPStartCommand = "for p in $(ps -ef | awk '/twinet-dhcpd/ && !/awk/ {print $1}'); " +
+	"do kill $p 2>/dev/null || true; done; sleep 1; " +
+	"nohup twinet-dhcpd -config " + DHCPConfigPath +
 	" >/var/log/twinet-dhcpd.log 2>&1 &"
 
 // SummariseDHCP renders a configuration for a human, which is what a fault's

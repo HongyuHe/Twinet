@@ -24,7 +24,7 @@ import (
 
 func init() {
 	Register(&Fault{
-		Name: "host_vpn_membership_missing", Category: CatMisconfig, Needs: []Capability{CapFRR},
+		Name: "host_vpn_membership_missing", Category: CatEndHost, Needs: []Capability{CapFRR},
 		Symptom: "One site of a customer cannot reach the customer's other sites. Every " +
 			"session is established, the provider's core is healthy, and the other sites " +
 			"reach each other normally.",

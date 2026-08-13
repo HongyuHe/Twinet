@@ -890,3 +890,79 @@ func resolverOf(t *testing.T, dir, device string) string {
 	t.Fatalf("%s named no resolver:\n%s", device, out)
 	return ""
 }
+
+// The five DHCP faults have five different symptoms, and a verifier that reads
+// the server's configuration back verifies the edit rather than the fault. So
+// the symptoms are proved here, by asking a real client for a lease over the
+// same path a person would use.
+//
+// The lease is not applied -- the script is /bin/true -- because the hosts of a
+// teaching lab are statically addressed and taking one would change the state a
+// grading run measures.
+func TestDHCPFaultsProduceTheirSymptoms(t *testing.T) {
+	dir := labDir(t)
+	const gw, client, iface = "as3/BOS", "as3/BOS_host", "BOSrouter"
+
+	lease := func(t *testing.T) string {
+		t.Helper()
+		var last string
+		for attempt := 0; attempt < 3; attempt++ {
+			out, _ := twinet(t, "exec", "-m", dir, client, "--", "sh", "-c",
+				"udhcpc -i "+iface+" -n -q -f -t 6 -T 3 -s /bin/true 2>&1 | tail -3")
+			last = out
+			if strings.Contains(out, "lease of") {
+				return out
+			}
+			time.Sleep(5 * time.Second)
+		}
+		return last
+	}
+
+	// The lab as it stands: a client is served, by the gateway.
+	if out := lease(t); !strings.Contains(out, "lease of") ||
+		!strings.Contains(out, "obtained from 3.103.0.2") {
+		t.Fatalf("no lease before anything was injected, so nothing below would mean "+
+			"anything:\n%s", out)
+	}
+
+	cases := []struct {
+		fault string
+		want  func(string) bool
+		says  string
+	}{
+		{"dhcp_service_down",
+			func(s string) bool { return !strings.Contains(s, "lease of") },
+			"a client to get no lease at all"},
+		{"dhcp_spoofed_gateway",
+			func(s string) bool { return strings.Contains(s, "obtained from 3.103.0.254") },
+			"a client to be served by an address that is not the router"},
+		{"dhcp_missing_subnet",
+			func(s string) bool { return !strings.Contains(s, "lease of") },
+			"a client on the removed segment to get no lease"},
+	}
+	for _, c := range cases {
+		t.Run(c.fault, func(t *testing.T) {
+			if out, err := twinet(t, "fault", "inject", "-m", dir, c.fault,
+				"--device", gw); err != nil {
+				t.Fatalf("injecting %s: %v\n%s", c.fault, err, out)
+			}
+			defer func() {
+				if out, err := twinet(t, "fault", "resolve", "--all", "-m", dir); err != nil {
+					t.Fatalf("resolving: %v\n%s", err, out)
+				}
+			}()
+			// The server re-reads its configuration on a timer.
+			time.Sleep(14 * time.Second)
+			out := lease(t)
+			if !c.want(out) {
+				t.Errorf("%s did not make %s; what the client saw:\n%s", c.fault, c.says, out)
+			}
+		})
+	}
+
+	// And afterwards the lab serves leases again.
+	time.Sleep(14 * time.Second)
+	if out := lease(t); !strings.Contains(out, "obtained from 3.103.0.2") {
+		t.Errorf("after resolving every fault a client is still not served by the gateway:\n%s", out)
+	}
+}

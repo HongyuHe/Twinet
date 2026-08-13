@@ -343,7 +343,6 @@ func (r *Renderer) dhcpCommands(d *model.Device) []deploy.Command {
 	return []deploy.Command{{
 		Describe: "serve DHCP on this router's own segments",
 		Args: []string{"sh", "-c", strings.Join([]string{
-			"for p in $(ps -ef | awk '/twinet-dhcpd/ && !/awk/ {print $1}'); do kill $p 2>/dev/null || true; done",
 			svc.DHCPStartCommand,
 			// A server that is not listening hands out nothing, and a client
 			// with no address then looks exactly like one whose server was

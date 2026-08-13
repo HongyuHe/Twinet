@@ -19,7 +19,7 @@ func init() {
 	// ---- DNS -----------------------------------------------------------
 
 	Register(&Fault{
-		Name: "dns_service_down", Category: CatNodeError, Needs: []Capability{CapProcess},
+		Name: "dns_service_down", Category: CatLink, Needs: []Capability{CapProcess},
 		Symptom:  "Users report that they cannot reach services by name, though addresses still work.",
 		Describe: "The authoritative name server was stopped.",
 		Inject: func(ctx context.Context, e *Env, t Target) (State, error) {
@@ -137,7 +137,7 @@ func init() {
 	})
 
 	Register(&Fault{
-		Name: "dns_record_error", Category: CatMisconfig, Needs: []Capability{CapFile, CapDNS},
+		Name: "dns_record_error", Category: CatEndHost, Needs: []Capability{CapFile, CapDNS},
 		Symptom:  "One service resolves to the wrong machine; everything else looks fine.",
 		Describe: "A record in a served zone points at an address that does not host the service.",
 		Inject: func(ctx context.Context, e *Env, t Target) (State, error) {

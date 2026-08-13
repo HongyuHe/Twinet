@@ -379,7 +379,7 @@ func init() {
 	// ---- switch fabric --------------------------------------------------
 
 	Register(&Fault{
-		Name: "flow_rule_shadowing", Category: CatMisconfig, Needs: []Capability{CapOVS},
+		Name: "flow_rule_shadowing", Category: CatNodeError, Needs: []Capability{CapOVS},
 		Symptom:  "One host on a segment cannot be reached, though the switch says the port is up.",
 		Describe: "A high-priority drop rule was installed on the switch, shadowing the rules below it.",
 		Inject: func(ctx context.Context, e *Env, t Target) (State, error) {
@@ -435,7 +435,7 @@ func init() {
 	})
 
 	Register(&Fault{
-		Name: "flow_rule_loop", Category: CatMisconfig, Needs: []Capability{CapOVS},
+		Name: "flow_rule_loop", Category: CatNodeError, Needs: []Capability{CapOVS},
 		Symptom:  "The segment is saturated and hosts on it become unreachable.",
 		Describe: "A flow rule sends traffic back out the port it arrived on, so frames circulate.",
 		Inject: func(ctx context.Context, e *Env, t Target) (State, error) {

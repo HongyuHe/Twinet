@@ -28,7 +28,7 @@ import (
 
 func init() {
 	Register(&Fault{
-		Name: "dhcp_service_down", Category: CatNodeError, Needs: []Capability{CapProcess},
+		Name: "dhcp_service_down", Category: CatLink, Needs: []Capability{CapProcess},
 		Symptom: "Hosts that reboot or renew come up with no address at all, while " +
 			"hosts that already hold a lease keep working until it expires.",
 		Describe: "The DHCP server was stopped.",
@@ -57,6 +57,15 @@ func init() {
 			if err != nil {
 				return Evidence{}, err
 			}
+			// The process, not a client probe.
+			//
+			// Asking a host for a lease here was tried: through this path the
+			// probe reported "no lease" for a fault whose symptom is a lease
+			// with the wrong contents, while the identical command through
+			// `twinet exec` obtained one every time. Evidence that cannot be
+			// explained is worse than no evidence, because it reads as a
+			// symptom. The symptoms are proved in the end-to-end suite, where
+			// a client is asked over the same path a person would use.
 			return Evidence{
 				Verified: code != 0,
 				Observed: boolWord(code == 0, "the DHCP server is running", "no DHCP server process"),
@@ -199,14 +208,15 @@ func init() {
 						continue
 					}
 					for _, v := range sp.reads(sub) {
-						if v == want {
-							return Evidence{
-								Verified: true,
-								Observed: fmt.Sprintf("%s is handed out as the %s for %s",
-									want, sp.option, subnet),
-								Expected: fmt.Sprintf("%s as the %s", want, sp.option),
-							}, nil
+						if v != want {
+							continue
 						}
+						return Evidence{
+							Verified: true,
+							Observed: fmt.Sprintf("%s is handed out as the %s for %s",
+								want, sp.option, subnet),
+							Expected: fmt.Sprintf("%s as the %s", want, sp.option),
+						}, nil
 					}
 				}
 				return Evidence{
