@@ -149,3 +149,80 @@ func TestRTRServerAnswersAResetQuery(t *testing.T) {
 		t.Errorf("served %d prefixes, payload has %d", prefixes, len(srv.payload.Roas))
 	}
 }
+
+// A router asking "what changed?" used to be told "all of this is still here",
+// because a serial query was answered with the full set and every record
+// carried the announcement flag. Nothing was ever removed, so a ROA withdrawn
+// or corrected at the trust anchor stayed in every router's table for the life
+// of the session -- which matters now that publishing is a student's own
+// action, because correcting a mistake appeared to do nothing.
+func TestASerialQueryCanWithdraw(t *testing.T) {
+	p := &Payload{Roas: []VRP{{Prefix: "3.0.0.0/8", MaxLength: 8, ASN: 3}}}
+	srv := NewRTRServer(p)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+	go func() { _ = srv.Serve(ln) }()
+
+	c, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+
+	// Ask as a router that already holds serial 0.
+	q := make([]byte, 12)
+	q[0], q[1] = 1, 1 // version 1, serial query
+	binary.BigEndian.PutUint32(q[4:8], 12)
+	binary.BigEndian.PutUint32(q[8:12], 1)
+
+	// Nothing has changed: the answer must not be a reset.
+	if _, err := c.Write(q); err != nil {
+		t.Fatal(err)
+	}
+	if kind := readPDUKind(t, c); kind != pduCacheResponse {
+		t.Fatalf("a router that is already up to date was answered with PDU %d, "+
+			"which makes it discard and re-learn everything on every refresh", kind)
+	}
+	readUntil(t, c, pduEndOfData)
+
+	// Now the payload changes. The router must be told to discard what it has,
+	// or a withdrawal never reaches it.
+	srv.Update(&Payload{Roas: nil})
+	if _, err := c.Write(q); err != nil {
+		t.Fatal(err)
+	}
+	if kind := readPDUKind(t, c); kind != pduCacheReset {
+		t.Fatalf("after a ROA was withdrawn, a serial query was answered with PDU %d "+
+			"instead of a cache reset, so the router keeps the withdrawn "+
+			"authorisation until the session is torn down", kind)
+	}
+}
+
+func readPDUKind(t *testing.T, c net.Conn) byte {
+	t.Helper()
+	_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	var hdr [8]byte
+	if _, err := io.ReadFull(c, hdr[:]); err != nil {
+		t.Fatal(err)
+	}
+	if rest := int(binary.BigEndian.Uint32(hdr[4:8])) - 8; rest > 0 {
+		if _, err := io.ReadFull(c, make([]byte, rest)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return hdr[1]
+}
+
+func readUntil(t *testing.T, c net.Conn, kind byte) {
+	t.Helper()
+	for i := 0; i < 100; i++ {
+		if readPDUKind(t, c) == kind {
+			return
+		}
+	}
+	t.Fatalf("never saw PDU %d", kind)
+}

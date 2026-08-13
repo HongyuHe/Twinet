@@ -191,19 +191,54 @@ func (s *RTRServer) handle(c net.Conn) error {
 		if length < 8 || length > 1<<20 {
 			return fmt.Errorf("bad pdu length %d", length)
 		}
-		if rest := int(length) - 8; rest > 0 {
-			if _, err := io.ReadFull(c, make([]byte, rest)); err != nil {
+		body := make([]byte, int(length)-8)
+		if len(body) > 0 {
+			if _, err := io.ReadFull(c, body); err != nil {
 				return err
 			}
 		}
 
 		switch hdr[1] {
-		case pduResetQuery, pduSerialQuery:
-			// Both are answered with the full set. Serving a delta for a
-			// serial query would be correct and is unnecessary here: the
-			// payload of a teaching lab is small, and a full response is
-			// always a valid answer.
+		case pduResetQuery:
 			if err := s.writeFull(c); err != nil {
+				return err
+			}
+		case pduSerialQuery:
+			// A serial query is not answered with the full set.
+			//
+			// It used to be, and every record was sent with the announcement
+			// flag, so a router asking "what changed?" was told "all of this
+			// is still here" and nothing was ever removed. A ROA withdrawn or
+			// corrected at the trust anchor stayed in every router's table for
+			// the life of the session -- which matters now that publishing is
+			// a student's own action, because correcting a mistake appeared to
+			// do nothing.
+			//
+			// Serving a real delta would mean keeping a history of every
+			// version. RFC 8210 has the answer for a cache that cannot: Cache
+			// Reset tells the router to discard what it has and ask again,
+			// which it does immediately.
+			var have uint32
+			if len(body) >= 4 {
+				have = binary.BigEndian.Uint32(body[:4])
+			}
+			s.mu.RLock()
+			serial := s.serial
+			s.mu.RUnlock()
+			if have == serial {
+				// Nothing has changed since they last asked.
+				if err := writePDU(c, pduCacheResponse, binary.BigEndian.Uint16(hdr[2:4]), nil); err != nil {
+					return err
+				}
+				var end [4]byte
+				binary.BigEndian.PutUint32(end[:], serial)
+				if err := writePDU(c, pduEndOfData, binary.BigEndian.Uint16(hdr[2:4]),
+					append(end[:], 0, 0, 0, 60, 0, 0, 0, 30, 0, 0, 2, 88)); err != nil {
+					return err
+				}
+				continue
+			}
+			if err := writePDU(c, pduCacheReset, 0, nil); err != nil {
 				return err
 			}
 		default:
