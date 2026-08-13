@@ -317,15 +317,38 @@ timer for a long-running episode.
 An **incident** is the reproducible unit: a lab manifest, a baseline, a set of
 faults, and the ground truth.
 
-`twinet incident run` today records a baseline of the deployed lab, injects the
-scenario's faults, verifies each took effect, waits, resolves them, and writes
-an episode: the ground truth, the symptoms an agent would be told, and the
-timings. What it does **not** do, despite the `--agent` flag shown above, is
-hand the lab to an agent and score a diagnosis. There is no agent endpoint, no
-diagnosis format and no scoring; an evaluation harness has to drive the agent
-itself and compare against the recorded truth. That is the remaining piece
-between this and "the same machinery as `twinet grade`, pointed at a different
-question".
+`twinet incident run` records a baseline of the deployed lab, injects the
+scenario's faults, verifies each took effect, hands the incident to an agent,
+scores what it says, resolves the faults and writes an episode: the ground
+truth, the symptoms, the diagnosis, the score and the timings.
+
+The agent is a command. It is given the brief, the symptoms, the lab's name and
+how to reach it, on standard input; it is not given the ground truth, the fault
+names or anything else that would answer the question, and the end-to-end suite
+asserts that -- an agent that could read the answer would measure nothing. It
+prints a diagnosis:
+
+```json
+{"is_anomaly": true,
+ "faulty_devices": ["as3/NYC"],
+ "root_cause_category": "misconfiguration",
+ "root_cause_name": ["ospf_neighbor_missing"],
+ "explanation": "free text, recorded and not scored"}
+```
+
+The score has four parts rather than one, because an agent that names the right
+device for the wrong reason and one that names the right reason on the wrong
+device are different failures: detection (0.2), the devices held responsible as
+a Jaccard overlap so that naming everything scores badly (0.3), the category
+(0.2) and the root cause names, all of them and nothing else (0.3). The
+explanation is recorded and not scored: scoring prose would make the mark depend
+on a judge nobody can inspect.
+
+Measured on the cluster with a small agent that greps for a router with too few
+OSPF adjacencies: 0.70 of 1.00 -- it detected the incident, named the category
+and the root cause, and blamed `as3/ATL`, which had lost its adjacency as a
+*consequence* of the fault injected at `as3/NYC`. That is exactly the
+distinction a benchmark exists to draw.
 
 ## 6. Consequences for the rest of the plan
 

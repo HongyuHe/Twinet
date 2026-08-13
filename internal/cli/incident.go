@@ -57,6 +57,12 @@ type Episode struct {
 	Truth     []fault.GroundTruth `json:"ground_truth"`
 	Resolved  bool                `json:"resolved"`
 	Err       string              `json:"error,omitempty"`
+
+	// What an agent said, and what it scored. Absent when no agent was run.
+	Diagnosis *Diagnosis `json:"diagnosis,omitempty"`
+	Score     *Score     `json:"score,omitempty"`
+	AgentErr  string     `json:"agent_error,omitempty"`
+	AgentLog  string     `json:"agent_log,omitempty"`
 }
 
 func newIncidentCmd(opts *Options) *cobra.Command {
@@ -126,6 +132,8 @@ func newIncidentRunCmd(opts *Options) *cobra.Command {
 		hold         time.Duration
 		keep         bool
 		showTruth    bool
+		agentCmd     string
+		agentTimeout time.Duration
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -262,6 +270,34 @@ func newIncidentRunCmd(opts *Options) *cobra.Command {
 					case <-cmd.Context().Done():
 					}
 				}
+
+				// The agent, if one was given, and the mark for what it said.
+				//
+				// This is what makes an episode a measurement rather than a
+				// recording. Without it every evaluation had to be driven from
+				// outside and compared against the truth in its own way, and
+				// two harnesses scoring the same episode differently is not a
+				// benchmark.
+				if agentCmd != "" {
+					d, stderr, aerr := runAgent(cmd.Context(), agentCmd, ep,
+						opts.Manifest, token, agentTimeout)
+					ep.Diagnosis = &d
+					if aerr != nil {
+						ep.AgentErr = aerr.Error()
+						fmt.Fprintf(cmd.ErrOrStderr(), "the agent did not answer: %v\n", aerr)
+					} else {
+						sc := scoreDiagnosis(d, ep.Truth)
+						ep.Score = &sc
+						fmt.Fprintf(cmd.OutOrStdout(),
+							"\nthe agent scored %.2f of 1.00 "+
+								"(detected %v, devices %.2f, category %v, root cause %v)%s\n",
+							sc.Total, sc.Detected, sc.Devices, sc.Category, sc.RootCause,
+							map[bool]string{true: "", false: "; " + sc.Detail}[sc.Detail == ""])
+					}
+					if strings.TrimSpace(stderr) != "" {
+						ep.AgentLog = stderr
+					}
+				}
 			}
 
 			if !keep {
@@ -332,6 +368,11 @@ func newIncidentRunCmd(opts *Options) *cobra.Command {
 	cmd.Flags().DurationVar(&hold, "hold", 0, "keep the incident live for this long")
 	cmd.Flags().BoolVar(&keep, "keep", false, "leave the faults injected")
 	cmd.Flags().BoolVar(&showTruth, "ground-truth", false, "print the answer")
+	cmd.Flags().StringVar(&agentCmd, "agent", "",
+		"command to run as the agent under evaluation; it is given the brief on stdin "+
+			"and must print a diagnosis as JSON")
+	cmd.Flags().DurationVar(&agentTimeout, "agent-timeout", 10*time.Minute,
+		"how long the agent may take")
 	return cmd
 }
 

@@ -966,3 +966,79 @@ func TestDHCPFaultsProduceTheirSymptoms(t *testing.T) {
 		t.Errorf("after resolving every fault a client is still not served by the gateway:\n%s", out)
 	}
 }
+
+// An episode is a measurement only if something can be measured on it. The
+// runner injected, waited, resolved and wrote the ground truth, and there it
+// stopped: no way to hand the incident to an agent and no definition of a right
+// answer, so every evaluation had to be driven from outside and compared
+// against the truth in its own way.
+func TestAnIncidentEvaluatesAndScoresAnAgent(t *testing.T) {
+	dir := labDir(t)
+	scenario := filepath.Join(dir, "incidents", "ospf_adjacency_lost.yaml")
+	if _, err := os.Stat(scenario); err != nil {
+		t.Skipf("no scenario to run: %v", err)
+	}
+	out := t.TempDir()
+
+	// An agent that answers correctly without looking, so this measures the
+	// harness rather than the agent. What it may see is the point: the brief
+	// arrives on standard input and the ground truth does not arrive at all.
+	agent := filepath.Join(out, "agent.sh")
+	script := "#!/bin/sh\ncat > " + filepath.Join(out, "brief.json") + "\n" +
+		"printf '%s\\n' '{\"is_anomaly\":true,\"faulty_devices\":[\"as3/NYC\"]," +
+		"\"root_cause_category\":\"misconfiguration\"," +
+		"\"root_cause_name\":[\"ospf_neighbor_missing\"]}'\n"
+	if err := os.WriteFile(agent, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := twinet(t, "incident", "run", "-m", dir, "--scenario", scenario,
+		"--agent", "sh "+agent, "--agent-timeout", "2m", "-o", out)
+	if err != nil {
+		t.Fatalf("running the incident: %v\n%s", err, res)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(out, "ospf_adjacency_lost.json"))
+	if err != nil {
+		t.Fatalf("no episode was written: %v", err)
+	}
+	var ep struct {
+		Truth []struct {
+			FaultyDevices []string `json:"faulty_devices"`
+		} `json:"ground_truth"`
+		Score *struct {
+			Total     float64 `json:"total"`
+			RootCause bool    `json:"root_cause"`
+			Devices   float64 `json:"devices"`
+		} `json:"score"`
+		Diagnosis *struct {
+			IsAnomaly bool `json:"is_anomaly"`
+		} `json:"diagnosis"`
+		Resolved bool `json:"resolved"`
+	}
+	if err := json.Unmarshal(raw, &ep); err != nil {
+		t.Fatal(err)
+	}
+	if ep.Score == nil || ep.Diagnosis == nil {
+		t.Fatal("the episode records no diagnosis and no score, so nothing was measured")
+	}
+	if ep.Score.Total < 0.99 {
+		t.Errorf("a diagnosis naming exactly the injected device, category and root cause "+
+			"scored %.2f", ep.Score.Total)
+	}
+	if !ep.Resolved {
+		t.Error("the incident was not resolved, so the lab is left broken for whatever runs next")
+	}
+
+	// The agent must not be handed the answer.
+	brief, err := os.ReadFile(filepath.Join(out, "brief.json"))
+	if err != nil {
+		t.Fatalf("the agent was given no brief at all: %v", err)
+	}
+	for _, leak := range []string{"ospf_neighbor_missing", "as3/NYC", "ground_truth"} {
+		if strings.Contains(string(brief), leak) {
+			t.Errorf("the agent was told %q in its brief, which is the answer it is being "+
+				"asked for:\n%s", leak, brief)
+		}
+	}
+}

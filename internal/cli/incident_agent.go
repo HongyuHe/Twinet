@@ -1,0 +1,210 @@
+package cli
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/HongyuHe/twinet/internal/fault"
+)
+
+// Evaluating an agent, and scoring what it said.
+//
+// The runner injected faults, waited, resolved them and wrote the ground truth,
+// and stopped there: there was no way to hand the incident to an agent and no
+// definition of what a right answer looks like, so every evaluation had to be
+// driven by something outside this repository that then compared against the
+// truth in its own way. Two harnesses scoring the same episode differently is
+// not a benchmark.
+//
+// This is the missing half. An agent is a command. It is given the brief, the
+// symptoms and how to reach the lab, and it prints a diagnosis. The diagnosis
+// is scored against the ground truth the episode already records.
+
+// Diagnosis is what an agent concludes.
+//
+// Deliberately small, and deliberately the same shape as the ground truth: the
+// two are compared field by field, and a field an agent cannot fill is a field
+// it scores nothing for rather than one it can talk its way around.
+type Diagnosis struct {
+	// IsAnomaly is whether the agent believes anything is wrong at all. A
+	// benchmark needs episodes where nothing is, or "something is broken" is
+	// free.
+	IsAnomaly bool `json:"is_anomaly"`
+	// FaultyDevices are the devices it holds responsible, as "as3/ATL".
+	FaultyDevices []string `json:"faulty_devices,omitempty"`
+	// Category is the taxonomy's category, and RootCauseNames the type names.
+	Category       string   `json:"root_cause_category,omitempty"`
+	RootCauseNames []string `json:"root_cause_name,omitempty"`
+	// Explanation is free text, recorded but not scored: scoring prose would
+	// make the mark depend on a judge nobody can inspect.
+	Explanation string `json:"explanation,omitempty"`
+}
+
+// Score is how well a diagnosis matched the truth.
+//
+// Four parts, each independently checkable, because a single number hides which
+// half of the answer was right: an agent that names the right device for the
+// wrong reason and one that names the right reason on the wrong device are
+// different failures and a benchmark that cannot tell them apart teaches
+// nothing.
+type Score struct {
+	Detected  bool    `json:"detected"`
+	Devices   float64 `json:"devices"`
+	Category  bool    `json:"category"`
+	RootCause bool    `json:"root_cause"`
+	Total     float64 `json:"total"`
+	Detail    string  `json:"detail"`
+}
+
+// scoreDiagnosis compares what an agent said with what was injected.
+func scoreDiagnosis(d Diagnosis, truth []fault.GroundTruth) Score {
+	var s Score
+	anomaly := false
+	wantDevices := map[string]bool{}
+	wantNames := map[string]bool{}
+	wantCats := map[string]bool{}
+	for _, t := range truth {
+		if t.IsAnomaly {
+			anomaly = true
+		}
+		for _, dev := range t.FaultyDevices {
+			wantDevices[dev] = true
+		}
+		for _, n := range t.Names {
+			wantNames[n] = true
+		}
+		if t.Category != "" {
+			wantCats[t.Category] = true
+		}
+	}
+
+	s.Detected = d.IsAnomaly == anomaly
+	// Jaccard over the devices, so naming every device in the lab scores badly
+	// rather than perfectly. An agent that answers "one of these two hundred"
+	// has diagnosed nothing.
+	if len(wantDevices) > 0 || len(d.FaultyDevices) > 0 {
+		said := map[string]bool{}
+		for _, dev := range d.FaultyDevices {
+			said[strings.TrimSpace(dev)] = true
+		}
+		inter, union := 0, len(wantDevices)
+		for dev := range said {
+			if wantDevices[dev] {
+				inter++
+			} else {
+				union++
+			}
+		}
+		if union > 0 {
+			s.Devices = float64(inter) / float64(union)
+		}
+	} else {
+		s.Devices = 1
+	}
+	s.Category = len(wantCats) == 0 || wantCats[d.Category]
+	// Every injected root cause has to be named, and nothing else: a list of
+	// all sixty type names would otherwise contain the right one.
+	if len(wantNames) == 0 {
+		s.RootCause = len(d.RootCauseNames) == 0
+	} else {
+		said := map[string]bool{}
+		for _, n := range d.RootCauseNames {
+			said[strings.TrimSpace(n)] = true
+		}
+		s.RootCause = len(said) == len(wantNames)
+		for n := range wantNames {
+			if !said[n] {
+				s.RootCause = false
+			}
+		}
+	}
+
+	// Weighted towards the cause. Detecting that something is wrong is the
+	// easiest part and worth the least; naming what it was is the point.
+	s.Total = 0
+	if s.Detected {
+		s.Total += 0.2
+	}
+	s.Total += 0.3 * s.Devices
+	if s.Category {
+		s.Total += 0.2
+	}
+	if s.RootCause {
+		s.Total += 0.3
+	}
+
+	var missing []string
+	for dev := range wantDevices {
+		found := false
+		for _, said := range d.FaultyDevices {
+			if strings.TrimSpace(said) == dev {
+				found = true
+			}
+		}
+		if !found {
+			missing = append(missing, dev)
+		}
+	}
+	sort.Strings(missing)
+	if len(missing) > 0 {
+		s.Detail = "did not name " + strings.Join(missing, ", ")
+	}
+	return s
+}
+
+// runAgent hands an episode to a command and reads back its diagnosis.
+//
+// The agent is given the brief and the symptoms on standard input, and the
+// environment it needs to look at the lab. It is *not* given the ground truth,
+// the fault names, or anything else that would answer the question: a benchmark
+// whose subject can read the answer measures nothing.
+func runAgent(ctx context.Context, command string, ep *Episode, manifest, token string,
+	timeout time.Duration) (Diagnosis, string, error) {
+
+	var d Diagnosis
+	brief := struct {
+		Brief    string   `json:"brief"`
+		Symptoms []string `json:"symptoms"`
+		Lab      string   `json:"lab"`
+		Manifest string   `json:"manifest"`
+		Deadline string   `json:"deadline"`
+	}{ep.Brief, ep.Symptoms, ep.Lab, manifest, timeout.String()}
+	input, err := json.MarshalIndent(brief, "", "  ")
+	if err != nil {
+		return d, "", err
+	}
+
+	runCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	c := exec.CommandContext(runCtx, "sh", "-c", command)
+	c.Stdin = strings.NewReader(string(input) + "\n")
+	c.Env = append(os.Environ(),
+		"TWINET_MANIFEST="+manifest,
+		"TWINET_LAB="+ep.Lab,
+		"TWINET_TOKEN="+token,
+	)
+	var out, errb strings.Builder
+	c.Stdout, c.Stderr = &out, &errb
+	runErr := c.Run()
+	raw := strings.TrimSpace(out.String())
+	if raw == "" {
+		return d, errb.String(), fmt.Errorf("the agent printed no diagnosis (%v): %s",
+			runErr, firstLines(errb.String(), 3))
+	}
+	// The last JSON object the agent printed, so an agent that narrates before
+	// answering is not punished for narrating.
+	if i := strings.LastIndex(raw, "{"); i > 0 {
+		raw = raw[i:]
+	}
+	if err := json.Unmarshal([]byte(raw), &d); err != nil {
+		return d, errb.String(), fmt.Errorf("the agent's diagnosis could not be read (%w): %s",
+			err, firstLines(raw, 3))
+	}
+	return d, errb.String(), nil
+}
