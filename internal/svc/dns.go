@@ -129,7 +129,14 @@ func BuildDNS(top *model.Topology, serial uint32) *DNSPlan {
 func resolverAddrs(top *model.Topology) map[int]string {
 	out := map[int]string{}
 	for _, d := range top.Devices {
-		if d.Kind != model.KindService || !strings.Contains(strings.ToLower(d.Name), "dns") {
+		if d.Kind != model.KindService {
+			continue
+		}
+		// What it was declared to be, not what it is called.
+		if d.ServiceKind != "" && d.ServiceKind != "builtin.dns" {
+			continue
+		}
+		if d.ServiceKind == "" && !strings.Contains(strings.ToLower(d.Name), "dns") {
 			continue
 		}
 		for _, i := range d.Ifaces {

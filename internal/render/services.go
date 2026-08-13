@@ -167,12 +167,36 @@ func (r *Renderer) serviceRoutes(d *model.Device) []deploy.Command {
 	return cmds
 }
 
+// isRPKI and isDNS ask what a service was declared to be.
+//
+// They used to ask what it was called: any service device whose name contained
+// "rpki" got a validator started in it and any other did not, so a manifest
+// that named its validator "roa" got a container running nothing at all, with
+// no error anywhere -- and every route in the lab became not-found, which looks
+// exactly like a student who filtered too much. The name is a label; the kind
+// is the declaration.
+//
+// The name is still consulted as a fallback, because a service declared as a
+// plain container may still be one of these, and because labs deployed before
+// the kind was recorded must keep working.
 func isRPKI(d *model.Device) bool {
-	return d.Kind == model.KindService && strings.Contains(strings.ToLower(d.Name), "rpki")
+	if d.Kind != model.KindService {
+		return false
+	}
+	if d.ServiceKind != "" {
+		return d.ServiceKind == "builtin.rpki"
+	}
+	return strings.Contains(strings.ToLower(d.Name), "rpki")
 }
 
 func isDNS(d *model.Device) bool {
-	return d.Kind == model.KindService && strings.Contains(strings.ToLower(d.Name), "dns")
+	if d.Kind != model.KindService {
+		return false
+	}
+	if d.ServiceKind != "" {
+		return d.ServiceKind == "builtin.dns"
+	}
+	return strings.Contains(strings.ToLower(d.Name), "dns")
 }
 
 // dnsSerial derives a zone serial from the topology, so a redeployment of an

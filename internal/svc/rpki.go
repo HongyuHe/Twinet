@@ -307,7 +307,14 @@ func writePDU(w io.Writer, kind byte, session uint16, body []byte) error {
 // RPKIAddrFor returns the address devices in an AS reach the validator at.
 func RPKIAddrFor(top *model.Topology, asn int) string {
 	for _, d := range top.Devices {
-		if d.Kind != model.KindService || !strings.Contains(strings.ToLower(d.Name), "rpki") {
+		if d.Kind != model.KindService {
+			continue
+		}
+		// What it was declared to be, not what it is called.
+		if d.ServiceKind != "" && d.ServiceKind != "builtin.rpki" {
+			continue
+		}
+		if d.ServiceKind == "" && !strings.Contains(strings.ToLower(d.Name), "rpki") {
 			continue
 		}
 		for _, i := range d.Ifaces {

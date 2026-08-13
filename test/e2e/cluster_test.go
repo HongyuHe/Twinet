@@ -904,43 +904,172 @@ func resolverOf(t *testing.T, dir, device string) string {
 func TestDHCPFaultsProduceTheirSymptoms(t *testing.T) {
 	dir := labDir(t)
 	const gw, client, iface = "as3/BOS", "as3/BOS_host", "BOSrouter"
+	const realGW = "3.103.0.2"
 
-	lease := func(t *testing.T) string {
+	// The lease is decoded, not pattern-matched on udhcpc's chatter.
+	//
+	// "obtained from X" is the server identifier and nothing else, so a test
+	// built on it could not tell a wrong gateway from a wrong server, could not
+	// see the resolver or the address at all, and passed a fault that changed
+	// something other than the option it names. udhcpc hands every option to
+	// its script in the environment, so the script prints them and the test
+	// reads the lease the client actually received.
+	lease := func(t *testing.T) map[string]string {
 		t.Helper()
+		script := "#!/bin/sh\n" +
+			"echo \"TWLEASE ip=$ip mask=$subnet router=$router dns=$dns " +
+			"serverid=$serverid lease=$lease\"\n"
+		cmd := "cat > /tmp/twlease.sh <<'EOS'\n" + script + "EOS\n" +
+			"chmod +x /tmp/twlease.sh\n" +
+			"udhcpc -i " + iface + " -n -q -f -t 6 -T 3 -s /tmp/twlease.sh 2>&1 | tail -6\n"
 		var last string
 		for attempt := 0; attempt < 3; attempt++ {
-			out, _ := twinet(t, "exec", "-m", dir, client, "--", "sh", "-c",
-				"udhcpc -i "+iface+" -n -q -f -t 6 -T 3 -s /bin/true 2>&1 | tail -3")
+			out, _ := twinet(t, "exec", "-m", dir, client, "--", "sh", "-c", cmd)
 			last = out
-			if strings.Contains(out, "lease of") {
-				return out
+			for _, line := range strings.Split(out, "\n") {
+				if !strings.Contains(line, "TWLEASE") {
+					continue
+				}
+				got := map[string]string{"raw": out}
+				for _, kv := range strings.Fields(strings.TrimSpace(line)) {
+					if k, v, ok := strings.Cut(kv, "="); ok {
+						got[k] = v
+					}
+				}
+				if got["ip"] != "" {
+					return got
+				}
 			}
 			time.Sleep(5 * time.Second)
 		}
-		return last
+		return map[string]string{"raw": last}
 	}
 
-	// The lab as it stands: a client is served, by the gateway.
-	if out := lease(t); !strings.Contains(out, "lease of") ||
-		!strings.Contains(out, "obtained from 3.103.0.2") {
+	inPool := func(ip string) bool {
+		return strings.HasPrefix(ip, "3.103.0.2") && ip != realGW
+	}
+
+	// The lab as it stands: a client is served, by the gateway, with the
+	// gateway as its router and the lab's resolver.
+	base := lease(t)
+	switch {
+	case base["ip"] == "":
 		t.Fatalf("no lease before anything was injected, so nothing below would mean "+
-			"anything:\n%s", out)
+			"anything:\n%s", base["raw"])
+	case base["serverid"] != realGW:
+		t.Fatalf("the lease came from %q rather than the gateway %s:\n%s",
+			base["serverid"], realGW, base["raw"])
+	case base["router"] != realGW:
+		t.Fatalf("option 3 is %q rather than the gateway %s:\n%s",
+			base["router"], realGW, base["raw"])
+	case base["mask"] == "":
+		t.Fatalf("option 1 is absent from the lease:\n%s", base["raw"])
+	case base["dns"] == "":
+		t.Fatalf("option 6 is absent from the lease:\n%s", base["raw"])
+	case !inPool(base["ip"]):
+		t.Fatalf("the address %q is not on the segment:\n%s", base["ip"], base["raw"])
 	}
+	t.Logf("healthy lease: ip=%s mask=%s router=%s dns=%s serverid=%s",
+		base["ip"], base["mask"], base["router"], base["dns"], base["serverid"])
 
+	// Every DHCP fault, and for each of them the option that must change and
+	// the ones that must not. A fault that moves more than it names is two
+	// faults, and an RCA episode built on it is unanswerable.
 	cases := []struct {
 		fault string
-		want  func(string) bool
 		says  string
+		want  func(t *testing.T, got map[string]string)
 	}{
-		{"dhcp_service_down",
-			func(s string) bool { return !strings.Contains(s, "lease of") },
-			"a client to get no lease at all"},
-		{"dhcp_spoofed_gateway",
-			func(s string) bool { return strings.Contains(s, "obtained from 3.103.0.254") },
-			"a client to be served by an address that is not the router"},
-		{"dhcp_missing_subnet",
-			func(s string) bool { return !strings.Contains(s, "lease of") },
-			"a client on the removed segment to get no lease"},
+		{
+			fault: "dhcp_service_down",
+			says:  "a client to get no lease at all",
+			want: func(t *testing.T, got map[string]string) {
+				if got["ip"] != "" {
+					t.Errorf("a client still obtained %s while the server was down:\n%s",
+						got["ip"], got["raw"])
+				}
+			},
+		},
+		{
+			fault: "dhcp_missing_subnet",
+			says:  "a client on the removed segment to get no lease",
+			want: func(t *testing.T, got map[string]string) {
+				if got["ip"] != "" {
+					t.Errorf("a client still obtained %s from a server with no configuration "+
+						"for its segment:\n%s", got["ip"], got["raw"])
+				}
+			},
+		},
+		{
+			fault: "dhcp_spoofed_gateway",
+			says:  "a client to be told to use a gateway that is not the router",
+			want: func(t *testing.T, got map[string]string) {
+				if got["ip"] == "" {
+					t.Fatalf("a client got no lease at all, but this fault keeps serving "+
+						"them:\n%s", got["raw"])
+				}
+				if got["router"] == realGW || got["router"] == "" {
+					t.Errorf("option 3 is %q; the fault is that it should not be the "+
+						"router:\n%s", got["router"], got["raw"])
+				}
+				// The server's identity is not the gateway it advertises.
+				// Deriving option 54 from option 3 made this fault move both,
+				// so the client renewed against the impostor and the symptom
+				// under test was two faults rather than the one named.
+				if got["serverid"] != realGW {
+					t.Errorf("option 54 moved to %q with the gateway; a fault that changes "+
+						"the advertised gateway must not change who the server is:\n%s",
+						got["serverid"], got["raw"])
+				}
+				if !inPool(got["ip"]) {
+					t.Errorf("the address %q also moved:\n%s", got["ip"], got["raw"])
+				}
+				if got["dns"] != base["dns"] {
+					t.Errorf("option 6 also moved, from %q to %q:\n%s",
+						base["dns"], got["dns"], got["raw"])
+				}
+			},
+		},
+		{
+			fault: "dhcp_spoofed_dns",
+			says:  "a client to be told to use a resolver that does not answer",
+			want: func(t *testing.T, got map[string]string) {
+				if got["ip"] == "" {
+					t.Fatalf("a client got no lease at all, but this fault keeps serving "+
+						"them:\n%s", got["raw"])
+				}
+				if got["dns"] == base["dns"] || got["dns"] == "" {
+					t.Errorf("option 6 is %q, the same resolver as before the fault:\n%s",
+						got["dns"], got["raw"])
+				}
+				if got["router"] != realGW {
+					t.Errorf("option 3 also moved, to %q:\n%s", got["router"], got["raw"])
+				}
+				if got["serverid"] != realGW {
+					t.Errorf("option 54 also moved, to %q:\n%s", got["serverid"], got["raw"])
+				}
+				if !inPool(got["ip"]) {
+					t.Errorf("the address %q also moved:\n%s", got["ip"], got["raw"])
+				}
+			},
+		},
+		{
+			fault: "dhcp_spoofed_subnet",
+			says:  "a client to come up on a network nobody else is on",
+			want: func(t *testing.T, got map[string]string) {
+				if got["ip"] == "" {
+					t.Fatalf("a client got no lease at all, but this fault keeps serving "+
+						"them:\n%s", got["raw"])
+				}
+				if !strings.HasPrefix(got["ip"], "10.255.255.") {
+					t.Errorf("the address is %q; the fault moves the pool to 10.255.255.0/24"+
+						":\n%s", got["ip"], got["raw"])
+				}
+				if got["serverid"] != realGW {
+					t.Errorf("option 54 also moved, to %q:\n%s", got["serverid"], got["raw"])
+				}
+			},
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.fault, func(t *testing.T) {
@@ -955,17 +1084,26 @@ func TestDHCPFaultsProduceTheirSymptoms(t *testing.T) {
 			}()
 			// The server re-reads its configuration on a timer.
 			time.Sleep(14 * time.Second)
-			out := lease(t)
-			if !c.want(out) {
-				t.Errorf("%s did not make %s; what the client saw:\n%s", c.fault, c.says, out)
-			}
+			got := lease(t)
+			t.Logf("%s: ip=%s mask=%s router=%s dns=%s serverid=%s",
+				c.fault, got["ip"], got["mask"], got["router"], got["dns"], got["serverid"])
+			c.want(t, got)
 		})
 	}
 
-	// And afterwards the lab serves leases again.
+	// And afterwards the lab serves leases again, with every option back where
+	// it started.
 	time.Sleep(14 * time.Second)
-	if out := lease(t); !strings.Contains(out, "obtained from 3.103.0.2") {
-		t.Errorf("after resolving every fault a client is still not served by the gateway:\n%s", out)
+	end := lease(t)
+	for _, k := range []string{"mask", "router", "dns", "serverid"} {
+		if end[k] != base[k] {
+			t.Errorf("after resolving every fault, %s is %q and was %q:\n%s",
+				k, end[k], base[k], end["raw"])
+		}
+	}
+	if !inPool(end["ip"]) {
+		t.Errorf("after resolving every fault a client is addressed %q:\n%s",
+			end["ip"], end["raw"])
 	}
 }
 

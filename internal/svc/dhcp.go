@@ -48,6 +48,16 @@ type DHCPSubnet struct {
 	DNS     []string `json:"dns,omitempty"`
 	// Lease is how long a client may keep an address.
 	Lease int `json:"lease_seconds,omitempty"`
+	// Self is this server's own address on the segment, which is what option
+	// 54 carries.
+	//
+	// It used to be derived from Routers[0], on the reasoning that they are the
+	// same address -- which they are, until a fault changes one of them. A
+	// fault that hands out a wrong gateway then also moved the server
+	// identifier, so the client renewed against the impostor and the symptom
+	// under test was two faults instead of one. The server's identity does not
+	// depend on what it tells clients to use as a gateway.
+	Self string `json:"self,omitempty"`
 }
 
 // DHCPConfig is what the server serves.
@@ -144,6 +154,7 @@ func BuildDHCP(top *model.Topology, r *model.Device) *DHCPConfig {
 			s.Last = netip.AddrFrom4(last).String()
 			if gw := addrOnSubnet(r, net); gw != "" {
 				s.Routers = []string{gw}
+				s.Self = gw
 			}
 			if dns := ResolverFor(top, r.ASN); dns != "" {
 				s.DNS = []string{dns}
@@ -403,10 +414,19 @@ func (s *DHCPServer) reply(req []byte, kind byte, sub *DHCPSubnet, addr netip.Ad
 	return out
 }
 
-// serverID is the address the client should talk to, which is ours on that
-// subnet. Derived from the router option because that is the only address of
-// this network the configuration names.
+// serverID is this server's own address on the subnet, which is what a client
+// puts in option 54 when it renews.
+//
+// Independent of the router option on purpose. Reading it out of Routers[0] was
+// convenient and wrong: it made every fault that changes the advertised gateway
+// also change who the server claims to be, so the symptom being measured was
+// never the one the fault names.
 func (s *DHCPServer) serverID(sub *DHCPSubnet) netip.Addr {
+	if sub.Self != "" {
+		if a, err := netip.ParseAddr(sub.Self); err == nil {
+			return a
+		}
+	}
 	if len(sub.Routers) > 0 {
 		if a, err := netip.ParseAddr(sub.Routers[0]); err == nil {
 			return a

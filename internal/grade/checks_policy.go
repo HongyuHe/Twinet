@@ -227,7 +227,7 @@ func checkSixIn4(ctx context.Context, env *Env) Result {
 			// what is left is whether the answer covers the whole datacentre
 			// or only the corner this check used to look at.
 			if throughTunnel {
-				unreached = crossDatacentreGaps(ctx, env, hostsIn, domains)
+				unreached = crossDatacentreGaps(ctx, env, hostsIn, domains, gateways, tunnels)
 			}
 			// And the return path has to be encapsulated too.
 			//
@@ -1685,8 +1685,10 @@ func selectedRoute(line string) bool {
 // a submission that configured one VLAN and not the other -- or the forward
 // path and not the return -- score the whole point.
 func crossDatacentreGaps(ctx context.Context, env *Env, hostsIn map[string][]*model.Device,
-	domains []string) []string {
+	domains []string, gateways map[string]*model.Device, tunnels map[string]string) []string {
+
 	var gaps []string
+	const packets = 2
 	for i, from := range domains {
 		for j, to := range domains {
 			if i == j {
@@ -1700,8 +1702,22 @@ func crossDatacentreGaps(ctx context.Context, env *Env, hostsIn map[string][]*mo
 							dst.Name, to))
 						continue
 					}
+					// The tunnel counter is bracketed around every pair, not
+					// only the first one.
+					//
+					// Reachability alone was the test here, and it does not
+					// distinguish encapsulated traffic from native IPv6: a
+					// system with a /128 tunnel route for the one pair the
+					// check happened to measure and native IPv6 for the rest
+					// scored the whole mark for an answer that does not use the
+					// tunnel at all.
+					gw, tun := gateways[from], tunnels[from]
+					before := -1
+					if gw != nil {
+						before = tunnelTx(ctx, env, gw.ID, tun)
+					}
 					res, err := env.Probe(ctx, src.ID,
-						[]string{"ping6", "-c", "2", "-W", "4", "-i", "0.3", addr})
+						[]string{"ping6", "-c", strconv.Itoa(packets), "-W", "4", "-i", "0.3", addr})
 					if err != nil {
 						gaps = append(gaps, fmt.Sprintf("%s could not be asked to reach %s: %v",
 							src.Name, dst.Name, err))
@@ -1710,6 +1726,26 @@ func crossDatacentreGaps(ctx context.Context, env *Env, hostsIn map[string][]*mo
 					if res.ExitCode != 0 {
 						gaps = append(gaps, fmt.Sprintf("%s (%s) cannot reach %s (%s) at %s",
 							src.Name, from, dst.Name, to, addr))
+						continue
+					}
+					if gw == nil || tun == "" || before < 0 {
+						continue
+					}
+					after := tunnelTx(ctx, env, gw.ID, tun)
+					if after < 0 {
+						gaps = append(gaps, fmt.Sprintf(
+							"%s reaches %s (%s), but %s could not be read on %s, so there is "+
+								"no evidence the traffic was encapsulated",
+							src.Name, dst.Name, to, tun, gw.Name))
+						continue
+					}
+					if after-before < packets {
+						gaps = append(gaps, fmt.Sprintf(
+							"%s (%s) reaches %s (%s) at %s, but %s on %s carried %d packet(s) "+
+								"while %d were sent, so that traffic is routed natively rather "+
+								"than through the tunnel",
+							src.Name, from, dst.Name, to, addr, tun, gw.Name,
+							after-before, packets))
 					}
 				}
 			}

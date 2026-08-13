@@ -145,6 +145,7 @@ func (l *Loaded) validateTemplates(d *Diagnostics) {
 		if len(tpl.Routers) == 0 {
 			d.Add(file, "routers", "template declares no routers", nodeAt(root, "routers"))
 		}
+		l.validateProvisioning(d, file, root, name, tpl)
 
 		// Router IDs must be unique: the addressing plan indexes on them, so a
 		// duplicate silently aliases two routers' loopbacks and host subnets.
@@ -641,4 +642,80 @@ func joinInts(v []int) string {
 		parts[i] = fmt.Sprint(n)
 	}
 	return strings.Join(parts, ", ")
+}
+
+// validateProvisioning refuses a provisioning declaration that cannot be
+// carried out.
+//
+// Everything here used to be accepted and ignored: a scope was never read, a
+// rule naming an interface was skipped, and the `student` list was read by
+// nothing at all. A course could declare precisely which half of the
+// configuration it wanted to hand out, be told the manifest was valid, and get
+// a lab where the split was decided entirely by whether the AS's role happened
+// to be "student".
+func (l *Loaded) validateProvisioning(d *Diagnostics, file string, root *yaml.Node,
+	name string, tpl *model.ASTemplate) {
+
+	base := "templates." + name + ".provisioning"
+	node := nodeAt(root, base)
+	known := strings.Join(model.KnownDomains(), ", ")
+
+	sawIBGP, sawEBGP := false, false
+	for i, r := range tpl.Provisioning.Provisioned {
+		path := fmt.Sprintf("%s.provisioned[%d]", base, i)
+		if r.Scope == "" && r.DeviceKind == "" && r.Iface == nil {
+			d.Add(file, path, "a provisioning rule selects nothing", node)
+			continue
+		}
+		if r.Scope != "" {
+			dom, ok := model.NormaliseDomain(r.Scope)
+			switch {
+			case !ok:
+				d.AddHint(file, path+".scope", node,
+					fmt.Sprintf("unknown configuration domain %q", r.Scope),
+					"known domains: "+known)
+			case !model.CanProvision(dom):
+				d.AddHint(file, path+".scope", node,
+					fmt.Sprintf("%q cannot be provisioned on its own", r.Scope),
+					"it is rendered inside a stanza that carries other domains too; "+
+						"use `scope: all` to hand out the whole configuration, or leave "+
+						"it to the students")
+			}
+			sawIBGP = sawIBGP || r.Scope == "ibgp"
+			sawEBGP = sawEBGP || r.Scope == "ebgp"
+		}
+		switch r.DeviceKind {
+		case "", model.KindRouter, model.KindHost, model.KindSwitch:
+		default:
+			d.AddHint(file, path+".device_kind", node,
+				fmt.Sprintf("provisioning cannot be decided per %q device", r.DeviceKind),
+				"device_kind may be router, host or switch")
+		}
+		if r.Iface != nil {
+			dev := r.Iface.Router
+			if dev == "" {
+				dev = r.Iface.Device
+			}
+			if dev == "" {
+				d.Add(file, path+".iface", "an interface rule must name a router or a device", node)
+			}
+			if r.Iface.Name == "" {
+				d.Add(file, path+".iface.name", "an interface rule must name an interface", node)
+			}
+		}
+	}
+	if sawIBGP != sawEBGP {
+		// One FRR stanza carries both, so there is no way to hand out one and
+		// withhold the other. Saying so is better than quietly giving both.
+		d.AddHint(file, base+".provisioned", node,
+			"iBGP and eBGP cannot be provisioned separately",
+			"they are rendered as one `router bgp` stanza; provision both, or neither")
+	}
+	for i, dom := range tpl.Provisioning.Student {
+		if _, ok := model.NormaliseDomain(dom); !ok {
+			d.AddHint(file, fmt.Sprintf("%s.student[%d]", base, i), node,
+				fmt.Sprintf("unknown configuration domain %q", dom),
+				"known domains: "+known)
+		}
+	}
 }

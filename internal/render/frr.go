@@ -157,22 +157,31 @@ func Router(top *model.Topology, d *model.Device) (RouterConfig, error) {
 	}
 	mpls := renderMPLS(as, d)
 	vrfBGP := renderVRFBGP(as, d)
-	if isPlatformOwned(as) {
-		plat.WriteString(ospf)
-		plat.WriteString(bgp)
-		plat.WriteString(mpls)
-		plat.WriteString(vrfBGP)
-	} else {
-		exp.WriteString(ospf)
-		exp.WriteString(bgp)
-		exp.WriteString(mpls)
-		exp.WriteString(vrfBGP)
+	// Per domain, not per AS.
+	//
+	// This was one decision for the whole router: either the AS was a staff one
+	// and Twinet configured everything, or it was a student one and Twinet
+	// configured nothing. A course that wants the interior given and the
+	// exterior assigned -- which is what the advanced labs are -- could declare
+	// exactly that in the manifest, and got a lab where the students were
+	// handed neither.
+	into := func(domain, text string) {
+		if text == "" {
+			return
+		}
+		if as.Provides(domain) {
+			plat.WriteString(text)
+			return
+		}
+		exp.WriteString(text)
 	}
+	into(model.DomainOSPF, ospf)
+	into(model.DomainBGP, bgp)
+	into(model.DomainMPLS, mpls)
+	into(model.DomainBGP, vrfBGP)
 
 	return RouterConfig{Platform: plat.String(), Expected: exp.String()}, nil
 }
-
-func isPlatformOwned(as *model.AS) bool { return as.Role != model.RoleStudent }
 
 // ospfCost returns the OSPF cost the reference solution puts on an interface.
 //

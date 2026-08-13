@@ -46,6 +46,17 @@ func TestTheWireCarriesEveryModelField(t *testing.T) {
 			},
 		},
 		{
+			name: "Device",
+			from: model.Device{},
+			to:   WireDev{},
+			omit: map[string]string{
+				"ASN":        "carried as AS",
+				"Services":   "the service devices are carried in their own list",
+				"AllowVLANs": "derived on the node from the interfaces it is given",
+				"FRR":        "rendered on the node from the wire, never sent: sending it would mean two renderers",
+			},
+		},
+		{
 			name: "AS",
 			from: model.AS{},
 			to:   WireAS{},

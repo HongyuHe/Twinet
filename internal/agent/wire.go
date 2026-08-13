@@ -3,6 +3,7 @@ package agent
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 
 	"github.com/HongyuHe/twinet/internal/model"
 )
@@ -83,6 +84,7 @@ type WireDev struct {
 	Binds        []string          `json:"binds,omitempty"`
 	Command      []string          `json:"command,omitempty"`
 	Labels       map[string]string `json:"labels,omitempty"`
+	ServiceKind  string            `json:"service_kind,omitempty"`
 	L2Gateway    string            `json:"l2_gateway,omitempty"`
 	L2Domain     string            `json:"l2_domain,omitempty"`
 	VLANs        []int             `json:"vlans,omitempty"`
@@ -151,6 +153,13 @@ type WireAS struct {
 	MPLSEnabled bool                     `json:"mpls_enabled,omitempty"`
 	MPLSCore    []string                 `json:"mpls_core,omitempty"`
 	VRFs        map[string]model.VRFSpec `json:"vrfs,omitempty"`
+	// Provisioned is the compiled provisioning declaration: which
+	// configuration domains Twinet configures for a student AS. The node
+	// renders the device, so a node that did not receive this would hand out a
+	// different half of the configuration from the one the manifest asked for,
+	// and nothing downstream would say so.
+	Provisioned       []string `json:"provisioned,omitempty"`
+	ProvisionedIfaces []string `json:"provisioned_ifaces,omitempty"`
 }
 
 // WireSvc is one auxiliary service.
@@ -184,7 +193,8 @@ func Serialise(top *model.Topology) *Wire {
 
 	for _, d := range top.SortedDevices() {
 		wd := WireDev{
-			ID: d.ID, Name: d.Name, Kind: string(d.Kind), AS: d.ASN,
+			ServiceKind: d.ServiceKind,
+			ID:          d.ID, Name: d.Name, Kind: string(d.Kind), AS: d.ASN,
 			RouterID: d.RouterID, Node: d.Node, Image: d.Image, ImageID: d.ImageID,
 			Container: d.Container, Hostname: d.Hostname, Owner: d.Owner,
 			CPUs: d.CPUs, Memory: d.Memory, Pids: d.Pids, Restart: d.Restart,
@@ -228,6 +238,8 @@ func Serialise(top *model.Topology) *Wire {
 			Template: as.Template, OwnerGroup: as.OwnerGroup,
 			Block: as.Block, BlockV6: as.BlockV6,
 			MPLSEnabled: as.MPLS.Enabled, MPLSCore: as.MPLS.Core,
+			Provisioned:       sortedSetKeys(as.Provisioned),
+			ProvisionedIfaces: sortedSetKeys(as.ProvisionedIfaces),
 		}
 		if len(as.VRFs) > 0 {
 			wa.VRFs = map[string]model.VRFSpec{}
@@ -297,7 +309,8 @@ func (w *Wire) Rehydrate() (*model.Topology, error) {
 			Privileged: wd.Privileged, Env: wd.Env, Sysctls: wd.Sysctls,
 			Capabilities: wd.Capabilities, Binds: wd.Binds, Command: wd.Command,
 			Labels: wd.Labels, L2Gateway: wd.L2Gateway, L2Domain: wd.L2Domain,
-			VLANs: wd.VLANs,
+			ServiceKind: wd.ServiceKind,
+			VLANs:       wd.VLANs,
 		}
 		for _, wi := range wd.Ifaces {
 			ifc := &model.Iface{
@@ -342,8 +355,10 @@ func (w *Wire) Rehydrate() (*model.Topology, error) {
 			ASN: wa.ASN, Role: model.ASRole(wa.Role), Region: wa.Region,
 			Template: wa.Template, OwnerGroup: wa.OwnerGroup,
 			Block: wa.Block, BlockV6: wa.BlockV6,
-			ExtPorts: map[string]*model.ExtPortBinding{},
-			MPLS:     model.MPLSSpec{Enabled: wa.MPLSEnabled, Core: wa.MPLSCore},
+			ExtPorts:          map[string]*model.ExtPortBinding{},
+			MPLS:              model.MPLSSpec{Enabled: wa.MPLSEnabled, Core: wa.MPLSCore},
+			Provisioned:       setOf(wa.Provisioned),
+			ProvisionedIfaces: setOf(wa.ProvisionedIfaces),
 		}
 		if len(wa.VRFs) > 0 {
 			as.VRFs = map[string]*model.VRFSpec{}
@@ -384,4 +399,30 @@ func (w *Wire) Rehydrate() (*model.Topology, error) {
 	}
 
 	return top, nil
+}
+
+// sortedSetKeys renders a set as a stable list for the wire.
+func sortedSetKeys(m map[string]bool) []string {
+	if len(m) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(m))
+	for k, v := range m {
+		if v {
+			out = append(out, k)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func setOf(v []string) map[string]bool {
+	if len(v) == 0 {
+		return map[string]bool{}
+	}
+	out := make(map[string]bool, len(v))
+	for _, k := range v {
+		out[k] = true
+	}
+	return out
 }
