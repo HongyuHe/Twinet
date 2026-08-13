@@ -187,15 +187,14 @@ is not built.
 
 Recorded here rather than implied to be complete:
 
-- `tunnel.sixin4` tests one host in each datacentre and one direction. A
-  submission that configures one VLAN and not another, or the forward path and
-  not the reverse, can still score the point. It does now check that the tunnel
-  is 6in4 rather than any encapsulation, and that its endpoints are the two
-  gateways' loopbacks.
-- `policy.ixp_communities` accepts any non-empty set of real member communities.
-  It checks that the exchange relayed the announcement and that no in-region
-  route was accepted, but not that the tagged set is exactly the members the
-  assignment intends.
+- `tunnel.sixin4` now tests every host of each datacentre against every host of
+  the other, in both directions, as well as checking that the tunnel is 6in4
+  rather than any encapsulation and that its endpoints are the two gateways'
+  loopbacks. Measured: flushing the IPv6 address of one of AS 3's six
+  datacentre hosts takes the system from 10.00 to 9.00.
+- `policy.ixp_communities` now requires the announcement to be tagged for every
+  member of the exchange, not merely for some real member. Measured: tagging
+  one member of seven takes the system from 10.00 to 9.50.
 - The end-to-end discrimination suite covers q1.2, q2.1 and q2.3. The rest rest
   on the reference scoring 10/10 and on the checks having been shown to
   discriminate by hand -- q2.4 against a forged community, q2.2 against

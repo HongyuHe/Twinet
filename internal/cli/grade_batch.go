@@ -707,7 +707,23 @@ func applyDeviceScript(ctx context.Context, exec execFn, d *model.Device, body s
 		`  case "$c" in ''|\#*) continue;; esac`,
 		"  opt=0",
 		`  case "$c" in -*) opt=1; c=${c#-};; esac`,
-		`  if ! err=$($c 2>&1 >/dev/null); then`,
+		// Run through a shell, because the syntax the checker accepts is
+		// shell syntax.
+		//
+		// The line used to be run as a bare `$c`, which word-splits and globs
+		// but does not act on operators. So `ip link show tun6 >/dev/null 2>&1
+		// || ip tunnel add ...` -- the ordinary guarded form, which the checker
+		// accepts and which the reference answer itself uses -- ran ip(8) with
+		// ">/dev/null", "2>&1" and "||" as arguments, failed, and was reported
+		// to the student as their mistake. And `true && ip ...` silently ran
+		// nothing but `true`, so the configuration was never installed and the
+		// submission was marked on a device where nothing had happened.
+		//
+		// Nothing new gets in: every word of every fragment has already been
+		// checked against the allowlist, and substitution is refused outright,
+		// so there is no way for a shell to turn this text into a command the
+		// checker did not see.
+		`  if ! err=$(sh -c "$c" 2>&1 >/dev/null); then`,
 		`    if [ "$opt" = 0 ]; then`,
 		`      echo "$c: $err" >&2`,
 		"      rc=1",

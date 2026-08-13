@@ -68,13 +68,24 @@ func checkSixIn4(ctx context.Context, env *Env) Result {
 	if len(gateways) < 2 {
 		return Errored("tunnel.sixin4", fmt.Errorf("expected two L2 gateways, found %d", len(gateways)))
 	}
-	hosts := map[string]*model.Device{}
+	// Every host, not one per datacentre.
+	//
+	// One host in each was tested, in one direction, so a submission that
+	// configured one VLAN and not the other, or the forward path and not the
+	// return, scored the whole point. The datacentres here hold two and four
+	// hosts across two VLANs, and the question is about the datacentres, not
+	// about whichever host this check happened to pick.
+	hostsIn := map[string][]*model.Device{}
 	for _, d := range as.Devices {
 		if d.Kind == model.KindHost && d.L2Domain != "" {
-			if _, have := hosts[d.L2Domain]; !have {
-				hosts[d.L2Domain] = d
-			}
+			hostsIn[d.L2Domain] = append(hostsIn[d.L2Domain], d)
 		}
+	}
+	hosts := map[string]*model.Device{}
+	for dom, ds := range hostsIn {
+		sort.Slice(ds, func(i, j int) bool { return ds[i].Name < ds[j].Name })
+		hostsIn[dom] = ds
+		hosts[dom] = ds[0]
 	}
 
 	domains := make([]string, 0, len(gateways))
@@ -122,6 +133,7 @@ func checkSixIn4(ctx context.Context, env *Env) Result {
 	// and it is not what the question asks for. The tunnel's own counters
 	// settle it: if they do not move, the packets went some other way.
 	var reach string
+	var unreached []string
 	reachable, throughTunnel := false, false
 	if len(domains) >= 2 {
 		src, sok := hosts[domains[0]]
@@ -208,14 +220,33 @@ func checkSixIn4(ctx context.Context, env *Env) Result {
 					"so the traffic is being routed natively rather than encapsulated",
 					dst.Name, tunnels[domains[0]])
 			}
+			// Now every host, both ways.
+			//
+			// The path above is known to work, so no waiting is needed here:
+			// what is left is whether the answer covers the whole datacentre
+			// or only the corner this check used to look at.
+			if throughTunnel {
+				unreached = crossDatacentreGaps(ctx, env, hostsIn, domains)
+			}
 		}
 	}
 
 	switch {
+	case len(missing) == 0 && reachable && throughTunnel && len(unreached) > 0:
+		// The tunnel works and the answer does not cover the datacentres.
+		return Partial("tunnel.sixin4", 0.5, Evidence{
+			Expected: "every host of each datacentre reaching every host of the other over IPv6",
+			Observed: fmt.Sprintf("the tunnel carries traffic, but %d host pair(s) cannot reach "+
+				"each other", len(unreached)),
+			Detail: strings.Join(truncate(unreached, 6), "\n"),
+			Hint: "check both VLANs, both datacentres and both directions -- a route or an " +
+				"address configured on one side only works one way",
+			Command: "ping6 <the other datacentre's host>",
+		})
 	case len(missing) == 0 && reachable && throughTunnel:
 		return Pass("tunnel.sixin4", Evidence{
-			Observed: fmt.Sprintf("IPv6 crosses between %s and %s through %s, which carried the packets",
-				domains[0], domains[1], tunnels[domains[0]])})
+			Observed: fmt.Sprintf("IPv6 crosses between %s and %s through %s in both directions, "+
+				"for every host of each", domains[0], domains[1], tunnels[domains[0]])})
 	case reachable:
 		return Partial("tunnel.sixin4", 0.5, Evidence{
 			Expected: "IPv6 carried over a 6in4 tunnel",
@@ -334,6 +365,26 @@ func checkIXPCommunities(ctx context.Context, env *Env) Result {
 	tagged = uniq(tagged)
 	sort.Strings(strangers)
 
+	// Every member, not any member.
+	//
+	// Any non-empty set of real member communities passed, so tagging one of
+	// five members -- an announcement four of them never receive -- scored the
+	// same as tagging all of them. The question is which members should get
+	// the route, and "one of them" is a different answer from "all of them".
+	var untagged []string
+	have := map[string]bool{}
+	for _, c := range tagged {
+		have[c] = true
+	}
+	for _, asn := range sortedInts(members) {
+		if asn == env.AS {
+			continue
+		}
+		if c := prefix + strconv.Itoa(asn); !have[c] {
+			untagged = append(untagged, c)
+		}
+	}
+
 	// (ii) The in-region filter must be applied to what arrives from the
 	// route server, the list it matches on must exist and select something,
 	// and -- the part that decides it -- no route whose path crosses an
@@ -408,6 +459,16 @@ func checkIXPCommunities(ctx context.Context, env *Env) Result {
 	}
 
 	switch {
+	case len(tagged) > 0 && filters && len(untagged) > 0:
+		return Partial("policy.ixp_communities", 0.5, Evidence{
+			Expected: fmt.Sprintf("the announcement tagged for every member of exchange %d", ixp),
+			Observed: fmt.Sprintf("it is tagged %s, so the exchange relays it to %d member(s) "+
+				"and not to %d other(s)", strings.Join(tagged, " "), len(seen.advertisedTo),
+				len(untagged)),
+			Detail:  "not tagged for " + strings.Join(untagged, " "),
+			Hint:    "every member of the exchange should receive your prefix; the in-region ones are refused on the way in, not left untagged on the way out",
+			Command: fmt.Sprintf("show bgp ipv4 unicast %s json (on the route server)", own),
+		})
 	case len(tagged) > 0 && filters:
 		return Pass("policy.ixp_communities", Evidence{
 			Observed: fmt.Sprintf("the exchange holds %s from this AS tagged %s and relayed it "+
@@ -1563,4 +1624,55 @@ var selectedRouteRE = regexp.MustCompile(`^[A-Za-z]*\*?>`)
 
 func selectedRoute(line string) bool {
 	return selectedRouteRE.MatchString(strings.TrimSpace(line))
+}
+
+// crossDatacentreGaps names the host pairs that cannot reach each other across
+// the two datacentres, in both directions.
+//
+// The question is about the datacentres. Testing one host in each, one way, let
+// a submission that configured one VLAN and not the other -- or the forward
+// path and not the return -- score the whole point.
+func crossDatacentreGaps(ctx context.Context, env *Env, hostsIn map[string][]*model.Device,
+	domains []string) []string {
+	var gaps []string
+	for i, from := range domains {
+		for j, to := range domains {
+			if i == j {
+				continue
+			}
+			for _, src := range hostsIn[from] {
+				for _, dst := range hostsIn[to] {
+					addr := firstAddr6(dst)
+					if addr == "" {
+						gaps = append(gaps, fmt.Sprintf("%s (%s) has no IPv6 address",
+							dst.Name, to))
+						continue
+					}
+					res, err := env.Probe(ctx, src.ID,
+						[]string{"ping6", "-c", "2", "-W", "4", "-i", "0.3", addr})
+					if err != nil {
+						gaps = append(gaps, fmt.Sprintf("%s could not be asked to reach %s: %v",
+							src.Name, dst.Name, err))
+						continue
+					}
+					if res.ExitCode != 0 {
+						gaps = append(gaps, fmt.Sprintf("%s (%s) cannot reach %s (%s) at %s",
+							src.Name, from, dst.Name, to, addr))
+					}
+				}
+			}
+		}
+	}
+	sort.Strings(gaps)
+	return gaps
+}
+
+// sortedInts returns the keys of a set in order.
+func sortedInts(m map[int]bool) []int {
+	out := make([]int, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Ints(out)
+	return out
 }

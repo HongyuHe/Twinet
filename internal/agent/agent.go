@@ -852,9 +852,21 @@ func (s *Server) handleDestroy(w http.ResponseWriter, r *http.Request) {
 	// Destroying a lab must not lose a class's work: everything is captured
 	// first, and refusing is better than proceeding blind.
 	if s.store != nil && !req.Force && !req.Ephemeral {
+		if err := s.captureBeforeDestroy(r.Context(), eng, req.Lab); err != nil {
+			httpError(w, http.StatusConflict, err)
+			return
+		}
+	}
+	s.destroyLab(w, r, eng, req)
+}
+
+// captureBeforeDestroy saves what the students have on this node, and refuses
+// when it cannot tell whether there is anything to save.
+func (s *Server) captureBeforeDestroy(ctx context.Context, eng *deploy.Engine, lab string) error {
+	{
 		s.mu.Lock()
-		top := s.current[req.Lab]
-		solved := s.modes[req.Lab] == string(render.ModeSolve)
+		top := s.current[lab]
+		solved := s.modes[lab] == string(render.ModeSolve)
 		s.mu.Unlock()
 		// Not while the reference solution is what is on the devices.
 		//
@@ -862,20 +874,54 @@ func (s *Server) handleDestroy(w http.ResponseWriter, r *http.Request) {
 		// solved grading lab -- which is every lab a class run touches -- still
 		// filed the answer as each student's saved configuration, to be
 		// replayed the next time anything recreated their container.
-		if solved {
-			top = nil
-		}
-		if top != nil {
-			if n, err := eng.CaptureAll(r.Context(), top, s.store); err != nil {
-				httpError(w, http.StatusConflict, fmt.Errorf(
+		switch {
+		case solved:
+			// Nothing of anybody's to save: the reference answer is what is on
+			// the devices.
+		case top == nil:
+			// This node does not know what the lab is, so it cannot read
+			// anybody's work out of it -- and it used to destroy it anyway.
+			//
+			// The topology is held in memory and on disk, and the disk copy is
+			// what an agent reads after a restart. If that read fails, or the
+			// record was never written, the node comes up hosting a class's
+			// containers with no idea what they are, and this branch quietly
+			// skipped straight to removing them. A term's work, deleted, with
+			// the destroy reporting success.
+			cs, err := s.rt.List(ctx, rt.Filter{All: true, Labels: map[string]string{
+				deploy.LabelManaged: "true", deploy.LabelLab: lab}})
+			if err != nil {
+				return fmt.Errorf(
+					"refusing to destroy %s: this node has no record of the lab and its "+
+						"containers could not be listed either (%w), so there is no way to "+
+						"tell whether anybody's work is about to be deleted; pass force to "+
+						"override", lab, err)
+			}
+			if len(cs) > 0 {
+				return fmt.Errorf(
+					"refusing to destroy %s: this node is running %d container(s) of it but "+
+						"has no record of what the lab is, so their configuration cannot be "+
+						"captured. Apply the lab first so the node knows what it is holding, "+
+						"or pass force to destroy it and lose whatever is inside",
+					lab, len(cs))
+			}
+		default:
+			if n, err := eng.CaptureAll(ctx, top, s.store); err != nil {
+				return fmt.Errorf(
 					"refusing to destroy %s: student configuration could not be captured (%w); "+
-						"pass force to override", req.Lab, err))
-				return
+						"pass force to override", lab, err)
 			} else if n > 0 {
-				slog.Info("captured before destroy", "lab", req.Lab, "snapshots", n)
+				slog.Info("captured before destroy", "lab", lab, "snapshots", n)
 			}
 		}
 	}
+	return nil
+}
+
+// destroyLab removes the lab from this node and reports what it could not
+// clean up.
+func (s *Server) destroyLab(w http.ResponseWriter, r *http.Request,
+	eng *deploy.Engine, req DestroyRequest) {
 	if err := eng.Destroy(r.Context(), req.Lab); err != nil {
 		httpError(w, http.StatusInternalServerError, err)
 		return
