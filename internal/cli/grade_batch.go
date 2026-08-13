@@ -589,6 +589,16 @@ func loadFRRConfig(ctx context.Context, exec execFn, d *model.Device, body strin
 		}
 		down = strings.Fields(res.Stdout)
 		if len(down) == 0 {
+			// Loading a submission restarts FRR, so its sessions come up while
+			// the validator is still reconnecting -- and a route that arrives
+			// before the ROAs is filtered as if there were none. FRR records
+			// the validation state afterwards but does not re-run the policy,
+			// so a submission that rejects invalid announcements perfectly
+			// still ends up carrying the lab's hijack. The refresh is what
+			// makes the answer visible; it runs in the background because it
+			// waits on a service, and the convergence barrier that follows is
+			// far longer than it needs.
+			refreshRPKIInBackground(ctx, exec, d)
 			return nil
 		}
 		if time.Now().After(deadline) {
@@ -605,6 +615,20 @@ func loadFRRConfig(ctx context.Context, exec execFn, d *model.Device, body strin
 		frrStartWait, strings.Join(down, ", "),
 		map[bool]string{true: "is", false: "are"}[len(down) == 1],
 		map[bool]string{true: "it", false: "they"}[len(down) == 1])
+}
+
+// refreshRPKIInBackground re-runs inbound policy once the validator answers.
+func refreshRPKIInBackground(ctx context.Context, exec execFn, d *model.Device) {
+	if d.Kind != model.KindRouter {
+		return
+	}
+	// Detached from this exec: the wait is for another container's service, and
+	// nothing here should hold a grading run open for it. A router with no
+	// validator configured leaves the loop on its own.
+	script := "(" + render.RPKIRefreshScript + ") >/dev/null 2>&1 &"
+	if _, err := exec(ctx, d.ID, []string{"sh", "-c", script}); err != nil {
+		slog.Debug("could not start the origin-validation refresh", "device", d.ID, "err", err)
+	}
 }
 
 // frrStartWait bounds how long a submission's routing daemons are given to

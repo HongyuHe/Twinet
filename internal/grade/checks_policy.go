@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -1029,7 +1030,7 @@ func checkRPKIInvalidRejected(ctx context.Context, env *Env) Result {
 			continue
 		}
 		for _, line := range strings.Split(out, "\n") {
-			if strings.HasPrefix(strings.TrimSpace(line), "*>") {
+			if selectedRoute(line) {
 				selected = append(selected, strings.TrimSpace(r.Name+": "+line))
 			}
 		}
@@ -1547,4 +1548,19 @@ func hijackIsAnnounced(ctx context.Context, env *Env) string {
 		why = append(why, fmt.Sprintf("%s does not have %s in its table", r.ID, prefix))
 	}
 	return strings.Join(truncate(why, 3), "; ")
+}
+
+// selectedRouteRE matches a route line FRR marks as chosen.
+//
+// The status field is not just "*>". When origin validation is on, FRR puts
+// the validation code first and the line reads "I*> 10.128.0.0/9", and this
+// check looked for a "*>" prefix -- on the output of `show bgp ipv4 unicast
+// rpki invalid`, where every line carries a validation code by construction.
+// So the one thing it existed to notice, an invalid route still being chosen,
+// was the one thing it could never match, and the check passed on every
+// submission including ones that had configured no validation at all.
+var selectedRouteRE = regexp.MustCompile(`^[A-Za-z]*\*?>`)
+
+func selectedRoute(line string) bool {
+	return selectedRouteRE.MatchString(strings.TrimSpace(line))
 }

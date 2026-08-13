@@ -313,22 +313,98 @@ func (r *Renderer) rpkiReadyCommands(d *model.Device) []deploy.Command {
 		return nil
 	}
 	return []deploy.Command{{
-		Describe: "connect to the origin validator",
-		Args: []string{"sh", "-c", strings.Join([]string{
-			"for i in 1 2 3 4 5 6 7 8; do",
-			"  vtysh -c 'show rpki cache-connection' 2>/dev/null | grep -q Connected && exit 0",
-			"  vtysh -c 'rpki reset' >/dev/null 2>&1 || true",
-			"  sleep 4",
-			"done",
-			// Not a hard failure: a lab without a working validator is still a
-			// usable lab, and refusing to deploy over it would turn a degraded
-			// service into an outage. The grading check for origin validation
-			// is what makes the degradation visible where it matters.
-			"echo 'the origin validator did not answer; routes will be treated as not-found' >&2",
-		}, "\n")},
+		Describe:    "connect to the origin validator",
+		Args:        []string{"sh", "-c", RPKIRefreshScript},
 		IgnoreError: true,
 	}}
 }
+
+// RPKIRefreshScript waits for the validator and then re-runs inbound policy.
+//
+// Exported because grading loads a submission by restarting FRR, which puts it
+// in exactly the same race: the sessions come up while the validator is still
+// connecting.
+var RPKIRefreshScript = strings.Join([]string{
+	// Origin validation only takes effect on a route when the inbound policy
+	// runs, and FRR runs an inbound policy when the route arrives. ROAs that
+	// turn up afterwards -- which is the normal order, because BGP converges
+	// while the validator is still connecting -- record each route's
+	// validation state and leave the route in place. The table then reads
+	// "rpki validation-state: invalid" on a route the policy was written to
+	// reject, still selected and still advertised onwards.
+	//
+	// That was the state of this cluster: the reference solution itself
+	// carried the lab's hijack on 64 routers, with a correct deny clause on
+	// every one of them, so the question could not be answered correctly by
+	// anybody. A soft inbound refresh re-runs the policy against what the
+	// neighbours already sent; it resets no session, and is what an operator
+	// does when a validator comes up late.
+	//
+	// The refresh watches for the condition rather than trying to time it.
+	// Timing it was tried five times and measured five times: the socket
+	// reports connected before any record has arrived, the first record
+	// arrives before the rest, a session the lab deliberately delays
+	// delivers its routes after all of them, and a repair that restarts
+	// FRR an hour later puts the router straight back into the same state
+	// with no deployment running to notice. Every timed version refreshed
+	// at the wrong moment, found nothing to do, and exited; 36 routers
+	// stayed as they were through five of them.
+	//
+	// So it stays, cheaply: one look a minute, and a refresh only when
+	// this router is holding an invalid route it learned itself.
+	"cat > /etc/twinet/rpki_refresh.sh <<'TWINET_RPKI'",
+	// One copy per container. A deployment runs this step every time, and
+	// a repair runs it again; without the guard a router accumulates a
+	// watcher per deployment for the life of the lab.
+	"pid=/run/twinet_rpki_refresh.pid",
+	"[ -f $pid ] && kill -0 \"$(cat $pid)\" 2>/dev/null && exit 0",
+	"echo $$ > $pid",
+	"while :; do",
+	"  sleep 60",
+	// Nothing to validate against yet.
+	"  vtysh -c 'show rpki prefix-table' 2>/dev/null | grep -qE '^[0-9]+[.]' || continue",
+	// Only a route this router learned for itself, and only while one is
+	// there. A router cannot refresh away an invalid route it heard over
+	// iBGP -- the border that accepted it is the only one that can -- and
+	// FRR marks an iBGP path with an "i" directly after the status field:
+	// "I*>i10.128.0.0/9" came from inside, "I*> 10.128.0.0/9" came from a
+	// neighbour of this router.
+	"  vtysh -c 'show bgp ipv4 unicast rpki invalid' 2>/dev/null |",
+	"    grep -E '^[A-Za-z]*[*]' | grep -qv '>i' || continue",
+	// A route refresh, not a soft replay. Storing the received
+	// announcements and replaying them was tried: FRR replays each stored
+	// entry with the validation state it was given when it arrived, which
+	// is precisely the stale answer being corrected. Asking the neighbour
+	// to send its routes again re-validates them against the ROA table as
+	// it stands now.
+	"  vtysh -c 'clear bgp ipv4 unicast * in' >/dev/null 2>&1 || true",
+	"done",
+	"TWINET_RPKI",
+	// Started before anything is waited for, and with every descriptor
+	// detached under setsid.
+	//
+	// It used to be started only inside the loop below, once the validator
+	// answered -- which it does not do within thirty seconds of an FRR
+	// restart, which is exactly when this runs. So on a deployment the
+	// watcher was never started at all, and the thing that was measured
+	// five times as "the watcher ran and did nothing" was a watcher that
+	// had never existed. A plain `&` does not survive either: the exec's
+	// session ends with the command and the child is signalled before its
+	// first sleep is over.
+	"setsid sh /etc/twinet/rpki_refresh.sh </dev/null >/dev/null 2>&1 &",
+	"for i in 1 2 3 4 5 6 7 8; do",
+	"  if vtysh -c 'show rpki cache-connection' 2>/dev/null | grep -q Connected; then",
+	"    exit 0",
+	"  fi",
+	"  vtysh -c 'rpki reset' >/dev/null 2>&1 || true",
+	"  sleep 4",
+	"done",
+	// Not a hard failure: a lab without a working validator is still a
+	// usable lab, and refusing to deploy over it would turn a degraded
+	// service into an outage. The grading check for origin validation is
+	// what makes the degradation visible where it matters.
+	"echo 'the origin validator did not answer; routes will be treated as not-found' >&2",
+}, "\n")
 
 func (r *Renderer) switchCommands(d *model.Device) []deploy.Command {
 	br := "br0"
