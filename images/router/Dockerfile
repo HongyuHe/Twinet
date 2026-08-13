@@ -38,7 +38,11 @@ RUN printf 'service integrated-vtysh-config\n' > /etc/frr/vtysh.conf \
 
 COPY entrypoint.sh /usr/local/bin/twinet-entrypoint
 COPY twinet_motd /etc/twinet/motd
-RUN chmod 0755 /usr/local/bin/twinet-entrypoint
+# The address server runs on the gateway, not in a service container of its
+# own: a client's first packet is a broadcast, and a server one hop away never
+# hears it -- which would give every fault about DHCP the same symptom.
+COPY twinet-dhcpd /usr/local/bin/twinet-dhcpd
+RUN chmod 0755 /usr/local/bin/twinet-entrypoint /usr/local/bin/twinet-dhcpd
 
 LABEL org.opencontainers.image.title="twinet-router" \
       org.opencontainers.image.description="FRR router for the Twinet teaching platform" \

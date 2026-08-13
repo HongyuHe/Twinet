@@ -79,6 +79,15 @@ func (r *Renderer) Files(d *model.Device) (map[string]deploy.FileSpec, error) {
 		}
 		out["/etc/frr/daemons"] = deploy.FileSpec{Content: []byte(FRRDaemons), Mode: 0o640}
 		out["/etc/frr/frr.conf"] = deploy.FileSpec{Content: []byte(body), Mode: 0o640}
+		// A router that has hosts on a segment of its own serves them DHCP.
+		//
+		// On the gateway rather than in a service container of its own,
+		// because a client's first packet is a broadcast and a server one hop
+		// away never hears it -- which would give every fault about DHCP the
+		// same symptom, "no address", whatever was actually wrong.
+		if cfg := svc.BuildDHCP(r.Top, d); len(cfg.Subnets) > 0 {
+			out[svc.DHCPConfigPath] = deploy.FileSpec{Content: cfg.JSON(), Mode: 0o644}
+		}
 		// The reference solution is deliberately NOT written here.
 		//
 		// It used to be, as /etc/twinet/reference.conf mode 0600, so that a TA
@@ -108,7 +117,8 @@ func (r *Renderer) Files(d *model.Device) (map[string]deploy.FileSpec, error) {
 func (r *Renderer) Commands(d *model.Device) ([]deploy.Command, error) {
 	switch d.Kind {
 	case model.KindRouter:
-		return append(r.routerCommands(d), r.rpkiReadyCommands(d)...), nil
+		cmds := append(r.routerCommands(d), r.dhcpCommands(d)...)
+		return append(cmds, r.rpkiReadyCommands(d)...), nil
 	case model.KindSwitch:
 		return r.switchCommands(d), nil
 	case model.KindHost:
@@ -320,6 +330,33 @@ func (r *Renderer) rpkiReadyCommands(d *model.Device) []deploy.Command {
 	}}
 	cmds = append(cmds, r.roaPublishCommands(d)...)
 	return cmds
+}
+
+// dhcpCommands starts the address server on a router that serves a segment.
+func (r *Renderer) dhcpCommands(d *model.Device) []deploy.Command {
+	if d.Kind != model.KindRouter {
+		return nil
+	}
+	if cfg := svc.BuildDHCP(r.Top, d); len(cfg.Subnets) == 0 {
+		return nil
+	}
+	return []deploy.Command{{
+		Describe: "serve DHCP on this router's own segments",
+		Args: []string{"sh", "-c", strings.Join([]string{
+			"for p in $(ps -ef | awk '/twinet-dhcpd/ && !/awk/ {print $1}'); do kill $p 2>/dev/null || true; done",
+			svc.DHCPStartCommand,
+			// A server that is not listening hands out nothing, and a client
+			// with no address then looks exactly like one whose server was
+			// deliberately stopped -- which is one of the faults. The two must
+			// not be confusable, so a deployment that cannot start it says so.
+			"for i in 1 2 3 4 5; do",
+			"  if ps -ef | grep -q '[t]winet-dhcpd'; then exit 0; fi",
+			"  sleep 1",
+			"done",
+			"echo 'the address server did not start' >&2; exit 1",
+		}, "\n")},
+		IgnoreError: true,
+	}}
 }
 
 // roaPublishCommands issues this system's own ROA, in solve mode only.

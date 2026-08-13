@@ -116,10 +116,10 @@ generating it.
 | | Count |
 |---|---:|
 | NIKA types | 60 |
-| Implemented in Twinet | **40** |
-| Not implemented | 20 |
+| Implemented in Twinet | **45** |
+| Not implemented | 15 |
 | Twinet-only types | 2 |
-| Total Twinet types | **42** |
+| Total Twinet types | **47** |
 
 Reproduce the accounting with:
 

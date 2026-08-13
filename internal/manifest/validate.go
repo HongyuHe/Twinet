@@ -382,7 +382,7 @@ func (l *Loaded) validateServices(d *Diagnostics, file string) {
 	known := map[string]bool{
 		"builtin.dns": true, "builtin.matrix": true, "builtin.measurement": true,
 		"builtin.web": true, "builtin.wireguard": true, "builtin.krill": true,
-		"builtin.rpki":       true,
+		"builtin.rpki": true, "builtin.dhcp": true,
 		"builtin.routinator": true, "container": true,
 	}
 	for _, name := range sortedMapKeys(l.Lab.Services) {

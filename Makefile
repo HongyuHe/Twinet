@@ -33,6 +33,7 @@ build:
 	$(GO) build -trimpath -ldflags '$(LDFLAGS)' -o $(BIN)/twinet ./cmd/twinet
 	$(GO) build -trimpath -ldflags '$(LDFLAGS)' -o $(BIN)/twinetd ./cmd/twinetd
 	CGO_ENABLED=0 $(GO) build -trimpath -ldflags '$(LDFLAGS)' -o $(BIN)/twinet-rtr ./cmd/twinet-rtr
+	CGO_ENABLED=0 $(GO) build -trimpath -ldflags '$(LDFLAGS)' -o $(BIN)/twinet-dhcpd ./cmd/twinet-dhcpd
 
 test:
 	$(GO) test -race -count=1 ./...
@@ -108,6 +109,7 @@ tidy-check:
 # repository and not a binary from somewhere else.
 images: build
 	@cp $(BIN)/twinet-rtr images/svc/twinet-rtr
+	@cp $(BIN)/twinet-dhcpd images/router/twinet-dhcpd
 	@for i in $(IMAGES); do \
 		echo "building $(REGISTRY)/twinet-$$i:$(TAG)"; \
 		$(DOCKER) build -q -t $(REGISTRY)/twinet-$$i:$(TAG) images/$$i || exit 1; \
