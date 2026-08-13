@@ -59,6 +59,23 @@ type Options struct {
 	// measures reachability end to end rather than in the routing table.
 	KeepHosts bool
 
+	// Reduce keeps every autonomous system but only the routers of each that
+	// face something already kept, plus one host apiece.
+	//
+	// Breadth and depth were the same setting, so the only way to make a
+	// harness smaller was to cut autonomous systems off it -- and a rubric that
+	// checks a session with a particular peer, or a route from a particular
+	// origin, then fails a correct submission. Measured on the course lab,
+	// depth 1 cost a correct submission most of its marks for exactly that.
+	//
+	// This keeps the whole internet and shrinks each neighbour to the part of
+	// it the target can see: every peer is still there, every prefix is still
+	// originated, and what disappears is eleven other systems' interior
+	// routers, which no check about this submission can observe. That is what
+	// makes a per-submission lab affordable, which is what makes marking a
+	// hundred students in their own labs possible at all.
+	Reduce bool
+
 	// Suffix distinguishes harnesses derived from the same target, so a
 	// re-mark can run beside the original instead of replacing it.
 	Suffix string
@@ -124,6 +141,18 @@ func Slice(top *model.Topology, target int, opts Options) (*model.Topology, erro
 			// AS and must never itself be graded.
 			dst.OwnerGroup = ""
 			dst.Role = model.RoleStaff
+			// Except an exchange, which is not a peer at all.
+			//
+			// The role is what tells the renderer to build a route server: one
+			// that reflects between members and originates nothing. Rewriting
+			// it to staff turned the exchange into an ordinary transit system,
+			// so the session the target opens to the route server was to
+			// something that was not one -- and a correct submission was
+			// quarantined with "CHI->180.140.0.140 Active". Measured on the
+			// cluster before this line existed.
+			if src.Role == model.RoleIXP {
+				dst.Role = model.RoleIXP
+			}
 		}
 		for _, d := range src.Devices {
 			if nd, ok := out.Devices[d.ID]; ok {
@@ -235,7 +264,7 @@ func neighbourhood(top *model.Topology, target, depth int) map[int]bool {
 func devicesToKeep(top *model.Topology, target int, keepAS map[int]bool, opts Options) map[string]bool {
 	keep := map[string]bool{}
 
-	if opts.Depth <= 0 {
+	if opts.Depth <= 0 && !opts.Reduce {
 		// Full breadth keeps every device. A reachability check that ends at a
 		// host, or an IGP check that crosses an interior router, must find the
 		// same network the class lab has.
@@ -256,6 +285,14 @@ func devicesToKeep(top *model.Topology, target int, keepAS map[int]bool, opts Op
 	// a single member, so the import policy that makes it interesting would
 	// never fire and the student would be marked on a session that cannot
 	// exhibit the behaviour being marked.
+	//
+	// Kept whole means kept: the loop below adds routers that face something
+	// already kept, and it runs after this, so the members reach the exchange.
+	// When this was skipped -- which it was for every reduced harness, because
+	// the exchange was only considered for systems inside the retained
+	// neighbourhood and reduction retains all of them by a different path --
+	// the route server was absent, the target's session to it stayed in
+	// Active, and a correct submission was quarantined for it. Measured.
 	for asn := range keepAS {
 		as := top.ASes[asn]
 		if as == nil || asn == target || as.Role != model.RoleIXP {
@@ -263,6 +300,33 @@ func devicesToKeep(top *model.Topology, target int, keepAS map[int]bool, opts Op
 		}
 		for _, d := range as.Devices {
 			keep[d.ID] = true
+		}
+	}
+
+	// The services the target is cabled to are kept.
+	//
+	// They belong to no autonomous system, so the rule below -- which keeps
+	// routers of retained systems -- skipped them, and the target came up with
+	// no interface where the manifest says one is. Its own configuration then
+	// failed on the line that addresses it, and the submission was quarantined
+	// for something nobody had done. The trust anchor, the resolver and the
+	// measurement host are part of the network the exercises are about.
+	for _, l := range top.Links {
+		if l.A == nil || l.B == nil {
+			continue
+		}
+		for _, side := range []*model.Iface{l.A, l.B} {
+			other := l.B
+			if side == l.B {
+				other = l.A
+			}
+			d, ok := top.Devices[devID(side)]
+			if !ok || d.Kind != model.KindService {
+				continue
+			}
+			if o, ok := top.Devices[devID(other)]; ok && o.ASN == target {
+				keep[d.ID] = true
+			}
 		}
 	}
 
@@ -296,7 +360,7 @@ func devicesToKeep(top *model.Topology, target int, keepAS map[int]bool, opts Op
 		}
 	}
 
-	if opts.KeepHosts {
+	if opts.KeepHosts || opts.Reduce {
 		asns := make([]int, 0, len(keepAS))
 		for asn := range keepAS {
 			asns = append(asns, asn)

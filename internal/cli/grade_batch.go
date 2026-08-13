@@ -37,6 +37,13 @@ type submission struct {
 	// worth reporting rather than ignoring: silently dropping it would mark
 	// the student on an empty router and tell them their routing is wrong.
 	Files map[string]string
+	// ROAs is what this system had authorised at the lab's trust anchor.
+	//
+	// Publishing is a student action rather than a line of configuration, so
+	// it appears in no running-config. Without it, a re-mark in a private
+	// harness -- whose trust anchor starts empty -- loses the mark for the
+	// question about publishing, for a group that published correctly.
+	ROAs []byte
 	// Scripts maps a device's short name to a shell script run inside it.
 	//
 	// Not everything a student configures is FRR. VLANs live in the switch,
@@ -53,6 +60,7 @@ func newGradeBatchCmd(opts *Options) *cobra.Command {
 		outDir     string
 		parallel   int
 		depth      int
+		reduce     bool
 		keepHosts  bool
 		keepLabs   bool
 		token      string
@@ -126,7 +134,7 @@ mark, unless --keep-labs is given for a dispute.`,
 					defer func() { <-sem }()
 
 					rep := gradeOne(cmd.Context(), class, rubric, s, batchOpts{
-						token: tok, depth: depth, keepHosts: keepHosts,
+						token: tok, depth: depth, keepHosts: keepHosts, reduce: reduce,
 						keepLab: keepLabs, converge: converge, settle: settle,
 						outDir: outDir,
 					})
@@ -169,6 +177,8 @@ mark, unless --keep-labs is given for a dispute.`,
 	cmd.Flags().StringVarP(&outDir, "out", "o", "", "where to write reports")
 	cmd.Flags().IntVarP(&parallel, "parallel", "p", 8, "harnesses deployed concurrently")
 	cmd.Flags().IntVar(&depth, "depth", 0, "AS hops of neighbourhood to keep; 0 keeps the whole topology")
+	cmd.Flags().BoolVar(&reduce, "reduce", false,
+		"keep every autonomous system but only the routers of each that face the target")
 	cmd.Flags().BoolVar(&keepHosts, "keep-hosts", true, "keep one host per neighbour, for end-to-end checks")
 	cmd.Flags().BoolVar(&keepLabs, "keep-labs", false, "do not destroy harnesses, for investigating a disputed mark")
 	cmd.Flags().StringVar(&token, "token", "", "agent token (or TWINET_TOKEN)")
@@ -183,6 +193,7 @@ mark, unless --keep-labs is given for a dispute.`,
 type batchOpts struct {
 	token     string
 	depth     int
+	reduce    bool
 	keepHosts bool
 	keepLab   bool
 	converge  time.Duration
@@ -210,7 +221,7 @@ func gradeOne(ctx context.Context, class *model.Topology, rubric *grade.Rubric,
 	}
 
 	h, err := harness.Slice(class, s.AS, harness.Options{
-		Depth: o.depth, KeepHosts: o.keepHosts, Suffix: s.Group,
+		Depth: o.depth, KeepHosts: o.keepHosts, Reduce: o.reduce, Suffix: s.Group,
 	})
 	if err != nil {
 		return fail("building the harness", err)
@@ -492,6 +503,14 @@ func applySubmission(ctx context.Context, exec execFn, h *model.Topology, s subm
 		}
 	}
 
+	// What the group authorised at the trust anchor, replayed before anything
+	// is measured so the routes it makes valid are valid while they converge.
+	if len(s.ROAs) > 0 {
+		if err := replayROAs(ctx, exec, h, as, s.ROAs); err != nil {
+			return err
+		}
+	}
+
 	// Scripts run after the routing configuration, because a tunnel or a host
 	// route may depend on an address the configuration has just brought up.
 	names = names[:0]
@@ -669,6 +688,8 @@ func submissionFromArchive(p string, class *model.Topology) (submission, error) 
 	}
 	for name, body := range files {
 		switch {
+		case name == "roas.json":
+			sub.ROAs = body
 		case strings.HasSuffix(name, ".conf"):
 			sub.Files[strings.TrimSuffix(name, ".conf")] = string(body)
 		case strings.HasSuffix(name, ".sh"):
@@ -1118,12 +1139,17 @@ func readSubmissions(dir string, class *model.Topology) ([]submission, error) {
 				continue
 			}
 			ext := filepath.Ext(f.Name())
-			if ext != ".conf" && ext != ".cfg" && ext != ".txt" && ext != ".sh" {
+			if ext != ".conf" && ext != ".cfg" && ext != ".txt" && ext != ".sh" &&
+				f.Name() != "roas.json" {
 				continue
 			}
 			raw, err := os.ReadFile(filepath.Join(sub.Dir, f.Name()))
 			if err != nil {
 				return nil, err
+			}
+			if f.Name() == "roas.json" {
+				sub.ROAs = raw
+				continue
 			}
 			base := strings.TrimSuffix(f.Name(), ext)
 			if ext == ".sh" {

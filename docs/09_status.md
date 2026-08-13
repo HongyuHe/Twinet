@@ -237,24 +237,51 @@ Recorded here rather than implied to be complete:
   one wrong one, not that they reject every wrong one, and nothing re-runs those
   demonstrations.
 
-### Grading a hundred students is not yet practical in the fair mode
+### Grading a hundred students: measured
 
-Measured: 4m 56s per submission, one at a time, almost all of it waiting for
-OSPF and then BGP to settle -- twice, once for the submission and once for the
-reference put back after it. A hundred students is therefore over eight hours.
+Two modes, both fair, with different costs.
 
-That is a real limit and it is stated here rather than in a footnote. Three
-things would move it, in the order they are worth doing:
+`twinet grade class` marks in the deployed lab, one submission at a time, with
+everything else at the reference. Measured: **4m 56s per submission**, and it
+holds the class lab for the duration -- a hundred students is over eight hours
+during which nobody can use their own network.
 
-1. **A per-submission harness with synthetic neighbours.** The convergence wait
-   exists because a submission is graded inside the whole internet. A harness of
-   the student's AS plus test doubles for its neighbours converges in seconds
-   rather than minutes. It is designed (§4 of [06](06_grading.md)) and not built;
-   the private-harness mode that does exist deploys a real neighbourhood and
-   takes about twelve minutes a submission, which is worse, and eight at once
-   saturates this cluster.
-2. **Restoring only what the submission touched.** The reference is currently
-   put back over the whole AS, which costs a second convergence. A submission
+`twinet grade batch --reduce` gives each submission its own disposable lab
+containing every autonomous system but only the routers of each that face the
+system under test, plus the services it is cabled to and the exchanges whole.
+121 devices instead of 212. The class lab is not touched at all, and harnesses
+run concurrently. Measured on this three-node cluster, with the class lab also
+running:
+
+| Concurrency | Submissions | Wall clock | Per submission |
+|---|---|---|---|
+| 1 | 1 | 6m 17s | 6m 17s |
+| 4 | 4 | 9m 50s | 2m 27s |
+| 8 | 8 | 15m 43s | 1m 58s |
+
+At eight-wide that is a hundred students in about three and a quarter hours, on
+three machines, without the class losing access to their lab. It scales with
+nodes; the class mode does not.
+
+The eight-wide run quarantined one submission of the eight: eight harnesses and
+the class lab together saturated this cluster and one system's routing daemons
+did not start. That is the honest capacity limit of three machines, and it is
+reported as a quarantine rather than as a mark, which is the behaviour that
+matters. On a cluster with room, or without the class lab running alongside, the
+same eight complete.
+
+### What would make the fair mode faster still
+
+Most of a run is waiting for OSPF and then BGP to settle. Three things would
+move it further, in the order they are worth doing:
+
+1. **Neighbours reduced to a single synthetic router each.** Reduction keeps the
+   routers of each neighbour that face the system under test, which on a tiered
+   internet is still most of their borders: 121 devices where the ideal is
+   perhaps 40. Replacing each neighbour with one router that originates its
+   block would cut both the deployment and the convergence again.
+2. **Restoring only what the submission touched.** In class mode the reference
+   is put back over the whole AS, which costs a second convergence. A submission
    names the devices it changed.
 3. **`--per-wave`.** It exists and works, and batches submissions no two of
    which are within two systems of each other. It is off by default because that

@@ -22,6 +22,7 @@ import (
 
 	"github.com/HongyuHe/twinet/internal/model"
 	rt "github.com/HongyuHe/twinet/internal/runtime"
+	"github.com/HongyuHe/twinet/internal/svc"
 )
 
 // Bundle is the manifest inside a submission archive.
@@ -211,6 +212,19 @@ func saveAS(ctx context.Context, top *model.Topology, asn int, outDir string,
 			}
 		}
 	}
+	// The ROAs this system published.
+	//
+	// Publishing is a student action, not a line of configuration, so it lives
+	// nowhere in a router's running-config. Without it the archive is not what
+	// the group did: re-marking one in a private harness, whose trust anchor
+	// starts empty, lost the mark for the question about publishing. Measured
+	// at 9.70 out of 10 for a submission that had published correctly.
+	if roas := publishedROAs(ctx, exec, top, as); len(roas) > 0 {
+		if raw, err := json.MarshalIndent(roas, "", "  "); err == nil {
+			contents["roas.json"] = append(raw, '\n')
+		}
+	}
+
 	if len(contents) == 0 {
 		return "", fmt.Errorf("nothing could be collected")
 	}
@@ -680,4 +694,93 @@ func firstLines(s string, n int) string {
 		lines = append(lines[:n], fmt.Sprintf("(and %d more)", len(lines)-n))
 	}
 	return strings.Join(lines, "; ")
+}
+
+// publishedROAs reads back what an autonomous system has authorised at the
+// lab's trust anchor.
+//
+// Read from inside the lab, through one of the system's own routers, because
+// that is the only place the validator is reachable from -- and because the
+// answer is then exactly what the system itself can see.
+func publishedROAs(ctx context.Context, exec execFn, top *model.Topology, as *model.AS) []svc.VRP {
+	addr := svc.RPKIAddrFor(top, as.ASN)
+	if addr == "" {
+		return nil
+	}
+	for _, r := range as.Routers {
+		res, err := exec(ctx, r.ID, []string{"sh", "-c",
+			fmt.Sprintf("curl -sf -m 5 http://%s%s/roas", addr, svc.PublishListen)})
+		if err != nil || res.ExitCode != 0 {
+			continue
+		}
+		var all []svc.VRP
+		if err := json.Unmarshal([]byte(res.Stdout), &all); err != nil {
+			continue
+		}
+		var mine []svc.VRP
+		for _, v := range all {
+			if v.ASN == as.ASN {
+				mine = append(mine, v)
+			}
+		}
+		return mine
+	}
+	return nil
+}
+
+// replayROAs publishes an archive's authorisations into the lab being graded.
+func replayROAs(ctx context.Context, exec execFn, top *model.Topology, as *model.AS, body []byte) error {
+	var roas []svc.VRP
+	if err := json.Unmarshal(body, &roas); err != nil {
+		return fmt.Errorf("the archive's published authorisations could not be read: %w", err)
+	}
+	addr := svc.RPKIAddrFor(top, as.ASN)
+	if addr == "" || len(roas) == 0 || len(as.Routers) == 0 {
+		return nil
+	}
+	// Published from the router the trust anchor is cabled to.
+	//
+	// Any router of the system can reach it once the interior routing is up,
+	// and this runs seconds after the configuration was installed, when it is
+	// not. Publishing from the directly-connected router needs no routing at
+	// all, so it does not depend on the very thing being marked.
+	r := as.Routers[0]
+	for _, d := range as.Devices {
+		if d.Kind != model.KindRouter {
+			continue
+		}
+		for _, i := range d.Ifaces {
+			if i.Peer != nil && i.Peer.Device != nil &&
+				i.Peer.Device.Kind == model.KindService &&
+				strings.Contains(strings.ToLower(i.Peer.Device.Name), "rpki") {
+				r = d
+			}
+		}
+	}
+	for _, v := range roas {
+		body := fmt.Sprintf(`{"prefix":%q,"max_length":%d,"asn":%d}`, v.Prefix, v.MaxLength, v.ASN)
+		// Retried, because this runs moments after the lab was built: the
+		// validator may still be starting, and the route to it may still be
+		// coming up. A single attempt failed on a harness that was working
+		// perfectly ten seconds later, and quarantined the submission.
+		//
+		// The reason is captured on the last attempt so a genuine refusal --
+		// a prefix outside the system's allocation, say -- is reported as
+		// itself rather than as a timeout.
+		script := fmt.Sprintf(
+			"for i in 1 2 3 4 5 6 7 8 9 10; do "+
+				"out=$(curl -s -m 5 -w ' HTTP %%{http_code}' -X POST http://%s%s/roas -d %s) && "+
+				"case \"$out\" in *'HTTP 200'*) exit 0;; esac; sleep 3; done; "+
+				"echo \"$out\" >&2; exit 1",
+			addr, svc.PublishListen, shellQuote(body))
+		res, err := exec(ctx, r.ID, []string{"sh", "-c", script})
+		if err != nil {
+			return fmt.Errorf("publishing %s: %w", v.Prefix, err)
+		}
+		if res.ExitCode != 0 {
+			return fmt.Errorf("publishing %s: the trust anchor did not accept it: %s",
+				v.Prefix, firstLine(res.Stderr+res.Stdout))
+		}
+	}
+	return nil
 }
