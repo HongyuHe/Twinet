@@ -456,6 +456,19 @@ func Inject(ctx context.Context, env *Env, name string, t Target) (*Injection, e
 
 	state, err := f.Inject(ctx, env, t)
 	if err != nil {
+		// An injection that failed part-way may have changed the device
+		// already: host_incorrect_ip removes the address before it adds the
+		// wrong one, so a failure between the two leaves a host with no address
+		// and nothing recording it. Undo what can be undone before giving up.
+		if state != nil {
+			if rerr := f.Resolve(ctx, env, t, state); rerr != nil {
+				return &Injection{ID: injID, Fault: name, Target: t, State: state,
+						InjectedAt: time.Now().UTC(), Truth: f.Truth(t, "")},
+					fmt.Errorf("inject %s: it failed (%w) and what it had already changed "+
+						"could not be undone either (%v); it is recorded so it can be "+
+						"found", name, err, rerr)
+			}
+		}
 		_ = env.exempt(ctx, t.DeviceID(), injID, false)
 		return nil, fmt.Errorf("inject %s: %w", name, err)
 	}

@@ -762,7 +762,12 @@ func wipeDeviceState(ctx context.Context, exec execFn, d *model.Device) error {
 			`for b in $(ovs-vsctl list-br 2>/dev/null); do ` +
 			`for p in $(ovs-vsctl list-ports "$b" 2>/dev/null); do ` +
 			`ovs-vsctl clear port "$p" tag 2>/dev/null; ` +
-			`ovs-vsctl clear port "$p" trunks 2>/dev/null; done; done; fi`,
+			`ovs-vsctl clear port "$p" trunks 2>/dev/null; ` +
+			// vlan_mode is part of the answer too, and clearing the other two
+			// without it leaves the reference's trunk ports behind. In Open
+			// vSwitch a trunk port with no trunks list carries every VLAN, so
+			// a student who configured nothing inherited a working answer.
+			`ovs-vsctl clear port "$p" vlan_mode 2>/dev/null; done; done; fi`,
 	}
 	// Addresses are flushed per interface and the planned ones put back, rather
 	// than flushed wholesale: in the state a student starts from, the platform
@@ -844,8 +849,10 @@ func verifyWiped(ctx context.Context, exec execFn, d *model.Device) error {
 		"for p in $(ovs-vsctl list-ports \"$br\" 2>/dev/null); do " +
 		"t=$(ovs-vsctl get port \"$p\" tag 2>/dev/null | tr -d '[]\" '); " +
 		"k=$(ovs-vsctl get port \"$p\" trunks 2>/dev/null | tr -d '[]\" '); " +
+		"m=$(ovs-vsctl get port \"$p\" vlan_mode 2>/dev/null | tr -d '[]\" '); " +
 		"[ -n \"$t\" ] && [ \"$t\" != '[]' ] && echo \"$p tag=$t\"; " +
 		"[ -n \"$k\" ] && [ \"$k\" != '[]' ] && echo \"$p trunks=$k\"; " +
+		"[ -n \"$m\" ] && [ \"$m\" != '[]' ] && echo \"$p vlan_mode=$m\"; " +
 		"done; done; fi || true\n")
 	b.WriteString("echo '--done'\n")
 	b.WriteString("exit 0\n")

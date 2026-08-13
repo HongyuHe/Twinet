@@ -239,7 +239,13 @@ func (f *frrConfig) externalNeighbours() []string {
 		if strings.Contains(body, "remote-as internal") {
 			continue
 		}
-		if f.localAS != 0 && strings.Contains(body, fmt.Sprintf("remote-as %d", f.localAS)) {
+		// Compared as a field, not as a substring.
+		//
+		// "remote-as 10" contains "remote-as 1", so in AS 1 every neighbour in
+		// AS 10, 100 or 140 was classified as internal -- and a check that
+		// requires every *external* session to be guarded then skipped exactly
+		// the sessions that matter.
+		if f.localAS != 0 && hasRemoteAS(body, f.localAS) {
 			continue
 		}
 		out = append(out, addr)
@@ -263,6 +269,21 @@ func denyMatches(body, condition string) bool {
 			deny = strings.Contains(t, " deny ")
 		case strings.HasPrefix(t, "match ") && deny:
 			if strings.Contains(t, strings.ToLower(condition)) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// hasRemoteAS reports whether a neighbour's settings name this AS number,
+// comparing the number as a whole field.
+func hasRemoteAS(body string, asn int) bool {
+	want := strconv.Itoa(asn)
+	for _, line := range strings.Split(body, "\n") {
+		f := strings.Fields(line)
+		for i := 0; i+1 < len(f); i++ {
+			if f[i] == "remote-as" && f[i+1] == want {
 				return true
 			}
 		}

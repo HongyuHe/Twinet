@@ -386,10 +386,13 @@ func captureSwitch(ctx context.Context, exec func(context.Context, string, []str
   trunks=$(ovs-vsctl get port "$p" trunks 2>/dev/null | tr -d '[] ')
   mode=$(ovs-vsctl get port "$p" vlan_mode 2>/dev/null | tr -d '"')
   [ -n "$tag" ] && echo "ovs-vsctl set port $p tag=$tag"
-  if [ -n "$trunks" ]; then
-    [ "$mode" != "[]" ] && [ -n "$mode" ] && echo "ovs-vsctl set port $p vlan_mode=$mode"
-    echo "ovs-vsctl set port $p trunks=$trunks"
-  fi
+  # vlan_mode is recorded on its own, not only when a trunk list exists.
+  #
+  # In Open vSwitch a trunk port with no trunks list carries every VLAN, which
+  # is a perfectly good answer and one this omitted entirely -- so a submission
+  # that used it came back from its own archive carrying nothing.
+  [ -n "$mode" ] && [ "$mode" != "[]" ] && echo "ovs-vsctl set port $p vlan_mode=$mode"
+  [ -n "$trunks" ] && echo "ovs-vsctl set port $p trunks=$trunks"
 done`
 	res, err := exec(ctx, d.ID, []string{"sh", "-c", script})
 	if err != nil {

@@ -26,3 +26,22 @@ not a row
 		t.Errorf("parsed %d entries from two IPv4 rows: %v", len(got), got)
 	}
 }
+
+// "remote-as 10" contains "remote-as 1", so in AS 1 every neighbour in AS 10,
+// 100 or 140 was classified as internal -- and a check that requires every
+// external session to be guarded then skipped exactly the sessions that matter.
+func TestARemoteASIsComparedAsAWholeNumber(t *testing.T) {
+	if !hasRemoteAS("remote-as 1", 1) {
+		t.Error("a neighbour in AS 1 was not recognised as being in AS 1")
+	}
+	if hasRemoteAS("remote-as 10", 1) {
+		t.Error("a neighbour in AS 10 was treated as internal to AS 1, so its session " +
+			"would be skipped by every check that looks at external sessions")
+	}
+	if hasRemoteAS("remote-as 140", 14) {
+		t.Error("a neighbour in AS 140 was treated as internal to AS 14")
+	}
+	if !hasRemoteAS("peer-group X\nremote-as 140", 140) {
+		t.Error("a neighbour in AS 140 was not recognised across multiple lines")
+	}
+}

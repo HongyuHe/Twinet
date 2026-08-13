@@ -161,15 +161,21 @@ after a partial failure, a reboot, or a topology edit.`,
 			if err != nil {
 				return err
 			}
+			// Remembered so that a later destroy of a solved lab does not file
+			// the reference as each student's saved configuration.
+			if !dryRun {
+				recordLabMode(top, string(mode))
+			}
 			eng := &deploy.Engine{
-				Runtime:       rt,
-				Node:          node,
-				State:         store,
-				PullPolicy:    runtime.PullPolicy(pull),
-				Renderer:      render.New(top, mode),
-				Authoritative: mode == render.ModeSolve,
-				UnderlayIP:    underlayOf(top, node),
-				PeerUnderlay:  peerUnderlays(top),
+				Runtime:         rt,
+				Node:            node,
+				State:           store,
+				PullPolicy:      runtime.PullPolicy(pull),
+				Renderer:        render.New(top, mode),
+				Authoritative:   mode == render.ModeSolve,
+				WritesReference: mode == render.ModeSolve,
+				UnderlayIP:      underlayOf(top, node),
+				PeerUnderlay:    peerUnderlays(top),
 			}
 
 			p, err := eng.Build(top)
@@ -291,6 +297,16 @@ if the manifest that created it is no longer available.`,
 				if bad > 0 {
 					return fmt.Errorf("%d node(s) failed to clean up", bad)
 				}
+				// The record describes containers that no longer exist.
+				// Leaving it pinned the next deployment to an arrangement
+				// chosen for a lab that is gone -- the single-node path
+				// removed it and this one returned first.
+				if err := os.Remove(filepath.Join(labPrivateDir(top), place.RecordName)); err != nil &&
+					!errors.Is(err, os.ErrNotExist) {
+					fmt.Fprintf(cmd.ErrOrStderr(), "note: the placement record could not be "+
+						"cleared (%v); the next deployment will be pinned to the arrangement "+
+						"chosen for the lab that has just been removed\n", err)
+				}
 				fmt.Fprintf(cmd.OutOrStdout(), "removed lab %q from %d nodes\n",
 					name, len(c.Nodes))
 				return nil
@@ -358,7 +374,11 @@ if the manifest that created it is no longer available.`,
 			if devTop == nil {
 				devTop = topologyFromLabels(name, cs)
 			}
-			eng := &deploy.Engine{Runtime: rt, Node: "local", State: store}
+			// A destroy of a solved lab must not file the reference as each
+			// student's saved configuration. The cluster path was fixed and
+			// this one, which single-node labs use, was not.
+			eng := &deploy.Engine{Runtime: rt, Node: "local", State: store,
+				WritesReference: labWasSolved(top)}
 			// Capture before removing. A destroy that discards a student's
 			// configuration without recording it is unrecoverable, and the
 			// person running it is usually not the person who loses the work.
@@ -1106,4 +1126,32 @@ func topologyFromLabels(lab string, cs []runtime.Container) *model.Topology {
 		}
 	}
 	return top
+}
+
+// labWasSolved reports whether a single-node lab's recorded state says it was
+// last deployed with the reference solution on it.
+//
+// A cluster records the mode with the topology on each node. A single-node lab
+// keeps its state beside the manifest, so the same question is answered from
+// the marker the deploy writes there.
+func labWasSolved(top *model.Topology) bool {
+	if top == nil {
+		// Without a manifest there is nothing that says otherwise, and the
+		// safe assumption is the one that does not file the answer as work.
+		return false
+	}
+	raw, err := os.ReadFile(filepath.Join(labPrivateDir(top), "mode"))
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(raw)) == string(render.ModeSolve)
+}
+
+// recordLabMode remembers how a single-node lab was last deployed.
+func recordLabMode(top *model.Topology, mode string) {
+	dir := labPrivateDir(top)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return
+	}
+	_ = os.WriteFile(filepath.Join(dir, "mode"), []byte(mode), 0o644)
 }

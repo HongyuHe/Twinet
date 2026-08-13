@@ -81,7 +81,15 @@ deadline:
 typically 2–6 s of actual convergence. Combined with parallelism, expected
 class-wide grading time goes from hours to **single-digit minutes**.
 
-## 4. Test doubles
+## 4. Test doubles — target design, not built
+
+Everything in this section describes what the grading harness is meant to
+become. **None of it exists yet.** Grading today deploys the real neighbourhood
+and waits for it to converge, which is why a submission costs about five
+minutes; see [09](09_status.md) for the measurement and for what would change
+it. The section is kept because it is the design the convergence cost argues
+for, not because it describes the code.
+
 
 The reusable primitive both existing generations converged on — *attach a
 scriptable BGP speaker where a real neighbour would be, inject benign and

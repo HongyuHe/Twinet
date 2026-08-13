@@ -244,8 +244,22 @@ The lab must already be deployed with --solve.`,
 						// that AS, so leaving it there would quietly move their
 						// marks. Put it back before going on.
 						note := fmt.Sprintf("loading the submission: %v", err)
-						if rerr := redeployScopes(cmd.Context(), top, token,
-							[]string{fmt.Sprintf("as%d", s.AS)}); rerr != nil {
+						// The same barrier as after a wave: putting a system
+						// back is not finished when the configuration is
+						// installed, it is finished when the routes it produces
+						// have reached the rest of the lab. This path put it
+						// back and carried straight on, so the next student was
+						// graded across a system that was still reconverging.
+						rerr := redeployScopes(cmd.Context(), top, token,
+							[]string{fmt.Sprintf("as%d", s.AS)})
+						if rerr == nil {
+							if bad := waitWaveErrs(cmd.Context(), top, exec,
+								[]submission{s}, converge); len(bad) > 0 {
+								rerr = fmt.Errorf("it did not converge afterwards: %s",
+									strings.Join(bad, "; "))
+							}
+						}
+						if rerr != nil {
 							note += fmt.Sprintf("; and AS %d could not be returned to the "+
 								"reference afterwards (%v), so this wave is suspect", s.AS, rerr)
 							contaminated = fmt.Sprintf(

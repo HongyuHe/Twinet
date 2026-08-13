@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -172,6 +173,25 @@ func newIncidentRunCmd(opts *Options) *cobra.Command {
 			if err != nil {
 				unlockInj()
 				return err
+			}
+			// An episode has to start from a lab with nothing wrong with it.
+			//
+			// Faults already live were neither refused nor recorded in the
+			// episode's ground truth, so the agent was shown anomalies that the
+			// scoring did not know about -- and the run could report itself
+			// resolved while they were still there. Whatever an agent concludes
+			// from an extra fault is then marked wrong for the right reason.
+			if len(ledger) > 0 {
+				unlockInj()
+				names := make([]string, 0, len(ledger))
+				for _, inj := range ledger {
+					names = append(names, fmt.Sprintf("%s on %s", inj.Fault, inj.Target.DeviceID()))
+				}
+				sort.Strings(names)
+				return fmt.Errorf("this lab already has %d fault(s) injected:\n  %s\n"+
+					"An episode measures what an agent concludes from what it can see, and "+
+					"these are not in its ground truth. Clear them with `twinet fault "+
+					"resolve --all` first", len(ledger), strings.Join(names, "\n  "))
 			}
 			// A fault that could not be recorded is undone rather than left
 			// live. Warning and carrying on recreated the exact defect this
