@@ -13,6 +13,36 @@ metadata:
     grader joins a group on one host, sends from another, and reads the
     multicast forwarding tables of the routers in between.
 
+kinds:
+  router:
+    image: hyhe/twinet-router:0.1
+    capabilities: [NET_ADMIN, NET_RAW, SYS_ADMIN]
+    sysctls:
+      net.ipv4.ip_forward: "1"
+      net.ipv4.conf.all.rp_filter: "0"
+      net.ipv4.conf.default.rp_filter: "0"
+      net.ipv4.icmp_ratelimit: "0"
+      # mc_forwarding is deliberately absent: it is read-only from userspace.
+      # The kernel sets it when a process opens a multicast routing socket,
+      # which is what pimd does on startup, and a container that tries to write
+      # it refuses to start at all.
+  host:
+    image: hyhe/twinet-host:0.1
+    capabilities: [NET_ADMIN, NET_RAW]
+    pids: 128
+  switch:
+    image: hyhe/twinet-switch:0.1
+    capabilities: [NET_ADMIN, NET_RAW, SYS_NICE]
+    pids: 512
+  service:
+    image: hyhe/twinet-svc:0.1
+    capabilities: [NET_ADMIN, NET_RAW]
+
+# The lab links must fit inside the cluster's underlay once VXLAN encapsulation
+# is added, or a link between two nodes silently drops anything large.
+link_defaults:
+  mtu: 1450
+
 addressing:
   as_block:        "{{ .AS }}.0.0.0/8"
   inter_as:        "179.{{ .Low }}.{{ .High }}.0/24"

@@ -91,7 +91,11 @@ The lab must already be deployed with --solve.`,
 				return err
 			}
 			if rubricPath == "" {
-				rubricPath = filepath.Join(top.Lab.Dir, "rubric", "cos461.yaml")
+				p, err := defaultRubric(top.Lab.Dir)
+				if err != nil {
+					return err
+				}
+				rubricPath = p
 			}
 			rubric, err := grade.LoadRubric(rubricPath)
 			if err != nil {

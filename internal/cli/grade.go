@@ -7,6 +7,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"text/tabwriter"
 	"time"
@@ -117,7 +119,11 @@ reference, and holds the nodes off from repairing anything while it does.`,
 				return err
 			}
 			if rubricPath == "" {
-				rubricPath = filepath.Join(top.Lab.Dir, "rubric", "cos461.yaml")
+				p, err := defaultRubric(top.Lab.Dir)
+				if err != nil {
+					return err
+				}
+				rubricPath = p
 			}
 			rubric, err := grade.LoadRubric(rubricPath)
 			if err != nil {
@@ -241,7 +247,7 @@ reference, and holds the nodes off from repairing anything while it does.`,
 			return releaseGuard(summary, cmd.ErrOrStderr())
 		},
 	}
-	cmd.Flags().StringVarP(&rubricPath, "rubric", "r", "", "rubric file (default: <lab>/rubric/cos461.yaml)")
+	cmd.Flags().StringVarP(&rubricPath, "rubric", "r", "", "rubric file (default: the one under <lab>/rubric/)")
 	cmd.Flags().IntSliceVar(&asList, "as", nil, "AS numbers to grade (default: every student AS)")
 	cmd.Flags().StringVarP(&outDir, "out", "o", "", "directory for reports")
 	cmd.Flags().IntVarP(&parallel, "parallel", "p", 8, "submissions graded concurrently")
@@ -514,4 +520,40 @@ func writeReports(dir string, s *grade.Summary) error {
 		return err
 	}
 	return os.WriteFile(filepath.Join(dir, "summary.json"), raw, 0o644)
+}
+
+// defaultRubric finds the rubric of a lab that did not name one.
+//
+// The default used to be the literal path <lab>/rubric/cos461.yaml, so every
+// course other than the one this project started with had to pass --rubric on
+// every command, and a lab whose rubric was named after itself reported that
+// the file did not exist rather than that the flag was needed. A lab with one
+// rubric does not need to be told which one to use; a lab with several does,
+// and is told so by name.
+func defaultRubric(dir string) (string, error) {
+	rd := filepath.Join(dir, "rubric")
+	entries, err := os.ReadDir(rd)
+	if err != nil {
+		return "", fmt.Errorf("this lab has no rubric directory (%s), so there is nothing "+
+			"to grade against: pass --rubric", rd)
+	}
+	var found []string
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if n := e.Name(); strings.HasSuffix(n, ".yaml") || strings.HasSuffix(n, ".yml") {
+			found = append(found, filepath.Join(rd, n))
+		}
+	}
+	sort.Strings(found)
+	switch len(found) {
+	case 0:
+		return "", fmt.Errorf("%s holds no rubric, so there is nothing to grade against", rd)
+	case 1:
+		return found[0], nil
+	default:
+		return "", fmt.Errorf("this lab has %d rubrics (%s); say which one with --rubric",
+			len(found), strings.Join(found, ", "))
+	}
 }

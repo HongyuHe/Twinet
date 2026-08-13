@@ -89,7 +89,11 @@ mark, unless --keep-labs is given for a dispute.`,
 				return err
 			}
 			if rubricPath == "" {
-				rubricPath = filepath.Join(class.Lab.Dir, "rubric", "cos461.yaml")
+				p, err := defaultRubric(class.Lab.Dir)
+				if err != nil {
+					return err
+				}
+				rubricPath = p
 			}
 			rubric, err := grade.LoadRubric(rubricPath)
 			if err != nil {
