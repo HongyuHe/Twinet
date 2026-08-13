@@ -171,9 +171,28 @@ The lab must already be deployed with --solve.`,
 			if !skipAttest {
 				fmt.Fprintf(cmd.ErrOrStderr(),
 					"checking that this lab is the reference solution before grading anybody\n")
+				// Attested twice before refusing.
+				//
+				// The lab is a live network: a system can be a few seconds
+				// short of converged when the attestation reads it, score
+				// 9.80, and be at 10.00 by the time anybody looks. Refusing on
+				// the first reading turned a transient into an aborted class
+				// run. Refusing on the second is the same guarantee -- nothing
+				// is graded against a lab that is not the reference -- without
+				// the false alarm.
 				if err := attestReference(cmd.Context(), top, rubric, exec, converge,
 					parallel, opts.Manifest); err != nil {
-					return err
+					fmt.Fprintf(cmd.ErrOrStderr(),
+						"the lab did not read as the reference solution; waiting for it to "+
+							"settle and checking once more\n")
+					waitWave(cmd.Context(), top, exec, subs, converge)
+					if err2 := attestReference(cmd.Context(), top, rubric, exec, converge,
+						parallel, opts.Manifest); err2 != nil {
+						return err2
+					}
+					fmt.Fprintf(cmd.ErrOrStderr(),
+						"the lab is the reference solution on the second reading; the first "+
+							"was taken while it was still settling\n")
 				}
 			}
 
@@ -764,7 +783,31 @@ func attestReference(ctx context.Context, top *model.Topology, rubric *grade.Rub
 			var why string
 			switch {
 			case rep.Total < rubric.MaxTotal():
+				// Which check, not just the total.
+				//
+				// "AS 5 scores 9.80 of 10.00" tells an operator that something
+				// is wrong and nothing about what, so the only way to act on it
+				// was to grade the system again by hand and hope it failed the
+				// same way. The reference is expected to pass everything, so
+				// anything that did not is worth naming.
+				var short []string
+				for _, q := range rep.Questions {
+					for _, r := range q.Results {
+						if r.Status == grade.StatusPass {
+							continue
+						}
+						detail := fmt.Sprintf("%v", r.Evidence.Observed)
+						if strings.TrimSpace(detail) == "" {
+							detail = r.Err
+						}
+						short = append(short, fmt.Sprintf("%s (%s: %s)",
+							r.Check, r.Status, firstLine(detail)))
+					}
+				}
 				why = fmt.Sprintf("scores %.2f of %.2f", rep.Total, rubric.MaxTotal())
+				if len(short) > 0 {
+					why += ": " + strings.Join(truncateStrings(short, 3), "; ")
+				}
 			case rep.NeedsReview:
 				why = "scores full marks but is flagged for review"
 				if rep.Err != "" {
@@ -811,4 +854,13 @@ func atLeastOne(n int) int {
 		return 1
 	}
 	return n
+}
+
+// truncateStrings keeps the first n and says how many were dropped.
+func truncateStrings(in []string, n int) []string {
+	if len(in) <= n {
+		return in
+	}
+	return append(append([]string{}, in[:n]...),
+		fmt.Sprintf("and %d more", len(in)-n))
 }
