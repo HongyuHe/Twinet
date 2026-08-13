@@ -217,6 +217,17 @@ The lab must already be deployed with --solve.`,
 					"grading %d submission(s), one at a time: everything else in the lab stays "+
 						"at the reference\n", len(subs))
 			}
+			// --parallel is concurrency *within* a wave, so it does nothing at
+			// all unless --per-wave put more than one submission in one. An
+			// operator asking for -p 4 and getting a serial run deserves to be
+			// told which flag they wanted rather than left to time it.
+			if parallel > 1 && widestWave(waves) < 2 {
+				fmt.Fprintf(cmd.ErrOrStderr(),
+					"--parallel %d has no effect here: it grades submissions concurrently "+
+						"within a wave, and every wave holds one. Use --per-wave to put "+
+						"several submissions in a wave, or `twinet grade batch` to grade "+
+						"submissions in labs of their own.\n", parallel)
+			}
 
 			start := time.Now()
 			var reports []*grade.Report
@@ -863,4 +874,15 @@ func truncateStrings(in []string, n int) []string {
 	}
 	return append(append([]string{}, in[:n]...),
 		fmt.Sprintf("and %d more", len(in)-n))
+}
+
+// widestWave reports how many submissions the largest wave holds.
+func widestWave(waves [][]submission) int {
+	n := 0
+	for _, w := range waves {
+		if len(w) > n {
+			n = len(w)
+		}
+	}
+	return n
 }
