@@ -120,18 +120,26 @@ type QuestionResult struct {
 
 // Report is one student's complete result.
 type Report struct {
-	Submission string           `json:"submission"`
-	AS         int              `json:"as"`
-	Lab        string           `json:"lab"`
-	Rubric     string           `json:"rubric"`
-	Manifest   string           `json:"manifest_hash"`
-	GradedAt   time.Time        `json:"graded_at"`
-	Duration   string           `json:"duration"`
-	Total      float64          `json:"total"`
-	MaxTotal   float64          `json:"max_total"`
-	Questions  []QuestionResult `json:"questions"`
-	Warnings   []string         `json:"warnings,omitempty"`
-	Err        string           `json:"error,omitempty"`
+	Submission string `json:"submission"`
+	AS         int    `json:"as"`
+	Lab        string `json:"lab"`
+	// Course and Term identify the class a mark belongs to.
+	//
+	// The manifest has carried them since the first version and nothing read
+	// them, so two runs of the same lab in successive terms produced reports
+	// that were indistinguishable -- which matters exactly when a mark is
+	// disputed a year later.
+	Course    string           `json:"course,omitempty"`
+	Term      string           `json:"term,omitempty"`
+	Rubric    string           `json:"rubric"`
+	Manifest  string           `json:"manifest_hash"`
+	GradedAt  time.Time        `json:"graded_at"`
+	Duration  string           `json:"duration"`
+	Total     float64          `json:"total"`
+	MaxTotal  float64          `json:"max_total"`
+	Questions []QuestionResult `json:"questions"`
+	Warnings  []string         `json:"warnings,omitempty"`
+	Err       string           `json:"error,omitempty"`
 	// NeedsReview marks a report that must not be released without a human
 	// looking at it, because some part of the grading did not run correctly.
 	NeedsReview bool `json:"needs_review,omitempty"`

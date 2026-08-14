@@ -174,6 +174,9 @@ func Run(ctx context.Context, r *Rubric, env *Env, opts RunOptions) *Report {
 		Manifest: env.Topology.Hash, GradedAt: time.Now().UTC(),
 		MaxTotal: r.MaxTotal(),
 	}
+	if lab := env.Topology.Lab; lab != nil {
+		rep.Course, rep.Term = lab.Metadata.Course, lab.Metadata.Term
+	}
 	if opts.ConvergeTimeout == 0 {
 		opts.ConvergeTimeout = 90 * time.Second
 	}

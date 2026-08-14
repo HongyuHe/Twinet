@@ -108,11 +108,14 @@ func (r Relationship) Inverse() Relationship {
 
 // Meta is the metadata block shared by every top-level document.
 type Meta struct {
-	Name        string            `yaml:"name" json:"name" jsonschema:"required,description=Unique name of the object"`
-	Description string            `yaml:"description,omitempty" json:"description,omitempty"`
-	Course      string            `yaml:"course,omitempty" json:"course,omitempty"`
-	Term        string            `yaml:"term,omitempty" json:"term,omitempty"`
-	Labels      map[string]string `yaml:"labels,omitempty" json:"labels,omitempty"`
+	Name        string `yaml:"name" json:"name" jsonschema:"required,description=Unique name of the object"`
+	Description string `yaml:"description,omitempty" json:"description,omitempty"`
+	// Course and Term are recorded on a report so a mark can be traced to the
+	// class that produced it. Term already appears in a lab's description;
+	// Course is carried through to the grading report.
+	Course string            `yaml:"course,omitempty" json:"course,omitempty"`
+	Term   string            `yaml:"term,omitempty" json:"term,omitempty"`
+	Labels map[string]string `yaml:"labels,omitempty" json:"labels,omitempty"`
 }
 
 // Lab is the top-level manifest: the complete description of one deployment.

@@ -272,9 +272,14 @@ node from a local tarball for air-gapped or slow-link environments.
 - **Web UI / Krill**: published on the front node only.
 - **VPN**: WireGuard endpoint on the front node; peer traffic is routed into
   the overlay, so a student's laptop can reach devices on any cluster node.
-- **Lab → Internet**: off by default. An explicit `egress:` block enables
-  masquerade for named devices (e.g. Routinator fetching real trust anchors),
-  rather than the current blanket `nat_setup.sh` + `iptables/filters.sh`.
+- **Lab → Internet**: *(planned, not implemented)* off by default; an explicit
+  `egress:` block would enable masquerade for named devices (e.g. a validator
+  fetching real trust anchors), rather than the legacy platform's blanket
+  `nat_setup.sh` + `iptables/filters.sh`. Today a device reaches only the lab,
+  and a manifest that declares `egress:` is **refused** rather than deployed
+  with the block silently ignored. The lab is self-contained by construction:
+  the trust anchor is derived from the topology, the resolver is authoritative
+  for the lab's own zones, and nothing else needs to leave.
 
 ## 6. Failure handling
 

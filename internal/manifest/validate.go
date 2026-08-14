@@ -34,6 +34,7 @@ func (l *Loaded) Validate() *Diagnostics {
 	l.validatePeerings(d, file)
 	l.validateServices(d, file)
 	l.validateBehaviours(d, file)
+	l.validateEgress(d, file)
 	l.validateResources(d, file)
 	l.validatePlacement(d, file)
 	l.validateAccess(d, file)
@@ -755,4 +756,26 @@ func (l *Loaded) validateProvisioning(d *Diagnostics, file string, root *yaml.No
 				"known domains: "+known)
 		}
 	}
+}
+
+// validateEgress refuses a block nothing carries out.
+//
+// `egress:` has been in the manifest, the schema and the design document since
+// the first version, documented as the replacement for the legacy platform's
+// blanket nat_setup.sh, with the specific example of a validator fetching real
+// trust anchors. No code has ever read it. A lab that declares it gets exactly
+// the internet access it would have got without it, which is none, and finds
+// out when something inside fails to resolve a name.
+//
+// Refusing is better than ignoring. It costs an author one line and a link to
+// the status ledger; ignoring costs them an afternoon.
+func (l *Loaded) validateEgress(d *Diagnostics, file string) {
+	if len(l.Lab.Egress) == 0 {
+		return
+	}
+	root := l.Nodes[file]
+	d.AddHint(file, "egress", nodeAt(root, "egress"),
+		"outbound access is not implemented, so this block would do nothing",
+		"devices reach only the lab. Remove the block; the design for it is in "+
+			"docs/04 section 5 and it is listed as unimplemented in docs/09")
 }
