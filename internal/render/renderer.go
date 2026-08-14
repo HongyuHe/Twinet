@@ -449,6 +449,25 @@ var RPKIRefreshScript = strings.Join([]string{
 	"echo $$ > $pid",
 	"while :; do",
 	"  sleep 60",
+	// A session that is configured and not connected does not repair
+	// itself, and nothing else was looking.
+	//
+	// FRR establishes the RTR connection when the cache line is
+	// committed, not when the daemon reads it out of a file, so a bgpd
+	// that restarts -- a repair, a container restart, an operator
+	// reloading -- comes back with the configuration present and no
+	// connection. Every route in the table is then not-found, which looks
+	// exactly like a student who filtered too much, and the whole class
+	// loses the origin-validation marks. Eight systems were found in that
+	// state at once. `rpki reset` and `rpki start` do not bring it back;
+	// re-entering the cache line does.
+	"  if vtysh -c 'show rpki cache-connection' 2>/dev/null | grep -q 'No connection'; then",
+	"    line=$(vtysh -c 'show running-config' 2>/dev/null | sed -n 's/^ *\\(rpki cache .*\\)$/\\1/p' | head -1)",
+	"    if [ -n \"$line\" ]; then",
+	"      vtysh -c 'configure terminal' -c 'rpki' -c \"no $line\" -c \"$line\" -c 'end' >/dev/null 2>&1",
+	"    fi",
+	"    continue",
+	"  fi",
 	// Nothing to validate against yet.
 	"  vtysh -c 'show rpki prefix-table' 2>/dev/null | grep -qE '^[0-9]+[.]' || continue",
 	// Only a route this router learned for itself, and only while one is
@@ -484,7 +503,13 @@ var RPKIRefreshScript = strings.Join([]string{
 	"  if vtysh -c 'show rpki cache-connection' 2>/dev/null | grep -q Connected; then",
 	"    exit 0",
 	"  fi",
-	"  vtysh -c 'rpki reset' >/dev/null 2>&1 || true",
+	// Re-entering the cache line, not `rpki reset`: reset was measured on
+	// a live router with the session down and left it down, as did
+	// `rpki start`.
+	"  line=$(vtysh -c 'show running-config' 2>/dev/null | sed -n 's/^ *\\(rpki cache .*\\)$/\\1/p' | head -1)",
+	"  if [ -n \"$line\" ]; then",
+	"    vtysh -c 'configure terminal' -c 'rpki' -c \"no $line\" -c \"$line\" -c 'end' >/dev/null 2>&1",
+	"  fi",
 	"  sleep 4",
 	"done",
 	// Not a hard failure: a lab without a working validator is still a
