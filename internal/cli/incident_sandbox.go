@@ -264,7 +264,43 @@ func chownTree(root string, uid, gid int) error {
 // existed would otherwise stay open for the rest of its life.
 func sealLabState(top *model.Topology) {
 	dir := filepath.Join(top.Lab.Dir, ".twinet")
-	if fi, err := os.Stat(dir); err == nil && fi.IsDir() {
-		_ = os.Chmod(dir, 0o700)
+	fi, err := os.Stat(dir)
+	if err != nil || !fi.IsDir() {
+		return
 	}
+	_ = os.Chmod(dir, 0o700)
+	// And it belongs to whoever is running twinet, not to root.
+	//
+	// Running one command under sudo -- which evaluating an agent now requires
+	// -- left the ledger and the directory owned by root and readable by nobody
+	// else, so the operator's next ordinary `twinet fault status` in their own
+	// lab directory failed with "permission denied". Locking a user out of
+	// their own lab is not what sealing it is for.
+	if os.Geteuid() != 0 {
+		return
+	}
+	uid, gid := sudoCaller()
+	if uid < 0 {
+		return
+	}
+	// Errors are ignored deliberately: this is a courtesy to the operator, and
+	// a path that cannot be chowned is not a reason to fail the command that
+	// was actually asked for.
+	_ = filepath.Walk(dir, func(p string, _ os.FileInfo, walkErr error) error {
+		if walkErr == nil {
+			_ = os.Chown(p, uid, gid)
+		}
+		return nil
+	})
+}
+
+// sudoCaller is the user who invoked sudo, or -1 when this is not a sudo
+// session.
+func sudoCaller() (uid, gid int) {
+	u, uerr := strconv.Atoi(os.Getenv("SUDO_UID"))
+	g, gerr := strconv.Atoi(os.Getenv("SUDO_GID"))
+	if uerr != nil || gerr != nil || u == 0 {
+		return -1, -1
+	}
+	return u, g
 }

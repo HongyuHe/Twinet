@@ -267,6 +267,25 @@ func sanitisedEnv() []string {
 // then the agent as an unprivileged account. Where they do not, it is the
 // unprivileged account alone, and the caller is told that the isolation is
 // weaker than it should be rather than left to assume it is not.
+// canEvaluateAgents reports whether this process can put an agent somewhere it
+// cannot read the answer, so `incident run` can refuse before it injects
+// anything rather than after.
+func canEvaluateAgents() error {
+	if os.Geteuid() != 0 {
+		return errors.New("evaluating an agent needs root: the agent has to be put in a " +
+			"namespace where it cannot read the scenario, the lab or the injection ledger, " +
+			"and this process cannot create one. Re-run under sudo")
+	}
+	for _, tool := range []string{"unshare", "setpriv"} {
+		if !haveTool(tool) {
+			return fmt.Errorf("evaluating an agent needs %s, which is not installed: without "+
+				"it the agent shares this machine's filesystem and process table, and can "+
+				"read the fault it is being asked to diagnose", tool)
+		}
+	}
+	return nil
+}
+
 func agentCommand(ctx context.Context, command string, sb *sandbox) (*exec.Cmd, error) {
 	// Refused rather than weakened.
 	//
@@ -277,17 +296,8 @@ func agentCommand(ctx context.Context, command string, sb *sandbox) (*exec.Cmd, 
 	// device -- so the benchmark silently measured nothing, and looked exactly
 	// like one that had worked. A score that cannot be trusted is worse than no
 	// score, because somebody will quote it.
-	if os.Geteuid() != 0 {
-		return nil, errors.New("evaluating an agent needs root: the agent has to be put in " +
-			"a namespace where it cannot read the scenario, the lab or the injection " +
-			"ledger, and this process cannot create one. Re-run under sudo")
-	}
-	for _, tool := range []string{"unshare", "setpriv"} {
-		if !haveTool(tool) {
-			return nil, fmt.Errorf("evaluating an agent needs %s, which is not installed: "+
-				"without it the agent shares this machine's filesystem and process table, "+
-				"and can read the fault it is being asked to diagnose", tool)
-		}
+	if err := canEvaluateAgents(); err != nil {
+		return nil, err
 	}
 	var script strings.Builder
 	for _, p := range sb.Hide {

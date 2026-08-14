@@ -159,6 +159,16 @@ func newIncidentRunCmd(opts *Options) *cobra.Command {
 			if scenarioPath == "" {
 				return fmt.Errorf("pass --scenario")
 			}
+			// Before anything is injected.
+			//
+			// The agent has to run somewhere it cannot read the scenario, and
+			// finding out after the faults are live means a lab left broken by
+			// a run that could never have measured anything.
+			if agentCmd != "" {
+				if err := canEvaluateAgents(); err != nil {
+					return err
+				}
+			}
 			sc, err := loadScenario(scenarioPath)
 			if err != nil {
 				return err
