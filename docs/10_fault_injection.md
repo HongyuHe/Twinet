@@ -362,9 +362,20 @@ one lab, and allow only commands that observe, so it cannot take a grading hold,
 enter configuration mode, or bring an interface down. An agent that can repair
 or worsen its own incident is not being scored on anything.
 
-`twinet incident run --agent` therefore needs root, to create the namespace and
-to drop out of it. Without `unshare` and `setpriv` it says so and runs with the
-account alone, which is weaker; it does not pretend otherwise.
+`twinet incident run --agent` therefore needs root, to create the namespaces and
+to drop out of them. Without root, or without `unshare` and `setpriv`, it
+refuses -- before injecting anything -- and says which is missing. It used to
+fall back to running the agent as the invoking user with no isolation at all,
+which produced a number that looked like a measurement and was not.
+
+The agent also needs to reach the node agents, and on a cluster with mutual TLS
+a bearer token is not enough. It is issued a client certificate of its own,
+valid for hours, in its sandbox: transport identity is not authorisation here --
+the node agents decide what a caller may do from its token -- but handing the
+controller's private key to something under evaluation is not a thing to do
+when issuing another costs nothing. Without this the agent could not observe
+anything at all, which scores exactly like an agent that looked and found
+nothing.
 
 The end-to-end suite runs an agent whose entire strategy is to look for the
 answer — the ledger by three paths, the scenarios in the lab and in its own

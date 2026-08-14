@@ -118,6 +118,13 @@ func Generate(dir string, nodes map[string][]string) (*Bundle, error) {
 
 func issue(dir, name string, caCert *x509.Certificate, caKey *ecdsa.PrivateKey,
 	sans []string, usage []x509.ExtKeyUsage) (Material, error) {
+	return issueFor(dir, name, caCert, caKey, sans, usage, leafValidity)
+}
+
+// issueFor is issue with an explicit lifetime, so a credential handed to
+// something under evaluation can be short-lived.
+func issueFor(dir, name string, caCert *x509.Certificate, caKey *ecdsa.PrivateKey,
+	sans []string, usage []x509.ExtKeyUsage, valid time.Duration) (Material, error) {
 
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -127,7 +134,7 @@ func issue(dir, name string, caCert *x509.Certificate, caKey *ecdsa.PrivateKey,
 		SerialNumber: serial(),
 		Subject:      pkix.Name{CommonName: name},
 		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(leafValidity),
+		NotAfter:     time.Now().Add(valid),
 		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
 		ExtKeyUsage:  usage,
 	}
@@ -178,4 +185,71 @@ func serial() *big.Int {
 		panic("pki: no randomness available: " + err.Error())
 	}
 	return n
+}
+
+// IssueDiagnostic mints a short-lived client certificate for an evaluated RCA
+// agent, in a directory of its own.
+//
+// The agent has to reach the node agents, and on a cluster with mutual TLS that
+// takes a client certificate as well as a token. It had neither: the sandbox
+// excluded the PKI, so every observation the agent tried failed with
+// "certificate required" and the benchmark could not be run at all -- which is
+// the one failure worse than a benchmark that measures the wrong thing, because
+// it looks like the agent found nothing.
+//
+// A certificate of its own rather than the controller's. Transport identity is
+// not authorisation here -- the node agents decide what a caller may do from
+// its bearer token, and the agent's token is the read-only, single-lab one --
+// but handing out the controller's private key to something under evaluation is
+// not a thing to do when issuing another key costs nothing. This one is valid
+// for hours, not months, and its subject says what it is.
+func IssueDiagnostic(pkiDir, outDir string, valid time.Duration) (Material, error) {
+	caCert, caKey, err := loadCA(pkiDir)
+	if err != nil {
+		return Material{}, err
+	}
+	if err := os.MkdirAll(outDir, 0o700); err != nil {
+		return Material{}, err
+	}
+	m, err := issueFor(outDir, "diagnostic", caCert, caKey, nil,
+		[]x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, valid)
+	if err != nil {
+		return Material{}, err
+	}
+	// The agent needs the authority to verify the nodes it talks to.
+	ca, err := os.ReadFile(filepath.Join(pkiDir, "ca_cert.pem"))
+	if err != nil {
+		return Material{}, err
+	}
+	m.CAPath = filepath.Join(outDir, "ca_cert.pem")
+	if err := os.WriteFile(m.CAPath, ca, 0o644); err != nil {
+		return Material{}, err
+	}
+	return m, nil
+}
+
+// loadCA reads the cluster authority from a PKI directory.
+func loadCA(dir string) (*x509.Certificate, *ecdsa.PrivateKey, error) {
+	certPEM, err := os.ReadFile(filepath.Join(dir, "ca_cert.pem"))
+	if err != nil {
+		return nil, nil, fmt.Errorf("read the cluster authority: %w", err)
+	}
+	keyPEM, err := os.ReadFile(filepath.Join(dir, "ca_key.pem"))
+	if err != nil {
+		return nil, nil, fmt.Errorf("read the cluster authority's key: %w", err)
+	}
+	cb, _ := pem.Decode(certPEM)
+	kb, _ := pem.Decode(keyPEM)
+	if cb == nil || kb == nil {
+		return nil, nil, fmt.Errorf("%s does not hold a usable authority", dir)
+	}
+	cert, err := x509.ParseCertificate(cb.Bytes)
+	if err != nil {
+		return nil, nil, err
+	}
+	key, err := x509.ParseECPrivateKey(kb.Bytes)
+	if err != nil {
+		return nil, nil, err
+	}
+	return cert, key, nil
 }

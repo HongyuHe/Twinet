@@ -9,8 +9,10 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/HongyuHe/twinet/internal/model"
+	"github.com/HongyuHe/twinet/internal/pki"
 )
 
 // An RCA agent under evaluation runs here: as somebody else, somewhere else.
@@ -32,6 +34,11 @@ type sandbox struct {
 	User     string
 	UID      int
 	GID      int
+	// TLS material the agent presents to the node agents, where the cluster
+	// requires it.
+	TLSCert string
+	TLSKey  string
+	TLSCA   string
 	// Hide is every path the agent must not be able to open: the lab it is
 	// diagnosing, the repository that lab lives in, and any episode record.
 	//
@@ -105,7 +112,51 @@ func newSandbox(top *model.Topology, manifest, name string) (*sandbox, error) {
 		return nil, err
 	}
 	sb.Hide = pathsToHide(top, manifest)
+	// A transport identity of its own, where the cluster wants one.
+	//
+	// On a cluster with mutual TLS a bearer token is not enough: every
+	// observation the agent tried came back "certificate required", so the
+	// benchmark could not be run at all -- the failure that looks exactly like
+	// an agent finding nothing. It gets a short-lived client certificate of its
+	// own rather than the controller's, because transport identity is not
+	// authorisation here (the node agents decide what a caller may do from its
+	// token, and the agent's is the read-only, single-lab one) and handing the
+	// controller's private key to something under evaluation is not a thing to
+	// do when issuing another costs nothing.
+	if dir := labPKIDir(top); dir != "" {
+		m, err := pki.IssueDiagnostic(dir, filepath.Join(sb.Dir, "tls"), 6*time.Hour)
+		if err != nil {
+			sb.Remove()
+			return nil, fmt.Errorf("issuing the agent's client certificate: %w", err)
+		}
+		sb.TLSCert, sb.TLSKey, sb.TLSCA = m.CertPath, m.KeyPath, m.CAPath
+		if err := chownTree(filepath.Join(sb.Dir, "tls"), uid, gid); err != nil {
+			sb.Remove()
+			return nil, err
+		}
+	}
 	return sb, nil
+}
+
+// labPKIDir is the mutual-TLS material for this lab, or "" when the cluster
+// does not use any.
+func labPKIDir(top *model.Topology) string {
+	var dirs []string
+	if top.Lab.Dir != "" {
+		dirs = append(dirs, filepath.Join(top.Lab.Dir, ".twinet", "pki"))
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		dirs = append(dirs, filepath.Join(home, ".twinet", "pki"))
+	}
+	dirs = append(dirs, "/etc/twinet/pki")
+	for _, d := range dirs {
+		// The authority's key is what says this directory can issue; a
+		// directory with only a certificate belongs to somebody else.
+		if _, err := os.Stat(filepath.Join(d, "ca_key.pem")); err == nil {
+			return d
+		}
+	}
+	return ""
 }
 
 // pathsToHide lists the directories an evaluated agent must not be able to

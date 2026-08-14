@@ -222,6 +222,12 @@ func runAgent(ctx context.Context, command string, ep *Episode, sb *sandbox, tok
 		"TWINET_LAB="+ep.Lab,
 		"TWINET_TOKEN="+agent.DiagnosticToken(token, ep.Lab),
 	)
+	if sb.TLSCert != "" {
+		c.Env = append(c.Env,
+			"TWINET_TLS_CERT="+sb.TLSCert,
+			"TWINET_TLS_KEY="+sb.TLSKey,
+			"TWINET_CA="+sb.TLSCA)
+	}
 	var out, errb strings.Builder
 	c.Stdout, c.Stderr = &out, &errb
 	runErr := c.Run()
@@ -251,6 +257,9 @@ func sanitisedEnv() []string {
 		k, _, _ := strings.Cut(kv, "=")
 		switch k {
 		case "TWINET_TOKEN", "TWINET_MANIFEST", "TWINET_LAB", "TWINET_STATE_DIR",
+			// The controller's own transport identity, which is not the
+			// agent's: it gets one of its own, valid for hours.
+			"TWINET_TLS_CERT", "TWINET_TLS_KEY", "TWINET_CA",
 			"TWINET_ALLOW_VERSION_SKEW", "HOME", "TMPDIR", "XDG_STATE_HOME",
 			"XDG_CONFIG_HOME", "XDG_CACHE_HOME", "SUDO_USER", "SUDO_UID", "SUDO_GID":
 			continue

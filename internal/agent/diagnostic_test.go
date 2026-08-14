@@ -202,3 +202,46 @@ func TestADiagnosticSessionHasAGrammarRatherThanADenylist(t *testing.T) {
 		}
 	}
 }
+
+// iproute2 accepts abbreviations, so a validator matching exact spellings is
+// matching the wrong thing.
+//
+// `ip link se dev lo up` is `ip link set dev lo up`: "se" is an unambiguous
+// prefix of "set". A diagnostic session brought an interface up on a device it
+// was being scored on, and could as easily have brought one down. And
+// `iptables-save -f <path>` creates or truncates a file as root anywhere on the
+// device, which was allowed because the program's name says "save".
+func TestADiagnosticSessionCannotUseAnAbbreviation(t *testing.T) {
+	refused := [][]string{
+		{"ip", "link", "se", "dev", "lo", "down"},
+		{"ip", "link", "se", "dev", "lo", "up"},
+		{"ip", "ad", "add", "10.0.0.1/24", "dev", "eth0"},
+		{"ip", "addr", "ad", "10.0.0.1/24", "dev", "eth0"},
+		{"ip", "route", "de", "default"},
+		{"ip", "route", "repl", "default", "via", "10.0.0.1"},
+		{"ip", "-b", "/tmp/commands"},
+		{"ip", "-bat", "/tmp/commands"},
+		{"ip", "-net", "other", "link", "show"},
+		{"iptables-save", "-f", "/tmp/proof"},
+		{"ip6tables-save", "--file", "/tmp/proof"},
+	}
+	for _, c := range refused {
+		if err := ReadOnlyCommand(c); err == nil {
+			t.Errorf("%v is an abbreviated write and was allowed", c)
+		}
+	}
+	allowed := [][]string{
+		{"ip", "link", "show"},
+		{"ip", "link", "sh"},
+		{"ip", "-br", "addr", "show", "dev", "eth0"},
+		{"ip", "route", "get", "1.2.3.4"},
+		{"iptables-save"},
+		{"iptables-save", "-c"},
+		{"iptables-save", "-t", "filter"},
+	}
+	for _, c := range allowed {
+		if err := ReadOnlyCommand(c); err != nil {
+			t.Errorf("%v only observes, and was refused: %v", c, err)
+		}
+	}
+}

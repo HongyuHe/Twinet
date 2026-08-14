@@ -107,7 +107,11 @@ var readOnlyPrograms = map[string]func(cmd []string) error{
 	"tracepath": nil, "mtr": nil, "dig": nil, "host": nil, "nslookup": nil,
 	"cat": nil, "head": nil, "tail": nil, "grep": nil, "wc": nil, "ls": nil,
 	"date": nil, "uptime": nil, "ps": nil, "free": nil, "df": nil,
-	"netstat": nil, "iptables-save": nil, "ip6tables-save": nil,
+	"netstat": nil,
+
+	// iptables-save -f writes the ruleset to a file, as root, anywhere.
+	"iptables-save":  savesReadOnly,
+	"ip6tables-save": savesReadOnly,
 
 	// Observation with a way to write, spelled out.
 	"ip":       refuseWrites,
@@ -137,25 +141,62 @@ var writeVerbs = map[string]bool{
 // writeOptions do something other than print, whatever else is on the line:
 // -batch runs a file of commands, -force presses on past errors, and -netns
 // moves the whole operation into another network namespace.
-var writeOptions = map[string]bool{
-	"-batch": true, "-force": true, "-n": true, "-netns": true,
-	"-w": true, "--write": true, "-a": true, "-all": true,
+var writeOptionNames = map[string]bool{
+	"batch": true, "force": true, "netns": true, "all": true, "write": true,
 }
 
+// refuseWrites rejects an iproute2-style command that changes anything.
+//
+// Abbreviations count. iproute2 accepts any unambiguous prefix of a keyword, so
+// `ip link se dev lo up` is `ip link set dev lo up` -- and a validator matching
+// the exact spellings saw an argument called "se" and let it through. A
+// diagnostic session brought an interface up on a device it was being scored
+// on, and could as easily have brought one down. Anything that could be short
+// for a word that writes is refused; a device really called "se" would be
+// refused too, which is the right way round.
 func refuseWrites(cmd []string) error {
 	for _, a := range cmd[1:] {
 		low := strings.ToLower(a)
-		if writeVerbs[low] {
-			return fmt.Errorf("a diagnostic session may not run %q: %q changes the device",
-				strings.Join(cmd, " "), a)
+		if strings.HasPrefix(low, "-") {
+			name := strings.TrimLeft(low, "-")
+			if i := strings.IndexByte(name, '='); i > 0 {
+				name = name[:i]
+			}
+			for w := range writeOptionNames {
+				if name != "" && strings.HasPrefix(w, name) {
+					return fmt.Errorf("a diagnostic session may not run %q: %q can be short "+
+						"for -%s, which does more than print",
+						strings.Join(cmd, " "), a, w)
+				}
+			}
+			continue
 		}
-		name := low
-		if i := strings.IndexByte(name, '='); i > 0 {
-			name = name[:i]
+		for w := range writeVerbs {
+			// Two characters is where iproute2 stops being ambiguous; a single
+			// letter it rejects itself.
+			if len(low) >= 2 && strings.HasPrefix(w, low) {
+				return fmt.Errorf("a diagnostic session may not run %q: %q is, or can be "+
+					"short for, %q, which changes the device",
+					strings.Join(cmd, " "), a, w)
+			}
 		}
-		if writeOptions[name] {
-			return fmt.Errorf("a diagnostic session may not run %q: %q is not an option that "+
-				"only prints", strings.Join(cmd, " "), a)
+	}
+	return nil
+}
+
+// savesReadOnly allows the ruleset dumps to print and nothing else.
+//
+// `iptables-save -f <path>` creates or truncates a file, as root, anywhere on
+// the device -- including a routing configuration. It was allowed because its
+// name says "save" and its validator was nil.
+func savesReadOnly(cmd []string) error {
+	for _, a := range cmd[1:] {
+		switch a {
+		case "-c", "--counters", "-t", "--table", "-M", "--modprobe":
+			continue
+		}
+		if strings.HasPrefix(a, "-") {
+			return fmt.Errorf("a diagnostic session may run %s only to print (%q)", cmd[0], a)
 		}
 	}
 	return nil

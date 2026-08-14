@@ -317,8 +317,19 @@ func newIncidentRunCmd(opts *Options) *cobra.Command {
 							return fmt.Errorf("preparing the agent sandbox: %w", serr)
 						}
 						defer sb.Remove()
+						// The cluster secret, resolved the same way every
+						// other command resolves it. Passing the flag through
+						// raw derived the agent's credential from an empty
+						// string whenever the token came from the environment,
+						// so every observation it tried came back 401 and the
+						// episode scored an agent that had been prevented from
+						// looking at anything.
+						secret, terr := tokenFor(token)
+						if terr != nil {
+							return fmt.Errorf("deriving the agent's credential: %w", terr)
+						}
 						d, stderr, aerr := runAgent(cmd.Context(), agentCmd, ep,
-							sb, token, agentTimeout)
+							sb, secret, agentTimeout)
 						if strings.TrimSpace(stderr) != "" {
 							ep.AgentLog = stderr
 						}

@@ -1137,10 +1137,32 @@ func TestAnIncidentEvaluatesAndScoresAnAgent(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = os.Remove(briefPath) }()
+	probePath := filepath.Join("/tmp", "twinet-e2e-probe-"+strconv.Itoa(os.Getpid())+".txt")
+	if err := os.WriteFile(probePath, nil, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(probePath, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Remove(probePath) }()
+	// An agent that has to look before it answers.
+	//
+	// It used to print the right answer without reading anything, so the test
+	// measured the harness and not the isolation -- and it went on passing on a
+	// cluster where the agent could not reach a single device, because the
+	// sandbox had no client certificate and every observation came back
+	// "certificate required". A benchmark whose subject is prevented from
+	// looking scores exactly like one whose subject looked and found nothing.
 	script := "#!/bin/sh\ncat > " + briefPath + "\n" +
-		"printf '%s\\n' '{\"is_anomaly\":true,\"faulty_devices\":[\"as3/NYC\"]," +
+		"out=$(twinet exec -m \"$TWINET_MANIFEST\" as3/NYC -- " +
+		"vtysh -c 'show ip ospf neighbor' 2>&1)\n" +
+		"echo \"$out\" > " + probePath + "\n" +
+		"case \"$out\" in\n" +
+		"  *Neighbor*) printf '%s\\n' '{\"is_anomaly\":true,\"faulty_devices\":[\"as3/NYC\"]," +
 		"\"root_cause_category\":\"misconfiguration\"," +
-		"\"root_cause_name\":[\"ospf_neighbor_missing\"]}'\n"
+		"\"root_cause_name\":[\"ospf_neighbor_missing\"]}' ;;\n" +
+		"  *) printf '%s\\n' '{\"is_anomaly\":false}' ;;\n" +
+		"esac\n"
 	if err := os.WriteFile(agent, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -1178,6 +1200,15 @@ func TestAnIncidentEvaluatesAndScoresAnAgent(t *testing.T) {
 	if ep.Score.Total < 0.99 {
 		t.Errorf("a diagnosis naming exactly the injected device, category and root cause "+
 			"scored %.2f", ep.Score.Total)
+	}
+	// And it earned that by looking. Without this, an agent that cannot reach
+	// any device at all scores the same as one that read the network, which is
+	// how a cluster with mutual TLS went a long time with a benchmark that
+	// could not be run on it.
+	probe, err := os.ReadFile(probePath)
+	if err != nil || !strings.Contains(string(probe), "Neighbor") {
+		t.Errorf("the agent could not observe the lab it was scored on; what its probe "+
+			"returned was:\n%s", probe)
 	}
 	if !ep.Resolved {
 		t.Error("the incident was not resolved, so the lab is left broken for whatever runs next")
