@@ -74,8 +74,30 @@ func checkBGPFreeCore(ctx context.Context, env *Env) Result {
 		}
 		// FRR says "BGP instance not found" when no process exists at all,
 		// which is the state being asked for.
-		if !strings.Contains(out, "instance not found") && strings.Contains(out, "Neighbor") {
-			bad = append(bad, fmt.Sprintf("%s runs BGP", d.Name))
+		//
+		// Requiring the word "Neighbor" as well was the mistake: FRR prints a
+		// neighbour table only when there are neighbours, so a core router with
+		// `router bgp 1` configured and no peers matched neither string and was
+		// reported as holding no BGP state. It holds a BGP instance, a routing
+		// information base and an identifier, and one line of configuration
+		// away from holding the whole table -- which is the thing the exercise
+		// says a core router must not do.
+		if !strings.Contains(out, "instance not found") {
+			bad = append(bad, fmt.Sprintf("%s has a BGP instance", d.Name))
+			continue
+		}
+		// And the configuration, because an instance that exists but has not
+		// been read by this command would be missed by it.
+		cfg, err := env.Vtysh(ctx, d.Name, "show running-config")
+		if err != nil {
+			return Errored("mpls.bgp_free_core", err)
+		}
+		for _, line := range strings.Split(cfg, "\n") {
+			if strings.HasPrefix(strings.TrimSpace(line), "router bgp") {
+				bad = append(bad, fmt.Sprintf("%s is configured with %s",
+					d.Name, strings.TrimSpace(line)))
+				break
+			}
 		}
 	}
 	// And no edge may name a core router as a neighbour: a session configured
