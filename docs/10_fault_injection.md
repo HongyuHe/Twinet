@@ -103,15 +103,19 @@ Emitted in NIKA's shape so scoring code is shared, not reimplemented:
 ## 4. Coverage of NIKA's fault taxonomy
 
 NIKA's registry currently defines **60** injectable root causes
-(`/users/hy/nika/docs/failure-types.md`). Twinet registers **42** fault types,
-of which **40 are NIKA types**; the remaining two (`bgp_peer_asn_misconfig`,
+(`/users/hy/nika/docs/failure-types.md`, vendored at
+`internal/fault/nika_types.json`). Twinet registers **47** fault types, of which
+**45 are NIKA types**; the remaining two (`bgp_peer_asn_misconfig`,
 `host_network_down`) are Twinet's own.
 
-The numbers below are produced by diffing `twinet fault list --json` against
-NIKA's table, not by counting entries in this document. An earlier revision
-claimed 47 of 48 by counting types the plan intended to add; the count was wrong
-in both terms and stayed wrong through two reviews, which is a good argument for
-generating it.
+The numbers below are produced by diffing the registry against the vendored
+taxonomy, not by counting entries in this document. An earlier revision claimed
+47 of 48 by counting types the plan intended to add; the count was wrong in both
+terms and stayed wrong through two reviews. A later one said 42 and 40 in this
+paragraph and 47 and 45 in the table below, which is the same failure in a
+smaller way. `TestTheCoverageTableMatchesTheRegistry` now reads the figures out
+of this document and compares them with the registry, so a stale number fails
+the build rather than a review.
 
 | | Count |
 |---|---:|
@@ -132,8 +136,8 @@ comm -23 /tmp/want /tmp/have    # NIKA types Twinet does not implement
 
 ### 4.1 What is not implemented, and why
 
-The 20 gaps are not scattered: they are four substrates Twinet does not emulate,
-plus one family that is a design change rather than a fault.
+The 15 gaps are not scattered: they are four substrates Twinet does not emulate,
+plus two types that are design changes rather than faults.
 
 | Group | Types | What it would take |
 |---|---:|---|

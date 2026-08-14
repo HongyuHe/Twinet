@@ -143,3 +143,33 @@ func TestAnUnconfiguredSubnetIsNotAnswered(t *testing.T) {
 			"has no symptom and the fault about it cannot be observed")
 	}
 }
+
+// Moving the pool must move the addresses clients are given.
+//
+// A remembered lease was reused whenever it fell inside the segment's prefix,
+// so narrowing the range -- or a fault that moves it somewhere else entirely --
+// changed nothing for any client that already had an address. The fault that
+// exists to put hosts on a network nobody else is on was measured on the
+// cluster handing out the original pool, with every option correct, while its
+// own verifier read the edited configuration back and called it done.
+func TestALeaseOutsideThePoolIsNotReused(t *testing.T) {
+	sub := DHCPSubnet{
+		Subnet: "3.103.0.0/24", First: "3.103.0.200", Last: "3.103.0.240",
+		Routers: []string{"3.103.0.2"}, Self: "3.103.0.2",
+	}
+	for _, c := range []struct {
+		addr string
+		want bool
+	}{
+		{"3.103.0.200", true},
+		{"3.103.0.240", true},
+		{"3.103.0.220", true},
+		{"3.103.0.1", false},   // inside the subnet, outside the pool
+		{"3.103.0.250", false}, // likewise
+		{"10.255.255.200", false},
+	} {
+		if got := inPool(&sub, netip.MustParseAddr(c.addr)); got != c.want {
+			t.Errorf("inPool(%s) = %v, want %v", c.addr, got, c.want)
+		}
+	}
+}
