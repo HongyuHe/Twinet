@@ -3,6 +3,7 @@ package grade
 import (
 	"context"
 	"fmt"
+	"net/netip"
 	"sort"
 	"strings"
 
@@ -337,19 +338,151 @@ func checkVPNIsolation(ctx context.Context, env *Env) Result {
 			}
 		}
 	}
+	// And the tables themselves, because a probe that needs a reply cannot see
+	// a leak that only goes one way.
+	//
+	// Importing another customer's route target on one edge puts their
+	// prefixes in this customer's table. Traffic then flows into the other
+	// bank's network, and nothing comes back, because their table has no route
+	// to here -- so every ping is lost and a check built on ping reports
+	// perfect isolation. One bank able to inject packets into another's
+	// network is precisely the failure the mechanism exists to prevent, and it
+	// scored full marks. Found by the advanced course's own discrimination
+	// suite, which is what that suite is for.
+	routeLeaks, err := crossCustomerRoutes(ctx, env, names)
+	if err != nil {
+		return Errored("vpn.isolation", err)
+	}
+	leaks = append(leaks, routeLeaks...)
+
 	if len(leaks) > 0 {
 		sort.Strings(leaks)
 		return Fail("vpn.isolation", Evidence{
-			Expected: "customers cannot reach one another",
-			Observed: strings.Join(leaks, "; "),
-			Command:  "ping",
+			Expected: "customers cannot reach one another, and cannot see one another's routes",
+			Observed: strings.Join(truncate(leaks, 6), "; "),
+			Command:  "ping; show ip route vrf <table> <prefix>",
 		})
 	}
 	return Pass("vpn.isolation", Evidence{
 		Expected: "customers are kept apart, over a VPN that carries their traffic",
-		Observed: fmt.Sprintf("%d directed site pair(s) across %d customer(s) mutually unreachable",
+		Observed: fmt.Sprintf("%d directed site pair(s) across %d customer(s) mutually "+
+			"unreachable, and no customer's table holds another's prefixes",
 			tried, len(names)),
 	})
+}
+
+// crossCustomerRoutes reports every place one customer's routing table holds
+// another customer's address space.
+//
+// This is the control-plane half of isolation, and it is not redundant with the
+// probes above: a leak in one direction delivers packets and receives no reply,
+// which is indistinguishable from isolation to anything that pings.
+//
+// The comparison is against each customer's own address block rather than
+// against a site address, because asking a router for a route to an address
+// returns the longest match -- and a default route matches everything, so every
+// correct submission with one looked like a total leak.
+func crossCustomerRoutes(ctx context.Context, env *Env, names []string) ([]string, error) {
+	holders, err := vrfHolders(env)
+	if err != nil {
+		return nil, err
+	}
+	blocks, err := customerBlocks(env)
+	if err != nil {
+		return nil, err
+	}
+	var leaks []string
+	for _, mine := range names {
+		for _, router := range holders[mine] {
+			var doc map[string][]struct {
+				Prefix string `json:"prefix"`
+			}
+			cmd := fmt.Sprintf("show ip route vrf %s json", mine)
+			if err := env.VtyshJSON(ctx, router, cmd, &doc); err != nil {
+				return nil, fmt.Errorf("%s: table %s could not be read (%w), so no verdict "+
+					"about what is in it is possible", router, mine, err)
+			}
+			for prefix := range doc {
+				p, perr := netip.ParsePrefix(prefix)
+				if perr != nil {
+					continue
+				}
+				for _, theirs := range names {
+					if theirs == mine {
+						continue
+					}
+					for _, b := range blocks[theirs] {
+						// Inside their block, and not their block's supernet:
+						// a default route is not a leak, it is a default route.
+						if b.Bits() <= p.Bits() && b.Contains(p.Addr()) {
+							leaks = append(leaks, fmt.Sprintf(
+								"%s holds %s in table %s, which is inside %s's %s: the "+
+									"tables are not separate",
+								router, prefix, mine, theirs, b))
+						}
+					}
+				}
+			}
+		}
+	}
+	sort.Strings(leaks)
+	return leaks, nil
+}
+
+// customerBlocks is the address space each customer was allocated, keyed by the
+// table that carries them.
+func customerBlocks(env *Env) (map[string][]netip.Prefix, error) {
+	as, ok := env.Topology.ASes[env.AS]
+	if !ok {
+		return nil, fmt.Errorf("AS %d is not in this lab", env.AS)
+	}
+	out := map[string][]netip.Prefix{}
+	seen := map[string]bool{}
+	for _, d := range as.Routers {
+		for _, i := range d.Ifaces {
+			if i.VRF == "" || i.Peer == nil || i.Peer.Device == nil {
+				continue
+			}
+			b := blockOf(env.Topology, i.Peer.Device.ASN)
+			if b == "" || seen[i.VRF+b] {
+				continue
+			}
+			p, err := netip.ParsePrefix(b)
+			if err != nil {
+				continue
+			}
+			seen[i.VRF+b] = true
+			out[i.VRF] = append(out[i.VRF], p)
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("no customer in AS %d has an address block, so one table "+
+			"holding another's routes cannot be recognised", env.AS)
+	}
+	return out, nil
+}
+
+// vrfHolders lists, for each routing table, the provider edges that hold it.
+func vrfHolders(env *Env) (map[string][]string, error) {
+	as, ok := env.Topology.ASes[env.AS]
+	if !ok {
+		return nil, fmt.Errorf("AS %d is not in this lab", env.AS)
+	}
+	out := map[string][]string{}
+	for _, d := range as.Routers {
+		seen := map[string]bool{}
+		for _, i := range d.Ifaces {
+			if i.VRF == "" || seen[i.VRF] {
+				continue
+			}
+			seen[i.VRF] = true
+			out[i.VRF] = append(out[i.VRF], d.Name)
+		}
+	}
+	for k := range out {
+		sort.Strings(out[k])
+	}
+	return out, nil
 }
 
 // ---------------------------------------------------------------------------
