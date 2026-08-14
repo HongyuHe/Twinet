@@ -70,3 +70,40 @@ func TestADiagnosticSessionMayOnlyObserve(t *testing.T) {
 		}
 	}
 }
+
+// A newline is a command separator, and vtysh is not an exception.
+//
+// The metacharacter check exempted vtysh, because a show command may legally
+// contain a pipe, and only the first word of a -c body was validated. Both
+// together let a diagnostic session send
+// "show version\nconfigure terminal\ninterface lo\ndescription ..." as one
+// argument whose first word is "show", and change the router -- while a plain
+// "configure terminal" was refused. An agent that can edit the device it is
+// being scored on is not being scored on anything.
+func TestADiagnosticSessionCannotHideACommandBehindANewline(t *testing.T) {
+	refused := [][]string{
+		{"vtysh", "-c", "show version\nconfigure terminal\ninterface lo\ndescription x\nend"},
+		{"vtysh", "-c", "show version\rconfigure terminal"},
+		{"vtysh", "-c", "show version; configure terminal"},
+		{"vtysh", "-c", "show ip bgp\nclear ip bgp *"},
+		{"ip", "-br\naddr", "show"},
+		{"ping", "1.2.3.4\nreboot"},
+		{"cat", "/etc/frr/frr.conf\nrm -rf /"},
+	}
+	for _, c := range refused {
+		if err := ReadOnlyCommand(c); err == nil {
+			t.Errorf("%q hides a second command behind a separator and was allowed", c)
+		}
+	}
+	// And the legitimate uses still work, including vtysh's own output filter.
+	allowed := [][]string{
+		{"vtysh", "-c", "show ip bgp summary"},
+		{"vtysh", "-c", "show running-config | include neighbor"},
+		{"vtysh", "-c", "show ip route json"},
+	}
+	for _, c := range allowed {
+		if err := ReadOnlyCommand(c); err != nil {
+			t.Errorf("%q is how you read a router, and it was refused: %v", c, err)
+		}
+	}
+}

@@ -4,6 +4,7 @@ package e2e
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -121,12 +122,30 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 	const as = 3
 
 	solveAS(t, dir, as)
+	// Graded twice if the first is short.
+	//
+	// Re-solving a system restarts FRR on all of its routers, and a table read
+	// while OSPF is still flooding scores a question at 0.99 -- which is not
+	// the reference failing, it is the reference not having finished. Failing
+	// here on that costs a whole run of the suite; grading again after a wait
+	// costs ninety seconds.
 	baseline, points, _ := gradeAS(t, dir, as)
-	for id, p := range points {
-		if baseline[id] < p {
-			t.Fatalf("the reference does not score full marks on %s (%.2f of %.2f); "+
-				"nothing below can be attributed to the breakage", id, baseline[id], p)
+	short := func(b map[string]float64) string {
+		for id, p := range points {
+			if b[id] < p {
+				return fmt.Sprintf("%s (%.2f of %.2f)", id, b[id], p)
+			}
 		}
+		return ""
+	}
+	if why := short(baseline); why != "" {
+		t.Logf("the reference is short on %s; waiting for it to settle and grading again", why)
+		time.Sleep(60 * time.Second)
+		baseline, points, _ = gradeAS(t, dir, as)
+	}
+	if why := short(baseline); why != "" {
+		t.Fatalf("the reference does not score full marks on %s; nothing below can be "+
+			"attributed to the breakage", why)
 	}
 
 	cases := []struct {
@@ -275,6 +294,49 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 				// ones already in the table keep the preference they were given.
 				vtysh(t, dir, router, "clear bgp ipv4 unicast "+nbr+" in")
 				time.Sleep(8 * time.Second)
+			},
+		},
+		{
+			// Somebody else's address space, originated somewhere the check
+			// was not looking.
+			//
+			// "Only your own prefix" read the table of the first router of the
+			// system, which is an accident of the template's ordering. A
+			// submission originating 203.0.113.0/24 on another router kept the
+			// whole mark: the prefix was in the neighbour's table and in the
+			// originating router's advertisements, and the grader looked at
+			// neither.
+			name:     "address space that is not yours, on another router",
+			question: "q2.2",
+			apply: func(t *testing.T) {
+				const foreign = "203.0.113.0/24"
+				routers := routersOf(t, dir, 3)
+				// Not the first: that is the one the old check read.
+				victim := routers[len(routers)-1]
+				for _, r := range routers {
+					if importRouteMaps(t, dir, r) != nil && r != routers[0] {
+						victim = r
+						break
+					}
+				}
+				t.Logf("originating %s on %s", foreign, victim)
+				vtysh(t, dir, victim, "configure terminal",
+					"ip route "+foreign+" Null0",
+					"router bgp 3", "address-family ipv4 unicast",
+					"network "+foreign, "end")
+				time.Sleep(12 * time.Second)
+			},
+			undo: func(t *testing.T) {
+				const foreign = "203.0.113.0/24"
+				// Tolerantly: a router that never had the statement answers
+				// non-zero, and that is not a failure of the undo.
+				for _, r := range routersOf(t, dir, 3) {
+					vtyshQuiet(t, dir, r, "configure terminal",
+						"router bgp 3", "address-family ipv4 unicast",
+						"no network "+foreign, "end")
+					vtyshQuiet(t, dir, r, "configure terminal",
+						"no ip route "+foreign+" Null0", "end")
+				}
 			},
 		},
 		{
@@ -776,4 +838,15 @@ func communitySetBy(t *testing.T, dir, router, rm string) string {
 		}
 	}
 	return last
+}
+
+// vtyshQuiet is vtysh for commands whose failure is expected on some devices --
+// undoing a statement a router never had, for instance.
+func vtyshQuiet(t *testing.T, dir, device string, cmds ...string) {
+	t.Helper()
+	args := []string{"exec", "-m", dir, device, "--", "vtysh"}
+	for _, c := range cmds {
+		args = append(args, "-c", c)
+	}
+	_, _ = twinet(t, args...)
 }

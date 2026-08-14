@@ -132,10 +132,25 @@ func ReadOnlyCommand(cmd []string) error {
 			"vtysh -c 'show ...'", prog)
 	}
 	for _, a := range cmd[1:] {
-		// No shell metacharacters anywhere. Every allowed program takes its
-		// arguments directly, so a semicolon or a backtick is somebody trying
-		// to reach a shell through one of them.
-		if strings.ContainsAny(a, ";|&`$><\n") && prog != "vtysh" && prog != "grep" {
+		// A newline is a command separator everywhere, and vtysh is no
+		// exception: it reads what follows one as the next line of input. The
+		// exemption below let a diagnostic session send
+		// "show version\nconfigure terminal\ninterface lo\ndescription ..."
+		// as a single -c body, whose first word is "show", and change the
+		// router -- while a plain "configure terminal" was refused with 403.
+		// An agent that can edit the device it is being scored on is not being
+		// scored on anything.
+		if strings.ContainsAny(a, "\n\r\x00") {
+			return fmt.Errorf("a diagnostic session may not send more than one command in "+
+				"an argument (%q contains a line break)", a)
+		}
+		// No shell metacharacters anywhere else. Every allowed program takes
+		// its arguments directly, so a semicolon or a backtick is somebody
+		// trying to reach a shell through one of them.
+		if strings.ContainsAny(a, ";&`$><") {
+			return fmt.Errorf("a diagnostic session may not use shell syntax (%q)", a)
+		}
+		if strings.Contains(a, "|") && prog != "vtysh" && prog != "grep" {
 			return fmt.Errorf("a diagnostic session may not use shell syntax (%q)", a)
 		}
 	}
@@ -154,6 +169,12 @@ func ReadOnlyCommand(cmd []string) error {
 			first := strings.Fields(body)
 			if len(first) == 0 {
 				return errors.New("vtysh -c needs a command")
+			}
+			// One command, checked as a whole. Validating the first word of a
+			// body that may contain several is validating the wrong thing.
+			if strings.ContainsAny(body, "\n\r;") {
+				return fmt.Errorf("a diagnostic session may send only one vtysh command per "+
+					"-c argument (%q)", body)
 			}
 			switch first[0] {
 			case "show", "ping", "traceroute", "terminal":

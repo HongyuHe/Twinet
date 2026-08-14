@@ -212,17 +212,57 @@ func checkOwnPrefix(ctx context.Context, env *Env) Result {
 	if len(routers) == 0 {
 		return Errored("bgp.own_prefix_only", fmt.Errorf("AS %d has no routers", env.AS))
 	}
-	tbl, err := bgpTable(ctx, env, routers[0].Name)
-	if err != nil {
-		return Errored("bgp.own_prefix_only", err)
+	// Every router, and what each of them actually sends.
+	//
+	// This read the table of routers[0] alone. A system originating somebody
+	// else's address space on one router and hiding it from the first with an
+	// outbound route-map kept the whole mark: the prefix was in the neighbour's
+	// table and in the originating router's advertisements, and the grader
+	// looked at neither. Which router happens to be first is an accident of the
+	// template's ordering, and no property of a system is a property of one of
+	// its routers.
+	originated := map[string]bool{}
+	for _, r := range routers {
+		tbl, err := bgpTable(ctx, env, r.Name)
+		if err != nil {
+			return Errored("bgp.own_prefix_only", err)
+		}
+		for prefix, entries := range tbl.Table() {
+			for _, e := range entries {
+				// An empty AS path on a locally injected route means we
+				// originate it.
+				if strings.TrimSpace(e.Path) == "" {
+					originated[prefix] = true
+				}
+			}
+		}
 	}
 
-	originated := map[string]bool{}
-	for prefix, entries := range tbl.Table() {
-		for _, e := range entries {
-			// An empty AS path on a locally injected route means we originate it.
-			if strings.TrimSpace(e.Path) == "" {
+	// And what leaves the system, which is what the neighbours see and what the
+	// question is really about. A prefix originated and withheld is a mistake;
+	// a prefix advertised is a claim on somebody's address space.
+	advertised := map[string]string{}
+	for _, sess := range externalSessions(ctx, env) {
+		adv, err := advertisedRoutes(ctx, env, sess.Router, sess.Addr)
+		if err != nil {
+			if errors.Is(err, errNoSuchNeighbour) {
+				continue
+			}
+			return Errored("bgp.own_prefix_only", fmt.Errorf(
+				"%s: what it advertises to %s could not be read, so whether this system "+
+					"announces address space that is not its own cannot be decided: %w",
+				sess.Router, sess.Addr, err))
+		}
+		for prefix, entries := range adv.Table() {
+			for _, e := range entries {
+				if strings.TrimSpace(e.Path) != "" {
+					continue // somebody else's route, passing through
+				}
 				originated[prefix] = true
+				if prefix != as.Block {
+					advertised[prefix] = fmt.Sprintf("%s advertises it to %s",
+						sess.Router, sess.Addr)
+				}
 			}
 		}
 	}
@@ -230,9 +270,14 @@ func checkOwnPrefix(ctx context.Context, env *Env) Result {
 	hasOwn := originated[as.Block]
 	var extra []string
 	for p := range originated {
-		if p != as.Block {
-			extra = append(extra, p)
+		if p == as.Block {
+			continue
 		}
+		if where, ok := advertised[p]; ok {
+			extra = append(extra, fmt.Sprintf("%s (%s)", p, where))
+			continue
+		}
+		extra = append(extra, p)
 	}
 	sort.Strings(extra)
 
