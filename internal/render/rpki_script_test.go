@@ -57,3 +57,30 @@ func TestTheRPKIWatcherIsValidShell(t *testing.T) {
 		t.Error("the watcher does not look for a disconnected validator session")
 	}
 }
+
+// A new watcher must replace the one already running.
+//
+// A shell reads a `while` loop into memory before running it, so a watcher
+// started an hour ago goes on executing the script it was started with however
+// often the file is rewritten -- and the guard that stops a deployment
+// accumulating one watcher per deploy then refuses to start the new one. Every
+// improvement to this script had been deployed to the file and to nothing else.
+func TestTheRPKIWatcherReplacesTheRunningOne(t *testing.T) {
+	body := RPKIRefreshScript
+	kill := strings.Index(body, "kill $p")
+	write := strings.Index(body, "cat > /etc/twinet/rpki_refresh.sh")
+	start := strings.Index(body, "setsid sh /etc/twinet/rpki_refresh.sh")
+	switch {
+	case kill < 0:
+		t.Errorf("nothing stops the watcher that is already running, so the one on these "+
+			"routers stays whatever version it was started with:\n%s", body)
+	case write < 0 || start < 0:
+		t.Fatalf("the watcher is no longer written or started:\n%s", body)
+	case kill > start:
+		t.Errorf("the old watcher is stopped after the new one is started:\n%s", body)
+	}
+	if !strings.Contains(body, "rm -f /run/twinet_rpki_refresh.pid") {
+		t.Error("the pid file of the stopped watcher is left behind, so the guard in the " +
+			"new one may still refuse to start it")
+	}
+}

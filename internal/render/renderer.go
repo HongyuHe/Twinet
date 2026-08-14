@@ -440,6 +440,17 @@ var RPKIRefreshScript = strings.Join([]string{
 	//
 	// So it stays, cheaply: one look a minute, and a refresh only when
 	// this router is holding an invalid route it learned itself.
+	// The watcher already running is stopped first.
+	//
+	// A shell reads a `while` loop into memory before executing it, so a
+	// watcher started an hour ago goes on running the script it was started
+	// with no matter what is written to the file afterwards. The guard below
+	// then refuses to start the new one, because a watcher is already
+	// running. Every improvement to this script since it was written had
+	// therefore been deployed to the file and to nothing else: the version
+	// actually watching these routers was the first one.
+	"for p in $(ps -ef | awk '/rpki_refresh/ && !/awk/ {print $1}'); do kill $p 2>/dev/null || true; done",
+	"rm -f /run/twinet_rpki_refresh.pid",
 	"cat > /etc/twinet/rpki_refresh.sh <<'TWINET_RPKI'",
 	// One copy per container. A deployment runs this step every time, and
 	// a repair runs it again; without the guard a router accumulates a
