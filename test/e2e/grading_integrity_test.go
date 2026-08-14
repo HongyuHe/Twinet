@@ -23,7 +23,7 @@ func gradeAS(t *testing.T, dir string, as int) (map[string]float64, map[string]f
 	// baseline came out at 0.83 of 1.00 on a question the reference answers
 	// perfectly, and everything measured against that baseline was then
 	// meaningless. The baseline waits; the deliberately broken runs do not.
-	return gradeASWithin(t, dir, as, "6m")
+	return gradeASWithin(t, dir, as, "6m", true)
 }
 
 // gradeASBroken marks a system that has been broken on purpose.
@@ -33,21 +33,31 @@ func gradeAS(t *testing.T, dir string, as int) (map[string]float64, map[string]f
 // past twelve minutes, at which point the subprocess was killed mid-run.
 func gradeASBroken(t *testing.T, dir string, as int) (map[string]float64, map[string]float64, string) {
 	t.Helper()
-	return gradeASWithin(t, dir, as, "90s")
+	// A deliberately broken submission may leave a question that cannot be
+	// marked at all -- "nothing was delivered, so whether anybody else
+	// received it says nothing" is the grader being careful, not the grader
+	// failing. Insisting on a clean run here made three honest mutations look
+	// like harness errors and hid whether the checks had noticed them.
+	return gradeASWithin(t, dir, as, "90s", false)
 }
 
-func gradeASWithin(t *testing.T, dir string, as int, converge string) (
+func gradeASWithin(t *testing.T, dir string, as int, converge string, requireClean bool) (
 	map[string]float64, map[string]float64, string) {
 	t.Helper()
 	out := t.TempDir()
 	res, err := twinet(t, "grade", "run", "-m", dir, "--as", itoa(as),
 		"-o", out, "--converge-timeout", converge)
-	if err != nil {
+	// A run that could not mark every question exits non-zero, correctly: a
+	// mark nobody can stand behind must not be released quietly. On a
+	// deliberately broken submission that is the expected outcome, and the
+	// report is still written, so the exit status is not a reason to stop --
+	// only a report that is missing or unreadable is.
+	if err != nil && requireClean {
 		t.Fatalf("grading AS %d: %v\n%s", as, err, res)
 	}
-	raw, err := os.ReadFile(filepath.Join(out, "group"+itoa(as)+".json"))
-	if err != nil {
-		t.Fatalf("no report was written: %v", err)
+	raw, rerr := os.ReadFile(filepath.Join(out, "group"+itoa(as)+".json"))
+	if rerr != nil {
+		t.Fatalf("no report was written (grade said %v): %v\n%s", err, rerr, res)
 	}
 	var rep struct {
 		NeedsReview bool   `json:"needs_review"`
@@ -61,7 +71,7 @@ func gradeASWithin(t *testing.T, dir string, as int, converge string) (
 	if err := json.Unmarshal(raw, &rep); err != nil {
 		t.Fatalf("the report does not parse: %v", err)
 	}
-	if rep.NeedsReview || rep.Err != "" {
+	if requireClean && (rep.NeedsReview || rep.Err != "") {
 		t.Fatalf("grading did not complete cleanly: needs_review=%v err=%q", rep.NeedsReview, rep.Err)
 	}
 	awarded := map[string]float64{}
