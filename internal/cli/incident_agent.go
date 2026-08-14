@@ -329,6 +329,14 @@ func agentCommand(ctx context.Context, command string, sb *sandbox) (*exec.Cmd, 
 	if err := canEvaluateAgents(); err != nil {
 		return nil, err
 	}
+	if sb.Net == nil {
+		// The network is not optional and there is no weaker version of it.
+		// Every published scenario names its own answer, so an agent with a
+		// route to the internet can fetch the answer instead of finding it.
+		return nil, errors.New("the agent has no network of its own, so it would have " +
+			"this machine's; the scenarios are published, and an agent that can reach " +
+			"the internet can read the answer instead of diagnosing it")
+	}
 	var script strings.Builder
 	for _, p := range sb.Hide {
 		// Empty, unreadable, and not a bind of anything: a directory the agent
@@ -351,8 +359,9 @@ func agentCommand(ctx context.Context, command string, sb *sandbox) (*exec.Cmd, 
 	// --fork is required with --pid (the namespace applies to children), and
 	// --mount-proc gives the namespace a procfs of its own, so /proc shows the
 	// agent and nothing else.
-	return exec.CommandContext(ctx, "unshare", "--mount", "--pid", "--fork", "--mount-proc",
-		"--propagation", "private", "--", "sh", "-c", script.String()), nil
+	argv := sb.Net.Wrap([]string{"unshare", "--mount", "--pid", "--fork", "--mount-proc",
+		"--propagation", "private", "--", "sh", "-c", script.String()})
+	return exec.CommandContext(ctx, argv[0], argv[1:]...), nil
 }
 
 func haveTool(name string) bool {

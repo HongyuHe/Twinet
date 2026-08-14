@@ -40,6 +40,14 @@ const (
 	// StatusError means the check itself could not run, which is the grader's
 	// problem and not the student's. It never silently costs marks.
 	StatusError Status = "error"
+	// StatusNotApplicable means the question this check asks cannot arise in
+	// this AS: a stub with no customers cannot withhold transit from one.
+	//
+	// It is distinct from StatusError, which is the grader failing and calls
+	// for a human, and from StatusPass, which would be a mark awarded for a
+	// property nobody established. The check is left out of the weighting, so
+	// the question's marks rest on the checks that could be asked.
+	StatusNotApplicable Status = "not_applicable"
 )
 
 // Evidence is machine-readable proof of what was observed.
@@ -101,6 +109,17 @@ func Partial(check string, score float64, ev Evidence) Result {
 // Errored builds a result recording that the check could not run.
 func Errored(check string, err error) Result {
 	return Result{Check: check, Status: StatusError, Score: 0, Err: err.Error()}
+}
+
+// NotApplicable builds a result recording that the property this check is about
+// cannot arise here, so no verdict about it is possible or needed.
+//
+// The reason is carried as evidence rather than as an error, because it is a
+// fact about the topology and not a malfunction: a student reading their report
+// should see why the check was set aside, and a marker should not be summoned.
+func NotApplicable(check, why string) Result {
+	return Result{Check: check, Status: StatusNotApplicable, Score: 0,
+		Evidence: Evidence{Observed: why}}
 }
 
 // QuestionResult aggregates the checks belonging to one assignment question.

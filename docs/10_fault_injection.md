@@ -348,6 +348,8 @@ find it, and every weaker arrangement was tried first and defeated:
 | Keep the ground truth off standard input | `cat $TWINET_MANIFEST/.twinet/injections.json` — the manifest path was in the environment |
 | Copy the lab, minus its private state | The original is world-readable; the agent opened it by absolute path |
 | Drop to an unprivileged account | The scenario file beside the lab names the fault, the device and the interface in plain YAML — and so do the tests that exercise it |
+| Mask every path that holds the answer | The agent had this machine's network, and the scenarios are published: `curl` fetched the answer from GitHub |
+| Mask the paths and cut the network | The answer was still *written in the scenario*, so a model that had read the repository never needed to fetch it |
 
 What holds is a mount namespace. The agent runs as a system account with no
 shell, in a private namespace where the lab directory, the repository containing
@@ -368,6 +370,55 @@ refuses -- before injecting anything -- and says which is missing. It used to
 fall back to running the agent as the invoking user with no isolation at all,
 which produced a number that looked like a measurement and was not.
 
+### The agent's network
+
+The agent gets a network namespace of its own, joined to the machine by a single
+link, with a firewall that permits the node agents' addresses and ports and
+rejects everything else. There is no route to the internet, no resolver, and
+nothing else on the cluster within reach — not another node's SSH, not a
+container, not the machine it is running on. Names the manifest uses are
+resolved before the agent starts and given to it as a hosts file, so blocking
+DNS costs it nothing and gives it no channel.
+
+This is not defence in depth for its own sake. Every scenario Twinet ships is in
+a public repository, and each one used to name its fault, its device and its
+interface. An agent that fetched
+`raw.githubusercontent.com/HongyuHe/Twinet/.../ospf_adjacency_lost.yaml` scored
+1.00 without asking a single router anything.
+
+An operator who needs the agent to reach something else — a model endpoint is
+the usual reason — says so with `--allow-egress host:port`, and the resulting
+set is recorded in the episode. A score earned with a route to the internet is a
+different measurement from one earned without, and that belongs beside the
+number rather than in somebody's memory.
+
+### Where the fault goes is drawn, not written
+
+Cutting the network stops an agent fetching the answer during the run. It does
+nothing about an answer it already knows, and a published scenario that says
+`device: NYC, iface: port_PHY` is an answer anybody can memorise — including a
+model trained on the internet.
+
+So a scenario says what *kind* of place the fault goes, and the run draws one:
+
+```yaml
+faults:
+  - type: ospf_neighbor_missing
+    select:
+      kind: internal_link      # or external_link, router, host
+      as: [3]
+```
+
+Twinet enumerates every target in the deployed topology the selector matches —
+24 internal links inside AS 3 in the COS-461 lab — and draws one with a seed
+taken at run time. The seed is recorded in the episode, so an episode can be
+replayed exactly afterwards (`--seed`) without being predictable beforehand. A
+selector that matches nothing is refused rather than skipped: an episode with
+fewer faults than its ground truth claims is worse than no episode.
+
+`incident run --agent` refuses a scenario whose targets are pinned, and says
+why. `--allow-pinned-target` is for a scenario that is genuinely private.
+
 The agent also needs to reach the node agents, and on a cluster with mutual TLS
 a bearer token is not enough. It is issued a client certificate of its own,
 valid for hours, in its sandbox: transport identity is not authorisation here --
@@ -379,8 +430,10 @@ nothing.
 
 The end-to-end suite runs an agent whose entire strategy is to look for the
 answer — the ledger by three paths, the scenarios in the lab and in its own
-copy, a search of the filesystem, a grep of the repository, and the Docker
-socket — and requires all of it to come back empty. It also requires that agent
+copy, a search of the filesystem, a grep of the repository, the Docker socket,
+the scenario fetched from GitHub by name and by address, a query to a public
+resolver, and a port on another node — and requires all of it to come back
+empty. It also requires that agent
 to have actually run, because a test that passes because the subject never
 started is the failure this whole mechanism exists to prevent.
 

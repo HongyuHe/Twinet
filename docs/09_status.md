@@ -125,6 +125,24 @@ reached students, and each motivated a permanent test.
     so a corrupt capture was silently skipped and the device came back looking
     clean.
 
+11. **The benchmark could be answered from the internet.** Every scenario Twinet
+    ships names its fault, its device and its interface, and the repository is
+    public. The sandbox masked those files on this machine and left the agent
+    the machine's network, so `curl` fetched the answer from GitHub and an agent
+    that never queried a router scored 1.00. The agent now has a network
+    namespace of its own permitting the node agents and nothing else, and the
+    published scenarios no longer contain an answer to fetch: they say what kind
+    of link or device to break and the run draws one, recording the seed.
+
+12. **Withholding the internet from a paying customer was unassessed.** The
+    export half of Gao-Rexford was graded in one direction only — nothing
+    learned from a peer or a provider may go to a peer or a provider — because
+    a customer may receive anything. "May receive anything" is not "need receive
+    nothing": an AS could deny its providers' routes to every customer, leaving
+    them able to reach nobody outside it, and keep full marks for business
+    relationships. `policy.transit_for_customers` now requires every selected
+    route to reach every customer, and the discrimination suite mutates for it.
+
 ## Environment findings
 
 - **Jumbo frames are unavailable.** Raising `eno2` to MTU 9000 dropped the

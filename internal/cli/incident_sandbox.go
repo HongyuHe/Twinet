@@ -49,6 +49,12 @@ type sandbox struct {
 	// whose whole strategy is to grep the repository for its brief scored a
 	// perfect 1.00.
 	Hide []string
+
+	// Net is the network the agent gets: the node agents and nothing else.
+	//
+	// Hiding the answer on this machine while leaving a route to the internet
+	// hid nothing, because the scenarios are published in a public repository.
+	Net *agentNetwork
 }
 
 // sandboxUser is the account agents run as. It owns nothing, has no shell, and
@@ -63,7 +69,7 @@ const sandboxUser = "twinet-rca"
 // the student credentials, the roster and the PKI, and none of those are
 // anybody's to read but the operator's. The placement record is copied back in
 // on its own, because without it the agent cannot find the devices.
-func newSandbox(top *model.Topology, manifest, name string) (*sandbox, error) {
+func newSandbox(top *model.Topology, manifest, name string, egress []string) (*sandbox, error) {
 	u, err := ensureSandboxUser(sandboxUser)
 	if err != nil {
 		return nil, err
@@ -135,6 +141,18 @@ func newSandbox(top *model.Topology, manifest, name string) (*sandbox, error) {
 			return nil, err
 		}
 	}
+	// A network with the node agents on it and nothing else.
+	//
+	// This is the last of the ways the answer used to be readable. The agent
+	// could not open the scenario file, and could fetch the repository that
+	// contains it from the internet -- so an agent that never looked at a
+	// router scored 1.00. See internal/cli/incident_netns.go.
+	net, err := newAgentNetwork(top, egress)
+	if err != nil {
+		sb.Remove()
+		return nil, err
+	}
+	sb.Net = net
 	return sb, nil
 }
 
@@ -272,7 +290,11 @@ func copyPublicTree(src, dst string) error {
 }
 
 func (s *sandbox) Remove() {
-	if s != nil && s.Dir != "" {
+	if s == nil {
+		return
+	}
+	s.Net.Close()
+	if s.Dir != "" {
 		_ = os.RemoveAll(s.Dir)
 	}
 }

@@ -465,6 +465,45 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 				time.Sleep(8 * time.Second)
 			},
 		},
+		{
+			// The opposite error, and the one nothing was looking at.
+			//
+			// Leaking a provider's route to a peer was marked; withholding it
+			// from a paying customer was not, because the export check skips
+			// customer sessions on the grounds that a customer may receive
+			// anything. "May receive anything" was read as "need receive
+			// nothing", so an AS could sell transit, take its customers'
+			// routes, and hand back only a fraction of the internet -- and
+			// score full marks for business relationships. The denial is
+			// symmetric across every customer so that no single-session check
+			// can catch it by accident.
+			name:     "a provider's route withheld from every customer",
+			question: "q2.3",
+			apply: func(t *testing.T) {
+				router, custs, prefix := customerSessionsOn(t, dir, 3)
+				if len(custs) == 0 {
+					t.Fatal("AS 3 has no customer session, so nothing can be withheld from one")
+				}
+				t.Logf("withholding %s from every customer of AS 3 (%v) on %s",
+					prefix, custs, router)
+				cmds := []string{"configure terminal",
+					"ip prefix-list NOPROV seq 5 deny " + prefix,
+					"ip prefix-list NOPROV seq 10 permit 0.0.0.0/0 le 32",
+					"route-map CUSTOUT permit 10",
+					" match ip address prefix-list NOPROV",
+					"router bgp 3",
+					" address-family ipv4 unicast"}
+				for _, c := range custs {
+					cmds = append(cmds, "  neighbor "+c+" route-map CUSTOUT out")
+				}
+				cmds = append(cmds, " exit-address-family", "end")
+				vtysh(t, dir, router, cmds...)
+				for _, c := range custs {
+					vtysh(t, dir, router, "clear bgp ipv4 unicast "+c+" out")
+				}
+				time.Sleep(8 * time.Second)
+			},
+		},
 	}
 
 	for _, c := range cases {
@@ -616,6 +655,93 @@ func bestCustomerRoute(t *testing.T, dir string, as int) (router, nbr, prefix st
 	t.Logf("customer route: %s learned %s from %s at local preference %d",
 		router, prefix, nbr, bestPref)
 	return router, nbr, prefix
+}
+
+// customerSessionsOn finds the router holding this AS's customer sessions and
+// lists every one of them, together with a prefix that arrived from somebody
+// else -- which is what a customer is owed and what can be withheld from them.
+//
+// Relationships are read the way the other helpers read them, from the local
+// preference the submission itself set: the neighbours whose routes rank
+// highest are the customers, and the lowest-ranked route on that router came
+// from a provider.
+func customerSessionsOn(t *testing.T, dir string, as int) (router string, addrs []string, prefix string) {
+	t.Helper()
+	bestPref := -1
+	byRouter := map[string]map[string]int{}
+	worstOn := map[string]struct {
+		pref   int
+		prefix string
+	}{}
+	for _, dev := range routersOf(t, dir, as) {
+		inMaps := importRouteMaps(t, dir, dev)
+		if len(inMaps) == 0 {
+			continue
+		}
+		out, err := twinet(t, "exec", "-m", dir, dev, "--", "vtysh", "-c", "show ip bgp json")
+		if err != nil {
+			continue
+		}
+		var tbl struct {
+			Routes map[string][]struct {
+				LocalPref int `json:"locPrf"`
+				Nexthops  []struct {
+					IP string `json:"ip"`
+				} `json:"nexthops"`
+				Path string `json:"path"`
+			} `json:"routes"`
+		}
+		if err := json.Unmarshal([]byte(trimToJSON(out)), &tbl); err != nil {
+			continue
+		}
+		worstOn[dev] = struct {
+			pref   int
+			prefix string
+		}{1 << 30, ""}
+		for p, entries := range tbl.Routes {
+			for _, e := range entries {
+				if strings.TrimSpace(e.Path) == "" {
+					continue
+				}
+				if w := worstOn[dev]; e.LocalPref < w.pref {
+					worstOn[dev] = struct {
+						pref   int
+						prefix string
+					}{e.LocalPref, p}
+				}
+				for _, nh := range e.Nexthops {
+					if inMaps[nh.IP] == "" {
+						continue
+					}
+					if byRouter[dev] == nil {
+						byRouter[dev] = map[string]int{}
+					}
+					if e.LocalPref > byRouter[dev][nh.IP] {
+						byRouter[dev][nh.IP] = e.LocalPref
+					}
+					if e.LocalPref > bestPref {
+						bestPref, router = e.LocalPref, dev
+					}
+				}
+			}
+		}
+	}
+	if router == "" {
+		t.Fatalf("AS %d has no external session with an import policy", as)
+	}
+	for addr, pref := range byRouter[router] {
+		if pref == bestPref {
+			addrs = append(addrs, addr)
+		}
+	}
+	sort.Strings(addrs)
+	prefix = worstOn[router].prefix
+	if prefix == "" {
+		t.Fatalf("%s has selected no route learned from anybody else", router)
+	}
+	t.Logf("customer sessions on %s: %v; %s came from a provider at local preference %d",
+		router, addrs, prefix, worstOn[router].pref)
+	return router, addrs, prefix
 }
 
 // importRouteMaps maps each neighbour of a router to the route-map applied on

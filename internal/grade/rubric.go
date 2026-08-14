@@ -254,9 +254,13 @@ func Run(ctx context.Context, r *Rubric, env *Env, opts RunOptions) *Report {
 		results := runChecks(ctx, q, env, opts)
 
 		var broken []string
+		inapplicable := 0
 		for i := range q.Checks {
-			if results[i].Status == StatusError {
+			switch results[i].Status {
+			case StatusError:
 				broken = append(broken, results[i].Check)
+			case StatusNotApplicable:
+				inapplicable++
 			}
 		}
 		qr.Awarded = awardFor(q, results)
@@ -277,6 +281,18 @@ func Run(ctx context.Context, r *Rubric, env *Env, opts RunOptions) *Report {
 				// an error rather than a zero.
 				qr.Status = StatusError
 			}
+		}
+		// A question none of whose checks could be asked has not been answered.
+		//
+		// Awarding it zero would read as a student mistake, and awarding it
+		// full marks would be a mark for nothing; either way the rubric is
+		// wrong about this AS and a person should say what to do.
+		if len(broken)+inapplicable == len(q.Checks) && inapplicable > 0 {
+			qr.NeedsReview = true
+			rep.NeedsReview = true
+			qr.Status = StatusError
+			qr.Note = fmt.Sprintf("none of the %d check(s) apply to this AS, so the question was "+
+				"not assessed; the rubric does not fit this topology", len(q.Checks))
 		}
 		earned[q.ID] = qr.Awarded
 
@@ -383,7 +399,7 @@ func awardFor(q QuestionSpec, results []Result) float64 {
 		if w == 0 {
 			w = 1
 		}
-		if results[i].Status == StatusError {
+		if results[i].Status == StatusError || results[i].Status == StatusNotApplicable {
 			continue
 		}
 		weightSum += w

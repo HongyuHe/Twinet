@@ -43,6 +43,11 @@ func init() {
 		Run:      checkNoTransit,
 	})
 	Register(&Check{
+		Name:     "policy.transit_for_customers",
+		Describe: "a customer receives every route this AS selected, which is the transit it pays for",
+		Run:      checkTransitForCustomers,
+	})
+	Register(&Check{
 		Name:     "config.no_forbidden_ospf",
 		Describe: "inter-AS subnets are kept out of OSPF, as the assignment requires",
 		Run:      checkNoForbiddenOSPF,
@@ -706,8 +711,155 @@ func checkNoTransit(ctx context.Context, env *Env) Result {
 	})
 }
 
-// sourceRelationship infers which neighbour a route was learned from.
+// checkTransitForCustomers verifies the half of Gao-Rexford's export rule that
+// says what a customer is owed: everything.
 //
+// A customer pays for reachability to the whole internet, so every route this
+// AS has selected is meant to reach them -- its own, its other customers', its
+// peers' and its providers'. The no-transit check deliberately skips customer
+// sessions because a customer may receive anything, and nothing then looked at
+// them at all: an AS could deny its providers' routes to every customer, leave
+// them able to reach nobody outside this AS, and still score full marks for
+// business relationships. That is the transit service not being delivered,
+// which is a worse error than leaking, and it was unassessed.
+//
+// The requirement is per session and per route rather than in aggregate,
+// because withholding the internet from one of two customers is not half an
+// error to that customer.
+func checkTransitForCustomers(ctx context.Context, env *Env) Result {
+	const name = "policy.transit_for_customers"
+	var customers []externalSession
+	for _, s := range externalSessions(ctx, env) {
+		if s.Rel == model.RelCustomer {
+			customers = append(customers, s)
+		}
+	}
+	if len(customers) == 0 {
+		// A stub AS sells transit to nobody. The property is not true or
+		// false here, it does not arise, and the question's other checks
+		// carry its marks.
+		return NotApplicable(name, fmt.Sprintf(
+			"AS %d has no customers, so it owes nobody transit", env.AS))
+	}
+
+	var missing []string
+	var silent []string
+	var unreadable []string
+	checked := 0
+	for _, sess := range customers {
+		// What this router selected is what this router has to give. Asking a
+		// different router's table would excuse a session on a router that had
+		// learned nothing, and blame one whose neighbour is simply elsewhere.
+		tbl, err := bgpTable(ctx, env, sess.Router)
+		if err != nil {
+			unreadable = append(unreadable, fmt.Sprintf("%s: %v", sess.Router, err))
+			continue
+		}
+		owed := map[string]string{}
+		for prefix, entries := range tbl.Table() {
+			for _, e := range entries {
+				if !e.IsBest() {
+					continue
+				}
+				// A route this customer taught us is not owed back to them,
+				// and a route already through their AS would be a loop. Both
+				// are correct to withhold, so neither is counted.
+				if sess.ASN != 0 && pathContainsASN(e.Path, sess.ASN) {
+					continue
+				}
+				if learnedFrom(e, sess.Addr) {
+					continue
+				}
+				owed[prefix] = strings.TrimSpace(e.Path)
+			}
+		}
+		adv, err := advertisedRoutes(ctx, env, sess.Router, sess.Addr)
+		if err != nil {
+			if errors.Is(err, errNoSuchNeighbour) {
+				checked++
+				silent = append(silent, fmt.Sprintf(
+					"%s has no BGP session with the customer at %s, so they get no transit at all",
+					sess.Router, sess.Addr))
+				continue
+			}
+			unreadable = append(unreadable, fmt.Sprintf("%s -> %s: %v", sess.Router, sess.Addr, err))
+			continue
+		}
+		checked++
+		sent := adv.Table()
+		var absent []string
+		for prefix := range owed {
+			if _, ok := sent[prefix]; !ok {
+				absent = append(absent, prefix)
+			}
+		}
+		if len(owed) == 0 {
+			// Nothing selected is nothing to pass on, and that is a finding
+			// about the import side rather than the export side.
+			silent = append(silent, fmt.Sprintf(
+				"%s has selected no routes at all, so the customer at %s receives nothing",
+				sess.Router, sess.Addr))
+			continue
+		}
+		if len(absent) > 0 {
+			sort.Strings(absent)
+			missing = append(missing, fmt.Sprintf(
+				"%s withholds %d of %d selected route(s) from the customer at %s: %s",
+				sess.Router, len(absent), len(owed), sess.Addr,
+				strings.Join(truncate(absent, 6), ", ")))
+		}
+	}
+	if len(unreadable) > 0 {
+		sort.Strings(unreadable)
+		return Errored(name, fmt.Errorf(
+			"%d of %d customer session(s) could not be read, so no verdict covers them: %s",
+			len(unreadable), len(customers), strings.Join(truncate(unreadable, 3), "; ")))
+	}
+	if checked == 0 {
+		return Errored(name, fmt.Errorf("none of the %d customer session(s) could be assessed",
+			len(customers)))
+	}
+	if len(missing) == 0 && len(silent) == 0 {
+		return Pass(name, Evidence{Observed: fmt.Sprintf(
+			"every selected route is advertised to all %d customer session(s)", checked)})
+	}
+	detail := append(append([]string{}, missing...), silent...)
+	sort.Strings(detail)
+	// Withholding some of the internet from a customer and withholding all of
+	// it are different sizes of the same error, and the score says so.
+	bad := len(missing) + len(silent)
+	return Partial(name, ratio(maxInt(checked-bad, 0), checked), Evidence{
+		Expected: "every route this AS selected, advertised to every customer",
+		Observed: fmt.Sprintf("%d of %d customer session(s) do not carry the full table", bad, checked),
+		Detail:   strings.Join(truncate(detail, 6), "\n"),
+		Hint: "a customer buys reachability to the whole internet from you; an export " +
+			"policy towards them should permit everything you have selected",
+		Command: "show ip bgp neighbors <addr> advertised-routes",
+	})
+}
+
+// learnedFrom reports whether a route came from a particular neighbour address.
+func learnedFrom(e bgpRoute, addr string) bool {
+	for _, nh := range e.NextHops() {
+		if nh == addr {
+			return true
+		}
+	}
+	return false
+}
+
+// pathContainsASN reports whether an AS path traverses a given AS.
+func pathContainsASN(path string, asn int) bool {
+	want := strconv.Itoa(asn)
+	for _, f := range strings.Fields(path) {
+		if f == want {
+			return true
+		}
+	}
+	return false
+}
+
+// sourceRelationship infers which neighbour a route was learned from.//
 // Both spellings of the next hop are read. FRR uses a "nexthops" array for
 // `show ip bgp` and a scalar "nextHop" for advertised routes, and this check
 // runs over the latter -- so reading only the array meant every advertisement

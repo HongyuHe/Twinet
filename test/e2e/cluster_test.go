@@ -1153,16 +1153,20 @@ func TestAnIncidentEvaluatesAndScoresAnAgent(t *testing.T) {
 	// sandbox had no client certificate and every observation came back
 	// "certificate required". A benchmark whose subject is prevented from
 	// looking scores exactly like one whose subject looked and found nothing.
+	//
+	// It cannot name the device in advance any more: the scenario draws its
+	// target when the episode runs, so an agent that answered "as3/NYC"
+	// because the file used to say so would now be wrong most of the time.
+	// This one asks every router in the AS which of its interfaces OSPF is
+	// running on, and reports the one with an internal link OSPF has forgotten
+	// -- which is a diagnosis, arrived at from what the network says.
+	detector := filepath.Join("/tmp", "twinet-e2e-detect-"+strconv.Itoa(os.Getpid())+".py")
+	if err := os.WriteFile(detector, []byte(ospfDetector), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Remove(detector) }()
 	script := "#!/bin/sh\ncat > " + briefPath + "\n" +
-		"out=$(twinet exec -m \"$TWINET_MANIFEST\" as3/NYC -- " +
-		"vtysh -c 'show ip ospf neighbor' 2>&1)\n" +
-		"echo \"$out\" > " + probePath + "\n" +
-		"case \"$out\" in\n" +
-		"  *Neighbor*) printf '%s\\n' '{\"is_anomaly\":true,\"faulty_devices\":[\"as3/NYC\"]," +
-		"\"root_cause_category\":\"misconfiguration\"," +
-		"\"root_cause_name\":[\"ospf_neighbor_missing\"]}' ;;\n" +
-		"  *) printf '%s\\n' '{\"is_anomaly\":false}' ;;\n" +
-		"esac\n"
+		"exec python3 " + detector + " 2>" + probePath + "\n"
 	if err := os.WriteFile(agent, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -1206,9 +1210,16 @@ func TestAnIncidentEvaluatesAndScoresAnAgent(t *testing.T) {
 	// how a cluster with mutual TLS went a long time with a benchmark that
 	// could not be run on it.
 	probe, err := os.ReadFile(probePath)
-	if err != nil || !strings.Contains(string(probe), "Neighbor") {
+	if err != nil || !strings.Contains(string(probe), "\"routers\": 8") {
 		t.Errorf("the agent could not observe the lab it was scored on; what its probe "+
 			"returned was:\n%s", probe)
+	}
+	// And the answer it gave was not one it could have known in advance. The
+	// scenario draws its target, so a run that landed on the device the file
+	// used to name proves nothing either way -- but a suite of them that always
+	// landed there would mean the draw is not drawing.
+	if len(ep.Truth) == 0 || len(ep.Truth[0].FaultyDevices) == 0 {
+		t.Fatal("the episode records no faulty device, so there was nothing to diagnose")
 	}
 	if !ep.Resolved {
 		t.Error("the incident was not resolved, so the lab is left broken for whatever runs next")
@@ -1219,13 +1230,74 @@ func TestAnIncidentEvaluatesAndScoresAnAgent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the agent was given no brief at all: %v", err)
 	}
-	for _, leak := range []string{"ospf_neighbor_missing", "as3/NYC", "ground_truth"} {
+	for _, leak := range []string{"ospf_neighbor_missing", "port_", "ground_truth"} {
 		if strings.Contains(string(brief), leak) {
 			t.Errorf("the agent was told %q in its brief, which is the answer it is being "+
 				"asked for:\n%s", leak, brief)
 		}
 	}
 }
+
+// ospfDetector is the agent the scoring test runs: a real, if small,
+// diagnostician.
+//
+// It asks every router in the AS which interfaces OSPF is running on, compares
+// that with the interfaces that face another router, and reports the router
+// with an internal link OSPF has forgotten. It knows nothing about the scenario
+// beyond the fact that it is looking at an AS, which is the point: the target
+// is drawn when the episode runs, so an agent that has read the scenario file
+// learns nothing from it.
+const ospfDetector = `import json, os, subprocess, sys
+
+m = os.environ.get("TWINET_MANIFEST", ".")
+
+
+def tw(dev, *args):
+    r = subprocess.run(["twinet", "exec", "-m", m, dev, "--"] + list(args),
+                       capture_output=True, text=True)
+    return r.stdout
+
+
+def js(text):
+    i = text.find("{")
+    if i < 0:
+        return {}
+    try:
+        return json.loads(text[i:])
+    except Exception:
+        return {}
+
+
+routers = []
+listing = subprocess.run(["twinet", "inspect", "-m", m], capture_output=True, text=True)
+for line in listing.stdout.splitlines():
+    f = line.split()
+    if len(f) > 2 and f[0].startswith("as3/") and f[1] == "router":
+        routers.append(f[0])
+
+suspects = []
+for r in routers:
+    links = set()
+    for line in tw(r, "ip", "-o", "link").splitlines():
+        if ":" in line:
+            links.add(line.split(":")[1].strip().split("@")[0])
+    ports = {n for n in links if n.startswith("port_")}
+    doc = js(tw(r, "vtysh", "-c", "show ip ospf interface json"))
+    enabled = set(doc.get("interfaces", {}) or {})
+    if not enabled:
+        enabled = {k for k in doc if isinstance(doc.get(k), dict)}
+    missing = sorted(ports - enabled)
+    if missing:
+        suspects.append(r)
+
+print(json.dumps({"routers": len(routers), "suspects": suspects}), file=sys.stderr)
+if suspects:
+    print(json.dumps({"is_anomaly": True, "faulty_devices": suspects,
+                      "root_cause_category": "misconfiguration",
+                      "root_cause_name": ["ospf_neighbor_missing"]}))
+else:
+    print(json.dumps({"is_anomaly": False}))
+`
 
 // A benchmark whose subject can read the answer measures nothing.
 //
@@ -1290,6 +1362,21 @@ func TestAnAgentCannotReachTheAnswer(t *testing.T) {
 		// was `ps -eo args | grep 'twinet incident run'` scored 1.00.
 		"  echo '--- process list'; ps -eo args 2>/dev/null | head -40",
 		"  echo '--- proc'; cat /proc/*/cmdline 2>/dev/null | tr '\\0' ' '",
+		// The answer is not only on this machine. Every scenario Twinet ships
+		// is in a public repository, so an agent with a route to the internet
+		// can fetch its own brief's answer instead of diagnosing it -- by
+		// name, by address, or through anybody's resolver. All three are
+		// tried, and all three have to fail.
+		"  echo '--- fetch the answer by name'; curl -s --max-time 20 " +
+			"https://raw.githubusercontent.com/HongyuHe/Twinet/main/examples/cos461/" +
+			"incidents/ospf_adjacency_lost.yaml",
+		"  echo '--- fetch the answer by address'; curl -s --max-time 20 --resolve " +
+			"raw.githubusercontent.com:443:185.199.109.133 " +
+			"https://raw.githubusercontent.com/HongyuHe/Twinet/main/examples/cos461/" +
+			"incidents/ospf_adjacency_lost.yaml",
+		"  echo '--- resolve anything'; nslookup github.com 8.8.8.8 2>&1 | tail -2",
+		"  echo '--- any other port on the cluster'; nc -z -w 4 10.0.1.2 22 && " +
+			"echo REACHED-SSH || echo blocked",
 		"} >> " + loot + " 2>&1",
 		// And the credential: it must not be able to change anything, or an
 		// agent can repair the fault and report a healthy network.
@@ -1330,10 +1417,11 @@ func TestAnAgentCannotReachTheAnswer(t *testing.T) {
 		"ospf_neighbor_missing", // the fault it was asked to diagnose
 		"faulty_devices",        // the shape of the ground truth record
 		"\"undo\"",              // how to reverse it, also in the ledger
-		"port_PHY",              // the interface the scenario names
-		"kind: Scenario",        // any scenario file at all
+		"kind: Scenario",        // any scenario file at all, here or fetched
 		"ospf_adjacency_lost",   // the scenario's name, in a path or an argv
 		"--scenario",            // the runner's own command line
+		"REACHED-SSH",           // any port on the cluster but the node agents'
+		"internal_link",         // the published scenario, fetched over the network
 	} {
 		if strings.Contains(got, secret) {
 			t.Errorf("the agent read %q out of the filesystem, so the episode measures "+
