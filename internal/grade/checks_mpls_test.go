@@ -90,7 +90,10 @@ const (
 func pingExec(matrix func(fromID, toAddr string) reachOutcome) func(context.Context, string, []string) (rt.ExecResult, error) {
 	return func(_ context.Context, deviceID string, cmd []string) (rt.ExecResult, error) {
 		if len(cmd) == 0 || cmd[0] != "ping" {
-			return rt.ExecResult{ExitCode: 0}, nil
+			// Isolation reads the tables as well as probing, because a leak
+			// that only goes one way answers no probe. An empty table is the
+			// right answer for a lab whose only subject here is reachability.
+			return rt.ExecResult{ExitCode: 0, Stdout: "{}"}, nil
 		}
 		addr := cmd[len(cmd)-1]
 		switch matrix(deviceID, addr) {
@@ -226,6 +229,74 @@ func TestAWorkingIsolatedVPNStillEarnsTheIsolationMarks(t *testing.T) {
 	got := checkVPNIsolation(context.Background(), env)
 	if !got.Passed() {
 		t.Fatalf("a working, correctly isolated VPN did not earn full isolation marks: %s", describe(got))
+	}
+}
+
+// A leak that only goes one way answers no probe.
+//
+// Importing another customer's route target on one edge puts their prefixes in
+// this customer's table and leaves theirs alone: packets flow into the other
+// bank's network and nothing comes back, so every ping times out and a check
+// built on pings reports perfect isolation. The tables have to be read.
+func TestAOneWayRouteLeakIsCaughtEvenThoughNoProbeSucceeds(t *testing.T) {
+	top, sites := vpnLab(100, map[string]int{"bankA": 2, "bankB": 2})
+	victim := sites["bankB"][0].addr
+
+	env := &Env{Topology: top, AS: 100,
+		Exec: func(_ context.Context, deviceID string, cmd []string) (rt.ExecResult, error) {
+			if len(cmd) > 0 && cmd[0] == "ping" {
+				addr := cmd[len(cmd)-1]
+				// A working VPN for each customer, and not one cross-customer
+				// probe succeeds: the leak is one-directional, so nothing
+				// replies over it.
+				if sameCustomer(sites, deviceID, addr) {
+					return rt.ExecResult{ExitCode: 0, Stdout: "3 packets transmitted, 3 received"}, nil
+				}
+				return rt.ExecResult{ExitCode: 1, Stdout: "3 packets transmitted, 0 received"}, nil
+			}
+			// bankA's table holds a host route to one of bankB's sites.
+			if strings.Contains(strings.Join(cmd, " "), "bankA") {
+				return rt.ExecResult{ExitCode: 0,
+					Stdout: `{"` + victim + `/32":[{"prefix":"` + victim + `/32"}]}`}, nil
+			}
+			return rt.ExecResult{ExitCode: 0, Stdout: "{}"}, nil
+		}}
+
+	got := checkVPNIsolation(context.Background(), env)
+	if got.Passed() {
+		t.Fatalf("one customer's table holds a route into another's network and the VPN was "+
+			"certified isolated, because no probe could succeed over a leak that only goes "+
+			"one way.\nevidence: %+v", got.Evidence)
+	}
+	if obs, _ := got.Evidence.Observed.(string); !strings.Contains(obs, victim) {
+		t.Errorf("the report does not say which address leaked (%s): %q", victim, obs)
+	}
+}
+
+// A route that covers everybody is not a leak.
+//
+// The first version of this compared a route against the address it was asked
+// about, and a router asked for a route to any address answers with the longest
+// match -- so the default route every correct submission carries made every one
+// of them look like a total leak.
+func TestADefaultRouteIsNotACrossCustomerLeak(t *testing.T) {
+	top, sites := vpnLab(100, map[string]int{"bankA": 2, "bankB": 2})
+	env := &Env{Topology: top, AS: 100,
+		Exec: func(_ context.Context, deviceID string, cmd []string) (rt.ExecResult, error) {
+			if len(cmd) > 0 && cmd[0] == "ping" {
+				addr := cmd[len(cmd)-1]
+				if sameCustomer(sites, deviceID, addr) {
+					return rt.ExecResult{ExitCode: 0, Stdout: "3 packets transmitted, 3 received"}, nil
+				}
+				return rt.ExecResult{ExitCode: 1, Stdout: "3 packets transmitted, 0 received"}, nil
+			}
+			return rt.ExecResult{ExitCode: 0,
+				Stdout: `{"0.0.0.0/0":[{"prefix":"0.0.0.0/0"}]}`}, nil
+		}}
+
+	if got := checkVPNIsolation(context.Background(), env); !got.Passed() {
+		t.Fatalf("a correctly isolated VPN with a default route lost the isolation marks: %s",
+			describe(got))
 	}
 }
 

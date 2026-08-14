@@ -349,7 +349,7 @@ func checkVPNIsolation(ctx context.Context, env *Env) Result {
 	// network is precisely the failure the mechanism exists to prevent, and it
 	// scored full marks. Found by the advanced course's own discrimination
 	// suite, which is what that suite is for.
-	routeLeaks, err := crossCustomerRoutes(ctx, env, names)
+	routeLeaks, err := crossCustomerRoutes(ctx, env, groups, names)
 	if err != nil {
 		return Errored("vpn.isolation", err)
 	}
@@ -371,95 +371,71 @@ func checkVPNIsolation(ctx context.Context, env *Env) Result {
 	})
 }
 
-// crossCustomerRoutes reports every place one customer's routing table holds
-// another customer's address space.
+// crossCustomerRoutes reports every place one customer's routing table holds a
+// route to another customer's addresses.
 //
 // This is the control-plane half of isolation, and it is not redundant with the
 // probes above: a leak in one direction delivers packets and receives no reply,
 // which is indistinguishable from isolation to anything that pings.
 //
-// The comparison is against each customer's own address block rather than
-// against a site address, because asking a router for a route to an address
-// returns the longest match -- and a default route matches everything, so every
-// correct submission with one looked like a total leak.
-func crossCustomerRoutes(ctx context.Context, env *Env, names []string) ([]string, error) {
+// A route counts as a leak when it covers another customer's site and does not
+// cover any of this customer's own. That last clause is what keeps a default
+// route -- which covers everybody, is not customer-specific, and is present in
+// every correct submission here -- from being read as a total leak, without
+// resorting to a list of prefixes to forgive.
+func crossCustomerRoutes(ctx context.Context, env *Env, groups map[string][]sitePoint,
+	names []string) ([]string, error) {
 	holders, err := vrfHolders(env)
 	if err != nil {
 		return nil, err
 	}
-	blocks, err := customerBlocks(env)
-	if err != nil {
-		return nil, err
+	addrs := map[string][]netip.Addr{}
+	for name, sites := range groups {
+		for _, s := range sites {
+			if a, perr := netip.ParseAddr(s.addr); perr == nil {
+				addrs[name] = append(addrs[name], a)
+			}
+		}
 	}
+	covers := func(p netip.Prefix, who string) bool {
+		for _, a := range addrs[who] {
+			if p.Contains(a) {
+				return true
+			}
+		}
+		return false
+	}
+
 	var leaks []string
 	for _, mine := range names {
 		for _, router := range holders[mine] {
-			var doc map[string][]struct {
-				Prefix string `json:"prefix"`
-			}
+			var doc map[string]any
 			cmd := fmt.Sprintf("show ip route vrf %s json", mine)
 			if err := env.VtyshJSON(ctx, router, cmd, &doc); err != nil {
-				return nil, fmt.Errorf("%s: table %s could not be read (%w), so no verdict "+
-					"about what is in it is possible", router, mine, err)
+				// Unreadable is not empty. A verdict of "no leaks" drawn from a
+				// table nobody managed to read is the failure this file exists
+				// to avoid.
+				return nil, fmt.Errorf("%s: table %s could not be read (%w), so what is in "+
+					"it cannot be part of a verdict", router, mine, err)
 			}
 			for prefix := range doc {
 				p, perr := netip.ParsePrefix(prefix)
-				if perr != nil {
+				if perr != nil || covers(p, mine) {
 					continue
 				}
 				for _, theirs := range names {
-					if theirs == mine {
+					if theirs == mine || !covers(p, theirs) {
 						continue
 					}
-					for _, b := range blocks[theirs] {
-						// Inside their block, and not their block's supernet:
-						// a default route is not a leak, it is a default route.
-						if b.Bits() <= p.Bits() && b.Contains(p.Addr()) {
-							leaks = append(leaks, fmt.Sprintf(
-								"%s holds %s in table %s, which is inside %s's %s: the "+
-									"tables are not separate",
-								router, prefix, mine, theirs, b))
-						}
-					}
+					leaks = append(leaks, fmt.Sprintf(
+						"%s holds a route to %s in table %s, and those addresses belong to "+
+							"%s: the tables are not separate", router, prefix, mine, theirs))
 				}
 			}
 		}
 	}
 	sort.Strings(leaks)
 	return leaks, nil
-}
-
-// customerBlocks is the address space each customer was allocated, keyed by the
-// table that carries them.
-func customerBlocks(env *Env) (map[string][]netip.Prefix, error) {
-	as, ok := env.Topology.ASes[env.AS]
-	if !ok {
-		return nil, fmt.Errorf("AS %d is not in this lab", env.AS)
-	}
-	out := map[string][]netip.Prefix{}
-	seen := map[string]bool{}
-	for _, d := range as.Routers {
-		for _, i := range d.Ifaces {
-			if i.VRF == "" || i.Peer == nil || i.Peer.Device == nil {
-				continue
-			}
-			b := blockOf(env.Topology, i.Peer.Device.ASN)
-			if b == "" || seen[i.VRF+b] {
-				continue
-			}
-			p, err := netip.ParsePrefix(b)
-			if err != nil {
-				continue
-			}
-			seen[i.VRF+b] = true
-			out[i.VRF] = append(out[i.VRF], p)
-		}
-	}
-	if len(out) == 0 {
-		return nil, fmt.Errorf("no customer in AS %d has an address block, so one table "+
-			"holding another's routes cannot be recognised", env.AS)
-	}
-	return out, nil
 }
 
 // vrfHolders lists, for each routing table, the provider edges that hold it.
