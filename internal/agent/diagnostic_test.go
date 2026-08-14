@@ -245,3 +245,43 @@ func TestADiagnosticSessionCannotUseAnAbbreviation(t *testing.T) {
 		}
 	}
 }
+
+// Short options cluster, so matching one exactly matches one spelling of
+// several.
+//
+// An evaluated agent ran `ss -Ktn dst <peer>` inside the real sandbox and
+// dropped a BGP session on a device it was being scored on: the validator
+// rejected "-K" and had nothing to say about "-Ktn". The same mistake was in
+// every validator that compared an option as a whole string.
+func TestADiagnosticSessionCannotClusterAWriteOption(t *testing.T) {
+	refused := [][]string{
+		{"ss", "-K", "dst", "10.0.0.1"},
+		{"ss", "-Ktn", "dst", "10.0.0.1"},
+		{"ss", "-tnK", "dst", "10.0.0.1"},
+		{"ss", "--kill", "dst", "10.0.0.1"},
+		{"arp", "-nd", "10.0.0.1"},
+		{"arp", "-v", "-s", "10.0.0.1", "00:11:22:33:44:55"},
+		{"tcpdump", "-nw", "/tmp/x"},
+		{"tcpdump", "-ni", "eth0", "-Gz", "/bin/sh"},
+		{"sysctl", "-aw", "net.ipv4.ip_forward=0"},
+		{"hostname", "-vF", "/tmp/name"},
+	}
+	for _, c := range refused {
+		if err := ReadOnlyCommand(c); err == nil {
+			t.Errorf("%v hides a write in a cluster of short options and was allowed", c)
+		}
+	}
+	allowed := [][]string{
+		{"ss", "-tn"},
+		{"ss", "-tnp", "state", "established"},
+		{"arp", "-n"},
+		{"tcpdump", "-nni", "eth0", "-c", "5"},
+		{"sysctl", "-a"},
+		{"hostname", "-f"},
+	}
+	for _, c := range allowed {
+		if err := ReadOnlyCommand(c); err != nil {
+			t.Errorf("%v only observes, and was refused: %v", c, err)
+		}
+	}
+}

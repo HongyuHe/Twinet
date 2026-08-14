@@ -204,8 +204,8 @@ func savesReadOnly(cmd []string) error {
 
 func sysctlReadOnly(cmd []string) error {
 	for _, a := range cmd[1:] {
-		low := strings.ToLower(a)
-		if low == "-w" || low == "--write" || low == "-p" || strings.Contains(a, "=") {
+		if hasShortOption(a, 'w') || hasShortOption(a, 'p') ||
+			a == "--write" || a == "--load" || strings.Contains(a, "=") {
 			return fmt.Errorf("a diagnostic session may not set a kernel parameter (%q)", a)
 		}
 	}
@@ -214,18 +214,43 @@ func sysctlReadOnly(cmd []string) error {
 
 func ssReadOnly(cmd []string) error {
 	for _, a := range cmd[1:] {
-		// ss -K closes sockets, which on a router is a session reset.
-		if a == "-K" || a == "--kill" {
+		// ss -K closes sockets, which on a router is a session reset -- an
+		// evaluated agent used `ss -Ktn` to drop a BGP session on a device it
+		// was being scored on. Short options cluster, so matching "-K" exactly
+		// was matching one spelling of several.
+		if hasShortOption(a, 'K') || a == "--kill" {
 			return errors.New("a diagnostic session may not close sockets (ss -K)")
 		}
 	}
 	return nil
 }
 
+// hasShortOption reports whether a clustered short-option argument contains a
+// letter: -K, -Ktn and -tnK are the same option three ways.
+//
+// Every validator that matched an option by exact string was matching one
+// spelling of several. A long option (--kill) and anything after "=" are not
+// clusters and are compared whole.
+func hasShortOption(arg string, opt byte) bool {
+	if !strings.HasPrefix(arg, "-") || strings.HasPrefix(arg, "--") {
+		return false
+	}
+	body := arg[1:]
+	if i := strings.IndexByte(body, '='); i >= 0 {
+		body = body[:i]
+	}
+	return strings.IndexByte(body, opt) >= 0
+}
+
 func arpReadOnly(cmd []string) error {
 	for _, a := range cmd[1:] {
+		for _, o := range []byte{'d', 's', 'f'} {
+			if hasShortOption(a, o) {
+				return fmt.Errorf("a diagnostic session may not change the ARP table (%q)", a)
+			}
+		}
 		switch a {
-		case "-d", "--delete", "-s", "--set", "-f", "--file":
+		case "--delete", "--set", "--file":
 			return fmt.Errorf("a diagnostic session may not change the ARP table (%q)", a)
 		}
 	}
@@ -237,7 +262,8 @@ func hostnameReadOnly(cmd []string) error {
 		if !strings.HasPrefix(a, "-") {
 			return errors.New("a diagnostic session may not set the hostname")
 		}
-		if a == "-F" || a == "--file" || a == "-b" || a == "--boot" {
+		if hasShortOption(a, 'F') || hasShortOption(a, 'b') ||
+			a == "--file" || a == "--boot" {
 			return fmt.Errorf("a diagnostic session may not set the hostname (%q)", a)
 		}
 	}
@@ -246,10 +272,14 @@ func hostnameReadOnly(cmd []string) error {
 
 func tcpdumpReadOnly(cmd []string) error {
 	for _, a := range cmd[1:] {
-		switch strings.ToLower(a) {
-		case "-z", "-w", "--postrotate-command":
-			return fmt.Errorf("a diagnostic session may not run tcpdump %s: it writes to the "+
-				"device or runs a command on it", a)
+		for _, o := range []byte{'z', 'w', 'W'} {
+			if hasShortOption(a, o) {
+				return fmt.Errorf("a diagnostic session may not run tcpdump %s: it writes to "+
+					"the device or runs a command on it", a)
+			}
+		}
+		if a == "--postrotate-command" {
+			return fmt.Errorf("a diagnostic session may not run tcpdump %s", a)
 		}
 	}
 	return nil

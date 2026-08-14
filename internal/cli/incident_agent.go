@@ -149,6 +149,27 @@ func scoreDiagnosis(d Diagnosis, truth []fault.GroundTruth) Score {
 		s.Total += 0.3
 	}
 
+	// Getting "is anything wrong" wrong means the rest is not an answer.
+	//
+	// The three parts below detection are scored against what was injected, so
+	// on a healthy control -- where nothing was -- naming no devices, no
+	// category and no root cause is exactly right, and an agent that cried
+	// wolf collected 0.80 for it. The control exists to catch the strategy of
+	// always answering "yes"; it was rewarding it. The same gate closes the
+	// other direction: an agent that says a broken network is fine has not
+	// diagnosed it by declining to name anything.
+	if !s.Detected {
+		s.Total = 0
+		if s.Detail == "" {
+			switch {
+			case anomaly:
+				s.Detail = "said nothing was wrong with a network that was broken"
+			default:
+				s.Detail = "reported a fault in a network that was healthy"
+			}
+		}
+	}
+
 	var missing []string
 	for dev := range wantDevices {
 		found := false
