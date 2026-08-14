@@ -213,10 +213,11 @@ func newIncidentRunCmd(opts *Options) *cobra.Command {
 			if drawSeed == 0 {
 				drawSeed = time.Now().UnixNano()
 			}
-			targets, drawn, err := drawTargets(top, sc.Faults, drawSeed)
+			candidates, err := drawTargets(top, sc.Faults, drawSeed)
 			if err != nil {
 				return err
 			}
+			var drawn []string
 			if pinned := pinnedTargets(sc.Faults); len(pinned) > 0 && agentCmd != "" && !allowPinned {
 				return fmt.Errorf("this scenario names its own answer:\n  %s\n"+
 					"An agent scored against it may have read the file rather than the "+
@@ -230,7 +231,7 @@ func newIncidentRunCmd(opts *Options) *cobra.Command {
 				Scenario: sc.Metadata.Name, Lab: top.Name, Topology: top.Hash,
 				Seed: sc.Seed, StartedAt: time.Now().UTC(), Brief: sc.Brief,
 			}
-			if len(drawn) > 0 {
+			if len(pinnedTargets(sc.Faults)) < len(sc.Faults) {
 				ep.SelectionSeed = drawSeed
 			}
 			start := time.Now()
@@ -299,7 +300,32 @@ func newIncidentRunCmd(opts *Options) *cobra.Command {
 
 			var injected []*fault.Injection
 			for i, fs := range sc.Faults {
-				inj, err := fault.Inject(cmd.Context(), env, fs.Type, targets[i])
+				// The draw, and then its fallbacks.
+				//
+				// A candidate that cannot host this fault -- a link already
+				// down, a symptom already present -- is refused before
+				// anything is changed, so the next one is tried. Only a
+				// failure that may have touched the device stops the run.
+				var inj *fault.Injection
+				var err error
+				attempts := candidates[i]
+				if len(attempts) > 5 {
+					attempts = attempts[:5]
+				}
+				for n, t := range attempts {
+					inj, err = fault.Inject(cmd.Context(), env, fs.Type, t)
+					if err == nil {
+						if sc.Faults[i].Select != nil {
+							drawn = append(drawn, describeDraw(fs.Type, t, len(candidates[i])))
+						}
+						break
+					}
+					if inj != nil || n == len(attempts)-1 {
+						break
+					}
+					fmt.Fprintf(cmd.ErrOrStderr(),
+						"a drawn target could not host %s (%v); drawing another\n", fs.Type, err)
+				}
 				if err != nil {
 					// A failed injection that still left something live hands
 					// it back. Record it before giving up, or the lab is

@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/HongyuHe/twinet/internal/model"
 )
@@ -73,6 +74,19 @@ func newAgentNetwork(top *model.Topology, extra []string) (n *agentNetwork, err 
 		return nil, err
 	}
 
+	// One episode at a time picks its addresses.
+	//
+	// Scanning for a free /30 and then taking it is two steps, and two runs
+	// starting together read the same answer and both take it. Sharing a /30
+	// is not a clash that fails loudly: each agent has a route to the other's
+	// address, which is a way out of a namespace whose whole purpose is that
+	// there is none.
+	unlock, err := lockAgentNetworks()
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+
 	id := fmt.Sprintf("%06x", rand.Intn(1<<24))
 	n = &agentNetwork{
 		NS:      "twrca" + id,
@@ -107,6 +121,11 @@ func newAgentNetwork(top *model.Topology, extra []string) (n *agentNetwork, err 
 	n.onClose(func() { _ = run("ip", "link", "del", n.HostDev) })
 
 	steps := [][]string{
+		// No IPv6 at all inside. The firewall below is IPv4, and a namespace
+		// that later acquired a v6 address and a route would have an
+		// unfiltered way out that nothing in this file would notice.
+		{"ip", "netns", "exec", n.NS, "sysctl", "-q", "-w", "net.ipv6.conf.all.disable_ipv6=1"},
+		{"ip", "netns", "exec", n.NS, "sysctl", "-q", "-w", "net.ipv6.conf.default.disable_ipv6=1"},
 		{"ip", "addr", "add", n.HostIP + "/30", "dev", n.HostDev},
 		{"ip", "link", "set", n.HostDev, "up"},
 		{"ip", "netns", "exec", n.NS, "ip", "link", "set", "lo", "up"},
@@ -294,21 +313,39 @@ func agentEgress(top *model.Topology, extra []string) ([]egressEndpoint, map[str
 	return out, names, nil
 }
 
-// freeLinkLocal picks a /30 no route on this machine already covers, so two
+// freeLinkLocal picks a /30 nothing on this machine already uses, so two
 // episodes running at once do not land on the same addresses.
+//
+// Both the routes and the addresses are read. A namespace whose link is up
+// contributes a connected route, but an address assigned a moment ago and not
+// yet routed contributes only an address, and two agents sharing a /30 would
+// have each other's return traffic -- which is a hole in the isolation, not
+// merely a clash.
 func freeLinkLocal() (int, error) {
 	taken := map[int]bool{}
+	note := func(cidr string) {
+		if !strings.HasPrefix(cidr, "169.254.") {
+			return
+		}
+		parts := strings.Split(strings.SplitN(cidr, "/", 2)[0], ".")
+		if len(parts) == 4 {
+			if v, err := strconv.Atoi(parts[2]); err == nil {
+				taken[v] = true
+			}
+		}
+	}
 	if out, err := exec.Command("ip", "-4", "route", "show").Output(); err == nil {
 		for _, line := range strings.Split(string(out), "\n") {
-			f := strings.Fields(line)
-			if len(f) == 0 || !strings.HasPrefix(f[0], "169.254.") {
-				continue
+			if f := strings.Fields(line); len(f) > 0 {
+				note(f[0])
 			}
-			parts := strings.Split(strings.SplitN(f[0], "/", 2)[0], ".")
-			if len(parts) == 4 {
-				if v, err := strconv.Atoi(parts[2]); err == nil {
-					taken[v] = true
-				}
+		}
+	}
+	if out, err := exec.Command("ip", "-4", "-o", "addr", "show").Output(); err == nil {
+		for _, line := range strings.Split(string(out), "\n") {
+			f := strings.Fields(line)
+			if len(f) >= 4 {
+				note(f[3])
 			}
 		}
 	}
@@ -320,6 +357,25 @@ func freeLinkLocal() (int, error) {
 		}
 	}
 	return 0, fmt.Errorf("no free link-local /30 for the agent's network")
+}
+
+// lockAgentNetworks serialises the choice of addresses across episodes.
+func lockAgentNetworks() (func(), error) {
+	const path = "/run/twinet-agent-net.lock"
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		// Nowhere to put the lock is not a reason to run without one: two
+		// episodes would then share a network and neither would be isolated.
+		return nil, fmt.Errorf("lock the agent network allocator: %w", err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("lock the agent network allocator: %w", err)
+	}
+	return func() {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = f.Close()
+	}, nil
 }
 
 func run(name string, args ...string) error {

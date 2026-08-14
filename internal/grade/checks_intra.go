@@ -557,11 +557,22 @@ func checkVLANIsolation(ctx context.Context, env *Env) Result {
 		mu.Unlock()
 	}
 
-	// Same VLAN: reachable, and directly.
+	// Same VLAN: reachable, and directly, in both directions.
+	//
+	// This ran i<j, one probe per unordered pair, while the cross-VLAN half
+	// below deliberately runs every *ordered* pair. Reachability is not
+	// symmetric and a student's mistake need not be either: a host that drops
+	// what it sends to a neighbour, or a switch port filtering one way, leaves
+	// the other direction working -- and whichever way the loop happened to
+	// probe was the mark. A firewall rule dropping new outbound traffic to a
+	// same-VLAN neighbour scored full marks.
 	for _, v := range vlans {
 		hs := hosts[v]
 		for i := 0; i < len(hs); i++ {
-			for j := i + 1; j < len(hs); j++ {
+			for j := 0; j < len(hs); j++ {
+				if i == j {
+					continue
+				}
 				wg.Add(1)
 				go func(v int, src, dst *model.Device) {
 					defer wg.Done()

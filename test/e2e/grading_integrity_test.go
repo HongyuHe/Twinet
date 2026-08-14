@@ -466,6 +466,34 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 			},
 		},
 		{
+			// One direction of one layer-2 pair.
+			//
+			// The same-VLAN half of the VLAN question probed i<j -- one
+			// unordered pair, one direction -- while the cross-VLAN half
+			// deliberately probed every ordered pair. Reachability is not
+			// symmetric and a student's mistake need not be either: a host
+			// that drops what it sends to its neighbour, or a switch port
+			// filtering one way, leaves the return path working, and whichever
+			// way the loop happened to run was the mark.
+			name:     "one same-VLAN neighbour unreachable in one direction",
+			question: "q1.1",
+			undo: func(t *testing.T) {
+				src, _, addr := sameVLANPair(t, dir, 3)
+				_, _ = twinet(t, "exec", "-m", dir, src, "--", "iptables", "-D", "OUTPUT",
+					"-d", addr+"/32", "-m", "conntrack", "--ctstate", "NEW", "-j", "DROP")
+			},
+			apply: func(t *testing.T) {
+				src, dst, addr := sameVLANPair(t, dir, 3)
+				t.Logf("dropping new outbound traffic from %s to %s (%s)", src, dst, addr)
+				if out, err := twinet(t, "exec", "-m", dir, src, "--", "iptables", "-I", "OUTPUT",
+					"1", "-d", addr+"/32", "-m", "conntrack", "--ctstate", "NEW",
+					"-j", "DROP"); err != nil {
+					t.Fatalf("installing the one-way block: %v\n%s", err, out)
+				}
+				time.Sleep(3 * time.Second)
+			},
+		},
+		{
 			// The opposite error, and the one nothing was looking at.
 			//
 			// Leaking a provider's route to a peer was marked; withholding it
@@ -655,6 +683,56 @@ func bestCustomerRoute(t *testing.T, dir string, as int) (router, nbr, prefix st
 	t.Logf("customer route: %s learned %s from %s at local preference %d",
 		router, prefix, nbr, bestPref)
 	return router, nbr, prefix
+}
+
+// sameVLANPair finds two hosts of a layer-2 domain that sit in the same VLAN,
+// and the address of the second.
+//
+// Membership is established by asking the kernel rather than by reading names:
+// a route to a neighbour in the same VLAN is directly connected, and one to a
+// different VLAN goes via the gateway. A test that inferred the VLAN from a
+// naming convention would keep passing on a lab that renamed its hosts.
+func sameVLANPair(t *testing.T, dir string, as int) (src, dst, addr string) {
+	t.Helper()
+	var l2 []string
+	out, err := twinet(t, "inspect", "-m", dir, "--json")
+	if err != nil {
+		t.Fatalf("inspecting the lab: %v", err)
+	}
+	var doc struct {
+		Devices []struct {
+			ID   string `json:"id"`
+			Kind string `json:"kind"`
+			AS   int    `json:"as"`
+		} `json:"devices"`
+	}
+	if err := json.Unmarshal([]byte(trimToJSON(out)), &doc); err != nil {
+		t.Fatalf("decoding the topology: %v", err)
+	}
+	for _, d := range doc.Devices {
+		if d.AS == as && d.Kind == "host" && !strings.HasSuffix(d.ID, "_host") {
+			l2 = append(l2, d.ID)
+		}
+	}
+	sort.Strings(l2)
+	for _, a := range l2 {
+		for _, b := range l2 {
+			if a == b {
+				continue
+			}
+			bAddr := hostAddr(t, dir, b)
+			if bAddr == "" {
+				continue
+			}
+			route, err := twinet(t, "exec", "-m", dir, a, "--", "ip", "route", "get", bAddr)
+			if err != nil || strings.Contains(route, " via ") {
+				continue
+			}
+			return a, b, bAddr
+		}
+	}
+	t.Fatalf("AS %d has no two hosts in one VLAN, so a one-way block cannot be tested", as)
+	return "", "", ""
 }
 
 // customerSessionsOn finds the router holding this AS's customer sessions and

@@ -95,30 +95,36 @@ func TestADrawIsReproducibleFromItsSeedAndNotOtherwise(t *testing.T) {
 	top := twoASLab(t)
 	specs := []FaultSpec{{Type: "ospf_neighbor_missing",
 		Select: &Selector{Kind: selectInternalLink, AS: []int{3}}}}
-	first, drawn, err := drawTargets(top, specs, 99)
+	first, err := drawTargets(top, specs, 99)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(drawn) != 1 || !strings.Contains(drawn[0], "1 of 4") {
-		t.Errorf("the draw was not recorded as one of the candidates: %v", drawn)
+	// Every candidate is offered, in an order the seed decides: the first is
+	// the draw and the rest are what to try if it cannot host the fault.
+	if len(first[0]) != 4 {
+		t.Errorf("the draw offered %d of 4 candidates, so an unsuitable one would end "+
+			"the episode", len(first[0]))
 	}
-	again, _, err := drawTargets(top, specs, 99)
+	if d := describeDraw("ospf_neighbor_missing", first[0][0], len(first[0])); !strings.Contains(d, "1 of 4") {
+		t.Errorf("the draw was not described as one of the candidates: %s", d)
+	}
+	again, err := drawTargets(top, specs, 99)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first[0].DeviceID() != again[0].DeviceID() || first[0].Iface != again[0].Iface {
+	if first[0][0].DeviceID() != again[0][0].DeviceID() || first[0][0].Iface != again[0][0].Iface {
 		t.Errorf("the same seed drew %v and then %v, so an episode cannot be replayed",
-			first[0], again[0])
+			first[0][0], again[0][0])
 	}
 	// And the draw has to move, or "drawn at run time" is a pinned target with
 	// extra steps.
 	seen := map[string]bool{}
 	for seed := int64(1); seed <= 40; seed++ {
-		got, _, err := drawTargets(top, specs, seed)
+		got, err := drawTargets(top, specs, seed)
 		if err != nil {
 			t.Fatal(err)
 		}
-		seen[got[0].Device+":"+got[0].Iface] = true
+		seen[got[0][0].Device+":"+got[0][0].Iface] = true
 	}
 	if len(seen) < 2 {
 		t.Errorf("40 seeds drew %d distinct target(s); the answer is effectively written "+
@@ -128,7 +134,7 @@ func TestADrawIsReproducibleFromItsSeedAndNotOtherwise(t *testing.T) {
 
 func TestAFaultTheLabCannotHostIsRefusedRatherThanSkipped(t *testing.T) {
 	top := twoASLab(t)
-	_, _, err := drawTargets(top, []FaultSpec{
+	_, err := drawTargets(top, []FaultSpec{
 		{Type: "ospf_neighbor_missing", Select: &Selector{Kind: selectHost, AS: []int{9}}},
 	}, 1)
 	if err == nil {
@@ -146,15 +152,12 @@ func TestAPinnedTargetSurvivesTheDrawAndIsReported(t *testing.T) {
 		{Type: "icmp_acl_block", Target: fault.Target{AS: 3, Device: "BOS"}},
 		{Type: "ospf_neighbor_missing", Select: &Selector{Kind: selectInternalLink}},
 	}
-	got, drawn, err := drawTargets(top, specs, 7)
+	got, err := drawTargets(top, specs, 7)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got[0].Device != "BOS" {
+	if len(got[0]) != 1 || got[0][0].Device != "BOS" {
 		t.Errorf("a pinned target was overwritten by a draw: %v", got[0])
-	}
-	if len(drawn) != 1 {
-		t.Errorf("the pinned fault was reported as drawn: %v", drawn)
 	}
 	pinned := pinnedTargets(specs)
 	if len(pinned) != 1 || !strings.Contains(pinned[0], "BOS") {

@@ -143,46 +143,60 @@ func (s *Selector) candidates(top *model.Topology) []fault.Target {
 // drawTargets resolves every fault's target, drawing the ones a scenario left
 // to the run.
 //
+// Each fault gets an ordered list of candidates rather than a single choice.
+// The first is the draw; the rest are what to try if it turns out the fault
+// cannot be applied there -- a link that is already down cannot be brought
+// down, and a fault that would change nothing is refused rather than recorded
+// as the cause of something. Without the fallback, one candidate in twenty
+// being unsuitable means one episode in twenty failing outright, which a
+// benchmark run overnight would discover in the morning.
+//
 // Each draw uses its own stream from the seed, so adding a fault to a scenario
 // does not change what the earlier ones chose, and a suite that reruns one
 // episode gets the same network back.
-func drawTargets(top *model.Topology, specs []FaultSpec, seed int64) ([]fault.Target, []string, error) {
-	out := make([]fault.Target, len(specs))
-	var drawn []string
+func drawTargets(top *model.Topology, specs []FaultSpec, seed int64) ([][]fault.Target, error) {
+	out := make([][]fault.Target, len(specs))
 	for i, spec := range specs {
 		if spec.Select == nil {
-			out[i] = spec.Target
+			out[i] = []fault.Target{spec.Target}
 			continue
 		}
 		if err := spec.Select.Valid(); err != nil {
-			return nil, nil, fmt.Errorf("faults[%d]: %w", i, err)
+			return nil, fmt.Errorf("faults[%d]: %w", i, err)
 		}
 		cands := spec.Select.candidates(top)
 		// A fault the topology cannot host is refused rather than skipped: an
 		// episode with fewer faults than its scenario says is not the episode
 		// anybody asked for, and its ground truth would be quietly wrong.
 		if len(cands) == 0 {
-			return nil, nil, fmt.Errorf("faults[%d]: nothing in this lab matches select %s%s",
+			return nil, fmt.Errorf("faults[%d]: nothing in this lab matches select %s%s",
 				i, spec.Select.Kind, asFilter(spec.Select.AS))
 		}
 		r := rand.New(rand.NewSource(seed + int64(i)*7919))
-		t := cands[r.Intn(len(cands))]
-		// A target the scenario did pin wins over the draw, so a scenario can
-		// fix the AS and leave the device to chance.
-		if spec.Target.Prefix != "" {
-			t.Prefix = spec.Target.Prefix
+		r.Shuffle(len(cands), func(a, b int) { cands[a], cands[b] = cands[b], cands[a] })
+		for j := range cands {
+			// A target the scenario did pin wins over the draw, so a scenario
+			// can fix the prefix and leave the device to chance.
+			if spec.Target.Prefix != "" {
+				cands[j].Prefix = spec.Target.Prefix
+			}
+			if len(spec.Target.Params) > 0 {
+				cands[j].Params = spec.Target.Params
+			}
 		}
-		if len(spec.Target.Params) > 0 {
-			t.Params = spec.Target.Params
-		}
-		out[i] = t
-		where := t.Device
-		if t.Iface != "" {
-			where += ":" + t.Iface
-		}
-		drawn = append(drawn, fmt.Sprintf("%s on as%d/%s (1 of %d)", spec.Type, t.AS, where, len(cands)))
+		out[i] = cands
 	}
-	return out, drawn, nil
+	return out, nil
+}
+
+// describeDraw says which of how many candidates a fault landed on. It is only
+// ever shown to the operator, and only on request: it is the answer.
+func describeDraw(kind string, t fault.Target, of int) string {
+	where := t.Device
+	if t.Iface != "" {
+		where += ":" + t.Iface
+	}
+	return fmt.Sprintf("%s on as%d/%s (1 of %d)", kind, t.AS, where, of)
 }
 
 func asFilter(as []int) string {
