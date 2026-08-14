@@ -755,7 +755,10 @@ func traceHops(ctx context.Context, env *Env, src, dst *model.Device) (int, erro
 	if addr == "" {
 		return 0, fmt.Errorf("%s has no address configured", dst.Name)
 	}
-	res, err := env.Probe(ctx, src.ID, []string{"traceroute", "-n", "-q", "1", "-w", "2", "-m", "8", addr})
+	// Two probes per hop. With one, a single dropped packet is reported as a
+	// hop that did not answer, and over the slow links of a layer-2 domain
+	// that happens often enough to cost a correct submission a mark.
+	res, err := env.Probe(ctx, src.ID, []string{"traceroute", "-n", "-q", "2", "-w", "2", "-m", "8", addr})
 	if err != nil {
 		return 0, err
 	}
@@ -769,7 +772,7 @@ func traceFirstHop(ctx context.Context, env *Env, src, dst *model.Device) (int, 
 	if addr == "" {
 		return 0, "", fmt.Errorf("%s has no address configured", dst.Name)
 	}
-	res, err := env.Probe(ctx, src.ID, []string{"traceroute", "-n", "-q", "1", "-w", "2", "-m", "8", addr})
+	res, err := env.Probe(ctx, src.ID, []string{"traceroute", "-n", "-q", "2", "-w", "2", "-m", "8", addr})
 	if err != nil {
 		return 0, "", err
 	}
@@ -975,28 +978,51 @@ func sortedKeysOfBool(m map[string]bool) []string {
 // once; a single lost traceroute was enough to cost a correct student a mark,
 // which is the worst kind of wrong answer a grader can give because it looks
 // exactly like a real finding.
+// Three attempts, not two.
+//
+// The hosts of a layer-2 domain sit behind deliberately slow links, and a
+// traceroute that loses its probe is indistinguishable from a host that cannot
+// be reached. Probing every ordered pair rather than every unordered one --
+// which is the only way to see a one-directional break -- doubled the traffic
+// through those links, and a correct submission started losing a mark now and
+// then to a dropped packet. A mark that depends on the weather is not a mark.
+const traceAttempts = 3
+
 func traceHopsRetrying(ctx context.Context, env *Env, src, dst *model.Device) (int, error) {
-	hops, err := traceHops(ctx, env, src, dst)
-	if err == nil && hops > 0 {
-		return hops, nil
+	var hops int
+	var err error
+	for i := 0; i < traceAttempts; i++ {
+		if i > 0 {
+			select {
+			case <-ctx.Done():
+				return hops, err
+			case <-time.After(time.Duration(i) * 2 * time.Second):
+			}
+		}
+		hops, err = traceHops(ctx, env, src, dst)
+		if err == nil && hops > 0 {
+			return hops, nil
+		}
 	}
-	select {
-	case <-ctx.Done():
-		return hops, err
-	case <-time.After(2 * time.Second):
-	}
-	return traceHops(ctx, env, src, dst)
+	return hops, err
 }
 
 func traceFirstHopRetrying(ctx context.Context, env *Env, src, dst *model.Device) (int, string, error) {
-	hops, first, err := traceFirstHop(ctx, env, src, dst)
-	if err == nil && hops > 0 && first != "" {
-		return hops, first, nil
+	var hops int
+	var first string
+	var err error
+	for i := 0; i < traceAttempts; i++ {
+		if i > 0 {
+			select {
+			case <-ctx.Done():
+				return hops, first, err
+			case <-time.After(time.Duration(i) * 2 * time.Second):
+			}
+		}
+		hops, first, err = traceFirstHop(ctx, env, src, dst)
+		if err == nil && hops > 0 && first != "" {
+			return hops, first, nil
+		}
 	}
-	select {
-	case <-ctx.Done():
-		return hops, first, err
-	case <-time.After(2 * time.Second):
-	}
-	return traceFirstHop(ctx, env, src, dst)
+	return hops, first, err
 }
