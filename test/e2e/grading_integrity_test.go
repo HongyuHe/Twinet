@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -134,6 +135,14 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 		question string
 		// break it.
 		apply func(t *testing.T)
+		// put back anything solveAS cannot.
+		//
+		// solveAS re-renders the routing configuration, which undoes a
+		// mutation made with vtysh. It does not undo one made with `ip`: a
+		// deployment converges towards the manifest and does not remove a route
+		// it never added, so a blackhole added on a host outlives the case that
+		// added it and every later case is measured against a broken lab.
+		undo func(t *testing.T)
 	}{
 		{
 			name:     "an inter-AS subnet advertised into OSPF",
@@ -199,6 +208,47 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 		{
 			// A mutation the previous check could not see.
 			//
+			// "Every host reaches every other" probed from one host to the
+			// rest, on the reasoning that a hub-and-spoke exercises every path
+			// through the backbone. Reachability is neither symmetric nor
+			// transitive: a blackhole on one host for another leaves the hub's
+			// seven probes all succeeding while the pair it breaks cannot reach
+			// each other, and the question kept its full mark.
+			name:     "one host pair unreachable in one direction",
+			question: "q1.2",
+			undo: func(t *testing.T) {
+				hosts := hostsOfAS(t, dir, 3)
+				if len(hosts) < 3 {
+					return
+				}
+				from, to := hosts[len(hosts)-1], hosts[1]
+				if addr := hostAddr(t, dir, to); addr != "" {
+					_, _ = twinet(t, "exec", "-m", dir, from, "--",
+						"ip", "route", "del", "blackhole", addr+"/32")
+				}
+			},
+			apply: func(t *testing.T) {
+				hosts := hostsOfAS(t, dir, 3)
+				if len(hosts) < 3 {
+					t.Fatalf("AS 3 has %d hosts, so a directed pair cannot be broken", len(hosts))
+				}
+				// Not the host the old check probed from, so that a check which
+				// still probes from there sees nothing wrong.
+				from, to := hosts[len(hosts)-1], hosts[1]
+				addr := hostAddr(t, dir, to)
+				if addr == "" {
+					t.Fatalf("%s has no address to blackhole", to)
+				}
+				t.Logf("blackholing %s (%s) on %s", to, addr, from)
+				if out, err := twinet(t, "exec", "-m", dir, from, "--",
+					"ip", "route", "replace", "blackhole", addr+"/32"); err != nil {
+					t.Fatalf("adding the blackhole: %v\n%s", err, out)
+				}
+			},
+		},
+		{
+			// The original of that comment.
+			//
 			// Gao-Rexford was assessed by comparing the *median* local
 			// preference of each relationship, which is a statement about most
 			// routes and about no particular one. Ranking a single customer
@@ -223,6 +273,48 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 					"end")
 				// A policy change applies to routes that arrive after it; the
 				// ones already in the table keep the preference they were given.
+				vtysh(t, dir, router, "clear bgp ipv4 unicast "+nbr+" in")
+				time.Sleep(8 * time.Second)
+			},
+		},
+		{
+			// The same median loophole as q2.3, in the question about
+			// engineering traffic around the slow link.
+			//
+			// The outbound half compared the *median* local preference of the
+			// slow provider's routes with the fast provider's. Raising one
+			// prefix learned over the slow link above the fast one's
+			// preference moves neither median, so traffic for that prefix took
+			// the link the question asks the student to avoid and the mark was
+			// awarded in full.
+			name:     "one prefix routed over the slow link",
+			question: "q2.5",
+			apply: func(t *testing.T) {
+				router, nbr, prefix := slowProviderRoute(t, dir, 3)
+				rm := importRouteMap(t, dir, router, nbr)
+				if rm == "" {
+					t.Fatalf("%s has no import route-map on the session with the slow "+
+						"provider %s", router, nbr)
+				}
+				t.Logf("raising %s learned from the slow provider %s on %s", prefix, nbr, router)
+				// The rest of the policy is preserved.
+				//
+				// A clause that matches and stops replaces the whole import
+				// policy for that prefix, including the community the export
+				// policy classifies routes by -- so the route stops looking
+				// like a provider's and the *export* question fails too. A
+				// student who mis-set one preference has not also stopped
+				// tagging their routes, and a mutation that breaks two
+				// questions cannot show that either check works.
+				cfg := []string{"configure terminal",
+					"ip prefix-list SLOWONE seq 5 permit " + prefix,
+					"route-map " + rm + " permit 1",
+					" match ip address prefix-list SLOWONE"}
+				if c := communitySetBy(t, dir, router, rm); c != "" {
+					cfg = append(cfg, " set community "+c)
+				}
+				cfg = append(cfg, " set local-preference 150", "end")
+				vtysh(t, dir, router, cfg...)
 				vtysh(t, dir, router, "clear bgp ipv4 unicast "+nbr+" in")
 				time.Sleep(8 * time.Second)
 			},
@@ -269,6 +361,9 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			defer solveAS(t, dir, as)
+			if c.undo != nil {
+				defer c.undo(t)
+			}
 			c.apply(t)
 
 			after, _, report := gradeASBroken(t, dir, as)
@@ -496,4 +591,142 @@ func trimToJSON(s string) string {
 		return s[i:]
 	}
 	return s
+}
+
+// hostsOfAS lists the L3 hosts of a system, in the order the grader sees them.
+func hostsOfAS(t *testing.T, dir string, asn int) []string {
+	t.Helper()
+	out, err := twinet(t, "inspect", "-m", dir, "--json")
+	if err != nil {
+		t.Fatalf("inspecting the lab: %v", err)
+	}
+	var doc struct {
+		Devices []struct {
+			ID       string `json:"id"`
+			Kind     string `json:"kind"`
+			AS       int    `json:"as"`
+			L2Domain string `json:"l2_domain"`
+		} `json:"devices"`
+	}
+	if err := json.Unmarshal([]byte(trimToJSON(out)), &doc); err != nil {
+		t.Fatalf("decoding the topology: %v", err)
+	}
+	var hosts []string
+	for _, d := range doc.Devices {
+		// The L3 hosts, which is what the reachability check is about. A
+		// layer-2 domain's hosts have names of their own and are graded by
+		// the VLAN question instead; the inspect output does not distinguish
+		// them, but their names do -- an L3 host is always <ROUTER>_host.
+		if d.AS == asn && d.Kind == "host" && strings.HasSuffix(d.ID, "_host") {
+			hosts = append(hosts, d.ID)
+		}
+	}
+	sort.Strings(hosts)
+	return hosts
+}
+
+// hostAddr returns a host's first IPv4 address.
+func hostAddr(t *testing.T, dir, device string) string {
+	t.Helper()
+	out, err := twinet(t, "exec", "-m", dir, device, "--",
+		"sh", "-c", "ip -4 -o addr show scope global | awk '{print $4}' | head -1")
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if s := strings.TrimSpace(line); strings.Count(s, ".") == 3 {
+			return strings.SplitN(s, "/", 2)[0]
+		}
+	}
+	return ""
+}
+
+// slowProviderRoute finds a prefix learned over the deliberately slow external
+// link, and the session it arrived on.
+//
+// The slow link is the one with the large delay the assignment builds question
+// 2.5 around; it is found by measuring, because that is the only definition
+// that cannot drift from the lab.
+func slowProviderRoute(t *testing.T, dir string, as int) (router, nbr, prefix string) {
+	t.Helper()
+	for _, dev := range routersOf(t, dir, as) {
+		sessions := importRouteMaps(t, dir, dev)
+		for addr := range sessions {
+			out, err := twinet(t, "exec", "-m", dir, dev, "--",
+				"ping", "-c", "2", "-W", "3", "-i", "0.3", addr)
+			if err != nil || !strings.Contains(out, "min/avg/max") {
+				continue
+			}
+			// "rtt min/avg/max/mdev = 25.1/25.2/25.3/0.1 ms"
+			f := strings.Split(out[strings.Index(out, "= ")+2:], "/")
+			if len(f) < 2 {
+				continue
+			}
+			avg, err := strconv.ParseFloat(f[1], 64)
+			if err != nil || avg < 20 {
+				continue
+			}
+			// A prefix this neighbour actually sent.
+			tbl, err := twinet(t, "exec", "-m", dir, dev, "--", "vtysh", "-c", "show ip bgp json")
+			if err != nil {
+				continue
+			}
+			var doc struct {
+				Routes map[string][]struct {
+					Nexthops []struct {
+						IP string `json:"ip"`
+					} `json:"nexthops"`
+					Path string `json:"path"`
+				} `json:"routes"`
+			}
+			if err := json.Unmarshal([]byte(trimToJSON(tbl)), &doc); err != nil {
+				continue
+			}
+			var found []string
+			for p, entries := range doc.Routes {
+				for _, e := range entries {
+					if strings.TrimSpace(e.Path) == "" {
+						continue
+					}
+					for _, nh := range e.Nexthops {
+						if nh.IP == addr {
+							found = append(found, p)
+						}
+					}
+				}
+			}
+			if len(found) == 0 {
+				continue
+			}
+			sort.Strings(found)
+			t.Logf("slow external link: %s -> %s at %.1fms", dev, addr, avg)
+			return dev, addr, found[0]
+		}
+	}
+	t.Fatalf("AS %d has no slow external link with routes on it", as)
+	return "", "", ""
+}
+
+// communitySetBy returns the community a route-map stamps on what it accepts,
+// so a test clause can preserve it.
+func communitySetBy(t *testing.T, dir, router, rm string) string {
+	t.Helper()
+	out, err := twinet(t, "exec", "-m", dir, router, "--", "vtysh", "-c", "show running-config")
+	if err != nil {
+		return ""
+	}
+	inMap := false
+	last := ""
+	for _, line := range strings.Split(out, "\n") {
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(trimmed, "route-map "+rm+" "):
+			inMap = true
+		case trimmed == "exit":
+			inMap = false
+		case inMap && strings.HasPrefix(trimmed, "set community "):
+			last = strings.TrimPrefix(trimmed, "set community ")
+		}
+	}
+	return last
 }

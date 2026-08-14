@@ -770,8 +770,11 @@ func checkTrafficEngineering(ctx context.Context, env *Env) Result {
 			continue
 		}
 		checks++
-		sp, sn := medianLocalPref(ctx, env, s.addr)
-		fp, fn := medianLocalPref(ctx, env, f.addr)
+		// Every route, not the middle one: the best route from the slow
+		// neighbour must still be worse than the worst from the fast one.
+		_, slowBest, sn := worstLocalPref(ctx, env, s.addr)
+		fastWorst, _, fn := worstLocalPref(ctx, env, f.addr)
+		sp, fp := slowBest, fastWorst
 		switch {
 		case sn == 0:
 			// Receiving nothing from the slow neighbour used to read as local
@@ -790,8 +793,10 @@ func checkTrafficEngineering(ctx context.Context, env *Env) Result {
 			passed++
 		default:
 			fmt.Fprintf(&detail,
-				"outbound: routes from the fast %s (AS%d, local preference %d) should be preferred over the slow one (AS%d, %d)\n",
-				rel, f.asn, fp, s.asn, sp)
+				"outbound: every route from the fast %s (AS%d) must be preferred over every "+
+					"route from the slow one (AS%d), but the slow one has a route at local "+
+					"preference %d and the fast one has one at %d\n",
+				rel, f.asn, s.asn, sp, fp)
 		}
 	}
 
@@ -955,16 +960,17 @@ func advertisedRoutes(ctx context.Context, env *Env, router, peer string) (bgpRo
 	return adv, nil
 }
 
-// medianLocalPref returns the median local preference of the routes learned
-// from a peer, and how many there were.
+// worstLocalPref returns the lowest local preference on any route learned from
+// a neighbour, the highest, and how many routes there were.
 //
-// The count is not decoration. Returning zero for a peer that sent nothing made
-// "no routes at all" indistinguishable from "local preference zero", which is
-// lower than anything and so counted as correctly deprioritised -- awarding the
-// mark for filtering the neighbour out, which is the one thing this question
-// forbids.
-func medianLocalPref(ctx context.Context, env *Env, peer string) (int, int) {
-	var prefs []int
+// It used to be the median, which is a statement about most routes and about no
+// particular one -- the same loophole that was closed in the Gao-Rexford check
+// and left open here. Setting one prefix learned over the slow provider to a
+// preference above the fast one's moves neither median, so the question about
+// engineering traffic around the slow link passed while traffic for that prefix
+// took it. Comparing the extremes is what makes the claim true of every route.
+func worstLocalPref(ctx context.Context, env *Env, peer string) (lo, hi, n int) {
+	lo, hi = 1<<30, -1
 	for _, r := range env.Routers() {
 		tbl, err := bgpTable(ctx, env, r.Name)
 		if err != nil {
@@ -973,18 +979,24 @@ func medianLocalPref(ctx context.Context, env *Env, peer string) (int, int) {
 		for _, entries := range tbl.Table() {
 			for _, e := range entries {
 				for _, nh := range e.Nexthops {
-					if nh.IP == peer {
-						prefs = append(prefs, e.LocalPref)
+					if nh.IP != peer {
+						continue
+					}
+					n++
+					if e.LocalPref < lo {
+						lo = e.LocalPref
+					}
+					if e.LocalPref > hi {
+						hi = e.LocalPref
 					}
 				}
 			}
 		}
 	}
-	if len(prefs) == 0 {
-		return 0, 0
+	if n == 0 {
+		return 0, 0, 0
 	}
-	sort.Ints(prefs)
-	return prefs[len(prefs)/2], len(prefs)
+	return lo, hi, n
 }
 
 // checkRPKIInvalidRejected verifies that a route whose origin is RPKI-invalid

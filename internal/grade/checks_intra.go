@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/HongyuHe/twinet/internal/model"
 )
@@ -610,31 +611,73 @@ func checkInternalReachability(ctx context.Context, env *Env) Result {
 		return Errored("dataplane.internal_reachability", fmt.Errorf("AS %d has %d L3 hosts", env.AS, len(hosts)))
 	}
 
-	// A full mesh is quadratic; a hub-and-spoke from one host exercises every
-	// path through the backbone and is linear, which matters when a class is
-	// being graded a hundred submissions at a time.
-	src := hosts[0]
-	var failed []string
-	for _, dst := range hosts[1:] {
-		addr := firstAddr(dst)
-		if addr == "" {
-			continue
-		}
-		res, err := env.Probe(ctx, src.ID, []string{"ping", "-c", "2", "-W", "2", "-i", "0.2", addr})
-		if err != nil || res.ExitCode != 0 {
-			failed = append(failed, fmt.Sprintf("%s cannot reach %s (%s)", src.Name, dst.Name, addr))
+	// Every ordered pair, run concurrently.
+	//
+	// This was a hub-and-spoke from one host, on the reasoning that it
+	// exercises every path through the backbone and is linear. It does not:
+	// reachability is not symmetric and it is not transitive. A blackhole route
+	// on one host for another was measured to leave the hub's seven probes all
+	// succeeding while the pair it broke could not reach each other, and the
+	// question kept its full mark. Eight hosts is 56 probes; they take about as
+	// long as one, because they run at once.
+	addrOf := map[string]string{}
+	for _, d := range hosts {
+		if a := firstAddr(d); a != "" {
+			addrOf[d.ID] = a
 		}
 	}
-	tried := len(hosts) - 1
+	type probe struct {
+		from, to *model.Device
+	}
+	var pairs []probe
+	for _, a := range hosts {
+		for _, b := range hosts {
+			if a.ID == b.ID || addrOf[b.ID] == "" {
+				continue
+			}
+			pairs = append(pairs, probe{a, b})
+		}
+	}
+	if len(pairs) == 0 {
+		return Errored("dataplane.internal_reachability",
+			fmt.Errorf("AS %d has no addressed host to probe", env.AS))
+	}
+
+	var (
+		mu     sync.Mutex
+		failed []string
+		wg     sync.WaitGroup
+	)
+	sem := make(chan struct{}, 16)
+	for _, p := range pairs {
+		wg.Add(1)
+		go func(p probe) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			addr := addrOf[p.to.ID]
+			res, err := env.Probe(ctx, p.from.ID,
+				[]string{"ping", "-c", "2", "-W", "2", "-i", "0.2", addr})
+			if err != nil || res.ExitCode != 0 {
+				mu.Lock()
+				failed = append(failed, fmt.Sprintf("%s cannot reach %s (%s)",
+					p.from.Name, p.to.Name, addr))
+				mu.Unlock()
+			}
+		}(p)
+	}
+	wg.Wait()
+
+	tried := len(pairs)
 	if len(failed) == 0 {
 		return Pass("dataplane.internal_reachability", Evidence{
-			Observed: fmt.Sprintf("%s reaches all %d other hosts", src.Name, tried)})
+			Observed: fmt.Sprintf("all %d ordered host pairs reach each other", tried)})
 	}
 	sort.Strings(failed)
 	return Partial("dataplane.internal_reachability", ratio(tried-len(failed), tried), Evidence{
-		Expected: fmt.Sprintf("%d reachable hosts", tried),
+		Expected: fmt.Sprintf("%d reachable ordered pairs", tried),
 		Observed: fmt.Sprintf("%d unreachable", len(failed)),
-		Detail:   strings.Join(failed, "\n"),
+		Detail:   strings.Join(truncate(failed, 8), "\n"),
 		Hint:     "every internal subnet, including the router-host links, must be advertised in OSPF",
 		Command:  "ping",
 	})

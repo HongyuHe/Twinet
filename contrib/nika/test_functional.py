@@ -105,3 +105,34 @@ def test_the_capabilities_are_the_ones_this_backend_has(runtime: TwinetRuntime) 
     )
     with pytest.raises(TwinetError):
         runtime.srl_set_bgp_as(runtime.list_nodes()[0], 65000)
+
+
+def test_a_failed_command_is_an_error_not_output(runtime: TwinetRuntime, router: str) -> None:
+    """Discarding the exit status made "not found" look like a result.
+
+    NIKA's semantic layer reads several command outputs as evidence. With the
+    status thrown away, "sh: dhclient: not found" came back as ordinary text and
+    the caller carried on -- and one of NIKA's own verifiers treats the text a
+    missing dhcpd.conf produces as proof that the edit it never made had worked.
+    """
+    from twinet_runtime import TwinetCommandError
+
+    assert "yes" in runtime.exec(router, "echo yes")
+    with pytest.raises(TwinetCommandError):
+        runtime.exec(router, "there-is-no-such-command")
+    with pytest.raises(TwinetCommandError):
+        runtime.exec(router, "exit 3")
+
+
+def test_dhcp_is_not_advertised(runtime: TwinetRuntime) -> None:
+    """Twinet has a DHCP server and five DHCP faults; NIKA's are not those.
+
+    The inherited operations drive dhclient, /etc/dhcp/dhcpd.conf and systemd,
+    none of which these images have. Advertising the capability meant a scenario
+    could be accepted, verified and scored without its fault ever being
+    injected.
+    """
+    assert not runtime.has_capability("dhcp")
+    for op in ("renew_dhcp_leases", "dhcp_set_option_routers", "dhcp_delete_subnet"):
+        with pytest.raises(TwinetError):
+            getattr(runtime, op)("as3/CHI_host")
