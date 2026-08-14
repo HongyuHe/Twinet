@@ -44,6 +44,12 @@ func (s *Server) handleAttach(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, errors.New("cmd is required"))
 		return
 	}
+	// An interactive session on a lab somebody is grading would land in
+	// somebody's marks.
+	if why := s.refuseIfHeldByAnother(container, q.Get("hold")); why != "" {
+		httpError(w, http.StatusConflict, errors.New(why))
+		return
+	}
 
 	c, err := s.rt.Inspect(r.Context(), container)
 	if err != nil {

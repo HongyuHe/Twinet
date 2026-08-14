@@ -41,6 +41,10 @@ type bgpRoute struct {
 	} `json:"nexthops"`
 	// NextHop is the `advertised-routes` form.
 	NextHop string `json:"nextHop"`
+	// PathFrom is "internal" for a route another router of this AS advertised,
+	// and "external" for one learned over an eBGP session directly. It is what
+	// tells a next-hop-self fault from a normal connected next hop.
+	PathFrom string `json:"pathFrom"`
 
 	Community *struct {
 		String string `json:"string"`
@@ -109,6 +113,18 @@ type bgpRouteJSON struct {
 	ReceivedRoutes   routeSet `json:"receivedRoutes"`
 	TotalPrefix      int      `json:"totalPrefixCounter"`
 	LocalAS          int      `json:"localAS"`
+
+	// FRR answers a query about a neighbour it does not have with
+	// {"warning":"No such neighbor in this view/vrf"} and exit status 0. That
+	// is a finding about the student -- they did not configure the session --
+	// and not an unreadable document, which is a fault in the grader.
+	Warning string `json:"warning"`
+}
+
+// NoSuchNeighbour reports whether FRR answered that the neighbour asked about
+// does not exist.
+func (b bgpRouteJSON) NoSuchNeighbour() bool {
+	return strings.Contains(strings.ToLower(b.Warning), "no such neighbor")
 }
 
 // Table returns the populated route map, whichever key FRR used.

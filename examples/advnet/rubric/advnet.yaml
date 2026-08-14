@@ -33,8 +33,16 @@ questions:
     points: 2
     converge: true
     checks:
+      # Reachability is the exercise's own test and it is satisfiable without
+      # doing the exercise: a provider that put every customer prefix in the
+      # global table, or wrote static routes, would pass it completely. So half
+      # the mark is for the customer arriving and half for how -- a route in
+      # the customer's own table, learned by BGP, resolved through a transport
+      # label and a VPN label.
       - check: vpn.site_reachability
-        weight: 1.0
+        weight: 0.5
+      - check: vpn.label_switched
+        weight: 0.5
 
   - id: q3
     title: Keeping the customers apart

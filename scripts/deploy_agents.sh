@@ -14,11 +14,19 @@ cd "$(dirname "$0")/.."
 # it off plain HTTP. The agent API creates privileged containers and rewires
 # hosts, so a shared bearer token is not an acceptable resting state; this is
 # how a cluster stops using one.
+#
+# --bind-underlay narrows the agent's listening address from every interface to
+# the cluster fabric it already knows about. The API is mutually authenticated,
+# so a stranger who reaches the port cannot do anything with it -- but a port
+# that is open to the internet collects scans, and there is no reason for this
+# one to answer anybody outside the fabric.
 PKI=""
+BIND_UNDERLAY=""
 ARGS=()
 while [ $# -gt 0 ]; do
     case "$1" in
         --pki) PKI="$2"; shift 2 ;;
+        --bind-underlay) BIND_UNDERLAY=1; shift ;;
         *) ARGS+=("$1"); shift ;;
     esac
 done
@@ -77,6 +85,15 @@ for n in "${NODES[@]}"; do
         unit_cmd="sed -i -e '${strip_re}' -e '\#^ExecStart=#s#\$#${add}#' /etc/systemd/system/twinetd.service"
     else
         unit_cmd="true"
+    fi
+
+    # The address the agent already announces as its own is the one it should
+    # answer on. Taken from -underlay-ip in the unit rather than from an
+    # argument, so it cannot disagree with what the rest of the cluster dials.
+    if [ -n "$BIND_UNDERLAY" ]; then
+        # shellcheck disable=SC2016  # runs on the far node, expands there
+        bind_cmd='u=/etc/systemd/system/twinetd.service; ip=$(sed -n "s#.*-underlay-ip \([^ ]*\).*#\1#p" $u); port=$(sed -n "s#.*-listen [^ ]*:\([0-9]*\).*#\1#p" $u); if [ -n "$ip" ] && [ -n "$port" ]; then sed -i "s#-listen [^ ]*#-listen $ip:$port#" $u; fi'
+        unit_cmd="$unit_cmd; $bind_cmd"
     fi
 
     if [ "$n" = "$(hostname -s)" ]; then

@@ -73,6 +73,18 @@ func BuildRPKI(top *model.Topology, notFound []int, invalid map[int]string) *Pay
 		if as.Block == "" || skip[asn] {
 			continue
 		}
+		// A student's own ROA is a student's own action.
+		//
+		// The platform used to publish one for every autonomous system,
+		// including the ones whose owners are being asked to publish theirs.
+		// The exercise then had nothing left in it: every prefix was already
+		// authorised before anybody logged in, and the check that asks whether
+		// a system published a ROA could only be scored by giving everybody
+		// the mark for something nobody did. Student systems now start with no
+		// ROA and publish through the validator's own interface.
+		if as.Role == model.RoleStudent {
+			continue
+		}
 		pfx, err := netip.ParsePrefix(as.Block)
 		if err != nil {
 			continue
@@ -179,19 +191,54 @@ func (s *RTRServer) handle(c net.Conn) error {
 		if length < 8 || length > 1<<20 {
 			return fmt.Errorf("bad pdu length %d", length)
 		}
-		if rest := int(length) - 8; rest > 0 {
-			if _, err := io.ReadFull(c, make([]byte, rest)); err != nil {
+		body := make([]byte, int(length)-8)
+		if len(body) > 0 {
+			if _, err := io.ReadFull(c, body); err != nil {
 				return err
 			}
 		}
 
 		switch hdr[1] {
-		case pduResetQuery, pduSerialQuery:
-			// Both are answered with the full set. Serving a delta for a
-			// serial query would be correct and is unnecessary here: the
-			// payload of a teaching lab is small, and a full response is
-			// always a valid answer.
+		case pduResetQuery:
 			if err := s.writeFull(c); err != nil {
+				return err
+			}
+		case pduSerialQuery:
+			// A serial query is not answered with the full set.
+			//
+			// It used to be, and every record was sent with the announcement
+			// flag, so a router asking "what changed?" was told "all of this
+			// is still here" and nothing was ever removed. A ROA withdrawn or
+			// corrected at the trust anchor stayed in every router's table for
+			// the life of the session -- which matters now that publishing is
+			// a student's own action, because correcting a mistake appeared to
+			// do nothing.
+			//
+			// Serving a real delta would mean keeping a history of every
+			// version. RFC 8210 has the answer for a cache that cannot: Cache
+			// Reset tells the router to discard what it has and ask again,
+			// which it does immediately.
+			var have uint32
+			if len(body) >= 4 {
+				have = binary.BigEndian.Uint32(body[:4])
+			}
+			s.mu.RLock()
+			serial := s.serial
+			s.mu.RUnlock()
+			if have == serial {
+				// Nothing has changed since they last asked.
+				if err := writePDU(c, pduCacheResponse, binary.BigEndian.Uint16(hdr[2:4]), nil); err != nil {
+					return err
+				}
+				var end [4]byte
+				binary.BigEndian.PutUint32(end[:], serial)
+				if err := writePDU(c, pduEndOfData, binary.BigEndian.Uint16(hdr[2:4]),
+					append(end[:], 0, 0, 0, 60, 0, 0, 0, 30, 0, 0, 2, 88)); err != nil {
+					return err
+				}
+				continue
+			}
+			if err := writePDU(c, pduCacheReset, 0, nil); err != nil {
 				return err
 			}
 		default:
@@ -260,7 +307,14 @@ func writePDU(w io.Writer, kind byte, session uint16, body []byte) error {
 // RPKIAddrFor returns the address devices in an AS reach the validator at.
 func RPKIAddrFor(top *model.Topology, asn int) string {
 	for _, d := range top.Devices {
-		if d.Kind != model.KindService || !strings.Contains(strings.ToLower(d.Name), "rpki") {
+		if d.Kind != model.KindService {
+			continue
+		}
+		// What it was declared to be, not what it is called.
+		if d.ServiceKind != "" && d.ServiceKind != "builtin.rpki" {
+			continue
+		}
+		if d.ServiceKind == "" && !strings.Contains(strings.ToLower(d.Name), "rpki") {
 			continue
 		}
 		for _, i := range d.Ifaces {
@@ -274,4 +328,38 @@ func RPKIAddrFor(top *model.Topology, asn int) string {
 		}
 	}
 	return ""
+}
+
+// HijackOrigin returns the AS that deliberately announces a mis-ROA'd prefix,
+// and the prefix it announces.
+//
+// The manifest declares a ROA held by one AS for a prefix inside another's
+// space, so that an announcement of it is RPKI-invalid. A ROA on its own is
+// only half of that: nothing announced the prefix, so no route in the lab was
+// ever invalid, and the question "do you reject invalid announcements?" could
+// not be answered by looking at any router. Every submission passed it on the
+// strength of having written a route-map.
+//
+// The hijack is originated by a staff AS other than the ROA holder, so it
+// exists for every student regardless of what any student does, and no student
+// can withdraw it.
+func HijackOrigin(top *model.Topology) (int, string) {
+	if top.Lab == nil || len(top.Lab.RPKI.Invalid) == 0 {
+		return 0, ""
+	}
+	holders := map[int]bool{}
+	var prefix string
+	for holder, p := range top.Lab.RPKI.Invalid {
+		holders[holder] = true
+		if prefix == "" || p < prefix {
+			prefix = p
+		}
+	}
+	for _, asn := range top.SortedASNs() {
+		as := top.ASes[asn]
+		if as.Role == model.RoleStaff && !holders[asn] {
+			return asn, prefix
+		}
+	}
+	return 0, ""
 }

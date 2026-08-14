@@ -19,7 +19,7 @@ func init() {
 	// ---- DNS -----------------------------------------------------------
 
 	Register(&Fault{
-		Name: "dns_service_down", Category: CatNodeError, Needs: []Capability{CapProcess},
+		Name: "dns_service_down", Category: CatLink, Needs: []Capability{CapProcess},
 		Symptom:  "Users report that they cannot reach services by name, though addresses still work.",
 		Describe: "The authoritative name server was stopped.",
 		Inject: func(ctx context.Context, e *Env, t Target) (State, error) {
@@ -65,13 +65,42 @@ func init() {
 			// Dropped rather than rejected: a rejection produces an immediate
 			// error, which is a much easier thing to diagnose than a timeout,
 			// and the timeout is what the symptom describes.
+			//
+			// Appended rather than inserted, and one at a time with rollback,
+			// so that resolving can remove exactly the rules this injection
+			// added. It used to insert both and then, on resolve, delete
+			// *every* rule dropping port 53 -- including one that was already
+			// there, or one another injection had added -- and report a clean
+			// undo, because the fingerprint compares sets of lines and cannot
+			// see a rule it removed that was never its own.
+			// Nothing may already be dropping these queries.
+			//
+			// Verification asks whether a rule dropping port 53 exists, which
+			// a rule that was already there satisfies -- so injecting onto a
+			// resolver somebody had already firewalled reported success while
+			// changing nothing, and the episode's ground truth named a cause
+			// that was not the reason anything was broken.
 			for _, proto := range []string{"udp", "tcp"} {
-				if _, err := e.Sh(ctx, t.DeviceID(), fmt.Sprintf(
-					"iptables -w -I INPUT -p %s --dport 53 -j DROP", proto)); err != nil {
-					return nil, err
+				if n := countACL(ctx, e, t, "INPUT", fmt.Sprintf("-p %s --dport 53", proto)); n > 0 {
+					return nil, fmt.Errorf("%s already drops %s queries to port 53, so this "+
+						"fault would change nothing while claiming to be the cause",
+						t.DeviceID(), proto)
 				}
 			}
-			return State{"device": t.DeviceID()}, nil
+
+			var done []string
+			for _, proto := range []string{"udp", "tcp"} {
+				if _, err := e.Sh(ctx, t.DeviceID(), fmt.Sprintf(
+					"iptables -w -A INPUT -p %s --dport 53 -j DROP", proto)); err != nil {
+					for _, p := range done {
+						_, _ = e.Try(ctx, t.DeviceID(), fmt.Sprintf(
+							"iptables -w -D INPUT -p %s --dport 53 -j DROP", p))
+					}
+					return nil, err
+				}
+				done = append(done, proto)
+			}
+			return State{"device": t.DeviceID(), "protos": strings.Join(done, " ")}, nil
 		},
 		Verify: func(ctx context.Context, e *Env, t Target, s State) (Evidence, error) {
 			out, _, err := e.TryE(ctx, t.DeviceID(), "iptables -w -S INPUT")
@@ -86,17 +115,29 @@ func init() {
 			}, nil
 		},
 		Resolve: func(ctx context.Context, e *Env, t Target, s State) error {
-			_, err := e.Sh(ctx, t.DeviceID(), strings.Join([]string{
-				"for p in udp tcp; do",
-				"  while iptables -w -D INPUT -p $p --dport 53 -j DROP 2>/dev/null; do :; done",
-				"done",
-			}, "\n"))
-			return err
+			protos := strings.Fields(s["protos"])
+			if len(protos) == 0 {
+				protos = []string{"udp", "tcp"}
+			}
+			// Exactly one copy per protocol, and the last one, which is the
+			// one this injection appended.
+			for _, p := range protos {
+				pos := lastMatchingRule(ctx, e, t, "INPUT",
+					fmt.Sprintf("-p %s --dport 53", p))
+				if pos <= 0 {
+					continue
+				}
+				if _, err := e.Sh(ctx, t.DeviceID(),
+					fmt.Sprintf("iptables -w -D INPUT %d", pos)); err != nil {
+					return err
+				}
+			}
+			return nil
 		},
 	})
 
 	Register(&Fault{
-		Name: "dns_record_error", Category: CatMisconfig, Needs: []Capability{CapFile, CapDNS},
+		Name: "dns_record_error", Category: CatEndHost, Needs: []Capability{CapFile, CapDNS},
 		Symptom:  "One service resolves to the wrong machine; everything else looks fine.",
 		Describe: "A record in a served zone points at an address that does not host the service.",
 		Inject: func(ctx context.Context, e *Env, t Target) (State, error) {
@@ -114,7 +155,7 @@ func init() {
 			if code != 0 || strings.TrimSpace(before) == "" {
 				return nil, fmt.Errorf("%s is empty or unreadable; refusing to edit what cannot be restored", zone)
 			}
-			bad := t.Param("address", "192.0.2.66")
+			bad := t.Param("address", "")
 			// awk rather than sed: busybox does not support sed's 0,/pat/
 			// range, and silently changes nothing rather than failing, so the
 			// fault reported success while the zone was untouched.
@@ -122,23 +163,56 @@ func init() {
 			// The NS record is skipped deliberately. Repointing the authority
 			// record breaks the whole zone, which is a different and much
 			// louder fault than one service resolving to the wrong machine.
-			// The name that was repointed is printed on stderr so verification
-			// can ask the server for it. Without it, verification had nothing
-			// to query and fell back to reading the file back, which is not
-			// the same claim.
-			script := fmt.Sprintf(
-				"awk 'BEGIN{done=0} { if(!done && $1!=\"ns\" && $2==\"IN\" && $3==\"A\"){ "+
-					"print $1\" IN A %s\"; print \"TWINET_NAME=\"$1 > \"/dev/stderr\"; done=1 } "+
-					"else print }' %s > %s.new && mv %s.new %s",
-				bad, zone, zone, zone, zone)
-			out, err := e.Sh(ctx, t.DeviceID(), script)
+			// The name to repoint is chosen first, on its own, and printed to
+			// standard output.
+			//
+			// It used to be announced from inside the editing script by
+			// writing to /dev/stderr, because the script's own output is the
+			// new zone file. Whether that reaches the caller depends on the
+			// exec transport merging stderr, and when it does not, the fault
+			// refuses with "no A record could be repointed" on a zone full of
+			// A records -- which is what it did.
+			pick := fmt.Sprintf(
+				"awk '$1!=\"ns\" && $2==\"IN\" && $3==\"A\" {print $1; exit}' %s", zone)
+			picked, err := e.Sh(ctx, t.DeviceID(), pick)
 			if err != nil {
 				return nil, err
 			}
-			name := valueAfter(out, "TWINET_NAME=")
+			name := firstNonEmptyLine(picked)
 			if name == "" {
 				return nil, fmt.Errorf("no A record in %s could be repointed, so the fault "+
 					"would have reported success while changing nothing", zone)
+			}
+
+			// The wrong address has to be wrong.
+			//
+			// It defaulted to 192.0.2.66, which is the address this lab's own
+			// zone already gives that name -- so the fault rewrote the record
+			// to the value it already had, changed nothing, and was rolled
+			// back with "it did not take effect". A fault whose default makes
+			// it a no-op on the lab it ships with is worse than no fault.
+			current := firstNonEmptyLine(mustTry(ctx, e, t, fmt.Sprintf(
+				"awk -v want=%s '$1==want && $2==\"IN\" && $3==\"A\" {print $4; exit}' %s",
+				shellQuoteFault(name), zone)))
+			if bad == "" {
+				bad = differentTestAddress(current)
+			}
+			if bad == current {
+				return nil, fmt.Errorf("%s already resolves to %s, so pointing it there "+
+					"would change nothing; pass --param address=<something else>",
+					name, current)
+			}
+
+			// The NS record is skipped deliberately. Repointing the authority
+			// record breaks the whole zone, which is a different and much
+			// louder fault than one service resolving to the wrong machine.
+			script := fmt.Sprintf(
+				"awk -v want=%s -v bad=%s 'BEGIN{done=0} "+
+					"{ if(!done && $1==want && $2==\"IN\" && $3==\"A\"){ "+
+					"print $1\" IN A \"bad; done=1 } else print }' %s > %s.new && mv %s.new %s",
+				shellQuoteFault(name), shellQuoteFault(bad), zone, zone, zone, zone)
+			if _, err := e.Sh(ctx, t.DeviceID(), script); err != nil {
+				return nil, err
 			}
 			if _, err := e.Sh(ctx, t.DeviceID(), reloadNamed()); err != nil {
 				return nil, err
@@ -169,7 +243,8 @@ func init() {
 				return Evidence{}, err
 			}
 			got := strings.Contains(answer, s["address"])
-			observed := "the server did not answer with " + s["address"]
+			observed := fmt.Sprintf("the server was asked for %s and did not answer with %s; "+
+				"it said: %s", fqdn, s["address"], firstNonEmptyLineAfter(answer, "Address:"))
 			if got {
 				observed = firstLine(matchingLine(answer, s["address"]))
 			}
@@ -326,8 +401,19 @@ func init() {
 
 	Register(&Fault{
 		Name: "link_detach", Category: CatLink, Needs: []Capability{CapIP},
-		Symptom:  "One link is completely gone; the interface is not even listed.",
-		Describe: "An interface was removed from its bridge, so the cable is effectively unplugged.",
+		Symptom:  "Traffic across one link disappears, though the interface is up and addressed.",
+		Describe: "An interface carries nothing in either direction, as though the cable were cut.",
+		// The symptom said "the interface is not even listed", and it is: this
+		// drops traffic rather than removing the device. An RCA benchmark that
+		// describes evidence the agent will not find is worse than one that
+		// describes none, because the agent spends its time looking for it.
+		//
+		// NIKA's link_failure deletes the interface. Twinet does not, because
+		// removing a veth end from inside the namespace cannot be undone from
+		// there, and a fault that cannot be undone destroys the lab rather than
+		// perturbing it. See docs/10 for what that means for the coverage
+		// claim.
+		//
 		// Distinct from link_down: the interface stays up and configured, so a
 		// student or an agent looking at `ip link` sees nothing wrong on this
 		// side. The traffic simply has nowhere to go.
@@ -475,18 +561,17 @@ func boolWord(b bool, yes, no string) string {
 	return no
 }
 
-// valueAfter pulls a KEY=value token out of command output.
-func valueAfter(out, key string) string {
-	for _, ln := range strings.Split(out, "\n") {
-		if i := strings.Index(ln, key); i >= 0 {
-			return strings.TrimSpace(ln[i+len(key):])
-		}
-	}
-	return ""
-}
-
 // zoneOrigin reads $ORIGIN from a zone file so a bare record name can be turned
 // into something resolvable.
+// zoneOrigin returns the domain a zone file is rooted at.
+//
+// $ORIGIN is only one of the ways a zone says so, and not the one this lab's
+// zones use: they name the origin in the SOA record instead. Returning ""
+// meant the verifier asked the server for "all" rather than "all.group1",
+// which resolves to nothing -- so the fault reported that it had not taken
+// effect and rolled itself back, on a zone it had edited perfectly. Three
+// faults were unusable for this reason and the message said only "it did not
+// take effect", with nothing after the colon.
 func zoneOrigin(zone string) string {
 	for _, ln := range strings.Split(zone, "\n") {
 		f := strings.Fields(ln)
@@ -494,5 +579,62 @@ func zoneOrigin(zone string) string {
 			return strings.TrimSuffix(f[1], ".")
 		}
 	}
+	// "@ IN SOA ns.group1. root.group1. (...)" -- the first label of the
+	// primary name server is the host, the rest is the zone.
+	for _, ln := range strings.Split(zone, "\n") {
+		f := strings.Fields(ln)
+		if len(f) >= 4 && f[1] == "IN" && f[2] == "SOA" {
+			ns := strings.TrimSuffix(f[3], ".")
+			if i := strings.IndexByte(ns, '.'); i > 0 {
+				return ns[i+1:]
+			}
+			return ns
+		}
+	}
 	return ""
+}
+
+// firstNonEmptyLine returns the first line of output that has content.
+func firstNonEmptyLine(s string) string {
+	for _, l := range strings.Split(s, "\n") {
+		if t := strings.TrimSpace(l); t != "" {
+			return t
+		}
+	}
+	return ""
+}
+
+// mustTry runs a probe and returns whatever it produced, empty on failure.
+func mustTry(ctx context.Context, e *Env, t Target, script string) string {
+	out, _ := e.Try(ctx, t.DeviceID(), script)
+	return out
+}
+
+// differentTestAddress picks an address in the documentation range that is not
+// the one given.
+//
+// TEST-NET-1 is used because it is reserved for exactly this: it can never be
+// something a student is trying to reach, so a name pointing there is
+// unambiguously wrong rather than accidentally right.
+func differentTestAddress(current string) string {
+	const a, b = "192.0.2.66", "192.0.2.67"
+	if strings.TrimSpace(current) == a {
+		return b
+	}
+	return a
+}
+
+// firstNonEmptyLineAfter returns the first line containing a marker, for an
+// error message that says what was actually seen rather than only what was not.
+func firstNonEmptyLineAfter(out, marker string) string {
+	var last string
+	for _, l := range strings.Split(out, "\n") {
+		if strings.Contains(l, marker) {
+			last = strings.TrimSpace(l)
+		}
+	}
+	if last == "" {
+		return "nothing usable (" + strings.TrimSpace(firstNonEmptyLine(out)) + ")"
+	}
+	return last
 }

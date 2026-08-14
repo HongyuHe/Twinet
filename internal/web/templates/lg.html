@@ -1,0 +1,9 @@
+{{template "head" .}}
+<form method="get" action="/lg">
+<select name="device">{{range .Routers}}<option value="{{.}}" {{if eq . $.Device}}selected{{end}}>{{.}}</option>{{end}}</select>
+<select name="cmd">{{range .Commands}}<option value="{{.}}" {{if eq . $.Cmd}}selected{{end}}>{{.}}</option>{{end}}</select>
+<button type="submit">run</button>
+</form>
+{{with .Err}}<p class="err">{{.}}</p>{{end}}
+{{with .Out}}<pre>{{.}}</pre>{{end}}
+{{template "foot" .}}

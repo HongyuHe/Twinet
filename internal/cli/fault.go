@@ -1,8 +1,11 @@
 package cli
 
 import (
+	"context"
+
 	"encoding/json"
 	"fmt"
+	"github.com/HongyuHe/twinet/internal/client"
 	"os"
 	"path/filepath"
 	"sort"
@@ -111,9 +114,14 @@ func loadInjections(top *model.Topology) ([]*fault.Injection, error) {
 
 func saveInjections(top *model.Topology, in []*fault.Injection) error {
 	p := injectionsPath(top)
-	if err := os.MkdirAll(filepath.Dir(p), 0o750); err != nil {
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
 		return err
 	}
+	// Narrowed every time, not only at creation: a lab directory made before
+	// this rule existed would otherwise stay group-readable for the rest of its
+	// life, and the agent account is in the invoking user's supplementary
+	// groups often enough that "0750" and "unreadable" are not the same thing.
+	sealLabState(top)
 	raw, err := json.MarshalIndent(in, "", "  ")
 	if err != nil {
 		return err
@@ -220,6 +228,20 @@ func newFaultInjectCmd(opts *Options) *cobra.Command {
 
 			inj, err := fault.Inject(cmd.Context(), env, args[0], target)
 			if err != nil {
+				// A failed injection can still leave a live fault: when
+				// verification fails and the rollback fails too, Inject
+				// reports both and hands back what it created. Discarding it
+				// left the device broken with nothing on disk saying so, and
+				// its exemption from automatic repair still in place -- so
+				// nothing would fix it and nothing would find it.
+				if inj != nil {
+					if serr := saveInjections(top, append(existing, inj)); serr != nil {
+						return fmt.Errorf("%w; it is still live, and recording it failed too "+
+							"(%v), so it must be undone by hand on %s", err, serr, target.DeviceID())
+					}
+					return fmt.Errorf("%w; it is still live and has been recorded, so "+
+						"`twinet fault resolve --all` will try again", err)
+				}
 				return err
 			}
 			if err := saveInjections(top, append(existing, inj)); err != nil {
@@ -539,9 +561,45 @@ func faultEnv(cmd *cobra.Command, top *model.Topology, token string) (*fault.Env
 	if err != nil {
 		return nil, err
 	}
+	exempt, err := exemptFunc(top, token)
+	if err != nil {
+		return nil, err
+	}
 	return &fault.Env{
 		Topology: top, Exec: exec, Lifecycle: life,
-		Reshape: reshape, NodeState: nodeState,
+		Reshape: reshape, NodeState: nodeState, Exempt: exempt,
+	}, nil
+}
+
+// exemptFunc returns a function that tells the node hosting a device to leave
+// it alone while a fault is live.
+//
+// The record is kept on the node rather than in the container. A marker inside
+// the device under test tells an agent being evaluated on root-cause analysis
+// both that a fault was injected and, if it names the fault, what the answer
+// is -- readable with `cat`, which makes the benchmark worthless.
+func exemptFunc(top *model.Topology, token string) (
+	func(context.Context, string, string, bool) error, error) {
+
+	if !clustered(top) {
+		// No agent, so no repair loop to exclude.
+		return nil, nil
+	}
+	tok, err := tokenFor(token)
+	if err != nil {
+		return nil, err
+	}
+	cl := client.NewCluster(top.Lab, tok)
+	return func(ctx context.Context, deviceID, injectionID string, on bool) error {
+		d, ok := top.Device(deviceID)
+		if !ok {
+			return fmt.Errorf("no device %q", deviceID)
+		}
+		n, ok := cl.Node(d.Node)
+		if !ok {
+			return fmt.Errorf("device %s is on unknown node %q", deviceID, d.Node)
+		}
+		return n.Exempt(ctx, top.Name, deviceID, injectionID, on)
 	}, nil
 }
 

@@ -14,6 +14,17 @@ func init() {
 	// ---- link failures -------------------------------------------------
 	Register(&Fault{
 		Name: "link_down", Category: CatLink, Needs: []Capability{CapInterface},
+		Precondition: func(ctx context.Context, e *Env, t Target) (string, error) {
+			iface, err := faultIface(e, t)
+			if err != nil {
+				return "", err
+			}
+			out, _ := e.Try(ctx, t.DeviceID(), "ip -o link show dev "+iface)
+			if out != "" && !strings.Contains(out, "state UP") && !strings.Contains(out, "UP,") {
+				return iface + " on " + t.DeviceID() + " is already down", nil
+			}
+			return "", nil
+		},
 		Symptom:  "Users report connectivity issues to other hosts.",
 		Describe: "An interface was administratively shut down.",
 		Inject: func(ctx context.Context, e *Env, t Target) (State, error) {
@@ -153,6 +164,13 @@ func init() {
 	// ---- node errors ----------------------------------------------------
 	Register(&Fault{
 		Name: "frr_service_down", Category: CatNodeError, Needs: []Capability{CapService, CapFRR},
+		Precondition: func(ctx context.Context, e *Env, t Target) (string, error) {
+			out, _ := e.Try(ctx, t.DeviceID(), procRunning("/bgpd")+" && echo running || echo stopped")
+			if strings.Contains(out, "stopped") {
+				return "FRR is not running on " + t.DeviceID() + " to begin with", nil
+			}
+			return "", nil
+		},
 		Symptom:  "Users report connectivity issues to other hosts in the network.",
 		Describe: "The routing daemon was stopped, so the router stops participating in OSPF and BGP.",
 		Inject: func(ctx context.Context, e *Env, t Target) (State, error) {
@@ -439,6 +457,36 @@ func init() {
 			if err != nil {
 				return nil, err
 			}
+			// The session must be up before it is broken.
+			//
+			// Verification waits for it to stop being established, which a
+			// session that was never established satisfies immediately -- so
+			// the fault reported success on a peering that was already down
+			// for some other reason, and the recorded cause was not the reason.
+			if out, _ := e.Try(ctx, t.DeviceID(), "vtysh -c 'show bgp summary'"); !peerEstablished(out, peer) {
+				return nil, fmt.Errorf("the session with %s on %s is not established to "+
+					"begin with, so breaking it would change nothing while claiming to be "+
+					"the cause", peer, t.DeviceID())
+			}
+			// Everything the configuration says about this neighbour is
+			// captured first.
+			//
+			// Undoing this fault removes the neighbour and adds it back, and
+			// `no neighbor X` in FRR deletes *all* of it -- the route-maps
+			// bound to it, its address-family settings, everything. Re-adding
+			// `neighbor X remote-as N` restored the session and nothing else,
+			// so the router came back with no policy at all on that session
+			// and leaked every route it knew to a provider. The fault reported
+			// a clean resolve, and the lab was quietly wrong from then on.
+			base, af, cerr := neighborConfig(ctx, e, t, peer)
+			if cerr != nil {
+				// Injecting without having captured what this neighbour holds
+				// means resolving cannot put it back, and undoing this fault
+				// deletes the neighbour outright -- so the router would come
+				// back with no policy on that session and leak every route it
+				// knows. Better not to inject at all.
+				return nil, cerr
+			}
 			if err := e.VtyshConfig(ctx, t.DeviceID(), "configure terminal",
 				fmt.Sprintf("router bgp %d", t.AS),
 				fmt.Sprintf("no neighbor %s remote-as %d", peer, asn),
@@ -446,7 +494,8 @@ func init() {
 				"end"); err != nil {
 				return nil, err
 			}
-			return State{"peer": peer, "asn": fmt.Sprint(asn)}, nil
+			return State{"peer": peer, "asn": fmt.Sprint(asn),
+				"cfg": strings.Join(base, "\n"), "cfgaf": strings.Join(af, "\n")}, nil
 		},
 		Verify: func(ctx context.Context, e *Env, t Target, s State) (Evidence, error) {
 			// The claim is that this one session stops establishing. Checking
@@ -473,14 +522,68 @@ func init() {
 			if s["peer"] == "" {
 				return fmt.Errorf("no peer was recorded for this fault")
 			}
-			return e.VtyshConfig(ctx, t.DeviceID(), "configure terminal",
-				fmt.Sprintf("router bgp %d", t.AS),
+			cmds := []string{"configure terminal", fmt.Sprintf("router bgp %d", t.AS),
 				fmt.Sprintf("no neighbor %s", s["peer"]),
-				fmt.Sprintf("neighbor %s remote-as %s", s["peer"], s["asn"]),
-				"end")
+				fmt.Sprintf("neighbor %s remote-as %s", s["peer"], s["asn"])}
+			for _, l := range splitNonEmpty(s["cfg"]) {
+				if strings.Contains(l, "remote-as") {
+					continue
+				}
+				cmds = append(cmds, l)
+			}
+			if af := splitNonEmpty(s["cfgaf"]); len(af) > 0 {
+				cmds = append(cmds, "address-family ipv4 unicast")
+				cmds = append(cmds, af...)
+				cmds = append(cmds, "exit-address-family")
+			}
+			cmds = append(cmds, "end")
+			return e.VtyshConfig(ctx, t.DeviceID(), cmds...)
 		},
 	})
+}
 
+// neighborConfig returns every configuration line naming a neighbour, split
+// into the ones that live directly under `router bgp` and the ones that live
+// inside an address family.
+//
+// Restoring a neighbour means restoring all of it. The route-maps bound to a
+// session are what stop a router handing every route it knows to a provider,
+// and they live in the address-family block.
+func neighborConfig(ctx context.Context, e *Env, t Target, peer string) (base, af []string, err error) {
+	out, code, err := e.TryE(ctx, t.DeviceID(), "vtysh -c 'show running-config'")
+	if err != nil {
+		return nil, nil, err
+	}
+	if code != 0 {
+		return nil, nil, fmt.Errorf("%s: its configuration could not be read, so what this "+
+			"fault would delete could not be captured first", t.DeviceID())
+	}
+	inAF := false
+	for _, line := range strings.Split(out, "\n") {
+		l := strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(l, "address-family "):
+			inAF = true
+			continue
+		case l == "exit-address-family":
+			inAF = false
+			continue
+		case strings.HasPrefix(l, "router "):
+			inAF = false
+		}
+		if !strings.HasPrefix(l, "neighbor "+peer+" ") {
+			continue
+		}
+		if inAF {
+			af = append(af, l)
+		} else {
+			base = append(base, l)
+		}
+	}
+	return base, af, nil
+}
+
+func init() {
 	Register(&Fault{
 		Name: "bgp_missing_route_advertisement", Category: CatMisconfig, Needs: []Capability{CapFRR},
 		Symptom:  "One network has become unreachable from the rest of the Internet.",
@@ -580,15 +683,16 @@ func init() {
 				func(c context.Context) (string, error) {
 					return e.Vtysh(c, t.DeviceID(), "show bgp ipv4 unicast "+victim)
 				},
-				func(o string) bool { return strings.Contains(o, "Local") })
+				func(o string) bool { return locallyOriginated(o) })
 			if err != nil {
 				return Evidence{}, err
 			}
+			got := locallyOriginated(out)
 			originated := firstLine(out)
-			if !strings.Contains(out, "Local") {
+			if !got {
 				originated = "the router is not originating " + victim
 			}
-			return Evidence{Verified: strings.Contains(out, "Local"),
+			return Evidence{Verified: got,
 				Expected: "AS " + fmt.Sprint(t.AS) + " originates " + victim,
 				Observed: originated}, nil
 		},
@@ -933,4 +1037,24 @@ func ospfPeerOnNetwork(e *Env, t Target, subnet string) (string, error) {
 	}
 	return "", fmt.Errorf("no link on %s carries subnet %s, so the adjacency the fault "+
 		"changed cannot be identified", d.ID, subnet)
+}
+
+// locallyOriginated reports whether `show bgp <prefix>` shows a path this
+// router originates itself.
+//
+// It used to look for the word "Local" anywhere in the output, and every
+// learned path prints "Local host: <addr>, Local port: 179". So the check was
+// true whenever the prefix was in the table at all -- which for a hijack of a
+// real neighbour's prefix is always. The fault could then never be resolved:
+// its own verification insisted it was still present after the configuration
+// had been removed. That happened on this cluster and needed a hand repair.
+//
+// FRR prints a locally originated path as a line containing only "Local".
+func locallyOriginated(out string) bool {
+	for _, line := range strings.Split(out, "\n") {
+		if strings.TrimSpace(line) == "Local" {
+			return true
+		}
+	}
+	return false
 }

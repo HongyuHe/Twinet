@@ -204,11 +204,23 @@ func Run(ctx context.Context, r *Rubric, env *Env, opts RunOptions) *Report {
 		// skip the wait before a later one that depends on more state.
 		if q.Converge {
 			if err := waitForScope(ctx, env, q.ConvergeScope, opts.ConvergeTimeout); err != nil {
+				// A network that will not settle is usually the submission.
+				//
+				// This flagged the whole report for review, and the release
+				// guard then withheld every mark on it -- so a student whose
+				// OSPF was simply not configured had their entire paper held
+				// back rather than marked, which is a worse answer than the
+				// low mark their work earns. The code elsewhere says exactly
+				// this: student non-convergence is a mark, not an outage.
+				//
+				// It is recorded as a warning on the report either way, so a
+				// marker reading it sees that the network had not settled. Only
+				// an infrastructure failure -- a node that could not be reached
+				// -- withholds the mark, and that is tracked separately.
 				rep.Warnings = append(rep.Warnings,
 					fmt.Sprintf("the network had not settled before %s: %v", q.ID, err))
-				qr.NeedsReview = true
-				qr.Note = "the control plane had not converged when this was assessed"
-				rep.NeedsReview = true
+				qr.Note = "the control plane had not converged when this was assessed, " +
+					"which is usually the submission's own doing"
 			}
 		}
 
@@ -280,6 +292,9 @@ func runChecks(ctx context.Context, q QuestionSpec, env *Env, opts RunOptions) [
 			// Each check gets its own environment so its arguments cannot leak
 			// into a sibling running concurrently.
 			e := *env
+			if e.peers == nil {
+				e.peers = &peerCache{addr: map[string]string{}}
+			}
 			e.Args = cs.Args
 			e.infraSeen = &infraTracker{}
 			res := runCheck(cctx, c, &e)
@@ -291,6 +306,22 @@ func runChecks(ctx context.Context, q QuestionSpec, env *Env, opts RunOptions) [
 			// a mark and says nothing about it.
 			if fail := e.infraSeen.failure(); fail != nil && res.Status != StatusError {
 				res = Errored(cs.Check, fail)
+			}
+
+			// A check whose own deadline expired did not finish looking.
+			//
+			// Cancellation and deadline errors are deliberately excluded from
+			// the infrastructure tracker, because a convergence predicate
+			// timing out is a legitimate finding about the submission. But the
+			// *check's* context expiring is not: it means the grader ran out
+			// of time, and several checks absorb that into a zero or a partial
+			// score. That is an outage turned into a mark, which is exactly
+			// what the tracker above exists to prevent.
+			if cctx.Err() != nil && res.Status != StatusError {
+				res = Errored(cs.Check, fmt.Errorf(
+					"this check ran out of time after %s, so what it found is what it had "+
+						"managed to look at rather than a judgement about the submission: %w",
+					opts.CheckTimeout, cctx.Err()))
 			}
 			results[i] = res
 		}(i, c, cs)

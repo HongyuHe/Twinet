@@ -354,3 +354,131 @@ itself.
   `switch.db`, `switch.summary`) plus a `manifest.json` with checksums and
   timestamps — so existing student instructions, the GitHub submission flow, and
   `golden-configs/` all keep working unchanged.
+
+## 9. Heterogeneous vendors
+
+FRR is one implementation of the protocols, not the protocols. A lab in which
+every router is FRR teaches students that BGP is what FRR's syntax says it is,
+and it cannot pose the question that dominates real operations: two vendors
+that read the same standard differently, and a network that must work anyway.
+
+**Objective.** A device declares which network operating system it runs, and
+everything downstream — the image, the configuration Twinet renders, the way a
+command is run inside it, the way its state is read for grading, and the way a
+fault is applied to it — follows from that declaration rather than from an
+assumption baked into the renderer.
+
+```yaml
+kinds:
+  router:
+    nos: frr                       # the default, and what every lab uses today
+routers:
+  MSP: {id: 1}
+  NYC: {id: 2, nos: bird}          # a second control plane on one router
+  BOS: {id: 3, nos: openbsd_bgpd}
+  EDGE: {id: 4, nos: sonic}
+```
+
+**What this requires, and where each piece belongs.**
+
+1. **A NOS interface** (`internal/nos`). Four operations, each of which the FRR
+   code already performs and none of which it names: *render* a configuration
+   for a device from the model; *apply* it to a running container; *read* the
+   protocol state a check needs, in a form independent of the vendor; and
+   *describe* which features it supports. FRR becomes the first implementation
+   of that interface rather than the only path through the code.
+
+2. **A vendor-neutral state model** (`internal/netstate`). The grading checks
+   must stop reading FRR's JSON directly. What a check needs is "the routes this
+   router selected, with their next hops, local preference, AS path and
+   communities" and "the sessions it has, with their state and their peer" —
+   both of which every implementation can produce, and neither of which is
+   FRR-shaped. This is the largest piece of work and the one that decides
+   whether the rest is honest: a check that still parses `show ip bgp json`
+   silently fails every non-FRR device, and a grader that fails silently is
+   worse than one that refuses.
+
+3. **Capability declaration and refusal.** A manifest that asks for RPKI origin
+   validation on a NOS that does not implement it must be refused at validation
+   time, naming the device, the feature and the implementation — not deployed
+   and marked wrong later. This is the same rule the fault registry already
+   follows with its `Needs []Capability`, applied to configuration.
+
+4. **Images.** One image per NOS, pinned by digest, built in `images/` from the
+   same reproducibility rules as the current ones. BIRD and OpenBGPD are small;
+   SONiC is large and belongs behind an opt-in.
+
+5. **Grading that is about the network, not the vendor.** Every check that
+   exists today asserts a property of the routing table or the data plane, and
+   those properties do not change with the implementation. Once the state model
+   is in place, the same rubric grades a mixed-vendor AS unchanged — which is
+   the acceptance test for this work: take `examples/cos461`, change two
+   routers' `nos:`, and require the reference to score identically.
+
+**Why this shape.** The alternative — a template per vendor, selected by a
+`switch` in the renderer — reproduces the mini-Internet's original defect at a
+larger scale: behaviour that depends on where in a chain of scripts a decision
+happened to be made. An interface with one implementation is a small cost today
+and the only structure that makes a second implementation a contained change.
+
+## 10. Topology types within an AS
+
+An AS in the current model is a set of routers, an optional layer-2 domain per
+gateway, and one host per router. That is the shape the two courses use, and it
+is written into the expander rather than declared: an author who wants a
+different interior has to write every link out by hand, and an author who wants
+a *generated* interior of a different shape cannot express it at all.
+
+**Objective.** The interior of an AS is declared by naming its type and its
+parameters, exactly as the inter-AS graph already is with
+`peerings.generator`. The generated result is an ordinary set of routers and
+links — nothing downstream needs to know how it was produced.
+
+```yaml
+# One of several shapes, all compiling to the same internal representation.
+interior:
+  kind: clos                # a datacentre fabric
+  spines: 4
+  leaves: 8
+  hosts_per_leaf: 2
+
+interior:
+  kind: ring                # the multicast exercise's shape
+  routers: [TOP, RIGHT, BOTTOMR, BOTTOML, LEFT]
+  hub: CENTER               # optional: one router connected to all of them
+
+interior:
+  kind: two-tier            # a small provider: core and edge
+  core: 2
+  edge: 6
+  edge_uplinks: 2
+
+interior:
+  kind: explicit            # what every template does today, named
+  links: [[MSP, SFO], [MSP, CHI]]
+```
+
+**What this requires.**
+
+1. **A generator registry mirroring `peerings.generator`** (`internal/expand`),
+   so the two kinds of generator share one mechanism, one validation path and
+   one set of error messages.
+2. **Addressing that scales with the shape.** A Clos fabric of 32 leaves needs
+   more router-to-router subnets than the current `{{ .LinkIndex }}` template
+   comfortably yields; the addressing plan must be able to derive a subnet from
+   the *role* of a link (spine-leaf, leaf-host) and not only from its index.
+3. **Placement that understands the shape.** `pack-by-as` is right for a
+   teaching AS of eight routers and wrong for a fabric of forty: a Clos fabric
+   should be cut across nodes along the spine-leaf boundary, because that is
+   where the traffic is least sensitive to the underlay. The placer already
+   takes a strategy; this adds one that reads the declared interior.
+4. **Checks that are shape-aware.** "Every router reaches every other" holds for
+   any interior. "The interior is a full iBGP mesh" does not: a fabric uses
+   route reflectors, and a rubric written for one shape must not be silently
+   applied to another. A rubric therefore declares which interior kinds it
+   grades, and grading a lab whose interior it does not name is refused.
+
+**Acceptance.** A manifest declaring a Clos interior deploys, converges, is
+graded by a rubric written for it, and places sensibly across three nodes; the
+existing course labs, expressed as `kind: explicit`, produce byte-identical
+topology hashes to the ones they produce today.

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -55,6 +56,7 @@ func newGradeClassCmd(opts *Options) *cobra.Command {
 		converge   time.Duration
 		parallel   int
 		keepLoaded bool
+		skipAttest bool
 		perWave    int
 	)
 	cmd := &cobra.Command{
@@ -89,7 +91,11 @@ The lab must already be deployed with --solve.`,
 				return err
 			}
 			if rubricPath == "" {
-				rubricPath = filepath.Join(top.Lab.Dir, "rubric", "cos461.yaml")
+				p, err := defaultRubric(top.Lab.Dir)
+				if err != nil {
+					return err
+				}
+				rubricPath = p
 			}
 			rubric, err := grade.LoadRubric(rubricPath)
 			if err != nil {
@@ -116,14 +122,97 @@ The lab must already be deployed with --solve.`,
 				parallel = 16
 			}
 
+			// Ask the nodes to leave this lab to us for the duration. This must
+			// come before the health check below: that check reads every
+			// router, and a repair loop rewiring one underneath it would make
+			// it report a problem that does not exist.
+			held, err := holdLab(cmd.Context(), top, token, cmd.ErrOrStderr())
+			if err != nil {
+				return err
+			}
+			defer held.Release()
+
+			// Nobody is graded against a lab that is not working. Both halves
+			// matter: a router with no routing process and a device with a
+			// missing cable are invisible where they are and expensive
+			// somewhere else, on somebody else's mark.
+			// Nodes that disagree about a container image mean a mark depends
+			// on which machine a system was placed on. `grade batch` held such
+			// marks for review and this did not, so the mode meant for marking
+			// a class was the one without the check.
+			// Recorded on every report, not only in batch mode. An image tag
+			// is not an identity, and a mark that cannot be traced to the
+			// software that produced it cannot be defended on appeal.
+			classImages := labImages(cmd.Context(), top, token)
+			if bad := imageDisagreements(cmd.Context(), top, token); len(bad) > 0 {
+				return fmt.Errorf("the nodes of this cluster do not agree on what these "+
+					"images are:\n  %s\nA mark would then depend on which machine a "+
+					"student's system happened to be placed on, and nothing in the report "+
+					"could say so. Make them match -- `docker pull` on each node, or refer "+
+					"to the image by digest -- and grade again", strings.Join(bad, "\n  "))
+			}
+			if bad := miswiredDevices(cmd.Context(), exec, top); len(bad) > 0 {
+				return notReadyToGrade("device(s) in this lab do not have the interfaces "+
+					"the lab says they have", bad, opts.Manifest)
+			}
+			if bad := unhealthyRouters(cmd.Context(), exec, top); len(bad) > 0 {
+				return notReadyToGrade("router(s) in this lab are not running their "+
+					"routing processes", bad, opts.Manifest)
+			}
+
+			// The lab must actually be the reference solution.
+			//
+			// Interfaces present and routing processes alive is not the same
+			// claim: a lab deployed in platform mode passes both, with every
+			// student system blank. The whole method rests on grading each
+			// submission against a correct internet, and the cheapest way to
+			// know the internet is correct is to mark it -- so it is graded,
+			// and anything short of full marks stops the run.
+			//
+			// It costs about eighty seconds against the forty minutes a class
+			// takes, and it is the difference between marks that mean
+			// something and marks nobody can defend.
+			if !skipAttest {
+				fmt.Fprintf(cmd.ErrOrStderr(),
+					"checking that this lab is the reference solution before grading anybody\n")
+				// Attested twice before refusing.
+				//
+				// The lab is a live network: a system can be a few seconds
+				// short of converged when the attestation reads it, score
+				// 9.80, and be at 10.00 by the time anybody looks. Refusing on
+				// the first reading turned a transient into an aborted class
+				// run. Refusing on the second is the same guarantee -- nothing
+				// is graded against a lab that is not the reference -- without
+				// the false alarm.
+				if err := attestReference(cmd.Context(), top, rubric, exec, converge,
+					parallel, opts.Manifest); err != nil {
+					fmt.Fprintf(cmd.ErrOrStderr(),
+						"the lab did not read as the reference solution; waiting for it to "+
+							"settle and checking once more\n")
+					waitWave(cmd.Context(), top, exec, subs, converge)
+					if err2 := attestReference(cmd.Context(), top, rubric, exec, converge,
+						parallel, opts.Manifest); err2 != nil {
+						return err2
+					}
+					fmt.Fprintf(cmd.ErrOrStderr(),
+						"the lab is the reference solution on the second reading; the first "+
+							"was taken while it was still settling\n")
+				}
+			}
+
 			var waves [][]submission
 			if perWave > 1 {
-				waves = independentWaves(top, subs)
+				// --per-wave N means at most N at a time, and it used to mean
+				// "as many as the colouring allows": --per-wave 2 and
+				// --per-wave 100 behaved identically, so an operator asking for
+				// a cautious amount of parallelism silently got all of it.
+				waves = capWaves(independentWaves(top, subs), perWave)
 				fmt.Fprintf(cmd.ErrOrStderr(),
-					"grading %d submission(s) in %d wave(s); within a wave no two submissions "+
-						"are within two systems of each other.\nThat is a heuristic, not a proof of "+
-						"isolation: run without --per-wave for marks that are final.\n",
-					len(subs), len(waves))
+					"grading %d submission(s) in %d wave(s), at most %d at a time; within a "+
+						"wave no two submissions are within two systems of each other.\nThat is "+
+						"a heuristic, not a proof of isolation: run without --per-wave for marks "+
+						"that are final.\n",
+					len(subs), len(waves), perWave)
 			} else {
 				for _, s := range subs {
 					waves = append(waves, []submission{s})
@@ -131,6 +220,17 @@ The lab must already be deployed with --solve.`,
 				fmt.Fprintf(cmd.ErrOrStderr(),
 					"grading %d submission(s), one at a time: everything else in the lab stays "+
 						"at the reference\n", len(subs))
+			}
+			// --parallel is concurrency *within* a wave, so it does nothing at
+			// all unless --per-wave put more than one submission in one. An
+			// operator asking for -p 4 and getting a serial run deserves to be
+			// told which flag they wanted rather than left to time it.
+			if parallel > 1 && widestWave(waves) < 2 {
+				fmt.Fprintf(cmd.ErrOrStderr(),
+					"--parallel %d has no effect here: it grades submissions concurrently "+
+						"within a wave, and every wave holds one. Use --per-wave to put "+
+						"several submissions in a wave, or `twinet grade batch` to grade "+
+						"submissions in labs of their own.\n", parallel)
 			}
 
 			start := time.Now()
@@ -140,11 +240,38 @@ The lab must already be deployed with --solve.`,
 			contaminated := ""
 
 			for i, wave := range waves {
+				// If the nodes have stopped leaving this lab alone, everything
+				// from here on is being graded against a lab something else is
+				// changing. That is not a slow run or a bad mark, it is an
+				// unknown one, so the rest is held for review rather than
+				// scored.
+				select {
+				case <-held.Lost:
+					contaminated = fmt.Sprintf("the nodes stopped holding this lab off "+
+						"from automatic repair partway through: %s", held.Reason())
+					reports = append(reports, quarantine(waves[i:], rubric.MaxTotal(), contaminated)...)
+				default:
+				}
+				if contaminated != "" {
+					break
+				}
 				fmt.Fprintf(cmd.ErrOrStderr(), "\nwave %d/%d: %s\n", i+1, len(waves), groupNames(wave))
 
 				loaded := make([]submission, 0, len(wave))
+				// Undoing what was adapted for this wave's submissions. The
+				// next wave is graded against the reference as the manifest
+				// describes it, not against the last group's addressing.
+				var adapted []func(context.Context) error
 				for _, s := range wave {
-					err := resetToStudentStart(cmd.Context(), exec, top, s.AS)
+					// Wait for the lab to stop moving before touching it. A
+					// deploy or a repair rewires by removing an interface and
+					// adding it back, and a submission loaded during that
+					// instant fails on its first line for a reason that has
+					// nothing to do with its author.
+					err := waitForASWiring(cmd.Context(), exec, top, s.AS)
+					if err == nil {
+						err = resetToStudentStart(cmd.Context(), exec, top, s.AS)
+					}
 					if err == nil {
 						err = applySubmission(cmd.Context(), exec, top, s)
 					}
@@ -155,8 +282,22 @@ The lab must already be deployed with --solve.`,
 						// that AS, so leaving it there would quietly move their
 						// marks. Put it back before going on.
 						note := fmt.Sprintf("loading the submission: %v", err)
-						if rerr := redeployScopes(cmd.Context(), top, token,
-							[]string{fmt.Sprintf("as%d", s.AS)}); rerr != nil {
+						// The same barrier as after a wave: putting a system
+						// back is not finished when the configuration is
+						// installed, it is finished when the routes it produces
+						// have reached the rest of the lab. This path put it
+						// back and carried straight on, so the next student was
+						// graded across a system that was still reconverging.
+						rerr := redeployScopes(cmd.Context(), top, token,
+							[]string{fmt.Sprintf("as%d", s.AS)})
+						if rerr == nil {
+							if bad := waitWaveErrs(cmd.Context(), top, exec,
+								[]submission{s}, converge); len(bad) > 0 {
+								rerr = fmt.Errorf("it did not converge afterwards: %s",
+									strings.Join(bad, "; "))
+							}
+						}
+						if rerr != nil {
 							note += fmt.Sprintf("; and AS %d could not be returned to the "+
 								"reference afterwards (%v), so this wave is suspect", s.AS, rerr)
 							contaminated = fmt.Sprintf(
@@ -166,6 +307,41 @@ The lab must already be deployed with --solve.`,
 						reports = append(reports, &grade.Report{
 							Submission: s.Group, AS: s.AS, MaxTotal: rubric.MaxTotal(),
 							Err: note, NeedsReview: true,
+						})
+						continue
+					}
+					// The assignment lets neighbouring groups agree their own
+					// peering addresses. Twinet plans them, and the other end
+					// of every session is a rendered reference expecting the
+					// planned address -- so a group that agreed something else
+					// could not bring the session up at all and lost the marks
+					// for every question that depends on it. The reference is
+					// adapted to what they actually configured, and put back
+					// after the wave.
+					ads, undo, why := adaptNeighbours(cmd.Context(), exec, top, s.AS)
+					if len(ads) > 0 {
+						adapted = append(adapted, undo)
+						for _, ad := range ads {
+							fmt.Fprintf(cmd.ErrOrStderr(),
+								"  %s: %s, so %s was given %s and a session to %s\n",
+								s.Group, ad.Because, ad.Device, ad.Added, ad.Session)
+						}
+					}
+					if len(why) > 0 {
+						// Held for review rather than marked. The session this
+						// submission is judged on cannot come up, for a reason
+						// that belongs to the grader and not to its author, and
+						// a low mark here is indistinguishable from a student
+						// who never configured the session at all.
+						fmt.Fprintf(cmd.ErrOrStderr(),
+							"  %s: held for review: a reference neighbour could not be "+
+								"adapted to this submission's peering addresses (%s)\n",
+							s.Group, strings.Join(why, "; "))
+						reports = append(reports, &grade.Report{
+							Submission: s.Group, AS: s.AS, MaxTotal: rubric.MaxTotal(),
+							NeedsReview: true,
+							Err: "a reference neighbour could not be adapted to this " +
+								"submission's peering addresses: " + strings.Join(why, "; "),
 						})
 						continue
 					}
@@ -183,10 +359,60 @@ The lab must already be deployed with --solve.`,
 				waitWave(cmd.Context(), top, exec, loaded, converge)
 
 				got := gradeWave(cmd.Context(), top, rubric, loaded, exec, converge, parallel,
-					cmd.ErrOrStderr())
-				reports = append(reports, got...)
+					classImages, cmd.ErrOrStderr())
 
-				if !keepLoaded {
+				// Checked again, after the wave rather than only before it.
+				//
+				// A wave takes about five minutes and the lease has ninety
+				// seconds left when loss is declared, so a hold lost during
+				// loading, convergence or grading would have been noticed only
+				// at the start of the next wave -- by which time the nodes had
+				// been repairing devices underneath this one for minutes, and
+				// its marks were about to be released. A submission graded
+				// while the reference solution is being written back over it
+				// looks like a good submission.
+				select {
+				case <-held.Lost:
+					contaminated = fmt.Sprintf("the nodes stopped holding this lab off "+
+						"from automatic repair while this wave was being graded: %s",
+						held.Reason())
+					reports = append(reports, quarantine(waves[i:], rubric.MaxTotal(), contaminated)...)
+				default:
+					reports = append(reports, got...)
+				}
+				if contaminated != "" {
+					break
+				}
+
+				// --keep-loaded means the *last* wave stays in the lab, which
+				// is what its description says and what investigating a
+				// disputed mark needs. It used to skip the restore after every
+				// wave, so the second submission was graded on top of the
+				// first, the third on top of both, and the marks drifted
+				// further from the truth the longer the run went on -- with
+				// nothing in the report saying which student's work each mark
+				// had actually measured.
+				// The neighbours go back to the manifest's addressing before
+				// anything else is graded against them.
+				for _, undo := range adapted {
+					if err := undo(cmd.Context()); err != nil {
+						fmt.Fprintf(cmd.ErrOrStderr(),
+							"\n  a neighbour adapted to this wave's addressing could not be "+
+								"put back (%v)\n  the remaining waves are held for review\n", err)
+						contaminated = fmt.Sprintf("a neighbour adapted to %s's addressing "+
+							"could not be put back: %v", groupNames(loaded), err)
+						reports = append(reports,
+							quarantine(waves[i+1:], rubric.MaxTotal(), contaminated)...)
+						break
+					}
+				}
+				if contaminated != "" {
+					break
+				}
+
+				lastWave := i+1 == len(waves)
+				if !keepLoaded || !lastWave {
+					restored := loaded
 					if err := restoreWave(cmd.Context(), opts, top, loaded, token); err != nil {
 						// Carrying on would grade every later wave against this
 						// wave's work and report the results as if they were
@@ -202,6 +428,34 @@ The lab must already be deployed with --solve.`,
 								quarantine(waves[i+1:], rubric.MaxTotal(), contaminated)...)
 						}
 						break
+					}
+					// Putting the reference back is not finished when the
+					// configuration is installed; it is finished when the
+					// routes it produces have reached the rest of the lab.
+					//
+					// The restore returned as soon as FRR answered, and the
+					// next wave then waited only on its own system -- so the
+					// next student was graded across a neighbour that was
+					// still reconverging, and lost marks for it. Waiting here
+					// charges that time to nobody's submission.
+					if !lastWave {
+						// The outcome matters here, unlike after loading.
+						//
+						// A submission that will not converge is a mark; a
+						// *reference* system that will not converge after being
+						// put back is the next student being measured across a
+						// neighbour that is not the answer, and their own
+						// system can look perfectly stable while it happens.
+						if bad := waitWaveErrs(cmd.Context(), top, exec, restored, converge); len(bad) > 0 {
+							contaminated = fmt.Sprintf(
+								"after putting %s back to the reference it did not converge: %s",
+								groupNames(restored), strings.Join(bad, "; "))
+							fmt.Fprintf(cmd.ErrOrStderr(), "\n  %s\n  the remaining waves are "+
+								"held for review\n", contaminated)
+							reports = append(reports,
+								quarantine(waves[i+1:], rubric.MaxTotal(), contaminated)...)
+							break
+						}
 					}
 				}
 			}
@@ -220,12 +474,22 @@ The lab must already be deployed with --solve.`,
 	cmd.Flags().StringVarP(&rubricPath, "rubric", "r", "", "rubric to grade against")
 	cmd.Flags().StringVarP(&outDir, "out", "o", "", "where to write reports")
 	cmd.Flags().StringVar(&token, "token", "", "agent token")
-	cmd.Flags().DurationVar(&converge, "converge-timeout", 4*time.Minute, "how long a convergence predicate may wait")
+	// Five minutes, from measurement rather than taste: a clean run of eight
+	// submissions on a twelve-AS lab took 4m 56s per submission end to end,
+	// nearly all of it waiting for OSPF, then BGP sessions, then the BGP table
+	// to stop changing. A budget below that turns a slow lab into a bad mark,
+	// which is the most expensive kind of wrong answer this produces.
+	cmd.Flags().DurationVar(&converge, "converge-timeout", 5*time.Minute,
+		"how long a convergence predicate may wait")
 	cmd.Flags().IntVarP(&parallel, "parallel", "p", 16, "submissions graded concurrently within a wave")
 	cmd.Flags().IntVar(&perWave, "per-wave", 1,
 		"submissions loaded into the lab at once; above 1 trades provable isolation for speed")
+	cmd.Flags().BoolVar(&skipAttest, "skip-reference-check", false,
+		"do not grade the reference solution first; only for a lab you have just checked "+
+			"by hand, since every mark depends on it being correct")
 	cmd.Flags().BoolVar(&keepLoaded, "keep-loaded", false,
-		"leave the last wave's submissions in the lab, for investigating a disputed mark")
+		"leave the final wave's submissions in the lab afterwards, for investigating a "+
+			"disputed mark; earlier waves are still put back")
 	return cmd
 }
 
@@ -340,6 +604,36 @@ func independentWaves(top *model.Topology, subs []submission) [][]submission {
 }
 
 // waitWave waits for the whole wave's control planes together.
+// waitWaveErrs waits for a wave to converge and says which systems did not.
+//
+// waitWave discards the outcome deliberately: a submission that never
+// converges is a bad mark, not an error. Putting the reference back is the
+// other case, and it needed the answer.
+func waitWaveErrs(ctx context.Context, top *model.Topology, exec execFn,
+	wave []submission, timeout time.Duration) []string {
+
+	var (
+		mu  sync.Mutex
+		bad []string
+		wg  sync.WaitGroup
+	)
+	for _, s := range wave {
+		wg.Add(1)
+		go func(s submission) {
+			defer wg.Done()
+			if err := grade.WaitConverged(ctx,
+				&grade.Env{Topology: top, AS: s.AS, Exec: exec}, timeout); err != nil {
+				mu.Lock()
+				bad = append(bad, fmt.Sprintf("AS %d: %v", s.AS, err))
+				mu.Unlock()
+			}
+		}(s)
+	}
+	wg.Wait()
+	sort.Strings(bad)
+	return bad
+}
+
 func waitWave(ctx context.Context, top *model.Topology, exec execFn,
 	wave []submission, timeout time.Duration) {
 
@@ -359,6 +653,7 @@ func waitWave(ctx context.Context, top *model.Topology, exec execFn,
 
 func gradeWave(ctx context.Context, top *model.Topology, rubric *grade.Rubric,
 	wave []submission, exec execFn, converge time.Duration, parallel int,
+	classImages map[string]string,
 	progress interface{ Write([]byte) (int, error) }) []*grade.Report {
 
 	out := make([]*grade.Report, len(wave))
@@ -378,6 +673,7 @@ func gradeWave(ctx context.Context, top *model.Topology, rubric *grade.Rubric,
 			rep.Submission = s.Group
 			rep.Lab = top.Name
 			rep.Controller = Version
+			rep.Images = classImages
 			out[i] = rep
 
 			mu.Lock()
@@ -449,4 +745,161 @@ func joinComma(v []string) string {
 		out += s
 	}
 	return out
+}
+
+// capWaves splits waves so none is larger than the operator asked for.
+//
+// The colouring decides which submissions may share a wave; this decides how
+// many actually do. They are different questions, and conflating them meant
+// --per-wave N ignored N entirely.
+func capWaves(waves [][]submission, max int) [][]submission {
+	if max <= 0 {
+		return waves
+	}
+	var out [][]submission
+	for _, w := range waves {
+		for len(w) > max {
+			out = append(out, w[:max])
+			w = w[max:]
+		}
+		if len(w) > 0 {
+			out = append(out, w)
+		}
+	}
+	return out
+}
+
+// attestReference grades the lab as it stands and refuses if it is not the
+// reference solution.
+//
+// Every mark a class run produces is a measurement of one submission against
+// the rest of the internet. If the rest of the internet is not the answer, the
+// measurement is of something else, and nothing in the reports would say so:
+// a lab deployed in platform mode has every interface, every routing process
+// and every student system blank, and the preconditions above all pass.
+func attestReference(ctx context.Context, top *model.Topology, rubric *grade.Rubric,
+	exec execFn, converge time.Duration, parallel int, manifest string) error {
+
+	var (
+		mu   sync.Mutex
+		bad  []string
+		wg   sync.WaitGroup
+		sem  = make(chan struct{}, atLeastOne(parallel))
+		seen int
+	)
+	for _, asn := range top.SortedASNs() {
+		as := top.ASes[asn]
+		if as == nil || as.Role != model.RoleStudent {
+			continue
+		}
+		seen++
+		wg.Add(1)
+		go func(asn int) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			rep := grade.Run(ctx, rubric, &grade.Env{Topology: top, AS: asn, Exec: exec},
+				grade.RunOptions{ConvergeTimeout: converge, Parallel: 4})
+
+			// Full marks is not enough on its own.
+			//
+			// A check that could not run is excluded and the remaining weights
+			// are rescaled, so a question can score full marks with half its
+			// checks errored -- and the report says so, in NeedsReview, which
+			// this ignored. An attestation that accepts a report the grader has
+			// marked untrustworthy is not an attestation.
+			var why string
+			switch {
+			case rep.Total < rubric.MaxTotal():
+				// Which check, not just the total.
+				//
+				// "AS 5 scores 9.80 of 10.00" tells an operator that something
+				// is wrong and nothing about what, so the only way to act on it
+				// was to grade the system again by hand and hope it failed the
+				// same way. The reference is expected to pass everything, so
+				// anything that did not is worth naming.
+				var short []string
+				for _, q := range rep.Questions {
+					for _, r := range q.Results {
+						if r.Status == grade.StatusPass {
+							continue
+						}
+						detail := fmt.Sprintf("%v", r.Evidence.Observed)
+						if strings.TrimSpace(detail) == "" {
+							detail = r.Err
+						}
+						short = append(short, fmt.Sprintf("%s (%s: %s)",
+							r.Check, r.Status, firstLine(detail)))
+					}
+				}
+				why = fmt.Sprintf("scores %.2f of %.2f", rep.Total, rubric.MaxTotal())
+				if len(short) > 0 {
+					why += ": " + strings.Join(truncateStrings(short, 3), "; ")
+				}
+			case rep.NeedsReview:
+				why = "scores full marks but is flagged for review"
+				if rep.Err != "" {
+					why += ": " + firstLine(rep.Err)
+				}
+			default:
+				for _, q := range rep.Questions {
+					for _, r := range q.Results {
+						if r.Status != grade.StatusPass {
+							why = fmt.Sprintf("scores full marks, but %s did not pass (%s)",
+								r.Check, r.Status)
+						}
+					}
+				}
+			}
+			if why != "" {
+				mu.Lock()
+				bad = append(bad, fmt.Sprintf("AS %d %s", asn, why))
+				mu.Unlock()
+			}
+		}(asn)
+	}
+	wg.Wait()
+
+	if seen == 0 {
+		return fmt.Errorf("this lab has no student systems to grade")
+	}
+	if len(bad) == 0 {
+		return nil
+	}
+	sort.Strings(bad)
+	return fmt.Errorf("this lab is not the reference solution, so nothing can be graded "+
+		"against it:\n  %s\nEvery mark is a measurement of one submission against the rest "+
+		"of the internet, and if the rest of it is not the answer the measurement is of "+
+		"something else -- with nothing in the reports able to say so.\nRun `twinet deploy "+
+		"-m %s --solve` and check it reported no problems. Pass --skip-reference-check only "+
+		"for a lab you have just checked by hand",
+		strings.Join(bad, "\n  "), manifest)
+}
+
+// atLeastOne keeps a concurrency limit usable when the caller passed zero.
+func atLeastOne(n int) int {
+	if n < 1 {
+		return 1
+	}
+	return n
+}
+
+// truncateStrings keeps the first n and says how many were dropped.
+func truncateStrings(in []string, n int) []string {
+	if len(in) <= n {
+		return in
+	}
+	return append(append([]string{}, in[:n]...),
+		fmt.Sprintf("and %d more", len(in)-n))
+}
+
+// widestWave reports how many submissions the largest wave holds.
+func widestWave(waves [][]submission) int {
+	n := 0
+	for _, w := range waves {
+		if len(w) > n {
+			n = len(w)
+		}
+	}
+	return n
 }

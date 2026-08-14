@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/HongyuHe/twinet/internal/model"
@@ -25,6 +26,9 @@ type frrConfig struct {
 	neighborMaps map[string]map[string]string // addr -> direction -> map name
 	// neighborAttrs records other per-neighbour settings, e.g. "route-reflector-client".
 	neighborAttrs map[string][]string
+	// localAS is the AS number the BGP process runs as, which is what tells an
+	// internal session from an external one.
+	localAS int
 }
 
 func parseFRR(cfg string) *frrConfig {
@@ -38,13 +42,22 @@ func parseFRR(cfg string) *frrConfig {
 	for _, line := range strings.Split(cfg, "\n") {
 		t := strings.TrimSpace(line)
 		fields := strings.Fields(t)
+		if len(fields) == 3 && fields[0] == "router" && fields[1] == "bgp" {
+			if n, err := strconv.Atoi(fields[2]); err == nil {
+				f.localAS = n
+			}
+		}
 		switch {
 		case len(fields) >= 3 && fields[0] == "route-map":
 			// "route-map NAME permit 10"
+			//
+			// The header is kept with the body. Without it a caller reading a
+			// map cannot tell a deny clause from a permit one, and the
+			// direction of a clause is what decides what it does: a check
+			// looking only for "match rpki invalid" gave the mark to a permit
+			// clause, which lets the very routes the question is about through.
 			currentMap = fields[1]
-			if _, ok := f.routeMaps[currentMap]; !ok {
-				f.routeMaps[currentMap] = nil
-			}
+			f.routeMaps[currentMap] = append(f.routeMaps[currentMap], t)
 			continue
 		case t == "exit" || t == "!" || t == "":
 			currentMap = ""
@@ -186,4 +199,127 @@ func runningConfigs(ctx context.Context, env *Env) (map[string]string, error) {
 			len(unreadable), len(routers), strings.Join(unreadable, "\n"))
 	}
 	return cfgs, nil
+}
+
+// asPathListLen counts the terms of a named AS-path access-list.
+//
+// A route-map that matches a list nobody defined, or one with no terms, never
+// matches anything -- and the check that only looked for the words "match
+// as-path" gave full marks for exactly that.
+func (c *frrConfig) asPathListLen(name string) int {
+	n := 0
+	for _, line := range strings.Split(c.raw, "\n") {
+		f := strings.Fields(strings.TrimSpace(line))
+		// bgp as-path access-list NAME seq N permit|deny REGEX
+		if len(f) >= 5 && f[0] == "bgp" && f[1] == "as-path" && f[2] == "access-list" && f[3] == name {
+			n++
+			continue
+		}
+		// ip as-path access-list NAME permit|deny REGEX
+		if len(f) >= 5 && f[0] == "ip" && f[1] == "as-path" && f[2] == "access-list" && f[3] == name {
+			n++
+		}
+	}
+	return n
+}
+
+// externalNeighbours lists the neighbours in another autonomous system.
+//
+// A route-map that guards against invalid origins has to be attached to the
+// sessions that bring routes in from outside; one attached to nothing, or to an
+// internal session, does not run on anything that could be invalid.
+func (f *frrConfig) externalNeighbours() []string {
+	var out []string
+	for addr, attrs := range f.neighborAttrs {
+		body := strings.Join(attrs, "\n")
+		if !strings.Contains(body, "remote-as") {
+			continue
+		}
+		// "remote-as internal" and "remote-as <own asn>" are iBGP.
+		if strings.Contains(body, "remote-as internal") {
+			continue
+		}
+		// Compared as a field, not as a substring.
+		//
+		// "remote-as 10" contains "remote-as 1", so in AS 1 every neighbour in
+		// AS 10, 100 or 140 was classified as internal -- and a check that
+		// requires every *external* session to be guarded then skipped exactly
+		// the sessions that matter.
+		if f.localAS != 0 && hasRemoteAS(body, f.localAS) {
+			continue
+		}
+		out = append(out, addr)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// denyMatches reports whether a route-map body contains a deny clause that
+// matches the given condition.
+//
+// The direction of a clause is what decides what it does. Looking only for the
+// words of the match awarded the mark to a permit clause, which lets the very
+// routes the question is about straight through.
+func denyMatches(body, condition string) bool {
+	// Route-maps are evaluated in sequence order, first match wins, and a
+	// clause with no match statements matches everything.
+	//
+	// This walked the clauses in the order they appeared and asked only
+	// whether *some* deny clause mentioned the condition. So a permit at
+	// sequence 10 that matches every route, followed by a deny at 20 that
+	// matches invalid origins, counted as protection -- when the deny is
+	// unreachable and the policy accepts everything.
+	type clause struct {
+		seq     int
+		deny    bool
+		matches []string
+	}
+	var clauses []clause
+	cur := -1
+	for _, line := range strings.Split(body, "\n") {
+		t := strings.TrimSpace(strings.ToLower(line))
+		switch {
+		case strings.HasPrefix(t, "route-map "):
+			f := strings.Fields(t)
+			seq := 0
+			if len(f) >= 4 {
+				seq, _ = strconv.Atoi(f[3])
+			}
+			clauses = append(clauses, clause{seq: seq, deny: len(f) >= 3 && f[2] == "deny"})
+			cur = len(clauses) - 1
+		case strings.HasPrefix(t, "match ") && cur >= 0:
+			clauses[cur].matches = append(clauses[cur].matches, t)
+		}
+	}
+	sort.SliceStable(clauses, func(i, j int) bool { return clauses[i].seq < clauses[j].seq })
+
+	want := strings.ToLower(condition)
+	for _, c := range clauses {
+		// A clause with no match statements matches everything, so nothing
+		// after it is ever reached.
+		if len(c.matches) == 0 {
+			return false
+		}
+		for _, m := range c.matches {
+			if strings.Contains(m, want) {
+				return c.deny
+			}
+		}
+	}
+	return false
+}
+
+// hasRemoteAS reports whether a neighbour's settings name this AS number,
+// comparing the number as a whole field.
+func hasRemoteAS(body string, asn int) bool {
+	want := strconv.Itoa(asn)
+	for _, line := range strings.Split(body, "\n") {
+		f := strings.Fields(line)
+		for i := 0; i+1 < len(f); i++ {
+			if f[i] == "remote-as" && f[i+1] == want {
+				return true
+			}
+		}
+	}
+	return false
 }

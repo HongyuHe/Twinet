@@ -32,6 +32,21 @@ func (r *recorder) exec(_ context.Context, id string, cmd []string) (rt.ExecResu
 	if cfg, ok := decodeWrittenConfig(body); ok {
 		r.conf[id] = cfg
 	}
+	// A device that is asked whether it still carries the last submission's
+	// work answers. The probe is deliberately a sequence of absence checks
+	// ending in a sentinel, so a fixture that returns nothing at all reads as
+	// "the device could not be read" -- which is correct, and not what these
+	// tests are about.
+	if strings.Contains(body, "--done") {
+		return rt.ExecResult{Stdout: "--tunnels\n--routes\n--routes6\n--addrs\n--vlans\n--done\n"}, nil
+	}
+	// The trust anchor answers too. What a system has published is part of what
+	// the reset clears, and a fixture that returned nothing would read as "the
+	// anchor could not be asked" -- which is correct behaviour, and not what
+	// these tests are about.
+	if strings.Contains(body, "/roas") {
+		return rt.ExecResult{Stdout: "[]"}, nil
+	}
 	return rt.ExecResult{}, nil
 }
 

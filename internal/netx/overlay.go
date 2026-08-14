@@ -2,6 +2,7 @@ package netx
 
 import (
 	"fmt"
+	"log/slog"
 	"net"
 	"strings"
 	"syscall"
@@ -117,8 +118,20 @@ func EnsureOverlay(spec OverlaySpec) (string, error) {
 			return "", fmt.Errorf("overlay VNI %d: %s exists but is a %s, not a vxlan",
 				spec.VNI, vxName, existing.Type())
 		}
-		// A changed remote means the peer moved to a different node; recreate.
-		if !vx.Group.Equal(remote) || int(vx.VxlanId) != int(spec.VNI) {
+		// A tunnel whose properties no longer match what the lab asks for is
+		// replaced, not adopted.
+		//
+		// Only the remote and the VNI used to be compared, so a tunnel built
+		// before the source address, the underlay device, the VTEP port or the
+		// MTU changed was kept exactly as it was. Every one of those produces a
+		// working-looking tunnel that behaves differently from the one the
+		// manifest describes: a stale source address sends encapsulated
+		// packets out of the wrong interface, and a stale MTU silently drops
+		// what the lab says will fit. The deployment reported success either
+		// way, and the difference is invisible in `docker ps`.
+		if reason := overlayDiffers(vx, spec, remote, local, vtepIdx, port, mtu); reason != "" {
+			slog.Info("replacing an overlay tunnel that no longer matches the lab",
+				"vni", spec.VNI, "device", vxName, "reason", reason)
 			if err := netlink.LinkDel(existing); err != nil {
 				return "", fmt.Errorf("overlay VNI %d: replace stale tunnel: %w", spec.VNI, err)
 			}
@@ -168,6 +181,29 @@ func EnsureOverlay(spec OverlaySpec) (string, error) {
 		return "", err
 	}
 	return brName, nil
+}
+
+// overlayDiffers names the first property of an existing tunnel that does not
+// match what the lab asks for, or "" if it can be kept.
+func overlayDiffers(vx *netlink.Vxlan, spec OverlaySpec, remote, local net.IP,
+	vtepIdx, port, mtu int) string {
+
+	switch {
+	case int(vx.VxlanId) != int(spec.VNI):
+		return fmt.Sprintf("it carries VNI %d, not %d", vx.VxlanId, spec.VNI)
+	case !vx.Group.Equal(remote):
+		return fmt.Sprintf("its remote is %s, not %s", vx.Group, remote)
+	case local != nil && !vx.SrcAddr.Equal(local):
+		return fmt.Sprintf("it is sourced from %s, not %s", vx.SrcAddr, local)
+	case vtepIdx != 0 && vx.VtepDevIndex != vtepIdx:
+		return fmt.Sprintf("it is sourced from interface index %d, not %d",
+			vx.VtepDevIndex, vtepIdx)
+	case port != 0 && vx.Port != port:
+		return fmt.Sprintf("its VTEP port is %d, not %d", vx.Port, port)
+	case mtu != 0 && vx.Attrs().MTU != mtu:
+		return fmt.Sprintf("its MTU is %d, not %d", vx.Attrs().MTU, mtu)
+	}
+	return ""
 }
 
 // reconcileDefaultFDB makes sure the tunnel has exactly one default forwarding
@@ -434,7 +470,12 @@ func overlayOwner(vxName string) (string, bool, error) {
 		if _, ok := err.(netlink.LinkNotFoundError); ok {
 			return "", false, nil
 		}
-		return "", false, nil
+		// Anything else is reported. Returning "there is no overlay" for a
+		// lookup that failed for some other reason turns a transient error
+		// into permission to take an identifier another lab is using, and
+		// joining two labs' traffic together is not a failure anybody
+		// diagnoses quickly.
+		return "", false, fmt.Errorf("look up %s: %w", vxName, err)
 	}
 	return ownerFromAlias(l.Attrs().Alias), true, nil
 }

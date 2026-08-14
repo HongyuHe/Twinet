@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -12,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -23,6 +25,7 @@ import (
 	"github.com/HongyuHe/twinet/internal/model"
 	"github.com/HongyuHe/twinet/internal/render"
 	rt "github.com/HongyuHe/twinet/internal/runtime"
+	"github.com/HongyuHe/twinet/internal/svc"
 )
 
 // submission is one student group's work, on disk.
@@ -35,6 +38,13 @@ type submission struct {
 	// worth reporting rather than ignoring: silently dropping it would mark
 	// the student on an empty router and tell them their routing is wrong.
 	Files map[string]string
+	// ROAs is what this system had authorised at the lab's trust anchor.
+	//
+	// Publishing is a student action rather than a line of configuration, so
+	// it appears in no running-config. Without it, a re-mark in a private
+	// harness -- whose trust anchor starts empty -- loses the mark for the
+	// question about publishing, for a group that published correctly.
+	ROAs []byte
 	// Scripts maps a device's short name to a shell script run inside it.
 	//
 	// Not everything a student configures is FRR. VLANs live in the switch,
@@ -51,6 +61,7 @@ func newGradeBatchCmd(opts *Options) *cobra.Command {
 		outDir     string
 		parallel   int
 		depth      int
+		reduce     bool
 		keepHosts  bool
 		keepLabs   bool
 		token      string
@@ -78,7 +89,11 @@ mark, unless --keep-labs is given for a dispute.`,
 				return err
 			}
 			if rubricPath == "" {
-				rubricPath = filepath.Join(class.Lab.Dir, "rubric", "cos461.yaml")
+				p, err := defaultRubric(class.Lab.Dir)
+				if err != nil {
+					return err
+				}
+				rubricPath = p
 			}
 			rubric, err := grade.LoadRubric(rubricPath)
 			if err != nil {
@@ -124,7 +139,7 @@ mark, unless --keep-labs is given for a dispute.`,
 					defer func() { <-sem }()
 
 					rep := gradeOne(cmd.Context(), class, rubric, s, batchOpts{
-						token: tok, depth: depth, keepHosts: keepHosts,
+						token: tok, depth: depth, keepHosts: keepHosts, reduce: reduce,
 						keepLab: keepLabs, converge: converge, settle: settle,
 						outDir: outDir,
 					})
@@ -146,7 +161,20 @@ mark, unless --keep-labs is given for a dispute.`,
 			fmt.Fprintln(cmd.OutOrStdout())
 			fmt.Fprint(cmd.OutOrStdout(), summary.Text())
 			fmt.Fprintf(cmd.OutOrStdout(), "\nreports written to %s\n", outDir)
-			return releaseGuard(summary, cmd.ErrOrStderr())
+			if err := releaseGuard(summary, cmd.ErrOrStderr()); err != nil {
+				return err
+			}
+			// A harness left behind keeps its containers and its overlay
+			// identifiers. At class scale a handful of those exhaust the
+			// cluster, and every later submission then fails for reasons that
+			// have nothing to do with its author -- so this cannot exit zero.
+			if TeardownFailed() {
+				return fmt.Errorf("the marks are written, but at least one grading harness " +
+					"could not be removed and is still using this cluster's containers and " +
+					"network identifiers; the failures are named above. Remove them with " +
+					"`twinet destroy --lab <name>` before the next run")
+			}
+			return nil
 		},
 	}
 	cmd.Flags().StringVarP(&subDir, "submissions", "s", "submissions", "directory of per-group submissions")
@@ -154,6 +182,8 @@ mark, unless --keep-labs is given for a dispute.`,
 	cmd.Flags().StringVarP(&outDir, "out", "o", "", "where to write reports")
 	cmd.Flags().IntVarP(&parallel, "parallel", "p", 8, "harnesses deployed concurrently")
 	cmd.Flags().IntVar(&depth, "depth", 0, "AS hops of neighbourhood to keep; 0 keeps the whole topology")
+	cmd.Flags().BoolVar(&reduce, "reduce", false,
+		"keep every autonomous system but only the routers of each that face the target")
 	cmd.Flags().BoolVar(&keepHosts, "keep-hosts", true, "keep one host per neighbour, for end-to-end checks")
 	cmd.Flags().BoolVar(&keepLabs, "keep-labs", false, "do not destroy harnesses, for investigating a disputed mark")
 	cmd.Flags().StringVar(&token, "token", "", "agent token (or TWINET_TOKEN)")
@@ -168,6 +198,7 @@ mark, unless --keep-labs is given for a dispute.`,
 type batchOpts struct {
 	token     string
 	depth     int
+	reduce    bool
 	keepHosts bool
 	keepLab   bool
 	converge  time.Duration
@@ -195,7 +226,7 @@ func gradeOne(ctx context.Context, class *model.Topology, rubric *grade.Rubric,
 	}
 
 	h, err := harness.Slice(class, s.AS, harness.Options{
-		Depth: o.depth, KeepHosts: o.keepHosts, Suffix: s.Group,
+		Depth: o.depth, KeepHosts: o.keepHosts, Reduce: o.reduce, Suffix: s.Group,
 	})
 	if err != nil {
 		return fail("building the harness", err)
@@ -218,8 +249,35 @@ func gradeOne(ctx context.Context, class *model.Topology, rubric *grade.Rubric,
 		// consumes the cluster that the rest of the class is waiting for.
 		tctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Minute)
 		defer cancel()
-		_ = destroyLab(tctx, c, h)
+		if err := destroyLab(tctx, c, h); err != nil {
+			teardownFailed.Store(true)
+			// Reported, not discarded. A harness that fails to come down keeps
+			// its containers and its overlay identifiers, and at class scale a
+			// handful of those exhaust the cluster -- after which every later
+			// submission fails for reasons that have nothing to do with its
+			// author. Four abandoned labs and 351 leftover overlay devices
+			// were found on this cluster, and nothing had ever said so.
+			slog.Error("a grading harness could not be removed; it is still using this "+
+				"cluster's containers and network identifiers, and must be removed by hand "+
+				"with `twinet destroy --lab <name>` before the next class-scale run",
+				"lab", h.Name, "submission", s.Group, "err", err)
+		}
 	}()
+
+	// A harness of this name may already exist, and if it does it is not
+	// empty.
+	//
+	// The name is a function of the lab, the AS and the group, so a regrade
+	// gets the same one -- and after --keep-labs or a teardown that failed,
+	// the containers from the previous attempt are still running with the
+	// previous submission's configuration on them. Applies are not
+	// authoritative on a node agent: they add what the plan says and leave
+	// what it does not mention, so a route, a tunnel, a ROA or a route-map
+	// from the last attempt survives into this one and the group is marked
+	// for work it did not submit this time.
+	if err := clearStaleHarness(ctx, c, h); err != nil {
+		return fail("clearing the previous attempt's harness", err)
+	}
 
 	if err := deployQuiet(ctx, c, h, s.AS); err != nil {
 		return fail("deploying the harness", err)
@@ -231,6 +289,41 @@ func gradeOne(ctx context.Context, class *model.Topology, rubric *grade.Rubric,
 	}
 	if err := applySubmission(ctx, exec, h, s); err != nil {
 		return fail("loading the submission", err)
+	}
+
+	// The reference side of every inter-AS link is moved to whatever addresses
+	// this group actually configured.
+	//
+	// The assignment lets a group pick its own peering addresses, and only
+	// class grading did this: a group that used its own /30 kept the reference
+	// on the planned address, so the session never came up and it lost the eBGP
+	// and policy marks for an answer the assignment explicitly permits --
+	// exactly the marks `grade batch` exists to award fairly.
+	ads, undoAdapt, why := adaptNeighbours(ctx, exec, h, s.AS)
+	if o.keepLab && len(ads) > 0 {
+		// Only matters when the lab outlives the run; otherwise the harness
+		// goes away and takes the adaptation with it.
+		defer func() {
+			uctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
+			defer cancel()
+			if err := undoAdapt(uctx); err != nil {
+				slog.Error("a peering adaptation could not be undone in a kept harness",
+					"lab", h.Name, "err", err)
+			}
+		}()
+	}
+	for _, ad := range ads {
+		slog.Info("adapted a reference peer to the submission's addressing",
+			"submission", s.Group, "why", ad.Because, "device", ad.Device,
+			"address", ad.Added, "session", ad.Session)
+	}
+	if len(why) > 0 {
+		// Not a mark. A reference peer that could not be moved means the
+		// session under test cannot come up for a reason that is the grader's,
+		// not the student's, and a zero here would be indistinguishable from a
+		// student who never configured it.
+		return fail("adapting the reference to this submission's peering addresses",
+			fmt.Errorf("%s", strings.Join(why, "; ")))
 	}
 	if o.settle > 0 {
 		// An explicit fixed wait, for the rare case where someone needs one.
@@ -267,6 +360,21 @@ func gradeOne(ctx context.Context, class *model.Topology, rubric *grade.Rubric,
 	rep.Images = imageDigests(ctx, c, h)
 	rep.Controller = Version
 
+	// Nodes that disagree about what an image is means this mark was produced
+	// by whichever build happened to be on whichever node this AS landed on.
+	// Recording that in the provenance and releasing the mark anyway is the
+	// worst of both: the evidence is there and nobody is told to look at it.
+	for ref, id := range rep.Images {
+		if !strings.HasPrefix(id, "DISAGREEMENT") {
+			continue
+		}
+		rep.NeedsReview = true
+		rep.Err = appendNote(rep.Err, fmt.Sprintf(
+			"the nodes of this cluster do not agree on what %s is (%s), so this mark was "+
+				"produced by whichever build was on whichever node this system was placed "+
+				"on; make the images match and grade again", ref, strings.TrimPrefix(id, "DISAGREEMENT: ")))
+	}
+
 	// A reduced harness can fail a correct submission for a reason the student
 	// cannot see: a check that names a peer, or a route from a particular
 	// origin, cannot pass if that AS was sliced away. The mark is still
@@ -282,7 +390,15 @@ func gradeOne(ctx context.Context, class *model.Topology, rubric *grade.Rubric,
 	return rep
 }
 
-// imageDigests resolves every image the lab uses to the digest in use.
+// imageDigests resolves every image the lab uses to the digest in use, for the
+// provenance recorded beside a mark.
+//
+// It used to take the first node that answered and stop. Nodes drift, and when
+// they do a student's routers run whichever build landed on whichever node
+// their AS was placed on -- so the report stated one image identity for marks
+// produced by two. An image the nodes do not agree on is recorded as exactly
+// that, because a provenance line that quietly names one of two builds is worse
+// than one that says the question has no single answer.
 func imageDigests(ctx context.Context, c *client.Cluster, top *model.Topology) map[string]string {
 	seen := map[string]bool{}
 	var refs []string
@@ -293,12 +409,43 @@ func imageDigests(ctx context.Context, c *client.Cluster, top *model.Topology) m
 		}
 	}
 	sort.Strings(refs)
+
+	byRef := map[string]map[string]string{}
 	for _, n := range c.Nodes {
-		if got, err := n.ImageDigests(ctx, refs); err == nil && len(got) > 0 {
-			return got
+		got, err := n.ImageDigests(ctx, refs)
+		if err != nil {
+			continue
+		}
+		for ref, id := range got {
+			if id == "" {
+				continue
+			}
+			if byRef[ref] == nil {
+				byRef[ref] = map[string]string{}
+			}
+			byRef[ref][n.Name] = id
 		}
 	}
-	return nil
+
+	out := map[string]string{}
+	for ref, perNode := range byRef {
+		nodes := sortedKeysOf(perNode)
+		first := perNode[nodes[0]]
+		agreed := true
+		var parts []string
+		for _, n := range nodes {
+			parts = append(parts, fmt.Sprintf("%s on %s", shortID(perNode[n]), n))
+			if perNode[n] != first {
+				agreed = false
+			}
+		}
+		if agreed {
+			out[ref] = first
+			continue
+		}
+		out[ref] = "DISAGREEMENT: " + strings.Join(parts, "; ")
+	}
+	return out
 }
 
 // missingASes reports which ASes of the class topology a harness left out.
@@ -411,6 +558,14 @@ func applySubmission(ctx context.Context, exec execFn, h *model.Topology, s subm
 		}
 	}
 
+	// What the group authorised at the trust anchor, replayed before anything
+	// is measured so the routes it makes valid are valid while they converge.
+	if len(s.ROAs) > 0 {
+		if err := replayROAs(ctx, exec, h, as, s.ROAs); err != nil {
+			return err
+		}
+	}
+
 	// Scripts run after the routing configuration, because a tunnel or a host
 	// route may depend on an address the configuration has just brought up.
 	names = names[:0]
@@ -481,19 +636,79 @@ func loadFRRConfig(ctx context.Context, exec execFn, d *model.Device, body strin
 	}
 
 	// A daemon that rejected the file exits, and FRR's own start script does
-	// not fail when that happens. Asking vtysh which daemons answered is the
-	// only reliable signal, and it is also the feedback the student needs.
-	res, err = exec(ctx, d.ID, []string{"sh", "-c",
-		"sleep 2; vtysh -c 'show version' >/dev/null 2>&1 && vtysh -c 'show running-config' | head -1"})
-	if err != nil {
-		return fmt.Errorf("checking that frr came up: %w", err)
+	// not fail when that happens, so the daemons have to be counted.
+	//
+	// This used to ask `vtysh -c "show version"`, which answers as long as any
+	// one daemon is up. A submission whose OSPF configuration was rejected
+	// therefore loaded successfully with ospfd dead, and was then marked on a
+	// network in which its routers could not learn a route -- against a lab
+	// that looked healthy. Every process the daemons file enables is now
+	// checked by name.
+	// Polled rather than slept on.
+	//
+	// A fixed two-second wait is a guess about how long FRR takes to bind, and
+	// on a node running two hundred containers it is sometimes wrong -- so a
+	// perfectly good submission was quarantined for being slow. Waiting for the
+	// answer instead is both faster in the common case and correct in the rare
+	// one; the deadline is what keeps a genuinely rejected configuration from
+	// hanging the run.
+	probe := "for d in " + strings.Join(render.EnabledDaemons(), " ") +
+		"; do pidof \"$d\" >/dev/null 2>&1 || printf '%s ' \"$d\"; done"
+	deadline := time.Now().Add(frrStartWait)
+	var down []string
+	for {
+		res, err = exec(ctx, d.ID, []string{"sh", "-c", probe})
+		if err != nil {
+			return fmt.Errorf("checking that frr came up: %w", err)
+		}
+		down = strings.Fields(res.Stdout)
+		if len(down) == 0 {
+			// Loading a submission restarts FRR, so its sessions come up while
+			// the validator is still reconnecting -- and a route that arrives
+			// before the ROAs is filtered as if there were none. FRR records
+			// the validation state afterwards but does not re-run the policy,
+			// so a submission that rejects invalid announcements perfectly
+			// still ends up carrying the lab's hijack. The refresh is what
+			// makes the answer visible; it runs in the background because it
+			// waits on a service, and the convergence barrier that follows is
+			// far longer than it needs.
+			refreshRPKIInBackground(ctx, exec, d)
+			return nil
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
 	}
-	if res.ExitCode != 0 {
-		return fmt.Errorf("frr did not come up on the submitted configuration: %s",
-			firstLine(res.Stdout+res.Stderr))
-	}
-	return nil
+	return fmt.Errorf("frr did not come up on the submitted configuration within %s: %s "+
+		"%s not running, which usually means %s rejected a line of it",
+		frrStartWait, strings.Join(down, ", "),
+		map[bool]string{true: "is", false: "are"}[len(down) == 1],
+		map[bool]string{true: "it", false: "they"}[len(down) == 1])
 }
+
+// refreshRPKIInBackground re-runs inbound policy once the validator answers.
+func refreshRPKIInBackground(ctx context.Context, exec execFn, d *model.Device) {
+	if d.Kind != model.KindRouter {
+		return
+	}
+	// Detached from this exec: the wait is for another container's service, and
+	// nothing here should hold a grading run open for it. A router with no
+	// validator configured leaves the loop on its own.
+	script := "(" + render.RPKIRefreshScript + ") >/dev/null 2>&1 &"
+	if _, err := exec(ctx, d.ID, []string{"sh", "-c", script}); err != nil {
+		slog.Debug("could not start the origin-validation refresh", "device", d.ID, "err", err)
+	}
+}
+
+// frrStartWait bounds how long a submission's routing daemons are given to
+// bind. Long enough for a loaded node, short enough that a rejected
+// configuration is reported rather than waited on.
+var frrStartWait = 30 * time.Second
 
 // submissionFromArchive reads a submission out of a `twinet save` archive.
 //
@@ -528,6 +743,8 @@ func submissionFromArchive(p string, class *model.Topology) (submission, error) 
 	}
 	for name, body := range files {
 		switch {
+		case name == "roas.json":
+			sub.ROAs = body
 		case strings.HasSuffix(name, ".conf"):
 			sub.Files[strings.TrimSuffix(name, ".conf")] = string(body)
 		case strings.HasSuffix(name, ".sh"):
@@ -566,7 +783,23 @@ func applyDeviceScript(ctx context.Context, exec execFn, d *model.Device, body s
 		`  case "$c" in ''|\#*) continue;; esac`,
 		"  opt=0",
 		`  case "$c" in -*) opt=1; c=${c#-};; esac`,
-		`  if ! err=$($c 2>&1 >/dev/null); then`,
+		// Run through a shell, because the syntax the checker accepts is
+		// shell syntax.
+		//
+		// The line used to be run as a bare `$c`, which word-splits and globs
+		// but does not act on operators. So `ip link show tun6 >/dev/null 2>&1
+		// || ip tunnel add ...` -- the ordinary guarded form, which the checker
+		// accepts and which the reference answer itself uses -- ran ip(8) with
+		// ">/dev/null", "2>&1" and "||" as arguments, failed, and was reported
+		// to the student as their mistake. And `true && ip ...` silently ran
+		// nothing but `true`, so the configuration was never installed and the
+		// submission was marked on a device where nothing had happened.
+		//
+		// Nothing new gets in: every word of every fragment has already been
+		// checked against the allowlist, and substitution is refused outright,
+		// so there is no way for a shell to turn this text into a command the
+		// checker did not see.
+		`  if ! err=$(sh -c "$c" 2>&1 >/dev/null); then`,
 		`    if [ "$opt" = 0 ]; then`,
 		`      echo "$c: $err" >&2`,
 		"      rc=1",
@@ -623,6 +856,55 @@ func resetToStudentStart(ctx context.Context, exec execFn, top *model.Topology, 
 			return fmt.Errorf("%s: restoring the starting configuration: %w", d.ID, err)
 		}
 	}
+	// What this system published at the trust anchor is part of what it did,
+	// so it is part of what the reset removes.
+	//
+	// It was not, and publishing is not a line of configuration that wiping a
+	// device takes away: the previous occupant's authorisation -- the
+	// reference's, on the first submission of a run -- stayed at the anchor,
+	// and a submission that never published one inherited it and scored the
+	// mark for it.
+	return withdrawROAs(ctx, exec, top, as)
+}
+
+// withdrawROAs removes every authorisation this system holds at the trust
+// anchor, and confirms none is left.
+func withdrawROAs(ctx context.Context, exec execFn, top *model.Topology, as *model.AS) error {
+	addr := svc.RPKIAddrFor(top, as.ASN)
+	if addr == "" || len(as.Routers) == 0 {
+		return nil
+	}
+	r := rpkiFacingRouter(as)
+	held, err := publishedROAs(ctx, exec, top, as)
+	if err != nil {
+		// Unreadable is not empty. Carrying on would grade the next submission
+		// against whatever is still published, with nothing saying so.
+		return fmt.Errorf("AS %d: what it has published could not be read (%w), so it "+
+			"cannot be cleared before the next submission", as.ASN, err)
+	}
+	for _, v := range held {
+		body := fmt.Sprintf(`{"prefix":%q,"asn":%d,"withdraw":true}`, v.Prefix, v.ASN)
+		res, err := exec(ctx, r.ID, []string{"sh", "-c", fmt.Sprintf(
+			"curl -sf -m 5 -X POST http://%s%s/roas -d %s", addr, svc.PublishListen,
+			shellQuote(body))})
+		if err != nil {
+			return fmt.Errorf("AS %d: withdrawing %s: %w", as.ASN, v.Prefix, err)
+		}
+		if res.ExitCode != 0 {
+			return fmt.Errorf("AS %d: withdrawing %s: the trust anchor refused: %s",
+				as.ASN, v.Prefix, firstLine(res.Stderr+res.Stdout))
+		}
+	}
+	// Read back, because a withdrawal that quietly failed leaves the next
+	// submission holding somebody else's answer.
+	left, err := publishedROAs(ctx, exec, top, as)
+	if err != nil {
+		return fmt.Errorf("AS %d: what it has published could not be re-read: %w", as.ASN, err)
+	}
+	if len(left) > 0 {
+		return fmt.Errorf("AS %d still has %d authorisation(s) at the trust anchor after "+
+			"being cleared", as.ASN, len(left))
+	}
 	return nil
 }
 
@@ -645,22 +927,36 @@ func wipeDeviceState(ctx context.Context, exec execFn, d *model.Device) error {
 			`for b in $(ovs-vsctl list-br 2>/dev/null); do ` +
 			`for p in $(ovs-vsctl list-ports "$b" 2>/dev/null); do ` +
 			`ovs-vsctl clear port "$p" tag 2>/dev/null; ` +
-			`ovs-vsctl clear port "$p" trunks 2>/dev/null; done; done; fi`,
+			`ovs-vsctl clear port "$p" trunks 2>/dev/null; ` +
+			// vlan_mode is part of the answer too, and clearing the other two
+			// without it leaves the reference's trunk ports behind. In Open
+			// vSwitch a trunk port with no trunks list carries every VLAN, so
+			// a student who configured nothing inherited a working answer.
+			`ovs-vsctl clear port "$p" vlan_mode 2>/dev/null; done; done; fi`,
 	}
 	// Addresses are flushed per interface and the planned ones put back, rather
 	// than flushed wholesale: in the state a student starts from, the platform
 	// has already addressed the interfaces it owns, and a deployment is what
 	// puts those back. Doing it here means the reset does not depend on one.
 	for _, i := range d.Ifaces {
-		if i.Name == "" || i.Name == "lo" {
+		if i.Name == "" {
 			continue
 		}
+		// The loopback is included.
+		//
+		// It was skipped, and a restart of FRR does not flush kernel
+		// addresses, so every submission inherited the previous one's loopback
+		// -- and the reference's, on the first run. That is marks for
+		// addressing nobody did, and an OSPF and iBGP fabric that comes up
+		// because the addresses the student was asked to configure are already
+		// there. Flushing global scope leaves 127.0.0.1, which is link-local
+		// to the host and not anybody's answer.
 		lines = append(lines, fmt.Sprintf("ip addr flush dev %s scope global 2>/dev/null", i.Name))
 		if i.Owner != model.OwnerPlatform {
 			continue
 		}
 		if i.Addr4 != "" {
-			lines = append(lines, fmt.Sprintf("ip addr replace %s dev %s 2>/dev/null", i.Addr4, i.Name))
+			lines = append(lines, fmt.Sprintf("ip addr replace %s brd + dev %s 2>/dev/null", i.Addr4, i.Name))
 		}
 		if i.Addr6 != "" {
 			lines = append(lines, fmt.Sprintf("ip -6 addr replace %s dev %s 2>/dev/null", i.Addr6, i.Name))
@@ -675,7 +971,122 @@ func wipeDeviceState(ctx context.Context, exec execFn, d *model.Device) error {
 		return fmt.Errorf("%s: clearing the previous submission: %s",
 			d.ID, firstLine(res.Stderr+res.Stdout))
 	}
-	return nil
+	// The script above suppresses every individual error and ends with
+	// `exit 0`, deliberately: a route that another line already removed, or an
+	// interface a student never addressed, must not stop the reset. But that
+	// makes its exit status worthless as evidence, and the thing it is evidence
+	// *for* is that the next student is being graded on their own work rather
+	// than on the last one's.
+	//
+	// So the device is read back. Anything the reset was supposed to remove and
+	// did not is reported, by name, and grading stops rather than marking
+	// somebody against a system still carrying somebody else's tunnels.
+	return verifyWiped(ctx, exec, d)
+}
+
+// verifyWiped reads a device back and reports what the reset failed to remove.
+//
+// Every section ends in a sentinel rather than in the exit status of a
+// pipeline. The first version of this ended with a `grep` for stale routes, and
+// grep exits 1 when it finds nothing -- which is the desired state. So a device
+// that had been reset perfectly reported "the reset could not be checked", and
+// a class run quarantined all eight submissions. Absence is the answer here,
+// and an absence probe must not signal failure by finding nothing.
+//
+// The sentinel is what distinguishes "nothing left" from "the probe never
+// ran": if the last line is missing, the device could not be read, and that is
+// reported as its own condition rather than as a clean device.
+func verifyWiped(ctx context.Context, exec execFn, d *model.Device) error {
+	var b strings.Builder
+	b.WriteString("echo '--tunnels'\n")
+	b.WriteString("ip -d tunnel show 2>/dev/null | grep -v '^sit0:' | cut -d: -f1 || true\n")
+	b.WriteString("echo '--routes'\n")
+	b.WriteString(`ip -o -4 route show 2>/dev/null | grep -v " proto " || true` + "\n")
+	b.WriteString("echo '--routes6'\n")
+	b.WriteString(`ip -o -6 route show 2>/dev/null | grep -v " proto " | grep -v "^fe80" || true` + "\n")
+	// The addresses the platform owns are put back by the reset, and a
+	// submission can leave others behind. Both were cleared with errors
+	// suppressed, so neither was ever confirmed.
+	b.WriteString("echo '--addrs'\n")
+	for _, i := range d.Ifaces {
+		if i.Name == "" {
+			continue
+		}
+		fmt.Fprintf(&b, "ip -o -4 addr show dev %s 2>/dev/null | "+
+			`awk '{print "%s " $4}' || true`+"\n", i.Name, i.Name)
+	}
+	// A switch's VLAN assignments are a submitted answer too, and clearing them
+	// was equally unchecked.
+	b.WriteString("echo '--vlans'\n")
+	b.WriteString("if command -v ovs-vsctl >/dev/null 2>&1; then " +
+		"for br in $(ovs-vsctl list-br 2>/dev/null); do " +
+		"for p in $(ovs-vsctl list-ports \"$br\" 2>/dev/null); do " +
+		"t=$(ovs-vsctl get port \"$p\" tag 2>/dev/null | tr -d '[]\" '); " +
+		"k=$(ovs-vsctl get port \"$p\" trunks 2>/dev/null | tr -d '[]\" '); " +
+		"m=$(ovs-vsctl get port \"$p\" vlan_mode 2>/dev/null | tr -d '[]\" '); " +
+		"[ -n \"$t\" ] && [ \"$t\" != '[]' ] && echo \"$p tag=$t\"; " +
+		"[ -n \"$k\" ] && [ \"$k\" != '[]' ] && echo \"$p trunks=$k\"; " +
+		"[ -n \"$m\" ] && [ \"$m\" != '[]' ] && echo \"$p vlan_mode=$m\"; " +
+		"done; done; fi || true\n")
+	b.WriteString("echo '--done'\n")
+	b.WriteString("exit 0\n")
+
+	res, err := exec(ctx, d.ID, []string{"sh", "-c", b.String()})
+	if err != nil {
+		return fmt.Errorf("%s: checking that the previous submission was cleared: %w", d.ID, err)
+	}
+	if !strings.Contains(res.Stdout, "--done") {
+		return fmt.Errorf("%s: checking that the previous submission was cleared did not "+
+			"finish (exit %d): %s", d.ID, res.ExitCode, firstLine(res.Stderr+res.Stdout))
+	}
+
+	// What the platform's own addressing should be, so an address that belongs
+	// there is not reported as somebody's leftover.
+	want := map[string]bool{}
+	for _, i := range d.Ifaces {
+		if i.Owner == model.OwnerPlatform && i.Addr4 != "" {
+			want[i.Name+" "+i.Addr4] = true
+		}
+	}
+
+	var left []string
+	section := ""
+	for _, line := range strings.Split(res.Stdout, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "--") {
+			section = strings.TrimPrefix(line, "--")
+			continue
+		}
+		switch section {
+		case "tunnels":
+			left = append(left, "tunnel "+line)
+		case "routes", "routes6":
+			left = append(left, "route "+line)
+		case "addrs":
+			if strings.HasSuffix(line, " 127.0.0.1/8") {
+				// The kernel's own, on every device, always.
+				continue
+			}
+			if !want[line] {
+				left = append(left, "address "+line)
+			}
+		case "vlans":
+			left = append(left, "vlan "+line)
+		}
+	}
+	if len(left) == 0 {
+		return nil
+	}
+	sort.Strings(left)
+	if len(left) > 6 {
+		left = append(left[:6], fmt.Sprintf("... and %d more", len(left)-6))
+	}
+	return fmt.Errorf("%s still carries the previous submission's work after being reset "+
+		"(%s). Grading the next submission here would mark it on somebody else's "+
+		"configuration", d.ID, strings.Join(left, "; "))
 }
 
 // scriptCommands are the commands a submitted script may use.
@@ -832,12 +1243,17 @@ func readSubmissions(dir string, class *model.Topology) ([]submission, error) {
 				continue
 			}
 			ext := filepath.Ext(f.Name())
-			if ext != ".conf" && ext != ".cfg" && ext != ".txt" && ext != ".sh" {
+			if ext != ".conf" && ext != ".cfg" && ext != ".txt" && ext != ".sh" &&
+				f.Name() != "roas.json" {
 				continue
 			}
 			raw, err := os.ReadFile(filepath.Join(sub.Dir, f.Name()))
 			if err != nil {
 				return nil, err
+			}
+			if f.Name() == "roas.json" {
+				sub.ROAs = raw
+				continue
 			}
 			base := strings.TrimSuffix(f.Name(), ext)
 			if ext == ".sh" {
@@ -852,10 +1268,377 @@ func readSubmissions(dir string, class *model.Topology) ([]submission, error) {
 		subs = append(subs, sub)
 	}
 	sort.Slice(subs, func(i, j int) bool { return subs[i].Group < subs[j].Group })
+	if err := refuseDuplicates(subs); err != nil {
+		return nil, err
+	}
 	return subs, nil
+}
+
+// refuseDuplicates rejects a submission set in which two entries claim the same
+// group or the same autonomous system.
+//
+// Both were accepted, and both lost work silently. Two archives for one group
+// wrote their reports to the same filename, so whichever was graded second
+// overwrote the first and nothing said which had survived. Two submissions for
+// one AS were silently dropped down to one by the wave planner, and in batch
+// mode were given the same harness name and could be deployed into the same
+// lab at once.
+//
+// There is no correct guess available here. "Latest wins" is a policy about
+// late submissions that belongs to a course, not to a grader, and picking one
+// silently is how a student is marked on an attempt they did not intend to
+// hand in. So it stops, names both, and lets a person decide.
+func refuseDuplicates(subs []submission) error {
+	byGroup := map[string][]string{}
+	byAS := map[int][]string{}
+	for _, s := range subs {
+		key := strings.ToLower(s.Group)
+		byGroup[key] = append(byGroup[key], s.Group)
+		byAS[s.AS] = append(byAS[s.AS], s.Group)
+	}
+
+	var problems []string
+	for g, all := range byGroup {
+		if len(all) > 1 {
+			problems = append(problems, fmt.Sprintf(
+				"%d submissions claim to be group %q", len(all), g))
+		}
+	}
+	for as, groups := range byAS {
+		if len(groups) > 1 {
+			sort.Strings(groups)
+			problems = append(problems, fmt.Sprintf(
+				"AS %d is claimed by %s", as, strings.Join(groups, ", ")))
+		}
+	}
+	if len(problems) == 0 {
+		return nil
+	}
+	sort.Strings(problems)
+	return fmt.Errorf("this set of submissions is ambiguous, so nothing was graded:\n  %s\n"+
+		"Two submissions for one system cannot both be graded against the same lab, and "+
+		"choosing between them is a decision about late work that belongs to whoever "+
+		"runs the course. Remove or rename the ones that should not count",
+		strings.Join(problems, "\n  "))
 }
 
 // execFn runs a command inside a device of a harness. It matches the shape the
 // grading engine expects, so a harness and the shared lab are graded by exactly
 // the same code path.
 type execFn = func(ctx context.Context, deviceID string, cmd []string) (rt.ExecResult, error)
+
+// unhealthyRouters names the routers that are not running the routing
+// processes the lab gave them, with what each is missing.
+//
+// It is the precondition for grading anybody. A router with no ospfd has no
+// symptom of its own: it simply stops answering, and what shows up is its
+// *neighbours* failing to converge -- so the marks land on students whose work
+// is correct, naming an autonomous system that is not the one at fault. That
+// has happened three times during development, and each time it cost hours,
+// because every configuration involved was right.
+//
+// Checking 212 routers costs a few seconds. Grading a class against a broken
+// lab costs an hour and produces marks that have to be thrown away.
+func unhealthyRouters(ctx context.Context, exec execFn, top *model.Topology) []string {
+	var (
+		mu  sync.Mutex
+		bad []string
+		wg  sync.WaitGroup
+	)
+	sem := make(chan struct{}, 32)
+	script := "miss=''; for p in " + strings.Join(render.EnabledDaemons(), " ") +
+		"; do pidof \"$p\" >/dev/null 2>&1 || miss=\"$miss $p\"; done; echo \"$miss\""
+	for _, d := range top.SortedDevices() {
+		if d.Kind != model.KindRouter {
+			continue
+		}
+		wg.Add(1)
+		go func(d *model.Device) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			res, err := exec(ctx, d.ID, []string{"sh", "-c", script})
+			if err != nil || res.ExitCode != 0 {
+				// A router that cannot be read is not a router that is well.
+				// This used to return quietly, so a stopped container, an
+				// unreachable node or a failing exec all counted as healthy and
+				// the class was graded against them -- the students who lost
+				// marks were the neighbours of whatever could not be seen.
+				//
+				// It is reported as its own condition rather than as a dead
+				// daemon, so nobody is sent to look in the wrong place.
+				detail := "could not be read"
+				if err != nil {
+					detail = fmt.Sprintf("could not be read: %v", err)
+				} else if line := firstLine(res.Stderr + res.Stdout); line != "" {
+					detail = "could not be read: " + line
+				}
+				mu.Lock()
+				bad = append(bad, d.ID+" ("+detail+")")
+				mu.Unlock()
+				return
+			}
+			if missing := strings.TrimSpace(res.Stdout); missing != "" {
+				mu.Lock()
+				bad = append(bad, d.ID+" ("+missing+")")
+				mu.Unlock()
+			}
+		}(d)
+	}
+	wg.Wait()
+	sort.Strings(bad)
+	return bad
+}
+
+// wiringWait bounds how long loading a submission waits for the lab to finish
+// moving underneath it.
+const wiringWait = 90 * time.Second
+
+// waitForWiring blocks until every device has the interfaces the lab says it
+// has, or gives up and says which one does not.
+//
+// Removing an interface and adding it back is how the platform rewires a
+// device, so for a moment during any deploy or repair the interface genuinely
+// is not there. A submission loaded in that moment failed on its first line --
+// `ip addr replace ... dev port_BOS: Cannot find device "port_BOS"` -- and its
+// owner was held for review for something that had nothing to do with them.
+// Seven of eight students in one class run were quarantined this way.
+//
+// Waiting is the right response because the condition is temporary by
+// construction: whatever removed the interface is in the middle of putting it
+// back. Waiting forever is not, because the same message is what a genuinely
+// misconfigured lab produces, and a grading run that hangs silently is worse
+// than one that stops and says why. So it waits, briefly, and then reports the
+// device and the interface it gave up on.
+func waitForWiring(ctx context.Context, exec execFn, devices []*model.Device, limit time.Duration) error {
+	deadline := time.Now().Add(limit)
+	for {
+		missing, err := firstMissingIface(ctx, exec, devices)
+		if err != nil || missing == "" {
+			return err
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("%s after waiting %s. Something is rewiring this lab -- "+
+				"a deploy, or a node repairing a device -- or the interface is genuinely "+
+				"absent and the lab needs redeploying", missing, limit)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
+	}
+}
+
+// miswiredDevices names every device of the lab that does not have the
+// interfaces the lab says it has, or cannot be read at all.
+//
+// This is a precondition for grading anybody, for the same reason the daemon
+// sweep is. A device with a missing cable produces no symptom of its own: its
+// neighbours fail to reach through it, and the marks land on whoever owns
+// them. Checking two hundred devices costs a few seconds against the forty
+// minutes a class run costs.
+func miswiredDevices(ctx context.Context, exec execFn, top *model.Topology) []string {
+	var (
+		mu  sync.Mutex
+		bad []string
+		wg  sync.WaitGroup
+	)
+	sem := make(chan struct{}, 32)
+	for _, d := range top.SortedDevices() {
+		wg.Add(1)
+		go func(d *model.Device) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			what, err := firstMissingIface(ctx, exec, []*model.Device{d})
+			switch {
+			case err != nil:
+				mu.Lock()
+				bad = append(bad, fmt.Sprintf("%s (could not be read: %v)", d.ID, err))
+				mu.Unlock()
+			case what != "":
+				mu.Lock()
+				bad = append(bad, what)
+				mu.Unlock()
+			}
+		}(d)
+	}
+	wg.Wait()
+	sort.Strings(bad)
+	return bad
+}
+
+// firstMissingIface names a device interface the lab expects and the container
+// does not have, or "" if they all agree.
+func firstMissingIface(ctx context.Context, exec execFn, devices []*model.Device) (string, error) {
+	for _, d := range devices {
+		want := map[string]bool{}
+		for _, i := range d.Ifaces {
+			if i.Name != "" && i.Name != "lo" && (i.Link != nil || i.VLAN > 0) {
+				want[i.Name] = true
+			}
+		}
+		if len(want) == 0 {
+			continue
+		}
+		res, err := exec(ctx, d.ID, []string{"sh", "-c",
+			`ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1`})
+		if err != nil {
+			return "", fmt.Errorf("%s: checking its interfaces: %w", d.ID, err)
+		}
+		if res.ExitCode != 0 {
+			return "", fmt.Errorf("%s: listing its interfaces exited %d: %s",
+				d.ID, res.ExitCode, firstLine(res.Stderr+res.Stdout))
+		}
+		have := map[string]bool{}
+		for _, n := range strings.Fields(res.Stdout) {
+			have[n] = true
+		}
+		names := make([]string, 0, len(want))
+		for n := range want {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		for _, n := range names {
+			if !have[n] {
+				return fmt.Sprintf("%s has no interface %s", d.ID, n), nil
+			}
+		}
+	}
+	return "", nil
+}
+
+// waitForASWiring waits for one autonomous system's devices to have the
+// interfaces the lab says they have.
+func waitForASWiring(ctx context.Context, exec execFn, top *model.Topology, asn int) error {
+	as, ok := top.ASes[asn]
+	if !ok {
+		return fmt.Errorf("AS %d is not in the harness", asn)
+	}
+	return waitForWiring(ctx, exec, as.Devices, wiringWait)
+}
+
+// notReadyToGrade explains why a lab cannot be graded yet, and what to do.
+//
+// It is one function because the two preconditions -- routing processes and
+// wiring -- have the same shape, the same consequence and the same remedy, and
+// because the remedy has a step people miss: a deploy that collided with
+// something else on a node reports it and exits non-zero, having left that
+// node's devices created but unconfigured.
+func notReadyToGrade(what string, bad []string, manifest string) error {
+	shown := bad
+	tail := ""
+	if len(shown) > 8 {
+		shown = shown[:8]
+		tail = fmt.Sprintf("\n  ... and %d more", len(bad)-len(shown))
+	}
+	return fmt.Errorf("%d %s, so nothing can be graded against it yet:\n  %s%s\n"+
+		"A broken device has no symptom of its own -- its neighbours fail to converge, "+
+		"and the marks land on students whose work is correct.\nRun `twinet deploy -m %s "+
+		"--solve` to put it right, and note that a node busy with something else refuses "+
+		"the deploy, so check that it reported no problems before grading",
+		len(bad), what, strings.Join(shown, "\n  "), tail, manifest)
+}
+
+// appendNote joins report notes without losing either.
+func appendNote(have, add string) string {
+	if have == "" {
+		return add
+	}
+	return have + "; " + add
+}
+
+// imageDisagreements names the images this cluster's nodes do not agree on.
+//
+// An image tag is not an identity: rebuilt in place it is different software
+// under the same name. When two nodes hold different builds, a student's
+// routers run whichever one landed on the node their system was placed on, and
+// every report says the deployment is current.
+func imageDisagreements(ctx context.Context, top *model.Topology, token string) []string {
+	if !clustered(top) {
+		return nil
+	}
+	tok, err := tokenFor(token)
+	if err != nil {
+		return nil
+	}
+	c := client.NewCluster(top.Lab, tok)
+	var bad []string
+	for ref, id := range imageDigests(ctx, c, top) {
+		if strings.HasPrefix(id, "DISAGREEMENT") {
+			bad = append(bad, ref+": "+strings.TrimPrefix(id, "DISAGREEMENT: "))
+		}
+	}
+	sort.Strings(bad)
+	return bad
+}
+
+// teardownFailed records that a grading harness could not be removed.
+//
+// It was logged and the run exited zero, so a class-scale run could leave a
+// handful of labs consuming the cluster and report success -- after which later
+// submissions fail for reasons that have nothing to do with their authors.
+var teardownFailed atomic.Bool
+
+// TeardownFailed reports whether any harness was left behind.
+func TeardownFailed() bool { return teardownFailed.Load() }
+
+// labImages resolves the digest of every image a lab uses, for the provenance
+// recorded beside a mark.
+func labImages(ctx context.Context, top *model.Topology, token string) map[string]string {
+	if !clustered(top) {
+		return nil
+	}
+	tok, err := tokenFor(token)
+	if err != nil {
+		return nil
+	}
+	return imageDigests(ctx, client.NewCluster(top.Lab, tok), top)
+}
+
+// clearStaleHarness removes any earlier deployment of a harness before it is
+// used again, and refuses rather than grading on top of one it cannot remove.
+func clearStaleHarness(ctx context.Context, c *client.Cluster, h *model.Topology) error {
+	found, errs := c.Containers(ctx, h.Name)
+	if len(errs) > 0 {
+		// A node that cannot be asked might be the one holding the remains. It
+		// is not safe to assume otherwise.
+		var msgs []string
+		for _, e := range errs {
+			msgs = append(msgs, e.Error())
+		}
+		return fmt.Errorf("could not establish whether an earlier attempt is still "+
+			"deployed: %s", strings.Join(msgs, "; "))
+	}
+	if len(found) == 0 {
+		return nil
+	}
+	slog.Warn("an earlier deployment of this harness is still up and is being removed "+
+		"before the submission is loaded", "lab", h.Name, "containers", len(found))
+	if err := destroyLab(ctx, c, h); err != nil {
+		return err
+	}
+	// Verified, not assumed: destroy reports what it asked for, and a container
+	// that survived it is exactly the one that would carry the last attempt's
+	// configuration into this mark.
+	still, errs := c.Containers(ctx, h.Name)
+	if len(errs) > 0 {
+		var msgs []string
+		for _, e := range errs {
+			msgs = append(msgs, e.Error())
+		}
+		return fmt.Errorf("could not confirm the earlier attempt is gone: %s",
+			strings.Join(msgs, "; "))
+	}
+	if len(still) > 0 {
+		names := make([]string, 0, len(still))
+		for _, cn := range still {
+			names = append(names, cn.Name)
+		}
+		sort.Strings(names)
+		return fmt.Errorf("%d container(s) from an earlier attempt survived teardown: %s",
+			len(still), strings.Join(names, ", "))
+	}
+	return nil
+}

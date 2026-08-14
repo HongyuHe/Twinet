@@ -1,6 +1,7 @@
 package render
 
 import (
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -22,6 +23,17 @@ func (r *Renderer) serviceFiles(d *model.Device) map[string]deploy.FileSpec {
 	if isRPKI(d) {
 		p := svc.BuildRPKI(r.Top, r.Top.Lab.RPKI.NotFound, r.Top.Lab.RPKI.Invalid)
 		out["/etc/twinet/rpki.json"] = deploy.FileSpec{Content: p.JSON(), Mode: 0o644}
+		// Who may authorise what. Derived from the topology so that a system
+		// can publish for its own allocation and nothing else -- otherwise the
+		// exercise's deliberate hijack could be published away by its victim,
+		// and a group could authorise a neighbour's space.
+		//
+		// The published ROAs themselves are deliberately not written here: they
+		// are a class's work, and a deployment that rewrote them would erase
+		// it every time anything else about the lab changed.
+		if raw, err := json.MarshalIndent(svc.AuthorityFor(r.Top), "", "  "); err == nil {
+			out["/etc/twinet/rpki_authority.json"] = deploy.FileSpec{Content: append(raw, '\n'), Mode: 0o644}
+		}
 		return out
 	}
 	if !isDNS(d) {
@@ -42,7 +54,11 @@ func (r *Renderer) serviceCommands(d *model.Device) []deploy.Command {
 			Describe: "start the RPKI validator",
 			Args: []string{"sh", "-c", strings.Join([]string{
 				"for p in $(ps -ef | awk '/twinet-rtr/ && !/awk/ {print $1}'); do kill $p 2>/dev/null || true; done",
-				"nohup twinet-rtr -listen :3323 -payload /etc/twinet/rpki.json >/var/log/twinet-rtr.log 2>&1 &",
+				"nohup twinet-rtr -listen :3323 -payload /etc/twinet/rpki.json " +
+					"-publish " + svc.PublishListen + " " +
+					"-published /etc/twinet/rpki_published.json " +
+					"-authority /etc/twinet/rpki_authority.json " +
+					">/var/log/twinet-rtr.log 2>&1 &",
 				// A validator that is listening but serving nothing is worse
 				// than one that failed to start: every route becomes
 				// not-found, and an exercise about filtering passes for a
@@ -151,12 +167,36 @@ func (r *Renderer) serviceRoutes(d *model.Device) []deploy.Command {
 	return cmds
 }
 
+// isRPKI and isDNS ask what a service was declared to be.
+//
+// They used to ask what it was called: any service device whose name contained
+// "rpki" got a validator started in it and any other did not, so a manifest
+// that named its validator "roa" got a container running nothing at all, with
+// no error anywhere -- and every route in the lab became not-found, which looks
+// exactly like a student who filtered too much. The name is a label; the kind
+// is the declaration.
+//
+// The name is still consulted as a fallback, because a service declared as a
+// plain container may still be one of these, and because labs deployed before
+// the kind was recorded must keep working.
 func isRPKI(d *model.Device) bool {
-	return d.Kind == model.KindService && strings.Contains(strings.ToLower(d.Name), "rpki")
+	if d.Kind != model.KindService {
+		return false
+	}
+	if d.ServiceKind != "" {
+		return d.ServiceKind == "builtin.rpki"
+	}
+	return strings.Contains(strings.ToLower(d.Name), "rpki")
 }
 
 func isDNS(d *model.Device) bool {
-	return d.Kind == model.KindService && strings.Contains(strings.ToLower(d.Name), "dns")
+	if d.Kind != model.KindService {
+		return false
+	}
+	if d.ServiceKind != "" {
+		return d.ServiceKind == "builtin.dns"
+	}
+	return strings.Contains(strings.ToLower(d.Name), "dns")
 }
 
 // dnsSerial derives a zone serial from the topology, so a redeployment of an

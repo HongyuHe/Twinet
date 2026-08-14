@@ -118,6 +118,17 @@ func matrixSource(top *model.Topology, asn int) string {
 // and running them from one container in sequence is what made the previous
 // matrix minutes stale.
 func BuildMatrix(ctx context.Context, top *model.Topology, probe Prober, parallel int) *Matrix {
+	return BuildMatrixWithPaths(ctx, top, probe, nil, parallel)
+}
+
+// PathProbe returns the AS path the source uses to reach an autonomous system,
+// origin last, excluding the source itself.
+type PathProbe func(ctx context.Context, deviceID string, to int) ([]int, error)
+
+// BuildMatrixWithPaths additionally marks pairs whose route violates the
+// business relationships the topology declares.
+func BuildMatrixWithPaths(ctx context.Context, top *model.Topology, probe Prober,
+	path PathProbe, parallel int) *Matrix {
 	if parallel <= 0 {
 		parallel = 64
 	}
@@ -162,6 +173,25 @@ func BuildMatrix(ctx context.Context, top *model.Topology, probe Prober, paralle
 				c.State, c.Detail = ReachUnknown, err.Error()
 			case ok:
 				c.State, c.RTTms = ReachOK, rtt
+				// Reachable is not the same as correct.
+				//
+				// ReachInvalid was declared as "the orange cell students
+				// chase" and never produced by anything, so the matrix could
+				// only ever say up or down -- and a network reachable through
+				// a path that gives somebody free transit looked exactly like
+				// a correct one. When the caller can supply the path, it is
+				// checked against the relationships the topology declares.
+				if path != nil {
+					p, perr := path(ctx, src, j.to)
+					switch {
+					case perr != nil:
+						c.Detail = "the path could not be read: " + perr.Error()
+					case len(p) > 0:
+						if why := violatesRelationships(top, j.from, p); why != "" {
+							c.State, c.Detail = ReachInvalid, why
+						}
+					}
+				}
 			default:
 				c.State = ReachDown
 			}
@@ -418,4 +448,85 @@ func atoiSafe(s string) int {
 		n = n*10 + int(r-'0')
 	}
 	return n
+}
+
+// violatesRelationships reports why an AS path is not valley-free, or "" when
+// it is.
+//
+// Gao-Rexford: from the source, a path may climb to providers, cross at most
+// one peering, and then descend to customers. Anything else means somebody on
+// the path is providing transit they are not paid for -- which is exactly what
+// the export policy exercises are about, and what an orange cell in the
+// original mini-Internet's matrix meant.
+func violatesRelationships(top *model.Topology, from int, path []int) string {
+	rel := relationshipMap(top)
+	if relationshipMapForTest != nil {
+		rel = relationshipMapForTest
+	}
+	const (
+		climbing = iota
+		crossed
+		descending
+	)
+	state := climbing
+	prev := from
+	for _, next := range path {
+		if next == prev {
+			continue // prepends
+		}
+		r, ok := rel[prev][next]
+		if !ok {
+			// Not adjacent in the model: an exchange sits between them, or the
+			// path crosses a system this lab does not describe. Nothing can be
+			// concluded, so nothing is claimed.
+			prev = next
+			continue
+		}
+		switch r {
+		case model.RelProvider:
+			if state != climbing {
+				return fmt.Sprintf("AS %d reaches its provider AS %d after already "+
+					"leaving the customer cone, so somebody on this path is carrying "+
+					"transit they are not paid for", prev, next)
+			}
+		case model.RelPeer:
+			if state != climbing {
+				return fmt.Sprintf("the path crosses the peering between AS %d and AS %d "+
+					"after having already crossed one, which no correct export policy allows",
+					prev, next)
+			}
+			state = crossed
+		case model.RelCustomer:
+			state = descending
+		}
+		prev = next
+	}
+	return ""
+}
+
+// relationshipMapForTest lets the valley-free rule be tested against a set of
+// relationships directly, rather than against a topology built to produce them.
+var relationshipMapForTest map[int]map[int]model.Relationship
+
+// relationshipMap says what each AS is to each of its neighbours.
+func relationshipMap(top *model.Topology) map[int]map[int]model.Relationship {
+	out := map[int]map[int]model.Relationship{}
+	for _, l := range top.Links {
+		if l.A == nil || l.B == nil || l.A.Device == nil || l.B.Device == nil {
+			continue
+		}
+		a, b := l.A.Device.ASN, l.B.Device.ASN
+		if a == b || a == 0 || b == 0 {
+			continue
+		}
+		if out[a] == nil {
+			out[a] = map[int]model.Relationship{}
+		}
+		if out[b] == nil {
+			out[b] = map[int]model.Relationship{}
+		}
+		out[a][b] = l.PeerRelationship(l.A)
+		out[b][a] = l.PeerRelationship(l.B)
+	}
+	return out
 }

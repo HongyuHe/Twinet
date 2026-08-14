@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -209,6 +210,21 @@ func (n *Node) destroy(ctx context.Context, req agent.DestroyRequest) error {
 			req.Lab, strings.Join(resp.Problems, "; "))
 	}
 	return nil
+}
+
+// Hold asks the node's repair loop to leave a lab alone for a while. Seconds of
+// zero drops the hold.
+func (n *Node) Hold(ctx context.Context, lab, holder, token string, seconds int) error {
+	var resp struct{}
+	return n.do(ctx, http.MethodPost, "/v1/hold",
+		agent.HoldRequest{Lab: lab, Holder: holder, Token: token, Seconds: seconds}, &resp)
+}
+
+// Exempt tells the node to leave a device alone, or to look after it again.
+func (n *Node) Exempt(ctx context.Context, lab, device, id string, on bool) error {
+	var resp struct{}
+	return n.do(ctx, http.MethodPost, "/v1/exempt",
+		agent.ExemptRequest{Lab: lab, Device: device, ID: id, On: on}, &resp)
 }
 
 // Exec runs a command in a container on the node.
@@ -471,6 +487,28 @@ func (c *Cluster) Apply(ctx context.Context, top *model.Topology, req agent.Appl
 		}
 		return out
 	}
+	// Stamp the image identities before serialising, if the caller has not.
+	//
+	// The container spec hash includes the digest a device's image reference
+	// resolves to, so that rebuilding a tag in place is noticed. Only the
+	// deploy command used to resolve it. Every other caller -- and there are
+	// three, grading's restore between submissions among them -- sent a
+	// topology with the field empty, computed a different hash for containers
+	// that had not changed at all, and so destroyed and recreated every
+	// container in scope.
+	//
+	// Measured on a three-node lab: grading two submissions recreated 89 of
+	// 212 containers, and the next ordinary deploy recreated 172 of them,
+	// because the two callers disagreed permanently. Recreating a container
+	// empties its network namespace, which is why submissions failed to load
+	// with "Cannot find device port_BOS", and leaves it with the image's own
+	// FRR daemons file, which is why routers were found with no bgpd and no
+	// ospfd. Both were blamed on students.
+	//
+	// It is resolved here because this is the one door every deployment goes
+	// through, which is the same reason the version check lives here.
+	c.stampImageIDs(ctx, top)
+
 	wire := agent.Serialise(top)
 	peers := map[string]string{}
 	for _, n := range top.Lab.Placement.Nodes {
@@ -486,6 +524,138 @@ func (c *Cluster) Apply(ctx context.Context, top *model.Topology, req agent.Appl
 	})
 }
 
+// stampImageIDs fills in the digest each image reference resolves to, for any
+// device whose identity the caller has not already established.
+//
+// Best effort by design: an image nobody has pulled yet has no digest, and a
+// first deployment must still be possible. What matters is that every caller
+// arrives at the same answer, not that the answer is always known.
+func (c *Cluster) stampImageIDs(ctx context.Context, top *model.Topology) {
+	refs := map[string]bool{}
+	for _, d := range top.Devices {
+		if d.Image != "" && d.ImageID == "" {
+			refs[d.Image] = true
+		}
+	}
+	if len(refs) == 0 {
+		return
+	}
+	list := make([]string, 0, len(refs))
+	for r := range refs {
+		list = append(list, r)
+	}
+	sort.Strings(list)
+
+	// Nodes are asked in a fixed order, and they must agree.
+	//
+	// Taking the first answer and moving on is how a lab ends up running two
+	// different builds at once: one node is rebuilt, a push half-succeeds, a
+	// pull is interrupted, and from then on a student's routers run whichever
+	// image landed on whichever node their AS was placed on. That was measured
+	// on this cluster -- all four images differed between node-0 and the other
+	// two -- while every report said the deployment was current. A mark that
+	// depends on where a container was scheduled is not a mark.
+	//
+	// A node that has not pulled an image yet is not a disagreement: it has no
+	// opinion, and the deployment is about to give it one.
+	answers := map[string]map[string]string{}
+	if len(c.Nodes) == 0 {
+		// A lab that runs on this machine alone. Asking the local daemon is
+		// the same question; leaving the field empty here would recreate every
+		// container of a single-node lab on the next deploy, which is the bug
+		// this exists to stop, just on one machine instead of a cluster.
+		local := map[string]string{}
+		d := rt.NewDocker()
+		for _, ref := range list {
+			if id, err := d.ImageDigest(ctx, ref); err == nil {
+				local[ref] = id
+			}
+		}
+		answers["local"] = local
+	}
+	for _, n := range c.Nodes {
+		got, err := n.ImageDigests(ctx, list)
+		if err != nil {
+			continue
+		}
+		answers[n.Name] = got
+	}
+
+	seen, disagree := agreedDigests(answers)
+	for ref, who := range disagree {
+		slog.Warn("nodes do not agree on what an image is, so its identity is not being "+
+			"used; deploy will refuse until they match",
+			"image", ref, "disagreement", strings.Join(who, ", "))
+	}
+	for _, d := range top.Devices {
+		if d.ImageID == "" {
+			d.ImageID = seen[d.Image]
+		}
+	}
+}
+
+// agreedDigests reduces each node's answer to the identity they all give, and
+// reports the images they do not agree on.
+//
+// Where the nodes disagree, no identity is returned for that image. Picking one
+// node's answer is how half a class ends up marked on a different build from
+// the other half, with every report saying the deployment is current; leaving
+// it out instead makes the spec hash omit it, so the containers are left alone.
+// The deploy command checks the same thing and refuses outright, which is the
+// better answer when there is a person present to hear it.
+//
+// A node that has not pulled an image yet is not a disagreement: it has no
+// opinion, and the deployment is about to give it one.
+func agreedDigests(answers map[string]map[string]string) (map[string]string, map[string][]string) {
+	byRef := map[string]map[string]string{} // image -> node -> digest
+	for node, got := range answers {
+		for ref, id := range got {
+			if id == "" {
+				continue
+			}
+			if byRef[ref] == nil {
+				byRef[ref] = map[string]string{}
+			}
+			byRef[ref][node] = id
+		}
+	}
+
+	seen := map[string]string{}
+	disagree := map[string][]string{}
+	for ref, byNode := range byRef {
+		nodes := make([]string, 0, len(byNode))
+		for n := range byNode {
+			nodes = append(nodes, n)
+		}
+		sort.Strings(nodes)
+
+		first := byNode[nodes[0]]
+		agreed := true
+		var who []string
+		for _, n := range nodes {
+			who = append(who, fmt.Sprintf("%s has %s", n, short(byNode[n])))
+			if byNode[n] != first {
+				agreed = false
+			}
+		}
+		if agreed {
+			seen[ref] = first
+			continue
+		}
+		disagree[ref] = who
+	}
+	return seen, disagree
+}
+
+// short abbreviates a digest for a message a person has to read.
+func short(id string) string {
+	id = strings.TrimPrefix(id, "sha256:")
+	if len(id) > 12 {
+		return id[:12]
+	}
+	return id
+}
+
 // Destroy removes the lab from every node.
 func (c *Cluster) Destroy(ctx context.Context, lab string, vnis []uint32) []NodeResult[struct{}] {
 	return fanOut(ctx, c.Nodes, func(ctx context.Context, n *Node) (struct{}, error) {
@@ -498,6 +668,14 @@ func (c *Cluster) Destroy(ctx context.Context, lab string, vnis []uint32) []Node
 func (c *Cluster) DestroyEphemeral(ctx context.Context, lab string, vnis []uint32) []NodeResult[struct{}] {
 	return fanOut(ctx, c.Nodes, func(ctx context.Context, n *Node) (struct{}, error) {
 		return struct{}{}, n.DestroyEphemeral(ctx, lab, vnis)
+	})
+}
+
+// Hold asks every node to leave a lab alone. Failures are returned per node so
+// a caller can decide whether to go ahead without one.
+func (c *Cluster) Hold(ctx context.Context, lab, holder, token string, seconds int) []NodeResult[struct{}] {
+	return fanOut(ctx, c.Nodes, func(ctx context.Context, n *Node) (struct{}, error) {
+		return struct{}{}, n.Hold(ctx, lab, holder, token, seconds)
 	})
 }
 

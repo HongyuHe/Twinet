@@ -183,6 +183,7 @@ func (e *expander) expandOneAS(asn int, spec model.ASSpec) error {
 		Node:       spec.Node,
 	}
 	e.top.ASes[asn] = as
+	compileProvisioning(as, tpl)
 
 	// Routers, in deterministic ID order.
 	routerNames := sortedKeys(tpl.Routers)
@@ -205,7 +206,7 @@ func (e *expander) expandOneAS(asn int, spec model.ASSpec) error {
 			Device:     d,
 			Name:       "lo",
 			Role:       model.RoleLoopback,
-			Owner:      e.ownerFor(as, tpl, rn, "lo"),
+			Owner:      e.ownerForIface(as, tpl, rn, "lo", model.DomainLoopbacks),
 			Prescribed: true,
 		}
 		if e.plan.Has(ipam.FieldRouterLoopback) {
@@ -239,6 +240,7 @@ func (e *expander) expandOneAS(asn int, spec model.ASSpec) error {
 	// the renderer and the grader read the same declaration rather than each
 	// interpreting the template themselves.
 	as.MPLS = tpl.MPLS
+	as.Multicast = tpl.Multicast
 	if len(tpl.VRFs) > 0 {
 		as.VRFs = map[string]*model.VRFSpec{}
 		table := 100
@@ -293,12 +295,17 @@ func (e *expander) expandOneAS(asn int, spec model.ASSpec) error {
 			subnet = s
 		}
 		hostAddr, routerAddr := hostPair(subnet)
-		owner := e.ownerFor(as, tpl, rn, "host")
+		owner := e.ownerFor(as, tpl, rn, model.DomainHostAddressing)
+		// A rule naming one of these interfaces claims it individually. Rules
+		// like that used to be skipped outright, so a manifest that provisioned
+		// a single interface got nothing.
+		hostOwner := e.ownerForIface(as, tpl, hostDev.Name, hostIface, model.DomainHostAddressing)
+		rtrOwner := e.ownerForIface(as, tpl, rn, "host", model.DomainHostAddressing)
 
 		hIf := &model.Iface{Device: hostDev, Name: hostIface, Role: model.RoleHostLink,
-			Addr4: hostAddr, Owner: owner, Prescribed: true, Subnet: subnet}
+			Addr4: hostAddr, Owner: hostOwner, Prescribed: true, Subnet: subnet}
 		rIf := &model.Iface{Device: r, Name: "host", Role: model.RoleHostLink,
-			Addr4: routerAddr, Owner: owner, Prescribed: true, Subnet: subnet}
+			Addr4: routerAddr, Owner: rtrOwner, Prescribed: true, Subnet: subnet}
 		hostDev.AddIface(hIf)
 		r.AddIface(rIf)
 		e.link(hIf, rIf, model.LinkVeth, e.lab.LinkDefaults, subnet, owner)
@@ -334,7 +341,7 @@ func (e *expander) expandOneAS(asn int, spec model.ASSpec) error {
 			subnet = s
 		}
 		aAddr, bAddr := hostPair(subnet)
-		owner := e.ownerFor(as, tpl, il.A, "intra")
+		owner := e.ownerFor(as, tpl, il.A, model.DomainRouterInterfaces)
 		aIf := &model.Iface{Device: a, Name: "port_" + il.B, Role: model.RoleIntraAS,
 			Addr4: aAddr, Owner: owner, Prescribed: true, Subnet: subnet}
 		bIf := &model.Iface{Device: b, Name: "port_" + il.A, Role: model.RoleIntraAS,
@@ -397,7 +404,7 @@ func (e *expander) expandL2Domain(as *model.AS, tpl *model.ASTemplate, routers m
 	gw.AddIface(gwIf)
 
 	swUplink := &model.Iface{Device: sw[uplinkSwitch], Name: "trunk_" + dom.Gateway,
-		Role: model.RoleL2Trunk, Trunk: true, Owner: e.ownerFor(as, tpl, uplinkSwitch, "l2")}
+		Role: model.RoleL2Trunk, Trunk: true, Owner: e.ownerFor(as, tpl, uplinkSwitch, model.DomainL2)}
 	sw[uplinkSwitch].AddIface(swUplink)
 	e.link(gwIf, swUplink, model.LinkVeth, e.lab.LinkDefaults, "", model.OwnerPlatform)
 
@@ -419,7 +426,7 @@ func (e *expander) expandL2Domain(as *model.AS, tpl *model.ASTemplate, routers m
 			Parent: trunkIface,
 			VLAN:   v,
 			Role:   model.RoleL2SubIface,
-			Owner:  e.ownerFor(as, tpl, dom.Gateway, "l2"),
+			Owner:  e.ownerFor(as, tpl, dom.Gateway, model.DomainL2),
 			// The assignment names the datacentre's prefix but lets students
 			// choose addresses inside it, so only the subnet is graded.
 			Prescribed: false,
@@ -455,9 +462,9 @@ func (e *expander) expandL2Domain(as *model.AS, tpl *model.ASTemplate, routers m
 			return fmt.Errorf("switch_links[%d]: unknown switch %q", li, sl.B)
 		}
 		aIf := &model.Iface{Device: a, Name: "trunk_" + sl.B, Role: model.RoleL2Trunk, Trunk: true,
-			Owner: e.ownerFor(as, tpl, sl.A, "l2")}
+			Owner: e.ownerFor(as, tpl, sl.A, model.DomainL2)}
 		bIf := &model.Iface{Device: b, Name: "trunk_" + sl.A, Role: model.RoleL2Trunk, Trunk: true,
-			Owner: e.ownerFor(as, tpl, sl.B, "l2")}
+			Owner: e.ownerFor(as, tpl, sl.B, model.DomainL2)}
 		a.AddIface(aIf)
 		b.AddIface(bIf)
 		e.link(aIf, bIf, model.LinkVeth, sl.Merge(e.lab.LinkDefaults), "", model.OwnerPlatform)
@@ -483,7 +490,7 @@ func (e *expander) expandL2Domain(as *model.AS, tpl *model.ASTemplate, routers m
 		}
 		d := e.newDevice(as, hn, model.KindHost, h.DeviceDefaults)
 		d.L2Domain = name
-		owner := e.ownerFor(as, tpl, hn, "l2")
+		owner := e.ownerFor(as, tpl, hn, model.DomainL2)
 		hIf := &model.Iface{Device: d, Name: h.Switch, Role: model.RoleL2Access,
 			VLAN: h.VLAN, Owner: owner, Prescribed: false, Subnet: domSubnet}
 		// Record the expected address so the reference solution can apply it
@@ -719,6 +726,7 @@ func (e *expander) expandServices() error {
 		// attachment router. This mirrors the mini-Internet's MATRIX/DNS/
 		// MEASUREMENT model, which the course text depends on.
 		dev := e.newGlobalDevice(name, model.KindService, spec.DeviceDefaults)
+		dev.ServiceKind = spec.Kind
 		svc.Device = dev
 
 		field := "svc_" + name
@@ -872,23 +880,101 @@ func (e *expander) ownerGroup(asn int, spec model.ASSpec) string {
 	return "staff"
 }
 
+// compileProvisioning turns a template's provisioning declaration into the set
+// of configuration domains Twinet configures for this AS.
+//
+// The declaration used to be inert: a rule naming an interface was skipped, a
+// scope was never read at all, and the `student` list was never read either, so
+// ownership came down to the AS's role and nothing else. A course manifest
+// could say precisely what it wanted, validate, and get something different.
+func compileProvisioning(as *model.AS, tpl *model.ASTemplate) {
+	as.Provisioned = map[string]bool{}
+	as.ProvisionedIfaces = map[string]bool{}
+	if as.Role != model.RoleStudent {
+		return // a staff AS is configured entirely by Twinet
+	}
+	add := func(d string) {
+		if d == model.DomainAll {
+			for _, k := range []string{
+				model.DomainLoopbacks, model.DomainRouterInterfaces,
+				model.DomainHostAddressing, model.DomainL2, model.DomainOSPF,
+				model.DomainBGP, model.DomainMPLS, model.DomainMulticast,
+				model.DomainBGPPolicy, model.DomainIPv6, model.DomainRPKI,
+			} {
+				as.Provisioned[k] = true
+			}
+			return
+		}
+		if !model.CanProvision(d) {
+			// Refused by the validator; ignored here so a manifest that
+			// slipped through cannot produce a half-configured lab.
+			return
+		}
+		as.Provisioned[d] = true
+	}
+	for _, r := range tpl.Provisioning.Provisioned {
+		if r.Scope != "" {
+			if d, ok := model.NormaliseDomain(r.Scope); ok {
+				add(d)
+			}
+		}
+		if r.DeviceKind != "" {
+			// A kind names the devices whose configuration is Twinet's: hosts
+			// are addressed by us, switches are wired by us.
+			switch r.DeviceKind {
+			case model.KindHost:
+				add(model.DomainHostAddressing)
+			case model.KindSwitch:
+				add(model.DomainL2)
+			case model.KindRouter:
+				add(model.DomainLoopbacks)
+				add(model.DomainRouterInterfaces)
+				add(model.DomainOSPF)
+				add(model.DomainBGP)
+			}
+		}
+		if r.Iface != nil && r.Iface.Name != "" {
+			dev := r.Iface.Router
+			if dev == "" {
+				dev = r.Iface.Device
+			}
+			as.ProvisionedIfaces[dev+"/"+r.Iface.Name] = true
+		}
+	}
+	// An explicit `student` entry wins over anything that claimed it. Saying
+	// "the students do OSPF" has to survive "we provision everything", or the
+	// two halves of the declaration cannot be combined at all.
+	for _, d := range tpl.Provisioning.Student {
+		if n, ok := model.NormaliseDomain(d); ok {
+			if n == model.DomainAll {
+				as.Provisioned = map[string]bool{}
+				continue
+			}
+			delete(as.Provisioned, n)
+		}
+	}
+}
+
 // ownerFor decides whether Twinet or the student configures an object.
 func (e *expander) ownerFor(as *model.AS, tpl *model.ASTemplate, device, domain string) model.ConfigOwner {
 	if as.Role != model.RoleStudent {
 		return model.OwnerPlatform
 	}
-	for _, r := range tpl.Provisioning.Provisioned {
-		if r.Iface != nil && (r.Iface.Router == device || r.Iface.Device == device) {
-			// A rule naming a specific interface is handled at the interface
-			// level by the caller; at device granularity we keep student
-			// ownership so the rest of the device stays unconfigured.
-			continue
-		}
-		if r.DeviceKind != "" && string(r.DeviceKind) == domain {
-			return model.OwnerPlatform
-		}
+	if as.Provides(domain) {
+		return model.OwnerPlatform
 	}
 	return model.OwnerStudent
+}
+
+// ownerForIface is ownerFor for a named interface, which a provisioning rule
+// may claim individually.
+func (e *expander) ownerForIface(as *model.AS, tpl *model.ASTemplate,
+	device, iface, domain string) model.ConfigOwner {
+
+	if as.Role == model.RoleStudent && as.ProvisionedIfaces[device+"/"+iface] {
+		return model.OwnerPlatform
+	}
+	return e.ownerFor(as, tpl, device, domain)
 }
 
 func hostnameFor(asn int, name string) string {

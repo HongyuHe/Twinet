@@ -2,15 +2,18 @@ package cli
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
 
+	"github.com/HongyuHe/twinet/internal/agent"
 	"github.com/HongyuHe/twinet/internal/fault"
 	"github.com/HongyuHe/twinet/internal/model"
 )
@@ -29,6 +32,14 @@ type Scenario struct {
 	Brief      string       `yaml:"brief,omitempty" json:"brief,omitempty"`
 	// Seed makes a time-varying fault replay exactly.
 	Seed int64 `yaml:"seed,omitempty" json:"seed,omitempty"`
+	// Control declares an episode that injects nothing.
+	//
+	// Without these, "is anything wrong?" is worth 0.2 for answering yes, and
+	// an agent that always answers yes collects it on every episode in the
+	// suite. A control is how the suite finds out whether an agent can tell a
+	// healthy network from a broken one; a benchmark made only of broken
+	// networks cannot.
+	Control bool `yaml:"control,omitempty" json:"control,omitempty"`
 }
 
 // ScenarioMeta names an incident.
@@ -56,6 +67,12 @@ type Episode struct {
 	Truth     []fault.GroundTruth `json:"ground_truth"`
 	Resolved  bool                `json:"resolved"`
 	Err       string              `json:"error,omitempty"`
+
+	// What an agent said, and what it scored. Absent when no agent was run.
+	Diagnosis *Diagnosis `json:"diagnosis,omitempty"`
+	Score     *Score     `json:"score,omitempty"`
+	AgentErr  string     `json:"agent_error,omitempty"`
+	AgentLog  string     `json:"agent_log,omitempty"`
 }
 
 func newIncidentCmd(opts *Options) *cobra.Command {
@@ -66,7 +83,8 @@ func newIncidentCmd(opts *Options) *cobra.Command {
 truth. It is the unit an AI agent is measured on: the agent sees the reported
 symptoms and the live network, and never the answer.`,
 	}
-	cmd.AddCommand(newIncidentRunCmd(opts), newIncidentValidateCmd())
+	cmd.AddCommand(newIncidentRunCmd(opts), newIncidentValidateCmd(),
+		newIncidentCredentialCmd(opts))
 	return cmd
 }
 
@@ -101,8 +119,14 @@ func loadScenario(path string) (*Scenario, error) {
 	if s.Metadata.Name == "" {
 		return nil, fmt.Errorf("%s: the scenario has no name", path)
 	}
-	if len(s.Faults) == 0 {
-		return nil, fmt.Errorf("%s: the scenario injects no faults", path)
+	if len(s.Faults) == 0 && !s.Control {
+		return nil, fmt.Errorf("%s: the scenario injects no faults. If that is deliberate -- "+
+			"a healthy control, so that answering \"something is wrong\" is not free -- say "+
+			"so with `control: true`", path)
+	}
+	if len(s.Faults) > 0 && s.Control {
+		return nil, fmt.Errorf("%s: a control injects nothing, but this one injects %d fault(s)",
+			path, len(s.Faults))
 	}
 	var problems []string
 	for i, f := range s.Faults {
@@ -125,6 +149,8 @@ func newIncidentRunCmd(opts *Options) *cobra.Command {
 		hold         time.Duration
 		keep         bool
 		showTruth    bool
+		agentCmd     string
+		agentTimeout time.Duration
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -173,6 +199,25 @@ func newIncidentRunCmd(opts *Options) *cobra.Command {
 				unlockInj()
 				return err
 			}
+			// An episode has to start from a lab with nothing wrong with it.
+			//
+			// Faults already live were neither refused nor recorded in the
+			// episode's ground truth, so the agent was shown anomalies that the
+			// scoring did not know about -- and the run could report itself
+			// resolved while they were still there. Whatever an agent concludes
+			// from an extra fault is then marked wrong for the right reason.
+			if len(ledger) > 0 {
+				unlockInj()
+				names := make([]string, 0, len(ledger))
+				for _, inj := range ledger {
+					names = append(names, fmt.Sprintf("%s on %s", inj.Fault, inj.Target.DeviceID()))
+				}
+				sort.Strings(names)
+				return fmt.Errorf("this lab already has %d fault(s) injected:\n  %s\n"+
+					"An episode measures what an agent concludes from what it can see, and "+
+					"these are not in its ground truth. Clear them with `twinet fault "+
+					"resolve --all` first", len(ledger), strings.Join(names, "\n  "))
+			}
 			// A fault that could not be recorded is undone rather than left
 			// live. Warning and carrying on recreated the exact defect this
 			// record exists to close: an interruption, or a scenario held open
@@ -200,6 +245,15 @@ func newIncidentRunCmd(opts *Options) *cobra.Command {
 			for _, fs := range sc.Faults {
 				inj, err := fault.Inject(cmd.Context(), env, fs.Type, fs.Target)
 				if err != nil {
+					// A failed injection that still left something live hands
+					// it back. Record it before giving up, or the lab is
+					// contaminated with nothing on disk naming the cause.
+					if inj != nil {
+						if jerr := journal(inj); jerr != nil {
+							fmt.Fprintf(cmd.ErrOrStderr(), "%v\n", jerr)
+						}
+						injected = append(injected, inj)
+					}
 					ep.Err = err.Error()
 					fmt.Fprintf(cmd.ErrOrStderr(), "injection failed: %v\n", err)
 					break
@@ -233,6 +287,50 @@ func newIncidentRunCmd(opts *Options) *cobra.Command {
 					case <-cmd.Context().Done():
 					}
 				}
+
+				// The agent, if one was given, and the mark for what it said.
+				//
+				// This is what makes an episode a measurement rather than a
+				// recording. Without it every evaluation had to be driven from
+				// outside and compared against the truth in its own way, and
+				// two harnesses scoring the same episode differently is not a
+				// benchmark.
+				if agentCmd != "" {
+					// An agent that crashed, timed out or printed nothing has
+					// not been evaluated, and an episode that reports no score
+					// used to exit successfully -- so a harness running a
+					// hundred episodes against a broken agent saw a hundred
+					// clean runs and no marks. It is an error now.
+					err := func() error {
+						sb, serr := newSandbox(top, opts.Manifest, sc.Metadata.Name)
+						if serr != nil {
+							return fmt.Errorf("preparing the agent sandbox: %w", serr)
+						}
+						defer sb.Remove()
+						d, stderr, aerr := runAgent(cmd.Context(), agentCmd, ep,
+							sb, token, agentTimeout)
+						if strings.TrimSpace(stderr) != "" {
+							ep.AgentLog = stderr
+						}
+						if aerr != nil {
+							ep.AgentErr = aerr.Error()
+							return fmt.Errorf("the agent did not answer: %w", aerr)
+						}
+						ep.Diagnosis = &d
+						mark := scoreDiagnosis(d, ep.Truth)
+						ep.Score = &mark
+						fmt.Fprintf(cmd.OutOrStdout(),
+							"\nthe agent scored %.2f of 1.00 "+
+								"(detected %v, devices %.2f, category %v, root cause %v)%s\n",
+							mark.Total, mark.Detected, mark.Devices, mark.Category, mark.RootCause,
+							map[bool]string{true: "", false: "; " + mark.Detail}[mark.Detail == ""])
+						return nil
+					}()
+					if err != nil {
+						ep.Err = err.Error()
+						fmt.Fprintf(cmd.ErrOrStderr(), "%v\n", err)
+					}
+				}
 			}
 
 			if !keep {
@@ -245,9 +343,16 @@ func newIncidentRunCmd(opts *Options) *cobra.Command {
 					// Removed from the record only once it is actually gone,
 					// so anything that failed to resolve stays listed and can
 					// be found later.
+					// Removed by identifier, not by name and device.
+					//
+					// A scenario may inject the same fault type on the same
+					// device twice. Matching on those removed whichever record
+					// came first, so resolving one deleted the other's entry --
+					// and if that one then failed to resolve, it was live with
+					// nothing on disk saying so, which is the state this record
+					// exists to make impossible.
 					for j, l := range ledger {
-						if l.Fault == injected[i].Fault &&
-							l.Target.DeviceID() == injected[i].Target.DeviceID() {
+						if l.ID == injected[i].ID {
 							ledger = append(ledger[:j], ledger[j+1:]...)
 							break
 						}
@@ -296,7 +401,47 @@ func newIncidentRunCmd(opts *Options) *cobra.Command {
 	cmd.Flags().DurationVar(&hold, "hold", 0, "keep the incident live for this long")
 	cmd.Flags().BoolVar(&keep, "keep", false, "leave the faults injected")
 	cmd.Flags().BoolVar(&showTruth, "ground-truth", false, "print the answer")
+	cmd.Flags().StringVar(&agentCmd, "agent", "",
+		"command to run as the agent under evaluation; it is given the brief on stdin "+
+			"and must print a diagnosis as JSON")
+	cmd.Flags().DurationVar(&agentTimeout, "agent-timeout", 10*time.Minute,
+		"how long the agent may take")
 	return cmd
 }
 
 var _ = model.DeviceID
+
+// newIncidentCredentialCmd mints the read-only credential an evaluated agent
+// runs with, so a harness outside this repository can drive an agent itself
+// without handing it the cluster.
+func newIncidentCredentialCmd(opts *Options) *cobra.Command {
+	var token string
+	cmd := &cobra.Command{
+		Use:   "credential",
+		Short: "mint a read-only, single-lab credential for an agent under evaluation",
+		Long: "An agent given TWINET_TOKEN can read every lab on the cluster, run anything " +
+			"in any container, take a grading hold, and destroy the evidence. This mints a " +
+			"credential that can look at one lab and change nothing: `twinet exec` and " +
+			"`twinet status` work with it, everything else is refused by the node agents.\n\n" +
+			"`twinet incident run --agent` uses one automatically; this is for harnesses that " +
+			"drive the agent themselves.",
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			top, err := loadAndPlace(opts)
+			if err != nil {
+				return err
+			}
+			if token == "" {
+				token = os.Getenv("TWINET_TOKEN")
+			}
+			if token == "" {
+				return errors.New("the cluster token is needed to derive a credential from it: " +
+					"pass --token or set TWINET_TOKEN")
+			}
+			fmt.Fprintln(cmd.OutOrStdout(), agent.DiagnosticToken(token, top.Name))
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&token, "token", "", "cluster agent token")
+	return cmd
+}

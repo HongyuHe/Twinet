@@ -332,6 +332,7 @@ func checkECMP(ctx context.Context, env *Env) Result {
 
 	// Cache each router's next hops toward the destination.
 	nextHops := map[string]map[string]bool{}
+	other := map[string]bool{}
 	fetch := func(router string) (map[string]bool, error) {
 		if v, ok := nextHops[router]; ok {
 			return v, nil
@@ -343,6 +344,17 @@ func checkECMP(ctx context.Context, env *Env) Result {
 		set := map[string]bool{}
 		for _, e := range routes[target] {
 			if !e.Selected && !e.Installed {
+				continue
+			}
+			// The protocol is what the question is about.
+			//
+			// It was decoded and then ignored, so three static routes over the
+			// prescribed interfaces earned full marks for a question that asks
+			// for equal-cost paths produced by OSPF costs. Hand-installed
+			// routes do not react to a link failing, which is the entire point
+			// of the exercise, and the two were indistinguishable in the mark.
+			if e.Protocol != "" && e.Protocol != "ospf" {
+				other[e.Protocol] = true
 				continue
 			}
 			for _, nh := range e.Nexthops {
@@ -358,12 +370,19 @@ func checkECMP(ctx context.Context, env *Env) Result {
 	if hops, err := fetch(from); err != nil {
 		return Errored("ospf.ecmp_paths", err)
 	} else if len(hops) == 0 {
+		observed := "no route at all"
+		if len(other) > 0 {
+			observed = fmt.Sprintf("a route learned by %s rather than OSPF",
+				strings.Join(sortedKeysOfBool(other), ", "))
+		}
 		return Fail("ospf.ecmp_paths", Evidence{
-			Expected: fmt.Sprintf("%d equal-cost paths from %s to %s", len(wantPaths), from, to),
-			Observed: "no route at all",
+			Expected: fmt.Sprintf("%d equal-cost paths from %s to %s, learned by OSPF",
+				len(wantPaths), from, to),
+			Observed: observed,
 			Detail:   fmt.Sprintf("%s has no route to %s (%s)", from, to, target),
-			Hint:     "OSPF must be converged before load balancing can be assessed",
-			Command:  "show ip route json",
+			Hint: "the paths have to come from OSPF costs; a hand-installed route does " +
+				"not move when a link fails, which is what this question is about",
+			Command: "show ip route json",
 		})
 	}
 
@@ -404,26 +423,43 @@ func checkECMP(ctx context.Context, env *Env) Result {
 		}
 	}
 
-	// Exclusivity: the source must use only the first hops the prescribed
-	// paths need, so a fourth path carrying traffic is caught.
+	// Exclusivity: at *every* router the prescribed paths pass through, the
+	// only next hops toward the destination are the ones those paths use.
+	//
+	// This used to look at the source alone, so a fourth path that diverges
+	// further along -- at PHY, say -- was invisible: the source's next hops
+	// were exactly right, and traffic was still taking a route the assignment
+	// does not prescribe. The question is which paths carry traffic, and that
+	// is decided at each hop, not at the first.
 	var extra []string
 	if exclusive {
-		allowed := map[string]bool{}
+		allowed := map[string][]string{}
 		for _, p := range wantPaths {
-			if len(p) > 1 {
-				allowed["port_"+p[1]] = true
+			for i := 0; i+1 < len(p); i++ {
+				allowed[p[i]] = append(allowed[p[i]], "port_"+p[i+1])
 			}
 		}
-		hops, _ := fetch(from)
-		for h := range hops {
-			if !allowed[h] {
-				extra = append(extra, h)
+		for _, router := range sortedKeysOfStrings(allowed) {
+			hops, err := fetch(router)
+			if err != nil {
+				fmt.Fprintf(&detail, "%s could not be read, so the paths through it could "+
+					"not be checked (%v)\n", router, err)
+				extra = append(extra, router+": unreadable")
+				continue
+			}
+			ok := map[string]bool{}
+			for _, h := range allowed[router] {
+				ok[h] = true
+			}
+			for h := range hops {
+				if !ok[h] {
+					extra = append(extra, router+" via "+h)
+					fmt.Fprintf(&detail, "%s also forwards toward %s over %s, which no "+
+						"prescribed path uses\n", router, to, h)
+				}
 			}
 		}
 		sort.Strings(extra)
-		for _, x := range extra {
-			fmt.Fprintf(&detail, "%s also forwards over %s, which no prescribed path uses\n", from, x)
-		}
 	}
 
 	got := make([]string, 0)
@@ -516,18 +552,34 @@ func checkVLANIsolation(ctx context.Context, env *Env) Result {
 	}
 
 	// Across VLANs: reachable, but through the gateway.
+	//
+	// "Two hops or more" was the whole test, and it is satisfied by any path
+	// that is not direct -- including one that bypasses the gateway entirely,
+	// which is the misconfiguration the question is about. The first hop must
+	// be the gateway, and it is now checked by address.
 	if len(vlans) >= 2 {
 		src, dst := hosts[vlans[0]][0], hosts[vlans[1]][0]
 		total++
-		hops, err := traceHops(ctx, env, src, dst)
+		hops, first, err := traceFirstHop(ctx, env, src, dst)
 		switch {
 		case err != nil:
 			fmt.Fprintf(&detail, "%s cannot reach %s across VLANs (%v)\n", src.Name, dst.Name, err)
-		case hops >= 2:
-			passed++
-		default:
+		case hops < 2:
 			fmt.Fprintf(&detail, "%s %s; different VLANs must be separated at layer 2\n",
 				src.Name, describeReach(dst.Name, hops))
+		case first == "":
+			// A first hop that did not answer is not a first hop that was the
+			// gateway. This fell through to success, so a path through a
+			// silent wrong router scored the point.
+			fmt.Fprintf(&detail, "%s reaches %s across VLANs, but nothing answered at the "+
+				"first hop, so it cannot be shown to have gone through %s\n",
+				src.Name, dst.Name, gateway.Name)
+		case !deviceHoldsAddr(ctx, env, gateway, first):
+			fmt.Fprintf(&detail, "%s reaches %s across VLANs, but its first hop is %s, "+
+				"which is not %s; traffic between VLANs must be routed by the gateway\n",
+				src.Name, dst.Name, first, gateway.Name)
+		default:
+			passed++
 		}
 	}
 
@@ -590,7 +642,7 @@ func checkInternalReachability(ctx context.Context, env *Env) Result {
 
 // traceHops counts the hops between two hosts.
 func traceHops(ctx context.Context, env *Env, src, dst *model.Device) (int, error) {
-	addr := firstAddr(dst)
+	addr := deviceAddr4(ctx, env, dst)
 	if addr == "" {
 		return 0, fmt.Errorf("%s has no address configured", dst.Name)
 	}
@@ -599,6 +651,92 @@ func traceHops(ctx context.Context, env *Env, src, dst *model.Device) (int, erro
 		return 0, err
 	}
 	return countTracerouteHops(res.Stdout, addr), nil
+}
+
+// traceFirstHop reports how many hops away a destination is and the address
+// that answered first, which is what says *through what* the traffic went.
+func traceFirstHop(ctx context.Context, env *Env, src, dst *model.Device) (int, string, error) {
+	addr := deviceAddr4(ctx, env, dst)
+	if addr == "" {
+		return 0, "", fmt.Errorf("%s has no address configured", dst.Name)
+	}
+	res, err := env.Probe(ctx, src.ID, []string{"traceroute", "-n", "-q", "1", "-w", "2", "-m", "8", addr})
+	if err != nil {
+		return 0, "", err
+	}
+	return countTracerouteHops(res.Stdout, addr), firstTracerouteHop(res.Stdout), nil
+}
+
+// firstTracerouteHop returns the address that answered at hop 1, or "" if
+// nothing did.
+func firstTracerouteHop(out string) string {
+	for _, line := range strings.Split(out, "\n") {
+		m := hopRe.FindStringSubmatch(line)
+		if m == nil || m[1] != "1" {
+			continue
+		}
+		if m[2] == "*" {
+			return ""
+		}
+		return m[2]
+	}
+	return ""
+}
+
+// deviceAddr4 returns the address a device actually has, falling back to the
+// one the manifest planned.
+//
+// The assignment lets a group choose their own datacentre addressing, and this
+// check pinged and traced towards the planned address: a group that used
+// another one was reported unreachable inside their own network, for an answer
+// the assignment permits.
+func deviceAddr4(ctx context.Context, env *Env, d *model.Device) string {
+	res, err := env.Exec(ctx, d.ID, []string{"sh", "-c",
+		"ip -o -4 addr show scope global 2>/dev/null | awk '{print $4}'"})
+	if err == nil && res.ExitCode == 0 {
+		for _, f := range strings.Fields(res.Stdout) {
+			if p, err := netip.ParsePrefix(f); err == nil && p.Addr().Is4() {
+				return p.Addr().String()
+			}
+		}
+	}
+	return firstAddr(d)
+}
+
+// deviceHoldsAddr reports whether a device actually holds an address.
+func deviceHoldsAddr(ctx context.Context, env *Env, d *model.Device, addr string) bool {
+	if d == nil || addr == "" {
+		return false
+	}
+	res, err := env.Exec(ctx, d.ID, []string{"sh", "-c",
+		"ip -o -4 addr show scope global 2>/dev/null | awk '{print $4}'"})
+	if err == nil && res.ExitCode == 0 {
+		for _, f := range strings.Fields(res.Stdout) {
+			if p, perr := netip.ParsePrefix(f); perr == nil && p.Addr().String() == addr {
+				return true
+			}
+		}
+		// The device answered and does not hold it. The plan is not consulted:
+		// this is about where the traffic actually went.
+		return false
+	}
+	return deviceHasAddr(d, addr)
+}
+
+// deviceHasAddr reports whether an address belongs to a device.
+func deviceHasAddr(d *model.Device, addr string) bool {
+	if d == nil {
+		return false
+	}
+	for _, i := range d.Ifaces {
+		if i.Addr4 != "" && ipOnly(i.Addr4) == addr {
+			return true
+		}
+		if i.Addr6 != "" && ipOnly(i.Addr6) == addr {
+			return true
+		}
+	}
+	return false
 }
 
 // describeReach turns a hop count into something that is true.
@@ -697,4 +835,25 @@ func ratio(got, want int) float64 {
 		got = 0
 	}
 	return float64(got) / float64(want)
+}
+
+// sortedKeysOfStrings returns a map's keys in order, so a report reads the same
+// way twice.
+func sortedKeysOfStrings(m map[string][]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// sortedKeysOfBool returns a set's members in order.
+func sortedKeysOfBool(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }

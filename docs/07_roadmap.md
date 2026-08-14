@@ -224,6 +224,42 @@ existing Kubernetes backend rather than duplicated.
 
 ---
 
+## M9 — Heterogeneous vendors (10 d)
+
+**Deliver:** a device's network operating system is a declaration, not an
+assumption. Full design in [03 §9](03_topology_model.md).
+
+- `internal/nos`: render, apply, read and describe, with FRR as the first
+  implementation rather than the only path.
+- `internal/netstate`: a vendor-neutral view of routes and sessions, and every
+  grading check moved onto it. A check that still parses FRR's JSON fails
+  silently on a non-FRR device, which is worse than refusing.
+- Capability declaration, so a manifest asking for a feature an implementation
+  does not have is refused at validation time, naming device and feature.
+- BIRD and OpenBGPD images, pinned by digest; SONiC behind an opt-in.
+
+**Acceptance:** take `examples/cos461`, change two routers to a second NOS, and
+the reference scores identically under the unchanged rubric.
+
+## M10 — Topology types within an AS (6 d)
+
+**Deliver:** the interior of an AS is generated from a declared shape, the way
+the inter-AS graph already is. Full design in [03 §10](03_topology_model.md).
+
+- An interior generator registry sharing one mechanism with
+  `peerings.generator`: `explicit`, `ring`, `two-tier`, `clos`.
+- Addressing derived from a link's role, not only its index, so a fabric's
+  subnets do not run out.
+- A placement strategy that cuts a fabric along the spine-leaf boundary.
+- Rubrics declare which interior kinds they grade; grading an interior a rubric
+  does not name is refused rather than marked wrongly.
+
+**Acceptance:** a Clos interior deploys, converges, grades and places across
+three nodes; the existing labs, expressed as `kind: explicit`, produce identical
+topology hashes to today's.
+
+---
+
 ## Summary
 
 | Milestone | Days | Cumulative |
@@ -237,6 +273,8 @@ existing Kubernetes backend rather than duplicated.
 | M6 Scale validation | 3 | 28 |
 | M7 Course parity and docs | 4 | 32 |
 | M8 Fault injection and RCA | 8 | 40 |
+| M9 Heterogeneous vendors | 10 | 50 |
+| M10 Topology types within an AS | 6 | 56 |
 
 ## Risks and mitigations
 

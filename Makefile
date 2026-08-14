@@ -33,6 +33,8 @@ build:
 	$(GO) build -trimpath -ldflags '$(LDFLAGS)' -o $(BIN)/twinet ./cmd/twinet
 	$(GO) build -trimpath -ldflags '$(LDFLAGS)' -o $(BIN)/twinetd ./cmd/twinetd
 	CGO_ENABLED=0 $(GO) build -trimpath -ldflags '$(LDFLAGS)' -o $(BIN)/twinet-rtr ./cmd/twinet-rtr
+	CGO_ENABLED=0 $(GO) build -trimpath -ldflags '$(LDFLAGS)' -o $(BIN)/twinet-dhcpd ./cmd/twinet-dhcpd
+	CGO_ENABLED=0 $(GO) build -trimpath -ldflags '$(LDFLAGS)' -o $(BIN)/twinet-mcast ./cmd/twinet-mcast
 
 test:
 	$(GO) test -race -count=1 ./...
@@ -108,6 +110,9 @@ tidy-check:
 # repository and not a binary from somewhere else.
 images: build
 	@cp $(BIN)/twinet-rtr images/svc/twinet-rtr
+	@cp $(BIN)/twinet-dhcpd images/router/twinet-dhcpd
+	@cp $(BIN)/twinet-mcast images/host/twinet-mcast
+	@cp $(BIN)/twinet-mcast images/router/twinet-mcast
 	@for i in $(IMAGES); do \
 		echo "building $(REGISTRY)/twinet-$$i:$(TAG)"; \
 		$(DOCKER) build -q -t $(REGISTRY)/twinet-$$i:$(TAG) images/$$i || exit 1; \
@@ -136,8 +141,16 @@ install: build
 	install -m 0755 $(BIN)/twinet /usr/local/bin/twinet
 	install -m 0755 $(BIN)/twinetd /usr/local/bin/twinetd
 
+# The test binary is version-stamped exactly like the real one. Without this it
+# reports itself as "dev" and every test that talks to a cluster refuses on
+# version skew -- against agents built from this very tree.
+#
+# The timeout is set explicitly because the suite deploys labs, injects
+# forty-odd faults and grades a system against a live cluster; Go's ten-minute
+# default kills it partway through, and a killed run leaves a grading hold
+# behind that refuses the next thing anybody does to the lab.
 e2e: build
-	$(GO) test -count=1 -tags e2e ./test/e2e/...
+	$(GO) test -count=1 -tags e2e -timeout 40m -ldflags '$(LDFLAGS)' ./test/e2e/...
 
 clean:
 	rm -rf $(BIN)

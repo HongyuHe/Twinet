@@ -54,8 +54,21 @@ type AS struct {
 	// MPLS and VRFs carry the advanced course's label-switching and
 	// virtual-routing configuration through to the renderer and the grader,
 	// so both work from the same declaration rather than from two.
-	MPLS MPLSSpec
-	VRFs map[string]*VRFSpec
+	MPLS      MPLSSpec
+	Multicast MulticastSpec
+	VRFs      map[string]*VRFSpec
+
+	// Provisioned is the compiled result of the template's provisioning
+	// declaration: the configuration domains Twinet configures even though this
+	// is a student AS. Empty means the students configure everything, which is
+	// what a teaching lab usually wants and what every manifest used to get
+	// whatever it declared.
+	Provisioned map[string]bool
+	// ProvisionedIfaces are the individual interfaces named by an `iface` rule,
+	// keyed "device/iface". A rule that names one was previously skipped
+	// outright, so a service attachment declared as provisioned was left for
+	// the student to guess at.
+	ProvisionedIfaces map[string]bool
 }
 
 // VRFsSorted returns the VRF names in a stable order.
@@ -119,6 +132,16 @@ type Device struct {
 	Ifaces []*Iface
 	// Services names the services attached to this device.
 	Services []string
+	// ServiceKind is the declared kind of a service container, e.g.
+	// "builtin.rpki".
+	//
+	// The renderer used to decide what daemon to start by looking for a
+	// substring in the device's name, so a manifest that declared
+	// `validator: {kind: builtin.rpki}` produced a container that validated
+	// nothing and reported no error, while one that declared
+	// `dns_probe: {kind: container}` had a resolver started inside it. What a
+	// service is is declared; it does not have to be guessed.
+	ServiceKind string
 	// L2Gateway is the L2 domain this router is gateway for, if any.
 	L2Gateway string
 	// VLANs is populated for switches: the set of VLAN ids in their domain.

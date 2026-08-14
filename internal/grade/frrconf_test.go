@@ -119,3 +119,21 @@ exit
 		t.Error("the in-region filter was not found in the policy applied from the route server")
 	}
 }
+
+// The question asks for IPv6 over IPv4 -- protocol 41, printed by iproute2 as
+// "ipv6/ip". A GRE tunnel between the same two addresses carries the same
+// traffic and moves the same counters, so accepting any tunnel with two
+// endpoints awarded the mark for a different answer to a different question.
+func TestOnlyA6in4TunnelCounts(t *testing.T) {
+	const gre = "sit0: ipv6/ip remote any local any ttl 64\n" +
+		"tun6: gre/ip remote 3.153.0.1 local 3.156.0.1 ttl 64\n"
+	if got := configuredTunnel(gre); got != "" {
+		t.Errorf("a GRE tunnel was accepted as the answer to the 6in4 question (got %q)", got)
+	}
+
+	const sit = "sit0: ipv6/ip remote any local any ttl 64\n" +
+		"tun6: ipv6/ip remote 3.153.0.1 local 3.156.0.1 ttl 64 6rd-prefix 2002::/16\n"
+	if got := configuredTunnel(sit); got != "tun6" {
+		t.Errorf("a correct 6in4 tunnel was not recognised (got %q)", got)
+	}
+}

@@ -1,0 +1,16 @@
+{{define "head"}}<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<title>Twinet — {{.Lab}}</title>
+<style>
+ body{font:14px/1.5 system-ui,sans-serif;margin:2rem;color:#111;max-width:70rem}
+ h1{font-size:1.3rem} h2{font-size:1.05rem;margin-top:2rem}
+ nav a{margin-right:1rem} table{border-collapse:collapse;margin-top:.5rem}
+ td,th{border:1px solid #ccc;padding:.2rem .5rem;text-align:left;font-variant-numeric:tabular-nums}
+ th{background:#f4f4f4} .y{background:#d8f0d8} .n{background:#f5d5d5} .u{background:#eee;color:#777} .i{background:#ffe0b0}
+ pre{background:#f7f7f7;padding:.75rem;overflow:auto;border:1px solid #ddd}
+ .err{color:#a00} .muted{color:#666}
+</style></head><body>
+<nav><a href="/">overview</a><a href="/matrix">connectivity</a><a href="/lg">looking glass</a></nav>
+<h1>{{.Lab}}</h1>{{end}}
+{{define "foot"}}<p class="muted">Twinet — read-only. Nothing on these pages can change the lab.</p>
+</body></html>{{end}}

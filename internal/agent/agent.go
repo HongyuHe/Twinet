@@ -131,6 +131,12 @@ type Server struct {
 	// -- and a single slot would make each new deployment forget the previous
 	// one, so a later destroy could no longer capture the work it holds.
 	current map[string]*model.Topology
+	// modes records what each lab was applied as, so a repair rebuilds what
+	// the lab is rather than what it started as.
+	modes map[string]string
+
+	// ungraded is the AS each lab exempted from the reference solution, if any.
+	ungraded map[string]int
 	// peers records the VTEP address of every other node, per lab, so that a
 	// cross-node link can be rebuilt without waiting for the controller to
 	// send the map again.
@@ -147,6 +153,19 @@ type Server struct {
 	// whole cluster, which is exactly what makes grading a class one submission
 	// at a time instead of many.
 	ops map[string]*lease
+
+	// holds are labs an external operation has asked this node to leave alone.
+	holds map[string]*hold
+
+	// repairFails counts consecutive failed repairs, keyed by lab and device.
+	repairFails map[string]int
+
+	// exempt records, per lab, the devices that are broken on purpose.
+	exempt map[string]*exemptions
+
+	// partial counts consecutive surveys in which a device has been missing
+	// some, but not all, of its interfaces.
+	partial map[string]int
 }
 
 // lease records an in-flight mutating operation on one lab.
@@ -168,6 +187,11 @@ func New(cfg Config) (*Server, error) {
 		cfg: cfg, rt: engine, started: time.Now(),
 		current: map[string]*model.Topology{},
 		ops:     map[string]*lease{},
+		holds:   map[string]*hold{},
+
+		repairFails: map[string]int{},
+		exempt:      map[string]*exemptions{},
+		partial:     map[string]int{},
 	}
 	if cfg.StateDir != "" {
 		st, err := state.Open(cfg.StateDir)
@@ -216,6 +240,8 @@ func (s *Server) rehydrate() {
 			continue
 		}
 		s.current[top.Name] = top
+		s.rememberHow(top.Name, wt.Mode, wt.Ungraded)
+		s.loadExemptions(top.Name)
 		if wt.PeerUnderlay != nil {
 			if s.peers == nil {
 				s.peers = map[string]map[string]string{}
@@ -265,6 +291,42 @@ func (s *Server) acquire(lab, kind string) error {
 	return nil
 }
 
+// rememberHow records how a lab was deployed, so a repair rebuilds what the lab
+// is rather than what the software would build from scratch.
+//
+// Both halves are needed and they are recorded together. A private grading
+// harness is deployed solved except for the one system being marked; replaying
+// only the mode rebuilds that system with the reference answer on it, for the
+// student whose work is being marked against it. Recording them in one place
+// means a caller cannot record half of it.
+//
+// The caller holds s.mu.
+func (s *Server) rememberHow(lab, mode string, ungraded int) {
+	if s.modes == nil {
+		s.modes = map[string]string{}
+	}
+	if s.ungraded == nil {
+		s.ungraded = map[string]int{}
+	}
+	s.modes[lab] = mode
+	s.ungraded[lab] = ungraded
+}
+
+// modeToPersist decides what mode is written to disk for a lab.
+//
+// Only an apply entitled to say how the lab was built writes it. A scoped or
+// failed one keeps whatever was already recorded, because the alternative is a
+// restarted agent believing a lab is at the reference when only one AS of it
+// ever was -- and a lab believed to be at the reference has its snapshotting
+// suppressed, so every student's work stops being preserved.
+func modeToPersist(authoritative bool, mode string, ungraded int,
+	prevMode string, prevUngraded int) (string, int) {
+	if authoritative {
+		return mode, ungraded
+	}
+	return prevMode, prevUngraded
+}
+
 func (s *Server) release(lab string) {
 	s.mu.Lock()
 	delete(s.ops, lab)
@@ -278,11 +340,13 @@ func (s *Server) Serve(ctx context.Context) error {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/status", s.auth(s.handleStatus))
-	mux.HandleFunc("GET /v1/containers", s.auth(s.handleContainers))
+	mux.HandleFunc("GET /v1/status", s.authDiag(s.handleStatus))
+	mux.HandleFunc("GET /v1/containers", s.authDiag(s.handleContainers))
 	mux.HandleFunc("POST /v1/apply", s.auth(s.handleApply))
 	mux.HandleFunc("POST /v1/destroy", s.auth(s.handleDestroy))
-	mux.HandleFunc("POST /v1/exec", s.auth(s.handleExec))
+	mux.HandleFunc("POST /v1/exec", s.authDiag(s.handleExec))
+	mux.HandleFunc("POST /v1/hold", s.auth(s.handleHold))
+	mux.HandleFunc("POST /v1/exempt", s.auth(s.handleExempt))
 	mux.HandleFunc("POST /v1/lifecycle", s.auth(s.handleLifecycle))
 	mux.HandleFunc("POST /v1/reshape", s.auth(s.handleReshape))
 	mux.HandleFunc("GET /v1/images", s.auth(s.handleImages))
@@ -469,11 +533,31 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if owners, err := netx.OverlayOwners(); err == nil {
 		resp.Overlays = owners
 	}
+	// A diagnostic caller is told about the node it is looking at and nothing
+	// about the rest of the cluster's business.
+	if scope, ok := diagScopeOf(r); ok {
+		resp.Overlays = nil
+		resp.Busy = nil
+		resp.Labs = nil
+		resp.Hash = ""
+		resp.Lab = ""
+		for _, l := range labs {
+			if l == scope {
+				resp.Lab, resp.Labs = scope, []string{scope}
+			}
+		}
+	}
 	writeJSON(w, resp)
 }
 
 func (s *Server) handleContainers(w http.ResponseWriter, r *http.Request) {
 	lab := r.URL.Query().Get("lab")
+	// A diagnostic caller sees its own lab and no other, whatever it asked
+	// for. Listing the cluster would tell it which other labs exist and, on a
+	// grading node, which harnesses are running.
+	if scope, ok := diagScopeOf(r); ok {
+		lab = scope
+	}
 	f := rt.Filter{All: true, Labels: map[string]string{deploy.LabelManaged: "true"}}
 	if lab != "" {
 		f.Labels[deploy.LabelLab] = lab
@@ -488,6 +572,10 @@ func (s *Server) handleContainers(w http.ResponseWriter, r *http.Request) {
 
 // ApplyRequest carries the slice of a topology this node is responsible for.
 type ApplyRequest struct {
+	// Hold is the caller's grading-hold token, if it has one. A lab that is
+	// held refuses changes from anybody else.
+	Hold string `json:"hold,omitempty"`
+
 	Topology   *Wire  `json:"topology"`
 	Mode       string `json:"mode"`
 	PullPolicy string `json:"pull_policy"`
@@ -535,6 +623,10 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, fmt.Errorf("rehydrate topology: %w", err))
 		return
 	}
+	if why := s.refuseMutationIfHeld(top.Name, req.Hold, "this deployment"); why != "" {
+		httpError(w, http.StatusConflict, errors.New(why))
+		return
+	}
 	if err := s.acquire(top.Name, "apply"); err != nil {
 		httpError(w, http.StatusConflict, err)
 		return
@@ -546,10 +638,11 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		mode = render.ModePlatform
 	}
 	eng := &deploy.Engine{
-		Runtime:    s.rt,
-		Node:       s.cfg.Node,
-		PullPolicy: rt.PullPolicy(req.PullPolicy),
-		Renderer:   renderer(top, mode, req.Ungraded),
+		Runtime:         s.rt,
+		Node:            s.cfg.Node,
+		PullPolicy:      rt.PullPolicy(req.PullPolicy),
+		Renderer:        renderer(top, mode, req.Ungraded),
+		WritesReference: mode == render.ModeSolve,
 		// Solve mode installs the reference solution, which is the one case
 		// where the rendered configuration must overwrite what is there.
 		Authoritative: mode == render.ModeSolve && req.Ungraded == 0,
@@ -582,6 +675,16 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Whether this apply is entitled to say how the lab was built.
+	//
+	// The same condition guards the in-memory record and the one on disk. It
+	// used to guard only the first, so a scoped or failed `--solve --only
+	// as=3` left "solve" on disk with the in-memory record correctly untouched
+	// -- and an agent restart read the disk copy back, so the node came up
+	// believing an unsolved lab was the reference and stopped preserving
+	// anybody's work.
+	authoritative := len(req.OnlySteps) == 0 && !rep.Failed()
+
 	s.mu.Lock()
 	// A dry run changed nothing on this node, so it must not become what the
 	// node believes it is hosting. Recording it made the agent claim a lab it
@@ -589,6 +692,16 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 	// would try to capture student work from containers that did not exist.
 	if !req.DryRun {
 		s.current[top.Name] = top
+		// Only a complete, successful solve makes the whole lab solved.
+		//
+		// `--solve --only as=3` restricts what runs and then recorded the
+		// entire lab as solved, so a later destroy skipped capturing every
+		// other system's work. A partial failure did the same. The record is
+		// what tells destroy whose configuration is whose, and it has to mean
+		// what it says.
+		if authoritative {
+			s.rememberHow(top.Name, req.Mode, req.Ungraded)
+		}
 	}
 	if s.peers == nil {
 		s.peers = map[string]map[string]string{}
@@ -604,21 +717,43 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 	// anything to capture.
 	// A dry run changed nothing, so recording it would make the node claim to
 	// host a lab that was never built.
+	var recordFailure string
 	if s.store != nil && !req.DryRun {
 		// The peer map travels with the lab so a node that restarts can rebuild
 		// a cross-node link without the controller.
 		wt := req.Topology
 		wt.PeerUnderlay = req.PeerUnderlay
-		if raw, err := json.Marshal(wt); err == nil {
-			if err := s.store.PutTopology(top.Name, raw); err != nil {
-				slog.Warn("recording the applied topology", "lab", top.Name, "err", err)
-			}
+		s.mu.Lock()
+		prevMode, prevUngraded := s.modes[top.Name], s.ungraded[top.Name]
+		s.mu.Unlock()
+		wt.Mode, wt.Ungraded = modeToPersist(authoritative,
+			req.Mode, req.Ungraded, prevMode, prevUngraded)
+		raw, err := json.Marshal(wt)
+		if err == nil {
+			err = s.store.PutTopology(top.Name, raw)
+		}
+		if err != nil {
+			// Reported to the caller, not merely journaled.
+			//
+			// This is the record that tells a restarted agent the node hosts
+			// anything at all. Without it the node comes back believing it is
+			// empty: nothing is repaired, and the next destroy removes a
+			// class's work without capturing it, because there is no topology
+			// saying there was anything to capture. An operator who is told
+			// the deploy succeeded has no reason to look in the journal.
+			slog.Error("recording the applied topology", "lab", top.Name, "err", err)
+			recordFailure = fmt.Sprintf("the deployment was applied but this node could "+
+				"not record it (%v); if this agent restarts it will believe the node is "+
+				"empty, and nothing here will be repaired or preserved", err)
 		}
 	}
 
 	resp := ApplyResponse{
 		Node: s.cfg.Node, Steps: p.Len(),
 		DurationMS: rep.Duration.Milliseconds(),
+	}
+	if recordFailure != "" {
+		resp.Failures = map[string][]string{"state": {recordFailure}}
 	}
 
 	// Pruning happens only after a clean run and only when asked, so a partial
@@ -652,7 +787,18 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 
 	// Snapshot student work at the end of every successful apply, so the most
 	// recent copy is never older than the last time anyone touched the lab.
-	if s.store != nil && !req.DryRun {
+	//
+	// Except when the apply *wrote* the reference solution. What is on those
+	// routers is then the answer, not anybody's work, and capturing it files
+	// the answer as the student's own saved configuration -- to be replayed
+	// onto their router the next time a container is recreated, or handed back
+	// when the lab is redeployed for teaching. Measured on this cluster: a
+	// snapshot of as5/CHI held the complete reference iBGP, OSPF, exchange and
+	// policy configuration.
+	//
+	// A grading run solves the lab constantly, so this is not a corner case;
+	// it is what every class run would do to every student.
+	if s.store != nil && !req.DryRun && req.Mode != string(render.ModeSolve) {
 		if n, err := eng.CaptureAll(r.Context(), top, s.store); err != nil {
 			slog.Warn("capturing student configuration", "err", err, "saved", n)
 		} else if n > 0 {
@@ -672,6 +818,9 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 
 // DestroyRequest asks the node to remove a lab.
 type DestroyRequest struct {
+	// Hold is the caller's grading-hold token, if it has one.
+	Hold string `json:"hold,omitempty"`
+
 	Lab  string   `json:"lab"`
 	VNIs []uint32 `json:"vnis,omitempty"`
 	// Force skips the pre-destroy snapshot of student work.
@@ -708,6 +857,10 @@ func (s *Server) handleDestroy(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, errors.New("a lab name is required"))
 		return
 	}
+	if why := s.refuseMutationIfHeld(req.Lab, req.Hold, "removing it"); why != "" {
+		httpError(w, http.StatusConflict, errors.New(why))
+		return
+	}
 	if err := s.acquire(req.Lab, "destroy"); err != nil {
 		httpError(w, http.StatusConflict, err)
 		return
@@ -719,20 +872,76 @@ func (s *Server) handleDestroy(w http.ResponseWriter, r *http.Request) {
 	// Destroying a lab must not lose a class's work: everything is captured
 	// first, and refusing is better than proceeding blind.
 	if s.store != nil && !req.Force && !req.Ephemeral {
+		if err := s.captureBeforeDestroy(r.Context(), eng, req.Lab); err != nil {
+			httpError(w, http.StatusConflict, err)
+			return
+		}
+	}
+	s.destroyLab(w, r, eng, req)
+}
+
+// captureBeforeDestroy saves what the students have on this node, and refuses
+// when it cannot tell whether there is anything to save.
+func (s *Server) captureBeforeDestroy(ctx context.Context, eng *deploy.Engine, lab string) error {
+	{
 		s.mu.Lock()
-		top := s.current[req.Lab]
+		top := s.current[lab]
+		solved := s.modes[lab] == string(render.ModeSolve)
 		s.mu.Unlock()
-		if top != nil {
-			if n, err := eng.CaptureAll(r.Context(), top, s.store); err != nil {
-				httpError(w, http.StatusConflict, fmt.Errorf(
+		// Not while the reference solution is what is on the devices.
+		//
+		// Capture was stopped on the apply path and not here, so destroying a
+		// solved grading lab -- which is every lab a class run touches -- still
+		// filed the answer as each student's saved configuration, to be
+		// replayed the next time anything recreated their container.
+		switch {
+		case solved:
+			// Nothing of anybody's to save: the reference answer is what is on
+			// the devices.
+		case top == nil:
+			// This node does not know what the lab is, so it cannot read
+			// anybody's work out of it -- and it used to destroy it anyway.
+			//
+			// The topology is held in memory and on disk, and the disk copy is
+			// what an agent reads after a restart. If that read fails, or the
+			// record was never written, the node comes up hosting a class's
+			// containers with no idea what they are, and this branch quietly
+			// skipped straight to removing them. A term's work, deleted, with
+			// the destroy reporting success.
+			cs, err := s.rt.List(ctx, rt.Filter{All: true, Labels: map[string]string{
+				deploy.LabelManaged: "true", deploy.LabelLab: lab}})
+			if err != nil {
+				return fmt.Errorf(
+					"refusing to destroy %s: this node has no record of the lab and its "+
+						"containers could not be listed either (%w), so there is no way to "+
+						"tell whether anybody's work is about to be deleted; pass force to "+
+						"override", lab, err)
+			}
+			if len(cs) > 0 {
+				return fmt.Errorf(
+					"refusing to destroy %s: this node is running %d container(s) of it but "+
+						"has no record of what the lab is, so their configuration cannot be "+
+						"captured. Apply the lab first so the node knows what it is holding, "+
+						"or pass force to destroy it and lose whatever is inside",
+					lab, len(cs))
+			}
+		default:
+			if n, err := eng.CaptureAll(ctx, top, s.store); err != nil {
+				return fmt.Errorf(
 					"refusing to destroy %s: student configuration could not be captured (%w); "+
-						"pass force to override", req.Lab, err))
-				return
+						"pass force to override", lab, err)
 			} else if n > 0 {
-				slog.Info("captured before destroy", "lab", req.Lab, "snapshots", n)
+				slog.Info("captured before destroy", "lab", lab, "snapshots", n)
 			}
 		}
 	}
+	return nil
+}
+
+// destroyLab removes the lab from this node and reports what it could not
+// clean up.
+func (s *Server) destroyLab(w http.ResponseWriter, r *http.Request,
+	eng *deploy.Engine, req DestroyRequest) {
 	if err := eng.Destroy(r.Context(), req.Lab); err != nil {
 		httpError(w, http.StatusInternalServerError, err)
 		return
@@ -810,6 +1019,10 @@ func (s *Server) handleDestroy(w http.ResponseWriter, r *http.Request) {
 
 // ExecRequest runs a command inside a container on this node.
 type ExecRequest struct {
+	// Hold is the caller's grading-hold token, if it has one. A lab that is
+	// held refuses commands from anybody else.
+	Hold string `json:"hold,omitempty"`
+
 	Container string   `json:"container"`
 	Cmd       []string `json:"cmd"`
 	// Owner, when set, must match the container's twinet.owner label. This is
@@ -847,6 +1060,9 @@ func (s *Server) handleImages(w http.ResponseWriter, r *http.Request) {
 // different queue from the one the topology describes, and every later
 // measurement on it is quietly wrong.
 type ReshapeRequest struct {
+	// Hold is the caller's grading-hold token, if it has one.
+	Hold string `json:"hold,omitempty"`
+
 	Container string       `json:"container"`
 	Iface     string       `json:"iface"`
 	Shaping   netx.Shaping `json:"shaping"`
@@ -861,6 +1077,14 @@ func (s *Server) handleReshape(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Container == "" || req.Iface == "" {
 		httpError(w, http.StatusBadRequest, errors.New("container and iface are both required"))
+		return
+	}
+	// Changing a link's delay or bandwidth during a class run changes the
+	// marks on the traffic-engineering question, and nothing in the report
+	// would say the network had been reshaped underneath it.
+	if why := s.refuseMutationIfHeld(s.labOfContainer(req.Container), req.Hold,
+		"reshaping a link"); why != "" {
+		httpError(w, http.StatusConflict, errors.New(why))
 		return
 	}
 	c, err := s.rt.Inspect(r.Context(), req.Container)
@@ -890,6 +1114,9 @@ func (s *Server) handleReshape(w http.ResponseWriter, r *http.Request) {
 
 // LifecycleRequest asks the agent to change a container's run state.
 type LifecycleRequest struct {
+	// Hold is the caller's grading-hold token, if it has one.
+	Hold string `json:"hold,omitempty"`
+
 	Container string `json:"container"`
 	// Action is one of state, pause, unpause, stop, start or restart.
 	Action string `json:"action"`
@@ -904,6 +1131,14 @@ func (s *Server) handleLifecycle(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Container == "" || req.Action == "" {
 		httpError(w, http.StatusBadRequest, errors.New("container and action are both required"))
+		return
+	}
+	// Stopping or restarting a container of a lab somebody is grading changes
+	// the marks: a restarted router loses its namespace and comes back with
+	// nothing, and the submission that was about to be measured is gone.
+	if why := s.refuseMutationIfHeld(s.labOfContainer(req.Container), req.Hold,
+		"changing a container's run state"); why != "" {
+		httpError(w, http.StatusConflict, errors.New(why))
 		return
 	}
 	c, err := s.rt.Inspect(r.Context(), req.Container)
@@ -964,6 +1199,28 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, errors.New("container and cmd are both required"))
 		return
 	}
+	// A diagnostic caller is something under evaluation. It may look at one
+	// lab, and it may only look: the hold token, other labs, and every command
+	// that could change a device are refused here rather than trusted to the
+	// caller's good manners.
+	diagLab, diagnostic := diagScopeOf(r)
+	if diagnostic {
+		if req.Hold != "" {
+			httpError(w, http.StatusForbidden,
+				errors.New("a diagnostic session may not present a grading hold"))
+			return
+		}
+		if err := ReadOnlyCommand(req.Cmd); err != nil {
+			httpError(w, http.StatusForbidden, err)
+			return
+		}
+	}
+	// Running a command inside a lab somebody is grading would land in
+	// somebody's marks. The grader passes its own hold token and is admitted.
+	if why := s.refuseIfHeldByAnother(req.Container, req.Hold); why != "" {
+		httpError(w, http.StatusConflict, errors.New(why))
+		return
+	}
 	c, err := s.rt.Inspect(r.Context(), req.Container)
 	if err != nil {
 		httpError(w, http.StatusInternalServerError, err)
@@ -980,6 +1237,12 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 	if req.Owner != "" && c.Labels[deploy.LabelOwner] != req.Owner {
 		httpError(w, http.StatusForbidden,
 			fmt.Errorf("%s belongs to %q, not %q", req.Container, c.Labels[deploy.LabelOwner], req.Owner))
+		return
+	}
+	if diagnostic && c.Labels[deploy.LabelLab] != diagLab {
+		httpError(w, http.StatusForbidden,
+			fmt.Errorf("this diagnostic session is scoped to lab %q; %s belongs to %q",
+				diagLab, req.Container, c.Labels[deploy.LabelLab]))
 		return
 	}
 	res, err := s.rt.Exec(r.Context(), req.Container, rt.ExecCmd{Cmd: req.Cmd})

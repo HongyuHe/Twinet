@@ -23,11 +23,11 @@ missed it is recorded as a miss.
 | Staged deployment DAG with per-scope failure isolation | done | `internal/plan`; tests assert stage ordering, real concurrency, and that one broken AS does not stop a class |
 | Convergence predicates in place of sleeps | done | `internal/plan.Wait`, `internal/grade/converge.go` |
 | Single-node deployment | done | 4-AS demo: 57 devices, 74 links, 64 s |
-| Node agent and cluster fabric | done | 12-AS lab: 211 devices, 291 links across 3 nodes in **83 s**, zero failures |
+| Node agent and cluster fabric | done | 12-AS lab: 212 devices, 299 links across 3 nodes in **58 s**, zero failures |
 | Cross-node VXLAN | done | 50.22 ms measured for a 25 ms configured delay, 9 µs jitter, no duplicates |
 | AS-granular placement | done | 13.4 % of links cross the fabric; `twinet inspect --placement` |
 | Underlay MTU verification | done | `twinet node check` refuses a lab that would not fit and names the MTU to use |
-| Grading engine: rubric, 17 checks, structured reports | done | 3 submissions in **31 s**; JSON, text and CSV output |
+| Grading engine: rubric, 23 registered checks, structured reports | done | the COS-461 rubric uses 20 of them; 8 systems graded in **79 s**; JSON, text and CSV output |
 | Reference solution (`--solve`) | done | scores **10.00 / 10.00** against its own rubric, verified end to end and re-checked by `make e2e` |
 | Container images | done | `hyhe/twinet-{router,host,switch,svc}` |
 | Reference solution | **10.00 / 10.00** | verified end to end on the live cluster; a rubric whose reference cannot score full marks is unfalsifiable, and every student who loses that mark loses it to the platform |
@@ -37,14 +37,14 @@ missed it is recorded as a miss.
 | Save and restore | done | `twinet save` archives every group work with the topology hash and per-file checksums; restore refuses an archive from a different topology or one edited after it was taken |
 | Per-submission grading harnesses | done | `twinet grade batch` gives each submission a private lab in which every AS but one is solved; verified with two submissions graded concurrently across three nodes |
 | NIKA LabRuntime adapter | done, with one caveat | `TwinetRuntime` subclasses NIKA's `LabRuntime` and implements all ten abstract methods, so the ~50 semantic operations of `ExecSemanticOpsMixin` work; verified live on the three-node cluster, including driving an unmodified `LinkFailure` problem through inject and verify. The caveat: NIKA's problem classes select behaviour with a literal `match` on the backend name and refuse anything that is not `kathara` or `containerlab`, so the runtime must be constructed with `dialect="kathara"` — the arm that is correct for Linux/FRR/eth0 devices. Without it, every problem raises `RuntimeCapabilityError`. See `contrib/nika/README.md`. |
-| Fault injection engine | partial | **42 registered, of which 40 are NIKA's** (NIKA publishes 60). Of the 20 not implemented, 15 need a substrate Twinet does not emulate — 6 P4/BMv2, 4 Kubernetes, 3 SDN-southbound, 2 others — and **5 are applicable and merely unbuilt**: the DHCP family. All 42 inject, verify, resolve, and are then checked to have left the device exactly as they found it; `make e2e` runs the full round trip in 54 s. See [10](10_fault_injection.md) §4.1 |
+| Fault injection engine | partial | **47 registered, of which 45 are NIKA's** (NIKA publishes 60). The 15 not implemented each need a substrate Twinet does not emulate — 6 P4/BMv2, 4 Kubernetes, 3 SDN-southbound, 2 others. 45 of the 47 inject, verify, resolve, and are then checked to have left the device exactly as they found it, in about 88 s of `make e2e`; the other two are skipped by name with reasons (one needs a lab with VRFs, one cannot measurably overwhelm the resolver from a single container). The DHCP family was the last applicable gap and is now built, with each fault checked against a real client asking for a lease rather than against the server's configuration file. See [10](10_fault_injection.md) |
 | Faults are reversible, and proved to be | done | The engine fingerprints a device before and after injecting and requires resolving to leave neither what it added nor a hole where something it removed used to be. Introducing the check immediately found five faults that satisfied their own predicate while leaving the device broken |
 | Fault secrecy | verified | No fault writes a self-identifying path into the device under test. A test reads the fault sources and fails on any such path; it found one on its first run |
 | Self-healing wiring | done | A container that restarts comes back with an empty network namespace. Each node now notices within a minute and rebuilds that device's links and configuration. Measured: `svc/matrix` went 10 interfaces → 2 → 10, repaired 0.8 s after detection, with no deploy run |
-| Incident runner | done | `twinet incident run`; a two-fault scenario injects, holds and unwinds in 798 ms |
+| Incident runner | done | `twinet incident run`; a two-fault scenario injects, holds and unwinds in 798 ms. It also runs an agent and scores what it says against the ground truth: four parts (detection, devices as a Jaccard overlap, category, root-cause names), and the agent is given the brief and never the answer, which the end-to-end suite asserts. Measured with a small agent that greps for a router with too few OSPF adjacencies: 0.70 of 1.00, blaming the router that lost an adjacency as a consequence rather than the one the fault was injected at |
 | Ground-truth isolation | verified | audited: 0 hits for the fault name, root cause or ground truth anywhere in a target container's files, environment or labels |
 | DNS | done | zones are generated from the model, served by BIND in the service container, and every device points at the lab own resolver; verified end to end for forward and reverse lookups |
-| Matrix, looking glass, policy analyzer | partial | the collectors and the analysis are implemented and tested, but nothing yet serves their output, so a student cannot open a looking glass. This is the largest remaining gap |
+| Matrix, looking glass, policy analyzer | done | `twinet web` serves an overview, the connectivity matrix and a looking glass restricted to nine read-only commands. Measured on the cluster: 90 of 90 pairs reachable, the matrix taken in 1.4 s, the looking glass answering from `as3/NYC`, and a command outside the list refused. What it does not have, and the original had, is the time slider over historical snapshots, per-group VPN status and the Krill proxy |
 | _(collectors)_ | done | control-plane collectors; the analyzer reads structured paths and the declared relationships rather than scraping text |
 | CI gates | done | `make ci` refuses to run without golangci-lint and shellcheck rather than reporting a pass it did not verify, and includes `go mod tidy -diff`. Turning the lint on found five real problems. The GitHub workflow is disabled on push by request; `make ci` runs the identical gates |
 | Grading marks behaviour, not text | done | The exchange check requires the policy to be bound to the route server, the 6in4 check requires a tunnel that carried the packets rather than the kernel's own `sit0`, and the RPKI check requires a connected validator holding ROAs before an empty invalid table means anything |
@@ -144,20 +144,171 @@ someone has checked.
 
 | Item | Milestone | Note |
 |---|---|---|
-| Serving the matrix, looking glass and web UI | M2 | The collectors and the analysis are implemented and tested; nothing yet serves their output, so a student cannot open a looking glass. This is the largest remaining gap in the student-facing workflow |
+| The web UI's history: a time slider over past snapshots, per-group VPN status, the Krill proxy | M2 | The matrix, looking glass and overview are served by `twinet web`; the snapshots exist in the state store and nothing renders them |
 | Gateway `save` / SFTP | M2 | `goto`, `status` and `help` are there, and leaving a device shell now returns to the menu rather than dropping the connection. `save` from inside the gateway and SFTP file transfer are not; students collect work with `twinet save` from outside |
 | Krill as a live RPKI publication point | M2 | The lab serves an RTR feed derived from the topology, which is what the exercise needs; a real publication point with per-AS validators is the fuller version |
 | COS-461 Q2.6 stub-AS hijack scenarios | M7 | The RPKI machinery is in place and the check is honest; the scripted hijack scenarios are not written |
 | Diff-and-converge `apply` | M4 | Deploy is idempotent and now self-healing, but does not compute a minimal change plan |
 | Advanced-course exercises: multicast | M7 | MPLS and VRF are done -- `examples/advnet` is the ETH BGP-free-core and BGP/MPLS L3VPN exercise, verified end to end on the cluster: the two sites of each bank reach each other over a two-label stack, neither bank reaches the other, and the core router has no BGP instance and four operational LDP neighbours. Multicast has no exercise and no checks. It is graded: `examples/advnet/rubric/advnet.yaml` is worth 6 points across the BGP-free core, carrying each customer between its sites, and keeping the customers apart. Verified to discriminate on the cluster, not merely to be satisfiable -- the reference scores 6/6; putting BGP on the core scores 0.8/2 on that question alone; making both tables import both route targets scores 0/2 on isolation while reachability still passes |
-| The 20 unimplemented NIKA fault types | M8 | 15 need a substrate Twinet does not emulate (6 P4/BMv2, 4 Kubernetes, 3 SDN-southbound, 2 others); adding them means adding that substrate. The other 5 are the DHCP family. See [10](10_fault_injection.md) §4.1, which explains why DHCP in particular is a design change rather than a fault to add |
-| DHCP, web and load-balancer services, traffic generation | M8 | Prerequisites for nine of those |
+| The 15 unimplemented NIKA fault types | M8 | Each needs a substrate Twinet does not emulate (6 P4/BMv2, 4 Kubernetes, 3 SDN-southbound, 2 others); adding them means adding that substrate. The DHCP family is now implemented: 45 of NIKA's 60 types are covered, verified by asking real clients for leases rather than by reading configuration back. See [10](10_fault_injection.md) |
+| Load-balancer service, traffic generation | M8 | Prerequisites for two of those |
+
+### Addresses the assignment lets students choose
+
+The COS-461 wiki leaves the layer-2 datacentre addresses and the inter-AS
+peering addresses to the students, to be agreed with their neighbours. Twinet
+plans both, and used to grade against its plan: a group that chose its own DCS
+addressing was marked wrong for an answer the assignment permits, and a group
+that agreed different eBGP addresses with a neighbour could not bring the
+session up at all, because the other end was a rendered reference expecting the
+planned address.
+
+Both are now discovered rather than assumed.
+
+- Every check reads the addresses off the devices. The datacentre checks ping
+  what a host actually has; the session checks ask for the address the
+  neighbour actually holds on its end of the link, in the subnet the group
+  chose.
+- Before a wave is graded, the reference side of each inter-AS link is adapted
+  to whatever the submission configured: it is given an address in the group's
+  subnet and a session to theirs, built by copying its own configuration for
+  the planned address with the address substituted, so the relationship, the
+  policies and the route-maps are exactly what the reference would have used.
+  Everything is undone after the wave, and a failure to undo it quarantines the
+  remaining waves rather than grading them against the last group's addressing.
+
+Measured on the cluster with a signed submission that peers on 10.34.0.1/30
+instead of the planned 179.3.4.1/24: 8.96/10 before, losing marks on
+bgp.ebgp_established, policy.gao_rexford and policy.no_transit_for_peers;
+10.00/10 after, with the run reporting `AS 3 configured 10.34.0.1/30 on
+ext_4_BOS instead of the planned 179.3.4.1/24, so as4/BOS was given 10.34.0.2/30
+and a session to 10.34.0.1`.
+
+What is still prescribed: the exchange addressing, which is the exchange's own
+and not a bilateral agreement, and the service subnets.
+
+### Moving an autonomous system between machines is not atomic
+
+`--rebalance` recomputes placement and now removes each system from the node it
+left. The two halves are still independent: each node applies and prunes for
+itself. If the destination fails and the source succeeds, the system is removed
+from the node that had it; if the destination succeeds and the source fails for
+some unrelated reason, the system runs on both and announces its prefix twice.
+
+Both are recoverable by re-running the deployment, and neither can happen to a
+lab nobody is rebalancing -- but a two-phase commit, creating and confirming
+every destination before pruning any source, is what would make it safe, and it
+is not built.
+
+### The agent's listening address
+
+`scripts/deploy_agents.sh --bind-underlay` narrows the agent from every
+interface to the cluster fabric address it already announces as its own, taken
+from the unit rather than from an argument so it cannot disagree with what the
+rest of the cluster dials. The API is mutually authenticated either way -- a
+stranger who reaches the port can do nothing with it -- but a port open to the
+internet collects scans, and this one has no reason to answer anybody outside
+the fabric. Verified on this cluster: `LISTEN 10.0.1.1:7200`.
+
+The agent still runs as root with the host's network namespace and the Docker
+socket, because creating network namespaces, moving interfaces between them and
+building overlays is what it is for. The usual systemd sandboxing directives
+would each have to be disabled again, so none are claimed.
+
+### The web interface
+
+`twinet web -m <lab>` serves three pages on the address the manifest's
+`builtin.web` service declares: an overview of the lab and the machines hosting
+it, the connectivity matrix between every pair of autonomous systems, and a
+looking glass that runs a fixed list of nine read-only commands on any router.
+Nothing on those pages can change a device.
+
+Until this existed, `builtin.web` was declared in the manifests, accepted by the
+schema, and served by nothing at all -- no container, no listener. Measured on
+the cluster: 90 of 90 pairs reachable, matrix taken in 1.4 s, looking glass
+answering from `as3/NYC`, and a command outside the list refused.
+
+What it does not have, and the original had: the time slider over historical
+snapshots, per-group VPN status, and the Krill proxy. The snapshots exist in the
+state store; nothing renders them yet.
+
+### Grading checks that are narrower than their questions
+
+Recorded here rather than implied to be complete:
+
+- `tunnel.sixin4` now tests every host of each datacentre against every host of
+  the other, in both directions, as well as checking that the tunnel is 6in4
+  rather than any encapsulation and that its endpoints are the two gateways'
+  loopbacks. Measured: flushing the IPv6 address of one of AS 3's six
+  datacentre hosts takes the system from 10.00 to 9.00.
+- `policy.ixp_communities` now requires the announcement to be tagged for every
+  member of the exchange, not merely for some real member. Measured: tagging
+  one member of seven takes the system from 10.00 to 9.50.
+- The end-to-end discrimination suite covers q1.2, q2.1 and q2.3. The rest rest
+  on the reference scoring 10/10 and on the checks having been shown to
+  discriminate by hand -- q2.4 against a forged community, q2.2 against
+  next-hop-self removed across an AS, q1.3 against static routes. That is
+  weaker than a suite: it shows the checks accept a correct answer and rejected
+  one wrong one, not that they reject every wrong one, and nothing re-runs those
+  demonstrations.
+
+### Grading a hundred students: measured
+
+Two modes, both fair, with different costs.
+
+`twinet grade class` marks in the deployed lab, one submission at a time, with
+everything else at the reference. Measured: **4m 56s per submission**, and it
+holds the class lab for the duration -- a hundred students is over eight hours
+during which nobody can use their own network.
+
+`twinet grade batch --reduce` gives each submission its own disposable lab
+containing every autonomous system but only the routers of each that face the
+system under test, plus the services it is cabled to and the exchanges whole.
+121 devices instead of 212. The class lab is not touched at all, and harnesses
+run concurrently. Measured on this three-node cluster, with the class lab also
+running:
+
+| Concurrency | Submissions | Wall clock | Per submission |
+|---|---|---|---|
+| 1 | 1 | 6m 17s | 6m 17s |
+| 4 | 4 | 9m 50s | 2m 27s |
+| 8 | 8 | 15m 43s | 1m 58s |
+
+At eight-wide that is a hundred students in about three and a quarter hours, on
+three machines, without the class losing access to their lab. It scales with
+nodes; the class mode does not.
+
+The eight-wide run quarantined one submission of the eight: eight harnesses and
+the class lab together saturated this cluster and one system's routing daemons
+did not start. That is the honest capacity limit of three machines, and it is
+reported as a quarantine rather than as a mark, which is the behaviour that
+matters. On a cluster with room, or without the class lab running alongside, the
+same eight complete.
+
+### What would make the fair mode faster still
+
+Most of a run is waiting for OSPF and then BGP to settle. Three things would
+move it further, in the order they are worth doing:
+
+1. **Neighbours reduced to a single synthetic router each.** Reduction keeps the
+   routers of each neighbour that face the system under test, which on a tiered
+   internet is still most of their borders: 121 devices where the ideal is
+   perhaps 40. Replacing each neighbour with one router that originates its
+   block would cut both the deployment and the convergence again.
+2. **Restoring only what the submission touched.** In class mode the reference
+   is put back over the whole AS, which costs a second convergence. A submission
+   names the devices it changed.
+3. **`--per-wave`.** It exists and works, and batches submissions no two of
+   which are within two systems of each other. It is off by default because that
+   is a heuristic about the peering graph and not a proof of isolation, and
+   marks are not the place to trade correctness for time without being asked.
 
 ## Measurements
 
 | Metric | Value |
 |---|---|
-| 12-AS lab, 211 containers, 291 links, 3 nodes | 83 s |
+| 12-AS lab, 212 containers, 299 links, 3 nodes (current topology) | **44-58 s** |
+| The same lab as it was measured earlier, at 211 containers and 291 links | 83 s -- superseded; the topology and the deployment path have both changed since |
 | Same lab, single node | not attempted; 4-AS/57-container demo takes 64 s |
 | Cross-node link RTT (25 ms configured) | 50.22 ms, σ 9 µs |
 | Links kept local by AS-granular placement, 84-AS lab | **89.7 %** (302 of 2927 cross) |
@@ -167,8 +318,10 @@ someone has checked.
 | Grading, 3 submissions, 10 questions, 17 checks | 31 s |
 | Grading a class of 8 in waves, all scoring 10/10 | **22m 11s in 4 waves**, measured when the conflict relation was adjacency and submissions were loaded onto the solved lab. Both have since changed and this number is not comparable to anything current |
 | Waves needed for 8 student ASes / for 80, under `--per-wave 8` | **6 / 42** — the conflict relation is distance-two, so roughly one wave per two submissions. `--per-wave` is off by default; see [grading](06_grading.md) |
-| `grade class`, 6 real submissions, one at a time, 4-minute convergence budget | **70m 24s, 5 of 6 quarantined.** The cause was routers deployed with no routing daemon, since fixed; the run is being repeated |
-| Same, 2 submissions, 10-minute budget | 31m 15s; the surviving failure traced to a third router whose bgpd had died after deployment |
+| **`grade class`, 8 submissions, one at a time, 5-minute convergence budget** | **39m 29s, 8 of 8 scored 10/10, none quarantined** -- 4m 56s per submission, of which the checks themselves are seconds; the rest is waiting for OSPF, then BGP sessions, then the BGP table to stop changing, twice per submission (once for the submission, once for the reference put back after it). Every archive was saved from the reference, so anything below 10/10 would have been a Twinet defect |
+| Same 8 submissions, before the container-identity fix | 28m 12s, **7 of 8 quarantined**: grading recreated 89 of 212 containers, which empties their network namespaces, so loading failed on `Cannot find device port_BOS` |
+| Containers recreated while grading, before / after that fix | **89 / 0** |
+| Automatic repairs triggered on a lab while it was being graded, before / after the grading hold | **13 / 0** |
 | Grading 1 submission in its own private harness | ~12 minutes; measured, and the reason waves exist |
 | 8 private harnesses at once on 3 nodes | saturates the cluster; the failures are resource exhaustion, not marks |
 | **Class-scale deployment: 84 ASes, 2012 devices, 2927 links across 3 nodes** | **22m 38s, zero failures** |

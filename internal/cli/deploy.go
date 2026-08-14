@@ -20,6 +20,7 @@ import (
 	"github.com/HongyuHe/twinet/internal/client"
 	"github.com/HongyuHe/twinet/internal/deploy"
 	"github.com/HongyuHe/twinet/internal/model"
+	"github.com/HongyuHe/twinet/internal/netx"
 	"github.com/HongyuHe/twinet/internal/place"
 	"github.com/HongyuHe/twinet/internal/plan"
 	"github.com/HongyuHe/twinet/internal/render"
@@ -47,6 +48,20 @@ func newDeployCmd(opts *Options) *cobra.Command {
 is actually running and creates only what is missing, so it is safe to re-run
 after a partial failure, a reboot, or a topology edit.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			// Rebalancing moves systems between machines, and pruning is what
+			// removes them from the machine they left. A scope switches
+			// pruning off, because a scoped deploy has not looked at the
+			// devices outside it and must not delete them -- so asking for
+			// both is asking for a move whose old copy is left running,
+			// announcing the same prefix from two places. Both halves then
+			// look correct, which is why nobody would think to look.
+			if rebalance && only != "" {
+				return fmt.Errorf("--rebalance moves autonomous systems between " +
+					"machines and --only stops the deployment from removing them " +
+					"from the machine they left, so the moved system would run in " +
+					"both places and announce its prefix from both. Rebalance the " +
+					"whole lab, or move nothing")
+			}
 			top, err := load(opts)
 			if err != nil {
 				return err
@@ -121,7 +136,16 @@ after a partial failure, a reboot, or a topology edit.`,
 					PullPolicy: pull,
 					Workers:    workers,
 					DryRun:     dryRun,
-					Prune:      prune && only == "",
+					// A deployment that moves an autonomous system to a
+					// different machine must remove it from the old one.
+					//
+					// Pruning was opt-in, and the engine's own comment says
+					// what that costs: the moved system runs on both nodes and
+					// announces the same prefix from two places, which is a
+					// fault nobody would think to look for because both halves
+					// look correct. A move is exactly when it matters, so a
+					// move now prunes whether it was asked for or not.
+					Prune:      (prune || rebalance) && only == "",
 					Generation: time.Now().UTC().Format("20060102T150405"),
 					OnlySteps:  scope,
 				}, cmd.OutOrStdout(), cmd.ErrOrStderr())
@@ -151,15 +175,21 @@ after a partial failure, a reboot, or a topology edit.`,
 			if err != nil {
 				return err
 			}
+			// Remembered so that a later destroy of a solved lab does not file
+			// the reference as each student's saved configuration.
+			if !dryRun {
+				recordLabMode(top, string(mode))
+			}
 			eng := &deploy.Engine{
-				Runtime:       rt,
-				Node:          node,
-				State:         store,
-				PullPolicy:    runtime.PullPolicy(pull),
-				Renderer:      render.New(top, mode),
-				Authoritative: mode == render.ModeSolve,
-				UnderlayIP:    underlayOf(top, node),
-				PeerUnderlay:  peerUnderlays(top),
+				Runtime:         rt,
+				Node:            node,
+				State:           store,
+				PullPolicy:      runtime.PullPolicy(pull),
+				Renderer:        render.New(top, mode),
+				Authoritative:   mode == render.ModeSolve,
+				WritesReference: mode == render.ModeSolve,
+				UnderlayIP:      underlayOf(top, node),
+				PeerUnderlay:    peerUnderlays(top),
 			}
 
 			p, err := eng.Build(top)
@@ -218,7 +248,8 @@ after a partial failure, a reboot, or a topology edit.`,
 	cmd.Flags().BoolVar(&overcommit, "overcommit", false,
 		"deploy even though a node is asked for more than it declares room for")
 	cmd.Flags().BoolVar(&rebalance, "rebalance", false,
-		"recompute placement from scratch; every AS that moves has its containers rebuilt")
+		"recompute placement from scratch; every AS that moves has its containers rebuilt "+
+			"and removed from the node it left")
 	return cmd
 }
 
@@ -256,6 +287,16 @@ if the manifest that created it is no longer available.`,
 				for _, l := range top.Links {
 					vnis = append(vnis, l.VNI)
 				}
+			} else if t, err := loadAndPlace(opts); err == nil && clustered(t) {
+				// A name and a manifest together: the name says which lab, the
+				// manifest says which machines. Without this, naming a lab fell
+				// straight through to the local container runtime and tried to
+				// clean a cluster's lab up on this machine alone -- which is
+				// also the instruction this code prints when a grading harness
+				// fails to come down, so the documented recovery did not work.
+				// Three abandoned harnesses were found on this cluster and
+				// could not be removed with the command that names them.
+				top = t
 			}
 
 			if top != nil && clustered(top) {
@@ -280,6 +321,29 @@ if the manifest that created it is no longer available.`,
 				if bad > 0 {
 					return fmt.Errorf("%d node(s) failed to clean up", bad)
 				}
+				// The record describes containers that no longer exist.
+				// Leaving it pinned the next deployment to an arrangement
+				// chosen for a lab that is gone -- the single-node path
+				// removed it and this one returned first.
+				//
+				// Only when the lab being destroyed is the manifest's own.
+				// Destroying a grading harness by name uses the class manifest
+				// to say which machines to reach, and this then deleted the
+				// *class's* record: the next deployment placed a running lab
+				// again from scratch, `inspect --placement` disagreed with
+				// what was actually running, and exec against three systems
+				// answered 404 from the wrong nodes. Observed on this cluster.
+				if name != top.Name {
+					fmt.Fprintf(cmd.OutOrStdout(), "removed lab %q from %d nodes\n",
+						name, len(c.Nodes))
+					return nil
+				}
+				if err := os.Remove(filepath.Join(labPrivateDir(top), place.RecordName)); err != nil &&
+					!errors.Is(err, os.ErrNotExist) {
+					fmt.Fprintf(cmd.ErrOrStderr(), "note: the placement record could not be "+
+						"cleared (%v); the next deployment will be pinned to the arrangement "+
+						"chosen for the lab that has just been removed\n", err)
+				}
 				fmt.Fprintf(cmd.OutOrStdout(), "removed lab %q from %d nodes\n",
 					name, len(c.Nodes))
 				return nil
@@ -291,8 +355,31 @@ if the manifest that created it is no longer available.`,
 			if err != nil {
 				return err
 			}
-			if len(cs) == 0 {
+			// The overlays are looked for before concluding there is nothing
+			// here. A lab can have no containers left and still own hundreds of
+			// VXLAN devices -- that is exactly the state an earlier destroy
+			// left behind -- and "nothing to remove" was then untrue in the
+			// most expensive way, because the identifiers stayed in use and the
+			// next lab deriving the same ones would have joined its traffic to
+			// a lab that no longer exists.
+			var strayVNIs []uint32
+			if top == nil && !keep {
+				if owned, oerr := netx.ListOverlaysOfLab(name); oerr == nil {
+					strayVNIs = owned
+				}
+			}
+			if len(cs) == 0 && len(strayVNIs) == 0 {
 				fmt.Fprintf(cmd.OutOrStdout(), "nothing to remove for lab %q\n", name)
+				return nil
+			}
+			if len(cs) == 0 {
+				eng := &deploy.Engine{Runtime: rt, Node: "local"}
+				if err := eng.DestroyOverlays(strayVNIs); err != nil {
+					return fmt.Errorf("removing the overlays of lab %q: %w", name, err)
+				}
+				fmt.Fprintf(cmd.OutOrStdout(),
+					"lab %q had no containers left, and %d overlay object(s) that it still "+
+						"owned have been removed\n", name, len(strayVNIs))
 				return nil
 			}
 			if !yes {
@@ -301,15 +388,50 @@ if the manifest that created it is no longer available.`,
 				return nil
 			}
 
-			store, err := localStore(top)
+			// Without a manifest there is no topology, and everything below
+			// used to dereference one. `twinet destroy --lab NAME` -- the one
+			// path the command's own help recommends for a lab whose manifest
+			// is gone -- panicked with a nil pointer before removing anything.
+			//
+			// The containers carry their own identity in their labels, which is
+			// what makes the command possible at all, so the devices are
+			// reconstructed from them and the same preservation guarantee
+			// holds either way.
+			if top == nil {
+				fmt.Fprintf(cmd.ErrOrStderr(),
+					"no manifest, so this removes lab %q from this machine only. "+
+						"A lab spread over a cluster keeps running everywhere else; "+
+						"destroy it with its manifest, or run this on each node.\n", name)
+			}
+			store, err := destroyStore(top)
 			if err != nil {
 				return err
 			}
-			eng := &deploy.Engine{Runtime: rt, Node: "local", State: store}
+			devTop := top
+			if devTop == nil {
+				devTop = topologyFromLabels(name, cs)
+			}
+			// A destroy of a solved lab must not file the reference as each
+			// student's saved configuration. The cluster path was fixed and
+			// this one, which single-node labs use, was not.
+			// The node the devices are actually placed on, not the string
+			// "local".
+			//
+			// CaptureAll selects devices by node, and with a manifest they are
+			// placed on the machine's real name -- so this matched nothing,
+			// captured nothing, reported "captured 0 snapshots" and then
+			// removed the containers. The reconstructed devices of the
+			// manifest-less path are the ones that are "local".
+			capNode := "local"
+			if top != nil {
+				capNode = localNode(top)
+			}
+			eng := &deploy.Engine{Runtime: rt, Node: capNode, State: store,
+				WritesReference: labWasSolved(top)}
 			// Capture before removing. A destroy that discards a student's
 			// configuration without recording it is unrecoverable, and the
 			// person running it is usually not the person who loses the work.
-			if n, err := eng.CaptureAll(cmd.Context(), top, store); err != nil {
+			if n, err := eng.CaptureAll(cmd.Context(), devTop, store); err != nil {
 				return fmt.Errorf("refusing to destroy %s: its configuration could not be captured first: %w", name, err)
 			} else if n > 0 {
 				fmt.Fprintf(cmd.OutOrStdout(), "captured %d configuration snapshots before destroy\n", n)
@@ -322,6 +444,16 @@ if the manifest that created it is no longer available.`,
 			// `docker ps`, so the next deployment inherits it and fails in a
 			// way that has nothing to do with the cause -- and "removed 212
 			// containers" scrolling past is not something anybody re-reads.
+			// Without a manifest there are no VNIs to remove, and the overlays
+			// were simply left behind: 461 VXLAN devices across three nodes
+			// were found belonging to four labs whose containers had been
+			// removed weeks earlier. They carry the owning lab's name on the
+			// device itself, which is exactly so that this is possible without
+			// consulting anything.
+			if top == nil && !keep {
+				vnis = append(vnis, strayVNIs...)
+			}
+
 			var left []string
 			if !keep && len(vnis) > 0 {
 				if err := eng.DestroyOverlays(vnis); err != nil {
@@ -548,6 +680,9 @@ func resolveImageIDs(ctx context.Context, top *model.Topology, token string) err
 			if err := sameEverywhere(byRef); err != nil {
 				return err
 			}
+			if err := allOrNoneHaveIt(byRef, list, len(cl.Nodes)); err != nil {
+				return err
+			}
 		}
 	} else {
 		rt := runtime.NewDocker()
@@ -573,6 +708,43 @@ func resolveImageIDs(ctx context.Context, top *model.Topology, token string) err
 // The alternative is to deploy anyway and let each student run whatever build
 // happens to be on the node their AS landed on. Nothing downstream can detect
 // that, and no report would mention it.
+// allOrNoneHaveIt refuses a deployment in which some nodes hold an image and
+// others do not.
+//
+// A node without the image is about to pull it, and the tag may have been
+// rebuilt since the others pulled theirs -- so the deployment stamps the old
+// digest into every container's specification while one node quietly runs new
+// software. Nothing downstream can tell, and a student's mark then depends on
+// which machine their autonomous system was placed on.
+//
+// Nobody having it is the ordinary first deployment and is allowed: they will
+// all pull the same tag within seconds of each other, and the next deployment
+// resolves and agrees.
+func allOrNoneHaveIt(byRef map[string]map[string]string, refs []string, nodes int) error {
+	if nodes <= 1 {
+		return nil
+	}
+	var problems []string
+	for _, ref := range refs {
+		have := len(byRef[ref])
+		if have == 0 || have == nodes {
+			continue
+		}
+		problems = append(problems, fmt.Sprintf(
+			"  %s is on %d of %d nodes (%s)", ref, have, nodes,
+			strings.Join(sortedKeysOf(byRef[ref]), ", ")))
+	}
+	if len(problems) == 0 {
+		return nil
+	}
+	return fmt.Errorf("some nodes hold these images and some do not:\n%s\n"+
+		"The nodes without them are about to pull, and if the tag has been rebuilt "+
+		"since the others pulled theirs, half the lab runs different software while "+
+		"every report says one thing. Pull on every node first (`docker pull <image>` "+
+		"on each), or refer to the image by digest so the tag cannot move",
+		strings.Join(problems, "\n"))
+}
+
 func sameEverywhere(byRef map[string]map[string]string) error {
 	var problems []string
 	for _, ref := range sortedKeysOf(byRef) {
@@ -931,4 +1103,104 @@ func serviceNameOf(top *model.Topology, device string) string {
 		}
 	}
 	return device
+}
+
+// destroyStore opens the snapshot store to capture into before a destroy.
+//
+// With a manifest that is the store beside it. Without one there is nowhere
+// obvious, so it goes under the working directory -- the alternative was
+// dereferencing a topology that is not there, which is what this command did.
+func destroyStore(top *model.Topology) (*state.Store, error) {
+	if top != nil {
+		return localStore(top)
+	}
+	dir := filepath.Join(".twinet", "state")
+	st, err := state.Open(dir)
+	if err != nil {
+		return nil, fmt.Errorf("open state store %s: %w", dir, err)
+	}
+	return st, nil
+}
+
+// topologyFromLabels reconstructs just enough of a topology to capture what the
+// containers hold, from the labels they carry.
+//
+// It is not the lab: there are no links, and no addresses. It is the set of
+// devices, their kinds and their autonomous systems, which is what capturing
+// configuration needs and all that a container can tell us about itself.
+func topologyFromLabels(lab string, cs []runtime.Container) *model.Topology {
+	top := &model.Topology{
+		Name:    lab,
+		Lab:     &model.Lab{Metadata: model.Meta{Name: lab}},
+		Devices: map[string]*model.Device{},
+		ASes:    map[int]*model.AS{},
+	}
+	for _, c := range cs {
+		id := c.Labels[deploy.LabelDeviceID]
+		if id == "" {
+			continue
+		}
+		asn, _ := strconv.Atoi(c.Labels[deploy.LabelAS])
+		d := &model.Device{
+			ID:        id,
+			Name:      c.Labels[deploy.LabelDevice],
+			Kind:      model.DeviceKind(c.Labels[deploy.LabelKind]),
+			ASN:       asn,
+			Container: c.Name,
+			Owner:     c.Labels[deploy.LabelOwner],
+			// The node this device is on, as far as the engine reading it is
+			// concerned, is this one: these containers were found by asking
+			// this machine's daemon. Leaving it empty made CaptureAll -- which
+			// selects devices by node -- match nothing at all, so a destroy
+			// without a manifest reported "captured 0 snapshots" and removed a
+			// term's work. The engine that does the capturing is constructed
+			// with node "local", so that is what they are.
+			Node: "local",
+		}
+		top.Devices[id] = d
+		if asn > 0 {
+			as, ok := top.ASes[asn]
+			if !ok {
+				// Every reconstructed system is treated as a student's.
+				//
+				// Only student-owned devices are captured, and a container's
+				// labels do not record whose the AS was. Guessing "not a
+				// student's" means destroying work without saving it, which
+				// cannot be undone; guessing the other way costs some snapshots
+				// of the platform's own configuration, which cost nothing.
+				as = &model.AS{ASN: asn, Role: model.RoleStudent}
+				top.ASes[asn] = as
+			}
+			as.Devices = append(as.Devices, d)
+		}
+	}
+	return top
+}
+
+// labWasSolved reports whether a single-node lab's recorded state says it was
+// last deployed with the reference solution on it.
+//
+// A cluster records the mode with the topology on each node. A single-node lab
+// keeps its state beside the manifest, so the same question is answered from
+// the marker the deploy writes there.
+func labWasSolved(top *model.Topology) bool {
+	if top == nil {
+		// Without a manifest there is nothing that says otherwise, and the
+		// safe assumption is the one that does not file the answer as work.
+		return false
+	}
+	raw, err := os.ReadFile(filepath.Join(labPrivateDir(top), "mode"))
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(raw)) == string(render.ModeSolve)
+}
+
+// recordLabMode remembers how a single-node lab was last deployed.
+func recordLabMode(top *model.Topology, mode string) {
+	dir := labPrivateDir(top)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return
+	}
+	_ = os.WriteFile(filepath.Join(dir, "mode"), []byte(mode), 0o644)
 }

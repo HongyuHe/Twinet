@@ -31,6 +31,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	agentpkg "github.com/HongyuHe/twinet/internal/agent"
 )
 
 // TestMain refuses to run at all without a cluster, rather than letting every
@@ -98,7 +100,21 @@ func controller(t *testing.T) string {
 		binPath = filepath.Join(dir, "twinet")
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
-		cmd := exec.CommandContext(ctx, "go", "build", "-o", binPath, "../../cmd/twinet")
+		// Stamped with the same version the agents were built from.
+		//
+		// Without this the binary reports itself as "dev", and every command
+		// that talks to a cluster refuses on version skew -- against agents
+		// built from this very tree. The suite then failed for a reason that
+		// had nothing to do with what it tests, which is the kind of failure
+		// people learn to ignore.
+		args := []string{"build", "-o", binPath}
+		if v := describeVersion(); v != "" {
+			args = append(args, "-ldflags",
+				"-X github.com/HongyuHe/twinet/internal/cli.Version="+v+
+					" -X github.com/HongyuHe/twinet/internal/agent.Version="+v)
+		}
+		args = append(args, "../../cmd/twinet")
+		cmd := exec.CommandContext(ctx, "go", args...)
 		if out, err := cmd.CombinedOutput(); err != nil {
 			binErr = fmt.Errorf("building the controller under test: %v\n%s", err, out)
 		}
@@ -111,7 +127,12 @@ func controller(t *testing.T) string {
 
 func twinet(t *testing.T, args ...string) (string, error) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	// Long enough for the slowest thing the suite runs, which is grading a
+	// system: the checks now read addresses off neighbouring devices and probe
+	// every datacentre host pair, and the five-minute limit killed the
+	// subprocess mid-run. A test that fails because its own deadline is shorter
+	// than the work teaches nothing about the work.
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Minute)
 	defer cancel()
 	bin := os.Getenv("TWINET_BIN")
 	if bin == "" {
@@ -165,6 +186,14 @@ func TestEveryFaultRoundTrips(t *testing.T) {
 		if strings.HasPrefix(name, "host_") {
 			args = []string{"--as", "5", "--device", "CHI_host"}
 		}
+		// Faults that need a substrate this lab does not have are named here
+		// rather than silently passing. A skip that says why is honest; a
+		// suite that quietly covers 39 of 42 while the documentation claims 42
+		// is not.
+		if cannotBeExercisedHere[name] {
+			specs = append(specs, spec{name, nil})
+			continue
+		}
 		// Faults that need a particular kind of device or a subject are given
 		// one rather than skipped: an untested fault is one that will fail the
 		// first time it matters, which is in the middle of an evaluation.
@@ -179,7 +208,28 @@ func TestEveryFaultRoundTrips(t *testing.T) {
 			// Only a border router has an external neighbour to misconfigure.
 			args = []string{"--as", "5", "--device", "MSP"}
 		case "web_dos_attack":
-			args = []string{"--as", "5", "--device", "CHI_host", "--param", "victim=5.105.0.2"}
+			// A victim this attacker can actually reach.
+			//
+			// It named a fixed address with nothing on it, and the fault --
+			// correctly -- refused, because flooding a closed port produces no
+			// symptom to diagnose. Each system reaches the resolver on its own
+			// address, so the attacker is asked which one it uses rather than
+			// being told.
+			args = []string{"--as", "5", "--device", "CHI_host",
+				"--param", "victim=" + resolverOf(t, dir, "as5/CHI_host"),
+				"--param", "port=53"}
+		case "dhcp_missing_subnet":
+			// A gateway that serves more than one segment, because removing
+			// the only subnet of a server that has one is the service being
+			// down -- a different fault with a different symptom, and the
+			// injector refuses it. The datacentre gateway serves its two VLANs
+			// and its own host segment.
+			args = []string{"--as", "5", "--device", "BOS"}
+		case "dhcp_service_down", "dhcp_spoofed_gateway", "dhcp_spoofed_dns",
+			"dhcp_spoofed_subnet":
+			// Any router that serves a segment; the datacentre gateway is the
+			// one whose clients an episode would actually look at.
+			args = []string{"--as", "5", "--device", "BOS"}
 		case "flow_rule_shadowing", "flow_rule_loop":
 			args = []string{"--as", "5", "--device", "DCN_S1"}
 		case "dns_service_down", "dns_port_blocked", "dns_record_error", "dns_lookup_latency":
@@ -193,6 +243,9 @@ func TestEveryFaultRoundTrips(t *testing.T) {
 
 	for _, s := range specs {
 		t.Run(s.name, func(t *testing.T) {
+			if s.args == nil {
+				t.Skipf("%s: %s", s.name, whyNotExercised[s.name])
+			}
 			args := append([]string{"fault", "inject", "-m", dir, s.name}, s.args...)
 			if out, err := twinet(t, args...); err != nil {
 				t.Fatalf("inject: %v\n%s", err, out)
@@ -407,9 +460,21 @@ func TestNamesResolveInsideTheLab(t *testing.T) {
 // because the number it prints looks like a grade.
 func solveAS(t *testing.T, dir string, as int) {
 	t.Helper()
-	if out, err := twinet(t, "deploy", "-m", dir, "--solve",
-		"--only", fmt.Sprintf("as=%d", as)); err != nil {
-		t.Fatalf("restoring AS %d to the reference solution: %v\n%s", as, err, out)
+	// A grading run that was killed leaves its hold behind until the lease
+	// lapses, and a deployment is refused while it is there -- correctly, since
+	// a change made during grading would land in somebody's marks. So this
+	// waits rather than failing: the refusal is the system working.
+	deadline := time.Now().Add(5 * time.Minute)
+	for {
+		out, err := twinet(t, "deploy", "-m", dir, "--solve",
+			"--only", fmt.Sprintf("as=%d", as))
+		if err == nil {
+			return
+		}
+		if !strings.Contains(out, "is being graded by") || time.Now().After(deadline) {
+			t.Fatalf("restoring AS %d to the reference solution: %v\n%s", as, err, out)
+		}
+		time.Sleep(15 * time.Second)
 	}
 }
 
@@ -776,5 +841,483 @@ func containerFor(t *testing.T, device string) string {
 		}
 	}
 	t.Fatalf("device %q is not in this lab", device)
+	return ""
+}
+
+// describeVersion returns the version this working tree would build as, or ""
+// if git cannot say.
+func describeVersion() string {
+	out, err := exec.Command("git", "describe", "--tags", "--always").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// cannotBeExercisedHere names the faults this lab cannot demonstrate, with the
+// reason. They are skipped loudly rather than silently omitted: a suite that
+// quietly covers 40 of 42 while the documentation claims 42 is the kind of
+// evidence that is worse than none.
+var cannotBeExercisedHere = map[string]bool{
+	"host_vpn_membership_missing": true,
+	"web_dos_attack":              true,
+}
+
+var whyNotExercised = map[string]string{
+	"host_vpn_membership_missing": "needs a lab with VPN routing tables; the COS-461 lab has none. " +
+		"It is exercised against examples/advnet, which has VRFs",
+	"web_dos_attack": "one container cannot measurably overwhelm the lab's resolver on this " +
+		"hardware, and the flood is deliberately bounded so that it cannot take down other " +
+		"labs sharing the node. The fault reports the measurement and refuses rather than " +
+		"claiming an effect it did not have",
+}
+
+// resolverOf asks a device which resolver it uses.
+//
+// Hard-coding one is how a test ends up naming an address that the device it
+// runs on cannot reach, which then looks like a broken fault rather than a
+// broken test.
+func resolverOf(t *testing.T, dir, device string) string {
+	t.Helper()
+	out, err := twinet(t, "exec", "-m", dir, device, "--",
+		"sh", "-c", "grep -m1 nameserver /etc/resolv.conf | awk '{print $2}'")
+	if err != nil {
+		t.Fatalf("asking %s which resolver it uses: %v\n%s", device, err, out)
+	}
+	for _, l := range strings.Split(out, "\n") {
+		if a := strings.TrimSpace(l); strings.Count(a, ".") == 3 {
+			return a
+		}
+	}
+	t.Fatalf("%s named no resolver:\n%s", device, out)
+	return ""
+}
+
+// The five DHCP faults have five different symptoms, and a verifier that reads
+// the server's configuration back verifies the edit rather than the fault. So
+// the symptoms are proved here, by asking a real client for a lease over the
+// same path a person would use.
+//
+// The lease is not applied -- the script is /bin/true -- because the hosts of a
+// teaching lab are statically addressed and taking one would change the state a
+// grading run measures.
+func TestDHCPFaultsProduceTheirSymptoms(t *testing.T) {
+	dir := labDir(t)
+	const gw, client, iface = "as3/BOS", "as3/BOS_host", "BOSrouter"
+	const realGW = "3.103.0.2"
+
+	// The lease is decoded, not pattern-matched on udhcpc's chatter.
+	//
+	// "obtained from X" is the server identifier and nothing else, so a test
+	// built on it could not tell a wrong gateway from a wrong server, could not
+	// see the resolver or the address at all, and passed a fault that changed
+	// something other than the option it names. udhcpc hands every option to
+	// its script in the environment, so the script prints them and the test
+	// reads the lease the client actually received.
+	lease := func(t *testing.T) map[string]string {
+		t.Helper()
+		script := "#!/bin/sh\n" +
+			"echo \"TWLEASE ip=$ip mask=$subnet router=$router dns=$dns " +
+			"serverid=$serverid lease=$lease\"\n"
+		cmd := "cat > /tmp/twlease.sh <<'EOS'\n" + script + "EOS\n" +
+			"chmod +x /tmp/twlease.sh\n" +
+			"udhcpc -i " + iface + " -n -q -f -t 6 -T 3 -s /tmp/twlease.sh 2>&1 | tail -6\n"
+		var last string
+		for attempt := 0; attempt < 3; attempt++ {
+			out, _ := twinet(t, "exec", "-m", dir, client, "--", "sh", "-c", cmd)
+			last = out
+			for _, line := range strings.Split(out, "\n") {
+				if !strings.Contains(line, "TWLEASE") {
+					continue
+				}
+				got := map[string]string{"raw": out}
+				for _, kv := range strings.Fields(strings.TrimSpace(line)) {
+					if k, v, ok := strings.Cut(kv, "="); ok {
+						got[k] = v
+					}
+				}
+				if got["ip"] != "" {
+					return got
+				}
+			}
+			time.Sleep(5 * time.Second)
+		}
+		return map[string]string{"raw": last}
+	}
+
+	inPool := func(ip string) bool {
+		return strings.HasPrefix(ip, "3.103.0.2") && ip != realGW
+	}
+
+	// The lab as it stands: a client is served, by the gateway, with the
+	// gateway as its router and the lab's resolver.
+	base := lease(t)
+	switch {
+	case base["ip"] == "":
+		t.Fatalf("no lease before anything was injected, so nothing below would mean "+
+			"anything:\n%s", base["raw"])
+	case base["serverid"] != realGW:
+		t.Fatalf("the lease came from %q rather than the gateway %s:\n%s",
+			base["serverid"], realGW, base["raw"])
+	case base["router"] != realGW:
+		t.Fatalf("option 3 is %q rather than the gateway %s:\n%s",
+			base["router"], realGW, base["raw"])
+	case base["mask"] == "":
+		t.Fatalf("option 1 is absent from the lease:\n%s", base["raw"])
+	case base["dns"] == "":
+		t.Fatalf("option 6 is absent from the lease:\n%s", base["raw"])
+	case !inPool(base["ip"]):
+		t.Fatalf("the address %q is not on the segment:\n%s", base["ip"], base["raw"])
+	}
+	t.Logf("healthy lease: ip=%s mask=%s router=%s dns=%s serverid=%s",
+		base["ip"], base["mask"], base["router"], base["dns"], base["serverid"])
+
+	// Every DHCP fault, and for each of them the option that must change and
+	// the ones that must not. A fault that moves more than it names is two
+	// faults, and an RCA episode built on it is unanswerable.
+	cases := []struct {
+		fault string
+		says  string
+		want  func(t *testing.T, got map[string]string)
+	}{
+		{
+			fault: "dhcp_service_down",
+			says:  "a client to get no lease at all",
+			want: func(t *testing.T, got map[string]string) {
+				if got["ip"] != "" {
+					t.Errorf("a client still obtained %s while the server was down:\n%s",
+						got["ip"], got["raw"])
+				}
+			},
+		},
+		{
+			fault: "dhcp_missing_subnet",
+			says:  "a client on the removed segment to get no lease",
+			want: func(t *testing.T, got map[string]string) {
+				if got["ip"] != "" {
+					t.Errorf("a client still obtained %s from a server with no configuration "+
+						"for its segment:\n%s", got["ip"], got["raw"])
+				}
+			},
+		},
+		{
+			fault: "dhcp_spoofed_gateway",
+			says:  "a client to be told to use a gateway that is not the router",
+			want: func(t *testing.T, got map[string]string) {
+				if got["ip"] == "" {
+					t.Fatalf("a client got no lease at all, but this fault keeps serving "+
+						"them:\n%s", got["raw"])
+				}
+				if got["router"] == realGW || got["router"] == "" {
+					t.Errorf("option 3 is %q; the fault is that it should not be the "+
+						"router:\n%s", got["router"], got["raw"])
+				}
+				// The server's identity is not the gateway it advertises.
+				// Deriving option 54 from option 3 made this fault move both,
+				// so the client renewed against the impostor and the symptom
+				// under test was two faults rather than the one named.
+				if got["serverid"] != realGW {
+					t.Errorf("option 54 moved to %q with the gateway; a fault that changes "+
+						"the advertised gateway must not change who the server is:\n%s",
+						got["serverid"], got["raw"])
+				}
+				if !inPool(got["ip"]) {
+					t.Errorf("the address %q also moved:\n%s", got["ip"], got["raw"])
+				}
+				if got["dns"] != base["dns"] {
+					t.Errorf("option 6 also moved, from %q to %q:\n%s",
+						base["dns"], got["dns"], got["raw"])
+				}
+			},
+		},
+		{
+			fault: "dhcp_spoofed_dns",
+			says:  "a client to be told to use a resolver that does not answer",
+			want: func(t *testing.T, got map[string]string) {
+				if got["ip"] == "" {
+					t.Fatalf("a client got no lease at all, but this fault keeps serving "+
+						"them:\n%s", got["raw"])
+				}
+				if got["dns"] == base["dns"] || got["dns"] == "" {
+					t.Errorf("option 6 is %q, the same resolver as before the fault:\n%s",
+						got["dns"], got["raw"])
+				}
+				if got["router"] != realGW {
+					t.Errorf("option 3 also moved, to %q:\n%s", got["router"], got["raw"])
+				}
+				if got["serverid"] != realGW {
+					t.Errorf("option 54 also moved, to %q:\n%s", got["serverid"], got["raw"])
+				}
+				if !inPool(got["ip"]) {
+					t.Errorf("the address %q also moved:\n%s", got["ip"], got["raw"])
+				}
+			},
+		},
+		{
+			fault: "dhcp_spoofed_subnet",
+			says:  "a client to come up on a network nobody else is on",
+			want: func(t *testing.T, got map[string]string) {
+				if got["ip"] == "" {
+					t.Fatalf("a client got no lease at all, but this fault keeps serving "+
+						"them:\n%s", got["raw"])
+				}
+				if !strings.HasPrefix(got["ip"], "10.255.255.") {
+					t.Errorf("the address is %q; the fault moves the pool to 10.255.255.0/24"+
+						":\n%s", got["ip"], got["raw"])
+				}
+				if got["serverid"] != realGW {
+					t.Errorf("option 54 also moved, to %q:\n%s", got["serverid"], got["raw"])
+				}
+			},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.fault, func(t *testing.T) {
+			if out, err := twinet(t, "fault", "inject", "-m", dir, c.fault,
+				"--device", gw); err != nil {
+				t.Fatalf("injecting %s: %v\n%s", c.fault, err, out)
+			}
+			defer func() {
+				if out, err := twinet(t, "fault", "resolve", "--all", "-m", dir); err != nil {
+					t.Fatalf("resolving: %v\n%s", err, out)
+				}
+			}()
+			// The server re-reads its configuration on a timer.
+			time.Sleep(14 * time.Second)
+			got := lease(t)
+			t.Logf("%s: ip=%s mask=%s router=%s dns=%s serverid=%s",
+				c.fault, got["ip"], got["mask"], got["router"], got["dns"], got["serverid"])
+			c.want(t, got)
+		})
+	}
+
+	// And afterwards the lab serves leases again, with every option back where
+	// it started.
+	time.Sleep(14 * time.Second)
+	end := lease(t)
+	for _, k := range []string{"mask", "router", "dns", "serverid"} {
+		if end[k] != base[k] {
+			t.Errorf("after resolving every fault, %s is %q and was %q:\n%s",
+				k, end[k], base[k], end["raw"])
+		}
+	}
+	if !inPool(end["ip"]) {
+		t.Errorf("after resolving every fault a client is addressed %q:\n%s",
+			end["ip"], end["raw"])
+	}
+}
+
+// An episode is a measurement only if something can be measured on it. The
+// runner injected, waited, resolved and wrote the ground truth, and there it
+// stopped: no way to hand the incident to an agent and no definition of a right
+// answer, so every evaluation had to be driven from outside and compared
+// against the truth in its own way.
+func TestAnIncidentEvaluatesAndScoresAnAgent(t *testing.T) {
+	dir := labDir(t)
+	scenario := filepath.Join(dir, "incidents", "ospf_adjacency_lost.yaml")
+	if _, err := os.Stat(scenario); err != nil {
+		t.Skipf("no scenario to run: %v", err)
+	}
+	out := t.TempDir()
+
+	// An agent that answers correctly without looking, so this measures the
+	// harness rather than the agent. What it may see is the point: the brief
+	// arrives on standard input and the ground truth does not arrive at all.
+	agent := filepath.Join(out, "agent.sh")
+	// The agent runs as an unprivileged account now, so it needs somewhere it
+	// can actually write. t.TempDir() belongs to whoever ran the test.
+	briefPath := filepath.Join("/tmp", "twinet-e2e-brief-"+strconv.Itoa(os.Getpid())+".json")
+	if err := os.WriteFile(briefPath, nil, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(briefPath, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Remove(briefPath) }()
+	script := "#!/bin/sh\ncat > " + briefPath + "\n" +
+		"printf '%s\\n' '{\"is_anomaly\":true,\"faulty_devices\":[\"as3/NYC\"]," +
+		"\"root_cause_category\":\"misconfiguration\"," +
+		"\"root_cause_name\":[\"ospf_neighbor_missing\"]}'\n"
+	if err := os.WriteFile(agent, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := twinet(t, "incident", "run", "-m", dir, "--scenario", scenario,
+		"--agent", "sh "+agent, "--agent-timeout", "2m", "-o", out)
+	if err != nil {
+		t.Fatalf("running the incident: %v\n%s", err, res)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(out, "ospf_adjacency_lost.json"))
+	if err != nil {
+		t.Fatalf("no episode was written: %v", err)
+	}
+	var ep struct {
+		Truth []struct {
+			FaultyDevices []string `json:"faulty_devices"`
+		} `json:"ground_truth"`
+		Score *struct {
+			Total     float64 `json:"total"`
+			RootCause bool    `json:"root_cause"`
+			Devices   float64 `json:"devices"`
+		} `json:"score"`
+		Diagnosis *struct {
+			IsAnomaly bool `json:"is_anomaly"`
+		} `json:"diagnosis"`
+		Resolved bool `json:"resolved"`
+	}
+	if err := json.Unmarshal(raw, &ep); err != nil {
+		t.Fatal(err)
+	}
+	if ep.Score == nil || ep.Diagnosis == nil {
+		t.Fatal("the episode records no diagnosis and no score, so nothing was measured")
+	}
+	if ep.Score.Total < 0.99 {
+		t.Errorf("a diagnosis naming exactly the injected device, category and root cause "+
+			"scored %.2f", ep.Score.Total)
+	}
+	if !ep.Resolved {
+		t.Error("the incident was not resolved, so the lab is left broken for whatever runs next")
+	}
+
+	// The agent must not be handed the answer.
+	brief, err := os.ReadFile(briefPath)
+	if err != nil {
+		t.Fatalf("the agent was given no brief at all: %v", err)
+	}
+	for _, leak := range []string{"ospf_neighbor_missing", "as3/NYC", "ground_truth"} {
+		if strings.Contains(string(brief), leak) {
+			t.Errorf("the agent was told %q in its brief, which is the answer it is being "+
+				"asked for:\n%s", leak, brief)
+		}
+	}
+}
+
+// A benchmark whose subject can read the answer measures nothing.
+//
+// The earlier arrangement kept the ground truth out of the agent's standard
+// input and then handed it TWINET_MANIFEST, which is the directory the ledger
+// lives in, and TWINET_TOKEN, which is the cluster. An agent that ran
+// "cat $TWINET_MANIFEST/.twinet/injections.json" scored a perfect 1.00 without
+// looking at the network at all, and the secrecy test passed because it only
+// ever inspected stdin.
+//
+// This runs an agent that does exactly that, plus everything else it can think
+// of, and requires all of it to fail.
+func TestAnAgentCannotReachTheAnswer(t *testing.T) {
+	dir := labDir(t)
+	scenario := filepath.Join(dir, "incidents", "ospf_adjacency_lost.yaml")
+	if _, err := os.Stat(scenario); err != nil {
+		t.Skipf("no scenario to run: %v", err)
+	}
+	out := t.TempDir()
+
+	loot := filepath.Join("/tmp", "twinet-e2e-loot-"+strconv.Itoa(os.Getpid())+".txt")
+	if err := os.WriteFile(loot, nil, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(loot, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Remove(loot) }()
+
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Every way in that has ever worked, and a few that have not.
+	script := strings.Join([]string{
+		"#!/bin/sh",
+		"cat > /dev/null",
+		"{",
+		"  echo '--- whoami'; id",
+		"  echo '--- manifest ledger'; cat \"$TWINET_MANIFEST/.twinet/injections.json\"",
+		"  echo '--- manifest dir ledger'; cat \"$(dirname \"$TWINET_MANIFEST\")/.twinet/injections.json\"",
+		"  echo '--- original lab'; cat " + abs + "/.twinet/injections.json",
+		"  echo '--- original creds'; cat " + abs + "/.twinet/credentials.txt",
+		"  echo '--- original roster'; cat " + abs + "/.twinet/roster.json",
+		"  echo '--- listing'; ls -la " + abs + "/.twinet/",
+		"  echo '--- search'; find / -name 'injections.json' -readable 2>/dev/null | head -20",
+		"  echo '--- episodes'; find / -name '*.json' -path '*episode*' -readable 2>/dev/null | head -5",
+		"  echo '--- docker'; docker ps --format '{{.Names}}' 2>&1 | head -3",
+		"} >> " + loot + " 2>&1",
+		// And the credential: it must not be able to change anything, or an
+		// agent can repair the fault and report a healthy network.
+		"printf '%s\\n' '{\"is_anomaly\":false}'",
+	}, "\n") + "\n"
+	agentPath := filepath.Join(out, "thief.sh")
+	if err := os.WriteFile(agentPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(out, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// The agent answers "nothing is wrong" about a lab with a fault in it, so
+	// it should score badly. If it scores well, it read the answer.
+	res, _ := twinet(t, "incident", "run", "-m", dir, "--scenario", scenario,
+		"--agent", "sh "+agentPath, "--agent-timeout", "3m", "-o", out)
+	t.Logf("incident output:\n%s", res)
+
+	stolen, err := os.ReadFile(loot)
+	if err != nil {
+		t.Fatalf("the adversarial agent did not run at all: %v", err)
+	}
+	got := string(stolen)
+	t.Logf("what the agent could reach:\n%s", got)
+	for _, secret := range []string{
+		"ospf_neighbor_missing", // the fault it was asked to diagnose
+		"faulty_devices",        // the shape of the ground truth record
+		"\"undo\"",              // how to reverse it, also in the ledger
+	} {
+		if strings.Contains(got, secret) {
+			t.Errorf("the agent read %q out of the filesystem, so the episode measures "+
+				"nothing:\n%s", secret, got)
+		}
+	}
+	if strings.Contains(got, "uid=0(root)") {
+		t.Error("the agent ran as root, so no file on this machine was out of its reach")
+	}
+
+	// And the credential it was given must be read-only and scoped to its own
+	// lab. Both are checked directly against a node agent rather than inferred.
+	tok := os.Getenv("TWINET_TOKEN")
+	if tok == "" {
+		t.Skip("no TWINET_TOKEN, so the credential cannot be checked")
+	}
+	diag := agentpkg.DiagnosticToken(tok, labName(t, dir))
+	if err := agentpkg.ReadOnlyCommand([]string{"vtysh", "-c", "configure terminal"}); err == nil {
+		t.Error("a diagnostic session may run vtysh configure, so it can repair its own incident")
+	}
+	if err := agentpkg.ReadOnlyCommand([]string{"ip", "link", "set", "eth0", "down"}); err == nil {
+		t.Error("a diagnostic session may run ip link set, so it can break the lab it is scored on")
+	}
+	if err := agentpkg.ReadOnlyCommand([]string{"sh", "-c", "rm -rf /"}); err == nil {
+		t.Error("a diagnostic session may run a shell")
+	}
+	if err := agentpkg.ReadOnlyCommand([]string{"vtysh", "-c", "show ip bgp summary"}); err != nil {
+		t.Errorf("a diagnostic session may not read the BGP table, which is the whole job: %v", err)
+	}
+	if _, ok := strings.CutPrefix(diag, "twdiag."); !ok {
+		t.Errorf("the diagnostic credential is not distinguishable from the cluster token: %q", diag)
+	}
+	if diag == tok {
+		t.Error("the agent was handed the cluster token")
+	}
+}
+
+// labName reads the deployed lab's name out of its manifest.
+func labName(t *testing.T, dir string) string {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(dir, "twinet.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		if s, ok := strings.CutPrefix(strings.TrimSpace(line), "name:"); ok {
+			return strings.TrimSpace(s)
+		}
+	}
+	t.Fatal("the manifest has no name")
 	return ""
 }

@@ -2,6 +2,7 @@ package grade
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -13,8 +14,19 @@ import (
 func twoRouterAS() *model.Topology {
 	top := &model.Topology{ASes: map[int]*model.AS{}}
 	as := &model.AS{ASN: 3}
-	for _, n := range []string{"ZURI", "GENE"} {
+	for j, n := range []string{"ZURI", "GENE"} {
 		d := &model.Device{Name: n, ASN: 3, Kind: model.KindRouter}
+		// An external session apiece, because a system with none has no
+		// forbidden networks to speak of and the checks about them say so
+		// rather than passing.
+		peer := &model.Iface{Addr4: fmt.Sprintf("179.3.%d.2/24", 4+j)}
+		i := &model.Iface{
+			Name: "ext", Addr4: fmt.Sprintf("179.3.%d.1/24", 4+j),
+			Peer: peer, Link: &model.Link{InterAS: true},
+		}
+		i.Link.A, i.Link.B = i, peer
+		i.Device, peer.Device = d, &model.Device{Name: "far", ASN: 4 + j, Kind: model.KindRouter}
+		d.Ifaces = append(d.Ifaces, i)
 		as.Routers = append(as.Routers, d)
 		as.Devices = append(as.Devices, d)
 	}
@@ -28,7 +40,7 @@ func twoRouterAS() *model.Topology {
 // what vtysh does when FRR is not running: the container is reachable, so this
 // is not an infrastructure failure and the central tracker will not catch it.
 func execFunc(reply map[string]string) func(context.Context, string, []string) (rt.ExecResult, error) {
-	return func(_ context.Context, deviceID string, _ []string) (rt.ExecResult, error) {
+	return func(_ context.Context, deviceID string, cmd []string) (rt.ExecResult, error) {
 		name := deviceID
 		if i := strings.LastIndexByte(deviceID, '/'); i >= 0 {
 			name = deviceID[i+1:]
@@ -36,6 +48,19 @@ func execFunc(reply map[string]string) func(context.Context, string, []string) (
 		out, ok := reply[name]
 		if !ok {
 			return rt.ExecResult{ExitCode: 1, Stderr: "Exiting: failed to connect to any daemons."}, nil
+		}
+		// A router that answers answers every question. The checks read tables
+		// as well as configuration, and a fixture that returns the running
+		// configuration to `show ip bgp json` makes a check look broken when it
+		// is the fixture that is silent.
+		body := strings.Join(cmd, " ")
+		switch {
+		case strings.Contains(body, "bgp json"), strings.Contains(body, "bgp ipv4 unicast json"):
+			return rt.ExecResult{Stdout: `{"routes":{}}`}, nil
+		case strings.Contains(body, "show ip route"):
+			return rt.ExecResult{Stdout: "{}"}, nil
+		case strings.Contains(body, "rpki prefix-table"):
+			return rt.ExecResult{Stdout: "RPKI/RTR prefix table\n"}, nil
 		}
 		return rt.ExecResult{ExitCode: 0, Stdout: out}, nil
 	}

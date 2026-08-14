@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/netip"
 	"sort"
 	"strings"
 	"sync"
@@ -28,6 +29,18 @@ type Env struct {
 	Exec func(ctx context.Context, deviceID string, cmd []string) (rt.ExecResult, error)
 	// Args are the check's parameters from the rubric.
 	Args map[string]any
+
+	// peers caches the address each neighbour actually has, for the length of
+	// one grading run. A pointer, because each check runs against a copy of
+	// this struct and they must share one cache -- and because a mutex inside
+	// a struct that is copied is a mutex that protects nothing.
+	peers *peerCache
+}
+
+// peerCache remembers the address on the far end of each link.
+type peerCache struct {
+	mu   sync.Mutex
+	addr map[string]string
 }
 
 // Device resolves a device in the AS under test.
@@ -303,4 +316,71 @@ func firstLine(s string) string {
 		return s[:i]
 	}
 	return strings.TrimSpace(s)
+}
+
+// PeerAddr returns the address the neighbour actually has on the other end of a
+// link, falling back to the one the manifest planned.
+//
+// The assignment lets neighbouring groups agree their own peering addresses,
+// and a grading run adapts the reference to whatever a submission used. The
+// checks then have to ask about the session that exists rather than the one the
+// plan predicted: measured on the cluster, a submission that used an agreed
+// address kept every session up and still lost a point, because
+// bgp.ebgp_established was looking for a neighbour at the planned address.
+//
+// Cached for the length of one grading run: every check that enumerates
+// external sessions asks, and each answer costs an exec on another system's
+// router.
+func (e *Env) PeerAddr(ctx context.Context, i *model.Iface) string {
+	planned := addrOf(i.Peer.Addr4)
+	if i.Peer == nil || i.Peer.Device == nil || i.Peer.Name == "" || i.Name == "" {
+		return planned
+	}
+	if e.peers == nil {
+		// A check run outside a rubric (a test, or a one-off) has no cache and
+		// simply asks every time.
+		e.peers = &peerCache{addr: map[string]string{}}
+	}
+	key := i.Device.ID + " " + i.Name
+	e.peers.mu.Lock()
+	if got, ok := e.peers.addr[key]; ok {
+		e.peers.mu.Unlock()
+		return got
+	}
+	e.peers.mu.Unlock()
+
+	answer := planned
+	ours := ifaceAddrs(ctx, e, i.Device.ID, i.Name)
+	theirs := ifaceAddrs(ctx, e, i.Peer.Device.ID, i.Peer.Name)
+	// The neighbour may hold both the planned address and one agreed with this
+	// group. The one that matters is the one in the same subnet as what this
+	// group configured, because that is the session that can come up.
+	for _, mine := range ours {
+		for _, other := range theirs {
+			if mine.Bits() == other.Bits() && mine.Masked() == other.Masked() &&
+				mine.Addr() != other.Addr() {
+				answer = other.Addr().String()
+			}
+		}
+	}
+	e.peers.mu.Lock()
+	e.peers.addr[key] = answer
+	e.peers.mu.Unlock()
+	return answer
+}
+
+// ifaceAddrs reads the addresses a device has on an interface.
+func ifaceAddrs(ctx context.Context, e *Env, deviceID, iface string) []netip.Prefix {
+	res, err := e.Exec(ctx, deviceID, []string{"sh", "-c",
+		"ip -o -4 addr show dev " + iface + " scope global 2>/dev/null | awk '{print $4}'"})
+	if err != nil || res.ExitCode != 0 {
+		return nil
+	}
+	var out []netip.Prefix
+	for _, f := range strings.Fields(res.Stdout) {
+		if p, err := netip.ParsePrefix(f); err == nil {
+			out = append(out, p)
+		}
+	}
+	return out
 }

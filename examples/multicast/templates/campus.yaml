@@ -1,0 +1,57 @@
+apiVersion: twinet.dev/v1
+kind: ASTemplate
+metadata:
+  name: campus
+  description: >
+    The advanced course's multicast topology: five routers in a ring around a
+    sixth in the middle, each with a host behind it.
+
+    Everything below the multicast configuration is given -- addresses, OSPF,
+    full unicast connectivity -- because PIM is not a routing protocol and has
+    nothing to do until the unicast tables are complete. What is left for the
+    student is exactly the exercise: enable PIM on every interface, IGMP where
+    the hosts are, and point every router at one rendezvous point.
+
+routers:
+  TOP:     {id: 1}
+  LEFT:    {id: 2}
+  RIGHT:   {id: 3}
+  BOTTOML: {id: 4}
+  BOTTOMR: {id: 5}
+  CENTER:  {id: 6}
+
+hosts:
+  per_router: true
+  name: host
+  iface: "{{ .Router }}router"
+
+internal_links:
+  - {a: TOP, b: LEFT}
+  - {a: TOP, b: RIGHT}
+  - {a: LEFT, b: BOTTOML}
+  - {a: RIGHT, b: BOTTOMR}
+  - {a: BOTTOML, b: BOTTOMR}
+  - {a: CENTER, b: TOP}
+  - {a: CENTER, b: LEFT}
+  - {a: CENTER, b: RIGHT}
+  - {a: CENTER, b: BOTTOML}
+  - {a: CENTER, b: BOTTOMR}
+
+# The exercise, declared once. The renderer builds the reference solution from
+# this, the grader marks against it, and the figure in the handout cannot drift
+# away from the running lab.
+multicast:
+  enabled: true
+  rp: CENTER
+  groups: "237.0.0.0/24"
+  test_group: "237.0.0.10"
+
+provisioning:
+  provisioned:
+    - scope: loopbacks
+    - scope: router_interfaces
+    - scope: host_addressing
+    - scope: ospf
+    - scope: bgp
+  student:
+    - multicast

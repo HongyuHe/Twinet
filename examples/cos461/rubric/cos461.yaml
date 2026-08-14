@@ -15,9 +15,14 @@ questions:
     title: Layer-2 connectivity and VLANs
     points: 1
     checks:
+      # Both datacentres. Only DCS was checked, so a student could leave DCN
+      # entirely unconfigured and still receive the whole point.
       - check: l2.vlan_isolation
-        weight: 1.0
+        weight: 0.5
         args: {domain: DCS}
+      - check: l2.vlan_isolation
+        weight: 0.5
+        args: {domain: DCN}
 
   - id: q1.2
     title: IP addressing and OSPF
@@ -49,8 +54,13 @@ questions:
     depends_on: [q1.2]
     checks:
       # Exactly the three paths the assignment prescribes, and no others.
+      #
+      # Both directions. The question asks for load balancing between ATL and
+      # BOS, and a submission can produce it one way and not the other -- OSPF
+      # costs are per interface, so the reverse path is a separate answer that
+      # was going unmarked.
       - check: ospf.ecmp_paths
-        weight: 1.0
+        weight: 0.5
         args:
           a: ATL
           b: BOS
@@ -59,6 +69,16 @@ questions:
             - [ATL, BOS]
             - [ATL, PHY, NYC, BOS]
             - [ATL, PHY, BOS]
+      - check: ospf.ecmp_paths
+        weight: 0.5
+        args:
+          a: BOS
+          b: ATL
+          exclusive: true
+          paths:
+            - [BOS, ATL]
+            - [BOS, NYC, PHY, ATL]
+            - [BOS, PHY, ATL]
 
   - id: q1.4
     title: IPv6 addressing and 6in4 tunnels
@@ -84,9 +104,11 @@ questions:
     depends_on: [q2.1]
     checks:
       - check: bgp.ebgp_established
-        weight: 0.5
+        weight: 0.4
+      - check: bgp.next_hop_self
+        weight: 0.2
       - check: bgp.own_prefix_only
-        weight: 0.5
+        weight: 0.4
 
   - id: q2.3
     title: Business relationships
@@ -120,7 +142,16 @@ questions:
     points: 1
     depends_on: [q2.2]
     checks:
+      # Publication is the student's own action.
+      #
+      # The platform used to publish every system's ROA, which made this check
+      # worthless: it would have awarded the mark to everybody for something
+      # nobody did, so it was left unscored. Student systems now start with no
+      # authorisation and issue their own through the lab's trust anchor, so
+      # the question can be asked and answered.
+      - check: rpki.roa_published
+        weight: 0.3
       - check: rpki.invalid_rejected
-        weight: 0.6
-      - check: rpki.notfound_preserved
         weight: 0.4
+      - check: rpki.notfound_preserved
+        weight: 0.3

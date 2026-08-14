@@ -8,6 +8,7 @@ package deploy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -66,6 +67,10 @@ type Engine struct {
 	PullPolicy runtime.PullPolicy
 	// Renderer produces per-device configuration. Optional.
 	Renderer Renderer
+	// WritesReference says this deployment installs the reference solution, so
+	// what ends up on a student-owned device is the answer rather than their
+	// work, and must never be captured as theirs.
+	WritesReference bool
 	// UnderlayIP is this node's VTEP source address.
 	UnderlayIP string
 	// UnderlayDev optionally pins the tunnel source interface.
@@ -339,7 +344,27 @@ func (e *Engine) captureBeforeReplace(ctx context.Context, top *model.Topology, 
 	if e.State == nil || !studentOwned(top, d) {
 		return nil
 	}
+	// Not while the reference solution is what is on the device.
+	//
+	// Capturing then files the answer as the student's own saved
+	// configuration, to be replayed onto their router the next time a
+	// container is recreated. A grading run solves the lab constantly, so this
+	// would happen to every student on every class run.
+	if e.WritesReference {
+		return nil
+	}
 	snaps, err := Capture(ctx, e.Runtime, d, top.Name, top.Hash)
+	if errors.Is(err, ErrNotRunning) {
+		// A stopped container still holds the student's work on its
+		// filesystem. Start it, read it, and only then allow the replacement.
+		// Refusing outright would strand the device instead, and going ahead
+		// would delete the work of whoever's router happened to be down.
+		if serr := e.Runtime.Start(ctx, d.Container); serr != nil {
+			return fmt.Errorf("refusing to replace %s: it is not running and could not be "+
+				"started to read its configuration: %w", d.ID, serr)
+		}
+		snaps, err = Capture(ctx, e.Runtime, d, top.Name, top.Hash)
+	}
 	if err != nil {
 		return fmt.Errorf("refusing to replace %s: its configuration could not be captured: %w", d.ID, err)
 	}
@@ -357,19 +382,79 @@ func (e *Engine) restoreIfNeeded(ctx context.Context, top *model.Topology, d *mo
 	if e.State == nil || !studentOwned(top, d) {
 		return nil
 	}
+	// Not when this deployment is writing the reference solution.
+	//
+	// Restoration exists so that a container recreated during teaching comes
+	// back with the student's work. A deployment that installs the reference
+	// wants the opposite: replaying the snapshot afterwards puts the student's
+	// old configuration back on top of the answer, and a grading run then
+	// measures every other submission against a lab that is not the reference
+	// -- while every check on that system passes, because it is somebody's
+	// converged network. The snapshot stays in the store for the platform-mode
+	// deployment that wants it.
+	if e.WritesReference {
+		return nil
+	}
 	// Restoration must happen after the interfaces exist, or addresses land on
 	// devices that are not there yet. It is therefore deferred to the configure
 	// stage; this records that it is pending.
 	e.pendingRestore.Store(d.ID, true)
+	e.markRestorePending(ctx, d)
 	return nil
+}
+
+// restoreMarker is written inside a device that has been recreated and not yet
+// had its saved configuration replayed.
+//
+// Pendingness used to live only in a map on the engine, which exists for the
+// length of one request. If the node's agent was restarted, killed by the OOM
+// killer, or simply upgraded between creating a container and configuring it,
+// the fact that a student's configuration was still waiting to be replayed went
+// with it. The next deploy saw a container that existed and nothing marking it,
+// so it converged happily on an empty router. The work was still in the state
+// store, and nothing would ever look for it again.
+//
+// The marker lives where the consequence lives. A container that comes back
+// without its configuration carries the note saying so, so any later deploy
+// finds it, whatever happened to the process that created it.
+const restoreMarker = "/etc/twinet/restore-pending"
+
+func (e *Engine) markRestorePending(ctx context.Context, d *model.Device) {
+	// Best effort: the in-memory marker covers this request, and failing to
+	// write the file must not fail a deployment. What it costs is the ability
+	// to recover from a crash, which is exactly what the in-memory marker
+	// cannot do either.
+	_, _ = e.Runtime.Exec(ctx, d.Container, runtime.ExecCmd{Cmd: []string{"sh", "-c",
+		"mkdir -p /etc/twinet && echo 'this device was recreated and its saved " +
+			"configuration has not been replayed yet' > " + restoreMarker}})
+}
+
+func (e *Engine) clearRestorePending(ctx context.Context, d *model.Device) {
+	_, _ = e.Runtime.Exec(ctx, d.Container, runtime.ExecCmd{
+		Cmd: []string{"rm", "-f", restoreMarker}})
+}
+
+// restoreIsPending reports whether this device still owes a restore, from
+// either the marker this request left or one a previous run left behind.
+func (e *Engine) restoreIsPending(ctx context.Context, d *model.Device) bool {
+	if _, ok := e.pendingRestore.Load(d.ID); ok {
+		return true
+	}
+	res, err := e.Runtime.Exec(ctx, d.Container, runtime.ExecCmd{
+		Cmd: []string{"test", "-f", restoreMarker}})
+	return err == nil && res.ExitCode == 0
 }
 
 // replayPending restores a device's captured configuration if one was pending.
 func (e *Engine) replayPending(ctx context.Context, top *model.Topology, d *model.Device) error {
-	if _, pending := e.pendingRestore.Load(d.ID); !pending {
+	if e.State == nil || !studentOwned(top, d) {
 		return nil
 	}
-	if e.State == nil {
+	// See restoreIfNeeded: the reference is not something to restore over.
+	if e.WritesReference {
+		return nil
+	}
+	if !e.restoreIsPending(ctx, d) {
 		return nil
 	}
 	ok, err := Restore(ctx, e.Runtime, d, top.Name, e.State)
@@ -389,6 +474,7 @@ func (e *Engine) replayPending(ctx context.Context, top *model.Topology, d *mode
 			"as needing one): %w", d.ID, err)
 	}
 	e.pendingRestore.Delete(d.ID)
+	e.clearRestorePending(ctx, d)
 	_ = ok
 	return nil
 }
@@ -461,9 +547,23 @@ func (e *Engine) captureOrphan(ctx context.Context, top *model.Topology, c runti
 	if e.State == nil {
 		return nil
 	}
+	// Nothing is captured while the reference solution is what is on the
+	// device: the snapshot would be the answer filed as the student's work.
+	if e.WritesReference {
+		return nil
+	}
 	// The device is gone from the topology, so its identity comes from the
 	// labels the deployment stamped on it.
-	id := c.Labels[LabelDevice]
+	//
+	// The *canonical* identifier, not the short name. Every autonomous system
+	// in these labs has a router called ATL, so keying on the name filed
+	// as3/ATL's configuration and as4/ATL's under the same "ATL" -- one
+	// overwriting the other, and neither findable by the identifier a restore
+	// looks up.
+	id := c.Labels[LabelDeviceID]
+	if id == "" {
+		id = c.Labels[LabelDevice]
+	}
 	if id == "" {
 		return nil
 	}

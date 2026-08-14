@@ -135,6 +135,13 @@ type Env struct {
 	wantSymptom bool
 
 	Topology *model.Topology
+	// Exempt tells the node hosting a device to leave it alone, or to look
+	// after it again, for one opaque injection identifier.
+	//
+	// It is a hook rather than a direct call so that a single-node lab, and
+	// the tests, can supply their own. Nil means there is no repair loop to
+	// exclude, which is the case in a unit test and on a lab with no agent.
+	Exempt func(ctx context.Context, deviceID, injectionID string, on bool) error
 	// Exec runs a command inside a device.
 	Exec func(ctx context.Context, deviceID string, cmd []string) (rt.ExecResult, error)
 	// Lifecycle changes a device container's run state: pause, unpause, stop,
@@ -257,6 +264,16 @@ type Fault struct {
 	Verify func(ctx context.Context, env *Env, t Target, s State) (Evidence, error)
 	// Resolve undoes the fault using the state Inject returned.
 	Resolve func(ctx context.Context, env *Env, t Target, s State) error
+	// Precondition returns why this fault would change nothing on this target,
+	// or "" if it may be injected.
+	//
+	// A fault whose symptom is already present verifies without having done
+	// anything, and the episode then records a cause that is not the reason
+	// anything is broken -- which makes every answer graded against it wrong.
+	// It is declared per fault rather than derived by running the verifier
+	// backwards, because the verifiers that poll for a transition wait out
+	// their whole symptom window to conclude that nothing is wrong yet.
+	Precondition func(ctx context.Context, env *Env, t Target) (string, error)
 }
 
 // Truth builds the ground truth for an application of this fault.
@@ -382,6 +399,32 @@ func Inject(ctx context.Context, env *Env, name string, t Target) (*Injection, e
 		}
 	}
 
+	// The symptom must not already be there.
+	//
+	// Verification asks whether the fault's predicate is true afterwards, and
+	// a predicate that was already true is satisfied by doing nothing at all.
+	// Injecting `link_down` on an interface that was already down, or
+	// `frr_service_down` where FRR had already died, therefore reported
+	// success -- and the episode's ground truth then named a cause that was
+	// not the reason anything was broken. Every answer graded against that
+	// truth is wrong, and it is the failure this benchmark cannot tolerate.
+	//
+	// A fault declares its own precondition rather than the engine running the
+	// verifier backwards. Running the verifier was tried and is far too
+	// expensive: the ones that poll for a transition wait out their whole
+	// symptom window before concluding that nothing is wrong yet, which turned
+	// a ninety-second suite into one that does not finish. A precondition is a
+	// single cheap question the fault already knows how to ask.
+	if f.Precondition != nil {
+		if why, perr := f.Precondition(ctx, env, t); perr != nil {
+			return nil, fmt.Errorf("inject %s: its precondition could not be checked: %w",
+				name, perr)
+		} else if why != "" {
+			return nil, fmt.Errorf("inject %s: %s, so injecting would change nothing while "+
+				"claiming to be the cause", name, why)
+		}
+	}
+
 	// The device is fingerprinted before anything is changed, so that resolving
 	// can be held to "the device is as it was" rather than the far weaker
 	// "the fault predicate is now false". A fault can satisfy the second while
@@ -391,8 +434,42 @@ func Inject(ctx context.Context, env *Env, name string, t Target) (*Injection, e
 		base = fingerprint(ctx, env, t.DeviceID())
 	}
 
+	// The device is exempted from automatic repair before the fault goes in,
+	// so the nodes' repair loop cannot see a broken device in the window
+	// between breaking it and recording why.
+	//
+	// The exemption is recorded on the node, never in the container: a marker
+	// inside the device under test tells an agent being evaluated on root-cause
+	// analysis that a fault was injected, and if it names the fault it is the
+	// answer, readable with cat.
+	//
+	// Failing to record it fails the injection. A fault the repair loop will
+	// undo within the minute, reported as live, produces an episode whose
+	// ground truth is false -- and every answer graded against it is wrong,
+	// with nothing anywhere saying so.
+	injID := newInjectionID()
+	if err := env.exempt(ctx, t.DeviceID(), injID, true); err != nil {
+		return nil, fmt.Errorf("inject %s: this node could not be told to leave %s alone "+
+			"(%w), so the fault would be repaired away within the minute while the "+
+			"episode went on saying it was live", name, t.DeviceID(), err)
+	}
+
 	state, err := f.Inject(ctx, env, t)
 	if err != nil {
+		// An injection that failed part-way may have changed the device
+		// already: host_incorrect_ip removes the address before it adds the
+		// wrong one, so a failure between the two leaves a host with no address
+		// and nothing recording it. Undo what can be undone before giving up.
+		if state != nil {
+			if rerr := f.Resolve(ctx, env, t, state); rerr != nil {
+				return &Injection{ID: injID, Fault: name, Target: t, State: state,
+						InjectedAt: time.Now().UTC(), Truth: f.Truth(t, "")},
+					fmt.Errorf("inject %s: it failed (%w) and what it had already changed "+
+						"could not be undone either (%v); it is recorded so it can be "+
+						"found", name, err, rerr)
+			}
+		}
+		_ = env.exempt(ctx, t.DeviceID(), injID, false)
 		return nil, fmt.Errorf("inject %s: %w", name, err)
 	}
 	if base != "" {
@@ -407,7 +484,7 @@ func Inject(ctx context.Context, env *Env, name string, t Target) (*Injection, e
 		}
 	}
 	inj := &Injection{
-		ID:    newInjectionID(),
+		ID:    injID,
 		Fault: name, Target: t, State: state,
 		InjectedAt: time.Now().UTC(),
 		Truth:      f.Truth(t, ""),
@@ -420,6 +497,7 @@ func Inject(ctx context.Context, env *Env, name string, t Target) (*Injection, e
 			return inj, fmt.Errorf("inject %s: verification failed (%w) and rollback also failed (%v)",
 				name, err, rerr)
 		}
+		_ = env.exempt(ctx, t.DeviceID(), injID, false)
 		return nil, fmt.Errorf("inject %s: could not verify it took effect, so it was rolled back: %w", name, err)
 	}
 	inj.Evidence = ev
@@ -428,7 +506,9 @@ func Inject(ctx context.Context, env *Env, name string, t Target) (*Injection, e
 			return inj, fmt.Errorf("inject %s: did not take effect (%s) and rollback failed (%v)",
 				name, ev.Detail, rerr)
 		}
-		return nil, fmt.Errorf("inject %s: it did not take effect, so it was rolled back: %s", name, ev.Detail)
+		_ = env.exempt(ctx, t.DeviceID(), injID, false)
+		return nil, fmt.Errorf("inject %s: it did not take effect, so it was rolled back: %s",
+			name, evidenceDetail(ev))
 	}
 	return inj, nil
 }
@@ -503,6 +583,15 @@ func Resolve(ctx context.Context, env *Env, inj *Injection) error {
 			return fmt.Errorf("resolve %s: the fault is gone but %s was not left as it was found: %s%s",
 				inj.Fault, inj.Target.DeviceID(), r, alsoFailed(undoErr))
 		}
+	}
+	// The fault is gone and the device is as it was found, so the nodes may
+	// look after it again. Cleared last: while any doubt remained, the device
+	// was better left exempt than repaired by something that does not know
+	// what it is looking at.
+	if err := env.exempt(ctx, inj.Target.DeviceID(), inj.ID, false); err != nil {
+		return fmt.Errorf("resolve %s: the fault is gone but this node could not be told "+
+			"to look after %s again (%w); it will not be repaired automatically until "+
+			"the lab is redeployed", inj.Fault, inj.Target.DeviceID(), err)
 	}
 	return nil
 }
@@ -668,3 +757,15 @@ func (e *Env) Settled(ctx context.Context, within time.Duration,
 // It costs nothing when the symptom appears sooner, because Settled returns as
 // soon as it sees what it is waiting for.
 const SymptomWindow = 90 * time.Second
+
+// exempt asks the node hosting a device to leave it alone, if there is a node
+// to ask.
+//
+// Nil means there is no repair loop to exclude, which is the case in a unit
+// test and on a lab with no agent.
+func (e *Env) exempt(ctx context.Context, deviceID, injectionID string, on bool) error {
+	if e.Exempt == nil || deviceID == "" {
+		return nil
+	}
+	return e.Exempt(ctx, deviceID, injectionID, on)
+}

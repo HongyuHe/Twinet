@@ -3,6 +3,7 @@ package fault
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -124,39 +125,103 @@ func init() {
 // benchmark case unreproducible.
 func injectACL(ctx context.Context, e *Env, t Target, match string) (State, error) {
 	chains := []string{"INPUT", "OUTPUT"}
-	// A rule identical to one the student already wrote cannot be told apart
-	// from it, and resolving used to delete every copy: the injection removed
-	// the student's own firewall rule and the baseline check did not notice,
-	// because it compares sets of lines and a duplicate line is one line.
+	// Nothing distinguishing is written into the rule.
 	//
-	// The injected rule therefore carries a comment nobody else will have
-	// written. The value is random per injection and recorded only in the
-	// controller, so it identifies the rule without announcing what it is.
-	mark, err := randomCookie()
-	if err != nil {
-		return nil, err
+	// It used to carry an iptables comment so that resolving could tell the
+	// injected rule from an identical one a student had written. The value was
+	// random, but the *presence* of a comment on a DROP rule is itself the
+	// giveaway: anyone who has read this source -- which for an agent being
+	// evaluated on root-cause analysis is the whole difficulty removed --
+	// finds the injected rule instantly, and its match tells them the fault.
+	//
+	// The count is recorded instead. Adding one copy and later removing
+	// exactly one copy leaves a student's own identical rule untouched, which
+	// is the property the marker was there to provide, and leaves nothing in
+	// the device to find.
+	before := map[string]int{}
+	for _, c := range chains {
+		before[c] = countACL(ctx, e, t, c, match)
+		// A rule that is already there means this fault changes nothing.
+		//
+		// The count was recorded and not acted on, so injecting onto a device
+		// that already dropped this traffic appended a duplicate, verified
+		// happily -- `iptables -C` finds either copy -- and produced an episode
+		// whose ground truth named a cause that was not the reason anything
+		// was broken. A benchmark is worth nothing if the fault it records was
+		// not the change that caused the symptom.
+		if before[c] > 0 {
+			return nil, fmt.Errorf("%s already has a rule in %s dropping %q, so injecting "+
+				"another would change nothing while claiming to be the cause",
+				t.DeviceID(), c, match)
+		}
 	}
-	tag := fmt.Sprintf("-m comment --comment %s", strings.TrimPrefix(mark, "0x"))
+
+	var installed []string
 	for _, c := range chains {
 		if _, err := e.Sh(ctx, t.DeviceID(),
-			fmt.Sprintf("iptables -w -A %s %s %s -j DROP", c, match, tag)); err != nil {
+			fmt.Sprintf("iptables -w -A %s %s -j DROP", c, match)); err != nil {
 			// Roll back whatever was installed, or the device is left in a
 			// state that is neither faulted nor clean.
-			for _, done := range chains {
-				_, _ = e.Sh(ctx, t.DeviceID(),
-					fmt.Sprintf("iptables -w -D %s %s %s -j DROP 2>/dev/null || true", done, match, tag))
+			for _, done := range installed {
+				_, _ = e.Try(ctx, t.DeviceID(),
+					fmt.Sprintf("iptables -w -D %s %s -j DROP", done, match))
 			}
 			return nil, err
 		}
+		installed = append(installed, c)
 	}
-	return State{"match": match, "tag": tag, "chains": strings.Join(chains, " ")}, nil
+
+	st := State{"match": match, "chains": strings.Join(chains, " ")}
+	for _, c := range chains {
+		st["before/"+c] = strconv.Itoa(before[c])
+	}
+	return st, nil
+}
+
+// countACL counts how many rules in a chain drop this match.
+func countACL(ctx context.Context, e *Env, t Target, chain, match string) int {
+	// Counted by what the rule looks like once installed, not by the text that
+	// installs it.
+	//
+	// A rule added as "-p icmp --icmp-type echo-request" is listed as
+	// "-p icmp -m icmp --icmp-type 8", so searching for the input form matched
+	// nothing: the count was always zero, and the guard that refuses to inject
+	// onto a device already dropping this traffic never fired.
+	out, code := e.Try(ctx, t.DeviceID(),
+		fmt.Sprintf("iptables -w -S %s 2>/dev/null", chain))
+	if code != 0 {
+		return -1
+	}
+	want := specTokens(match)
+	n := 0
+	for _, line := range strings.Split(out, "\n") {
+		t := strings.TrimSpace(line)
+		if !strings.HasPrefix(t, "-A ") || !strings.HasSuffix(t, "-j DROP") {
+			continue
+		}
+		all := true
+		for _, w := range want {
+			if !strings.Contains(t, w) {
+				all = false
+				break
+			}
+		}
+		if all {
+			n++
+		}
+	}
+	return n
+}
+
+func shellQuoteFault(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 func verifyACL(ctx context.Context, e *Env, t Target, s State) (Evidence, error) {
 	var missing []string
 	for _, c := range strings.Fields(s["chains"]) {
 		if _, code := e.Try(ctx, t.DeviceID(),
-			fmt.Sprintf("iptables -w -C %s %s %s -j DROP", c, s["match"], s["tag"])); code != 0 {
+			fmt.Sprintf("iptables -w -C %s %s -j DROP", c, s["match"])); code != 0 {
 			missing = append(missing, c)
 		}
 	}
@@ -167,6 +232,41 @@ func verifyACL(ctx context.Context, e *Env, t Target, s State) (Evidence, error)
 	}, nil
 }
 
+func resolveACL(ctx context.Context, e *Env, t Target, s State) error {
+	if s["match"] == "" {
+		return fmt.Errorf("this fault's rule was not recorded, so it cannot be removed "+
+			"without guessing (device %s)", t.DeviceID())
+	}
+	for _, c := range strings.Fields(s["chains"]) {
+		// The rule is removed by position, not by specification.
+		//
+		// `iptables -D <chain> <spec>` deletes the *first* rule matching the
+		// specification. The injected rule is appended, so if the device
+		// already had an identical one, deleting by specification removes the
+		// student's and leaves ours -- and the counts still match, so nothing
+		// notices. Deleting the last matching position removes the one that
+		// was added.
+		pos := lastMatchingRule(ctx, e, t, c, s["match"])
+		if pos <= 0 {
+			// Already gone is not a failure; the checks below decide.
+			continue
+		}
+		if _, code := e.Try(ctx, t.DeviceID(),
+			fmt.Sprintf("iptables -w -D %s %d", c, pos)); code != 0 {
+			continue
+		}
+		want, err := strconv.Atoi(s["before/"+c])
+		if err != nil {
+			continue
+		}
+		if got := countACL(ctx, e, t, c, s["match"]); got >= 0 && got != want {
+			return fmt.Errorf("%s now has %d rule(s) dropping %q, and had %d before the "+
+				"fault was injected", c, got, s["match"], want)
+		}
+	}
+	return nil
+}
+
 func describeACL(missing []string, chains string) string {
 	if len(missing) == 0 {
 		return fmt.Sprintf("the rule is present in %s", chains)
@@ -174,25 +274,76 @@ func describeACL(missing []string, chains string) string {
 	return "the rule is absent from " + strings.Join(missing, " and ")
 }
 
-func resolveACL(ctx context.Context, e *Env, t Target, s State) error {
-	if s["match"] == "" || s["tag"] == "" {
-		return fmt.Errorf("this fault's rule was not recorded with an identifier, so it "+
-			"cannot be told apart from a rule the student wrote; removing by match would "+
-			"delete theirs too (device %s)", t.DeviceID())
+// lastMatchingRule returns the position of the last rule in a chain that drops
+// this match, or 0 if there is none.
+//
+// Position rather than specification, because two identical rules are
+// indistinguishable by specification and the injected one is always the later.
+func lastMatchingRule(ctx context.Context, e *Env, t Target, chain, match string) int {
+	out, code := e.Try(ctx, t.DeviceID(),
+		fmt.Sprintf("iptables -w -S %s 2>/dev/null", chain))
+	if code != 0 {
+		return 0
 	}
-	for _, c := range strings.Fields(s["chains"]) {
-		// Only rules carrying this injection's own marker are removed, and only
-		// as many as it installed.
-		for i := 0; i < 8; i++ {
-			if _, code := e.Try(ctx, t.DeviceID(),
-				fmt.Sprintf("iptables -w -D %s %s %s -j DROP", c, s["match"], s["tag"])); code != 0 {
+	return lastMatchingPosition(out, chain, specTokens(match))
+}
+
+// lastMatchingPosition returns the position of the last DROP rule in a chain
+// that mentions every one of the given values.
+//
+// It reads `iptables -S`, not `iptables -L`. The human listing renders the
+// protocol as a number -- an OSPF rule appears as "89", not "ospf" -- so
+// matching the specification against it failed for every rule named by
+// protocol, and the fault could not be removed at all. `-S` prints rules in
+// the same syntax they were added with, and the Nth "-A <chain>" line is
+// rule N.
+func lastMatchingPosition(out, chain string, want []string) int {
+	n, last := 0, 0
+	prefix := "-A " + chain + " "
+	for _, line := range strings.Split(out, "\n") {
+		t := strings.TrimSpace(line)
+		if !strings.HasPrefix(t, prefix) {
+			continue
+		}
+		n++
+		if !strings.HasSuffix(t, "-j DROP") {
+			continue
+		}
+		all := true
+		for _, w := range want {
+			if !strings.Contains(t, w) {
+				all = false
 				break
 			}
 		}
-		if _, code := e.Try(ctx, t.DeviceID(),
-			fmt.Sprintf("iptables -w -C %s %s %s -j DROP", c, s["match"], s["tag"])); code == 0 {
-			return fmt.Errorf("the drop rule is still present in %s after removal", c)
+		if all {
+			last = n
 		}
 	}
-	return nil
+	return last
+}
+
+// specTokens reduces an iptables specification to the values that also appear
+// in a rule listing: addresses and protocol names, not option flags.
+func specTokens(spec string) []string {
+	var out []string
+	f := strings.Fields(spec)
+	for i := 0; i < len(f); i++ {
+		switch f[i] {
+		case "-p", "-s", "-d":
+			if i+1 < len(f) {
+				out = append(out, f[i+1])
+				i++
+			}
+		case "--dport", "--sport":
+			// The port is part of what makes the rule this rule. Without it,
+			// "-p udp --dport 53" matched any UDP drop rule at all, and
+			// removing "the last one" could remove somebody else's.
+			if i+1 < len(f) {
+				out = append(out, f[i]+" "+f[i+1])
+				i++
+			}
+		}
+	}
+	return out
 }

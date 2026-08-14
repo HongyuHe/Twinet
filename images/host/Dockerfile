@@ -17,7 +17,12 @@ RUN apk add --no-cache \
     && mkdir -p /etc/twinet
 
 COPY entrypoint.sh /usr/local/bin/twinet-entrypoint
-RUN chmod 0755 /usr/local/bin/twinet-entrypoint
+# The multicast tool, built from this module. The advanced course's exercise
+# uses smcroute to join a group and ping to send to it, which needs two packages
+# and leaves a membership behind after it exits; this holds the membership in an
+# open socket, so a measurement cannot change the next one's answer.
+COPY twinet-mcast /usr/local/bin/twinet-mcast
+RUN chmod 0755 /usr/local/bin/twinet-entrypoint /usr/local/bin/twinet-mcast
 
 LABEL org.opencontainers.image.title="twinet-host" \
       org.opencontainers.image.source="https://github.com/HongyuHe/Twinet"

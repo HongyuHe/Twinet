@@ -1,0 +1,67 @@
+apiVersion: twinet.dev/v1
+kind: Lab
+metadata:
+  name: multicast
+  description: >
+    IP multicast with PIM sparse mode and IGMP, from the ETH advanced-networks
+    course.
+
+    One autonomous system, six routers, six hosts. The unicast network is built
+    and working before the student touches it; the exercise is to make a packet
+    sent to a group address reach exactly the hosts that asked for it, and no
+    others. That is checkable in a way "did you type the commands" is not: the
+    grader joins a group on one host, sends from another, and reads the
+    multicast forwarding tables of the routers in between.
+
+kinds:
+  router:
+    image: hyhe/twinet-router:0.1
+    capabilities: [NET_ADMIN, NET_RAW, SYS_ADMIN]
+    sysctls:
+      net.ipv4.ip_forward: "1"
+      net.ipv4.conf.all.rp_filter: "0"
+      net.ipv4.conf.default.rp_filter: "0"
+      net.ipv4.icmp_ratelimit: "0"
+      # mc_forwarding is deliberately absent: it is read-only from userspace.
+      # The kernel sets it when a process opens a multicast routing socket,
+      # which is what pimd does on startup, and a container that tries to write
+      # it refuses to start at all.
+  host:
+    image: hyhe/twinet-host:0.1
+    capabilities: [NET_ADMIN, NET_RAW]
+    pids: 128
+  switch:
+    image: hyhe/twinet-switch:0.1
+    capabilities: [NET_ADMIN, NET_RAW, SYS_NICE]
+    pids: 512
+  service:
+    image: hyhe/twinet-svc:0.1
+    capabilities: [NET_ADMIN, NET_RAW]
+
+# The lab links must fit inside the cluster's underlay once VXLAN encapsulation
+# is added, or a link between two nodes silently drops anything large.
+link_defaults:
+  mtu: 1450
+
+addressing:
+  as_block:        "{{ .AS }}.0.0.0/8"
+  inter_as:        "179.{{ .Low }}.{{ .High }}.0/24"
+  router_loopback: "{{ .AS }}.{{ add 150 .RouterID }}.0.1/32"
+  router_router:   "{{ .AS }}.0.{{ add 1 .LinkIndex }}.0/24"
+  router_host:     "{{ .AS }}.{{ add 100 .RouterID }}.0.0/24"
+
+autonomous_systems:
+  - list: [1]
+    template: campus
+    role: student
+
+access:
+  mode: gateway
+  listen: ":2024"
+
+placement:
+  strategy: pack-by-as
+  nodes:
+    - {name: node-0, addr: "10.0.1.1:7200", underlay_ip: 10.0.1.1, front: true}
+    - {name: node-1, addr: "10.0.1.2:7200", underlay_ip: 10.0.1.2}
+    - {name: node-2, addr: "10.0.1.3:7200", underlay_ip: 10.0.1.3}

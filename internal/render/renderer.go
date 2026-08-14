@@ -12,6 +12,7 @@ import (
 	"github.com/HongyuHe/twinet/internal/model"
 	"github.com/HongyuHe/twinet/internal/plan"
 	"github.com/HongyuHe/twinet/internal/runtime"
+	"github.com/HongyuHe/twinet/internal/svc"
 )
 
 // Mode selects how much configuration is applied.
@@ -76,8 +77,18 @@ func (r *Renderer) Files(d *model.Device) (map[string]deploy.FileSpec, error) {
 		if r.modeFor(d) == ModeSolve {
 			body = cfg.Platform + cfg.Expected
 		}
-		out["/etc/frr/daemons"] = deploy.FileSpec{Content: []byte(FRRDaemons), Mode: 0o640}
+		out["/etc/frr/daemons"] = deploy.FileSpec{
+			Content: []byte(DaemonsFor(r.Top.ASes[d.ASN])), Mode: 0o640}
 		out["/etc/frr/frr.conf"] = deploy.FileSpec{Content: []byte(body), Mode: 0o640}
+		// A router that has hosts on a segment of its own serves them DHCP.
+		//
+		// On the gateway rather than in a service container of its own,
+		// because a client's first packet is a broadcast and a server one hop
+		// away never hears it -- which would give every fault about DHCP the
+		// same symptom, "no address", whatever was actually wrong.
+		if cfg := svc.BuildDHCP(r.Top, d); len(cfg.Subnets) > 0 {
+			out[svc.DHCPConfigPath] = deploy.FileSpec{Content: cfg.JSON(), Mode: 0o644}
+		}
 		// The reference solution is deliberately NOT written here.
 		//
 		// It used to be, as /etc/twinet/reference.conf mode 0600, so that a TA
@@ -107,7 +118,8 @@ func (r *Renderer) Files(d *model.Device) (map[string]deploy.FileSpec, error) {
 func (r *Renderer) Commands(d *model.Device) ([]deploy.Command, error) {
 	switch d.Kind {
 	case model.KindRouter:
-		return append(r.routerCommands(d), r.rpkiReadyCommands(d)...), nil
+		cmds := append(r.routerCommands(d), r.dhcpCommands(d)...)
+		return append(cmds, r.rpkiReadyCommands(d)...), nil
 	case model.KindSwitch:
 		return r.switchCommands(d), nil
 	case model.KindHost:
@@ -127,8 +139,13 @@ func (r *Renderer) routerCommands(d *model.Device) []deploy.Command {
 	// it in place on every lab already running -- the classes that are exposed
 	// are exactly the ones that have been up longest. Remove it explicitly.
 	cmds = append(cmds, deploy.Command{
-		Describe: "remove any reference solution left by an earlier version",
-		Args:     []string{"sh", "-c", "rm -f /etc/twinet/reference.conf"},
+		Describe: "remove any configuration left in the device by an earlier version",
+		// restore.conf is the same problem found later: the snapshot loader
+		// copied a complete routing configuration in and left it there. On a
+		// lab deployed at the reference that is the answer, readable by any
+		// root shell -- which is what a student has, and what an agent being
+		// evaluated on root-cause analysis has.
+		Args: []string{"sh", "-c", "rm -f /etc/twinet/reference.conf /etc/twinet/restore.conf"},
 	})
 
 	// Solve mode installs the reference answer, so the running daemon must end
@@ -179,7 +196,7 @@ func (r *Renderer) routerCommands(d *model.Device) []deploy.Command {
 				// and bgpd let a router pass its deployment with ospfd dead,
 				// which is the same silence in a different daemon: OSPF never
 				// converges, and the report says the router is fine.
-				"daemons='" + strings.Join(EnabledDaemons(), " ") + "'",
+				"daemons='" + strings.Join(EnabledDaemonsFor(r.Top.ASes[d.ASN]), " ") + "'",
 				"missing() { m=''; for d in $daemons; do",
 				"  pidof \"$d\" >/dev/null 2>&1 || m=\"$m $d\"",
 				"done; echo \"$m\"; }",
@@ -269,7 +286,7 @@ func (r *Renderer) routerCommands(d *model.Device) []deploy.Command {
 	// still starting.
 	if lo, ok := d.IfaceByName("lo"); ok && lo.Owner == model.OwnerPlatform && lo.Addr4 != "" {
 		cmds = append([]deploy.Command{{
-			Args:     []string{"sh", "-c", fmt.Sprintf("ip addr replace %s dev lo && ip link set lo up", lo.Addr4)},
+			Args:     []string{"sh", "-c", fmt.Sprintf("ip addr replace %s brd + dev lo && ip link set lo up", lo.Addr4)},
 			Describe: "configure loopback",
 		}}, cmds...)
 	}
@@ -307,23 +324,211 @@ func (r *Renderer) rpkiReadyCommands(d *model.Device) []deploy.Command {
 	if !hasRPKICache(r.Top, d) {
 		return nil
 	}
+	cmds := []deploy.Command{{
+		Describe:    "connect to the origin validator",
+		Args:        []string{"sh", "-c", RPKIRefreshScript},
+		IgnoreError: true,
+	}}
+	cmds = append(cmds, r.roaPublishCommands(d)...)
+	return cmds
+}
+
+// dhcpCommands starts the address server on a router that serves a segment.
+func (r *Renderer) dhcpCommands(d *model.Device) []deploy.Command {
+	if d.Kind != model.KindRouter {
+		return nil
+	}
+	if cfg := svc.BuildDHCP(r.Top, d); len(cfg.Subnets) == 0 {
+		return nil
+	}
 	return []deploy.Command{{
-		Describe: "connect to the origin validator",
+		Describe: "serve DHCP on this router's own segments",
 		Args: []string{"sh", "-c", strings.Join([]string{
-			"for i in 1 2 3 4 5 6 7 8; do",
-			"  vtysh -c 'show rpki cache-connection' 2>/dev/null | grep -q Connected && exit 0",
-			"  vtysh -c 'rpki reset' >/dev/null 2>&1 || true",
-			"  sleep 4",
+			svc.DHCPStartCommand,
+			// A server that is not listening hands out nothing, and a client
+			// with no address then looks exactly like one whose server was
+			// deliberately stopped -- which is one of the faults. The two must
+			// not be confusable, so a deployment that cannot start it says so.
+			"for i in 1 2 3 4 5; do",
+			"  if ps -ef | grep -q '[t]winet-dhcpd'; then exit 0; fi",
+			"  sleep 1",
 			"done",
-			// Not a hard failure: a lab without a working validator is still a
-			// usable lab, and refusing to deploy over it would turn a degraded
-			// service into an outage. The grading check for origin validation
-			// is what makes the degradation visible where it matters.
-			"echo 'the origin validator did not answer; routes will be treated as not-found' >&2",
+			"echo 'the address server did not start' >&2; exit 1",
 		}, "\n")},
 		IgnoreError: true,
 	}}
 }
+
+// roaPublishCommands issues this system's own ROA, in solve mode only.
+//
+// Publishing is the student's action -- the platform authorises nothing for a
+// student system -- so the reference solution has to perform it like anybody
+// else, or the reference would fail the very question it defines the answer to.
+//
+// An autonomous system the manifest declares as having no ROA is skipped: that
+// is the deliberate not-found case, and publishing for it would remove the one
+// thing it exists to teach.
+func (r *Renderer) roaPublishCommands(d *model.Device) []deploy.Command {
+	if r.modeFor(d) != ModeSolve {
+		return nil
+	}
+	as, ok := r.Top.ASes[d.ASN]
+	if !ok || as.Role != model.RoleStudent || as.Block == "" {
+		return nil
+	}
+	if r.Top.Lab != nil {
+		for _, n := range r.Top.Lab.RPKI.NotFound {
+			if n == d.ASN {
+				return nil
+			}
+		}
+	}
+	addr := svc.RPKIAddrFor(r.Top, d.ASN)
+	if addr == "" {
+		return nil
+	}
+	body := fmt.Sprintf(`{"prefix":%q,"asn":%d}`, as.Block, d.ASN)
+	return []deploy.Command{{
+		Describe: "authorise this system's prefix with the lab's trust anchor",
+		// Retried, because the validator and this router come up together and
+		// the publication interface may not be listening yet. Failing softly:
+		// a lab whose trust anchor is briefly unreachable is still a usable
+		// lab, and the graded check is what makes a missing authorisation
+		// visible where it matters.
+		Args: []string{"sh", "-c", strings.Join([]string{
+			"for i in 1 2 3 4 5 6 7 8 9 10; do",
+			fmt.Sprintf("  curl -sf -m 5 -X POST http://%s%s/roas -d '%s' >/dev/null 2>&1 && exit 0",
+				addr, svc.PublishListen, body),
+			"  sleep 3",
+			"done",
+			"echo 'the trust anchor did not accept this authorisation' >&2",
+		}, "\n")},
+		IgnoreError: true,
+	}}
+}
+
+// RPKIRefreshScript waits for the validator and then re-runs inbound policy.
+//
+// Exported because grading loads a submission by restarting FRR, which puts it
+// in exactly the same race: the sessions come up while the validator is still
+// connecting.
+var RPKIRefreshScript = strings.Join([]string{
+	// Origin validation only takes effect on a route when the inbound policy
+	// runs, and FRR runs an inbound policy when the route arrives. ROAs that
+	// turn up afterwards -- which is the normal order, because BGP converges
+	// while the validator is still connecting -- record each route's
+	// validation state and leave the route in place. The table then reads
+	// "rpki validation-state: invalid" on a route the policy was written to
+	// reject, still selected and still advertised onwards.
+	//
+	// That was the state of this cluster: the reference solution itself
+	// carried the lab's hijack on 64 routers, with a correct deny clause on
+	// every one of them, so the question could not be answered correctly by
+	// anybody. A soft inbound refresh re-runs the policy against what the
+	// neighbours already sent; it resets no session, and is what an operator
+	// does when a validator comes up late.
+	//
+	// The refresh watches for the condition rather than trying to time it.
+	// Timing it was tried five times and measured five times: the socket
+	// reports connected before any record has arrived, the first record
+	// arrives before the rest, a session the lab deliberately delays
+	// delivers its routes after all of them, and a repair that restarts
+	// FRR an hour later puts the router straight back into the same state
+	// with no deployment running to notice. Every timed version refreshed
+	// at the wrong moment, found nothing to do, and exited; 36 routers
+	// stayed as they were through five of them.
+	//
+	// So it stays, cheaply: one look a minute, and a refresh only when
+	// this router is holding an invalid route it learned itself.
+	// The watcher already running is stopped first.
+	//
+	// A shell reads a `while` loop into memory before executing it, so a
+	// watcher started an hour ago goes on running the script it was started
+	// with no matter what is written to the file afterwards. The guard below
+	// then refuses to start the new one, because a watcher is already
+	// running. Every improvement to this script since it was written had
+	// therefore been deployed to the file and to nothing else: the version
+	// actually watching these routers was the first one.
+	"for p in $(ps -ef | awk '/rpki_refresh/ && !/awk/ {print $1}'); do kill $p 2>/dev/null || true; done",
+	"rm -f /run/twinet_rpki_refresh.pid",
+	"cat > /etc/twinet/rpki_refresh.sh <<'TWINET_RPKI'",
+	// One copy per container. A deployment runs this step every time, and
+	// a repair runs it again; without the guard a router accumulates a
+	// watcher per deployment for the life of the lab.
+	"pid=/run/twinet_rpki_refresh.pid",
+	"[ -f $pid ] && kill -0 \"$(cat $pid)\" 2>/dev/null && exit 0",
+	"echo $$ > $pid",
+	"while :; do",
+	"  sleep 60",
+	// A session that is configured and not connected does not repair
+	// itself, and nothing else was looking.
+	//
+	// FRR establishes the RTR connection when the cache line is
+	// committed, not when the daemon reads it out of a file, so a bgpd
+	// that restarts -- a repair, a container restart, an operator
+	// reloading -- comes back with the configuration present and no
+	// connection. Every route in the table is then not-found, which looks
+	// exactly like a student who filtered too much, and the whole class
+	// loses the origin-validation marks. Eight systems were found in that
+	// state at once. `rpki reset` and `rpki start` do not bring it back;
+	// re-entering the cache line does.
+	"  if vtysh -c 'show rpki cache-connection' 2>/dev/null | grep -q 'No connection'; then",
+	"    line=$(vtysh -c 'show running-config' 2>/dev/null | sed -n 's/^ *\\(rpki cache .*\\)$/\\1/p' | head -1)",
+	"    if [ -n \"$line\" ]; then",
+	"      vtysh -c 'configure terminal' -c 'rpki' -c \"no $line\" -c \"$line\" -c 'end' >/dev/null 2>&1",
+	"    fi",
+	"    continue",
+	"  fi",
+	// Nothing to validate against yet.
+	"  vtysh -c 'show rpki prefix-table' 2>/dev/null | grep -qE '^[0-9]+[.]' || continue",
+	// Only a route this router learned for itself, and only while one is
+	// there. A router cannot refresh away an invalid route it heard over
+	// iBGP -- the border that accepted it is the only one that can -- and
+	// FRR marks an iBGP path with an "i" directly after the status field:
+	// "I*>i10.128.0.0/9" came from inside, "I*> 10.128.0.0/9" came from a
+	// neighbour of this router.
+	"  vtysh -c 'show bgp ipv4 unicast rpki invalid' 2>/dev/null |",
+	"    grep -E '^[A-Za-z]*[*]' | grep -qv '>i' || continue",
+	// A route refresh, not a soft replay. Storing the received
+	// announcements and replaying them was tried: FRR replays each stored
+	// entry with the validation state it was given when it arrived, which
+	// is precisely the stale answer being corrected. Asking the neighbour
+	// to send its routes again re-validates them against the ROA table as
+	// it stands now.
+	"  vtysh -c 'clear bgp ipv4 unicast * in' >/dev/null 2>&1 || true",
+	"done",
+	"TWINET_RPKI",
+	// Started before anything is waited for, and with every descriptor
+	// detached under setsid.
+	//
+	// It used to be started only inside the loop below, once the validator
+	// answered -- which it does not do within thirty seconds of an FRR
+	// restart, which is exactly when this runs. So on a deployment the
+	// watcher was never started at all, and the thing that was measured
+	// five times as "the watcher ran and did nothing" was a watcher that
+	// had never existed. A plain `&` does not survive either: the exec's
+	// session ends with the command and the child is signalled before its
+	// first sleep is over.
+	"setsid sh /etc/twinet/rpki_refresh.sh </dev/null >/dev/null 2>&1 &",
+	"for i in 1 2 3 4 5 6 7 8; do",
+	"  if vtysh -c 'show rpki cache-connection' 2>/dev/null | grep -q Connected; then",
+	"    exit 0",
+	"  fi",
+	// Re-entering the cache line, not `rpki reset`: reset was measured on
+	// a live router with the session down and left it down, as did
+	// `rpki start`.
+	"  line=$(vtysh -c 'show running-config' 2>/dev/null | sed -n 's/^ *\\(rpki cache .*\\)$/\\1/p' | head -1)",
+	"  if [ -n \"$line\" ]; then",
+	"    vtysh -c 'configure terminal' -c 'rpki' -c \"no $line\" -c \"$line\" -c 'end' >/dev/null 2>&1",
+	"  fi",
+	"  sleep 4",
+	"done",
+	// Not a hard failure: a lab without a working validator is still a
+	// usable lab, and refusing to deploy over it would turn a degraded
+	// service into an outage. The grading check for origin validation is
+	// what makes the degradation visible where it matters.
+	"echo 'the origin validator did not answer; routes will be treated as not-found' >&2",
+}, "\n")
 
 func (r *Renderer) switchCommands(d *model.Device) []deploy.Command {
 	br := "br0"
@@ -484,7 +689,15 @@ func (r *Renderer) hostCommands(d *model.Device) []deploy.Command {
 	apply := func(i *model.Iface) {
 		if i.Addr4 != "" {
 			cmds = append(cmds, deploy.Command{
-				Args:     []string{"sh", "-c", fmt.Sprintf("ip addr replace %s dev %s", i.Addr4, i.Name)},
+				Args: []string{"sh", "-c", // brd + , so the address carries its broadcast attribute.
+					//
+					// Without it the kernel records no broadcast address, and a
+					// fault that removes and re-adds the address puts back
+					// something that differs from what it found -- which the
+					// baseline comparison then reports, correctly, as a lab that
+					// was not restored. Measured on this cluster: every
+					// address-changing fault left this residue behind.
+					fmt.Sprintf("ip addr replace %s brd + dev %s", i.Addr4, i.Name)},
 				Describe: "address " + i.Name,
 			})
 		}
@@ -632,6 +845,17 @@ func vlanList(d *model.Device) string {
 // deviceFacts writes a machine-readable description of the device into the
 // container, so tooling inside it (the student shell, save/restore, the
 // grader's probes) never has to guess or re-derive the topology.
+//
+// It deliberately omits the addressing of interfaces the *student* owns.
+//
+// This file listed every prescribed address, including the ones a student is
+// meant to configure themselves. For a teaching lab that is only mildly
+// unhelpful. For the root-cause benchmark it is the answer: three of the
+// end-host faults change an address, and an agent could find them by comparing
+// this file with `ip addr` instead of diagnosing anything -- an oracle no other
+// backend in the comparison has. What the platform configured is still
+// described, because that is what the container's own tooling needs and it is
+// not what anybody is being asked to work out.
 func deviceFacts(top *model.Topology, d *model.Device) []byte {
 	var b strings.Builder
 	b.WriteString("{\n")
@@ -648,8 +872,12 @@ func deviceFacts(top *model.Topology, d *model.Device) []byte {
 		if ifc.Peer != nil {
 			peer = ifc.Peer.Device.ID + ":" + ifc.Peer.Name
 		}
+		addr4, addr6 := ifc.Addr4, ifc.Addr6
+		if ifc.Owner != model.OwnerPlatform {
+			addr4, addr6 = "", ""
+		}
 		fmt.Fprintf(&b, "    {\"name\": %q, \"role\": %q, \"owner\": %q, \"addr4\": %q, \"addr6\": %q, \"vlan\": %d, \"peer\": %q}",
-			ifc.Name, ifc.Role, ifc.Owner, ifc.Addr4, ifc.Addr6, ifc.VLAN, peer)
+			ifc.Name, ifc.Role, ifc.Owner, addr4, addr6, ifc.VLAN, peer)
 		if i < len(d.Ifaces)-1 {
 			b.WriteString(",")
 		}

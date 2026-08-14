@@ -116,10 +116,10 @@ generating it.
 | | Count |
 |---|---:|
 | NIKA types | 60 |
-| Implemented in Twinet | **40** |
-| Not implemented | 20 |
+| Implemented in Twinet | **45** |
+| Not implemented | 15 |
 | Twinet-only types | 2 |
-| Total Twinet types | **42** |
+| Total Twinet types | **47** |
 
 Reproduce the accounting with:
 
@@ -139,7 +139,7 @@ plus one family that is a design change rather than a fault.
 |---|---:|---|
 | P4 / BMv2 | 6 | A `p4` device kind running BMv2 with a P4 program and a control plane |
 | Kubernetes | 4 | A Kubernetes node kind, or delegation to NIKA's existing backend |
-| DHCP | 5 | A DHCP server in the service image, and hosts that lease rather than are addressed |
+| DHCP | — | **implemented**: the gateway routers serve DHCP, and the five faults stop it, remove a subnet, or hand out the wrong gateway, resolver or pool |
 | VPN membership | — | **implemented**, once the advanced-networks lab gave the platform an L3VPN to break: `host_vpn_membership_missing` takes a customer-facing port out of its routing table |
 | SDN southbound | 3 | A `controller` device kind speaking OpenFlow to the OVS switches |
 | Other | 2 | `mpls_label_limit_exceeded`, `load_balancer_overload` |
@@ -156,12 +156,36 @@ force re-allocation left it unchanged again. A fault that configures something
 and changes nothing is worse than an absent one, so it is absent and counted as
 a gap.
 
-Twinet addresses every host statically from the plan, because the plan is also
-the grading key: a check can say "the address is not the one the assignment
-specifies" precisely because Twinet knows what that address is. Introducing DHCP
-means introducing an address Twinet did not choose, which the grader would then
-have to discover rather than know. That is a real design change, not a fault to
-add, and it is why the DHCP family is listed here rather than implemented.
+Twinet addresses every host statically from the plan, and DHCP is served
+alongside that rather than instead of it: the pool starts at .200, outside every
+planned address, so a lease can be taken without disturbing the addressing an
+exercise is about. That was the design change the DHCP family needed, and it is
+why it took a server rather than five injectors.
+
+The server runs on the gateway routers, not in a service container of its own. A
+client's first packet is a broadcast and a server one hop away never hears it,
+which would have given all five faults the same symptom -- "no address" --
+whatever was actually wrong. One socket per segment, bound to the device,
+because a DISCOVER carries no address to say which segment it came from:
+measured, a gateway serving three segments on one wildcard socket answered
+nobody.
+
+Their symptoms are proved in the end-to-end suite, which asks a real client for
+a lease over the same path a person would use: served by the gateway before
+anything is injected, no lease when the server is stopped, no lease on the
+segment whose subnet was removed, a lease from 3.103.0.254 when the gateway is
+spoofed, and served by the gateway again afterwards. The verifiers themselves
+read the server's process and configuration, which is deterministic; a client
+probe inside the verifier was tried and removed, because through that path it
+reported "no lease" for a fault whose symptom is a lease with the wrong
+contents, while the identical command through `twinet exec` obtained one every
+time. Evidence that cannot be explained is worse than none, because it reads as
+a symptom.
+
+A fault shared with the taxonomy also sits in the taxonomy's category, checked
+against a vendored copy (`internal/fault/nika_types.json`). Six did not, and the
+test meant to catch that checked only that each category was a member of the
+enum -- which every category is by construction.
 
 The P4 and SDN groups fit the device-kind model directly and are the natural
 next extension. The Kubernetes group is a poor fit: those are a container
@@ -171,10 +195,11 @@ Kubernetes to NIKA's existing backend rather than duplicating it.**
 
 ### 4.2 What is implemented
 
-All 39 shared types round-trip against a live cluster in
-`TestEveryFaultRoundTrips`: each is injected, verified to have taken effect,
-resolved, and then verified to be gone *and* to have left the device as it was
-found (§4.3).
+Of the 40 shared types, 39 round-trip against a live cluster in
+`TestEveryFaultRoundTrips`, along with one of the two Twinet-only types: each is
+injected, verified to have taken effect, resolved, and then verified to be gone
+*and* to have left the device as it was found (§4.3). The two that are skipped,
+and why, are above.
 
 - **End-host failures.** `host_incorrect_ip`, `host_missing_ip`,
   `host_incorrect_netmask`, `host_incorrect_gateway`, `host_incorrect_dns`,
@@ -277,7 +302,7 @@ twinet fault inject ospf-adjacency-lost    # apply, then verify it manifested
 twinet fault verify ospf-adjacency-lost    # is it *still* doing what it claims
 twinet fault resolve ospf-adjacency-lost
 twinet fault status --json                 # what is currently injected
-twinet incident run --scenario incidents/ospf.yaml --agent <endpoint>
+twinet incident run --scenario incidents/ospf.yaml   # inject, record, resolve
 ```
 
 `twinet fault verify` is worth using and easy to overlook. Injection verifies
@@ -290,11 +315,40 @@ looks valid and its ground truth is wrong. Re-verify before scoring, or on a
 timer for a long-running episode.
 
 An **incident** is the reproducible unit: a lab manifest, a baseline, a set of
-faults, and the ground truth. `twinet incident run` builds the lab, establishes
-the baseline, injects, verifies, hands an endpoint to the agent, and scores the
-diagnosis. It is the same machinery as `twinet grade`, pointed at a different
-question: not "did the student configure this correctly" but "did the agent
-work out what was wrong".
+faults, and the ground truth.
+
+`twinet incident run` records a baseline of the deployed lab, injects the
+scenario's faults, verifies each took effect, hands the incident to an agent,
+scores what it says, resolves the faults and writes an episode: the ground
+truth, the symptoms, the diagnosis, the score and the timings.
+
+The agent is a command. It is given the brief, the symptoms, the lab's name and
+how to reach it, on standard input; it is not given the ground truth, the fault
+names or anything else that would answer the question, and the end-to-end suite
+asserts that -- an agent that could read the answer would measure nothing. It
+prints a diagnosis:
+
+```json
+{"is_anomaly": true,
+ "faulty_devices": ["as3/NYC"],
+ "root_cause_category": "misconfiguration",
+ "root_cause_name": ["ospf_neighbor_missing"],
+ "explanation": "free text, recorded and not scored"}
+```
+
+The score has four parts rather than one, because an agent that names the right
+device for the wrong reason and one that names the right reason on the wrong
+device are different failures: detection (0.2), the devices held responsible as
+a Jaccard overlap so that naming everything scores badly (0.3), the category
+(0.2) and the root cause names, all of them and nothing else (0.3). The
+explanation is recorded and not scored: scoring prose would make the mark depend
+on a judge nobody can inspect.
+
+Measured on the cluster with a small agent that greps for a router with too few
+OSPF adjacencies: 0.70 of 1.00 -- it detected the incident, named the category
+and the root cause, and blamed `as3/ATL`, which had lost its adjacency as a
+*consequence* of the fault injected at `as3/NYC`. That is exactly the
+distinction a benchmark exists to draw.
 
 ## 6. Consequences for the rest of the plan
 
@@ -327,7 +381,7 @@ Recording these here so they are not discovered late.
    time-varying. Reproducibility requires a seeded, recorded schedule rather
    than wall-clock randomness, so an episode can be replayed exactly.
 
-6. **New services are needed.** DHCP (four fault types), a web service and load
+6. **New services are needed.** A load balancer, and traffic generation. DHCP and the web service are now built. Originally this read: DHCP (four fault types), a web service and load
    balancer (three), and traffic generation (four) are prerequisites. These join
    the [05](05_services.md) list, motivated now by two consumers rather than one.
 
@@ -365,18 +419,39 @@ for the command. Do not edit these by hand — regenerate them.
 
 | | Count |
 | --- | --- |
-| Registered in Twinet | 41 |
+| Registered in Twinet | 42 |
 | NIKA types total | 60 |
-| **Covered** | **39** |
-| Not yet covered | 21 |
+| **Covered** | **40** |
+| Not yet covered | 20 |
 
-The 21 are not arbitrary: each needs a substrate the lab does not run — six P4,
-five DHCP, four Kubernetes, three SDN southbound, and three others. They are
+The 20 are not arbitrary: each needs a substrate the lab does not run — six P4,
+four Kubernetes, three SDN southbound, and two others. They are
 absent because the substrates are, and adding a fault against a service that
 does not exist would produce an episode with no symptom, which is worse than an
 absent fault because it looks like a working one.
 
-Every registered fault is exercised against the live cluster by `make e2e`,
-which injects and resolves all thirty-seven in about thirty-six seconds. A fault
+`make e2e` exercises forty of the forty-two against the live cluster in about
+eighty seconds: each is injected, verified to have taken effect, resolved, and
+verified to be gone and to have left the device as it was found.
+
+Where a fault's mechanism differs from NIKA's, it is recorded rather than
+implied to be identical. `link_detach` drops traffic in both directions on an
+interface; NIKA's `link_failure` deletes the interface. Twinet does not delete
+it, because removing a veth end from inside the namespace cannot be undone from
+there, and a fault that cannot be undone destroys the lab rather than perturbing
+it. The symptom an agent is given describes what is actually there -- traffic
+disappearing across a link whose interface is up and addressed -- because a
+benchmark that describes evidence the agent will not find is worse than one that
+describes none.
+
+Two are skipped, with the reason printed rather than quietly omitted.
+`host_vpn_membership_missing` needs VPN routing tables, which the COS-461 lab
+does not have; it is exercised against `examples/advnet`. `web_dos_attack`
+cannot measurably overwhelm the lab's resolver from one container on this
+hardware, and its flood is deliberately bounded so that it cannot take down
+other labs sharing the node -- so it reports the measurement and refuses rather
+than claiming an effect it did not have. A fault that reports success without a
+symptom is worse than an absent one, because whatever an agent concludes is
+then scored against a cause that was never there. A fault
 that cannot be undone is treated as a failure there, because an episode that
 contaminates the next one is worse than an episode that never ran.

@@ -27,9 +27,31 @@ import (
 // out of the daemons file rather than listed a second time here. A deployment
 // checks for exactly these, so enabling a daemon and forgetting to check for it
 // is not something that can happen.
-func EnabledDaemons() []string {
+func EnabledDaemons() []string { return daemonsIn(FRRDaemons) }
+
+// DaemonsFor returns the daemons file for a device: the base set, plus pimd
+// where the AS declares the multicast exercise.
+//
+// Per AS rather than everywhere. pimd is another process in every one of a
+// thousand containers, and a lab that is not about multicast should not pay for
+// it; but a lab that is about multicast cannot be configured at all without it,
+// and the exercise used to be undeployable for exactly that reason -- the
+// daemon was off, so `ip pim` was rejected on every router and there was
+// nothing to grade.
+func DaemonsFor(as *model.AS) string {
+	if as == nil || !as.Multicast.Enabled {
+		return FRRDaemons
+	}
+	out := strings.ReplaceAll(FRRDaemons, "pimd=no", "pimd=yes")
+	return out
+}
+
+// EnabledDaemonsFor is EnabledDaemons for one AS.
+func EnabledDaemonsFor(as *model.AS) []string { return daemonsIn(DaemonsFor(as)) }
+
+func daemonsIn(file string) []string {
 	var out []string
-	for _, line := range strings.Split(FRRDaemons, "\n") {
+	for _, line := range strings.Split(file, "\n") {
 		name, value, ok := strings.Cut(strings.TrimSpace(line), "=")
 		// The settings that are not daemons -- zebra_enable, vtysh_enable --
 		// are the ones with an underscore in the key.
@@ -157,22 +179,33 @@ func Router(top *model.Topology, d *model.Device) (RouterConfig, error) {
 	}
 	mpls := renderMPLS(as, d)
 	vrfBGP := renderVRFBGP(as, d)
-	if isPlatformOwned(as) {
-		plat.WriteString(ospf)
-		plat.WriteString(bgp)
-		plat.WriteString(mpls)
-		plat.WriteString(vrfBGP)
-	} else {
-		exp.WriteString(ospf)
-		exp.WriteString(bgp)
-		exp.WriteString(mpls)
-		exp.WriteString(vrfBGP)
+	mcast := renderMulticast(as, d)
+	// Per domain, not per AS.
+	//
+	// This was one decision for the whole router: either the AS was a staff one
+	// and Twinet configured everything, or it was a student one and Twinet
+	// configured nothing. A course that wants the interior given and the
+	// exterior assigned -- which is what the advanced labs are -- could declare
+	// exactly that in the manifest, and got a lab where the students were
+	// handed neither.
+	into := func(domain, text string) {
+		if text == "" {
+			return
+		}
+		if as.Provides(domain) {
+			plat.WriteString(text)
+			return
+		}
+		exp.WriteString(text)
 	}
+	into(model.DomainOSPF, ospf)
+	into(model.DomainBGP, bgp)
+	into(model.DomainMPLS, mpls)
+	into(model.DomainBGP, vrfBGP)
+	into(model.DomainMulticast, mcast)
 
 	return RouterConfig{Platform: plat.String(), Expected: exp.String()}, nil
 }
-
-func isPlatformOwned(as *model.AS) bool { return as.Role != model.RoleStudent }
 
 // ospfCost returns the OSPF cost the reference solution puts on an interface.
 //
@@ -326,6 +359,18 @@ func renderBGP(top *model.Topology, as *model.AS, d *model.Device) string {
 	if as.Role != model.RoleIXP {
 		fmt.Fprintf(&b, "  network %s\n", as.Block)
 	}
+	// The deliberate hijack the RPKI exercise is about.
+	//
+	// The manifest declares a ROA held by one AS for a prefix inside another's
+	// space. That is only half of an invalid announcement: without anybody
+	// announcing the prefix, no route in the lab was ever RPKI-invalid, so the
+	// question "do you reject invalid announcements?" could not be answered by
+	// looking at any router, and every submission passed it for having written
+	// a route-map. A staff AS other than the ROA holder announces it, so the
+	// invalid route exists for every student and no student can withdraw it.
+	if hijacker, prefix := svc.HijackOrigin(top); hijacker == as.ASN && prefix != "" {
+		fmt.Fprintf(&b, "  network %s\n", prefix)
+	}
 	for _, p := range peers {
 		fmt.Fprintf(&b, "  neighbor %s activate\n", p)
 		fmt.Fprintf(&b, "  neighbor %s next-hop-self\n", p)
@@ -424,7 +469,7 @@ func slowLinkPolicy(as *model.AS, rels map[model.Relationship]bool, rpki bool) s
 			continue
 		}
 		up := strings.ToUpper(string(rel))
-		b.WriteString(inboundMap("LP-SLOW-"+up, rel, base[rel]-50, rpki))
+		b.WriteString(inboundMap("LP-SLOW-"+up, rel, base[rel]-slowLinkPenalty, rpki))
 		// The export mirrors the fast neighbour of the same class exactly, and
 		// adds only the prepend. Anything else is filtering: withholding a
 		// prefix from the slow neighbour that the fast one receives removes
@@ -682,12 +727,29 @@ func localPrefFor(rel model.Relationship) int {
 // accepted only what is explicitly valid would black-hole most of the real
 // internet, and a check testing only for rejection would award full marks for
 // exactly that mistake.
+// notFoundPenalty is how much a route with no ROA is deprioritised, and
+// slowLinkPenalty how much a route across a deliberately slow link is. They
+// must differ, or the two policies cancel: see inboundMap.
+const (
+	notFoundPenalty = 25
+	slowLinkPenalty = 50
+)
+
 func inboundMap(name string, rel model.Relationship, pref int, rpki bool) string {
 	var b strings.Builder
 	if rpki {
 		fmt.Fprintf(&b, "route-map %s deny 5\n match rpki invalid\nexit\n", name)
+		// The not-found penalty is smaller than the slow-link one.
+		//
+		// Both were 50, and the two collided: the system this lab deliberately
+		// leaves without a ROA is somebody's *fast* customer, so its routes
+		// arrived at 300-50 while the slow customer's arrived at 300-50 as
+		// well, and the reference solution stopped preferring the fast
+		// neighbour it had just been configured to prefer. Keeping the
+		// penalties different keeps the two answers independent, which is what
+		// the two questions are.
 		fmt.Fprintf(&b, "route-map %s permit 10\n match rpki notfound\n set local-preference %d\n set community 1:%d\nexit\n",
-			name, pref-50, communityFor(rel))
+			name, pref-notFoundPenalty, communityFor(rel))
 	}
 	fmt.Fprintf(&b, "route-map %s permit 20\n set local-preference %d\n set community 1:%d\nexit\n!\n",
 		name, pref, communityFor(rel))
@@ -743,4 +805,71 @@ func dedupStrings(in []string) []string {
 		}
 	}
 	return out
+}
+
+// renderMulticast is the reference answer to the advanced course's PIM
+// exercise: multicast on every interface, IGMP where the hosts are, and one
+// rendezvous point for the declared group range.
+//
+// Written from the AS's declaration rather than from a fixture, so the figure
+// in the exercise, the reference solution and the grader all come from one
+// statement. The interface stanzas are emitted separately from the ones the
+// addressing produced because FRR merges repeated `interface` blocks, and
+// keeping them apart is what lets the addressing be handed out while the
+// multicast configuration is left for the student.
+func renderMulticast(as *model.AS, d *model.Device) string {
+	if as == nil || !as.Multicast.Enabled || !d.IsRouter() {
+		return ""
+	}
+	var b strings.Builder
+	for _, i := range d.Ifaces {
+		if i.Name == "" {
+			continue
+		}
+		fmt.Fprintf(&b, "interface %s\n ip pim\n", i.Name)
+		// IGMP belongs on the interfaces hosts are behind and nowhere else:
+		// the routers do not join groups, they route between the hosts that
+		// do, and the exercise says so explicitly.
+		if facesHosts(i) {
+			b.WriteString(" ip igmp\n")
+		}
+		b.WriteString("exit\n!\n")
+	}
+	rp := as.Multicast.RP
+	groups := as.Multicast.Groups
+	if rp != "" && groups != "" {
+		// The rendezvous point is addressed by its loopback, so it survives an
+		// interface going down while another path to it is still up. That is
+		// the reason the exercise gives, and it is the reason here.
+		if addr := loopbackAddrOf(as, rp); addr != "" {
+			fmt.Fprintf(&b, "ip pim rp %s %s\n!\n", addr, groups)
+		}
+	}
+	return b.String()
+}
+
+// facesHosts reports whether an interface has hosts behind it: a host link, or
+// a layer-2 access or trunk port into a segment the hosts are on.
+func facesHosts(i *model.Iface) bool {
+	switch i.Role {
+	case model.RoleHostLink, model.RoleL2Access, model.RoleL2Trunk:
+		return true
+	}
+	return false
+}
+
+// loopbackAddrOf returns the bare loopback address of a named router.
+func loopbackAddrOf(as *model.AS, router string) string {
+	for _, r := range as.Routers {
+		if r.Name != router {
+			continue
+		}
+		if lo, ok := r.IfaceByName("lo"); ok && lo.Addr4 != "" {
+			if i := strings.IndexByte(lo.Addr4, '/'); i > 0 {
+				return lo.Addr4[:i]
+			}
+			return lo.Addr4
+		}
+	}
+	return ""
 }

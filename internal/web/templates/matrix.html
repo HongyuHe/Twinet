@@ -1,0 +1,15 @@
+{{template "head" .}}
+{{if .Pending}}<p>The first connectivity snapshot is being taken. Reload in a minute.</p>{{else}}
+<p>{{.M.Reachable}} of {{.M.Total}} pairs reachable ({{pct .M.Percent}}), taken {{.M.TakenAt.Format "15:04:05 MST"}} in {{.M.Duration}}.
+<a href="/matrix.json">JSON</a></p>
+<p class="muted">Green: reachable, with the round trip in milliseconds. Orange: reachable, but
+over a path that violates the business relationships — somebody is carrying transit
+they are not paid for. Red: no answer. Grey: the probe itself could not run.</p>
+<table><tr><th>from \ to</th>{{range .M.ASNs}}<th>{{.}}</th>{{end}}</tr>
+{{$grid := .Grid}}{{range $from := .M.ASNs}}<tr><th>{{$from}}</th>
+{{range $to := $.M.ASNs}}{{$c := index $grid $from $to}}
+{{if not $c}}<td class="u">·</td>{{else if eq (printf "%v" $c.State) "ok"}}<td class="y" title="{{$c.Detail}}">{{printf "%.0f" $c.RTTms}}</td>{{else if eq (printf "%v" $c.State) "invalid"}}<td class="i" title="{{$c.Detail}}">!</td>{{else if eq (printf "%v" $c.State) "unknown"}}<td class="u" title="{{$c.Detail}}">?</td>{{else}}<td class="n" title="{{$c.Detail}}">×</td>{{end}}
+{{end}}</tr>{{end}}
+</table>
+{{end}}
+{{template "foot" .}}

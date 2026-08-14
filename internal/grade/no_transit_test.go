@@ -1,6 +1,8 @@
 package grade
 
 import (
+	"os"
+	"strings"
 	"testing"
 
 	"github.com/HongyuHe/twinet/internal/model"
@@ -36,7 +38,7 @@ func TestALeakedRouteIsAttributedToItsSource(t *testing.T) {
 			bgpRoute{NextHop: "0.0.0.0", Path: ""}, model.Relationship("")},
 	}
 	for _, c := range cases {
-		if got := sourceRelationship(c.e, relOf, relOfASN); got != c.want {
+		if got := sourceRelationship(c.e, 3, relOf, relOfASN); got != c.want {
 			t.Errorf("%s: got %q, want %q", c.name, got, c.want)
 		}
 	}
@@ -49,11 +51,83 @@ func TestOnlyCustomerRoutesMayBeRelayed(t *testing.T) {
 	relOf := map[string]model.Relationship{}
 
 	leak := bgpRoute{Path: "4 200"}
-	if got := sourceRelationship(leak, relOf, relOfASN); got != model.RelPeer {
+	if got := sourceRelationship(leak, 3, relOf, relOfASN); got != model.RelPeer {
 		t.Fatalf("a peer's route was attributed to %q", got)
 	}
 	fine := bgpRoute{Path: "9 500"}
-	if got := sourceRelationship(fine, relOf, relOfASN); got != model.RelCustomer {
+	if got := sourceRelationship(fine, 3, relOf, relOfASN); got != model.RelCustomer {
 		t.Fatalf("a customer's route was attributed to %q", got)
 	}
+}
+
+// The traffic-engineering question asks for `set as-path prepend <own> <own>
+// <own>` towards a slow neighbour, so an advertisement leaving this AS reads
+// "3 3 3 9". Reading only the first element found *ourselves* -- in no
+// relationship map -- so the route's origin came back unknown, and a peer's
+// route leaked out over a prepended session was attributed to nobody and
+// passed.
+func TestOurOwnPrependsDoNotHideWhoTheRouteCameFrom(t *testing.T) {
+	relOfASN := map[int]model.Relationship{4: model.RelPeer, 9: model.RelCustomer}
+	relOf := map[string]model.Relationship{}
+
+	leak := bgpRoute{Path: "3 3 3 4 200"}
+	if got := sourceRelationship(leak, 3, relOf, relOfASN); got != model.RelPeer {
+		t.Fatalf("a peer's route relayed over a prepended session was attributed to %q, "+
+			"so the leak the question is about goes unnoticed on exactly the "+
+			"sessions the other question asks students to prepend", got)
+	}
+	own := bgpRoute{Path: "3 3 3"}
+	if got := sourceRelationship(own, 3, relOf, relOfASN); got != model.Relationship("") {
+		t.Fatalf("our own prepended route was attributed to %q", got)
+	}
+}
+
+// FRR answers a query about a neighbour it does not have with
+// {"warning":"No such neighbor in this view/vrf"} and exit status 0, which is a
+// finding about the student. A read that fails for any other reason is a fault
+// in the grader, and a check that reports "no leaks" while some of the sessions
+// it is about were never read is reporting on a question it did not finish
+// asking.
+func TestUnreadableSessionsAreNotTreatedAsClean(t *testing.T) {
+	var doc bgpRouteJSON
+	if err := jsonUnmarshalLoose(`{"warning":"No such neighbor in this view/vrf"}`, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if !doc.NoSuchNeighbour() {
+		t.Error("FRR's answer for a neighbour that does not exist was not recognised, " +
+			"so a session the student never configured is indistinguishable from " +
+			"a router the grader could not read")
+	}
+	var table bgpRouteJSON
+	if err := jsonUnmarshalLoose(`{"advertisedRoutes":{}}`, &table); err != nil {
+		t.Fatal(err)
+	}
+	if table.NoSuchNeighbour() {
+		t.Error("an empty advertised-routes table was read as a missing session")
+	}
+}
+
+// The assignment lets a group choose their own datacentre addressing and agree
+// their own peering addresses with a neighbour. Reading either out of the plan
+// marks them wrong for an answer the assignment permits: the datacentre check
+// pings an address nobody configured, and the session check looks for a
+// neighbour at an address the two groups agreed not to use.
+func TestAddressesAreReadFromTheDevicesNotThePlan(t *testing.T) {
+	src := []byte(readFileForTest(t, "checks_policy.go") + readFileForTest(t, "checks_inter.go"))
+	for _, bad := range []string{"firstAddr6(dst)", "firstAddr6(h)", "addrOf(i.Peer.Addr4)"} {
+		if strings.Contains(string(src), bad) {
+			t.Errorf("a check still takes %s from the manifest rather than from the "+
+				"device, so a group that used the addressing the assignment lets them "+
+				"choose is marked wrong for it", bad)
+		}
+	}
+}
+
+func readFileForTest(t *testing.T, name string) string {
+	t.Helper()
+	b, err := os.ReadFile(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
 }

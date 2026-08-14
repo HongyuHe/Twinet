@@ -7,6 +7,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"text/tabwriter"
 	"time"
@@ -34,17 +36,30 @@ can quote the routing-table entry that was wrong rather than saying "FAIL".`,
 		newGradeRunCmd(opts),
 		newGradeBatchCmd(opts),
 		newGradeClassCmd(opts),
-		newGradeChecksCmd(),
+		newGradeChecksCmd(opts),
 		newGradeValidateCmd(),
 	)
 	return cmd
 }
 
-func newGradeChecksCmd() *cobra.Command {
+func newGradeChecksCmd(opts *Options) *cobra.Command {
 	return &cobra.Command{
 		Use:   "checks",
 		Short: "List the checks a rubric may refer to",
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if opts.JSON {
+				// Only what a caller can use. A check carries the function
+				// that runs it, which does not serialise -- and encoding the
+				// whole struct failed at run time on a flag that is supposed
+				// to be the machine-readable one.
+				out := make([]map[string]string, 0)
+				for _, c := range grade.Checks() {
+					out = append(out, map[string]string{
+						"check": c.Name, "verifies": c.Describe,
+					})
+				}
+				return json.NewEncoder(cmd.OutOrStdout()).Encode(out)
+			}
 			w := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
 			fmt.Fprintln(w, "CHECK\tWHAT IT VERIFIES")
 			for _, c := range grade.Checks() {
@@ -86,18 +101,29 @@ func newGradeRunCmd(opts *Options) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "run",
 		Short: "Grade the autonomous systems of a running lab",
-		Long: `Grades one or more ASes of a deployed lab and writes structured reports.
+		Long: `Grades one or more ASes of a deployed lab exactly as they are, and writes
+structured reports.
 
-Submissions are graded concurrently, and every wait is a convergence predicate
-rather than a fixed sleep, so a whole class completes in minutes rather than
-the hours a sleep-driven serial grader takes.`,
+This is a diagnostic, not the way to mark a class. It reads whatever is in the
+lab right now: it does not put anybody's system back to the reference first, so
+each system is measured across its neighbours in whatever state they happen to
+be in, and one student's broken configuration lowers their neighbours' marks.
+
+Use it to check the reference solution, to investigate one submission, or to see
+where a lab stands. To mark a class, use "twinet grade class", which loads one
+submission at a time onto a blank system with the rest of the internet at the
+reference, and holds the nodes off from repairing anything while it does.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			top, err := loadAndPlace(opts)
 			if err != nil {
 				return err
 			}
 			if rubricPath == "" {
-				rubricPath = filepath.Join(top.Lab.Dir, "rubric", "cos461.yaml")
+				p, err := defaultRubric(top.Lab.Dir)
+				if err != nil {
+					return err
+				}
+				rubricPath = p
 			}
 			rubric, err := grade.LoadRubric(rubricPath)
 			if err != nil {
@@ -109,12 +135,44 @@ the hours a sleep-driven serial grader takes.`,
 				return err
 			}
 
+			// The nodes are asked to leave the lab alone for this too. Reading
+			// a system takes seconds, but a repair rewiring a device in the
+			// middle of it re-renders configuration, and in a solved lab that
+			// is the reference being written over whatever is there -- which
+			// this command would then report as the answer.
+			held, herr := holdLab(cmd.Context(), top, token, cmd.ErrOrStderr())
+			if herr != nil {
+				return herr
+			}
+			defer held.Release()
+			defer func() {
+				// If the nodes stopped holding the lab partway, what was read
+				// afterwards may be a repair in progress rather than the lab.
+				select {
+				case <-held.Lost:
+					fmt.Fprintf(cmd.ErrOrStderr(),
+						"\nwarning: the nodes stopped holding this lab off from automatic "+
+							"repair during this run (%s), so anything read after that moment "+
+							"may be a repair in progress rather than the lab as deployed\n",
+						held.Reason())
+				default:
+				}
+			}()
+
 			targets := asList
 			if len(targets) == 0 {
 				for _, asn := range top.SortedASNs() {
 					if top.ASes[asn].Role == model.RoleStudent {
 						targets = append(targets, asn)
 					}
+				}
+				if len(targets) > 1 {
+					fmt.Fprintf(cmd.ErrOrStderr(),
+						"reading all %d systems as they stand. These are not class marks: "+
+							"nothing has been put back to the reference, so each system is "+
+							"measured across its neighbours in whatever state they are in, and "+
+							"one broken submission lowers its neighbours' scores.\nUse "+
+							"`twinet grade class` to mark a class.\n", len(targets))
 				}
 			}
 			if len(targets) == 0 {
@@ -189,7 +247,7 @@ the hours a sleep-driven serial grader takes.`,
 			return releaseGuard(summary, cmd.ErrOrStderr())
 		},
 	}
-	cmd.Flags().StringVarP(&rubricPath, "rubric", "r", "", "rubric file (default: <lab>/rubric/cos461.yaml)")
+	cmd.Flags().StringVarP(&rubricPath, "rubric", "r", "", "rubric file (default: the one under <lab>/rubric/)")
 	cmd.Flags().IntSliceVar(&asList, "as", nil, "AS numbers to grade (default: every student AS)")
 	cmd.Flags().StringVarP(&outDir, "out", "o", "", "directory for reports")
 	cmd.Flags().IntVarP(&parallel, "parallel", "p", 8, "submissions graded concurrently")
@@ -238,7 +296,8 @@ func execFunc(ctx context.Context, top *model.Topology, token string) (
 		if !ok {
 			return runtime.ExecResult{}, fmt.Errorf("device %s is on unknown node %q", deviceID, d.Node)
 		}
-		r, err := n.Exec(ctx, agent.ExecRequest{Container: d.Container, Cmd: cmd})
+		r, err := n.Exec(ctx, agent.ExecRequest{
+			Container: d.Container, Cmd: cmd, Hold: currentHoldToken()})
 		return runtime.ExecResult{ExitCode: r.ExitCode, Stdout: r.Stdout, Stderr: r.Stderr}, err
 	}, nil
 }
@@ -461,4 +520,40 @@ func writeReports(dir string, s *grade.Summary) error {
 		return err
 	}
 	return os.WriteFile(filepath.Join(dir, "summary.json"), raw, 0o644)
+}
+
+// defaultRubric finds the rubric of a lab that did not name one.
+//
+// The default used to be the literal path <lab>/rubric/cos461.yaml, so every
+// course other than the one this project started with had to pass --rubric on
+// every command, and a lab whose rubric was named after itself reported that
+// the file did not exist rather than that the flag was needed. A lab with one
+// rubric does not need to be told which one to use; a lab with several does,
+// and is told so by name.
+func defaultRubric(dir string) (string, error) {
+	rd := filepath.Join(dir, "rubric")
+	entries, err := os.ReadDir(rd)
+	if err != nil {
+		return "", fmt.Errorf("this lab has no rubric directory (%s), so there is nothing "+
+			"to grade against: pass --rubric", rd)
+	}
+	var found []string
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if n := e.Name(); strings.HasSuffix(n, ".yaml") || strings.HasSuffix(n, ".yml") {
+			found = append(found, filepath.Join(rd, n))
+		}
+	}
+	sort.Strings(found)
+	switch len(found) {
+	case 0:
+		return "", fmt.Errorf("%s holds no rubric, so there is nothing to grade against", rd)
+	case 1:
+		return found[0], nil
+	default:
+		return "", fmt.Errorf("this lab has %d rubrics (%s); say which one with --rubric",
+			len(found), strings.Join(found, ", "))
+	}
 }

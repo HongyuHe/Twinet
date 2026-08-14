@@ -63,6 +63,7 @@ across a cluster and graded automatically.`,
 		newRestoreCmd(opts),
 		newFaultCmd(opts),
 		newIncidentCmd(opts),
+		newWebCmd(opts),
 		newVersionCmd(),
 	)
 	return root

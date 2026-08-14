@@ -12,17 +12,26 @@ group for the Internet to work.
 > **Status: under construction.** The design is in [`docs/`](docs/); what is
 > built and measured so far is in [`docs/09_status.md`](docs/09_status.md).
 >
-> A twelve-AS lab of 211 containers and 291 links currently deploys across three
-> machines in 83 seconds, and a rubric-driven grading run completes a submission
-> in about ten seconds.
+> A twelve-AS lab of 212 containers and 299 links currently deploys across three
+> machines in 58 seconds. Grading a system that is already converged takes about
+> ten seconds of checks; grading a *submission* takes about five minutes, almost
+> all of it waiting for the network to settle after the submission is loaded and
+> again after the reference is put back.
 
 ## What it is for
 
-- **Courses.** Supports the Princeton [COS-461 routing project](https://github.com/cos-461/routing/wiki)
-  and the ETH advanced-networks exercises (MPLS/LDP, BGP-free core, BGP/MPLS
-  VPN with VRFs, multicast).
-- **Autograding.** Hundreds of submissions graded in parallel, in isolated
-  reproducible labs, in minutes.
+- **Courses.** The Princeton [COS-461 routing project](https://github.com/cos-461/routing/wiki)
+  is deployed and graded end to end. The ETH advanced-networks exercises are
+  covered for MPLS/LDP, the BGP-free core and BGP/MPLS VPN with VRFs; multicast
+  has neither an exercise nor a check. The COS-461 hijack scenarios (Q2.6) are
+  not scripted. See [`docs/09_status.md`](docs/09_status.md) for the ledger.
+- **Autograding.** A class of eight, each graded against the reference network
+  with nobody else's work loaded, takes 39 minutes -- about five minutes per
+  submission, nearly all of it waiting for BGP to settle twice. That is the
+  honest figure for the fair mode, and it does not yet suit a hundred students
+  in an evening; `--per-wave` trades isolation for time and is off by default,
+  and a per-submission harness with synthetic neighbours, which would remove
+  the convergence wait, is designed and not built.
 - **Scale-out.** The unit of placement is an AS; adding a machine adds capacity.
 - **Agent evaluation.** The same twin, broken in a known and reversible way, is
   a reproducible benchmark for whether an AI agent can perform root-cause

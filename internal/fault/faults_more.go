@@ -2,8 +2,6 @@ package fault
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"fmt"
 	"strconv"
 	"strings"
@@ -20,27 +18,25 @@ import (
 // therefore consume the real resource -- processor time, memory, socket
 // backlog -- and are undone by releasing it.
 
-// randomCookie returns a per-injection identifier for a flow rule.
+// Flow rules an injected fault installs carry nothing that identifies them.
 //
-// A fixed constant was used here, and it is spelled out in this repository:
-// anything that has read the source -- which for an agent being benchmarked is
-// a realistic assumption -- can list the switch's flows, see the one carrying
-// the known cookie, and read the fault straight off it without diagnosing
-// anything. Even without the source, the same value on every injection is a
-// tell across episodes.
+// They used to carry a cookie -- first a constant, then a random value -- so
+// that resolving could delete exactly the injected rule. But a switch in this
+// lab has one flow, "cookie=0x0, priority=0, actions=NORMAL", so any rule with
+// a non-zero cookie and a priority of 60000 is visibly not part of the lab.
+// Anything that has read this source, which for an agent being benchmarked on
+// root-cause analysis is a realistic assumption, could list the flows and read
+// the fault off the one that stands out, without diagnosing anything.
 //
-// The value is recorded in the controller's injection record, which is the only
-// place that needs it, and nothing about it identifies the framework.
-func randomCookie() (string, error) {
-	var b [6]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return "", fmt.Errorf("generating a flow cookie: %w", err)
-	}
-	// Leading nibble forced non-zero so the value is a plausible controller
-	// cookie rather than one that stands out by being short.
-	b[0] |= 0x10
-	return "0x" + hex.EncodeToString(b[:]), nil
-}
+// A fault should look like the misconfiguration it is imitating. These
+// priorities are what somebody writing an access rule by hand would use, the
+// cookie is left at the default like everything else, and the rule is removed
+// with `--strict`, which matches the priority and the match exactly -- so the
+// injected rule can be deleted precisely without carrying a label.
+const (
+	ovsDropPriority = 100
+	ovsLoopPriority = 200
+)
 
 func init() {
 	// ---- routing --------------------------------------------------------
@@ -383,7 +379,7 @@ func init() {
 	// ---- switch fabric --------------------------------------------------
 
 	Register(&Fault{
-		Name: "flow_rule_shadowing", Category: CatMisconfig, Needs: []Capability{CapOVS},
+		Name: "flow_rule_shadowing", Category: CatNodeError, Needs: []Capability{CapOVS},
 		Symptom:  "One host on a segment cannot be reached, though the switch says the port is up.",
 		Describe: "A high-priority drop rule was installed on the switch, shadowing the rules below it.",
 		Inject: func(ctx context.Context, e *Env, t Target) (State, error) {
@@ -396,23 +392,20 @@ func init() {
 				}
 				port = p
 			}
-			// The rule carries a cookie so it can be removed exactly. Deleting
+			// The rule is removed later with --strict on this exact priority
+			// and match, so it needs no label. Deleting
 			// by match does not work: ovs-ofctl ignores priority when matching
 			// for deletion, so "del-flows priority=60000,in_port=1" removes
 			// every rule on that port -- including the lab's own -- or, with a
 			// cookie-less match that happens not to apply, nothing at all. The
 			// first silently breaks the switch; the second leaves the fault in
 			// place while reporting that it was resolved.
-			cookie, err := randomCookie()
-			if err != nil {
-				return nil, err
-			}
 			if _, err := e.Sh(ctx, t.DeviceID(), fmt.Sprintf(
-				"ovs-ofctl add-flow %s 'cookie=%s,priority=60000,in_port=%s,actions=drop'",
-				br, cookie, port)); err != nil {
+				"ovs-ofctl add-flow %s 'priority=%d,in_port=%s,actions=drop'",
+				br, ovsDropPriority, port)); err != nil {
 				return nil, err
 			}
-			return State{"bridge": br, "port": port, "cookie": cookie}, nil
+			return State{"bridge": br, "port": port}, nil
 		},
 		Verify: func(ctx context.Context, e *Env, t Target, s State) (Evidence, error) {
 			out, _, err := e.TryE(ctx, t.DeviceID(), "ovs-ofctl dump-flows "+s["bridge"])
@@ -420,28 +413,29 @@ func init() {
 				return Evidence{}, err
 			}
 			return Evidence{
-				Verified: strings.Contains(out, "priority=60000") && strings.Contains(out, "actions=drop"),
-				Observed: matchingLine(out, "priority=60000"),
-				Expected: "a priority 60000 drop rule on port " + s["port"],
+				Verified: strings.Contains(out, fmt.Sprintf("priority=%d", ovsDropPriority)) && strings.Contains(out, "actions=drop"),
+				Observed: matchingLine(out, fmt.Sprintf("priority=%d", ovsDropPriority)),
+				Expected: "a drop rule on port " + s["port"],
 			}, nil
 		},
 		Resolve: func(ctx context.Context, e *Env, t Target, s State) error {
 			// Refuse rather than delete by an empty cookie. "cookie=/-1" is a
 			// wildcard: it would remove every flow on the bridge, including the
 			// lab's own, and report success.
-			if s["bridge"] == "" || s["cookie"] == "" {
-				return fmt.Errorf("no bridge and cookie were recorded for this fault, "+
+			if s["bridge"] == "" || s["port"] == "" {
+				return fmt.Errorf("no bridge and port were recorded for this fault, "+
 					"so the rule it installed cannot be identified; removing by match would "+
 					"take the switch's own rules with it (device %s)", t.DeviceID())
 			}
 			_, err := e.Sh(ctx, t.DeviceID(), fmt.Sprintf(
-				"ovs-ofctl del-flows %s 'cookie=%s/-1'", s["bridge"], s["cookie"]))
+				"ovs-ofctl --strict del-flows %s 'priority=%d,in_port=%s'",
+				s["bridge"], ovsDropPriority, s["port"]))
 			return err
 		},
 	})
 
 	Register(&Fault{
-		Name: "flow_rule_loop", Category: CatMisconfig, Needs: []Capability{CapOVS},
+		Name: "flow_rule_loop", Category: CatNodeError, Needs: []Capability{CapOVS},
 		Symptom:  "The segment is saturated and hosts on it become unreachable.",
 		Describe: "A flow rule sends traffic back out the port it arrived on, so frames circulate.",
 		Inject: func(ctx context.Context, e *Env, t Target) (State, error) {
@@ -457,16 +451,12 @@ func init() {
 			// IN_PORT is the explicit "send it back where it came from" action,
 			// which OVS otherwise refuses to do. Without it there is no loop,
 			// and the fault would install a rule that changes nothing.
-			cookie, err := randomCookie()
-			if err != nil {
-				return nil, err
-			}
 			if _, err := e.Sh(ctx, t.DeviceID(), fmt.Sprintf(
-				"ovs-ofctl add-flow %s 'cookie=%s,priority=59000,in_port=%s,actions=IN_PORT'",
-				br, cookie, port)); err != nil {
+				"ovs-ofctl add-flow %s 'priority=%d,in_port=%s,actions=IN_PORT'",
+				br, ovsLoopPriority, port)); err != nil {
 				return nil, err
 			}
-			return State{"bridge": br, "port": port, "cookie": cookie}, nil
+			return State{"bridge": br, "port": port}, nil
 		},
 		Verify: func(ctx context.Context, e *Env, t Target, s State) (Evidence, error) {
 			out, _, err := e.TryE(ctx, t.DeviceID(), "ovs-ofctl dump-flows "+s["bridge"])
@@ -474,8 +464,8 @@ func init() {
 				return Evidence{}, err
 			}
 			return Evidence{
-				Verified: strings.Contains(out, "priority=59000"),
-				Observed: matchingLine(out, "priority=59000"),
+				Verified: strings.Contains(out, fmt.Sprintf("priority=%d", ovsLoopPriority)),
+				Observed: matchingLine(out, fmt.Sprintf("priority=%d", ovsLoopPriority)),
 				Expected: "a rule returning traffic to port " + s["port"],
 			}, nil
 		},
@@ -483,13 +473,14 @@ func init() {
 			// Refuse rather than delete by an empty cookie. "cookie=/-1" is a
 			// wildcard: it would remove every flow on the bridge, including the
 			// lab's own, and report success.
-			if s["bridge"] == "" || s["cookie"] == "" {
-				return fmt.Errorf("no bridge and cookie were recorded for this fault, "+
+			if s["bridge"] == "" || s["port"] == "" {
+				return fmt.Errorf("no bridge and port were recorded for this fault, "+
 					"so the rule it installed cannot be identified; removing by match would "+
 					"take the switch's own rules with it (device %s)", t.DeviceID())
 			}
 			_, err := e.Sh(ctx, t.DeviceID(), fmt.Sprintf(
-				"ovs-ofctl del-flows %s 'cookie=%s/-1'", s["bridge"], s["cookie"]))
+				"ovs-ofctl --strict del-flows %s 'priority=%d,in_port=%s'",
+				s["bridge"], ovsLoopPriority, s["port"]))
 			return err
 		},
 	})

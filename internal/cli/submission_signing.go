@@ -322,17 +322,26 @@ func checkBundleSignature(b Bundle, sig string, allowUnsigned bool) error {
 			"in it are whatever its author chose. Re-collect it, or pass --allow-unsigned if " +
 			"you know where it came from")
 	}
-	pub, err := submissionPublicKey()
+	keys, err := trustedSubmissionKeys()
 	if err != nil {
-		return fmt.Errorf("this archive is signed but the key to check it against could not "+
-			"be read (%w); grading it would be accepting a signature nobody verified", err)
+		return fmt.Errorf("this archive is signed and the keys to check it against could not "+
+			"all be read (%w); grading it would be accepting a signature nobody verified", err)
 	}
-	if !verifyBundle(b, sig, pub) {
-		return fmt.Errorf("this archive's signature does not match its contents: it was edited "+
-			"after it was collected, or it was not produced by this platform. It claims to be "+
-			"AS %d, group %q", b.AS, b.Group)
+	if len(keys) == 0 {
+		return fmt.Errorf("this archive is signed but this machine trusts no signing key, so " +
+			"nothing can check it. Copy the public half of the key that collected these " +
+			"archives (submission_pub.pem on that machine) into the trusted_signers " +
+			"directory beside this machine's own credentials")
 	}
-	return nil
+	for _, pub := range keys {
+		if verifyBundle(b, sig, pub) {
+			return nil
+		}
+	}
+	return fmt.Errorf("this archive's signature does not match its contents under any key "+
+		"this machine trusts (%s): it was edited after it was collected, or it was collected "+
+		"on a machine whose public key is not installed here. It claims to be AS %d, group %q",
+		trustedKeyIDs(keys), b.AS, b.Group)
 }
 
 // bundleJSON marshals the manifest with its signature attached.

@@ -100,3 +100,56 @@ func deviceOf(t *testing.T, top *model.Topology, role model.ASRole) *model.Devic
 	t.Fatalf("no %s router in the fixture", role)
 	return nil
 }
+
+// The facts file inside a container listed every prescribed address, including
+// the ones a student configures themselves. For the root-cause benchmark that
+// is the answer: three of the end-host faults change an address, and an agent
+// could find them by comparing this file with `ip addr` instead of diagnosing
+// anything -- an oracle no other backend in the comparison has.
+func TestTheFactsFileDoesNotCarryStudentAddressing(t *testing.T) {
+	top := &model.Topology{Name: "cos461", Lab: &model.Lab{}}
+	d := &model.Device{ID: "as3/ATL", Name: "ATL", Kind: model.KindRouter, ASN: 3}
+	d.Ifaces = []*model.Iface{
+		{Name: "host", Owner: model.OwnerStudent, Addr4: "3.101.0.1/24", Addr6: "2001:db8:3::1/64"},
+		{Name: "lo", Owner: model.OwnerPlatform, Addr4: "3.151.0.1/24"},
+	}
+
+	got := string(deviceFacts(top, d))
+	if strings.Contains(got, "3.101.0.1") || strings.Contains(got, "2001:db8:3::1") {
+		t.Errorf("the facts file tells the device what the student was supposed to "+
+			"configure:\n%s", got)
+	}
+	if !strings.Contains(got, "3.151.0.1") {
+		t.Error("the platform's own addressing was removed too; the container's tooling " +
+			"needs it and nobody is being asked to work it out")
+	}
+	if !strings.Contains(got, `"name": "host"`) {
+		t.Error("the interface itself is no longer described, which the student shell needs")
+	}
+}
+
+// The snapshot loader copied a complete routing configuration into
+// /etc/twinet/restore.conf and left it there. On a lab deployed at the
+// reference that is the answer, readable by any root shell -- which is what a
+// student has, and what an agent being evaluated on root-cause analysis has.
+// It was found on sampled routers of three autonomous systems on a live
+// cluster.
+func TestEveryDeploymentScrubsConfigurationLeftInTheDevice(t *testing.T) {
+	top := &model.Topology{Name: "cos461", Lab: &model.Lab{}}
+	d := &model.Device{ID: "as3/ATL", Name: "ATL", Kind: model.KindRouter, ASN: 3}
+
+	cmds, err := New(top, ModeSolve).Commands(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var all string
+	for _, c := range cmds {
+		all += strings.Join(c.Args, " ") + "\n"
+	}
+	for _, leak := range []string{"/etc/twinet/reference.conf", "/etc/twinet/restore.conf"} {
+		if !strings.Contains(all, leak) {
+			t.Errorf("no deployment step removes %s, so a lab already running keeps it -- "+
+				"and the labs that have been up longest are the exposed ones", leak)
+		}
+	}
+}

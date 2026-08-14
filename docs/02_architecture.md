@@ -118,8 +118,11 @@ twinet.kind=router         twinet.owner=group12 twinet.node=node-1
 twinet.manifest-hash=9f3c… twinet.role=student  twinet.link-id=…
 ```
 
-`twinet inspect` is a label query fanned out across agents — it needs no local
-files and works from any machine with the manifest. Orphaned veths carry an
+`twinet inspect` renders what the manifest says the lab is -- its devices,
+links, addressing and placement. It reads the manifest, not the cluster: it is
+how you see what *would* be deployed, and `twinet node status` and `twinet
+attach` are how you see what is. (It was described here as a label query fanned
+out across the agents, which it is not.) Orphaned veths carry an
 `altname` derived from the link ID so cleanup is possible even if a container
 died.
 
@@ -127,6 +130,19 @@ died.
 A node that reboots is repaired by re-running deploy, which recreates only that
 node's objects. There is no `docker_pid.map` to go stale and no `groups/`
 directory to drift.
+
+Idempotence is a property of the **container spec hash**, and it holds only if
+every caller computes that hash from the same information. The hash covers the
+digest a device's image reference resolves to, so that rebuilding a tag in place
+is noticed; for a long time only `twinet deploy` resolved that digest, and every
+other caller sent it empty. The two disagreed permanently, each replacing the
+containers the other had just made: grading two submissions recreated 89 of 212
+containers and the following deploy recreated 172, both reporting success.
+Recreating a container empties its network namespace and reverts its FRR daemons
+file to the image default, so the visible symptoms were missing interfaces and
+routers with no BGP -- neither of which points at the cause. The digest is now
+resolved in `Cluster.Apply`, the single door every deployment passes through,
+which is also where the version check lives after the same mistake.
 
 The only durable on-disk artifacts are the **lab directory** (per-device
 rendered configs, saved student configs, TLS material, DNS zones) — which is

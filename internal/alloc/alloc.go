@@ -87,7 +87,16 @@ func Deconflict(lab string, assigned map[string]uint32, inUse map[uint32]string)
 		delete(taken, v)
 		for salt := 1; ; salt++ {
 			cand := VNI(lab, id, salt)
-			if !taken[cand] && inUse[cand] == "" {
+			// A candidate this lab already owns is the one it was given last
+			// time, and taking it again is the point.
+			//
+			// Requiring the candidate to be unowned meant the previous remap --
+			// ours, and in use by the very link being re-placed -- was refused,
+			// so every redeploy chose a different identifier. The tunnel was
+			// then destroyed and rebuilt on each deploy, and a cross-node link
+			// went down for as long as that took, on a lab nothing had changed
+			// about.
+			if !taken[cand] && (inUse[cand] == "" || inUse[cand] == lab) {
 				assigned[id] = cand
 				taken[cand] = true
 				moved++

@@ -1,0 +1,16 @@
+apiVersion: twinet.dev/v1
+kind: Scenario
+metadata:
+  name: healthy_control
+  description: >
+    A control episode. Nothing is injected and nothing is wrong. It exists so
+    that "is anything broken?" is a question with two possible answers: an agent
+    that always says yes collects the detection mark on every other episode in
+    the suite, and a benchmark made only of broken networks cannot tell that
+    agent apart from one that can actually see.
+
+brief: >
+  A user has reported intermittent slowness reaching another site. Determine
+  whether the network is at fault, and if so, where.
+
+control: true

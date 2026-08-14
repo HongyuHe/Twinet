@@ -22,6 +22,7 @@ import (
 
 	"github.com/HongyuHe/twinet/internal/model"
 	rt "github.com/HongyuHe/twinet/internal/runtime"
+	"github.com/HongyuHe/twinet/internal/svc"
 )
 
 // Bundle is the manifest inside a submission archive.
@@ -211,6 +212,25 @@ func saveAS(ctx context.Context, top *model.Topology, asn int, outDir string,
 			}
 		}
 	}
+	// The ROAs this system published.
+	//
+	// Publishing is a student action, not a line of configuration, so it lives
+	// nowhere in a router's running-config. Without it the archive is not what
+	// the group did: re-marking one in a private harness, whose trust anchor
+	// starts empty, lost the mark for the question about publishing. Measured
+	// at 9.70 out of 10 for a submission that had published correctly.
+	roas, rerr := publishedROAs(ctx, exec, top, as)
+	if rerr != nil {
+		return "", fmt.Errorf("what AS %d has published at the trust anchor could not be "+
+			"read (%w); an archive without it would lose the mark for publishing when it "+
+			"is graded in a lab of its own", as.ASN, rerr)
+	}
+	if len(roas) > 0 {
+		if raw, err := json.MarshalIndent(roas, "", "  "); err == nil {
+			contents["roas.json"] = append(raw, '\n')
+		}
+	}
+
 	if len(contents) == 0 {
 		return "", fmt.Errorf("nothing could be collected")
 	}
@@ -386,10 +406,13 @@ func captureSwitch(ctx context.Context, exec func(context.Context, string, []str
   trunks=$(ovs-vsctl get port "$p" trunks 2>/dev/null | tr -d '[] ')
   mode=$(ovs-vsctl get port "$p" vlan_mode 2>/dev/null | tr -d '"')
   [ -n "$tag" ] && echo "ovs-vsctl set port $p tag=$tag"
-  if [ -n "$trunks" ]; then
-    [ "$mode" != "[]" ] && [ -n "$mode" ] && echo "ovs-vsctl set port $p vlan_mode=$mode"
-    echo "ovs-vsctl set port $p trunks=$trunks"
-  fi
+  # vlan_mode is recorded on its own, not only when a trunk list exists.
+  #
+  # In Open vSwitch a trunk port with no trunks list carries every VLAN, which
+  # is a perfectly good answer and one this omitted entirely -- so a submission
+  # that used it came back from its own archive carrying nothing.
+  [ -n "$mode" ] && [ "$mode" != "[]" ] && echo "ovs-vsctl set port $p vlan_mode=$mode"
+  [ -n "$trunks" ] && echo "ovs-vsctl set port $p trunks=$trunks"
 done`
 	res, err := exec(ctx, d.ID, []string{"sh", "-c", script})
 	if err != nil {
@@ -677,4 +700,107 @@ func firstLines(s string, n int) string {
 		lines = append(lines[:n], fmt.Sprintf("(and %d more)", len(lines)-n))
 	}
 	return strings.Join(lines, "; ")
+}
+
+// publishedROAs reads back what an autonomous system has authorised at the
+// lab's trust anchor.
+//
+// Read from inside the lab, through one of the system's own routers, because
+// that is the only place the validator is reachable from -- and because the
+// answer is then exactly what the system itself can see.
+func publishedROAs(ctx context.Context, exec execFn, top *model.Topology, as *model.AS) ([]svc.VRP, error) {
+	addr := svc.RPKIAddrFor(top, as.ASN)
+	if addr == "" || len(as.Routers) == 0 {
+		return nil, nil
+	}
+	var last error
+	for _, r := range append([]*model.Device{rpkiFacingRouter(as)}, as.Routers...) {
+		res, err := exec(ctx, r.ID, []string{"sh", "-c",
+			fmt.Sprintf("curl -sf -m 5 http://%s%s/roas", addr, svc.PublishListen)})
+		if err != nil {
+			last = err
+			continue
+		}
+		if res.ExitCode != 0 {
+			last = fmt.Errorf("%s: the trust anchor did not answer", r.ID)
+			continue
+		}
+		var all []svc.VRP
+		if err := json.Unmarshal([]byte(res.Stdout), &all); err != nil {
+			last = fmt.Errorf("%s: the trust anchor's answer could not be read: %w", r.ID, err)
+			continue
+		}
+		var mine []svc.VRP
+		for _, v := range all {
+			if v.ASN == as.ASN {
+				mine = append(mine, v)
+			}
+		}
+		// An empty list is an answer; nil with no error would be read as "not
+		// asked" by a caller that has to tell the two apart.
+		return mine, nil
+	}
+	return nil, last
+}
+
+// replayROAs publishes an archive's authorisations into the lab being graded.
+func replayROAs(ctx context.Context, exec execFn, top *model.Topology, as *model.AS, body []byte) error {
+	var roas []svc.VRP
+	if err := json.Unmarshal(body, &roas); err != nil {
+		return fmt.Errorf("the archive's published authorisations could not be read: %w", err)
+	}
+	addr := svc.RPKIAddrFor(top, as.ASN)
+	if addr == "" || len(roas) == 0 || len(as.Routers) == 0 {
+		return nil
+	}
+	r := rpkiFacingRouter(as)
+	for _, v := range roas {
+		body := fmt.Sprintf(`{"prefix":%q,"max_length":%d,"asn":%d}`, v.Prefix, v.MaxLength, v.ASN)
+		// Retried, because this runs moments after the lab was built: the
+		// validator may still be starting, and the route to it may still be
+		// coming up. A single attempt failed on a harness that was working
+		// perfectly ten seconds later, and quarantined the submission.
+		//
+		// The reason is captured on the last attempt so a genuine refusal --
+		// a prefix outside the system's allocation, say -- is reported as
+		// itself rather than as a timeout.
+		script := fmt.Sprintf(
+			"for i in 1 2 3 4 5 6 7 8 9 10; do "+
+				"out=$(curl -s -m 5 -w ' HTTP %%{http_code}' -X POST http://%s%s/roas -d %s) && "+
+				"case \"$out\" in *'HTTP 200'*) exit 0;; esac; sleep 3; done; "+
+				"echo \"$out\" >&2; exit 1",
+			addr, svc.PublishListen, shellQuote(body))
+		res, err := exec(ctx, r.ID, []string{"sh", "-c", script})
+		if err != nil {
+			return fmt.Errorf("publishing %s: %w", v.Prefix, err)
+		}
+		if res.ExitCode != 0 {
+			return fmt.Errorf("publishing %s: the trust anchor did not accept it: %s",
+				v.Prefix, firstLine(res.Stderr+res.Stdout))
+		}
+	}
+	return nil
+}
+
+// rpkiFacingRouter returns the router the trust anchor is cabled to.
+//
+// Any router of the system can reach it once the interior routing is up, and
+// publishing happens seconds after a configuration is installed, when it is
+// not. Talking to the directly-connected router needs no routing at all, so it
+// does not depend on the very thing being marked.
+func rpkiFacingRouter(as *model.AS) *model.Device {
+	r := as.Routers[0]
+	for _, d := range as.Devices {
+		if d.Kind != model.KindRouter {
+			continue
+		}
+		for _, i := range d.Ifaces {
+			if i.Peer != nil && i.Peer.Device != nil &&
+				i.Peer.Device.Kind == model.KindService &&
+				strings.Contains(strings.ToLower(i.Peer.Device.Name), "rpki") {
+				r = d
+			}
+		}
+	}
+	return r
 }

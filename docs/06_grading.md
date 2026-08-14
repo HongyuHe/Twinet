@@ -81,7 +81,15 @@ deadline:
 typically 2–6 s of actual convergence. Combined with parallelism, expected
 class-wide grading time goes from hours to **single-digit minutes**.
 
-## 4. Test doubles
+## 4. Test doubles — target design, not built
+
+Everything in this section describes what the grading harness is meant to
+become. **None of it exists yet.** Grading today deploys the real neighbourhood
+and waits for it to converge, which is why a submission costs about five
+minutes; see [09](09_status.md) for the measurement and for what would change
+it. The section is kept because it is the design the convergence cost argues
+for, not because it describes the code.
+
 
 The reusable primitive both existing generations converged on — *attach a
 scriptable BGP speaker where a real neighbour would be, inject benign and
@@ -179,16 +187,22 @@ run, instead of reporting cascading failures.
 
 ## 7. Output
 
-- `reports/<id>.json` — every check, score, evidence, timings, lab fingerprint.
-- `reports/<id>.html` — human-readable feedback with the evidence inline
-  (the RIB entry that was wrong, the traceroute that took the wrong path).
+What is written today:
+
+- `<group>.json` — every check, score, evidence, timings, lab fingerprint and
+  the version of Twinet that produced it. Self-contained, so an appeal is
+  answered by reading it.
+- `<group>.txt` — the same thing as human-readable feedback, with the evidence
+  inline: the table entry that was wrong, the address that could not be
+  reached, the command that produced it.
 - `summary.csv` — one row per student, one column per question; drops straight
-  into Canvas/Gradescope.
-- `summary.html` — class-wide dashboard: distribution per question, the most
-  common failure modes, which check is failing for the most students (directly
-  useful for deciding what to re-teach).
-- `reports/<id>.twinetlab` — the exact grading lab, replayable with
-  the report is self-contained JSON, so an appeal is answered by reading it.
+  into Canvas or Gradescope.
+
+Not written, and previously listed here as though they were: an HTML report per
+student, an HTML class dashboard, and a `.twinetlab` replay bundle. The JSON and
+text carry the same evidence, and the CSV is what an LMS ingests, so nothing is
+unusable without them -- but they were described in the present tense and did
+not exist, which is the kind of claim this document exists not to make.
 
 ## 8. Formative use
 
@@ -252,6 +266,42 @@ deployed at the reference, that router keeps the model answer — and the studen
 is marked correct for work they did not do, with nothing in the report able to
 say so, because a correct router looks identical however it came to be correct.
 Blanking first makes an omission read as an omission.
+
+### Nothing else may touch the lab while it is being graded
+
+Each node runs a loop that repairs devices which have lost their wiring, and
+grading is indistinguishable from that fault while it is working: it blanks an
+autonomous system back to the state its owner started from, which is a device
+with no addresses and no routing configuration, and then loads somebody's work
+onto it.
+
+The loop believed what it saw. In one recorded run it rewired thirteen devices
+of the lab being graded; rewiring removes an interface and adds it back, so the
+submission being loaded at that moment failed with `Cannot find device
+port_BOS`, and seven of eight students were held for review. The marks that
+survive that are worse than the ones that do not, because in a lab deployed at
+the reference a repair also re-renders configuration -- the model answer written
+over a student's work while it is being marked.
+
+`grade class` therefore asks every node to leave the lab alone, and keeps
+asking. It is a lease with a deadline, not a switch: a grader that is killed
+stops renewing, and the nodes resume looking after the lab by themselves within
+three minutes. Nobody has to remember to turn repairs back on, and no crash can
+leave them off.
+
+Every node must agree, and grading refuses to start if one will not hold. A
+hold on two nodes of three is not a hold: the devices of a lab this size are
+spread across all of them, and the third node's repair loop rewires its share
+regardless. If the hold lapses partway through a run -- two renewals failing in
+a row -- the wave being graded and everything after it is held for review rather
+than marked, because from that moment nothing can say whether a mark measures
+the student's work or the reference being written back over it.
+
+Loading also waits, briefly, for the interfaces the lab says a device has. Any
+deploy rewires by removing an interface and adding it back, so the condition is
+temporary by construction -- but the wait is bounded, because a genuinely absent
+interface produces the same symptom and a run that hangs silently is worse than
+one that stops and names the device.
 
 ### Trading isolation for speed, deliberately
 
