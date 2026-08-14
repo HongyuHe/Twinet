@@ -65,17 +65,24 @@ naming:
 # installed. A tool that is missing is an unrun gate, and an unrun gate that
 # prints "passed" is worse than no gate at all: it is a gate that lies.
 ci: ci-tools naming lint test build tidy-check
-	./bin/twinet validate -m examples/demo
-	./bin/twinet validate -m examples/cos461
-	./bin/twinet validate -m examples/advnet
-	./bin/twinet grade validate examples/cos461/rubric/cos461.yaml
+	# Every lab and every rubric that ships, found rather than listed.
+	#
+	# The list was written out, so three labs and two rubrics were added and the
+	# gate went on checking the original two -- a release gate that does not
+	# cover what is being released.
+	@for m in examples/*/; do \
+		./bin/twinet validate -m "$$m" || exit 1; \
+	done
+	@for r in examples/*/rubric/*.yaml; do \
+		./bin/twinet grade validate "$$r" || exit 1; \
+	done
 	# The schema is generated, so it can only be trusted if something checks it
 	# still describes the manifests that exist -- the root labs and every AS
 	# template, since a template ships unvalidated otherwise.
 	./bin/twinet schema > /tmp/twinet-lab.schema.json
-	@for m in examples/demo examples/cos461 examples/advnet examples/scale; do \
-		python3 scripts/check_schema.py /tmp/twinet-lab.schema.json $$m/twinet.yaml || exit 1; \
-		for t in $$m/templates/*.yaml; do \
+	@for m in examples/*/; do \
+		python3 scripts/check_schema.py /tmp/twinet-lab.schema.json $${m}twinet.yaml || exit 1; \
+		for t in $${m}templates/*.yaml; do \
 			[ -e "$$t" ] || continue; \
 			python3 scripts/check_schema.py --def ASTemplate /tmp/twinet-lab.schema.json $$t || exit 1; \
 		done; \
