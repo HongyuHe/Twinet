@@ -1573,10 +1573,12 @@ func TestABehaviourStartsAndStopsAHijack(t *testing.T) {
 // site receives nothing. The pair the checks happened to use went on working and
 // the exercise awarded all four marks with a sixth of it disconnected.
 func TestAPassiveMulticastSiteLosesMarks(t *testing.T) {
-	dir := os.Getenv("TWINET_MULTICAST_LAB")
-	if dir == "" {
-		t.Skip("set TWINET_MULTICAST_LAB to the multicast lab to run this")
-	}
+	// The example lab by default.
+	//
+	// This used to skip unless TWINET_MULTICAST_LAB was set, which nothing
+	// sets, so the only test establishing that a passive multicast site loses
+	// marks never ran -- and the suite reported success either way.
+	dir := multicastLab(t)
 	const victim = "as1/RIGHT"
 	ports := []string{"port_TOP", "port_CENTER", "port_BOTTOMR"}
 
