@@ -81,9 +81,18 @@ func newNodeCmd(opts *Options) *cobra.Command {
 				return json.NewEncoder(cmd.OutOrStdout()).Encode(out)
 			}
 
+			// "ok" used to mean "answered", and nothing else.
+			//
+			// A cluster whose agents were a build behind the controller -- which
+			// makes them render different configuration from the same manifest
+			// -- reported every node ok, in the one command an operator runs to
+			// ask whether the cluster is healthy. So did a cluster with a
+			// grading hold on it, and one with a node busy applying. Each of
+			// those is something the next command will refuse to do, and being
+			// told afterwards is not the same as being told.
 			w := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
 			fmt.Fprintln(w, "NODE\tSTATE\tVERSION\tRUNTIME\tCPUS\tUNDERLAY\tCONTAINERS\tLAB")
-			bad := 0
+			bad, degraded := 0, 0
 			for _, r := range results {
 				if r.Err != nil {
 					bad++
@@ -91,15 +100,27 @@ func newNodeCmd(opts *Options) *cobra.Command {
 					continue
 				}
 				v := r.Value
-				fmt.Fprintf(w, "%s\tok\t%s\t%s %s\t%d\t%s\t%d\t%s\n",
-					r.Node, v.Version, v.Runtime, v.RuntimeVer, v.CPUs,
-					dash(v.UnderlayIP), v.Containers, dash(v.Lab))
+				state, why := nodeState(v, Version)
+				if state != "ok" {
+					degraded++
+				}
+				lab := dash(v.Lab)
+				if why != "" {
+					lab = why
+				}
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s %s\t%d\t%s\t%d\t%s\n",
+					r.Node, state, v.Version, v.Runtime, v.RuntimeVer, v.CPUs,
+					dash(v.UnderlayIP), v.Containers, lab)
 			}
 			if err := w.Flush(); err != nil {
 				return err
 			}
 			if bad > 0 {
 				return fmt.Errorf("%d of %d node(s) are unreachable", bad, len(results))
+			}
+			if degraded > 0 {
+				return fmt.Errorf("%d of %d node(s) are not in a state this controller can "+
+					"safely act on; see the last column", degraded, len(results))
 			}
 			return nil
 		},
@@ -171,7 +192,7 @@ what will run with root on their machines before it does.`,
 		},
 	}
 
-	cmd.AddCommand(status, check, bootstrap, newNodePKICmd(opts))
+	cmd.AddCommand(status, check, bootstrap, newNodePKICmd(opts), newNodeSweepCmd(opts))
 	return cmd
 }
 
@@ -407,4 +428,91 @@ func deployCluster(ctx context.Context, top *model.Topology, tok string, req age
 func restoreScopes(scopes []string) []string {
 	out := append([]string{}, scopes...)
 	return append(out, "peering", "services")
+}
+
+// nodeState says what an agent's status means, rather than that it answered.
+//
+// Three things make a node one the controller should not act on without saying
+// so first: a build that differs from this one, because the node renders the
+// device configuration and a different build renders it differently; a lab
+// with an operation already in flight, because the next command will be
+// refused; and an agent that reports no runtime at all.
+func nodeState(v agent.StatusResponse, controller string) (state, why string) {
+	switch {
+	case v.RuntimeVer == "":
+		return "no-runtime", "the container runtime did not answer"
+	case controller != "" && v.Version != "" && v.Version != controller:
+		return "skewed", fmt.Sprintf("agent %s, controller %s: they render configuration "+
+			"differently", v.Version, controller)
+	case len(v.Busy) > 0:
+		return "busy", "operation in flight: " + strings.Join(v.Busy, ", ")
+	}
+	return "ok", ""
+}
+
+// newNodeSweepCmd finds and removes the overlays a node is carrying for nobody.
+func newNodeSweepCmd(opts *Options) *cobra.Command {
+	var (
+		token  string
+		remove bool
+	)
+	cmd := &cobra.Command{
+		Use:   "sweep",
+		Short: "Find, and optionally remove, overlay devices left behind by removed labs",
+		Long: "A lab whose teardown was interrupted leaves its tunnels and bridges on the " +
+			"nodes. They cost a network identifier each out of a finite space, and the " +
+			"deconfliction that stops two labs choosing the same one reads exactly the " +
+			"ownership record they are missing. A hundred were found on one node of this " +
+			"cluster against forty-four in use.\n\n" +
+			"Reports by default. An overlay whose bridge still has something attached is " +
+			"never removed, whatever its ownership record says: it is carrying a cable for " +
+			"something.",
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			top, err := loadAndPlace(opts)
+			if err != nil {
+				return err
+			}
+			tok, err := tokenFor(token)
+			if err != nil {
+				return err
+			}
+			c := client.NewCluster(top.Lab, tok)
+			results := c.Sweep(cmd.Context(), remove)
+
+			w := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
+			fmt.Fprintln(w, "NODE\tORPHANS\tREMOVED\tIN USE\tNOTE")
+			bad, total := 0, 0
+			for _, r := range results {
+				if r.Err != nil {
+					bad++
+					fmt.Fprintf(w, "%s\t-\t-\t-\t%s\n", r.Node, firstLine(r.Err.Error()))
+					continue
+				}
+				v := r.Value
+				total += len(v.Orphans)
+				note := ""
+				if len(v.Errs) > 0 {
+					note = strings.Join(v.Errs, "; ")
+				}
+				fmt.Fprintf(w, "%s\t%d\t%d\t%d\t%s\n",
+					r.Node, len(v.Orphans), len(v.Removed), len(v.InUse), note)
+			}
+			if err := w.Flush(); err != nil {
+				return err
+			}
+			if !remove && total > 0 {
+				fmt.Fprintf(cmd.ErrOrStderr(),
+					"\n%d overlay(s) belong to no lab these nodes host; remove them with "+
+						"--remove\n", total)
+			}
+			if bad > 0 {
+				return fmt.Errorf("%d of %d node(s) could not be swept", bad, len(results))
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&token, "token", "", "agent token (or set TWINET_TOKEN)")
+	cmd.Flags().BoolVar(&remove, "remove", false, "actually remove them")
+	return cmd
 }
