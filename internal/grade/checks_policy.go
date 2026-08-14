@@ -800,6 +800,50 @@ func checkTrafficEngineering(ctx context.Context, env *Env) Result {
 		}
 	}
 
+	// And what is actually installed, which is the question.
+	//
+	// Everything above reads BGP: the preferences a policy assigned, the paths
+	// it advertised. None of it is the forwarding table. A static route over
+	// the slow link overrides every one of those decisions and was invisible
+	// here -- a submission with textbook BGP policy and `ip route 2.0.0.0/8
+	// <slow neighbour>` sent its traffic over exactly the link the question
+	// asks it to avoid, and kept the mark in full.
+	//
+	// So the installed route is read for every destination that has a path
+	// through a fast neighbour. Being in the table is not the failure: the slow
+	// link must stay usable as a backup, and the question says so. Being
+	// *selected* is.
+	for _, rel := range []model.Relationship{model.RelProvider, model.RelCustomer} {
+		var slowAddrs, fastAddrs []string
+		for _, n := range neighbours {
+			if n.rel != rel {
+				continue
+			}
+			if n.slow {
+				slowAddrs = append(slowAddrs, n.addr)
+			} else {
+				fastAddrs = append(fastAddrs, n.addr)
+			}
+		}
+		if len(slowAddrs) == 0 || len(fastAddrs) == 0 {
+			continue
+		}
+		checks++
+		viaSlow, unreadable := installedVia(ctx, env, slowAddrs, fastAddrs)
+		switch {
+		case unreadable != "":
+			fmt.Fprintf(&detail, "forwarding: %s\n", unreadable)
+		case len(viaSlow) == 0:
+			passed++
+		default:
+			sort.Strings(viaSlow)
+			fmt.Fprintf(&detail,
+				"forwarding: %d destination(s) are installed over the slow %s even though a "+
+					"path through the fast one exists: %s\n",
+				len(viaSlow), rel, strings.Join(truncate(viaSlow, 4), "; "))
+		}
+	}
+
 	// Inbound: the announcement of our own prefix sent to the slow neighbour
 	// should carry a longer AS path than the one sent to the fast neighbour of
 	// the same relationship class, so other networks find that route less
@@ -1775,4 +1819,80 @@ func sortedInts(m map[int]bool) []int {
 	}
 	sort.Ints(out)
 	return out
+}
+
+// installedVia names the destinations whose selected route leaves through one
+// of the slow addresses, when a path through a fast one is also available.
+//
+// It reads the routing table rather than BGP, because that is where a static
+// route, a policy route or an administrative distance shows up and BGP does
+// not. Every router is asked, and a router that cannot be read stops the check:
+// concluding "nothing goes the slow way" from the routers that answered is the
+// kind of verdict this project keeps having to take back.
+func installedVia(ctx context.Context, env *Env, slow, fast []string) (via []string, unreadable string) {
+	isSlow := map[string]bool{}
+	for _, a := range slow {
+		isSlow[a] = true
+	}
+	isFast := map[string]bool{}
+	for _, a := range fast {
+		isFast[a] = true
+	}
+	// What the system as a whole has an alternative path for, so that a
+	// destination nobody can reach except over the slow link is not counted
+	// against a student who cannot avoid it.
+	//
+	// System-wide, not per router: the fast session is usually on a different
+	// router from the slow one, so a router that holds the slow session sees
+	// the fast path only as an iBGP route with an interior next hop. Computing
+	// this per router found no alternative anywhere and the check passed a
+	// static route straight over the slow link.
+	alt := map[string]bool{}
+	for _, r := range env.Routers() {
+		tbl, err := bgpTable(ctx, env, r.Name)
+		if err != nil {
+			continue
+		}
+		for prefix, entries := range tbl.Table() {
+			for _, e := range entries {
+				for _, nh := range e.Nexthops {
+					if isFast[nh.IP] {
+						alt[prefix] = true
+					}
+				}
+			}
+		}
+	}
+	for _, r := range env.Routers() {
+		var routes map[string][]struct {
+			Protocol string `json:"protocol"`
+			Selected bool   `json:"selected"`
+			Nexthops []struct {
+				IP  string `json:"ip"`
+				FIB bool   `json:"fib"`
+			} `json:"nexthops"`
+		}
+		if err := env.VtyshJSON(ctx, r.Name, "show ip route json", &routes); err != nil {
+			return nil, fmt.Sprintf("%s: its routing table could not be read (%v), so where "+
+				"its traffic actually goes could not be established", r.Name, err)
+		}
+		for prefix, entries := range routes {
+			if !alt[prefix] {
+				continue
+			}
+			for _, e := range entries {
+				if !e.Selected {
+					continue
+				}
+				for _, nh := range e.Nexthops {
+					if !isSlow[nh.IP] {
+						continue
+					}
+					via = append(via, fmt.Sprintf("%s on %s (%s)", prefix, r.Name, e.Protocol))
+					break
+				}
+			}
+		}
+	}
+	return via, ""
 }

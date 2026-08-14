@@ -278,6 +278,53 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 			},
 		},
 		{
+			// Correct BGP policy, overridden in the forwarding table.
+			//
+			// Everything the traffic-engineering check read was BGP: the
+			// preferences a policy assigned and the paths it advertised. None
+			// of it is the routing table. A static route over the slow link
+			// overrides every one of those decisions, and a submission with
+			// textbook policy and one `ip route` statement sent its traffic
+			// over exactly the link the question asks it to avoid, with the
+			// mark awarded in full.
+			name:     "a static route over the slow link",
+			question: "q2.5",
+			apply: func(t *testing.T) {
+				router, nbr, prefix := slowProviderRoute(t, dir, 3)
+				t.Logf("routing %s over the slow link via %s on %s", prefix, nbr, router)
+				vtysh(t, dir, router, "configure terminal",
+					"ip route "+prefix+" "+nbr, "end")
+				time.Sleep(6 * time.Second)
+			},
+			undo: func(t *testing.T) {
+				router, nbr, prefix := slowProviderRoute(t, dir, 3)
+				vtysh(t, dir, router, "configure terminal",
+					"no ip route "+prefix+" "+nbr, "end")
+			},
+		},
+		{
+			// Kept out of OSPF by a configuration reading, put into it another
+			// way.
+			//
+			// The check read `network` statements under `router ospf`, which
+			// finds one way of putting a prefix into the interior and misses
+			// every other. `redistribute connected` puts every inter-AS subnet
+			// there with no network statement anywhere, and the peering
+			// networks appeared as OSPF routes on every other router of the
+			// system while the question was marked correct.
+			name:     "inter-AS subnets redistributed into OSPF",
+			question: "q1.2",
+			apply: func(t *testing.T) {
+				vtysh(t, dir, "as3/MSP", "configure terminal", "router ospf",
+					"redistribute connected", "end")
+				time.Sleep(15 * time.Second)
+			},
+			undo: func(t *testing.T) {
+				vtysh(t, dir, "as3/MSP", "configure terminal", "router ospf",
+					"no redistribute connected", "end")
+			},
+		},
+		{
 			// The same median loophole as q2.3, in the question about
 			// engineering traffic around the slow link.
 			//

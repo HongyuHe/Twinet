@@ -761,17 +761,61 @@ func checkNoForbiddenOSPF(ctx context.Context, env *Env) Result {
 			}
 		}
 	}
+
+	// And what OSPF is actually carrying, which is the question.
+	//
+	// Reading `network` statements finds one way of putting a prefix into OSPF
+	// and misses every other. `redistribute connected` under `router ospf` puts
+	// every inter-AS subnet into the interior with no network statement
+	// anywhere, and this check passed a system doing exactly that while the
+	// peering networks appeared as OSPF routes on every other router of the
+	// system. The configuration is the intent; the routing table is the fact.
+	for _, r := range env.Routers() {
+		var routes map[string][]struct {
+			Protocol string `json:"protocol"`
+			Selected bool   `json:"selected"`
+			Nexthops []struct {
+				InterfaceName string `json:"interfaceName"`
+			} `json:"nexthops"`
+		}
+		if err := env.VtyshJSON(ctx, r.Name, "show ip route ospf json", &routes); err != nil {
+			// An empty table is not an error, and FRR prints nothing at all
+			// for it; anything else is.
+			if s, verr := env.Vtysh(ctx, r.Name, "show ip route ospf json"); verr == nil &&
+				strings.TrimSpace(s) == "" {
+				continue
+			}
+			return Errored("config.no_forbidden_ospf", fmt.Errorf(
+				"%s: its OSPF routes could not be read, so whether the inter-AS ranges are "+
+					"in its interior routing cannot be decided: %w", r.Name, err))
+		}
+		for prefix, entries := range routes {
+			if !external.matches(prefix) {
+				continue
+			}
+			for _, e := range entries {
+				if e.Protocol != "ospf" {
+					continue
+				}
+				found = append(found, fmt.Sprintf(
+					"%s carries %s as an OSPF route", r.Name, prefix))
+				break
+			}
+		}
+	}
+
 	if len(found) == 0 {
 		return Pass("config.no_forbidden_ospf", Evidence{
-			Observed: "no inter-AS subnets are advertised in OSPF"})
+			Observed: "no inter-AS subnet is advertised in OSPF or carried as an OSPF route"})
 	}
 	sort.Strings(found)
 	return Fail("config.no_forbidden_ospf", Evidence{
-		Expected: "no inter-AS network under router ospf",
-		Observed: fmt.Sprintf("%d such statement(s)", len(found)),
-		Detail:   strings.Join(found, "\n"),
-		Hint:     "external subnets belong to BGP, not to your interior routing protocol",
-		Command:  "show running-config",
+		Expected: "no inter-AS network in the interior routing protocol, however it got there",
+		Observed: fmt.Sprintf("%d finding(s)", len(found)),
+		Detail:   strings.Join(truncate(found, 8), "\n"),
+		Hint: "external subnets belong to BGP, not to your interior routing protocol; " +
+			"`redistribute connected` puts them there as surely as a network statement does",
+		Command: "show running-config; show ip route ospf",
 	})
 }
 

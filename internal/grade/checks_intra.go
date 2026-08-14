@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/HongyuHe/twinet/internal/model"
 )
@@ -545,7 +546,11 @@ func checkVLANIsolation(ctx context.Context, env *Env) Result {
 		results []outcome
 		wg      sync.WaitGroup
 	)
-	sem := make(chan struct{}, 8)
+	// Four at a time, not ten. The hosts of a layer-2 domain sit behind
+	// deliberately slow links (10mbit, 1ms), and ten traceroutes at once
+	// through one switch lose probes -- which this check would read as a
+	// misconfiguration and take a mark for.
+	sem := make(chan struct{}, 4)
 	record := func(ok bool, format string, args ...any) {
 		mu.Lock()
 		results = append(results, outcome{ok, fmt.Sprintf(format, args...)})
@@ -562,7 +567,7 @@ func checkVLANIsolation(ctx context.Context, env *Env) Result {
 					defer wg.Done()
 					sem <- struct{}{}
 					defer func() { <-sem }()
-					hops, err := traceHops(ctx, env, src, dst)
+					hops, err := traceHopsRetrying(ctx, env, src, dst)
 					switch {
 					case err != nil:
 						record(false, "VLAN %d: %s cannot reach %s (%v)", v, src.Name, dst.Name, err)
@@ -591,7 +596,7 @@ func checkVLANIsolation(ctx context.Context, env *Env) Result {
 						defer wg.Done()
 						sem <- struct{}{}
 						defer func() { <-sem }()
-						hops, first, err := traceFirstHop(ctx, env, src, dst)
+						hops, first, err := traceFirstHopRetrying(ctx, env, src, dst)
 						switch {
 						case err != nil:
 							record(false, "%s cannot reach %s across VLANs (%v)",
@@ -949,4 +954,38 @@ func sortedKeysOfBool(m map[string]bool) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// traceHopsRetrying and traceFirstHopRetrying try once more before reporting a
+// failure.
+//
+// A dropped probe is not a misconfiguration. These hosts are behind
+// deliberately slow links and a grading run puts several checks on them at
+// once; a single lost traceroute was enough to cost a correct student a mark,
+// which is the worst kind of wrong answer a grader can give because it looks
+// exactly like a real finding.
+func traceHopsRetrying(ctx context.Context, env *Env, src, dst *model.Device) (int, error) {
+	hops, err := traceHops(ctx, env, src, dst)
+	if err == nil && hops > 0 {
+		return hops, nil
+	}
+	select {
+	case <-ctx.Done():
+		return hops, err
+	case <-time.After(2 * time.Second):
+	}
+	return traceHops(ctx, env, src, dst)
+}
+
+func traceFirstHopRetrying(ctx context.Context, env *Env, src, dst *model.Device) (int, string, error) {
+	hops, first, err := traceFirstHop(ctx, env, src, dst)
+	if err == nil && hops > 0 && first != "" {
+		return hops, first, nil
+	}
+	select {
+	case <-ctx.Done():
+		return hops, first, err
+	case <-time.After(2 * time.Second):
+	}
+	return traceFirstHop(ctx, env, src, dst)
 }
