@@ -1311,21 +1311,42 @@ func missingNotFoundRoutes(ctx context.Context, env *Env) ([]string, int, error)
 		return nil, 0, err
 	}
 
-	// One router's table is enough: iBGP carries the AS's view, and a prefix
-	// filtered at the border is absent from all of them.
-	var router string
-	for _, r := range env.Routers() {
-		router = r.Name
-		break
-	}
-	if router == "" {
+	// Every router, and the route each of them has selected.
+	//
+	// One router's table was read, on the reasoning that iBGP carries the AS's
+	// view and a prefix filtered at the border is absent from all of them. The
+	// reasoning holds for a border filter and for nothing else: an inbound
+	// policy on one router's iBGP sessions removes the prefix from that router
+	// alone, and the site behind it cannot reach the network -- 100% packet
+	// loss and "Destination Net Unreachable" were measured while this check
+	// reported all prefixes present and the system scored full marks. A
+	// question about what a system preserves is a question about all of it.
+	routers := env.Routers()
+	if len(routers) == 0 {
 		return nil, 0, fmt.Errorf("AS %d has no router to read", env.AS)
 	}
-	tbl, err := bgpTable(ctx, env, router)
-	if err != nil {
-		return nil, 0, err
+	// Present, per router. A router that cannot be read stops the check: this
+	// concludes from what it does not find, so an unreadable router is one
+	// whose missing routes would also not have been found.
+	haveOn := map[string]map[string]bool{}
+	for _, r := range routers {
+		tbl, err := bgpTable(ctx, env, r.Name)
+		if err != nil {
+			return nil, 0, fmt.Errorf("%s: its table could not be read, so whether it still "+
+				"holds the routes without a ROA cannot be decided: %w", r.Name, err)
+		}
+		seen := map[string]bool{}
+		for prefix, entries := range tbl.Table() {
+			for _, e := range entries {
+				// Selected, not merely present: a route the router holds and
+				// does not use carries no traffic.
+				if e.IsBest() {
+					seen[prefix] = true
+				}
+			}
+		}
+		haveOn[r.Name] = seen
 	}
-	have := tbl.Table()
 
 	var missing []string
 	checked := 0
@@ -1337,8 +1358,16 @@ func missingNotFoundRoutes(ctx context.Context, env *Env) ([]string, int, error)
 			continue
 		}
 		checked++
-		if _, ok := have[as.Block]; !ok {
-			missing = append(missing, fmt.Sprintf("%s (AS %d) is not in the table", as.Block, asn))
+		var without []string
+		for _, r := range routers {
+			if !haveOn[r.Name][as.Block] {
+				without = append(without, r.Name)
+			}
+		}
+		if len(without) > 0 {
+			sort.Strings(without)
+			missing = append(missing, fmt.Sprintf("%s (AS %d) is not selected on %s",
+				as.Block, asn, strings.Join(truncate(without, 4), ", ")))
 		}
 	}
 	return missing, checked, nil

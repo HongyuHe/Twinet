@@ -286,8 +286,21 @@ func agentCommand(ctx context.Context, command string, sb *sandbox) *exec.Cmd {
 	}
 	fmt.Fprintf(&script, "exec setpriv --reuid %d --regid %d --clear-groups sh -c %s\n",
 		sb.UID, sb.GID, shellQuote(command))
-	return exec.CommandContext(ctx, "unshare", "--mount", "--propagation", "private",
-		"--", "sh", "-c", script.String())
+	// A process namespace as well as a mount one.
+	//
+	// Masking the files was not enough: the agent shared the host's /proc, and
+	// this runner's own command line contains "--scenario
+	// .../ospf_adjacency_lost.yaml". An agent whose entire strategy was
+	// `ps -eo args | grep 'twinet incident run'` read the scenario's name,
+	// mapped it to the answer, and scored 1.00 without looking at the network.
+	// The scenario names in any suite say what the fault is; that is what makes
+	// them useful to a person and fatal here.
+	//
+	// --fork is required with --pid (the namespace applies to children), and
+	// --mount-proc gives the namespace a procfs of its own, so /proc shows the
+	// agent and nothing else.
+	return exec.CommandContext(ctx, "unshare", "--mount", "--pid", "--fork", "--mount-proc",
+		"--propagation", "private", "--", "sh", "-c", script.String())
 }
 
 func haveTool(name string) bool {

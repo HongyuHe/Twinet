@@ -107,3 +107,45 @@ func TestADiagnosticSessionCannotHideACommandBehindANewline(t *testing.T) {
 		}
 	}
 }
+
+// A write verb is a write verb wherever it appears.
+//
+// The parser took the first argument that did not begin with a dash as the
+// object and the next as the verb, so `ip -family inet link set dev lo down` --
+// where "inet" is the argument to -family -- made "inet" the object, "link" the
+// verb, and "set" invisible. A diagnostic session took an interface down on a
+// host it was being scored on.
+func TestADiagnosticSessionCannotHideAWriteBehindAnOption(t *testing.T) {
+	refused := [][]string{
+		{"ip", "-family", "inet", "link", "set", "dev", "lo", "down"},
+		{"ip", "-f", "inet", "addr", "add", "10.0.0.1/24", "dev", "eth0"},
+		{"ip", "-j", "-family", "inet6", "route", "del", "default"},
+		{"ip", "-batch", "/tmp/commands"},
+		{"ip", "-netns", "other", "link", "show"},
+		{"ip", "-force", "-batch", "/tmp/x"},
+		{"bridge", "-j", "link", "set", "dev", "eth0", "state", "0"},
+		{"sysctl", "-w", "net.ipv4.ip_forward=0"},
+		{"sysctl", "--write", "net.ipv4.ip_forward=0"},
+		{"tcpdump", "-i", "eth0", "-w", "/tmp/cap.pcap"},
+		{"tcpdump", "-i", "eth0", "-G", "1", "-z", "/bin/sh"},
+	}
+	for _, c := range refused {
+		if err := ReadOnlyCommand(c); err == nil {
+			t.Errorf("%v changes the device or runs a command on it, and was allowed", c)
+		}
+	}
+	allowed := [][]string{
+		{"ip", "-family", "inet", "link", "show"},
+		{"ip", "-j", "-br", "addr", "show"},
+		{"ip", "-6", "route", "show"},
+		{"ip", "route", "get", "1.2.3.4"},
+		{"bridge", "-j", "link", "show"},
+		{"sysctl", "net.ipv4.ip_forward"},
+		{"tcpdump", "-n", "-c", "10", "-i", "eth0"},
+	}
+	for _, c := range allowed {
+		if err := ReadOnlyCommand(c); err != nil {
+			t.Errorf("%v only reads, and was refused: %v", c, err)
+		}
+	}
+}

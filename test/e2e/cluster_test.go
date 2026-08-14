@@ -1253,6 +1253,12 @@ func TestAnAgentCannotReachTheAnswer(t *testing.T) {
 		"  echo '--- wander'; find " + repoRoot + " -maxdepth 2 -readable 2>/dev/null | head -5",
 		"  echo '--- episodes'; find / -name '*.json' -path '*episode*' -readable 2>/dev/null | head -5",
 		"  echo '--- docker'; docker ps --format '{{.Names}}' 2>&1 | head -3",
+		// The runner's own command line names the scenario file, and the
+		// scenario names say what the fault is -- that is what makes them
+		// useful to a person and fatal here. An agent whose entire strategy
+		// was `ps -eo args | grep 'twinet incident run'` scored 1.00.
+		"  echo '--- process list'; ps -eo args 2>/dev/null | head -40",
+		"  echo '--- proc'; cat /proc/*/cmdline 2>/dev/null | tr '\\0' ' '",
 		"} >> " + loot + " 2>&1",
 		// And the credential: it must not be able to change anything, or an
 		// agent can repair the fault and report a healthy network.
@@ -1295,6 +1301,8 @@ func TestAnAgentCannotReachTheAnswer(t *testing.T) {
 		"\"undo\"",              // how to reverse it, also in the ledger
 		"port_PHY",              // the interface the scenario names
 		"kind: Scenario",        // any scenario file at all
+		"ospf_adjacency_lost",   // the scenario's name, in a path or an argv
+		"--scenario",            // the runner's own command line
 	} {
 		if strings.Contains(got, secret) {
 			t.Errorf("the agent read %q out of the filesystem, so the episode measures "+

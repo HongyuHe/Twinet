@@ -98,17 +98,63 @@ var readOnlyCommands = map[string]bool{
 	"ip": true, "ss": true, "netstat": true, "arp": true, "bridge": true,
 	"cat": true, "ls": true, "head": true, "tail": true, "grep": true, "wc": true,
 	"date": true, "uptime": true, "hostname": true, "ethtool": true,
-	"vtysh": true, "birdc": true, "tcpdump": true, "curl": true, "wget": true,
+	"vtysh": true, "birdc": true, "tcpdump": true,
 	"ip6tables-save": true, "iptables-save": true, "sysctl": true, "nc": true,
 	"ps": true, "free": true, "df": true, "sh": false, "bash": false,
 }
 
-// writeSubcommands are the second words that turn an otherwise read-only
-// program into one that changes the device.
+// writeSubcommands marks the programs whose arguments have to be inspected
+// before they are allowed: iproute2 tools observe and change with the same
+// binary, and the difference is a word somewhere in the middle.
 var writeSubcommands = map[string]map[string]bool{
-	"ip":     {"link": true, "addr": true, "address": true, "route": true, "rule": true, "neigh": true, "netns": true, "tunnel": true, "vrf": true, "xfrm": true, "mroute": true, "maddr": true},
-	"bridge": {"link": true, "fdb": true, "vlan": true, "mdb": true},
-	"sysctl": {"-w": true},
+	"ip":     {},
+	"bridge": {},
+	"sysctl": {},
+}
+
+// writeVerbs change something, wherever they appear in an iproute2 command
+// line.
+//
+// Matching by position was the mistake. The parser took the first argument that
+// did not begin with a dash as the object and the next as the verb, so
+// `ip -family inet link set dev lo down` -- where "inet" is the *argument to*
+// -family -- made "inet" the object, "link" the verb, and "set" invisible. A
+// diagnostic session took an interface down on a host it was being scored on.
+// A word that changes the device is refused wherever it occurs; a device called
+// "set" would be refused too, which is the right way round.
+var writeVerbs = map[string]bool{
+	"set": true, "add": true, "del": true, "delete": true, "change": true,
+	"replace": true, "append": true, "flush": true, "restore": true,
+	"exec": true, "attach": true, "detach": true, "chain": true,
+}
+
+// writeOptions do something other than print, whatever else is on the line:
+// -batch runs a file of commands, -force presses on past errors, and -netns
+// moves the whole operation into another network namespace.
+var writeOptions = map[string]bool{
+	"-batch": true, "-force": true, "-n": true, "-netns": true,
+	"-w": true, "--write": true, "-a": true, "-all": true,
+}
+
+// refuseIfWriting rejects an iproute2-style command that changes anything.
+func refuseIfWriting(prog string, cmd []string) error {
+	for _, a := range cmd[1:] {
+		low := strings.ToLower(a)
+		if writeVerbs[low] {
+			return fmt.Errorf("a diagnostic session may not run %q: %q changes the device",
+				strings.Join(cmd, " "), a)
+		}
+		// An option and its value may be written together.
+		name := low
+		if i := strings.IndexByte(name, '='); i > 0 {
+			name = name[:i]
+		}
+		if writeOptions[name] {
+			return fmt.Errorf("a diagnostic session may not run %q: %q is not an option that "+
+				"only prints", strings.Join(cmd, " "), a)
+		}
+	}
+	return nil
 }
 
 // ReadOnlyCommand reports whether a command can be run by a diagnostic caller.
@@ -155,6 +201,16 @@ func ReadOnlyCommand(cmd []string) error {
 		}
 	}
 	switch prog {
+	case "tcpdump":
+		// -z runs a command, -w writes a file, and both are on a device this
+		// session is only meant to watch.
+		for _, a := range cmd[1:] {
+			switch strings.ToLower(a) {
+			case "-z", "-w", "-w-", "--postrotate-command":
+				return fmt.Errorf("a diagnostic session may not run tcpdump %s: it writes to "+
+					"the device or runs a command on it", a)
+			}
+		}
 	case "vtysh":
 		// Only "show" and "ping"/"traceroute" style commands. A vtysh that can
 		// enter configuration mode can do anything the router can.
@@ -190,31 +246,9 @@ func ReadOnlyCommand(cmd []string) error {
 		// Reading files is allowed, writing through them is not; none of these
 		// write, and redirection was refused above.
 	default:
-		if subs := writeSubcommands[prog]; subs != nil && len(cmd) > 1 {
-			// "ip link show" observes; "ip link set" does not. The object word
-			// is the one after the program, modulo flags.
-			var obj, verb string
-			for _, a := range cmd[1:] {
-				if strings.HasPrefix(a, "-") {
-					if prog == "sysctl" && subs[a] {
-						return fmt.Errorf("a diagnostic session may not run %q", strings.Join(cmd, " "))
-					}
-					continue
-				}
-				if obj == "" {
-					obj = a
-					continue
-				}
-				verb = a
-				break
-			}
-			if subs[obj] {
-				switch verb {
-				case "", "show", "list", "get":
-				default:
-					return fmt.Errorf("a diagnostic session may not run %q: it changes the device",
-						strings.Join(cmd, " "))
-				}
+		if writeSubcommands[prog] != nil {
+			if err := refuseIfWriting(prog, cmd); err != nil {
+				return err
 			}
 		}
 	}
