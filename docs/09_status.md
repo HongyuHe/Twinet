@@ -143,6 +143,27 @@ reached students, and each motivated a permanent test.
     relationships. `policy.transit_for_customers` now requires every selected
     route to reach every customer, and the discrimination suite mutates for it.
 
+13. **Reachability inside a VLAN was probed one way.** The same-VLAN half of the
+    layer-2 question looped over `i<j` -- one probe per unordered pair -- while
+    the cross-VLAN half deliberately probed every ordered pair. A host that
+    dropped what it sent to its neighbour, while still answering that
+    neighbour, kept whichever direction the loop happened to take, and full
+    marks with it. Every ordered pair is probed now. Doubling the traffic
+    through links the lab deliberately makes slow then cost a *correct*
+    submission a mark to a dropped packet, so the probes send two per hop and
+    retry three times: a mark that depends on the weather is worse than a
+    missing check, because nobody re-reads a grade that looks plausible.
+
+14. **A route-target leak that only went one way answered no probe.** Isolation
+    between VPN customers was established by pinging every site pair in both
+    directions. A ping needs a route home, and importing another customer's
+    route target on one edge leaves their table alone -- so packets flow into
+    the other bank's network, nothing comes back, every probe times out, and
+    the check reports perfect isolation. One bank able to inject traffic into
+    another's scored full marks. The tables are read as well as probed now.
+    Found by the advanced course's new discrimination suite on its first run,
+    which is what that suite is for.
+
 ## Environment findings
 
 - **Jumbo frames are unavailable.** Raising `eno2` to MTU 9000 dropped the
