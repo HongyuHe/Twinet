@@ -466,6 +466,14 @@ func (s *Server) auth(h http.HandlerFunc) http.HandlerFunc {
 			http.Error(w, "unauthorised", http.StatusUnauthorized)
 			return
 		}
+		// The certificate issued to an evaluated agent is a limit as well as a
+		// permission: whatever token it presents, it may not reach the routes
+		// that change the cluster.
+		if diagnosticClient(r) {
+			http.Error(w, "a diagnostic session may not use this route",
+				http.StatusForbidden)
+			return
+		}
 		h(w, r)
 	}
 }

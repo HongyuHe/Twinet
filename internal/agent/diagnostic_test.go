@@ -285,3 +285,33 @@ func TestADiagnosticSessionCannotClusterAWriteOption(t *testing.T) {
 		}
 	}
 }
+
+// ss's observational options are an allowlist now.
+//
+// The denylist rejected -K and missed -D, which dumps raw socket information to
+// a file of the caller's choosing -- as root, anywhere on the device, including
+// over a routing configuration. There is no reason to believe the next reader
+// of ss's manual page would have found the last of them.
+func TestADiagnosticSessionMayRunSsOnlyToPrint(t *testing.T) {
+	refused := [][]string{
+		{"ss", "-D", "/tmp/dump"},
+		{"ss", "-tnD", "/tmp/dump"},
+		{"ss", "--diag=/tmp/dump"},
+		{"ss", "-K"},
+		{"ss", "-Ktn"},
+	}
+	for _, c := range refused {
+		if err := ReadOnlyCommand(c); err == nil {
+			t.Errorf("%v writes or kills, and was allowed", c)
+		}
+	}
+	allowed := [][]string{
+		{"ss"}, {"ss", "-tn"}, {"ss", "-tnp"}, {"ss", "-s"},
+		{"ss", "-tuln"}, {"ss", "-n", "state", "established"},
+	}
+	for _, c := range allowed {
+		if err := ReadOnlyCommand(c); err != nil {
+			t.Errorf("%v only prints, and was refused: %v", c, err)
+		}
+	}
+}

@@ -67,7 +67,7 @@ func (s *Server) authDiag(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		r.Header.Del(scopeHeader)
 		got := r.Header.Get("Authorization")
-		if subtle.ConstantTimeCompare([]byte(got), full) == 1 {
+		if subtle.ConstantTimeCompare([]byte(got), full) == 1 && !diagnosticClient(r) {
 			h(w, r)
 			return
 		}
@@ -78,6 +78,26 @@ func (s *Server) authDiag(h http.HandlerFunc) http.HandlerFunc {
 		}
 		http.Error(w, "unauthorised", http.StatusUnauthorized)
 	}
+}
+
+// diagnosticClient reports whether the transport identity is the certificate
+// issued to an evaluated agent.
+//
+// A leaked cluster token should not be usable from inside the sandbox. The
+// token was found in a world-readable systemd unit and the agent read it, so
+// the certificate it was given is now also a limit rather than only a
+// permission: presented with it, a node refuses the full token and honours only
+// a diagnostic one. Two independent things now have to go wrong.
+func diagnosticClient(r *http.Request) bool {
+	if r.TLS == nil {
+		return false
+	}
+	for _, c := range r.TLS.PeerCertificates {
+		if c.Subject.CommonName == "diagnostic" {
+			return true
+		}
+	}
+	return false
 }
 
 // diagScopeOf reports the lab a diagnostic caller is confined to, and whether
@@ -212,6 +232,15 @@ func sysctlReadOnly(cmd []string) error {
 	return nil
 }
 
+// ssOptionsThatOnlyPrint is the observational subset of ss's short options.
+//
+// An allowlist, because the denylist missed -D, which dumps raw socket
+// information to a file of the caller's choosing -- as root, anywhere on the
+// device, including over a routing configuration. It also missed -K in a
+// cluster. There is no reason to believe the next reader of ss's manual page
+// will find the last of them.
+const ssOptionsThatOnlyPrint = "hVnraletuwxfimsbEZzoNp0469gHOM"
+
 func ssReadOnly(cmd []string) error {
 	for _, a := range cmd[1:] {
 		// ss -K closes sockets, which on a router is a session reset -- an
@@ -220,6 +249,25 @@ func ssReadOnly(cmd []string) error {
 		// was matching one spelling of several.
 		if hasShortOption(a, 'K') || a == "--kill" {
 			return errors.New("a diagnostic session may not close sockets (ss -K)")
+		}
+		// -D writes a raw dump to a file, as root, wherever it is pointed.
+		if hasShortOption(a, 'D') || a == "--diag" || strings.HasPrefix(a, "--diag=") {
+			return errors.New("a diagnostic session may not write a socket dump to a file " +
+				"(ss -D)")
+		}
+		if !strings.HasPrefix(a, "-") || strings.HasPrefix(a, "--") {
+			continue
+		}
+		// And anything else short that is not in the observational set.
+		body := a[1:]
+		if i := strings.IndexByte(body, '='); i >= 0 {
+			body = body[:i]
+		}
+		for _, c := range body {
+			if !strings.ContainsRune(ssOptionsThatOnlyPrint, c) || c == 'D' {
+				return fmt.Errorf("a diagnostic session may run ss only to print; %q is not "+
+					"an option that does", a)
+			}
 		}
 	}
 	return nil

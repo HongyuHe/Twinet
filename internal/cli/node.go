@@ -206,10 +206,21 @@ func bootstrapScript(n model.NodeSpec, token string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "# ---- %s ----\n", n.Name)
 	fmt.Fprintf(&b, "scp bin/twinetd root@%s:/usr/local/bin/twinetd\n", n.Name)
-	fmt.Fprintf(&b, "ssh root@%s 'cat > /etc/systemd/system/twinetd.service <<UNIT\n", n.Name)
+	// The token goes in a file only root can read, not in the unit.
+	//
+	// A systemd unit is world-readable by default and `Environment=` puts the
+	// value in plain sight -- so the cluster secret was legible to every
+	// account on the node, including the unprivileged one an evaluated RCA
+	// agent runs as. That agent could read it, discard its own read-only
+	// credential, and act as the controller across every lab on the cluster.
+	fmt.Fprintf(&b, "ssh root@%s 'install -d -m 0700 /etc/twinet\n", n.Name)
+	fmt.Fprintf(&b, "umask 077; printf %%s %q > /etc/twinet/agent.env\n",
+		"TWINET_TOKEN="+token)
+	b.WriteString("chmod 0600 /etc/twinet/agent.env\n")
+	b.WriteString("cat > /etc/systemd/system/twinetd.service <<UNIT\n")
 	b.WriteString("[Unit]\nDescription=Twinet node agent\nAfter=docker.service\nRequires=docker.service\n\n")
 	b.WriteString("[Service]\nType=simple\n")
-	fmt.Fprintf(&b, "Environment=TWINET_TOKEN=%s\n", token)
+	b.WriteString("EnvironmentFile=/etc/twinet/agent.env\n")
 	fmt.Fprintf(&b, "ExecStart=/usr/local/bin/twinetd -node %s -listen %s", n.Name, listen)
 	if n.UnderlayIP != "" {
 		fmt.Fprintf(&b, " -underlay-ip %s", n.UnderlayIP)

@@ -201,6 +201,17 @@ func pathsToHide(top *model.Topology, manifest string) []string {
 	if wd, err := os.Getwd(); err == nil {
 		add(filepath.Join(wd, "episodes"))
 	}
+	// Where this machine keeps the cluster's own secrets.
+	//
+	// The node agent's systemd unit carried TWINET_TOKEN in an Environment
+	// line, and a unit is world-readable: an evaluated agent read the cluster
+	// secret out of it, discarded its own read-only credential and could act as
+	// the controller across every lab. The token has been moved to a root-only
+	// file, and these are masked as well -- one mistake in a unit file should
+	// not be the whole of the defence.
+	for _, d := range []string{"/etc/systemd", "/etc/twinet", "/run/systemd/system"} {
+		add(d)
+	}
 	sort.Strings(out)
 	// Only the outermost of any nested pair.
 	//
