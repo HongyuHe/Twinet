@@ -2,6 +2,8 @@ package agent
 
 import (
 	"context"
+	"os"
+	"os/exec"
 	"strings"
 	"testing"
 
@@ -21,6 +23,8 @@ type fakeRuntime struct {
 	// scripts records every shell command the agent ran, so a test can assert
 	// on the order of a repair rather than only on its result.
 	scripts []string
+	// ps is what the container's process listing would show.
+	ps string
 }
 
 func (f *fakeRuntime) Inspect(context.Context, string) (rt.Container, error) {
@@ -33,6 +37,14 @@ func (f *fakeRuntime) Exec(_ context.Context, _ string, c rt.ExecCmd) (rt.ExecRe
 		f.scripts = append(f.scripts, c.Cmd[2])
 	}
 	switch {
+	case strings.Contains(body, "ps -ef | awk") && strings.Contains(body, "wc -l"):
+		// The agent's own pipeline, run over a recorded process listing, so
+		// what the test exercises is the awk pattern itself rather than a
+		// second implementation of it.
+		script := c.Cmd[len(c.Cmd)-1]
+		script = strings.Replace(script, "ps -ef", "cat "+f.psFile(), 1)
+		out, _ := exec.Command("sh", "-c", script).Output()
+		return rt.ExecResult{Stdout: string(out)}, nil
 	case strings.Contains(body, "ip -o link show"):
 		return rt.ExecResult{Stdout: f.links}, nil
 	case strings.Contains(body, "frrinit.sh start"):
@@ -232,4 +244,49 @@ func TestARepairStopsTheDaemonsBeforeStartingThem(t *testing.T) {
 		t.Errorf("the repair deletes the pid files before stopping, which is what makes "+
 			"the init script start a second copy:\n%s", start)
 	}
+}
+
+// ldpd forks two privilege-separated children, and they are not extra copies.
+//
+// Counting processes by daemon name alone read "ldpd -L" and "ldpd -E" -- which
+// every healthy router running LDP has -- as two duplicates, so every router in
+// the lab was declared broken and restarted, for ever. The symptom was a class
+// whose marks fell a little further each time it was graded, and routers whose
+// OSPF adjacencies were always two minutes old.
+func TestLDPsChildrenAreNotDuplicateDaemons(t *testing.T) {
+	// What `ps -ef` shows on a healthy router.
+	const psOut = ` 9420 root      0:00 /usr/lib/frr/watchfrr -d -F traditional zebra mgmtd bgpd ospfd ospf6d ldpd staticd
+ 9433 frr       0:00 /usr/lib/frr/zebra -d -F traditional -A 127.0.0.1 -s 90000000
+ 9440 frr       0:00 /usr/lib/frr/bgpd -d -F traditional -A 127.0.0.1 -M rpki
+ 9447 frr       0:00 /usr/lib/frr/ospfd -d -F traditional -A 127.0.0.1
+ 9450 frr       0:00 /usr/lib/frr/ospf6d -d -F traditional -A ::1
+ 9453 frr       0:00 /usr/lib/frr/ldpd -L -u frr -g frr
+ 9454 frr       0:00 /usr/lib/frr/ldpd -E -u frr -g frr
+ 9455 frr       0:00 /usr/lib/frr/ldpd -d -F traditional -A 127.0.0.1
+`
+	f := &fakeRuntime{links: "lo\n", running: map[string]bool{}, ps: psOut}
+	s := &Server{rt: f}
+	s.cfg.Node = "node-0"
+	if dup := s.duplicateDaemons(context.Background(), routerWithTwoCables(), nil); dup != "" {
+		t.Errorf("a healthy router was reported as running duplicate daemons: %s", dup)
+	}
+
+	// And a router that really is running two zebras is still caught.
+	f.ps = psOut + " 9999 frr      0:00 /usr/lib/frr/zebra -d -F traditional -A 127.0.0.1 -s 90000000\n"
+	if dup := s.duplicateDaemons(context.Background(), routerWithTwoCables(), nil); dup == "" {
+		t.Error("a router running two zebras was reported healthy")
+	}
+}
+
+// psFile writes the recorded process listing where the fake's shell can read it.
+func (f *fakeRuntime) psFile() string {
+	// Written fresh each time: caching it meant a test that changed the
+	// listing went on measuring the first one.
+	tmp, err := os.CreateTemp("", "twinet-ps-*")
+	if err != nil {
+		return "/dev/null"
+	}
+	_, _ = tmp.WriteString(f.ps)
+	_ = tmp.Close()
+	return tmp.Name()
 }

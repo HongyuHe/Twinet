@@ -429,7 +429,15 @@ func (s *Server) startDaemons(ctx context.Context, lab string, d *model.Device) 
 func (s *Server) duplicateDaemons(ctx context.Context, d *model.Device, as *model.AS) string {
 	var dup []string
 	for _, name := range render.EnabledDaemonsFor(as) {
-		script := "ps -ef | awk '/usr\\/lib\\/frr\\/" + name + " / && !/awk/' | wc -l"
+		// The daemon proper, which is the one started with -d.
+		//
+		// Matching the name alone counted ldpd's two privilege-separated
+		// children -- "ldpd -L" and "ldpd -E", which every healthy router
+		// with LDP has -- as two extra copies of ldpd. Every router in the
+		// lab was then declared broken and restarted, for ever, and the
+		// symptom was a class whose marks fell a little further every time
+		// it was graded.
+		script := "ps -ef | awk '/usr\\/lib\\/frr\\/" + name + " -d/ && !/awk/' | wc -l"
 		r, err := s.rt.Exec(ctx, d.Container, rt.ExecCmd{Cmd: []string{"sh", "-c", script}})
 		if err != nil || r.ExitCode != 0 {
 			return ""
