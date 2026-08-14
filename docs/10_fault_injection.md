@@ -328,9 +328,7 @@ truth, the symptoms, the diagnosis, the score and the timings.
 
 The agent is a command. It is given the brief, the symptoms, the lab's name and
 how to reach it, on standard input; it is not given the ground truth, the fault
-names or anything else that would answer the question, and the end-to-end suite
-asserts that -- an agent that could read the answer would measure nothing. It
-prints a diagnosis:
+names or anything else that would answer the question. It prints a diagnosis:
 
 ```json
 {"is_anomaly": true,
@@ -339,6 +337,41 @@ prints a diagnosis:
  "root_cause_name": ["ospf_neighbor_missing"],
  "explanation": "free text, recorded and not scored"}
 ```
+
+### What the agent can and cannot see
+
+Not telling the agent the answer is not the same as the agent not being able to
+find it, and every weaker arrangement was tried first and defeated:
+
+| Attempt | How it was defeated |
+|---|---|
+| Keep the ground truth off standard input | `cat $TWINET_MANIFEST/.twinet/injections.json` — the manifest path was in the environment |
+| Copy the lab, minus its private state | The original is world-readable; the agent opened it by absolute path |
+| Drop to an unprivileged account | The scenario file beside the lab names the fault, the device and the interface in plain YAML — and so do the tests that exercise it |
+
+What holds is a mount namespace. The agent runs as a system account with no
+shell, in a private namespace where the lab directory, the repository containing
+it and any episode directory are each covered by an empty, unreadable
+filesystem. Its working directory is a copy of the lab holding the manifest and
+the placement — how the network was meant to be built, and where the devices
+are, both of which a diagnostician is entitled to — and not the scenarios, the
+ledger, the roster, the credentials or the PKI. Its credential is derived from
+the cluster token by HMAC over the lab name: the node agents accept it for
+status, container listing and exec, refuse every other route, confine it to that
+one lab, and allow only commands that observe, so it cannot take a grading hold,
+enter configuration mode, or bring an interface down. An agent that can repair
+or worsen its own incident is not being scored on anything.
+
+`twinet incident run --agent` therefore needs root, to create the namespace and
+to drop out of it. Without `unshare` and `setpriv` it says so and runs with the
+account alone, which is weaker; it does not pretend otherwise.
+
+The end-to-end suite runs an agent whose entire strategy is to look for the
+answer — the ledger by three paths, the scenarios in the lab and in its own
+copy, a search of the filesystem, a grep of the repository, and the Docker
+socket — and requires all of it to come back empty. It also requires that agent
+to have actually run, because a test that passes because the subject never
+started is the failure this whole mechanism exists to prevent.
 
 The score has four parts rather than one, because an agent that names the right
 device for the wrong reason and one that names the right reason on the wrong

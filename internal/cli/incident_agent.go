@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"sort"
@@ -192,7 +193,22 @@ func runAgent(ctx context.Context, command string, ep *Episode, sb *sandbox, tok
 
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	c := exec.CommandContext(runCtx, "sh", "-c", command)
+
+	// Run inside a mount namespace with the answer masked out.
+	//
+	// Dropping to an unprivileged account and handing it a filtered copy was
+	// not enough: the original lab is world-readable, and the scenario file in
+	// it names the fault, the device and the interface in plain YAML. So does
+	// the end-to-end test that exercises it. An agent whose entire strategy was
+	// to grep the repository for the words in its own brief scored a perfect
+	// 1.00 without looking at the network.
+	//
+	// A namespace is the only control that holds, because there is no list of
+	// files that is both short enough to allowlist and complete enough to
+	// trust. Each path is covered with an empty, unreadable filesystem; the
+	// mounts are private, so nothing outside this process sees them, and they
+	// disappear with it.
+	c := agentCommand(runCtx, command, sb)
 	c.Stdin = strings.NewReader(string(input) + "\n")
 	c.Dir = sb.Dir
 	// The agent is handed a credential that can look at this lab and change
@@ -204,14 +220,6 @@ func runAgent(ctx context.Context, command string, ep *Episode, sb *sandbox, tok
 		"TWINET_LAB="+ep.Lab,
 		"TWINET_TOKEN="+agent.DiagnosticToken(token, ep.Lab),
 	)
-	// Dropped to the sandbox account, so the ledger is not merely somewhere
-	// else but unreadable. Without this the agent runs as root and the copy is
-	// decoration.
-	if os.Geteuid() == 0 {
-		c.SysProcAttr = &syscall.SysProcAttr{
-			Credential: &syscall.Credential{Uid: uint32(sb.UID), Gid: uint32(sb.GID)},
-		}
-	}
 	var out, errb strings.Builder
 	c.Stdout, c.Stderr = &out, &errb
 	runErr := c.Run()
@@ -248,4 +256,41 @@ func sanitisedEnv() []string {
 		out = append(out, kv)
 	}
 	return out
+}
+
+// agentCommand builds the process an evaluated agent runs as.
+//
+// Where the tools exist and this process is root, that is: a private mount
+// namespace, an empty filesystem over every path that holds the answer, and
+// then the agent as an unprivileged account. Where they do not, it is the
+// unprivileged account alone, and the caller is told that the isolation is
+// weaker than it should be rather than left to assume it is not.
+func agentCommand(ctx context.Context, command string, sb *sandbox) *exec.Cmd {
+	if os.Geteuid() != 0 || !haveTool("unshare") || !haveTool("setpriv") {
+		c := exec.CommandContext(ctx, "sh", "-c", command)
+		if os.Geteuid() == 0 {
+			c.SysProcAttr = &syscall.SysProcAttr{
+				Credential: &syscall.Credential{Uid: uint32(sb.UID), Gid: uint32(sb.GID)},
+			}
+			slog.Warn("running the agent without a mount namespace: unshare or setpriv is " +
+				"missing, so it can read the lab directory it is being scored on")
+		}
+		return c
+	}
+	var script strings.Builder
+	for _, p := range sb.Hide {
+		// Empty, unreadable, and not a bind of anything: a directory the agent
+		// can see the name of and nothing inside.
+		fmt.Fprintf(&script, "mount -t tmpfs -o size=4k,mode=0000 none %s || exit 90\n",
+			shellQuote(p))
+	}
+	fmt.Fprintf(&script, "exec setpriv --reuid %d --regid %d --clear-groups sh -c %s\n",
+		sb.UID, sb.GID, shellQuote(command))
+	return exec.CommandContext(ctx, "unshare", "--mount", "--propagation", "private",
+		"--", "sh", "-c", script.String())
+}
+
+func haveTool(name string) bool {
+	_, err := exec.LookPath(name)
+	return err == nil
 }

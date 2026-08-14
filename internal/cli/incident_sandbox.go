@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -31,6 +32,16 @@ type sandbox struct {
 	User     string
 	UID      int
 	GID      int
+	// Hide is every path the agent must not be able to open: the lab it is
+	// diagnosing, the repository that lab lives in, and any episode record.
+	//
+	// A copy is not isolation. The agent ran as an unprivileged account in a
+	// filtered copy and could still open the original by absolute path, where
+	// the scenario file says in plain YAML which fault was injected on which
+	// device -- and so does the end-to-end test that exercises it. An agent
+	// whose whole strategy is to grep the repository for its brief scored a
+	// perfect 1.00.
+	Hide []string
 }
 
 // sandboxUser is the account agents run as. It owns nothing, has no shell, and
@@ -59,7 +70,11 @@ func newSandbox(top *model.Topology, manifest, name string) (*sandbox, error) {
 		return nil, fmt.Errorf("gid of %s: %w", u.Username, err)
 	}
 
-	dir, err := os.MkdirTemp("", "twinet-rca-"+sanitiseName(name)+"-")
+	// A neutral name. Putting the scenario's name in the path told the agent
+	// which episode it was in, which is most of the answer for a suite whose
+	// scenarios are named after what they do.
+	_ = name
+	dir, err := os.MkdirTemp("", "twinet-work-")
 	if err != nil {
 		return nil, err
 	}
@@ -89,7 +104,74 @@ func newSandbox(top *model.Topology, manifest, name string) (*sandbox, error) {
 		sb.Remove()
 		return nil, err
 	}
+	sb.Hide = pathsToHide(top, manifest)
 	return sb, nil
+}
+
+// pathsToHide lists the directories an evaluated agent must not be able to
+// read: the lab, whatever repository it lives in, and any episode record.
+//
+// The repository, not only the lab: the scenario files live under the lab, but
+// the end-to-end tests that exercise them name the same faults, and so does the
+// documentation. Hiding the lab and leaving the tree it sits in is the kind of
+// half-measure this whole mechanism exists to stop.
+func pathsToHide(top *model.Topology, manifest string) []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(p string) {
+		if p == "" || p == "/" {
+			return
+		}
+		abs, err := filepath.Abs(p)
+		if err != nil || abs == "/" || seen[abs] {
+			return
+		}
+		if fi, err := os.Stat(abs); err != nil || !fi.IsDir() {
+			return
+		}
+		seen[abs] = true
+		out = append(out, abs)
+	}
+	add(top.Lab.Dir)
+	if fi, err := os.Stat(manifest); err == nil && fi.IsDir() {
+		add(manifest)
+	} else {
+		add(filepath.Dir(manifest))
+	}
+	// The repository the lab lives in, found by walking up to a .git.
+	if dir, err := filepath.Abs(top.Lab.Dir); err == nil {
+		for d := dir; d != "/" && d != "."; d = filepath.Dir(d) {
+			if _, err := os.Stat(filepath.Join(d, ".git")); err == nil {
+				add(d)
+				break
+			}
+		}
+	}
+	if wd, err := os.Getwd(); err == nil {
+		add(filepath.Join(wd, "episodes"))
+	}
+	sort.Strings(out)
+	// Only the outermost of any nested pair.
+	//
+	// Masking a parent removes the child's mount point, so mounting the
+	// repository and then the lab inside it failed with "mount point does not
+	// exist" and the agent never started at all -- which the adversarial test
+	// would have read as "it could not reach anything" had it not been made to
+	// insist the agent ran.
+	var outermost []string
+	for _, p := range out {
+		nested := false
+		for _, q := range outermost {
+			if p == q || strings.HasPrefix(p, q+string(filepath.Separator)) {
+				nested = true
+				break
+			}
+		}
+		if !nested {
+			outermost = append(outermost, p)
+		}
+	}
+	return outermost
 }
 
 // copyPublicTree copies everything in a lab directory that is not private
@@ -108,7 +190,10 @@ func copyPublicTree(src, dst string) error {
 			return nil
 		}
 		head := strings.Split(rel, string(filepath.Separator))[0]
-		if head == ".twinet" || head == "episodes" {
+		// incidents/ holds the scenario files, each of which names the fault,
+		// the device and the interface. Copying them into the agent's own
+		// sandbox was handing over the answer with extra steps.
+		if head == ".twinet" || head == "episodes" || head == "incidents" {
 			if d.IsDir() {
 				return filepath.SkipDir
 			}
@@ -171,19 +256,6 @@ func chownTree(root string, uid, gid int) error {
 		}
 		return os.Chown(p, uid, gid)
 	})
-}
-
-func sanitiseName(s string) string {
-	var b strings.Builder
-	for _, r := range s {
-		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
-			b.WriteRune(r)
-		default:
-			b.WriteRune('-')
-		}
-	}
-	return b.String()
 }
 
 // sealLabState makes a lab's private state unreadable to anyone but its owner,

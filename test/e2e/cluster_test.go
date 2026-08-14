@@ -1123,7 +1123,10 @@ func TestAnIncidentEvaluatesAndScoresAnAgent(t *testing.T) {
 	// An agent that answers correctly without looking, so this measures the
 	// harness rather than the agent. What it may see is the point: the brief
 	// arrives on standard input and the ground truth does not arrive at all.
-	agent := filepath.Join(out, "agent.sh")
+	// Somewhere the sandbox account can read: t.TempDir() belongs to whoever
+	// ran the test.
+	agent := filepath.Join("/tmp", "twinet-e2e-agent-"+strconv.Itoa(os.Getpid())+".sh")
+	defer func() { _ = os.Remove(agent) }()
 	// The agent runs as an unprivileged account now, so it needs somewhere it
 	// can actually write. t.TempDir() belongs to whoever ran the test.
 	briefPath := filepath.Join("/tmp", "twinet-e2e-brief-"+strconv.Itoa(os.Getpid())+".json")
@@ -1225,6 +1228,7 @@ func TestAnAgentCannotReachTheAnswer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	repoRoot := filepath.Dir(filepath.Dir(abs))
 	// Every way in that has ever worked, and a few that have not.
 	script := strings.Join([]string{
 		"#!/bin/sh",
@@ -1238,6 +1242,15 @@ func TestAnAgentCannotReachTheAnswer(t *testing.T) {
 		"  echo '--- original roster'; cat " + abs + "/.twinet/roster.json",
 		"  echo '--- listing'; ls -la " + abs + "/.twinet/",
 		"  echo '--- search'; find / -name 'injections.json' -readable 2>/dev/null | head -20",
+		// The scenario itself, which names the fault in plain YAML, and the
+		// repository it lives in, whose tests name it too. Reading the answer
+		// out of a file beside the lab is not less of a leak than reading it
+		// out of the ledger.
+		"  echo '--- scenarios'; cat " + abs + "/incidents/*.yaml",
+		"  echo '--- scenario copy'; cat \"$TWINET_MANIFEST\"/incidents/*.yaml",
+		"  echo '--- repo grep'; grep -rl ospf_neighbor_missing " + repoRoot + " 2>/dev/null | head -5",
+		"  echo '--- repo read'; grep -rh 'ospf_neighbor_missing' " + repoRoot + " 2>/dev/null | head -5",
+		"  echo '--- wander'; find " + repoRoot + " -maxdepth 2 -readable 2>/dev/null | head -5",
 		"  echo '--- episodes'; find / -name '*.json' -path '*episode*' -readable 2>/dev/null | head -5",
 		"  echo '--- docker'; docker ps --format '{{.Names}}' 2>&1 | head -3",
 		"} >> " + loot + " 2>&1",
@@ -1245,13 +1258,17 @@ func TestAnAgentCannotReachTheAnswer(t *testing.T) {
 		// agent can repair the fault and report a healthy network.
 		"printf '%s\\n' '{\"is_anomaly\":false}'",
 	}, "\n") + "\n"
-	agentPath := filepath.Join(out, "thief.sh")
+	// Somewhere the sandbox account can read: t.TempDir() belongs to whoever
+	// ran the test and is not world-readable, and an agent that cannot open its
+	// own script proves nothing about what else it could open.
+	agentPath := filepath.Join("/tmp", "twinet-e2e-thief-"+strconv.Itoa(os.Getpid())+".sh")
 	if err := os.WriteFile(agentPath, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chmod(out, 0o755); err != nil {
+	if err := os.Chmod(agentPath, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	defer func() { _ = os.Remove(agentPath) }()
 
 	// The agent answers "nothing is wrong" about a lab with a fault in it, so
 	// it should score badly. If it scores well, it read the answer.
@@ -1264,11 +1281,20 @@ func TestAnAgentCannotReachTheAnswer(t *testing.T) {
 		t.Fatalf("the adversarial agent did not run at all: %v", err)
 	}
 	got := string(stolen)
+	// A test that passes because the agent never started is the defect this
+	// whole file is about. The agent writes its identity first, so its absence
+	// means nothing below was measured.
+	if !strings.Contains(got, "uid=") {
+		t.Fatalf("the agent never ran, so this test proves nothing about what it could "+
+			"reach. The incident said:\n%s\nwhat the agent wrote:\n%s", res, got)
+	}
 	t.Logf("what the agent could reach:\n%s", got)
 	for _, secret := range []string{
 		"ospf_neighbor_missing", // the fault it was asked to diagnose
 		"faulty_devices",        // the shape of the ground truth record
 		"\"undo\"",              // how to reverse it, also in the ledger
+		"port_PHY",              // the interface the scenario names
+		"kind: Scenario",        // any scenario file at all
 	} {
 		if strings.Contains(got, secret) {
 			t.Errorf("the agent read %q out of the filesystem, so the episode measures "+
