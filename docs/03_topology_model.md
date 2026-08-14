@@ -348,12 +348,21 @@ itself.
   legacy `.txt` files plus `subnet_config.sh` and emits an equivalent Twinet
   manifest. This lets us diff old vs. new behaviour and migrate the ETH advanced
   course exercises mechanically.
-- `twinet save` writes the **same directory layout** as the legacy
-  `save_configs.sh` (`<DEVICE>/router.conf`, `router.rib.json`,
-  `router.rib6.json`, `router.tunnels`, `host.ip`, `host.route`, `host.route6`,
-  `switch.db`, `switch.summary`) plus a `manifest.json` with checksums and
-  timestamps — so existing student instructions, the GitHub submission flow, and
-  `golden-configs/` all keep working unchanged.
+- `twinet save` writes an archive per group containing, for each device, its
+  routing configuration (`<DEVICE>.conf`) and the commands that recreate
+  everything FRR does not hold — VLANs, addresses, routes and tunnels
+  (`<DEVICE>.sh`) — plus the ROAs the group published and a `manifest.json`
+  with checksums and timestamps.
+
+  This is **not** the legacy `save_configs.sh` layout of per-device directories
+  (`<DEVICE>/router.conf`, `router.rib.json`, `router.tunnels`, `host.ip`,
+  `switch.db`, …), and an earlier revision of this document claimed it was. The
+  difference matters for one purpose only: diffing a Twinet archive against one
+  produced by the old platform. Everything else — restore, regrading, the
+  submission flow — reads Twinet's own format, and the `.sh` half exists
+  because a dump of state cannot be replayed and the legacy layout is a dump.
+  A legacy exporter is listed as unimplemented in
+  [09 — Status](09_status.md).
 
 ## 9. Heterogeneous vendors
 

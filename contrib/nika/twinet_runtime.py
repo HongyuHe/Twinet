@@ -105,6 +105,40 @@ class TwinetRuntime(LabRuntime):
 
     # ---- the protocol NIKA depends on ----------------------------------
 
+    # What this backend can actually serve.
+    #
+    # The base class declares a default set that includes "k8s", and its
+    # SR Linux operations are inherited as ordinary methods. Twinet emulates
+    # neither: a Kubernetes fault would be accepted and do nothing, and an
+    # srl_* call would send Nokia CLI syntax to FRR, which answers with an
+    # error that looks like the network being broken. Declaring the truth is
+    # what lets NIKA refuse a scenario this backend cannot serve instead of
+    # running it and scoring the result.
+    CAPABILITIES = frozenset(
+        {
+            "exec",
+            "node_status",
+            "interface",
+            "ip",
+            "route",
+            "dns",
+            "service",
+            "tc",
+            "nft",
+            "iptables",
+            "process",
+            "pidfile",
+            "file",
+            "frr",
+            "traffic",
+            "dhcp",
+        }
+    )
+
+    @property
+    def capabilities(self) -> frozenset[str]:
+        return self.CAPABILITIES
+
     @property
     def backend(self) -> str:
         return self.dialect or "twinet"
@@ -341,3 +375,33 @@ def _target_args(target: dict[str, Any]) -> list[str]:
         else:
             args += ["--param", f"{key}={value}"]
     return args
+
+
+def _unsupported(name: str):
+    """Refuse an operation this backend cannot serve, by name.
+
+    The base class implements the Nokia SR Linux operations by sending SR Linux
+    CLI syntax over exec. Against an FRR router that is not a no-op: the command
+    fails, and the failure is indistinguishable from the network being broken --
+    so a scenario built on one would be scored as though the agent's diagnosis
+    were the problem. Twinet's devices run FRR, so the honest answer is to say
+    so at the point of call.
+    """
+
+    def refuse(self, *_args, **_kwargs):
+        raise TwinetError(
+            f"{name}() is a Nokia SR Linux operation and Twinet's devices run FRR. "
+            f"This backend declares the capabilities it has ({', '.join(sorted(TwinetRuntime.CAPABILITIES))}); "
+            "use the FRR equivalent, or run this scenario on a backend with SR Linux nodes."
+        )
+
+    refuse.__name__ = name
+    return refuse
+
+
+# Bound after the class body so the list is derived from the base class rather
+# than written out again and left to drift.
+for _name in dir(LabRuntime):
+    if _name.startswith("srl_") and _name not in TwinetRuntime.__dict__:
+        setattr(TwinetRuntime, _name, _unsupported(_name))
+del _name
