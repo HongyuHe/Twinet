@@ -1410,3 +1410,104 @@ func TestABehaviourStartsAndStopsAHijack(t *testing.T) {
 		t.Errorf("a stopped behaviour still reports itself running:\n%s", got)
 	}
 }
+
+// One site made passive must cost marks.
+//
+// The multicast checks used a fixed pair of hosts -- first and last in name
+// order -- and one fixed bystander. `ip pim passive` on every transit interface
+// of one router leaves its PIM configuration looking perfect (the interfaces are
+// listed, the rendezvous point is right) and forms no adjacency at all, so that
+// site receives nothing. The pair the checks happened to use went on working and
+// the exercise awarded all four marks with a sixth of it disconnected.
+func TestAPassiveMulticastSiteLosesMarks(t *testing.T) {
+	dir := os.Getenv("TWINET_MULTICAST_LAB")
+	if dir == "" {
+		t.Skip("set TWINET_MULTICAST_LAB to the multicast lab to run this")
+	}
+	const victim = "as1/RIGHT"
+	ports := []string{"port_TOP", "port_CENTER", "port_BOTTOMR"}
+
+	grade := func(t *testing.T) map[string]float64 {
+		t.Helper()
+		out := t.TempDir()
+		if res, err := twinet(t, "grade", "run", "-m", dir, "--as", "1", "-o", out); err != nil {
+			t.Fatalf("grading: %v\n%s", err, res)
+		}
+		raw, err := os.ReadFile(filepath.Join(out, "group1.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var rep struct {
+			Questions []struct {
+				ID      string  `json:"id"`
+				Awarded float64 `json:"awarded"`
+			} `json:"questions"`
+		}
+		if err := json.Unmarshal(raw, &rep); err != nil {
+			t.Fatal(err)
+		}
+		got := map[string]float64{}
+		for _, q := range rep.Questions {
+			got[q.ID] = q.Awarded
+		}
+		return got
+	}
+
+	setPassive := func(t *testing.T, on bool) {
+		t.Helper()
+		cmds := []string{"configure terminal"}
+		for _, p := range ports {
+			cmds = append(cmds, "interface "+p)
+			if on {
+				cmds = append(cmds, "ip pim passive")
+			} else {
+				cmds = append(cmds, "no ip pim passive")
+			}
+		}
+		cmds = append(cmds, "end")
+		args := []string{"exec", "-m", dir, victim, "--", "vtysh"}
+		for _, c := range cmds {
+			args = append(args, "-c", c)
+		}
+		if out, err := twinet(t, args...); err != nil {
+			t.Fatalf("configuring %s: %v\n%s", victim, err, out)
+		}
+	}
+
+	before := grade(t)
+	for _, id := range []string{"q1", "q3", "q4"} {
+		if before[id] < 0.999 {
+			t.Fatalf("the reference does not score full marks on %s (%.2f); nothing below "+
+				"could be attributed to the change", id, before[id])
+		}
+	}
+
+	setPassive(t, true)
+	defer func() {
+		setPassive(t, false)
+		// Coming back is quick: a hello is sent at once.
+		time.Sleep(45 * time.Second)
+		after := grade(t)
+		for _, id := range []string{"q1", "q3"} {
+			if after[id] < 0.999 {
+				t.Errorf("%s is still %.2f after the lab was put back", id, after[id])
+			}
+		}
+	}()
+	// Long enough for the neighbours to time out.
+	//
+	// PIM's default hold time is 105 seconds, so a shorter wait reads a
+	// neighbour that has not expired yet as evidence that the check does not
+	// work.
+	time.Sleep(130 * time.Second)
+
+	broken := grade(t)
+	if broken["q1"] >= before["q1"] {
+		t.Errorf("q1 still scored %.2f with three transit interfaces passive; a PIM "+
+			"interface with no neighbour is not running PIM", broken["q1"])
+	}
+	if broken["q3"] >= before["q3"] {
+		t.Errorf("q3 still scored %.2f with one site unable to receive the group; the "+
+			"delivery check is not covering every site", broken["q3"])
+	}
+}

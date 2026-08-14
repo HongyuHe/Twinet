@@ -47,25 +47,34 @@ func init() {
 	})
 }
 
-// pimInterfaces reads the interfaces PIM is running on, from FRR's own view.
-func pimInterfaces(ctx context.Context, env *Env, router string) (map[string]bool, error) {
-	var doc struct {
-		Interfaces map[string]any `json:"-"`
-	}
-	_ = doc
-	// `show ip pim interface json` keys the document by interface name, with
-	// some scalar members alongside; decoding into a map and dropping the
-	// non-objects is more robust than modelling FRR's exact shape.
+// pimInterfaces reads the interfaces PIM is running on, with the number of
+// neighbours each has formed.
+//
+// The count is the point. `ip pim passive` puts an interface in this table with
+// state up and never sends or accepts a hello on it, so a router configured
+// that way on every transit port has a perfect-looking PIM configuration and no
+// adjacencies at all -- one site of the exercise was disconnected exactly that
+// way with all four marks still awarded. A transit interface with no PIM
+// neighbour is not running PIM in any sense the exercise means.
+func pimInterfaces(ctx context.Context, env *Env, router string) (map[string]int, error) {
 	var raw map[string]any
 	if err := env.VtyshJSON(ctx, router, "show ip pim interface json", &raw); err != nil {
 		return nil, err
 	}
-	out := map[string]bool{}
+	out := map[string]int{}
 	for k, v := range raw {
-		if _, ok := v.(map[string]any); !ok {
+		m, ok := v.(map[string]any)
+		if !ok {
 			continue
 		}
-		out[k] = true
+		if st, ok := m["state"].(string); ok && !strings.EqualFold(st, "up") {
+			continue
+		}
+		n := 0
+		if f, ok := m["pimNeighbors"].(float64); ok {
+			n = int(f)
+		}
+		out[k] = n
 	}
 	return out, nil
 }
@@ -119,19 +128,31 @@ func checkPIMEnabled(ctx context.Context, env *Env) Result {
 	var missingPIM, missingIGMP, unreadable []string
 	routers, checked := env.Routers(), 0
 	for _, r := range routers {
-		want, hostFacing := wantsPIM(r)
+		want, hostIfaces := wantsPIM(r)
 		got, err := pimInterfaces(ctx, env, r.Name)
 		if err != nil {
 			unreadable = append(unreadable, fmt.Sprintf("%s: %v", r.Name, err))
 			continue
 		}
 		checked++
+		hostFacing := map[string]bool{}
+		for _, n := range hostIfaces {
+			hostFacing[n] = true
+		}
 		for _, name := range want {
-			if !got[name] {
+			n, present := got[name]
+			switch {
+			case !present:
 				missingPIM = append(missingPIM, r.Name+"/"+name)
+			case !hostFacing[name] && n == 0:
+				// A link between two routers with PIM on both ends has a
+				// neighbour. None means one end is passive, or is not
+				// running PIM at all.
+				missingPIM = append(missingPIM,
+					fmt.Sprintf("%s/%s (no PIM neighbour)", r.Name, name))
 			}
 		}
-		if len(hostFacing) == 0 {
+		if len(hostIfaces) == 0 {
 			continue
 		}
 		ig, err := igmpInterfaces(ctx, env, r.Name)
@@ -139,7 +160,7 @@ func checkPIMEnabled(ctx context.Context, env *Env) Result {
 			unreadable = append(unreadable, fmt.Sprintf("%s: %v", r.Name, err))
 			continue
 		}
-		for _, name := range hostFacing {
+		for _, name := range hostIfaces {
 			if !ig[name] {
 				missingIGMP = append(missingIGMP, r.Name+"/"+name)
 			}
@@ -341,30 +362,58 @@ func sendTo(ctx context.Context, env *Env, host *model.Device, group string, n i
 	return nil
 }
 
-// multicastRun joins a group on one host, sends from another, and returns what
-// the receiver saw along with the forwarding state of the routers.
-func multicastRun(ctx context.Context, env *Env, recv, src *model.Device, group string) (
-	got string, trees map[string]string, err error) {
+// multicastRun joins a group on several hosts at once, sends from another, and
+// returns what each listener saw along with the forwarding state of the
+// routers.
+//
+// Every site, not a fixed pair. Choosing the first and last host in name order
+// tested one path through the topology and left the rest unmeasured: making one
+// router passive on all of its transit interfaces disconnected a whole site
+// while the pair this check happened to use went on working, and the exercise
+// awarded all four marks. The listeners run concurrently because the tree is
+// built once and shared -- measuring each site in turn would take six times as
+// long and answer a different question, since a tree built for one receiver is
+// not the tree built for six.
+func multicastRun(ctx context.Context, env *Env, receivers []*model.Device,
+	bystanders []*model.Device, src *model.Device, group string) (
+	got map[string]string, trees map[string]string, err error) {
 
 	type result struct {
-		out string
-		err error
+		name string
+		out  string
+		err  error
 	}
-	done := make(chan result, 1)
-	go func() {
-		out, err := receiveOn(ctx, env, recv, group, 20)
-		done <- result{out, err}
-	}()
-	// The receiver has to be listening before the source starts, or the tree is
-	// built after the packets have gone and nothing arrives for a reason that
-	// has nothing to do with the submission.
+	done := make(chan result, len(receivers)+len(bystanders))
+	for _, h := range receivers {
+		go func(h *model.Device) {
+			out, err := receiveOn(ctx, env, h, group, 25)
+			done <- result{h.Name, out, err}
+		}(h)
+	}
+	// A host that does not join, listening on the same port. Anything it
+	// receives is traffic nobody asked it to receive.
+	for _, h := range bystanders {
+		go func(h *model.Device) {
+			iface := hostIface(h)
+			res, err := env.Probe(ctx, h.ID, []string{"twinet-mcast", "-listen",
+				"-group", group, "-iface", iface, "-seconds", "25"})
+			if err != nil {
+				done <- result{h.Name, "", err}
+				return
+			}
+			done <- result{h.Name, res.Stdout + res.Stderr, nil}
+		}(h)
+	}
+	// The listeners have to be listening before the source starts, or the tree
+	// is built after the packets have gone and nothing arrives for a reason
+	// that has nothing to do with the submission.
 	select {
-	case <-time.After(6 * time.Second):
+	case <-time.After(8 * time.Second):
 	case <-ctx.Done():
-		return "", nil, ctx.Err()
+		return nil, nil, ctx.Err()
 	}
-	if err := sendTo(ctx, env, src, group, 15); err != nil {
-		return "", nil, err
+	if err := sendTo(ctx, env, src, group, 25); err != nil {
+		return nil, nil, err
 	}
 	// Read the trees while the traffic is still flowing: multicast forwarding
 	// state expires, so a table read after the sender stops is empty for a
@@ -375,12 +424,35 @@ func multicastRun(ctx context.Context, env *Env, recv, src *model.Device, group 
 			trees[r.Name] = out
 		}
 	}
-	select {
-	case res := <-done:
-		return res.out, trees, res.err
-	case <-ctx.Done():
-		return "", trees, ctx.Err()
+	got = map[string]string{}
+	for i := 0; i < len(receivers)+len(bystanders); i++ {
+		select {
+		case res := <-done:
+			if res.err != nil {
+				return got, trees, res.err
+			}
+			got[res.name] = res.out
+		case <-ctx.Done():
+			return got, trees, ctx.Err()
+		}
 	}
+	return got, trees, nil
+}
+
+// multicastCast is who sends, who joins and who merely listens.
+//
+// Every host but the source joins, and the source itself is the bystander: it
+// is the one host guaranteed to see the traffic if anything is flooding, and
+// making it the control costs no extra device. A topology with more hosts than
+// routers would leave some out; there are none here, and the check says how
+// many it covered.
+func multicastCast(hosts []*model.Device) (src *model.Device, recv, bystanders []*model.Device) {
+	if len(hosts) < 2 {
+		return nil, nil, nil
+	}
+	src = hosts[len(hosts)-1]
+	recv = append(recv, hosts[:len(hosts)-1]...)
+	return src, recv, nil
 }
 
 func checkMulticastDelivery(ctx context.Context, env *Env) Result {
@@ -391,27 +463,28 @@ func checkMulticastDelivery(ctx context.Context, env *Env) Result {
 	}
 	group := as.Multicast.TestGroup
 	if group == "" {
-		return Errored("multicast.delivery",
-			fmt.Errorf("the lab declares no test group to send to"))
+		return Errored("multicast.delivery", fmt.Errorf("the lab declares no test group"))
 	}
 	hosts := hostsOf(env)
-	if len(hosts) < 2 {
+	src, recv, _ := multicastCast(hosts)
+	if src == nil {
 		return Errored("multicast.delivery",
 			fmt.Errorf("multicast needs at least two hosts; this AS has %d", len(hosts)))
 	}
-	// The two ends are chosen as far apart as the topology allows -- the first
-	// and last host in name order -- so a submission that only works between
-	// two routers that happen to be adjacent does not pass.
-	recv, src := hosts[0], hosts[len(hosts)-1]
 
-	got, trees, err := multicastRun(ctx, env, recv, src, group)
+	got, trees, err := multicastRun(ctx, env, recv, nil, src, group)
 	if err != nil {
 		return Errored("multicast.delivery", err)
 	}
-	delivered := strings.Contains(got, "received")
-	// And it must have been delivered by multicast forwarding, not by flooding
-	// or by a unicast route somebody installed. A router with the group in its
-	// multicast forwarding table is doing the former.
+	var missed []string
+	delivered := 0
+	for _, h := range recv {
+		if strings.Contains(got[h.Name], "received") {
+			delivered++
+			continue
+		}
+		missed = append(missed, fmt.Sprintf("%s never received %s", h.Name, group))
+	}
 	var forwarding []string
 	for name, out := range trees {
 		if strings.Contains(out, group) {
@@ -419,35 +492,34 @@ func checkMulticastDelivery(ctx context.Context, env *Env) Result {
 		}
 	}
 	sort.Strings(forwarding)
+	sort.Strings(missed)
 
 	switch {
-	case delivered && len(forwarding) >= 2:
+	case len(missed) == 0 && len(forwarding) >= 2:
 		return Pass("multicast.delivery", Evidence{
-			Observed: fmt.Sprintf("%s received %s sent by %s, over a tree through %s",
-				recv.Name, group, src.Name, strings.Join(forwarding, ", "))})
-	case delivered:
+			Observed: fmt.Sprintf("all %d receiver(s) got %s from %s, over a tree through %s",
+				delivered, group, src.Name, strings.Join(forwarding, ", "))})
+	case len(missed) == 0:
 		return Partial("multicast.delivery", 0.5, Evidence{
-			Expected: "a multicast tree carrying the group from the source to the receiver",
-			Observed: fmt.Sprintf("%s received %s, but only %d router(s) have any "+
-				"forwarding state for it", recv.Name, group, len(forwarding)),
+			Expected: "a multicast tree carrying the group from the source to every receiver",
+			Observed: fmt.Sprintf("all %d receiver(s) got %s, but only %d router(s) have any "+
+				"forwarding state for it", delivered, group, len(forwarding)),
 			Detail: strings.Join(forwarding, ", "),
-			Hint: "a packet that arrives without a tree behind it arrived by some other " +
-				"means; check `show ip mroute` on the routers between the two hosts",
+			Hint: "a packet that arrives with no tree behind it arrived by some other means; " +
+				"check `show ip mroute` on the routers between the hosts",
 			Command: "show ip mroute",
 		})
 	default:
-		detail := got
-		if len(forwarding) > 0 {
-			detail += "\nrouters with forwarding state: " + strings.Join(forwarding, ", ")
-		}
-		return Fail("multicast.delivery", Evidence{
-			Expected: fmt.Sprintf("%s receiving what %s sends to %s", recv.Name, src.Name, group),
-			Observed: "nothing arrived",
-			Detail:   strings.TrimSpace(detail),
-			Hint: "the receiver joins with IGMP, the router tells the rendezvous point with " +
-				"PIM, and the source's first packet builds the rest of the tree; check " +
-				"`show ip pim state` on both ends",
-			Command: "show ip mroute; show ip pim state",
+		return Partial("multicast.delivery", ratio(delivered, len(recv)), Evidence{
+			Expected: fmt.Sprintf("every host receiving what %s sends to %s", src.Name, group),
+			Observed: fmt.Sprintf("%d of %d receiver(s) got nothing", len(missed), len(recv)),
+			Detail: strings.Join(append(truncate(missed, 6),
+				"routers with forwarding state: "+strings.Join(forwarding, ", ")), "\n"),
+			Hint: "the receiver joins with IGMP, its router tells the rendezvous point with " +
+				"PIM, and the source's first packet builds the rest of the tree; a site that " +
+				"gets nothing usually has a transit interface that is not forming a PIM " +
+				"adjacency",
+			Command: "show ip mroute; show ip pim state; show ip pim neighbor",
 		})
 	}
 }
@@ -464,54 +536,52 @@ func checkMulticastNoFlooding(ctx context.Context, env *Env) Result {
 		return Errored("multicast.no_flooding",
 			fmt.Errorf("this check needs three hosts and a test group"))
 	}
-	recv, src, bystander := hosts[0], hosts[len(hosts)-1], hosts[1]
-
-	// The bystander listens without joining. Everything else is the same run,
-	// because the interesting question is what a third host sees while a real
-	// delivery is happening.
-	type result struct {
-		out string
-		err error
+	// One receiver and every other host listening without joining, rather than
+	// one fixed bystander. A submission that floods to five sites and not to
+	// the one host this check happened to pick used to pass it.
+	recv := hosts[0]
+	src := hosts[len(hosts)-1]
+	var bystanders []*model.Device
+	bystanders = append(bystanders, hosts[1:len(hosts)-1]...)
+	if len(bystanders) == 0 {
+		return Errored("multicast.no_flooding",
+			fmt.Errorf("every host is either the source or the receiver, so nothing is left "+
+				"to overhear the group"))
 	}
-	quiet := make(chan result, 1)
-	go func() {
-		iface := hostIface(bystander)
-		res, err := env.Probe(ctx, bystander.ID, []string{"twinet-mcast", "-listen",
-			"-group", group, "-iface", iface, "-seconds", "20"})
-		if err != nil {
-			quiet <- result{"", err}
-			return
-		}
-		quiet <- result{res.Stdout + res.Stderr, nil}
-	}()
 
-	got, _, err := multicastRun(ctx, env, recv, src, group)
+	got, _, err := multicastRun(ctx, env, []*model.Device{recv}, bystanders, src, group)
 	if err != nil {
 		return Errored("multicast.no_flooding", err)
 	}
-	if !strings.Contains(got, "received") {
+	if !strings.Contains(got[recv.Name], "received") {
 		// Nothing was delivered at all, so there is nothing to have leaked.
-		// That is q2's failure, not this one, and marking it twice would
-		// punish one mistake in two places.
+		// That is the delivery question's failure, not this one, and marking it
+		// twice would punish one mistake in two places.
 		return Errored("multicast.no_flooding", fmt.Errorf(
-			"nothing was delivered to %s, so whether a third host also received it "+
-				"says nothing", recv.Name))
+			"nothing was delivered to %s, so whether anybody else received it says nothing",
+			recv.Name))
 	}
-	res := <-quiet
-	if res.err != nil {
-		return Errored("multicast.no_flooding", res.err)
+	var leaked []string
+	for _, h := range bystanders {
+		if strings.Contains(got[h.Name], "received") {
+			leaked = append(leaked, fmt.Sprintf("%s received %s without joining it",
+				h.Name, group))
+		}
 	}
-	if strings.Contains(res.out, "received") {
-		return Fail("multicast.no_flooding", Evidence{
-			Expected: fmt.Sprintf("only hosts that joined %s receiving it", group),
-			Observed: fmt.Sprintf("%s received the group without joining it", bystander.Name),
-			Detail:   strings.TrimSpace(res.out),
-			Hint: "packets reaching a host that never asked for them means they are being " +
-				"flooded rather than forwarded along a tree",
-			Command: "show ip mroute",
-		})
+	sort.Strings(leaked)
+	if len(leaked) > 0 {
+		return Partial("multicast.no_flooding", ratio(len(bystanders)-len(leaked), len(bystanders)),
+			Evidence{
+				Expected: fmt.Sprintf("only hosts that joined %s receiving it", group),
+				Observed: fmt.Sprintf("%d of %d host(s) that did not join received it anyway",
+					len(leaked), len(bystanders)),
+				Detail: strings.Join(truncate(leaked, 6), "\n"),
+				Hint: "packets reaching a host that never asked for them means they are being " +
+					"flooded rather than forwarded along a tree",
+				Command: "show ip mroute",
+			})
 	}
 	return Pass("multicast.no_flooding", Evidence{
-		Observed: fmt.Sprintf("%s received %s and %s, which did not join, received nothing",
-			recv.Name, group, bystander.Name)})
+		Observed: fmt.Sprintf("%s received %s and all %d host(s) that did not join received "+
+			"nothing", recv.Name, group, len(bystanders))})
 }
