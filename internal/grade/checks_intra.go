@@ -529,60 +529,110 @@ func checkVLANIsolation(ctx context.Context, env *Env) Result {
 	}
 	sort.Ints(vlans)
 
-	var detail strings.Builder
-	passed, total := 0, 0
+	// Every pair, not one per VLAN and one across.
+	//
+	// This tested hosts[0] against hosts[1] within each VLAN, and one ordered
+	// pair across them. In this topology that meant the cross-VLAN question was
+	// asked only of two hosts on the same switch, so a trunk that mis-tags the
+	// other switch's ports -- which is the mistake the question exists to catch
+	// -- was never looked at. Four hosts is twelve ordered pairs, run at once.
+	type outcome struct {
+		ok     bool
+		detail string
+	}
+	var (
+		mu      sync.Mutex
+		results []outcome
+		wg      sync.WaitGroup
+	)
+	sem := make(chan struct{}, 8)
+	record := func(ok bool, format string, args ...any) {
+		mu.Lock()
+		results = append(results, outcome{ok, fmt.Sprintf(format, args...)})
+		mu.Unlock()
+	}
 
-	// Same VLAN: must be reachable, and directly (one hop).
+	// Same VLAN: reachable, and directly.
 	for _, v := range vlans {
 		hs := hosts[v]
-		if len(hs) < 2 {
-			continue
-		}
-		src, dst := hs[0], hs[1]
-		total++
-		hops, err := traceHops(ctx, env, src, dst)
-		switch {
-		case err != nil:
-			fmt.Fprintf(&detail, "VLAN %d: %s cannot reach %s (%v)\n", v, src.Name, dst.Name, err)
-		case hops == 1:
-			passed++
-		default:
-			fmt.Fprintf(&detail, "VLAN %d: %s %s; hosts in one VLAN must be adjacent\n",
-				v, src.Name, describeReach(dst.Name, hops))
+		for i := 0; i < len(hs); i++ {
+			for j := i + 1; j < len(hs); j++ {
+				wg.Add(1)
+				go func(v int, src, dst *model.Device) {
+					defer wg.Done()
+					sem <- struct{}{}
+					defer func() { <-sem }()
+					hops, err := traceHops(ctx, env, src, dst)
+					switch {
+					case err != nil:
+						record(false, "VLAN %d: %s cannot reach %s (%v)", v, src.Name, dst.Name, err)
+					case hops == 1:
+						record(true, "")
+					default:
+						record(false, "VLAN %d: %s %s; hosts in one VLAN must be adjacent",
+							v, src.Name, describeReach(dst.Name, hops))
+					}
+				}(v, hs[i], hs[j])
+			}
 		}
 	}
 
-	// Across VLANs: reachable, but through the gateway.
-	//
-	// "Two hops or more" was the whole test, and it is satisfied by any path
-	// that is not direct -- including one that bypasses the gateway entirely,
-	// which is the misconfiguration the question is about. The first hop must
-	// be the gateway, and it is now checked by address.
-	if len(vlans) >= 2 {
-		src, dst := hosts[vlans[0]][0], hosts[vlans[1]][0]
-		total++
-		hops, first, err := traceFirstHop(ctx, env, src, dst)
-		switch {
-		case err != nil:
-			fmt.Fprintf(&detail, "%s cannot reach %s across VLANs (%v)\n", src.Name, dst.Name, err)
-		case hops < 2:
-			fmt.Fprintf(&detail, "%s %s; different VLANs must be separated at layer 2\n",
-				src.Name, describeReach(dst.Name, hops))
-		case first == "":
-			// A first hop that did not answer is not a first hop that was the
-			// gateway. This fell through to success, so a path through a
-			// silent wrong router scored the point.
-			fmt.Fprintf(&detail, "%s reaches %s across VLANs, but nothing answered at the "+
-				"first hop, so it cannot be shown to have gone through %s\n",
-				src.Name, dst.Name, gateway.Name)
-		case !deviceHoldsAddr(ctx, env, gateway, first):
-			fmt.Fprintf(&detail, "%s reaches %s across VLANs, but its first hop is %s, "+
-				"which is not %s; traffic between VLANs must be routed by the gateway\n",
-				src.Name, dst.Name, first, gateway.Name)
-		default:
-			passed++
+	// Across VLANs: reachable, but through the gateway, in both directions and
+	// for every pair.
+	for a := range vlans {
+		for b := range vlans {
+			if a == b {
+				continue
+			}
+			for _, src := range hosts[vlans[a]] {
+				for _, dst := range hosts[vlans[b]] {
+					wg.Add(1)
+					go func(src, dst *model.Device) {
+						defer wg.Done()
+						sem <- struct{}{}
+						defer func() { <-sem }()
+						hops, first, err := traceFirstHop(ctx, env, src, dst)
+						switch {
+						case err != nil:
+							record(false, "%s cannot reach %s across VLANs (%v)",
+								src.Name, dst.Name, err)
+						case hops < 2:
+							record(false, "%s %s; different VLANs must be separated at layer 2",
+								src.Name, describeReach(dst.Name, hops))
+						case first == "":
+							// A first hop that did not answer is not a first
+							// hop that was the gateway. This fell through to
+							// success, so a path through a silent wrong router
+							// scored the point.
+							record(false, "%s reaches %s across VLANs, but nothing answered "+
+								"at the first hop, so it cannot be shown to have gone "+
+								"through %s", src.Name, dst.Name, gateway.Name)
+						case !deviceHoldsAddr(ctx, env, gateway, first):
+							record(false, "%s reaches %s across VLANs, but its first hop is "+
+								"%s, which is not %s; traffic between VLANs must be routed "+
+								"by the gateway", src.Name, dst.Name, first, gateway.Name)
+						default:
+							record(true, "")
+						}
+					}(src, dst)
+				}
+			}
 		}
 	}
+	wg.Wait()
+
+	var problems []string
+	passed, total := 0, len(results)
+	for _, r := range results {
+		if r.ok {
+			passed++
+			continue
+		}
+		problems = append(problems, r.detail)
+	}
+	sort.Strings(problems)
+	var detail strings.Builder
+	detail.WriteString(strings.Join(truncate(problems, 8), "\n"))
 
 	if total > 0 && passed == total {
 		return Pass("l2.vlan_isolation", Evidence{
