@@ -1321,3 +1321,92 @@ func labName(t *testing.T, dir string) string {
 	t.Fatal("the manifest has no name")
 	return ""
 }
+
+// A behaviour is a declaration that has to do something.
+//
+// `behaviours:` -- the manifest's scripted, reversible perturbations, documented
+// since the first version as the replacement for the legacy platform's
+// hijack.sh -- validated, appeared in the schema, and was read by no code at
+// all. The COS-461 RPKI question is built on one: a stub AS starts announcing
+// somebody else's prefix and a student's filters are supposed to stop it.
+// Without it the lab could only carry a permanent invalid announcement, so the
+// question could never be "did your filter stop the hijack when it happened".
+func TestABehaviourStartsAndStopsAHijack(t *testing.T) {
+	dir := labDir(t)
+	out, err := twinet(t, "behaviour", "list", "-m", dir)
+	if err != nil {
+		t.Fatalf("listing behaviours: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "stub_hijack") {
+		t.Skipf("this lab declares no stub_hijack behaviour:\n%s", out)
+	}
+
+	victim := "2.0.0.0/8"
+	originates := func(t *testing.T) bool {
+		t.Helper()
+		got, err := twinet(t, "exec", "-m", dir, "as10/MSP", "--",
+			"vtysh", "-c", "show ip bgp "+victim)
+		if err != nil {
+			return false
+		}
+		// "Local" is how FRR describes a path this router originated.
+		return strings.Contains(got, "Local")
+	}
+
+	if originates(t) {
+		t.Fatal("AS 10 is already announcing the victim's prefix before the behaviour " +
+			"was started, so nothing below would mean anything")
+	}
+
+	if out, err := twinet(t, "behaviour", "start", "stub_hijack", "-m", dir); err != nil {
+		t.Fatalf("starting the behaviour: %v\n%s", err, out)
+	}
+	defer func() {
+		if out, err := twinet(t, "behaviour", "stop", "stub_hijack", "-m", dir); err != nil {
+			t.Fatalf("stopping the behaviour: %v\n%s", err, out)
+		}
+	}()
+	time.Sleep(15 * time.Second)
+
+	if !originates(t) {
+		t.Error("the behaviour reported success and AS 10 is not announcing the prefix, " +
+			"so the exercise's hijack does not happen")
+	}
+	// It is recorded, so an interrupted session leaves nothing live that
+	// nothing on disk mentions.
+	if got, err := twinet(t, "behaviour", "status", "-m", dir); err != nil {
+		t.Errorf("reading the status: %v", err)
+	} else if !strings.Contains(got, "running") {
+		t.Errorf("a started behaviour does not report itself running:\n%s", got)
+	}
+
+	// And the reference solution rejects it: a system whose routers validate
+	// origins must not select a path for the victim's prefix that came from
+	// the hijacker.
+	for _, dev := range []string{"as3/CHI", "as5/SFO"} {
+		got, err := twinet(t, "exec", "-m", dir, dev, "--",
+			"vtysh", "-c", "show ip bgp "+victim)
+		if err != nil {
+			t.Errorf("reading %s: %v", dev, err)
+			continue
+		}
+		if strings.Contains(got, "10 i") || strings.Contains(got, "invalid, best") {
+			t.Errorf("%s selected the hijacked path, so the reference solution does not "+
+				"reject it:\n%s", dev, got)
+		}
+	}
+
+	if out, err := twinet(t, "behaviour", "stop", "stub_hijack", "-m", dir); err != nil {
+		t.Fatalf("stopping the behaviour: %v\n%s", err, out)
+	}
+	time.Sleep(10 * time.Second)
+	if originates(t) {
+		t.Error("the behaviour was stopped and AS 10 is still announcing the prefix, so " +
+			"the lab is left hijacked for whatever runs next")
+	}
+	if got, err := twinet(t, "behaviour", "status", "-m", dir); err != nil {
+		t.Errorf("reading the status: %v", err)
+	} else if strings.Contains(got, "running") {
+		t.Errorf("a stopped behaviour still reports itself running:\n%s", got)
+	}
+}
