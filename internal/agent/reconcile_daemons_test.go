@@ -18,6 +18,9 @@ type fakeRuntime struct {
 	links   string
 	running map[string]bool
 	started bool
+	// scripts records every shell command the agent ran, so a test can assert
+	// on the order of a repair rather than only on its result.
+	scripts []string
 }
 
 func (f *fakeRuntime) Inspect(context.Context, string) (rt.Container, error) {
@@ -26,6 +29,9 @@ func (f *fakeRuntime) Inspect(context.Context, string) (rt.Container, error) {
 
 func (f *fakeRuntime) Exec(_ context.Context, _ string, c rt.ExecCmd) (rt.ExecResult, error) {
 	body := strings.Join(c.Cmd, " ")
+	if len(c.Cmd) == 3 && c.Cmd[0] == "sh" {
+		f.scripts = append(f.scripts, c.Cmd[2])
+	}
 	switch {
 	case strings.Contains(body, "ip -o link show"):
 		return rt.ExecResult{Stdout: f.links}, nil
@@ -178,5 +184,52 @@ func TestADeviceThatRecoversStartsAgain(t *testing.T) {
 	if why := s.brokenBecause(context.Background(), "cos461", routerWithTwoCables()); why != "" {
 		t.Errorf("a device that had recovered and then lost a cable again was reported "+
 			"broken on the first survey (%q); the count should have restarted", why)
+	}
+}
+
+// A repair must not leave a container running two of each daemon.
+//
+// The old repair killed watchfrr, deleted the pid files and started FRR. With
+// the pid files gone the init script cannot tell that the daemons are already
+// running, so it starts a second copy of every one -- and two zebras compete
+// for the same netlink socket, so the one holding the configuration is not the
+// one that owns the interfaces. Four zebras were found in one container; the
+// symptom was a router whose files and running-config both had its loopback
+// address and whose kernel did not, and six routers of one system were marked
+// down for it in every grading run.
+func TestARepairStopsTheDaemonsBeforeStartingThem(t *testing.T) {
+	f := &fakeRuntime{
+		links:   "lo\nport_BOS\nport_CHI\n",
+		running: map[string]bool{"zebra": true},
+	}
+	s := &Server{rt: f}
+	s.cfg.Node = "node-0"
+	if err := s.startDaemons(context.Background(), "lab", routerWithTwoCables()); err != nil {
+		t.Fatalf("starting daemons: %v", err)
+	}
+	if len(f.scripts) == 0 {
+		t.Fatal("the repair ran nothing")
+	}
+	var start string
+	for _, sc := range f.scripts {
+		if strings.Contains(sc, "frrinit.sh start") {
+			start = sc
+		}
+	}
+	if start == "" {
+		t.Fatal("the repair never starts FRR")
+	}
+	stopAt := strings.Index(start, "frrinit.sh stop")
+	startAt := strings.Index(start, "frrinit.sh start")
+	rmAt := strings.Index(start, "rm -f /var/run/frr")
+	switch {
+	case stopAt < 0:
+		t.Errorf("the repair never stops FRR, so it starts a second copy of every "+
+			"daemon:\n%s", start)
+	case stopAt > startAt:
+		t.Errorf("the repair starts FRR before stopping it:\n%s", start)
+	case rmAt >= 0 && rmAt < stopAt:
+		t.Errorf("the repair deletes the pid files before stopping, which is what makes "+
+			"the init script start a second copy:\n%s", start)
 	}
 }

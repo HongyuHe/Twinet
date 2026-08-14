@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -338,8 +339,12 @@ func (s *Server) brokenBecause(ctx context.Context, lab string, d *model.Device)
 	// and the only symptom was students being marked down for neighbours that
 	// had no routing process.
 	if d.Kind == model.KindRouter {
-		if missing := s.missingDaemons(ctx, d, s.asOf(lab, d)); missing != "" {
+		as := s.asOf(lab, d)
+		if missing := s.missingDaemons(ctx, d, as); missing != "" {
 			return daemonsDown + missing
+		}
+		if dup := s.duplicateDaemons(ctx, d, as); dup != "" {
+			return daemonsDown + " duplicated: " + dup
 		}
 	}
 	if d.Kind == model.KindSwitch {
@@ -365,18 +370,83 @@ func (s *Server) peerUnderlay(lab string) map[string]string {
 // it was given, so starting a dead daemon restores what was there rather than
 // replacing it.
 func (s *Server) startDaemons(ctx context.Context, lab string, d *model.Device) error {
+	// Stopped properly before being started.
+	//
+	// This used to kill watchfrr, delete the pid files, and start. Deleting the
+	// pid files is what made it wrong: the init script then has no idea the
+	// daemons are already running, so it starts a second copy of every one of
+	// them. Four zebras were found in one container that way, and the symptom
+	// is not a crash -- it is a router whose FRR configuration is correct, whose
+	// running-config shows the address, and whose kernel interface never gets
+	// it, because the zebra that owns the netlink socket is not the one holding
+	// the configuration. Six routers of one system were in that state and every
+	// grading run marked their owner down for it.
 	script := strings.Join([]string{
+		// watchfrr outlives a plain stop and holds the pid lock.
 		"for p in $(ps -ef | awk '/watchfrr/ && !/awk/ {print $1}'); do kill $p 2>/dev/null || true; done",
+		"/usr/lib/frr/frrinit.sh stop >/dev/null 2>&1 || true",
+		// Anything that survived the stop, by name, because starting on top of
+		// a live daemon is the failure above.
+		"for p in $(ps -ef | awk '/usr\\/lib\\/frr\\// && !/awk/ && !/frrinit/ {print $1}'); do kill $p 2>/dev/null || true; done",
+		"sleep 1",
 		"rm -f /var/run/frr/*.pid /var/run/frr/*.vty 2>/dev/null || true",
 		"/usr/lib/frr/frrinit.sh start >/dev/null 2>&1 || true",
 	}, "\n")
 	if _, err := s.rt.Exec(ctx, d.Container, rt.ExecCmd{Cmd: []string{"sh", "-c", script}}); err != nil {
 		return err
 	}
-	if missing := s.missingDaemons(ctx, d, s.asOf(lab, d)); missing != "" {
-		return fmt.Errorf("still not running:%s", missing)
+	// And given time to come up.
+	//
+	// frrinit.sh returns before the daemons have forked and written their pid
+	// files, so asking immediately answered "still not running" for daemons
+	// that were seconds from being up. The repair reported failure three times
+	// and gave up on routers that had in fact recovered, while the logs said
+	// they could not be started.
+	as := s.asOf(lab, d)
+	var missing string
+	for i := 0; i < 20; i++ {
+		missing = s.missingDaemons(ctx, d, as)
+		if missing == "" {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Second):
+		}
 	}
-	return nil
+	return fmt.Errorf("still not running:%s", missing)
+}
+
+// duplicateDaemons names routing processes a router is running more than one
+// copy of.
+//
+// Two zebras is not a redundant router, it is a broken one: they compete for
+// the same netlink socket and the same interface state, and the loser's
+// configuration is applied to nothing. It produces a device whose files and
+// whose running-config are both correct and whose kernel is not, which is
+// indistinguishable from a student mistake and was being marked as one.
+func (s *Server) duplicateDaemons(ctx context.Context, d *model.Device, as *model.AS) string {
+	var dup []string
+	for _, name := range render.EnabledDaemonsFor(as) {
+		script := "ps -ef | awk '/usr\\/lib\\/frr\\/" + name + " / && !/awk/' | wc -l"
+		r, err := s.rt.Exec(ctx, d.Container, rt.ExecCmd{Cmd: []string{"sh", "-c", script}})
+		if err != nil || r.ExitCode != 0 {
+			return ""
+		}
+		n, err := strconv.Atoi(strings.TrimSpace(r.Stdout))
+		if err != nil {
+			return ""
+		}
+		if n > 1 {
+			dup = append(dup, fmt.Sprintf("%s (%d)", name, n))
+		}
+	}
+	if len(dup) == 0 {
+		return ""
+	}
+	sort.Strings(dup)
+	return strings.Join(dup, " ")
 }
 
 // Repairs that cannot succeed are attempted a few times and then left alone.
