@@ -129,17 +129,25 @@ type Report struct {
 	// them, so two runs of the same lab in successive terms produced reports
 	// that were indistinguishable -- which matters exactly when a mark is
 	// disputed a year later.
-	Course    string           `json:"course,omitempty"`
-	Term      string           `json:"term,omitempty"`
-	Rubric    string           `json:"rubric"`
-	Manifest  string           `json:"manifest_hash"`
-	GradedAt  time.Time        `json:"graded_at"`
-	Duration  string           `json:"duration"`
-	Total     float64          `json:"total"`
-	MaxTotal  float64          `json:"max_total"`
-	Questions []QuestionResult `json:"questions"`
-	Warnings  []string         `json:"warnings,omitempty"`
-	Err       string           `json:"error,omitempty"`
+	Course string `json:"course,omitempty"`
+	// RubricNotes is what the rubric says about how it splits the marks.
+	//
+	// Every bundled rubric writes several sentences explaining why a question
+	// is worth what it is worth -- why isolation is worth nothing on its own,
+	// why the absence of BGP in the core is the larger share -- and the field
+	// was read by nothing, so none of it ever reached the person being marked.
+	// A student disputing a grade is entitled to the reasoning.
+	RubricNotes string           `json:"rubric_notes,omitempty"`
+	Term        string           `json:"term,omitempty"`
+	Rubric      string           `json:"rubric"`
+	Manifest    string           `json:"manifest_hash"`
+	GradedAt    time.Time        `json:"graded_at"`
+	Duration    string           `json:"duration"`
+	Total       float64          `json:"total"`
+	MaxTotal    float64          `json:"max_total"`
+	Questions   []QuestionResult `json:"questions"`
+	Warnings    []string         `json:"warnings,omitempty"`
+	Err         string           `json:"error,omitempty"`
 	// NeedsReview marks a report that must not be released without a human
 	// looking at it, because some part of the grading did not run correctly.
 	NeedsReview bool `json:"needs_review,omitempty"`
@@ -179,6 +187,13 @@ func (r *Report) Text() string {
 	if r.NeedsReview {
 		b.WriteString("NEEDS REVIEW: part of this run did not complete correctly; " +
 			"the marks below are provisional.\n\n")
+	}
+	if n := strings.TrimSpace(r.RubricNotes); n != "" {
+		b.WriteString("How these marks are split\n")
+		for _, line := range strings.Split(n, "\n") {
+			fmt.Fprintf(&b, "  %s\n", strings.TrimSpace(line))
+		}
+		b.WriteString("\n")
 	}
 	for _, q := range r.Questions {
 		mark := "x"
