@@ -3,13 +3,12 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"log/slog"
 	"os"
 	"os/exec"
 	"sort"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/HongyuHe/twinet/internal/agent"
@@ -208,7 +207,10 @@ func runAgent(ctx context.Context, command string, ep *Episode, sb *sandbox, tok
 	// trust. Each path is covered with an empty, unreadable filesystem; the
 	// mounts are private, so nothing outside this process sees them, and they
 	// disappear with it.
-	c := agentCommand(runCtx, command, sb)
+	c, err := agentCommand(runCtx, command, sb)
+	if err != nil {
+		return d, "", err
+	}
 	c.Stdin = strings.NewReader(string(input) + "\n")
 	c.Dir = sb.Dir
 	// The agent is handed a credential that can look at this lab and change
@@ -265,17 +267,27 @@ func sanitisedEnv() []string {
 // then the agent as an unprivileged account. Where they do not, it is the
 // unprivileged account alone, and the caller is told that the isolation is
 // weaker than it should be rather than left to assume it is not.
-func agentCommand(ctx context.Context, command string, sb *sandbox) *exec.Cmd {
-	if os.Geteuid() != 0 || !haveTool("unshare") || !haveTool("setpriv") {
-		c := exec.CommandContext(ctx, "sh", "-c", command)
-		if os.Geteuid() == 0 {
-			c.SysProcAttr = &syscall.SysProcAttr{
-				Credential: &syscall.Credential{Uid: uint32(sb.UID), Gid: uint32(sb.GID)},
-			}
-			slog.Warn("running the agent without a mount namespace: unshare or setpriv is " +
-				"missing, so it can read the lab directory it is being scored on")
+func agentCommand(ctx context.Context, command string, sb *sandbox) (*exec.Cmd, error) {
+	// Refused rather than weakened.
+	//
+	// This used to fall back to running the agent as the invoking user, with no
+	// namespaces and no warning unless it happened to be root. An ordinary
+	// `twinet incident run --agent ...` without sudo therefore ran the agent as
+	// somebody who can read the scenario file, which names the fault and the
+	// device -- so the benchmark silently measured nothing, and looked exactly
+	// like one that had worked. A score that cannot be trusted is worse than no
+	// score, because somebody will quote it.
+	if os.Geteuid() != 0 {
+		return nil, errors.New("evaluating an agent needs root: the agent has to be put in " +
+			"a namespace where it cannot read the scenario, the lab or the injection " +
+			"ledger, and this process cannot create one. Re-run under sudo")
+	}
+	for _, tool := range []string{"unshare", "setpriv"} {
+		if !haveTool(tool) {
+			return nil, fmt.Errorf("evaluating an agent needs %s, which is not installed: "+
+				"without it the agent shares this machine's filesystem and process table, "+
+				"and can read the fault it is being asked to diagnose", tool)
 		}
-		return c
 	}
 	var script strings.Builder
 	for _, p := range sb.Hide {
@@ -300,7 +312,7 @@ func agentCommand(ctx context.Context, command string, sb *sandbox) *exec.Cmd {
 	// --mount-proc gives the namespace a procfs of its own, so /proc shows the
 	// agent and nothing else.
 	return exec.CommandContext(ctx, "unshare", "--mount", "--pid", "--fork", "--mount-proc",
-		"--propagation", "private", "--", "sh", "-c", script.String())
+		"--propagation", "private", "--", "sh", "-c", script.String()), nil
 }
 
 func haveTool(name string) bool {

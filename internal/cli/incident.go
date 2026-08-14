@@ -422,7 +422,7 @@ func newIncidentCredentialCmd(opts *Options) *cobra.Command {
 		Long: "An agent given TWINET_TOKEN can read every lab on the cluster, run anything " +
 			"in any container, take a grading hold, and destroy the evidence. This mints a " +
 			"credential that can look at one lab and change nothing: `twinet exec` and " +
-			"`twinet status` work with it, everything else is refused by the node agents.\n\n" +
+			"`twinet node status` work with it, everything else is refused by the node agents.\n\n" +
 			"`twinet incident run --agent` uses one automatically; this is for harnesses that " +
 			"drive the agent themselves.",
 		Args: cobra.NoArgs,

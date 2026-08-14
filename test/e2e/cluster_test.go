@@ -1545,3 +1545,39 @@ func TestAPassiveMulticastSiteLosesMarks(t *testing.T) {
 			"delivery check is not covering every site", broken["q3"])
 	}
 }
+
+// Evaluating an agent without root must refuse, not fall back.
+//
+// The sandbox used to run the agent as the invoking user when it could not
+// create a namespace, with no warning unless that user happened to be root. An
+// ordinary `twinet incident run --agent ...` therefore ran the agent as
+// somebody who can read the scenario file -- which names the fault and the
+// device -- so the benchmark measured nothing and looked exactly like one that
+// had worked. A score that cannot be trusted is worse than no score, because
+// somebody will quote it.
+func TestEvaluatingAnAgentWithoutRootRefuses(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("this test is about what happens when the runner is not root")
+	}
+	dir := labDir(t)
+	scenario := filepath.Join(dir, "incidents", "ospf_adjacency_lost.yaml")
+	if _, err := os.Stat(scenario); err != nil {
+		t.Skipf("no scenario to run: %v", err)
+	}
+	out, err := twinet(t, "incident", "run", "-m", dir, "--scenario", scenario,
+		"--agent", "printf '%s\\n' '{\"is_anomaly\":true}'", "--agent-timeout", "1m",
+		"-o", t.TempDir())
+	if err == nil {
+		t.Fatalf("an unprivileged run evaluated an agent instead of refusing:\n%s", out)
+	}
+	if !strings.Contains(out, "needs root") {
+		t.Errorf("the refusal does not say why:\n%s", out)
+	}
+	// And it must not have left the lab broken: refusing to evaluate is not a
+	// reason to leave a fault behind.
+	if got, err := twinet(t, "fault", "status", "-m", dir); err != nil {
+		t.Errorf("reading the fault status: %v", err)
+	} else if !strings.Contains(got, "nothing is injected") {
+		t.Errorf("a refused evaluation left faults in the lab:\n%s", got)
+	}
+}
