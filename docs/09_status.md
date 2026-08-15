@@ -270,6 +270,15 @@ reached students, and each motivated a permanent test.
     the student likes. Sessions are now confirmed from the neighbour's side,
     and publication from the trust anchor's own container.
 
+27. **A counter is a total, and a total can be moved by anything.** Whether
+    IPv6 crossed between the datacentres through the 6in4 tunnel was settled by
+    the tunnel's packet counters rising during the test. Routing every
+    datacentre prefix natively and pinging a link-local address across the
+    tunnel in a loop kept the counters climbing and earned the whole mark while
+    none of the traffic in question was encapsulated. Each gateway is now asked
+    what it would do with a packet for the address being tested, in both
+    directions, and the answer has to be the tunnel.
+
 ## Environment findings
 
 - **Jumbo frames are unavailable.** Raising `eno2` to MTU 9000 dropped the
