@@ -783,6 +783,29 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 			},
 		},
 		{
+			// An address the plan does not mention.
+			//
+			// Reported and scored neither way until two reviewers made the
+			// same objection: the question is whether the addressing matches
+			// the plan, and a router carrying an address the plan does not
+			// mention does not match it. It is also the raw material for
+			// impersonation, which is how most of the defects in this grader
+			// were built.
+			name:     "an unplanned address left on a router",
+			question: "q1.2",
+			undo: func(t *testing.T) {
+				_, _ = twinet(t, "exec", "-m", dir, "as3/NYC", "--",
+					"ip", "addr", "del", "192.0.2.123/32", "dev", "lo")
+			},
+			apply: func(t *testing.T) {
+				out, err := twinet(t, "exec", "-m", dir, "as3/NYC", "--",
+					"ip", "addr", "add", "192.0.2.123/32", "dev", "lo")
+				if err != nil {
+					t.Fatalf("adding an unplanned address: %v\n%s", err, out)
+				}
+			},
+		},
+		{
 			// The right prefix, advertised by the wrong router.
 			//
 			// A prefix carries no record of where it came from. Taking a
