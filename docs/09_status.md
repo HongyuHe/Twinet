@@ -316,6 +316,14 @@ reached students, and each motivated a permanent test.
     must now have one, and an adjacency where the plan has no link is reported
     rather than counted.
 
+32. **The provider answering for the customer it is meant to carry.** Whether a
+    customer's sites reach each other was established by pinging between them,
+    and every packet crosses the provider -- the thing being marked. A rule on
+    each edge answering the far site's address locally, with the real traffic
+    dropped, left all four probes succeeding and the mark untouched. The
+    customer's own hosts now have to have received the probes; unlike the
+    single-AS case, they belong to somebody else, so this evidence is decisive.
+
 ## Environment findings
 
 - **Jumbo frames are unavailable.** Raising `eno2` to MTU 9000 dropped the
