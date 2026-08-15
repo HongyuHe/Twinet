@@ -350,6 +350,20 @@ func renderBGP(top *model.Topology, as *model.AS, d *model.Device) string {
 	sort.Slice(exts, func(x, y int) bool { return exts[x].addr < exts[y].addr })
 	for _, x := range exts {
 		fmt.Fprintf(&b, " neighbor %s remote-as %d\n", x.addr, x.asn)
+		if x.ixp {
+			// A route server is transparent: it relays a member's
+			// announcement without putting its own AS in front of the path.
+			// FRR checks by default that the first AS of an eBGP update is
+			// the peer's, and silently treats every route from the exchange
+			// as a withdrawal -- "incorrect first AS (must be 140)" in the
+			// log, no notification, no session reset, and nothing in the
+			// table. Every member of every exchange in this lab accepted
+			// exactly nothing through it, for as long as the lab has
+			// existed, while the question about exchange policy scored full
+			// marks because refusing everything refuses the in-region routes
+			// too.
+			fmt.Fprintf(&b, " no neighbor %s enforce-first-as\n", x.addr)
+		}
 	}
 
 	hasRPKI := svc.RPKIAddrFor(top, as.ASN) != ""
@@ -543,7 +557,17 @@ func ixpPolicy(top *model.Topology, as *model.AS, exts []ext, rpki bool) string 
 			fmt.Fprintf(&b, "route-map %s deny 3\n match rpki invalid\nexit\n", name)
 		}
 		if len(sameRegion) > 0 {
+			// Two terms, because one of them cannot match what an exchange
+			// mostly carries. `_X_` requires a separator on each side, so it
+			// matches a path that crosses AS X on the way to somewhere else
+			// and not a path that *is* AS X -- which is exactly what a member
+			// announcing its own prefix at an exchange sends. Measured: of
+			// nineteen paths, `_(4|5|6|7|8)_` matched two and `^(4|5|6|7|8)$`
+			// matched five, and the five were the ones the filter exists to
+			// refuse.
 			fmt.Fprintf(&b, "bgp as-path access-list IXP-%d-REGION permit _(%s)_\n",
+				x.asn, joinASNs(sameRegion, "|"))
+			fmt.Fprintf(&b, "bgp as-path access-list IXP-%d-REGION permit ^(%s)$\n",
 				x.asn, joinASNs(sameRegion, "|"))
 			fmt.Fprintf(&b, "!\nroute-map %s deny 10\n match as-path IXP-%d-REGION\nexit\n", name, x.asn)
 		}

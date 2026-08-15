@@ -435,12 +435,34 @@ func checkIXPCommunities(ctx context.Context, env *Env) Result {
 			emptyList = name
 		}
 	}
-	admitted, aerr := inRegionRoutesViaIXP(ctx, env, ixpRouter.Name, ixpPeer)
+	admitted, accepted, aerr := routesViaIXP(ctx, env, ixpRouter.Name, ixpPeer)
 	if aerr != nil {
 		return Errored("policy.ixp_communities", aerr)
 	}
 	if len(admitted) > 0 {
 		filters = false
+	}
+	// What the exchange is for.
+	//
+	// Only the refusals were read, so an inbound policy denying everything the
+	// route server sent admitted no in-region route and passed. A member that
+	// accepts nothing from the exchange has not written a peering policy; it
+	// has switched the exchange off, and the point of the question is the
+	// traffic that does cross it.
+	relaying, rerr := routeServerRelaysToUs(ctx, env, rs.ID, env.AS)
+	if rerr != nil {
+		return Errored("policy.ixp_communities", rerr)
+	}
+	if len(accepted) == 0 && relaying {
+		return Fail("policy.ixp_communities", Evidence{
+			Expected: "the routes the exchange relays from out-of-region members accepted, " +
+				"and the in-region ones refused",
+			Observed: fmt.Sprintf("nothing at all was accepted from %s, though the route "+
+				"server is relaying to this AS", ixpPeer),
+			Hint: "an inbound filter that denies everything refuses the in-region routes " +
+				"and the rest with them; match the AS path rather than blocking the session",
+			Command: fmt.Sprintf("show ip bgp neighbors %s routes", ixpPeer),
+		})
 	}
 
 	unapplied := ""
@@ -1664,6 +1686,109 @@ func fieldAfter(line, key string) string {
 // check passes for everybody -- vacuous in exactly the way it was written to
 // stop. `show ip bgp neighbors <rs> routes` is what the router itself
 // considers to have come from that session, after policy.
+// routeServerRelaysToUs reports whether the exchange is advertising anything to
+// this AS at all.
+//
+// It is the precondition for demanding that the AS accept something: if the
+// route server has nothing to relay -- because no other member is announcing,
+// or because it is refusing to -- then accepting nothing is not the member's
+// doing, and marking it against them would be blaming a student for the lab.
+func routeServerRelaysToUs(ctx context.Context, env *Env, rsDevice string, asn int) (bool, error) {
+	me, ok := env.Topology.ASes[asn]
+	if !ok {
+		return false, fmt.Errorf("AS %d not in the lab", asn)
+	}
+	_ = me
+	var doc struct {
+		Peers map[string]struct {
+			RemoteAs int `json:"remoteAs"`
+			PfxSnt   int `json:"pfxSnt"`
+		} `json:"peers"`
+	}
+	// Probe, not Vtysh: the route server belongs to the exchange, not to the
+	// system under test, so it is addressed by its full device identity.
+	res, err := env.Probe(ctx, rsDevice, []string{"vtysh", "-c",
+		"show bgp ipv4 unicast summary json"})
+	if err != nil {
+		return false, fmt.Errorf("asking the route server what it relays: %w", err)
+	}
+	body := res.Stdout
+	if jerr := jsonUnmarshalLoose(body, &doc); jerr != nil {
+		var v4 struct {
+			IPv4Unicast struct {
+				Peers map[string]struct {
+					RemoteAs int `json:"remoteAs"`
+					PfxSnt   int `json:"pfxSnt"`
+				} `json:"peers"`
+			} `json:"ipv4Unicast"`
+		}
+		if jerr2 := jsonUnmarshalLoose(body, &v4); jerr2 != nil {
+			return false, fmt.Errorf("asking the route server what it relays: %w", jerr)
+		}
+		for _, p := range v4.IPv4Unicast.Peers {
+			if p.RemoteAs == asn && p.PfxSnt > 0 {
+				return true, nil
+			}
+		}
+		return false, nil
+	}
+	for _, p := range doc.Peers {
+		if p.RemoteAs == asn && p.PfxSnt > 0 {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// routesViaIXP splits what this AS accepted from the exchange into the routes
+// whose path crosses a system in its own region -- which the exercise says to
+// refuse -- and the rest, which it exists to accept.
+//
+// Both halves matter. Only the first was ever read, so an inbound policy that
+// denied everything from the exchange admitted no in-region route and passed:
+// a member that hears nothing from the exchange and sends nothing to it has not
+// implemented the peering policy, it has switched the exchange off.
+func routesViaIXP(ctx context.Context, env *Env, router, ixpPeer string) (in, out []string, err error) {
+	me, ok := env.Topology.ASes[env.AS]
+	if !ok {
+		return nil, nil, fmt.Errorf("AS %d not in the lab", env.AS)
+	}
+	inRegion := map[int]bool{}
+	for asn, as := range env.Topology.ASes {
+		if asn != env.AS && me.Region != "" && as.Region == me.Region && as.Role != model.RoleIXP {
+			inRegion[asn] = true
+		}
+	}
+	var got bgpRouteJSON
+	body, verr := env.Vtysh(ctx, router,
+		fmt.Sprintf("show ip bgp neighbors %s routes json", ixpPeer))
+	if verr != nil {
+		return nil, nil, fmt.Errorf("reading what %s accepted from the exchange: %w", router, verr)
+	}
+	if jerr := jsonUnmarshalLoose(body, &got); jerr != nil {
+		return nil, nil, fmt.Errorf("reading what %s accepted from the exchange: %w", router, jerr)
+	}
+	for prefix, entries := range got.Table() {
+		for _, e := range entries {
+			crosses := false
+			for _, f := range strings.Fields(e.Path) {
+				if n, cerr := strconv.Atoi(f); cerr == nil && inRegion[n] {
+					crosses = true
+					break
+				}
+			}
+			if crosses {
+				in = append(in, fmt.Sprintf("%s (path %q)", prefix, strings.TrimSpace(e.Path)))
+			} else {
+				out = append(out, prefix)
+			}
+		}
+	}
+	sort.Strings(in)
+	sort.Strings(out)
+	return uniq(in), uniq(out), nil
+}
+
 func inRegionRoutesViaIXP(ctx context.Context, env *Env, router, ixpPeer string) ([]string, error) {
 	me, ok := env.Topology.ASes[env.AS]
 	if !ok || me.Region == "" {
