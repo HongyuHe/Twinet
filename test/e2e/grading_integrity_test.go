@@ -656,6 +656,27 @@ func unrelated(id, broken string) bool {
 // it was asked to preserve.
 func notFoundPrefix(t *testing.T, dir string, as int) string {
 	t.Helper()
+	// Waited for, not demanded immediately.
+	//
+	// The case before this one restores the system, and BGP takes a minute to
+	// bring its sessions back and re-learn what the neighbours know. Reading
+	// the table the instant the previous case finished found it empty and
+	// stopped the run -- a test failing because it asked too early, which is
+	// the sort of flake that gets a real failure ignored later.
+	deadline := time.Now().Add(3 * time.Minute)
+	for {
+		if p := findNotFoundPrefix(t, dir, as); p != "" {
+			return p
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("AS %d carries no unsigned origin, so there is nothing to preserve", as)
+		}
+		time.Sleep(10 * time.Second)
+	}
+}
+
+func findNotFoundPrefix(t *testing.T, dir string, as int) string {
+	t.Helper()
 	for _, router := range routersOf(t, dir, as) {
 		out, err := twinet(t, "exec", "-m", dir, router, "--", "vtysh",
 			"-c", "show bgp ipv4 unicast rpki notfound")
@@ -676,7 +697,6 @@ func notFoundPrefix(t *testing.T, dir string, as int) string {
 			return f[1]
 		}
 	}
-	t.Fatalf("AS %d carries no unsigned origin, so there is nothing to preserve", as)
 	return ""
 }
 
