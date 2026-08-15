@@ -426,6 +426,12 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 			// awarded in full.
 			name:     "one prefix routed over the slow link",
 			question: "q2.5",
+			// Raising a provider's route above a peer's to make traffic take
+			// the slow link is also a business-relationship error, and since
+			// routes are attributed by the session they arrived on rather
+			// than by a rewritable next hop, the relationship question sees
+			// it. That is the grader being right twice, not collateral.
+			alsoAffects: []string{"q2.3"},
 			apply: func(t *testing.T) {
 				router, nbr, prefix := slowProviderRoute(t, dir, 3)
 				rm := importRouteMap(t, dir, router, nbr)
