@@ -215,6 +215,14 @@ reached students, and each motivated a permanent test.
     tables still decide which paths exist; a probe now decides whether they
     work.
 
+21. **A subnet redistributed into OSPF passed for one advertised into it.**
+    "Protocol is ospf" is true of a route redistributed from a static
+    blackhole: removing a service subnet's advertisement and redistributing a
+    Null0 route for it elsewhere put the prefix in every table, marked ospf,
+    reaching nowhere, while the check reported all thirty-two subnets carried.
+    OSPF classifies its own routes -- "N" intra-area against "N E1"/"N E2"
+    external -- and that classification is what is read now.
+
 ## Environment findings
 
 - **Jumbo frames are unavailable.** Raising `eno2` to MTU 9000 dropped the
