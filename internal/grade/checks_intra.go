@@ -738,7 +738,7 @@ func checkVLANIsolation(ctx context.Context, env *Env) Result {
 					defer wg.Done()
 					sem <- struct{}{}
 					defer func() { <-sem }()
-					hops, err := traceHopsRetrying(ctx, env, src, dst)
+					hops, err := adjacentHopsRetrying(ctx, env, src, dst)
 					switch {
 					case err != nil:
 						record(false, "VLAN %d: %s cannot reach %s (%v)", v, src.Name, dst.Name, err)
@@ -1262,6 +1262,42 @@ func traceHopsRetrying(ctx context.Context, env *Env, src, dst *model.Device) (i
 		}
 		hops, err = traceHops(ctx, env, src, dst)
 		if err == nil && hops > 0 {
+			return hops, nil
+		}
+	}
+	return hops, err
+}
+
+// adjacentHopsRetrying measures the distance to a neighbour in the same VLAN,
+// priming the neighbour cache first.
+//
+// A host whose neighbour entry for its VLAN peer has gone stale sends the first
+// packet to its default gateway, which forwards it: the traceroute then reads
+// two hops and the submission loses a mark for a switch that is working
+// perfectly. Measured twice on correct systems -- 9.96 of 10 once on AS 9 and
+// once on AS 6, with the two hosts nine milliseconds and one hop apart when
+// asked again. A ping resolves the neighbour and is thrown away; only then is
+// the distance measured, and a result that is still not one is retried.
+func adjacentHopsRetrying(ctx context.Context, env *Env, src, dst *model.Device) (int, error) {
+	addr := deviceAddr4(ctx, env, dst)
+	if addr == "" {
+		return 0, fmt.Errorf("%s has no address configured", dst.Name)
+	}
+	var hops int
+	var err error
+	for i := 0; i < traceAttempts; i++ {
+		if i > 0 {
+			select {
+			case <-ctx.Done():
+				return hops, err
+			case <-time.After(time.Duration(i) * 2 * time.Second):
+			}
+		}
+		// Resolve the neighbour, and discard whatever it says: this is about
+		// the ARP entry existing, not about reachability.
+		_, _ = env.Probe(ctx, src.ID, []string{"ping", "-c", "1", "-W", "2", addr})
+		hops, err = traceHops(ctx, env, src, dst)
+		if err == nil && hops == 1 {
 			return hops, nil
 		}
 	}
