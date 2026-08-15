@@ -372,6 +372,13 @@ func TestAFailureToReadTheMPLSTableIsAnInfrastructureError(t *testing.T) {
 					return rt.ExecResult{ExitCode: 0, Stdout: "ipv4 10.100.0.2 OPERATIONAL\n"}, nil
 				}
 				return rt.ExecResult{ExitCode: 0, Stdout: "ipv4 10.100.0.1 OPERATIONAL\n"}, nil
+			case "show mpls ldp discovery":
+				if name == "R1" {
+					return rt.ExecResult{ExitCode: 0,
+						Stdout: "ipv4 10.100.0.2       Link     port_R2                15\n"}, nil
+				}
+				return rt.ExecResult{ExitCode: 0,
+					Stdout: "ipv4 10.100.0.1       Link     port_R1                15\n"}, nil
 			case "show mpls table":
 				return rt.ExecResult{}, fmt.Errorf("container %s is not running", deviceID)
 			}

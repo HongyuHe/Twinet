@@ -62,6 +62,8 @@ func TestABrokenVPNLosesTheRightMarks(t *testing.T) {
 	dir := advnetLab(t)
 	const provider = 1
 
+	var ldpPair []ldpEnd
+
 	baseline, points, report := gradeAS(t, dir, provider)
 	if len(baseline) == 0 {
 		t.Fatalf("the provider scored nothing at all, so there is no baseline to fall "+
@@ -128,6 +130,40 @@ func TestABrokenVPNLosesTheRightMarks(t *testing.T) {
 					"  rt vpn import "+other,
 					" exit-address-family",
 					"end")
+				time.Sleep(25 * time.Second)
+			},
+		},
+		{
+			// A targeted session in place of a link adjacency.
+			//
+			// LDP will bring up a session between two loopbacks routed over
+			// whatever path the IGP offers. That is a session with the right
+			// peer at the right address, so a submission could take LDP off an
+			// interior link entirely, replace it with a targeted session, and
+			// keep full marks for label distribution across a link that
+			// distributes no labels.
+			name:     "an interior link's LDP replaced by a targeted session",
+			question: "q1",
+			undo: func(t *testing.T) {
+				for _, p := range ldpPair {
+					vtysh(t, dir, p.router, "configure terminal", "mpls ldp",
+						" address-family ipv4",
+						"  no neighbor "+p.peerAddr+" targeted", "end")
+				}
+			},
+			apply: func(t *testing.T) {
+				ldpPair = ldpLinkEnds(t, dir, provider)
+				if len(ldpPair) != 2 {
+					t.Fatal("no interior LDP link with two ends was found")
+				}
+				for _, p := range ldpPair {
+					t.Logf("replacing %s's link adjacency on %s with a targeted session to %s",
+						p.router, p.iface, p.peerAddr)
+					vtysh(t, dir, p.router, "configure terminal", "mpls ldp",
+						" address-family ipv4",
+						"  no interface "+p.iface,
+						"  neighbor "+p.peerAddr+" targeted", "end")
+				}
 				time.Sleep(25 * time.Second)
 			},
 		},
@@ -219,6 +255,74 @@ func TestABrokenVPNLosesTheRightMarks(t *testing.T) {
 			}
 		})
 	}
+}
+
+// ldpEnd is one end of an interior link running LDP.
+type ldpEnd struct{ router, iface, peerAddr string }
+
+// ldpLinkEnds finds one interior link with LDP on both ends, and returns both.
+//
+// Read from the running configuration and the discovery table, so the mutation
+// follows the submission rather than a memory of the lab.
+func ldpLinkEnds(t *testing.T, dir string, as int) []ldpEnd {
+	t.Helper()
+	type disc struct{ iface, id string }
+	byRouter := map[string][]disc{}
+	for _, dev := range routersOf(t, dir, as) {
+		out, err := twinet(t, "exec", "-m", dir, dev, "--", "vtysh",
+			"-c", "show mpls ldp discovery")
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(out, "\n") {
+			f := strings.Fields(line)
+			if len(f) >= 4 && f[0] == "ipv4" && f[2] == "Link" {
+				byRouter[dev] = append(byRouter[dev], disc{f[3], f[1]})
+			}
+		}
+	}
+	routers := make([]string, 0, len(byRouter))
+	for r := range byRouter {
+		routers = append(routers, r)
+	}
+	sort.Strings(routers)
+	// A pair, so both ends of one link are moved: leaving one end on the link
+	// would keep a link adjacency and prove nothing.
+	for _, a := range routers {
+		for _, da := range byRouter[a] {
+			for _, b := range routers {
+				if b == a {
+					continue
+				}
+				for _, db := range byRouter[b] {
+					if db.id == "" || da.id == "" {
+						continue
+					}
+					// b discovered a on its link, and a discovered b on its.
+					if aOf, bOf := loopbackOf(t, dir, a), loopbackOf(t, dir, b); aOf == db.id && bOf == da.id {
+						return []ldpEnd{{a, da.iface, db.id}, {b, db.iface, da.id}}
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// loopbackOf returns a router's loopback address.
+func loopbackOf(t *testing.T, dir, device string) string {
+	t.Helper()
+	out, err := twinet(t, "exec", "-m", dir, device, "--",
+		"sh", "-c", "ip -4 -o addr show dev lo scope global | awk '{print $4}' | head -1")
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if s := strings.TrimSpace(line); strings.Count(s, ".") == 3 {
+			return strings.SplitN(s, "/", 2)[0]
+		}
+	}
+	return ""
 }
 
 // interiorPorts lists a router's links to other routers, by name.

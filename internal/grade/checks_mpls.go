@@ -160,6 +160,22 @@ func checkLDPAdjacencies(ctx context.Context, env *Env) Result {
 		if err != nil {
 			return Errored("mpls.ldp_adjacencies", err)
 		}
+		// Where the adjacency was discovered, not merely that a session
+		// exists.
+		//
+		// LDP will happily bring up a *targeted* session between two
+		// loopbacks, routed over whatever path the IGP offers. That is a
+		// session with the right peer at the right address, and the check
+		// accepted it -- so a submission could take LDP off the interior link
+		// entirely, replace it with a targeted session, and keep full marks
+		// for label distribution across a link that distributes no labels.
+		// A link adjacency is discovered by hellos on the interface itself,
+		// and says so.
+		disc, err := env.Vtysh(ctx, d.Name, "show mpls ldp discovery")
+		if err != nil {
+			return Errored("mpls.ldp_adjacencies", err)
+		}
+		links := ldpLinkAdjacencies(disc)
 		for _, p := range want {
 			if !strings.Contains(out, p.addr) {
 				problems = append(problems, fmt.Sprintf("%s has no LDP session with %s", d.Name, p.name))
@@ -168,6 +184,15 @@ func checkLDPAdjacencies(ctx context.Context, env *Env) Result {
 			if !operationalWith(out, p.addr) {
 				problems = append(problems, fmt.Sprintf("%s's LDP session with %s is not operational",
 					d.Name, p.name))
+			}
+			if id, ok := links[p.iface]; !ok {
+				problems = append(problems, fmt.Sprintf(
+					"%s has no link LDP adjacency on %s, the interface facing %s: a targeted "+
+						"session is not label distribution across that link",
+					d.Name, p.iface, p.name))
+			} else if id != p.addr {
+				problems = append(problems, fmt.Sprintf(
+					"%s's link adjacency on %s is with %s, not %s", d.Name, p.iface, id, p.name))
 			}
 		}
 		// Labels must reach the kernel, not merely be negotiated. A table that
@@ -561,7 +586,7 @@ func coreRouters(as *model.AS) []*model.Device {
 
 func isCore(as *model.AS, name string) bool { return as.InCore(name) }
 
-type ldpPeer struct{ name, addr string }
+type ldpPeer struct{ name, addr, iface string }
 
 // interiorPeers lists the routers this one shares an interior link with, by the
 // address LDP identifies them with.
@@ -576,11 +601,33 @@ func interiorPeers(as *model.AS, d *model.Device) []ldpPeer {
 			continue
 		}
 		if lo, ok := p.IfaceByName("lo"); ok && lo.Addr4 != "" {
-			out = append(out, ldpPeer{name: p.Name, addr: addrOnly(lo.Addr4)})
+			out = append(out, ldpPeer{name: p.Name, addr: addrOnly(lo.Addr4), iface: i.Name})
 		}
 	}
 	sort.Slice(out, func(a, b int) bool { return out[a].name < out[b].name })
 	return out
+}
+
+// ldpLinkAdjacencies maps each interface with a *link* LDP adjacency to the
+// peer discovered on it.
+//
+// `show mpls ldp discovery` names the kind in its Type column: "Link" for
+// hellos heard on an interface, "Targeted" for a session set up to an address
+// over whatever path the IGP has. Only the first is an adjacency on that link.
+func ldpLinkAdjacencies(out string) map[string]string {
+	res := map[string]string{}
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		// "ipv4 1.152.0.1 Link port_R2 15"
+		if len(f) < 4 || f[0] == "AF" {
+			continue
+		}
+		if !strings.EqualFold(f[2], "Link") {
+			continue
+		}
+		res[f[3]] = f[1]
+	}
+	return res
 }
 
 // operationalWith reports whether the line mentioning an address says the
