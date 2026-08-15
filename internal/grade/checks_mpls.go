@@ -371,6 +371,43 @@ func checkVPNIsolation(ctx context.Context, env *Env) Result {
 	})
 }
 
+// anyCustomerTrafficArrives reports whether at least one customer's site can
+// reach another of its own sites.
+//
+// It is deliberately a low bar: this is not the reachability question, which is
+// marked separately and in full. It is the precondition for asking *how*
+// traffic is carried, and a VPN across which nothing at all passes cannot
+// answer it.
+func anyCustomerTrafficArrives(ctx context.Context, env *Env) (bool, error) {
+	groups, err := customerGroups(env)
+	if err != nil {
+		return false, err
+	}
+	tried := 0
+	for _, sites := range groups {
+		for i := 0; i < len(sites); i++ {
+			for j := 0; j < len(sites); j++ {
+				if i == j {
+					continue
+				}
+				tried++
+				ok, err := env.reaches(ctx, sites[i].host, sites[j].addr)
+				if err != nil {
+					return false, err
+				}
+				if ok {
+					return true, nil
+				}
+			}
+		}
+	}
+	if tried == 0 {
+		return false, fmt.Errorf("no customer in this lab has two sites, so there is no " +
+			"traffic between them to carry")
+	}
+	return false, nil
+}
+
 // crossCustomerRoutes reports every place one customer's routing table holds a
 // route to another customer's addresses.
 //
@@ -769,6 +806,27 @@ func checkVPNLabelSwitched(ctx context.Context, env *Env) Result {
 			}
 		}
 	}
+	// And the labels have to be carrying something.
+	//
+	// Everything above reads the forwarding table, which is the only place
+	// that can distinguish a two-label VPN path from a static route or a leak
+	// into the global table -- and it says nothing about whether a packet gets
+	// through. Dropping EtherType 0x8847 on the interior links leaves every
+	// label stack installed and every labelled packet discarded, and this
+	// awarded full marks for a mechanism that carried nothing. The question is
+	// how the customer's traffic is carried; if none of it is, there is
+	// nothing to answer it about.
+	carried, err := anyCustomerTrafficArrives(ctx, env)
+	if err != nil {
+		return Errored("vpn.label_switched", err)
+	}
+	if !carried {
+		return Errored("vpn.label_switched", fmt.Errorf(
+			"no customer's traffic reaches its other site at all, so how it would have been "+
+				"carried cannot be assessed; the label stacks are installed and nothing "+
+				"crosses them"))
+	}
+
 	sort.Strings(problems)
 	if len(problems) == 0 {
 		return Pass("vpn.label_switched", Evidence{

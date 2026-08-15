@@ -78,6 +78,9 @@ func TestABrokenVPNLosesTheRightMarks(t *testing.T) {
 		name     string
 		question string
 		apply    func(t *testing.T)
+		// undo puts back what re-solving the provider cannot: a queueing
+		// discipline is not part of the routing configuration.
+		undo func(t *testing.T)
 	}{
 		{
 			// One character of a route target.
@@ -128,6 +131,40 @@ func TestABrokenVPNLosesTheRightMarks(t *testing.T) {
 			},
 		},
 		{
+			// Label stacks that carry nothing.
+			//
+			// How the customer is carried is read from the forwarding table,
+			// which is the only place that can tell a two-label VPN path from
+			// a static route or a leak into the global table -- and it says
+			// nothing about whether a packet gets through. Dropping labelled
+			// frames on the interior links leaves every stack installed and
+			// every packet discarded, and that used to keep full marks for a
+			// mechanism carrying nothing.
+			name:     "the labelled path dropping every packet",
+			question: "q2",
+			undo: func(t *testing.T) {
+				for _, dev := range routersOf(t, dir, provider) {
+					_, _ = twinet(t, "exec", "-m", dir, dev, "--", "sh", "-c",
+						`for i in $(ip -o link | awk -F": " "{print $2}" | cut -d@ -f1 | `+
+							`grep "^port_"); do tc qdisc del dev $i clsact 2>/dev/null; done; `+
+							`echo -n ""`)
+				}
+			},
+			apply: func(t *testing.T) {
+				for _, dev := range routersOf(t, dir, provider) {
+					if _, err := twinet(t, "exec", "-m", dir, dev, "--", "sh", "-c",
+						`for i in $(ip -o link | awk -F": " "{print $2}" | cut -d@ -f1 | `+
+							`grep "^port_"); do tc qdisc add dev $i clsact 2>/dev/null; `+
+							`tc filter add dev $i ingress protocol mpls_uc flower action drop `+
+							`2>/dev/null; done; echo -n ""`); err != nil {
+						t.Fatalf("dropping labelled frames on %s: %v", dev, err)
+					}
+				}
+				t.Logf("dropped every labelled frame on the interior links of AS %d", provider)
+				time.Sleep(10 * time.Second)
+			},
+		},
+		{
 			// A core router that speaks BGP is the thing the exercise forbids.
 			//
 			// The whole point of carrying customer routes in labels is that the
@@ -157,6 +194,9 @@ func TestABrokenVPNLosesTheRightMarks(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			defer solveProvider(t, dir, provider)
+			if c.undo != nil {
+				defer c.undo(t)
+			}
 			c.apply(t)
 
 			after, _, report := gradeASBroken(t, dir, provider)
