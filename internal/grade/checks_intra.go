@@ -19,9 +19,10 @@ import (
 
 func init() {
 	Register(&Check{
-		Name:     "l3.addressing_matches_plan",
-		Describe: "every router interface carries the address the assignment prescribes",
-		Run:      checkAddressing,
+		Name: "l3.addressing_matches_plan",
+		Describe: "every router interface carries the address the assignment prescribes; " +
+			"anything extra is reported and not marked",
+		Run: checkAddressing,
 	})
 	Register(&Check{
 		Name:     "ospf.full_adjacency",
@@ -63,12 +64,42 @@ func checkAddressing(ctx context.Context, env *Env) Result {
 	var missing []string
 	checked := 0
 
+	// Addresses the plan does not mention are reported, not marked.
+	//
+	// The question is whether the prescribed address is there, and it is
+	// deliberately not whether anything else is: a student who adds a second
+	// address while testing has not got the addressing wrong, and failing them
+	// for it would be worse than the check that reads configuration instead of
+	// state. But an unexplained address on a router is worth a marker's
+	// attention -- it is how a submission would stand in for a neighbour it is
+	// meant to be peering with -- so it is put in front of them.
+	var extra []string
+
 	for _, r := range env.Routers() {
-		out, err := env.Probe(ctx, r.ID, []string{"ip", "-o", "-4", "addr", "show"})
+		out, err := env.Probe(ctx, r.ID, []string{"ip", "-o", "-4", "addr", "show", "scope", "global"})
 		if err != nil {
 			return Errored("l3.addressing_matches_plan", err)
 		}
 		have := parseIPAddrOutput(out.Stdout)
+		planned := map[string]bool{}
+		for _, i := range r.Ifaces {
+			if i.Addr4 != "" {
+				planned[i.Name+" "+i.Addr4] = true
+			}
+		}
+		for iface, addrs := range have {
+			for _, a := range addrs {
+				if planned[iface+" "+a] {
+					continue
+				}
+				if i, ok := r.IfaceByName(iface); ok && !i.Prescribed && i.Subnet != "" &&
+					anyInSubnet([]string{a}, i.Subnet) {
+					continue // the student's own choice inside the mandated prefix
+				}
+				extra = append(extra, fmt.Sprintf("%s:%s carries %s, which the plan does "+
+					"not mention", r.Name, iface, a))
+			}
+		}
 
 		for _, i := range r.Ifaces {
 			// Inter-AS addressing is agreed with a neighbour, not prescribed.
@@ -104,9 +135,14 @@ func checkAddressing(ctx context.Context, env *Env) Result {
 		}
 	}
 
+	sort.Strings(extra)
 	if len(bad) == 0 && len(missing) == 0 {
-		return Pass("l3.addressing_matches_plan", Evidence{
-			Detail: fmt.Sprintf("all %d required addresses are configured", checked)})
+		detail := fmt.Sprintf("all %d required addresses are configured", checked)
+		if len(extra) > 0 {
+			detail += fmt.Sprintf("\n%d address(es) the plan does not mention, which are not "+
+				"marked either way:\n%s", len(extra), strings.Join(truncate(extra, 6), "\n"))
+		}
+		return Pass("l3.addressing_matches_plan", Evidence{Detail: detail})
 	}
 	var detail strings.Builder
 	sort.Strings(missing)
