@@ -93,6 +93,28 @@ func TestABrokenMulticastTreeLosesTheRightMarks(t *testing.T) {
 			},
 		},
 		{
+			// PIM off the loopbacks.
+			//
+			// The check reported "PIM is up on every interface of all 6
+			// routers" while the set it examined excluded the loopback from
+			// itself. The loopback is not a formality: the rendezvous point is
+			// addressed by it so that it outlives any one link, and a
+			// rendezvous point whose own address does not run PIM cannot
+			// register a source.
+			name:     "PIM removed from every loopback",
+			question: "q1",
+			apply: func(t *testing.T) {
+				for _, dev := range routersOf(t, dir, as) {
+					vtysh(t, dir, dev, "configure terminal",
+						"interface lo",
+						" no ip pim",
+						"end")
+				}
+				t.Logf("removed PIM from the loopback of every router in AS %d", as)
+				time.Sleep(15 * time.Second)
+			},
+		},
+		{
 			// IGMP off the interface a receiver is behind.
 			//
 			// The router never learns that anybody downstream wants the group,

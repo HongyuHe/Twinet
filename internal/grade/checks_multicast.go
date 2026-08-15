@@ -103,9 +103,16 @@ func igmpInterfaces(ctx context.Context, env *Env, router string) (map[string]bo
 }
 
 // wantsPIM reports the interfaces of a router the exercise asks for.
+//
+// The loopback is included. It used to be skipped, and the check went on
+// reporting "PIM is up on every interface of all 6 routers" while PIM had been
+// removed from every one of them -- a claim about a set the check had excluded
+// from itself. It is not a formality either: the rendezvous point is addressed
+// by its loopback precisely so that it survives a link going down, and a
+// loopback without PIM is a rendezvous point that cannot register a source.
 func wantsPIM(d *model.Device) (all, hostFacing []string) {
 	for _, i := range d.Ifaces {
-		if i.Name == "" || i.Name == "lo" {
+		if i.Name == "" {
 			continue
 		}
 		all = append(all, i.Name)
@@ -144,6 +151,11 @@ func checkPIMEnabled(ctx context.Context, env *Env) Result {
 			switch {
 			case !present:
 				missingPIM = append(missingPIM, r.Name+"/"+name)
+			case name == "lo":
+				// A loopback has no neighbour and is not meant to: it is
+				// there so the rendezvous point has an address that outlives
+				// any one link. Running PIM on it is the requirement; having
+				// somebody on the other end is not.
 			case !hostFacing[name] && n == 0:
 				// A link between two routers with PIM on both ends has a
 				// neighbour. None means one end is passive, or is not
