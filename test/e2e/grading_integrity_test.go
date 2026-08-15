@@ -169,6 +169,7 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 	var roaWithdrawn struct{ router, anchor, prefix string }
 	var nativeV6 []nativeV6End
 	var hidden struct{ router, peer, origMap string }
+	var greEnds []string
 
 	cases := []struct {
 		name string
@@ -497,6 +498,48 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 					"end")
 				vtysh(t, dir, router, "clear bgp ipv4 unicast "+prov+" out")
 				time.Sleep(8 * time.Second)
+			},
+		},
+		{
+			// An adjacency somewhere else instead of the one that was asked
+			// for.
+			//
+			// The question counted neighbours in state Full and compared the
+			// total with twice the number of interior links. A count does not
+			// say which links: making one link's interfaces passive and
+			// building a tunnel between the same two routers to carry an
+			// adjacency instead kept the total exactly right, and every
+			// interior link was reported adjacent while one of them was not.
+			name:     "an interior adjacency moved onto a tunnel",
+			question: "q1.2",
+			undo: func(t *testing.T) {
+				for _, r := range greEnds {
+					_, _ = twinet(t, "exec", "-m", dir, r, "--", "sh", "-c",
+						"ip link set gre1 down 2>/dev/null; ip tunnel del gre1 2>/dev/null; echo ok")
+				}
+			},
+			apply: func(t *testing.T) {
+				a, b, aIf, bIf := interiorLinkEnds(t, dir, 3)
+				greEnds = []string{a, b}
+				aLo, bLo := loopbackOf(t, dir, a), loopbackOf(t, dir, b)
+				t.Logf("making %s/%s and %s/%s passive and tunnelling the adjacency instead",
+					a, aIf, b, bIf)
+				vtysh(t, dir, a, "configure terminal", "router ospf",
+					" passive-interface "+aIf, "end")
+				vtysh(t, dir, b, "configure terminal", "router ospf",
+					" passive-interface "+bIf, "end")
+				for _, e := range []struct{ dev, local, remote, addr string }{
+					{a, aLo, bLo, "10.66.0.1/30"}, {b, bLo, aLo, "10.66.0.2/30"},
+				} {
+					if _, err := twinet(t, "exec", "-m", dir, e.dev, "--", "sh", "-c",
+						"ip tunnel add gre1 mode gre local "+e.local+" remote "+e.remote+
+							" ttl 64; ip addr add "+e.addr+" dev gre1; ip link set gre1 up"); err != nil {
+						t.Fatalf("building the tunnel on %s: %v", e.dev, err)
+					}
+					vtysh(t, dir, e.dev, "configure terminal", "router ospf",
+						" network 10.66.0.0/30 area 0", "end")
+				}
+				time.Sleep(75 * time.Second)
 			},
 		},
 		{
