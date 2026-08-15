@@ -171,6 +171,12 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 		name string
 		// question that must lose marks.
 		question string
+		// alsoAffects names the other questions this mutation is allowed to
+		// cost marks on, for a break that is genuinely about several of them
+		// at once. Denying every route that arrives from outside is not "work
+		// done correctly" for the questions about which routes you accept and
+		// re-export; it is the same mistake seen from three sides.
+		alsoAffects []string
 		// break it.
 		apply func(t *testing.T)
 		// put back anything solveAS cannot.
@@ -494,8 +500,9 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 			// prefix, and the origin-validation question awarded full marks
 			// for refusing something it had never been in a position to
 			// accept.
-			name:     "every external route denied on the way in",
-			question: "q2.6",
+			name:        "every external route denied on the way in",
+			question:    "q2.6",
+			alsoAffects: []string{"q2.3", "q2.4", "q2.5"},
 			undo: func(t *testing.T) {
 				for _, dev := range routersOf(t, dir, 3) {
 					cmds := []string{"configure terminal"}
@@ -788,7 +795,13 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 				if id == c.question {
 					continue
 				}
-				if unrelated(id, c.question) && after[id] < baseline[id] {
+				allowed := false
+				for _, a := range c.alsoAffects {
+					if a == id {
+						allowed = true
+					}
+				}
+				if !allowed && unrelated(id, c.question) && after[id] < baseline[id] {
 					t.Errorf("%s fell from %.2f to %.2f of %.2f because of %q, which is "+
 						"about %s; a student would lose a mark for work they did correctly",
 						id, baseline[id], after[id], p, c.name, c.question)
