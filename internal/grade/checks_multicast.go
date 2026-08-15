@@ -3,6 +3,7 @@ package grade
 import (
 	"context"
 	"fmt"
+	"net/netip"
 	"sort"
 	"strings"
 	"time"
@@ -238,6 +239,15 @@ func checkRendezvousPoint(ctx context.Context, env *Env) Result {
 			fmt.Errorf("the lab declares %q as the rendezvous point but it has no loopback",
 				as.Multicast.RP))
 	}
+	// The group the rest of the exercise sends to: whatever mapping covers it
+	// is the one that decides where the tree is rooted.
+	testAddr, terr := netip.ParseAddr(as.Multicast.TestGroup)
+	if terr != nil {
+		return Errored("multicast.rendezvous_point", fmt.Errorf(
+			"the lab declares %q as its test group, which is not an address: %w",
+			as.Multicast.TestGroup, terr))
+	}
+
 	var wrong, unreadable []string
 	agreed := 0
 	for _, r := range env.Routers() {
@@ -246,27 +256,40 @@ func checkRendezvousPoint(ctx context.Context, env *Env) Result {
 			unreadable = append(unreadable, fmt.Sprintf("%s: %v", r.Name, err))
 			continue
 		}
-		found := ""
+		// The mapping that would actually be used for the group under test.
+		//
+		// This compared the group range exactly, so any other mapping was
+		// ignored -- and PIM does not ignore them: it takes the most specific
+		// prefix covering the group. Adding `ip pim rp <someone else>
+		// 237.0.0.10/32` alongside the declared /24 pointed the tested group
+		// at a different router on every one of the six, and the check went on
+		// reporting that they all agreed. The rule PIM uses is the rule read
+		// here.
+		found, foundBits := "", -1
 		for _, line := range strings.Split(out, "\n") {
 			f := strings.Fields(line)
 			if len(f) < 2 || !strings.Contains(f[1], "/") {
 				continue
 			}
-			// The group range must be the declared one; a rendezvous point for
-			// some other range is not an answer to this question.
-			if f[1] != as.Multicast.Groups {
+			pfx, err := netip.ParsePrefix(f[1])
+			if err != nil {
 				continue
 			}
-			found = f[0]
+			if !pfx.Contains(testAddr) || pfx.Bits() <= foundBits {
+				continue
+			}
+			found, foundBits = f[0], pfx.Bits()
 		}
 		switch found {
 		case want:
 			agreed++
 		case "":
-			wrong = append(wrong, fmt.Sprintf("%s has no rendezvous point for %s",
-				r.Name, as.Multicast.Groups))
+			wrong = append(wrong, fmt.Sprintf("%s has no rendezvous point covering %s",
+				r.Name, as.Multicast.TestGroup))
 		default:
-			wrong = append(wrong, fmt.Sprintf("%s points at %s, not %s", r.Name, found, want))
+			wrong = append(wrong, fmt.Sprintf("%s sends %s to %s, not %s (the most specific "+
+				"mapping covering it wins, whatever the declared range says)",
+				r.Name, as.Multicast.TestGroup, found, want))
 		}
 	}
 	if len(unreadable) > 0 {

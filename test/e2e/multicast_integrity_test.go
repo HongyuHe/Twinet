@@ -4,6 +4,7 @@ package e2e
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -53,6 +54,9 @@ func TestABrokenMulticastTreeLosesTheRightMarks(t *testing.T) {
 		name     string
 		question string
 		apply    func(t *testing.T)
+		// undo puts back what re-solving cannot: a mapping added alongside the
+		// rendered configuration rather than in place of it.
+		undo func(t *testing.T)
 	}{
 		{
 			// Two rendezvous points for one group range.
@@ -72,6 +76,37 @@ func TestABrokenMulticastTreeLosesTheRightMarks(t *testing.T) {
 					"ip pim rp 10.255.255.1 "+group,
 					"end")
 				time.Sleep(20 * time.Second)
+			},
+		},
+		{
+			// A more specific mapping for the group actually being tested.
+			//
+			// PIM takes the longest prefix covering a group. The check
+			// compared the declared range exactly, so a second mapping for a
+			// /32 inside it was ignored -- and it is the one PIM would use.
+			// Every router agreed on the wrong rendezvous point while the
+			// question said they agreed on the right one.
+			name:     "a more specific rendezvous point for the group under test",
+			question: "q2",
+			apply: func(t *testing.T) {
+				_, rp, _ := pimRP(t, dir, as)
+				group := testGroup(t, dir, as)
+				other := "10.255.255.1"
+				if rp != other {
+					t.Logf("overriding %s for %s/32 on every router", rp, group)
+				}
+				for _, dev := range routersOf(t, dir, as) {
+					vtysh(t, dir, dev, "configure terminal",
+						"ip pim rp "+other+" "+group+"/32", "end")
+				}
+				time.Sleep(15 * time.Second)
+			},
+			undo: func(t *testing.T) {
+				group := testGroup(t, dir, as)
+				for _, dev := range routersOf(t, dir, as) {
+					vtysh(t, dir, dev, "configure terminal",
+						"no ip pim rp 10.255.255.1 "+group+"/32", "end")
+				}
 			},
 		},
 		{
@@ -137,6 +172,9 @@ func TestABrokenMulticastTreeLosesTheRightMarks(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			defer solveProvider(t, dir, as)
+			if c.undo != nil {
+				defer c.undo(t)
+			}
 			c.apply(t)
 
 			after, _, report := gradeASBroken(t, dir, as)
@@ -166,6 +204,27 @@ func pimRP(t *testing.T, dir string, as int) (router, rp, group string) {
 	}
 	t.Fatalf("no router in AS %d declares a rendezvous point", as)
 	return "", "", ""
+}
+
+// testGroup is the group address the exercise sends to, read from the lab.
+func testGroup(t *testing.T, dir string, as int) string {
+	t.Helper()
+	files, _ := filepath.Glob(filepath.Join(dir, "templates", "*.yaml"))
+	files = append([]string{filepath.Join(dir, "twinet.yaml")}, files...)
+	var body string
+	for _, f := range files {
+		if raw, err := os.ReadFile(f); err == nil {
+			body += string(raw) + "\n"
+		}
+	}
+	for _, line := range strings.Split(body, "\n") {
+		f := strings.Fields(strings.TrimSpace(line))
+		if len(f) == 2 && (f[0] == "test_group:" || f[0] == "testGroup:") {
+			return strings.Trim(f[1], `"`)
+		}
+	}
+	t.Fatal("the lab declares no multicast test group")
+	return ""
 }
 
 // pimTransitIface finds an interface running PIM that faces another router,
