@@ -223,6 +223,27 @@ reached students, and each motivated a permanent test.
     OSPF classifies its own routes -- "N" intra-area against "N E1"/"N E2"
     external -- and that classification is what is read now.
 
+22. **The label stack that carried nothing.** How a customer is carried is read
+    from the forwarding table, which is the only place that can tell a
+    two-label VPN path from a static route. Dropping labelled frames on the
+    interior links left every stack installed, every packet discarded, and the
+    mark intact. The mechanism question now has a precondition: some customer
+    traffic must arrive.
+
+23. **The internet exchange never delivered a route to anybody.** A route server
+    is transparent -- it relays a member's announcement without putting its own
+    AS in front of the path -- and FRR checks by default that the first AS of an
+    eBGP update is the peer's. Every member treated every route from the
+    exchange as a withdrawal, with no notification and an established-looking
+    session, for as long as the lab has existed. The exchange question scored
+    full marks throughout, because the half of it that can be observed is a
+    refusal and an AS that accepts nothing has certainly accepted nothing wrong.
+    Fixing it exposed a second defect hiding behind the first: the in-region
+    filter's `_X_` cannot match a path that *is* AS X, which is what a member
+    announcing its own prefix at an exchange sends. Both are fixed, and the
+    check now requires a member to accept what the exchange is relaying to it
+    from outside its region.
+
 ## Environment findings
 
 - **Jumbo frames are unavailable.** Raising `eno2` to MTU 9000 dropped the
