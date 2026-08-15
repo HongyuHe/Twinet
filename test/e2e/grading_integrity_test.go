@@ -166,6 +166,7 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 	var redistributed struct{ faker, prefix string }
 	var ixpDeny struct{ router, peer, routeMap string }
 	var importMapNames []string
+	var roaWithdrawn struct{ router, anchor, prefix string }
 
 	cases := []struct {
 		name string
@@ -488,6 +489,37 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 					"end")
 				vtysh(t, dir, router, "clear bgp ipv4 unicast "+prov+" out")
 				time.Sleep(8 * time.Second)
+			},
+		},
+		{
+			// A trust anchor of one's own.
+			//
+			// Whether a ROA was published was read out of `show rpki
+			// prefix-table` on a router of the system being marked. A student
+			// has root in their own containers: withdraw the genuine ROA, run
+			// an RTR server on a host, point the validator session at it, and
+			// the prefix table says whatever they like -- so the question
+			// about having published was answered by the publication being
+			// faked. Publication is a fact about the anchor. This mutation
+			// withdraws the real one and leaves the routers untouched: if the
+			// mark survives, the check is reading something other than the
+			// anchor.
+			name:     "the published ROA withdrawn from the trust anchor",
+			question: "q2.6",
+			undo: func(t *testing.T) {
+				if roaWithdrawn.prefix == "" {
+					return
+				}
+				publishROA(t, dir, roaWithdrawn.router, roaWithdrawn.anchor,
+					roaWithdrawn.prefix, 3, false)
+				time.Sleep(70 * time.Second)
+			},
+			apply: func(t *testing.T) {
+				router, anchor, prefix := roaPublisher(t, dir, 3)
+				roaWithdrawn = struct{ router, anchor, prefix string }{router, anchor, prefix}
+				t.Logf("withdrawing %s from the trust anchor at %s", prefix, anchor)
+				publishROA(t, dir, router, anchor, prefix, 3, true)
+				time.Sleep(70 * time.Second)
 			},
 		},
 		{
@@ -888,6 +920,46 @@ func findNotFoundPrefix(t *testing.T, dir string, as int) string {
 		}
 	}
 	return ""
+}
+
+// roaPublisher finds the router entitled to publish this AS's ROA, the address
+// of the trust anchor it publishes to, and the prefix.
+func roaPublisher(t *testing.T, dir string, as int) (router, anchor, prefix string) {
+	t.Helper()
+	for _, dev := range routersOf(t, dir, as) {
+		out, err := twinet(t, "exec", "-m", dir, dev, "--", "vtysh", "-c", "show running-config")
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(out, "\n") {
+			f := strings.Fields(strings.TrimSpace(line))
+			// "rpki cache 197.3.0.2 3323 pref 1"
+			if len(f) >= 4 && f[0] == "rpki" && f[1] == "cache" {
+				return dev, f[2], itoa(as) + ".0.0.0/8"
+			}
+		}
+	}
+	t.Fatalf("no router of AS %d is configured with a validator, so the anchor cannot be found", as)
+	return "", "", ""
+}
+
+// publishROA publishes or withdraws an authorisation at the trust anchor, from
+// the router entitled to do it.
+func publishROA(t *testing.T, dir, router, anchor, prefix string, as int, withdraw bool) {
+	t.Helper()
+	body := fmt.Sprintf(`{"prefix":"%s","max_length":8,"asn":%d,"withdraw":%v}`,
+		prefix, as, withdraw)
+	out, err := twinet(t, "exec", "-m", dir, router, "--", "sh", "-c",
+		"wget -qO- --post-data="+shellQuoteForTest(body)+
+			" --header=Content-Type:application/json http://"+anchor+":8323/roas")
+	if err != nil {
+		t.Fatalf("publishing to the anchor at %s: %v\n%s", anchor, err, out)
+	}
+}
+
+// shellQuoteForTest wraps a string so one level of shell keeps it intact.
+func shellQuoteForTest(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'"'"'`) + "'"
 }
 
 // inboundRouteMaps lists every route-map this AS applies to what arrives from
