@@ -167,6 +167,7 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 	var ixpDeny struct{ router, peer, routeMap string }
 	var importMapNames []string
 	var roaWithdrawn struct{ router, anchor, prefix string }
+	var nativeV6 []nativeV6End
 
 	cases := []struct {
 		name string
@@ -489,6 +490,57 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 					"end")
 				vtysh(t, dir, router, "clear bgp ipv4 unicast "+prov+" out")
 				time.Sleep(8 * time.Second)
+			},
+		},
+		{
+			// Native IPv6, with the tunnel's counters kept moving.
+			//
+			// The tunnel question was settled by the tunnel's packet counters
+			// rising during the test. A counter is a total, and a total can be
+			// moved by anything: routing every datacentre prefix natively and
+			// pinging a link-local address across the tunnel in a loop earned
+			// the whole mark while none of the traffic in question was
+			// encapsulated at all.
+			name:     "the datacentres routed natively while the tunnel is kept busy",
+			question: "q1.4",
+			undo: func(t *testing.T) {
+				for _, g := range nativeV6 {
+					for _, p := range g.prefixes {
+						_, _ = twinet(t, "exec", "-m", dir, g.router, "--", "ip", "-6",
+							"route", "del", p, "via", g.via, "dev", g.iface, "metric", "100")
+					}
+					_, _ = twinet(t, "exec", "-m", dir, g.router, "--", "ip", "-6",
+						"addr", "del", g.addr, "dev", g.iface)
+				}
+				time.Sleep(45 * time.Second)
+			},
+			apply: func(t *testing.T) {
+				nativeV6 = nativeV6Path(t, dir, 3)
+				if len(nativeV6) != 2 {
+					t.Fatal("could not build a native IPv6 path between the two datacentres")
+				}
+				for _, g := range nativeV6 {
+					if out, err := twinet(t, "exec", "-m", dir, g.router, "--", "ip", "-6",
+						"addr", "add", g.addr, "dev", g.iface); err != nil {
+						t.Fatalf("addressing %s on %s: %v\n%s", g.iface, g.router, err, out)
+					}
+				}
+				for _, g := range nativeV6 {
+					for _, p := range g.prefixes {
+						if out, err := twinet(t, "exec", "-m", dir, g.router, "--", "ip", "-6",
+							"route", "replace", p, "via", g.via, "dev", g.iface,
+							"metric", "100"); err != nil {
+							t.Fatalf("routing %s natively on %s: %v\n%s", p, g.router, err, out)
+						}
+					}
+					// And keep the tunnel busy, so its counters climb
+					// throughout the measurement.
+					_, _ = twinet(t, "exec", "-m", dir, g.router, "--", "sh", "-c",
+						"setsid timeout 600 ping6 -q -i 0.2 -I "+g.tunnel+
+							" ff02::1 >/dev/null 2>&1 & echo started")
+				}
+				t.Logf("routed the datacentre prefixes natively and set both tunnels pinging")
+				time.Sleep(10 * time.Second)
 			},
 		},
 		{
@@ -920,6 +972,51 @@ func findNotFoundPrefix(t *testing.T, dir string, as int) string {
 		}
 	}
 	return ""
+}
+
+// nativeV6End is one end of a native IPv6 path built to bypass the tunnel.
+type nativeV6End struct {
+	router, iface, addr, via, tunnel string
+	prefixes                         []string
+}
+
+// nativeV6Path finds the two tunnel gateways, the link between them, and the
+// datacentre prefixes each currently reaches through the tunnel.
+func nativeV6Path(t *testing.T, dir string, as int) []nativeV6End {
+	t.Helper()
+	type gw struct {
+		router, tunnel string
+		prefixes       []string
+	}
+	var gws []gw
+	for _, dev := range routersOf(t, dir, as) {
+		out, err := twinet(t, "exec", "-m", dir, dev, "--", "ip", "-6", "route", "show")
+		if err != nil {
+			continue
+		}
+		g := gw{router: dev}
+		for _, line := range strings.Split(out, "\n") {
+			f := strings.Fields(line)
+			if len(f) >= 3 && f[1] == "dev" && strings.HasPrefix(f[2], "tun") {
+				g.tunnel = f[2]
+				g.prefixes = append(g.prefixes, f[0])
+			}
+		}
+		if g.tunnel != "" && len(g.prefixes) > 0 {
+			gws = append(gws, g)
+		}
+	}
+	if len(gws) != 2 {
+		return nil
+	}
+	// A link between them, named after each other.
+	a, b := gws[0], gws[1]
+	aName := a.router[strings.LastIndexByte(a.router, '/')+1:]
+	bName := b.router[strings.LastIndexByte(b.router, '/')+1:]
+	return []nativeV6End{
+		{a.router, "port_" + bName, "2001:db8:ff::1/64", "2001:db8:ff::2", a.tunnel, a.prefixes},
+		{b.router, "port_" + aName, "2001:db8:ff::2/64", "2001:db8:ff::1", b.tunnel, b.prefixes},
+	}
 }
 
 // roaPublisher finds the router entitled to publish this AS's ROA, the address

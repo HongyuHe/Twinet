@@ -214,8 +214,28 @@ func checkSixIn4(ctx context.Context, env *Env) Result {
 				}
 				break
 			}
-			if reachable && tunnels[domains[0]] != "" && after > before {
+			// The counters say something crossed the tunnel; the routing
+			// table says whether *this* traffic did.
+			//
+			// A counter is a total, and a total can be moved by anything: a
+			// submission that routed every datacentre prefix natively and then
+			// pinged a link-local address across the tunnel in a loop made the
+			// counters climb throughout the test and earned the whole mark
+			// while none of the traffic in question was encapsulated at all.
+			// What the gateway would do with a packet for that host is not a
+			// total, and it is the thing the question asks about.
+			nativeFwd := ""
+			if reachable && tunnels[domains[0]] != "" {
+				if via, ok := forwardsVia(ctx, env, gw.ID, addr, tunnels[domains[0]]); !ok {
+					nativeFwd = fmt.Sprintf("%s forwards traffic for %s over %s, not through "+
+						"%s: the tunnel's counters moved, but not for this traffic",
+						gw.Name, addr, via, tunnels[domains[0]])
+				}
+			}
+			if reachable && tunnels[domains[0]] != "" && after > before && nativeFwd == "" {
 				throughTunnel = true
+			} else if nativeFwd != "" {
+				reach = nativeFwd
 			} else if reachable && tunnels[domains[0]] != "" {
 				reach = fmt.Sprintf("IPv6 reaches %s, but %s carried no packets during the test, "+
 					"so the traffic is being routed natively rather than encapsulated",
@@ -245,7 +265,13 @@ func checkSixIn4(ctx context.Context, env *Env) Result {
 						res, err := env.Probe(ctx, bs.ID,
 							[]string{"ping6", "-c", "3", "-W", "5", "-i", "0.3", addr})
 						after := tunnelTx(ctx, env, back.ID, tunnels[domains[1]])
+						via, encapsulated := forwardsVia(ctx, env, back.ID, addr, tunnels[domains[1]])
 						switch {
+						case !encapsulated:
+							throughTunnel = false
+							reach = fmt.Sprintf("%s forwards traffic for %s over %s, not "+
+								"through %s, so the return path is not encapsulated",
+								back.Name, addr, via, tunnels[domains[1]])
 						case err != nil || res.ExitCode != 0:
 							throughTunnel = false
 							reach = fmt.Sprintf("%s cannot reach %s at %s over IPv6, so the "+
@@ -1971,6 +1997,26 @@ var selectedRouteRE = regexp.MustCompile(`^[A-Za-z]*\*?>`)
 
 func selectedRoute(line string) bool {
 	return selectedRouteRE.MatchString(strings.TrimSpace(line))
+}
+
+// forwardsVia reports whether a device would send a packet for an address out
+// of the interface it is supposed to, and names the interface it would use.
+//
+// This is what the tunnel question is about. A counter says traffic crossed the
+// tunnel; it does not say *which* traffic, and a total can be moved by anything
+// the submission cares to send.
+func forwardsVia(ctx context.Context, env *Env, deviceID, addr, want string) (string, bool) {
+	res, err := env.Probe(ctx, deviceID, []string{"ip", "-6", "route", "get", addr})
+	if err != nil || res.ExitCode != 0 {
+		return "", false
+	}
+	f := strings.Fields(res.Stdout)
+	for i := 0; i+1 < len(f); i++ {
+		if f[i] == "dev" {
+			return f[i+1], f[i+1] == want
+		}
+	}
+	return "", false
 }
 
 // crossDatacentreGaps names the host pairs that cannot reach each other across
