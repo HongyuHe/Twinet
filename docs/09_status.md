@@ -198,6 +198,14 @@ reached students, and each motivated a permanent test.
     and vanished into them. Every router must now hold every destination the AS
     has learned.
 
+19. **The loopback was excluded from the check that said it covered every
+    interface.** "PIM is up on every interface of all 6 routers" was reported
+    by a check whose interface set skipped `lo`. The rendezvous point is
+    addressed by its loopback so that it outlives any one link, and one without
+    PIM cannot register a source: removing it from all six broke delivery while
+    this question kept full marks. The loopback is required now, and exempt
+    only from the rule about having a PIM neighbour, which a loopback cannot.
+
 ## Environment findings
 
 - **Jumbo frames are unavailable.** Raising `eno2` to MTU 9000 dropped the
