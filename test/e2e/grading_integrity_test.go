@@ -1022,6 +1022,33 @@ func findNotFoundPrefix(t *testing.T, dir string, as int) string {
 	return ""
 }
 
+// interiorLinkEnds finds one link between two routers of this AS, and the
+// interface each of them faces the other on.
+func interiorLinkEnds(t *testing.T, dir string, as int) (a, b, aIf, bIf string) {
+	t.Helper()
+	routers := routersOf(t, dir, as)
+	short := func(id string) string { return id[strings.LastIndexByte(id, '/')+1:] }
+	for _, dev := range routers {
+		out, err := twinet(t, "exec", "-m", dir, dev, "--", "ls", "/sys/class/net")
+		if err != nil {
+			continue
+		}
+		for _, f := range strings.Fields(out) {
+			if !strings.HasPrefix(f, "port_") {
+				continue
+			}
+			peer := strings.TrimPrefix(f, "port_")
+			for _, other := range routers {
+				if short(other) == peer {
+					return dev, other, f, "port_" + short(dev)
+				}
+			}
+		}
+	}
+	t.Fatalf("AS %d has no link between two of its routers", as)
+	return "", "", "", ""
+}
+
 // customerImport finds a customer session and the route-map applied to it, by
 // taking the neighbour whose routes this AS ranks highest.
 func customerImport(t *testing.T, dir string, as int) (router, peer, routeMap string) {

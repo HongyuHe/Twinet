@@ -195,49 +195,105 @@ type ospfNeighborJSON struct {
 }
 
 func checkOSPFAdjacency(ctx context.Context, env *Env) Result {
-	total, full := 0, 0
-	var stuck []string
+	// Which adjacency, not how many.
+	//
+	// This counted neighbours in state Full and compared the total with twice
+	// the number of interior links. A count does not say *which* links: making
+	// the interfaces of one link passive and building a tunnel between the same
+	// two routers to carry an adjacency instead kept the total exactly right,
+	// and the question -- which is about the interior links being adjacent --
+	// reported all twenty-four of them Full. The topology says which interface
+	// faces which router, and that is what is required to be adjacent.
+	type want struct{ router, iface, peer string }
+	var wanted []want
+	for _, r := range env.Routers() {
+		for _, i := range r.Ifaces {
+			if i.Link == nil || i.Link.InterAS || i.Peer == nil || i.Peer.Device == nil {
+				continue
+			}
+			if !i.Peer.Device.IsRouter() || i.Peer.Device.ASN != env.AS {
+				continue
+			}
+			wanted = append(wanted, want{r.Name, i.Name, i.Peer.Device.Name})
+		}
+	}
+	if len(wanted) == 0 {
+		return Errored("ospf.full_adjacency",
+			fmt.Errorf("AS %d has no interior link between routers", env.AS))
+	}
+
+	// What each router has, by interface.
+	full := map[string]map[string]bool{}    // router -> iface -> a Full neighbour
+	state := map[string]map[string]string{} // router -> iface -> worst state seen
+	var extra []string
 	for _, r := range env.Routers() {
 		var out ospfNeighborJSON
 		if err := env.VtyshJSON(ctx, r.Name, "show ip ospf neighbor json", &out); err != nil {
 			// A router with OSPF entirely unconfigured is a legitimate student
-			// failure, not a grader failure, so it counts as zero adjacencies.
+			// failure, not a grader failure, so it counts as no adjacencies.
 			continue
+		}
+		full[r.Name] = map[string]bool{}
+		state[r.Name] = map[string]string{}
+		planned := map[string]bool{}
+		for _, w := range wanted {
+			if w.router == r.Name {
+				planned[w.iface] = true
+			}
 		}
 		for id, ns := range out.Neighbors {
 			for _, n := range ns {
-				total++
+				iface := n.IfaceName
+				if i := strings.IndexByte(iface, ':'); i >= 0 {
+					iface = iface[:i]
+				}
 				if strings.HasPrefix(n.NbrState, "Full") {
-					full++
-				} else {
-					stuck = append(stuck, fmt.Sprintf("%s -> %s on %s is %s",
-						r.Name, id, n.IfaceName, n.NbrState))
+					full[r.Name][iface] = true
+				} else if state[r.Name][iface] == "" {
+					state[r.Name][iface] = n.NbrState
+				}
+				if !planned[iface] {
+					extra = append(extra, fmt.Sprintf("%s is adjacent to %s over %s, which is "+
+						"not an interior link of this AS", r.Name, id, iface))
 				}
 			}
 		}
 	}
 
-	// The expected number of adjacencies is twice the number of intra-AS links,
-	// which the model knows exactly.
-	want := 0
-	for _, l := range env.Topology.Links {
-		if l.InterAS || l.A.Device.ASN != env.AS {
-			continue
-		}
-		if l.A.Device.IsRouter() && l.B.Device.IsRouter() {
-			want += 2
+	var stuck []string
+	got := 0
+	for _, w := range wanted {
+		switch {
+		case full[w.router][w.iface]:
+			got++
+		case state[w.router][w.iface] != "":
+			stuck = append(stuck, fmt.Sprintf("%s -> %s on %s is %s",
+				w.router, w.peer, w.iface, state[w.router][w.iface]))
+		default:
+			stuck = append(stuck, fmt.Sprintf("%s has no OSPF adjacency with %s on %s",
+				w.router, w.peer, w.iface))
 		}
 	}
+	sort.Strings(extra)
 
-	if want > 0 && full == want && len(stuck) == 0 {
+	if got == len(wanted) && len(stuck) == 0 && len(extra) == 0 {
 		return Pass("ospf.full_adjacency", Evidence{
-			Observed: fmt.Sprintf("%d/%d adjacencies Full", full, want)})
+			Observed: fmt.Sprintf("all %d interior adjacencies are Full, each on the link "+
+				"the plan gives it", got)})
 	}
 	sort.Strings(stuck)
-	return Partial("ospf.full_adjacency", ratio(full, want), Evidence{
-		Expected: fmt.Sprintf("%d adjacencies in state Full", want),
-		Observed: fmt.Sprintf("%d Full of %d seen", full, total),
-		Detail:   strings.Join(stuck, "\n"),
+	detail := append(append([]string{}, stuck...), extra...)
+	score := ratio(got, len(wanted))
+	if len(extra) > 0 {
+		// An adjacency somewhere the plan does not have a link is not a
+		// substitute for one it does.
+		score *= 0.5
+	}
+	return Partial("ospf.full_adjacency", score, Evidence{
+		Expected: fmt.Sprintf("%d adjacencies in state Full, one for each interior link end",
+			len(wanted)),
+		Observed: fmt.Sprintf("%d of them", got),
+		Detail:   strings.Join(truncate(detail, 8), "\n"),
 		Hint:     "check that OSPF is enabled on every inter-router subnet, on both ends",
 		Command:  "show ip ospf neighbor json",
 	})
