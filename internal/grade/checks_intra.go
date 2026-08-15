@@ -255,21 +255,36 @@ func checkOSPFSubnets(ctx context.Context, env *Env) Result {
 	// directly. Asking every router and requiring at least one to hold the
 	// prefix as an OSPF route is what actually distinguishes "flooded through
 	// the area" from "plugged into this box".
+	// And it counts only as a route of the area, not as something redistributed
+	// into it.
+	//
+	// "Protocol is ospf" is true of a route somebody redistributed from a
+	// static blackhole: remove the genuine advertisement of a service subnet,
+	// point a Null0 route at it on a different router and turn on
+	// `redistribute static`, and the prefix is in every table, marked ospf,
+	// reaching nowhere -- the service went to 100% loss while this check said
+	// all thirty-two subnets were carried. OSPF itself distinguishes them: an
+	// intra-area network route is "N", and a redistributed one is "N E1" or
+	// "N E2". The subnet has to be in the area, which is what putting it in
+	// OSPF means and what makes it survive the attached router being reached
+	// another way.
 	seen := map[string]bool{}
+	external := map[string]bool{}
 	read := 0
 	var unreadable []string
 	for _, r := range routers {
-		var routes ospfRouteJSON
-		if err := env.VtyshJSON(ctx, r.Name, "show ip route json", &routes); err != nil {
+		var classes map[string]ospfRouteClass
+		if err := env.VtyshJSON(ctx, r.Name, "show ip ospf route json", &classes); err != nil {
 			unreadable = append(unreadable, fmt.Sprintf("%s: %v", r.Name, err))
 			continue
 		}
 		read++
-		for prefix, entries := range routes {
-			for _, e := range entries {
-				if e.Protocol == "ospf" {
-					seen[prefix] = true
-				}
+		for prefix, c := range classes {
+			switch {
+			case strings.Contains(c.RouteType, "E"):
+				external[prefix] = true
+			case strings.HasPrefix(c.RouteType, "N"):
+				seen[prefix] = true
 			}
 		}
 	}
@@ -281,7 +296,12 @@ func checkOSPFSubnets(ctx context.Context, env *Env) Result {
 
 	var absent []string
 	for p, why := range want {
-		if !seen[p] {
+		switch {
+		case seen[p]:
+		case external[p]:
+			absent = append(absent, fmt.Sprintf("%s (%s) is redistributed into OSPF as an "+
+				"external route rather than advertised by the router it is attached to", p, why))
+		default:
 			absent = append(absent, fmt.Sprintf("%s (%s)", p, why))
 		}
 	}
@@ -299,6 +319,15 @@ func checkOSPFSubnets(ctx context.Context, env *Env) Result {
 		Hint:     "the DNS and measurement subnets must be advertised in OSPF too",
 		Command:  "show ip route json",
 	})
+}
+
+// ospfRouteClass is one entry of `show ip ospf route json`: how OSPF itself
+// classifies a destination. "N" is an intra-area network, "N IA" an inter-area
+// one, and "N E1"/"N E2" something redistributed from outside OSPF.
+type ospfRouteClass struct {
+	RouteType string `json:"routeType"`
+	Area      string `json:"area,omitempty"`
+	Cost      int    `json:"cost,omitempty"`
 }
 
 // checkECMP verifies equal-cost multipath between two routers.

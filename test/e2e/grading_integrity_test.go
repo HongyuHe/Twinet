@@ -163,6 +163,7 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 	var counterfeit string
 	var blackholed struct{ router, nh string }
 	var ecmpBlock struct{ router, addr string }
+	var redistributed struct{ faker, prefix string }
 
 	cases := []struct {
 		name string
@@ -482,6 +483,45 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 			},
 		},
 		{
+			// A subnet redistributed into OSPF instead of advertised into it.
+			//
+			// "Protocol is ospf" is true of a route somebody redistributed
+			// from a static blackhole. Removing a service subnet's genuine
+			// advertisement, pointing Null0 at it on a different router and
+			// turning on `redistribute static` put the prefix in every table,
+			// marked ospf, reaching nowhere -- and the check said all
+			// thirty-two subnets were carried while the service was at total
+			// loss.
+			name:     "a service subnet redistributed into OSPF rather than advertised",
+			question: "q1.2",
+			undo: func(t *testing.T) {
+				if redistributed.prefix == "" {
+					return
+				}
+				vtysh(t, dir, redistributed.faker, "configure terminal",
+					"no ip route "+redistributed.prefix+" Null0",
+					"router ospf",
+					" no redistribute static",
+					"end")
+			},
+			apply: func(t *testing.T) {
+				owner, faker, prefix := serviceSubnet(t, dir, 3)
+				redistributed = struct{ faker, prefix string }{faker, prefix}
+				t.Logf("removing %s from OSPF on %s and redistributing a blackhole for it on %s",
+					prefix, owner, faker)
+				vtysh(t, dir, owner, "configure terminal",
+					"router ospf",
+					" no network "+prefix+" area 0",
+					"end")
+				vtysh(t, dir, faker, "configure terminal",
+					"ip route "+prefix+" Null0",
+					"router ospf",
+					" redistribute static",
+					"end")
+				time.Sleep(20 * time.Second)
+			},
+		},
+		{
 			// Installed paths that carry nothing.
 			//
 			// The equal-cost question is decided from the forwarding tables,
@@ -758,6 +798,50 @@ func findNotFoundPrefix(t *testing.T, dir string, as int) string {
 		}
 	}
 	return ""
+}
+
+// serviceSubnet finds a subnet one router advertises into OSPF, another router
+// that does not, and the prefix itself.
+//
+// Read from the running configuration, so the mutation follows whatever the
+// submission actually advertises rather than a memory of the lab.
+func serviceSubnet(t *testing.T, dir string, as int) (owner, faker, prefix string) {
+	t.Helper()
+	nets := map[string][]string{}
+	for _, dev := range routersOf(t, dir, as) {
+		out, err := twinet(t, "exec", "-m", dir, dev, "--", "vtysh", "-c", "show running-config")
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(out, "\n") {
+			f := strings.Fields(strings.TrimSpace(line))
+			if len(f) == 4 && f[0] == "network" && f[2] == "area" {
+				nets[f[1]] = append(nets[f[1]], dev)
+			}
+		}
+	}
+	var prefixes []string
+	for p, owners := range nets {
+		if len(owners) == 1 {
+			prefixes = append(prefixes, p)
+		}
+	}
+	sort.Strings(prefixes)
+	if len(prefixes) == 0 {
+		t.Fatalf("AS %d has no subnet advertised by exactly one router", as)
+	}
+	prefix = prefixes[0]
+	owner = nets[prefix][0]
+	for _, dev := range routersOf(t, dir, as) {
+		if dev != owner {
+			faker = dev
+			break
+		}
+	}
+	if faker == "" {
+		t.Fatalf("AS %d has only one router, so nothing else can counterfeit its subnet", as)
+	}
+	return owner, faker, prefix
 }
 
 // ecmpEndpoints returns the two ends of the equal-cost question: the router the
