@@ -308,6 +308,14 @@ reached students, and each motivated a permanent test.
     the range pointed the group the exercise actually sends to at a different
     router, on all six of them, while the question reported agreement.
 
+31. **A count of adjacencies instead of the adjacencies asked for.** Whether
+    every interior link was adjacent was decided by counting neighbours in
+    state Full against twice the number of links. Making one link passive and
+    tunnelling an adjacency between the same two routers kept the total exactly
+    right while the link had none. Each interface the plan gives a neighbour
+    must now have one, and an adjacency where the plan has no link is reported
+    rather than counted.
+
 ## Environment findings
 
 - **Jumbo frames are unavailable.** Raising `eno2` to MTU 9000 dropped the
