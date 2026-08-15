@@ -144,6 +144,9 @@ func checkEBGPEstablished(ctx context.Context, env *Env) Result {
 	type want struct {
 		router, peerAddr string
 		peerAS           int
+		// Who the neighbour actually is, and what they should see us as.
+		peerDevice string
+		ourAddr    string
 	}
 	var wanted []want
 	for _, r := range env.Routers() {
@@ -154,7 +157,12 @@ func checkEBGPEstablished(ctx context.Context, env *Env) Result {
 			if i.Peer == nil || i.Peer.Addr4 == "" {
 				continue
 			}
-			wanted = append(wanted, want{r.Name, env.PeerAddr(ctx, i), i.Peer.Device.ASN})
+			w := want{router: r.Name, peerAddr: env.PeerAddr(ctx, i), peerAS: i.Peer.Device.ASN}
+			w.peerDevice = i.Peer.Device.ID
+			if i.Addr4 != "" {
+				w.ourAddr = addrOnly(i.Addr4)
+			}
+			wanted = append(wanted, w)
 		}
 	}
 	if len(wanted) == 0 {
@@ -184,6 +192,23 @@ func checkEBGPEstablished(ctx context.Context, env *Env) Result {
 			problems = append(problems, fmt.Sprintf("%s -> AS %d (%s) is %s",
 				w.router, w.peerAS, w.peerAddr, p.State))
 		default:
+			// And the neighbour has to agree.
+			//
+			// This read the session out of the submission's own router: an
+			// address, a state and a remote AS number, all of them things the
+			// submission controls. Taking the real link down, routing the
+			// neighbour's address to a host of one's own and running a
+			// four-message BGP speaker there that claims to be AS 4 produced
+			// "Established, remote AS 4" and full marks for a session with a
+			// system that was never contacted. The neighbour belongs to
+			// somebody else, and asking it is the one thing a submission
+			// cannot arrange.
+			if why := peerAgrees(ctx, env, w.peerDevice, w.ourAddr, env.AS); why != "" {
+				problems = append(problems, fmt.Sprintf(
+					"%s reports a session with AS %d at %s, but %s", w.router, w.peerAS,
+					w.peerAddr, why))
+				continue
+			}
 			up++
 		}
 	}
@@ -200,6 +225,38 @@ func checkEBGPEstablished(ctx context.Context, env *Env) Result {
 		Hint:     "agree the addresses with your neighbour, and remember next-hop-self",
 		Command:  "show ip bgp summary json",
 	})
+}
+
+// peerAgrees asks the device on the other side of a link whether it has an
+// established session with this AS at the address we think we are using, and
+// says what is wrong if not.
+//
+// An empty answer means agreement. A neighbour that cannot be read is reported
+// as such rather than assumed to agree: the whole point is that this is the
+// half of the evidence the submission does not control.
+func peerAgrees(ctx context.Context, env *Env, peerDevice, ourAddr string, ourAS int) string {
+	if peerDevice == "" || ourAddr == "" {
+		return ""
+	}
+	res, err := env.Probe(ctx, peerDevice, []string{"vtysh", "-c", "show ip bgp summary json"})
+	if err != nil {
+		return fmt.Sprintf("%s could not be asked whether it sees one (%v)", peerDevice, err)
+	}
+	var sum bgpSummaryJSON
+	if jerr := jsonUnmarshalLoose(res.Stdout, &sum); jerr != nil {
+		return fmt.Sprintf("%s's own view could not be read (%v)", peerDevice, jerr)
+	}
+	p, ok := sum.IPv4Unicast.Peers[ourAddr]
+	switch {
+	case !ok:
+		return fmt.Sprintf("%s has no session with %s at all, so the session is with "+
+			"something else answering at that address", peerDevice, ourAddr)
+	case p.RemoteAs != ourAS:
+		return fmt.Sprintf("%s sees %s as AS %d, not AS %d", peerDevice, ourAddr, p.RemoteAs, ourAS)
+	case !strings.EqualFold(p.State, "Established"):
+		return fmt.Sprintf("%s sees that session as %s", peerDevice, p.State)
+	}
+	return ""
 }
 
 func bgpTable(ctx context.Context, env *Env, router string) (bgpRouteJSON, error) {
