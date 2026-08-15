@@ -1239,34 +1239,13 @@ func sortedKeysOfBool(m map[string]bool) []string {
 // once; a single lost traceroute was enough to cost a correct student a mark,
 // which is the worst kind of wrong answer a grader can give because it looks
 // exactly like a real finding.
+
 // Three attempts, not two.
 //
 // The hosts of a layer-2 domain sit behind deliberately slow links, and a
 // traceroute that loses its probe is indistinguishable from a host that cannot
-// be reached. Probing every ordered pair rather than every unordered one --
-// which is the only way to see a one-directional break -- doubled the traffic
-// through those links, and a correct submission started losing a mark now and
-// then to a dropped packet. A mark that depends on the weather is not a mark.
+// be reached. A mark that depends on the weather is not a mark.
 const traceAttempts = 3
-
-func traceHopsRetrying(ctx context.Context, env *Env, src, dst *model.Device) (int, error) {
-	var hops int
-	var err error
-	for i := 0; i < traceAttempts; i++ {
-		if i > 0 {
-			select {
-			case <-ctx.Done():
-				return hops, err
-			case <-time.After(time.Duration(i) * 2 * time.Second):
-			}
-		}
-		hops, err = traceHops(ctx, env, src, dst)
-		if err == nil && hops > 0 {
-			return hops, nil
-		}
-	}
-	return hops, err
-}
 
 // adjacentHopsRetrying measures the distance to a neighbour in the same VLAN,
 // priming the neighbour cache first.
