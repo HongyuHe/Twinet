@@ -279,6 +279,13 @@ reached students, and each motivated a permanent test.
     what it would do with a packet for the address being tested, in both
     directions, and the answer has to be the tunnel.
 
+28. **A route attributed to the next hop it carries rather than the session it
+    arrived on.** An inbound route-map can set the next hop to anything.
+    Pointing a customer's routes at an unrelated on-link address made them
+    invisible to the business-relationship check, so ranking them below a
+    peer's cost nothing. A path's peerId is the session it came in on and no
+    policy can change it; provenance is read from there now.
+
 ## Environment findings
 
 - **Jumbo frames are unavailable.** Raising `eno2` to MTU 9000 dropped the
