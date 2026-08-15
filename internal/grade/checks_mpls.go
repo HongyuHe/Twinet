@@ -237,8 +237,24 @@ func checkVPNReachability(ctx context.Context, env *Env) Result {
 	if err != nil {
 		return Errored("vpn.site_reachability", err)
 	}
+	// What each site received, before and after.
+	//
+	// A ping proves that something answered, not that the customer's site did.
+	// The provider is the system being marked and every packet crosses it: a
+	// DNAT rule on each edge, answering the far site's address locally while
+	// the real traffic is dropped, left every probe succeeding and the mark
+	// untouched. The customer's hosts are not the provider's to configure, and
+	// the kernel's count of echo requests delivered to them is not something a
+	// rule on the way can arrange.
+	var allSites []sitePoint
+	for _, sites := range groups {
+		allSites = append(allSites, sites...)
+	}
+	before := receivedEchoesAt(ctx, env, allSites)
+
 	var problems []string
 	tried := 0
+	sentTo := map[string]int{}
 	for name, sites := range groups {
 		if len(sites) < 2 {
 			continue
@@ -250,6 +266,7 @@ func checkVPNReachability(ctx context.Context, env *Env) Result {
 				// report it as working.
 				for _, d := range directed(sites[i], sites[j]) {
 					tried++
+					sentTo[d.to.host]++
 					reached, err := env.reaches(ctx, d.from.host, d.to.addr)
 					if err != nil {
 						return Errored("vpn.site_reachability", err)
@@ -261,6 +278,22 @@ func checkVPNReachability(ctx context.Context, env *Env) Result {
 					}
 				}
 			}
+		}
+	}
+	after := receivedEchoesAt(ctx, env, allSites)
+	for _, site := range allSites {
+		if sentTo[site.host] == 0 {
+			continue
+		}
+		b, okB := before[site.host]
+		a, okA := after[site.host]
+		if !okB || !okA {
+			continue // the counter could not be read; the probe stands alone
+		}
+		if a <= b {
+			problems = append(problems, fmt.Sprintf(
+				"%s answered %d probe(s) it never received, so something on the way is "+
+					"replying for it", site.host, sentTo[site.host]))
 		}
 	}
 	if tried == 0 {
@@ -277,8 +310,30 @@ func checkVPNReachability(ctx context.Context, env *Env) Result {
 	}
 	return Pass("vpn.site_reachability", Evidence{
 		Expected: "each customer's sites reach each other",
-		Observed: fmt.Sprintf("%d site pair(s) reachable", tried),
+		Observed: fmt.Sprintf("%d site pair(s) reachable, and every site received the traffic "+
+			"addressed to it", tried),
 	})
+}
+
+// receivedEchoesAt reads each site host's count of ICMP echo requests the
+// kernel delivered to it.
+func receivedEchoesAt(ctx context.Context, env *Env, sites []sitePoint) map[string]int {
+	out := map[string]int{}
+	seen := map[string]bool{}
+	for _, s := range sites {
+		if seen[s.host] {
+			continue
+		}
+		seen[s.host] = true
+		res, err := env.Probe(ctx, s.host, []string{"cat", "/proc/net/snmp"})
+		if err != nil || res.ExitCode != 0 {
+			continue
+		}
+		if n, ok := icmpInEchos(res.Stdout); ok {
+			out[s.host] = n
+		}
+	}
+	return out
 }
 
 // checkVPNIsolation asks whether the customers are kept apart.

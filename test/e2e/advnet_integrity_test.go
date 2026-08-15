@@ -63,6 +63,7 @@ func TestABrokenVPNLosesTheRightMarks(t *testing.T) {
 	const provider = 1
 
 	var ldpPair []ldpEnd
+	var impostors []edgeImpostor
 
 	baseline, points, report := gradeAS(t, dir, provider)
 	if len(baseline) == 0 {
@@ -165,6 +166,41 @@ func TestABrokenVPNLosesTheRightMarks(t *testing.T) {
 						"  neighbor "+p.peerAddr+" targeted", "end")
 				}
 				time.Sleep(25 * time.Second)
+			},
+		},
+		{
+			// The provider answering for the customer it is meant to carry.
+			//
+			// Reachability between a customer's sites was established by
+			// pinging. Every packet crosses the provider, and the provider is
+			// what is being marked: a rule on each edge answering the far
+			// site's address locally, with the real traffic dropped, left all
+			// four probes succeeding and the mark untouched.
+			name:     "the provider answering for the customer's far site",
+			question: "q2",
+			undo: func(t *testing.T) {
+				for _, i := range impostors {
+					_, _ = twinet(t, "exec", "-m", dir, i.router, "--", "sh", "-c",
+						"iptables -t nat -D PREROUTING -d "+i.addr+" -p icmp -j REDIRECT; "+
+							"iptables -D FORWARD -d "+i.addr+" -j DROP; "+
+							"ip addr del "+i.addr+"/32 dev lo; echo ok")
+				}
+			},
+			apply: func(t *testing.T) {
+				impostors = edgeImpostors(t, dir, provider)
+				if len(impostors) < 2 {
+					t.Fatal("could not find two edges to impersonate the far sites from")
+				}
+				for _, i := range impostors {
+					t.Logf("%s will answer for %s", i.router, i.addr)
+					if _, err := twinet(t, "exec", "-m", dir, i.router, "--", "sh", "-c",
+						"ip addr add "+i.addr+"/32 dev lo; "+
+							"iptables -t nat -I PREROUTING 1 -d "+i.addr+" -p icmp -j REDIRECT; "+
+							"iptables -I FORWARD 1 -d "+i.addr+" -j DROP; echo ok"); err != nil {
+						t.Fatalf("setting up the impostor on %s: %v", i.router, err)
+					}
+				}
+				time.Sleep(8 * time.Second)
 			},
 		},
 		{
@@ -314,6 +350,66 @@ func loopbackOf(t *testing.T, dir, device string) string {
 	t.Helper()
 	out, err := twinet(t, "exec", "-m", dir, device, "--",
 		"sh", "-c", "ip -4 -o addr show dev lo scope global | awk '{print $4}' | head -1")
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if s := strings.TrimSpace(line); strings.Count(s, ".") == 3 {
+			return strings.SplitN(s, "/", 2)[0]
+		}
+	}
+	return ""
+}
+
+// edgeImpostor is one provider edge and the customer address it will answer for.
+type edgeImpostor struct{ router, addr string }
+
+// edgeImpostors pairs each provider edge with the address of the *other* site
+// of the customer attached to it, which is what its own site would ping.
+func edgeImpostors(t *testing.T, dir string, as int) []edgeImpostor {
+	t.Helper()
+	type edge struct{ router, vrf, site string }
+	var edges []edge
+	for _, dev := range routersOf(t, dir, as) {
+		out, err := twinet(t, "exec", "-m", dir, dev, "--", "vtysh", "-c", "show running-config")
+		if err != nil {
+			continue
+		}
+		var vrf string
+		for _, line := range strings.Split(out, "\n") {
+			f := strings.Fields(strings.TrimSpace(line))
+			if len(f) >= 5 && f[0] == "router" && f[1] == "bgp" && f[3] == "vrf" {
+				vrf = f[4]
+				continue
+			}
+			if vrf != "" && len(f) == 4 && f[0] == "neighbor" && f[2] == "remote-as" {
+				edges = append(edges, edge{dev, vrf, f[3]})
+				vrf = ""
+			}
+		}
+	}
+	var out []edgeImpostor
+	for _, e := range edges {
+		for _, other := range edges {
+			if other.vrf != e.vrf || other.site == e.site {
+				continue
+			}
+			addr := siteHostAddr(t, dir, other.site)
+			if addr == "" {
+				continue
+			}
+			out = append(out, edgeImpostor{e.router, addr})
+			break
+		}
+	}
+	return out
+}
+
+// siteHostAddr is the address of the host at a customer site, by AS number.
+func siteHostAddr(t *testing.T, dir, asn string) string {
+	t.Helper()
+	out, err := twinet(t, "exec", "-m", dir, "as"+asn+"/BR_host", "--",
+		"sh", "-c", "ip -4 -o addr show scope global | awk '{print $4}' | head -1")
 	if err != nil {
 		return ""
 	}
