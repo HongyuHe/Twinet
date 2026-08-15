@@ -178,6 +178,26 @@ reached students, and each motivated a permanent test.
     guarded on an environment variable nothing sets. There is now a suite that
     runs by default, and its first execution found the two holes above.
 
+17. **A counterfeit of the unsigned prefix passed for the real one.** Origin
+    validation asks that a prefix nobody has signed is still carried rather
+    than filtered away; it was marked by finding the prefix in every router's
+    table. A submission that filtered the real route away at every border and
+    announced the same prefix itself -- pointed at Null0, with a forged AS path
+    -- had it everywhere and kept full marks while nothing in that AS could
+    reach the network. The route must now have been learned from outside (FRR
+    gives a locally sourced route a next hop of 0.0.0.0, and where a route
+    entered cannot be written the way an AS path can) and must carry traffic.
+
+18. **A blackholed next hop counted as a reachable one.** The check named for
+    "the route is everywhere and the traffic is dropped" asked only whether the
+    router had *a* route to the next hop, and a blackhole is a route. The
+    entry is parsed now: installed, active, with somewhere to send the packet,
+    and not a discard. The same attack exposed a second hole -- the check
+    totalled usable next hops across the AS, so a router that had lost its
+    externally learned routes altogether contributed nothing to either total
+    and vanished into them. Every router must now hold every destination the AS
+    has learned.
+
 ## Environment findings
 
 - **Jumbo frames are unavailable.** Raising `eno2` to MTU 9000 dropped the
