@@ -168,6 +168,7 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 	var importMapNames []string
 	var roaWithdrawn struct{ router, anchor, prefix string }
 	var nativeV6 []nativeV6End
+	var hidden struct{ router, peer, origMap string }
 
 	cases := []struct {
 		name string
@@ -490,6 +491,47 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 					"end")
 				vtysh(t, dir, router, "clear bgp ipv4 unicast "+prov+" out")
 				time.Sleep(8 * time.Second)
+			},
+		},
+		{
+			// A customer's routes made invisible by rewriting their next hop.
+			//
+			// Routes were attributed to a relationship by their next hop, and
+			// an inbound route-map can set that to anything. Rewriting a
+			// customer's next hop to an unrelated on-link address hid its
+			// routes from the check entirely, so ranking them below a peer's
+			// -- the exact violation the question is about -- cost nothing.
+			name:     "a customer's next hop rewritten and its routes ranked below a peer's",
+			question: "q2.3",
+			undo: func(t *testing.T) {
+				if hidden.router == "" {
+					return
+				}
+				vtysh(t, dir, hidden.router, "configure terminal",
+					"router bgp 3",
+					" address-family ipv4 unicast",
+					"  neighbor "+hidden.peer+" route-map "+hidden.origMap+" in",
+					" exit-address-family",
+					"exit",
+					"no route-map HIDECUST permit 10",
+					"end")
+				vtysh(t, dir, hidden.router, "clear ip bgp "+hidden.peer+" in")
+				time.Sleep(20 * time.Second)
+			},
+			apply: func(t *testing.T) {
+				router, peer, orig := customerImport(t, dir, 3)
+				hidden = struct{ router, peer, origMap string }{router, peer, orig}
+				t.Logf("hiding the customer at %s behind a rewritten next hop on %s", peer, router)
+				vtysh(t, dir, router, "configure terminal",
+					"route-map HIDECUST permit 10",
+					" set local-preference 50",
+					" set ip next-hop "+bumpLastOctet(peer),
+					"router bgp 3",
+					" address-family ipv4 unicast",
+					"  neighbor "+peer+" route-map HIDECUST in",
+					"end")
+				vtysh(t, dir, router, "clear ip bgp "+peer+" in")
+				time.Sleep(20 * time.Second)
 			},
 		},
 		{
@@ -972,6 +1014,32 @@ func findNotFoundPrefix(t *testing.T, dir string, as int) string {
 		}
 	}
 	return ""
+}
+
+// customerImport finds a customer session and the route-map applied to it, by
+// taking the neighbour whose routes this AS ranks highest.
+func customerImport(t *testing.T, dir string, as int) (router, peer, routeMap string) {
+	t.Helper()
+	r, addr, _ := bestCustomerRoute(t, dir, as)
+	maps := importRouteMaps(t, dir, r)
+	if maps[addr] == "" {
+		t.Fatalf("%s applies no import policy to the customer at %s", r, addr)
+	}
+	return r, addr, maps[addr]
+}
+
+// bumpLastOctet returns a neighbouring address on the same subnet, which is
+// on-link and therefore resolvable, and is not the neighbour.
+func bumpLastOctet(addr string) string {
+	i := strings.LastIndexByte(addr, '.')
+	if i < 0 {
+		return addr
+	}
+	n, err := strconv.Atoi(addr[i+1:])
+	if err != nil {
+		return addr
+	}
+	return addr[:i+1] + strconv.Itoa(n+1)
 }
 
 // nativeV6End is one end of a native IPv6 path built to bypass the tunnel.

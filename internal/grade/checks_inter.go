@@ -415,12 +415,8 @@ func checkGaoRexford(ctx context.Context, env *Env) Result {
 		}
 		for prefix, entries := range tbl.Table() {
 			for _, e := range entries {
-				for _, nh := range e.Nexthops {
-					rel, ok := relOf[nh.IP]
-					if !ok {
-						continue
-					}
-					seen[rel] = append(seen[rel], observed{e.LocalPref, prefix, nh.IP, r.Name})
+				if rel, via, ok := learnedFromRelationship(e, relOf); ok {
+					seen[rel] = append(seen[rel], observed{e.LocalPref, prefix, via, r.Name})
 				}
 			}
 		}
@@ -916,6 +912,29 @@ func pathContainsASN(path string, asn int) bool {
 	return false
 }
 
+// learnedFromRelationship says which neighbour a path came from, preferring
+// the evidence the submission cannot alter.
+//
+// A path's peerId is the address of the session it arrived on. An inbound
+// route-map can set the next hop to anything it likes -- rewriting a
+// customer's to an unrelated on-link address made that customer's routes
+// invisible to this check, so ranking them below a peer's cost nothing -- but
+// no policy can change which session a route came in on.
+func learnedFromRelationship(e bgpRoute, relOf map[string]model.Relationship) (
+	model.Relationship, string, bool) {
+	if e.PeerID != "" {
+		if rel, ok := relOf[e.PeerID]; ok {
+			return rel, e.PeerID, true
+		}
+	}
+	for _, nh := range e.NextHops() {
+		if rel, ok := relOf[nh]; ok {
+			return rel, nh, true
+		}
+	}
+	return "", "", false
+}
+
 // sourceRelationship infers which neighbour a route was learned from.//
 // Both spellings of the next hop are read. FRR uses a "nexthops" array for
 // `show ip bgp` and a scalar "nextHop" for advertised routes, and this check
@@ -1184,6 +1203,9 @@ type externalSession struct {
 	Addr   string
 	Rel    model.Relationship
 	ASN    int
+	// PeerDevice is the device on the far side, which is not the submission's
+	// to configure and is therefore where unforgeable evidence comes from.
+	PeerDevice string
 }
 
 // externalSessions lists every session with a neighbour outside this AS,
@@ -1213,14 +1235,18 @@ func externalSessions(ctx context.Context, env *Env) []externalSession {
 				if addr == "" {
 					continue
 				}
-				out = append(out, externalSession{r.Name, addr, model.RelPeer, asn})
+				rsDev := ""
+				if rs, ok := routeServerDevice(env.Topology, asn); ok {
+					rsDev = rs.ID
+				}
+				out = append(out, externalSession{r.Name, addr, model.RelPeer, asn, rsDev})
 			case i.Link.InterAS && i.Peer != nil && i.Peer.Addr4 != "":
 				rel := i.Link.PeerRelationship(i)
-				asn := 0
+				asn, dev := 0, ""
 				if i.Peer.Device != nil {
-					asn = i.Peer.Device.ASN
+					asn, dev = i.Peer.Device.ASN, i.Peer.Device.ID
 				}
-				out = append(out, externalSession{r.Name, env.PeerAddr(ctx, i), rel, asn})
+				out = append(out, externalSession{r.Name, env.PeerAddr(ctx, i), rel, asn, dev})
 			}
 		}
 	}
