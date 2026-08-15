@@ -5,6 +5,7 @@ package e2e
 import (
 	"encoding/json"
 	"fmt"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"sort"
@@ -164,6 +165,7 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 	var blackholed struct{ router, nh string }
 	var ecmpBlock struct{ router, addr string }
 	var redistributed struct{ faker, prefix string }
+	var impostorSubnet struct{ faker, prefix string }
 	var ixpDeny struct{ router, peer, routeMap string }
 	var importMapNames []string
 	var roaWithdrawn struct{ router, anchor, prefix string }
@@ -781,6 +783,51 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 			},
 		},
 		{
+			// The right prefix, advertised by the wrong router.
+			//
+			// A prefix carries no record of where it came from. Taking a
+			// service subnet out of OSPF on the router it is attached to and
+			// putting the same numbers on a dummy interface elsewhere in the
+			// AS left every router holding it as an ordinary intra-area route,
+			// which the check read as the subnet being advertised. It was not:
+			// the network was dark, and nothing sent a packet to it to find
+			// out.
+			name:     "a service subnet advertised from a dummy interface on another router",
+			question: "q1.2",
+			undo: func(t *testing.T) {
+				if impostorSubnet.prefix == "" {
+					return
+				}
+				vtysh(t, dir, impostorSubnet.faker, "configure terminal",
+					"router ospf",
+					" no network "+impostorSubnet.prefix+" area 0",
+					"end")
+				_, _ = twinet(t, "exec", "-m", dir, impostorSubnet.faker, "--",
+					"ip", "link", "del", "twgrade0")
+			},
+			apply: func(t *testing.T) {
+				owner, faker, prefix := serviceSubnet(t, dir, as)
+				impostorSubnet = struct{ faker, prefix string }{faker, prefix}
+				t.Logf("removing %s from OSPF on %s and advertising it from a dummy on %s",
+					prefix, owner, faker)
+				vtysh(t, dir, owner, "configure terminal",
+					"router ospf",
+					" no network "+prefix+" area 0",
+					"end")
+				out, err := twinet(t, "exec", "-m", dir, faker, "--", "sh", "-c",
+					"ip link add twgrade0 type dummy && ip addr add "+
+						impostorAddr(prefix)+" dev twgrade0 && ip link set twgrade0 up")
+				if err != nil {
+					t.Fatalf("putting the subnet on a dummy interface: %v\n%s", err, out)
+				}
+				vtysh(t, dir, faker, "configure terminal",
+					"router ospf",
+					" network "+prefix+" area 0",
+					"end")
+				time.Sleep(25 * time.Second)
+			},
+		},
+		{
 			// Installed paths that carry nothing.
 			//
 			// The equal-cost question is decided from the forwarding tables,
@@ -1271,6 +1318,23 @@ func ixpImport(t *testing.T, dir string, as int) (router, peer, routeMap string)
 // serviceSubnet finds a subnet one router advertises into OSPF, another router
 // that does not, and the prefix itself.
 //
+// impostorAddr picks an address inside a prefix that nothing else is using, so
+// a dummy interface can claim to be that subnet.
+func impostorAddr(prefix string) string {
+	pfx, err := netip.ParsePrefix(prefix)
+	if err != nil || !pfx.Addr().Is4() {
+		return prefix
+	}
+	b := pfx.Masked().Addr().As4()
+	host := uint32(1)<<(32-pfx.Bits()) - 2 // the last usable address
+	if pfx.Bits() >= 31 {
+		host = 0
+	}
+	v := uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3]) + host
+	return netip.AddrFrom4([4]byte{byte(v >> 24), byte(v >> 16), byte(v >> 8), byte(v)}).String() +
+		"/" + strconv.Itoa(pfx.Bits())
+}
+
 // Read from the running configuration, so the mutation follows whatever the
 // submission actually advertises rather than a memory of the lab.
 func serviceSubnet(t *testing.T, dir string, as int) (owner, faker, prefix string) {
