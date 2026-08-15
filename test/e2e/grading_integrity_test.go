@@ -165,6 +165,7 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 	var ecmpBlock struct{ router, addr string }
 	var redistributed struct{ faker, prefix string }
 	var ixpDeny struct{ router, peer, routeMap string }
+	var importMapNames []string
 
 	cases := []struct {
 		name string
@@ -481,6 +482,52 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 					"end")
 				vtysh(t, dir, router, "clear bgp ipv4 unicast "+prov+" out")
 				time.Sleep(8 * time.Second)
+			},
+		},
+		{
+			// Everything denied, everywhere.
+			//
+			// "No invalid route is selected" is trivially true of an AS that
+			// selected no external route at all. A deny-everything clause
+			// ahead of the RPKI one -- which stays present and reachable in
+			// the configuration -- left the AS with nothing but its own
+			// prefix, and the origin-validation question awarded full marks
+			// for refusing something it had never been in a position to
+			// accept.
+			name:     "every external route denied on the way in",
+			question: "q2.6",
+			undo: func(t *testing.T) {
+				for _, dev := range routersOf(t, dir, 3) {
+					cmds := []string{"configure terminal"}
+					for _, m := range importMapNames {
+						cmds = append(cmds, "no route-map "+m+" deny 1")
+					}
+					cmds = append(cmds,
+						"no ip prefix-list DENYALL seq 5 permit 0.0.0.0/0 le 32", "end")
+					vtysh(t, dir, dev, cmds...)
+					vtysh(t, dir, dev, "clear ip bgp * in")
+				}
+				time.Sleep(20 * time.Second)
+			},
+			apply: func(t *testing.T) {
+				importMapNames = inboundRouteMaps(t, dir, 3)
+				if len(importMapNames) == 0 {
+					t.Fatal("AS 3 applies no inbound policy, so there is nothing to put a " +
+						"deny in front of")
+				}
+				t.Logf("denying everything ahead of %v on every router of AS 3", importMapNames)
+				for _, dev := range routersOf(t, dir, 3) {
+					cmds := []string{"configure terminal",
+						"ip prefix-list DENYALL seq 5 permit 0.0.0.0/0 le 32"}
+					for _, m := range importMapNames {
+						cmds = append(cmds, "route-map "+m+" deny 1",
+							" match ip address prefix-list DENYALL")
+					}
+					cmds = append(cmds, "end")
+					vtysh(t, dir, dev, cmds...)
+					vtysh(t, dir, dev, "clear ip bgp * in")
+				}
+				time.Sleep(25 * time.Second)
 			},
 		},
 		{
@@ -828,6 +875,31 @@ func findNotFoundPrefix(t *testing.T, dir string, as int) string {
 		}
 	}
 	return ""
+}
+
+// inboundRouteMaps lists every route-map this AS applies to what arrives from
+// outside, across all of its routers.
+func inboundRouteMaps(t *testing.T, dir string, as int) []string {
+	t.Helper()
+	seen := map[string]bool{}
+	for _, dev := range routersOf(t, dir, as) {
+		out, err := twinet(t, "exec", "-m", dir, dev, "--", "vtysh", "-c", "show running-config")
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(out, "\n") {
+			f := strings.Fields(strings.TrimSpace(line))
+			if len(f) >= 5 && f[0] == "neighbor" && f[2] == "route-map" && f[4] == "in" {
+				seen[f[3]] = true
+			}
+		}
+	}
+	var names []string
+	for n := range seen {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	return names
 }
 
 // ixpImport finds the router holding this AS's exchange session, the route

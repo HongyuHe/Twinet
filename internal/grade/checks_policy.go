@@ -1236,15 +1236,71 @@ func checkRPKIInvalidRejected(ctx context.Context, env *Env) Result {
 				"this lab is not announcing anything RPKI-invalid, so rejecting it "+
 					"cannot be observed and no verdict here would mean anything: %s", why))
 		}
+		// And something did get in.
+		//
+		// "No invalid route is selected" is trivially true of an AS that
+		// selected no external route at all. A deny-everything clause placed
+		// ahead of the RPKI one -- the legitimate clause still present and
+		// still reachable in the configuration -- left this AS with nothing
+		// in its table but its own prefix, and this check awarded full marks
+		// for rejecting an invalid origin it had never been in a position to
+		// accept. A rejection means something only against a background of
+		// acceptance.
+		accepted, aerr := externalRoutesSelected(ctx, env)
+		if aerr != nil {
+			return Errored("rpki.invalid_rejected", aerr)
+		}
+		if accepted == 0 {
+			return Fail("rpki.invalid_rejected", Evidence{
+				Expected: "the invalid origin refused and everything else accepted",
+				Observed: "this AS has selected no externally learned route at all, so " +
+					"refusing the invalid one shows nothing",
+				Hint: "an import policy that denies everything rejects the invalid origin " +
+					"and the rest of the internet with it; deny on the validation state, " +
+					"not on the prefix",
+				Command: "show ip bgp json",
+			})
+		}
 		return Pass("rpki.invalid_rejected", Evidence{
-			Observed: "validation is live and the lab's invalid announcement is not selected",
-			Detail:   liveDetail + "\n" + detail})
+			Observed: fmt.Sprintf("validation is live, %d externally learned route(s) are "+
+				"selected, and the lab's invalid announcement is not among them", accepted),
+			Detail: liveDetail + "\n" + detail})
 	}
 	return Partial("rpki.invalid_rejected", 0.6, Evidence{
 		Expected: "no invalid route selected",
 		Observed: fmt.Sprintf("%d invalid route(s) still chosen", len(selected)),
 		Detail:   strings.Join(truncate(selected, 5), "\n"),
 	})
+}
+
+// externalRoutesSelected counts the destinations this AS learned from outside
+// and chose to use.
+//
+// It is the background any claim about refusing one route has to be read
+// against: an AS that accepted nothing has not shown that it refused anything
+// in particular.
+func externalRoutesSelected(ctx context.Context, env *Env) (int, error) {
+	seen := map[string]bool{}
+	read := 0
+	for _, r := range env.Routers() {
+		tbl, err := bgpTable(ctx, env, r.Name)
+		if err != nil {
+			continue
+		}
+		read++
+		for prefix, entries := range tbl.Table() {
+			for _, e := range entries {
+				if e.IsBest() && strings.TrimSpace(e.Path) != "" {
+					seen[prefix] = true
+				}
+			}
+		}
+	}
+	if read == 0 {
+		return 0, fmt.Errorf("no router's table could be read, so what this AS accepted " +
+			"cannot be established")
+	}
+	return len(seen), nil
 }
 
 // checkRPKINotFoundPreserved guards against over-filtering: a student who
