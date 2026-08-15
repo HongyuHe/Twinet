@@ -608,10 +608,12 @@ func checkNoTransit(ctx context.Context, env *Env) Result {
 				if !e.IsBest() {
 					continue
 				}
-				for _, nh := range e.Nexthops {
-					if relOf[nh.IP] == model.RelCustomer {
-						custPrefixes[prefix] = fmt.Sprintf("learned from a customer at %s", nh.IP)
-					}
+				// By the session it arrived on, not the next hop it carries:
+				// an inbound route-map can rewrite the second, and a customer
+				// whose routes are invisible here is a customer whose routes
+				// nobody is required to pass on.
+				if rel, via, ok := learnedFromRelationship(e, relOf); ok && rel == model.RelCustomer {
+					custPrefixes[prefix] = fmt.Sprintf("learned from a customer at %s", via)
 				}
 			}
 		}
