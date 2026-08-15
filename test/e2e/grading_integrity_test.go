@@ -158,9 +158,10 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 			"attributed to the breakage", why)
 	}
 
-	// Remembered by the mutation that makes it, so its undo does not have to
-	// find it again in a lab it has just changed.
+	// Remembered by the mutations that make them, so their undo does not have
+	// to find them again in a lab they have just changed.
 	var counterfeit string
+	var blackholed struct{ router, nh string }
 
 	cases := []struct {
 		name string
@@ -480,6 +481,34 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 			},
 		},
 		{
+			// A next hop that is present and discards everything.
+			//
+			// The check asked whether the router had a route to the next hop.
+			// A blackhole is a route: selected, installed, and dropping every
+			// packet sent to it. Pointing one router's route to another
+			// router's loopback at Null0 left the AS looking correct from
+			// every other router while that router forwarded nothing outside
+			// the AS, and the whole fault this check is named for is "the
+			// route is everywhere and the traffic is dropped".
+			name:     "the interior next hop pointed at a blackhole",
+			question: "q2.2",
+			undo: func(t *testing.T) {
+				if blackholed.router == "" {
+					return
+				}
+				vtysh(t, dir, blackholed.router, "configure terminal",
+					"no ip route "+blackholed.nh+"/32 Null0", "end")
+			},
+			apply: func(t *testing.T) {
+				router, nh := internalNextHop(t, dir, 3)
+				blackholed = struct{ router, nh string }{router, nh}
+				t.Logf("blackholing %s, the interior next hop %s forwards through", nh, router)
+				vtysh(t, dir, router, "configure terminal",
+					"ip route "+nh+"/32 Null0", "end")
+				time.Sleep(20 * time.Second)
+			},
+		},
+		{
 			// A route you announce yourself is not a route you preserved.
 			//
 			// The question asks that an origin nobody has signed is still
@@ -698,6 +727,47 @@ func findNotFoundPrefix(t *testing.T, dir string, as int) string {
 		}
 	}
 	return ""
+}
+
+// internalNextHop finds a router of this AS and an address it uses as the next
+// hop for routes another of its routers taught it.
+//
+// Read from the running system rather than assumed, because which router holds
+// which external session is the submission's choice.
+func internalNextHop(t *testing.T, dir string, as int) (router, nh string) {
+	t.Helper()
+	for _, dev := range routersOf(t, dir, as) {
+		out, err := twinet(t, "exec", "-m", dir, dev, "--", "vtysh", "-c", "show ip bgp json")
+		if err != nil {
+			continue
+		}
+		var doc struct {
+			Routes map[string][]struct {
+				PathFrom string `json:"pathFrom"`
+				Nexthops []struct {
+					IP string `json:"ip"`
+				} `json:"nexthops"`
+			} `json:"routes"`
+		}
+		if err := json.Unmarshal([]byte(trimToJSON(out)), &doc); err != nil {
+			continue
+		}
+		for _, entries := range doc.Routes {
+			for _, e := range entries {
+				if e.PathFrom != "internal" {
+					continue
+				}
+				for _, n := range e.Nexthops {
+					if n.IP != "" && n.IP != "0.0.0.0" {
+						return dev, n.IP
+					}
+				}
+			}
+		}
+	}
+	t.Fatalf("AS %d carries no route between its own routers, so there is no interior next "+
+		"hop to spoil", as)
+	return "", ""
 }
 
 // firstIBGPPeer finds a neighbour in the router's own AS.
