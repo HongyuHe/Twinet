@@ -206,6 +206,15 @@ reached students, and each motivated a permanent test.
     this question kept full marks. The loopback is required now, and exempt
     only from the rule about having a PIM neighbour, which a loopback cannot.
 
+20. **Equal-cost paths that carried nothing.** The question is decided from the
+    forwarding tables, which is right -- they say exactly which next hops are
+    installed, and sampling traceroutes can miss a live path. What they cannot
+    say is whether anything gets through: a rule dropping that exact traffic
+    left all three prescribed paths installed and every packet discarded, and
+    the report added that the source was balancing over both of them. The
+    tables still decide which paths exist; a probe now decides whether they
+    work.
+
 ## Environment findings
 
 - **Jumbo frames are unavailable.** Raising `eno2` to MTU 9000 dropped the
