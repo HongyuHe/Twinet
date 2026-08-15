@@ -360,8 +360,31 @@ func checkOSPFSubnets(ctx context.Context, env *Env) Result {
 	// "N E2". The subnet has to be in the area, which is what putting it in
 	// OSPF means and what makes it survive the attached router being reached
 	// another way.
-	seen := map[string]bool{}
+	// Which router interface each subnet hangs off, according to the plan.
+	//
+	// Without this the check asked only whether *somebody* held the prefix as
+	// an intra-area route, and a prefix has no memory of where it came from: a
+	// reviewer took 3.0.199.0/24 out of OSPF on HOU, where the measurement
+	// network actually is, put 3.0.199.254/24 on a dummy interface on CHI and
+	// advertised it from there. Every router held 3.0.199.0/24 as an "N" route
+	// and the check gave full credit for a measurement network that OSPF no
+	// longer reached. A subnet is advertised when the router it is attached to
+	// advertises it; anywhere else is a different subnet that happens to be
+	// spelled the same.
+	attached := map[string][]attachment{}
+	for _, r := range routers {
+		for _, i := range r.Ifaces {
+			for p := range want {
+				if ifacePlannedIn(i, p) {
+					attached[p] = append(attached[p], attachment{Router: r.Name, Iface: i.Name})
+				}
+			}
+		}
+	}
+
+	seen := map[string]map[string]bool{} // prefix -> routers holding it intra-area
 	external := map[string]bool{}
+	enabled := map[string]map[string]ospfIfaceState{} // router -> iface -> state
 	read := 0
 	var unreadable []string
 	for _, r := range routers {
@@ -376,9 +399,18 @@ func checkOSPFSubnets(ctx context.Context, env *Env) Result {
 			case strings.Contains(c.RouteType, "E"):
 				external[prefix] = true
 			case strings.HasPrefix(c.RouteType, "N"):
-				seen[prefix] = true
+				if seen[prefix] == nil {
+					seen[prefix] = map[string]bool{}
+				}
+				seen[prefix][r.Name] = true
 			}
 		}
+		var ifaces ospfIfacesJSON
+		if err := env.VtyshJSON(ctx, r.Name, "show ip ospf interface json", &ifaces); err != nil {
+			unreadable = append(unreadable, fmt.Sprintf("%s interfaces: %v", r.Name, err))
+			continue
+		}
+		enabled[r.Name] = ifaces.states()
 	}
 	if read == 0 {
 		return Errored("ospf.subnets_advertised", fmt.Errorf(
@@ -386,31 +418,230 @@ func checkOSPFSubnets(ctx context.Context, env *Env) Result {
 			strings.Join(truncate(unreadable, 3), "; ")))
 	}
 
-	var absent []string
+	var absent, notes []string
 	for p, why := range want {
+		here := attached[p]
+		// Somebody other than the attachment has to hold it, or it was never
+		// flooded: a directly connected network is in its own router's OSPF
+		// table whether or not any neighbour ever heard about it.
+		elsewhere := false
+		for r := range seen[p] {
+			if !attachedTo(here, r) {
+				elsewhere = true
+				break
+			}
+		}
+		remoteExists := len(routers) > len(here)
 		switch {
-		case seen[p]:
-		case external[p]:
+		case len(here) == 0:
+			// No interface in the plan sits in this subnet, so there is no
+			// attachment to hold to; fall back to "somebody carries it".
+			if len(seen[p]) == 0 {
+				absent = append(absent, fmt.Sprintf("%s (%s)", p, why))
+			}
+		case !advertisedAt(enabled, here, p):
+			where := describeAttachments(here)
+			switch {
+			case external[p] && len(seen[p]) == 0:
+				absent = append(absent, fmt.Sprintf("%s (%s) is redistributed into OSPF as an "+
+					"external route rather than advertised by %s, the router it is attached to",
+					p, why, where))
+			case len(seen[p]) > 0:
+				absent = append(absent, fmt.Sprintf(
+					"%s (%s) is in OSPF, but not from %s, where the plan attaches it: "+
+						"some other router is advertising that prefix", p, why, where))
+			default:
+				absent = append(absent, fmt.Sprintf("%s (%s) is not in OSPF on %s", p, why, where))
+			}
+		case external[p] && len(seen[p]) == 0:
 			absent = append(absent, fmt.Sprintf("%s (%s) is redistributed into OSPF as an "+
 				"external route rather than advertised by the router it is attached to", p, why))
-		default:
-			absent = append(absent, fmt.Sprintf("%s (%s)", p, why))
+		case remoteExists && !elsewhere:
+			absent = append(absent, fmt.Sprintf(
+				"%s (%s) is enabled on %s but no other router has it as an intra-area route, "+
+					"so it was never flooded", p, why, describeAttachments(here)))
+		}
+		if extra := advertisedElsewhere(enabled, here, p); len(extra) > 0 {
+			notes = append(notes, fmt.Sprintf(
+				"note: %s is also in OSPF on %s, which the plan does not attach to it",
+				p, strings.Join(extra, ", ")))
 		}
 	}
 	sort.Strings(absent)
+	sort.Strings(notes)
 
 	if len(absent) == 0 {
-		return Pass("ospf.subnets_advertised", Evidence{
-			Observed: fmt.Sprintf("all %d internal subnets are carried by OSPF, seen across %d routers",
-				len(want), read)})
+		observed := fmt.Sprintf(
+			"all %d internal subnets are advertised by the router the plan attaches them to "+
+				"and reach the rest of the area, checked across %d routers", len(want), read)
+		return Pass("ospf.subnets_advertised", Evidence{Observed: observed,
+			Detail: strings.Join(notes, "\n")})
 	}
 	return Partial("ospf.subnets_advertised", ratio(len(want)-len(absent), len(want)), Evidence{
-		Expected: fmt.Sprintf("all %d internal subnets carried by OSPF", len(want)),
-		Observed: fmt.Sprintf("%d not learned through OSPF on any router", len(absent)),
-		Detail:   strings.Join(absent, "\n"),
+		Expected: fmt.Sprintf("all %d internal subnets advertised in OSPF by the router "+
+			"the plan attaches them to", len(want)),
+		Observed: fmt.Sprintf("%d are not", len(absent)),
+		Detail:   strings.Join(append(absent, notes...), "\n"),
 		Hint:     "the DNS and measurement subnets must be advertised in OSPF too",
-		Command:  "show ip route json",
+		Command:  "show ip ospf interface json",
 	})
+}
+
+// attachment is one place the plan puts a subnet: an interface of a router.
+type attachment struct {
+	Router string
+	Iface  string
+}
+
+func attachedTo(list []attachment, router string) bool {
+	for _, a := range list {
+		if a.Router == router {
+			return true
+		}
+	}
+	return false
+}
+
+func describeAttachments(list []attachment) string {
+	var parts []string
+	for _, a := range list {
+		parts = append(parts, a.Router+":"+a.Iface)
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, " or ")
+}
+
+// ifacePlannedIn reports whether the plan puts this interface in that subnet.
+func ifacePlannedIn(i *model.Iface, prefix string) bool {
+	if i.Addr4 == "" {
+		return false
+	}
+	pfx, err := netip.ParsePrefix(prefix)
+	if err != nil {
+		return false
+	}
+	addr, err := netip.ParsePrefix(i.Addr4)
+	if err != nil {
+		return false
+	}
+	// A loopback is wanted as its own host route, which its /24 interface
+	// address does not sit "inside" in the ordinary sense.
+	if pfx.Bits() == 32 {
+		return addr.Addr() == pfx.Addr()
+	}
+	return pfx.Contains(addr.Addr())
+}
+
+// advertisedAt reports whether OSPF is running on one of the planned
+// attachment interfaces with an address that is actually in the subnet.
+//
+// Both halves matter. Without the first, a subnet counts as advertised when a
+// dummy interface somewhere else in the AS carries the same numbers. Without
+// the second, a student could leave OSPF enabled on the interface, readdress it
+// out of the subnet, and still be credited for advertising a prefix that is no
+// longer there.
+func advertisedAt(enabled map[string]map[string]ospfIfaceState, here []attachment, prefix string) bool {
+	pfx, err := netip.ParsePrefix(prefix)
+	if err != nil {
+		return false
+	}
+	for _, a := range here {
+		st, ok := enabled[a.Router][a.Iface]
+		if !ok || !st.Enabled {
+			continue
+		}
+		for _, addr := range st.Addrs {
+			ip, err := netip.ParseAddr(addr)
+			if err != nil {
+				continue
+			}
+			if pfx.Bits() == 32 {
+				if ip == pfx.Addr() {
+					return true
+				}
+				continue
+			}
+			if pfx.Contains(ip) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// advertisedElsewhere names the router interfaces outside the plan's
+// attachment that are running OSPF with an address in the subnet. A subnet
+// injected from a second place is not what the assignment asks for even when
+// the right router is also advertising it, and saying so in the report is what
+// turns a silent duplicate into something a grader can see.
+func advertisedElsewhere(enabled map[string]map[string]ospfIfaceState, here []attachment, prefix string) []string {
+	pfx, err := netip.ParsePrefix(prefix)
+	if err != nil || pfx.Bits() == 32 {
+		return nil
+	}
+	var out []string
+	for router, ifaces := range enabled {
+		for name, st := range ifaces {
+			if !st.Enabled {
+				continue
+			}
+			planned := false
+			for _, a := range here {
+				if a.Router == router && a.Iface == name {
+					planned = true
+					break
+				}
+			}
+			if planned {
+				continue
+			}
+			for _, addr := range st.Addrs {
+				ip, err := netip.ParseAddr(addr)
+				if err == nil && pfx.Contains(ip) {
+					out = append(out, router+":"+name)
+					break
+				}
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// ospfIfacesJSON is `show ip ospf interface json`: what OSPF itself believes
+// it is running on, read per interface rather than inferred from a prefix
+// turning up in a routing table.
+type ospfIfacesJSON struct {
+	Interfaces map[string]struct {
+		OSPFEnabled bool `json:"ospfEnabled"`
+		IfUp        bool `json:"ifUp"`
+		InterfaceIP map[string]struct {
+			IPAddress string `json:"ipAddress"`
+			Area      string `json:"area"`
+		} `json:"interfaceIp"`
+		IPAddress string `json:"ipAddress"`
+	} `json:"interfaces"`
+}
+
+type ospfIfaceState struct {
+	Enabled bool
+	Addrs   []string
+}
+
+func (j ospfIfacesJSON) states() map[string]ospfIfaceState {
+	out := map[string]ospfIfaceState{}
+	for name, e := range j.Interfaces {
+		st := ospfIfaceState{Enabled: e.OSPFEnabled && e.IfUp}
+		for addr := range e.InterfaceIP {
+			st.Addrs = append(st.Addrs, addr)
+		}
+		if len(st.Addrs) == 0 && e.IPAddress != "" {
+			st.Addrs = append(st.Addrs, e.IPAddress)
+		}
+		sort.Strings(st.Addrs)
+		out[name] = st
+	}
+	return out
 }
 
 // ospfRouteClass is one entry of `show ip ospf route json`: how OSPF itself
