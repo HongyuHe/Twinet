@@ -158,6 +158,10 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 			"attributed to the breakage", why)
 	}
 
+	// Remembered by the mutation that makes it, so its undo does not have to
+	// find it again in a lab it has just changed.
+	var counterfeit string
+
 	cases := []struct {
 		name string
 		// question that must lose marks.
@@ -487,19 +491,25 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 			name:     "the unsigned prefix announced locally instead of carried",
 			question: "q2.6",
 			undo: func(t *testing.T) {
-				prefix := notFoundPrefix(t, dir, 3)
+				// The prefix the mutation chose, not one looked up again: by
+				// the time this runs the only unsigned route left is the
+				// counterfeit, and looking for one would find nothing.
+				if counterfeit == "" {
+					return
+				}
 				router := routersOf(t, dir, 3)[0]
 				vtysh(t, dir, router, "configure terminal",
 					"router bgp 3",
 					" address-family ipv4 unicast",
-					"  no network "+prefix,
+					"  no network "+counterfeit,
 					" exit-address-family",
 					"exit",
-					"no ip route "+prefix+" Null0",
+					"no ip route "+counterfeit+" Null0",
 					"end")
 			},
 			apply: func(t *testing.T) {
 				prefix := notFoundPrefix(t, dir, 3)
+				counterfeit = prefix
 				router := routersOf(t, dir, 3)[0]
 				t.Logf("originating %s on %s, pointed at Null0", prefix, router)
 				vtysh(t, dir, router, "configure terminal",
