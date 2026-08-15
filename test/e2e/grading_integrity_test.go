@@ -164,6 +164,7 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 	var blackholed struct{ router, nh string }
 	var ecmpBlock struct{ router, addr string }
 	var redistributed struct{ faker, prefix string }
+	var ixpDeny struct{ router, peer, routeMap string }
 
 	cases := []struct {
 		name string
@@ -483,6 +484,35 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 			},
 		},
 		{
+			// Everything from the exchange denied.
+			//
+			// The exchange question was decided on refusals: no route whose
+			// path crosses this region may be accepted. An inbound policy that
+			// denied everything the route server sent accepted no in-region
+			// route either, and passed -- a member that hears nothing from the
+			// exchange has not written a peering policy, it has switched the
+			// exchange off.
+			name:     "everything from the exchange denied",
+			question: "q2.4",
+			undo: func(t *testing.T) {
+				if ixpDeny.router == "" {
+					return
+				}
+				vtysh(t, dir, ixpDeny.router, "configure terminal",
+					"no route-map "+ixpDeny.routeMap+" deny 4", "end")
+				vtysh(t, dir, ixpDeny.router, "clear ip bgp "+ixpDeny.peer+" in")
+			},
+			apply: func(t *testing.T) {
+				router, peer, rmap := ixpImport(t, dir, 3)
+				ixpDeny = struct{ router, peer, routeMap string }{router, peer, rmap}
+				t.Logf("denying everything %s sends %s, before its AS-path filter", peer, router)
+				vtysh(t, dir, router, "configure terminal",
+					"route-map "+rmap+" deny 4", "end")
+				vtysh(t, dir, router, "clear ip bgp "+peer+" in")
+				time.Sleep(15 * time.Second)
+			},
+		},
+		{
 			// A subnet redistributed into OSPF instead of advertised into it.
 			//
 			// "Protocol is ospf" is true of a route somebody redistributed
@@ -798,6 +828,27 @@ func findNotFoundPrefix(t *testing.T, dir string, as int) string {
 		}
 	}
 	return ""
+}
+
+// ixpImport finds the router holding this AS's exchange session, the route
+// server's address, and the route-map applied to what it sends.
+func ixpImport(t *testing.T, dir string, as int) (router, peer, routeMap string) {
+	t.Helper()
+	for _, dev := range routersOf(t, dir, as) {
+		out, err := twinet(t, "exec", "-m", dir, dev, "--", "vtysh", "-c", "show running-config")
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(out, "\n") {
+			f := strings.Fields(strings.TrimSpace(line))
+			if len(f) >= 5 && f[0] == "neighbor" && f[2] == "route-map" && f[4] == "in" &&
+				strings.HasPrefix(f[1], "180.") {
+				return dev, f[1], f[3]
+			}
+		}
+	}
+	t.Fatalf("AS %d has no exchange session with an import policy", as)
+	return "", "", ""
 }
 
 // serviceSubnet finds a subnet one router advertises into OSPF, another router

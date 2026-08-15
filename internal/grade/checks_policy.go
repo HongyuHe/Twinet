@@ -449,16 +449,25 @@ func checkIXPCommunities(ctx context.Context, env *Env) Result {
 	// accepts nothing from the exchange has not written a peering policy; it
 	// has switched the exchange off, and the point of the question is the
 	// traffic that does cross it.
-	relaying, rerr := routeServerRelaysToUs(ctx, env, rs.ID, env.AS)
-	if rerr != nil {
-		return Errored("policy.ixp_communities", rerr)
+	ourAddr := ""
+	for _, i := range ixpRouter.Ifaces {
+		if i.Role == model.RoleIXPLink && i.Addr4 != "" {
+			ourAddr = addrOnly(i.Addr4)
+		}
 	}
-	if len(accepted) == 0 && relaying {
+	offered := 0
+	if ourAddr != "" {
+		offered, aerr = routeServerOffersOutOfRegion(ctx, env, rs.ID, ourAddr, ixpInRegion(env))
+		if aerr != nil {
+			return Errored("policy.ixp_communities", aerr)
+		}
+	}
+	if len(accepted) == 0 && offered > 0 {
 		return Fail("policy.ixp_communities", Evidence{
 			Expected: "the routes the exchange relays from out-of-region members accepted, " +
 				"and the in-region ones refused",
-			Observed: fmt.Sprintf("nothing at all was accepted from %s, though the route "+
-				"server is relaying to this AS", ixpPeer),
+			Observed: fmt.Sprintf("nothing at all was accepted from %s, though the exchange "+
+				"is relaying %d route(s) from outside this region", ixpPeer, offered),
 			Hint: "an inbound filter that denies everything refuses the in-region routes " +
 				"and the rest with them; match the AS path rather than blocking the session",
 			Command: fmt.Sprintf("show ip bgp neighbors %s routes", ixpPeer),
@@ -1686,58 +1695,41 @@ func fieldAfter(line, key string) string {
 // check passes for everybody -- vacuous in exactly the way it was written to
 // stop. `show ip bgp neighbors <rs> routes` is what the router itself
 // considers to have come from that session, after policy.
-// routeServerRelaysToUs reports whether the exchange is advertising anything to
-// this AS at all.
+// routeServerOffersOutOfRegion reports how many of the routes the exchange is
+// relaying to this AS are ones it ought to accept.
 //
-// It is the precondition for demanding that the AS accept something: if the
-// route server has nothing to relay -- because no other member is announcing,
-// or because it is refusing to -- then accepting nothing is not the member's
-// doing, and marking it against them would be blaming a student for the lab.
-func routeServerRelaysToUs(ctx context.Context, env *Env, rsDevice string, asn int) (bool, error) {
-	me, ok := env.Topology.ASes[asn]
-	if !ok {
-		return false, fmt.Errorf("AS %d not in the lab", asn)
-	}
-	_ = me
-	var doc struct {
-		Peers map[string]struct {
-			RemoteAs int `json:"remoteAs"`
-			PfxSnt   int `json:"pfxSnt"`
-		} `json:"peers"`
-	}
-	// Probe, not Vtysh: the route server belongs to the exchange, not to the
-	// system under test, so it is addressed by its full device identity.
+// Requiring a member to accept *something* is only fair when something it
+// should accept is on offer. At an exchange whose other members are all in
+// this AS's own region, refusing everything is the correct answer, and an
+// exchange that is relaying nothing at all is the lab's doing rather than the
+// submission's.
+func routeServerOffersOutOfRegion(ctx context.Context, env *Env, rsDevice, ourAddr string,
+	inRegion map[int]bool) (int, error) {
 	res, err := env.Probe(ctx, rsDevice, []string{"vtysh", "-c",
-		"show bgp ipv4 unicast summary json"})
+		fmt.Sprintf("show ip bgp neighbors %s advertised-routes json", ourAddr)})
 	if err != nil {
-		return false, fmt.Errorf("asking the route server what it relays: %w", err)
+		return 0, fmt.Errorf("asking the route server what it relays to %s: %w", ourAddr, err)
 	}
-	body := res.Stdout
-	if jerr := jsonUnmarshalLoose(body, &doc); jerr != nil {
-		var v4 struct {
-			IPv4Unicast struct {
-				Peers map[string]struct {
-					RemoteAs int `json:"remoteAs"`
-					PfxSnt   int `json:"pfxSnt"`
-				} `json:"peers"`
-			} `json:"ipv4Unicast"`
-		}
-		if jerr2 := jsonUnmarshalLoose(body, &v4); jerr2 != nil {
-			return false, fmt.Errorf("asking the route server what it relays: %w", jerr)
-		}
-		for _, p := range v4.IPv4Unicast.Peers {
-			if p.RemoteAs == asn && p.PfxSnt > 0 {
-				return true, nil
+	var got bgpRouteJSON
+	if jerr := jsonUnmarshalLoose(res.Stdout, &got); jerr != nil {
+		return 0, fmt.Errorf("reading what the route server relays to %s: %w", ourAddr, jerr)
+	}
+	n := 0
+	for _, entries := range got.Table() {
+		for _, e := range entries {
+			crosses := false
+			for _, f := range strings.Fields(e.Path) {
+				if asn, cerr := strconv.Atoi(f); cerr == nil && inRegion[asn] {
+					crosses = true
+					break
+				}
+			}
+			if !crosses {
+				n++
 			}
 		}
-		return false, nil
 	}
-	for _, p := range doc.Peers {
-		if p.RemoteAs == asn && p.PfxSnt > 0 {
-			return true, nil
-		}
-	}
-	return false, nil
+	return n, nil
 }
 
 // routesViaIXP splits what this AS accepted from the exchange into the routes
@@ -1748,17 +1740,38 @@ func routeServerRelaysToUs(ctx context.Context, env *Env, rsDevice string, asn i
 // denied everything from the exchange admitted no in-region route and passed:
 // a member that hears nothing from the exchange and sends nothing to it has not
 // implemented the peering policy, it has switched the exchange off.
-func routesViaIXP(ctx context.Context, env *Env, router, ixpPeer string) (in, out []string, err error) {
+// ixpInRegion is the set the exercise names and the reference answer filters
+// on: the other *student* systems of this AS's region.
+//
+// The staff systems are everybody's transit and are reached through the
+// exchange like any out-of-region member; counting them as in-region made the
+// reference solution fail its own question the moment the exchange began
+// delivering routes at all.
+func ixpInRegion(env *Env) map[int]bool {
+	out := map[int]bool{}
 	me, ok := env.Topology.ASes[env.AS]
-	if !ok {
-		return nil, nil, fmt.Errorf("AS %d not in the lab", env.AS)
+	if !ok || me.Region == "" {
+		return out
 	}
-	inRegion := map[int]bool{}
 	for asn, as := range env.Topology.ASes {
-		if asn != env.AS && me.Region != "" && as.Region == me.Region && as.Role != model.RoleIXP {
-			inRegion[asn] = true
+		if asn != env.AS && as.Region == me.Region && as.Role == model.RoleStudent {
+			out[asn] = true
 		}
 	}
+	return out
+}
+
+func routesViaIXP(ctx context.Context, env *Env, router, ixpPeer string) (in, out []string, err error) {
+	if _, ok := env.Topology.ASes[env.AS]; !ok {
+		return nil, nil, fmt.Errorf("AS %d not in the lab", env.AS)
+	}
+	// The same set the exercise names, and the same one the reference answer
+	// filters on: the other *student* systems of this region. The staff
+	// systems are everybody's transit and are reached through the exchange
+	// like any out-of-region member, so counting them as in-region made the
+	// reference solution fail its own question the moment the exchange
+	// started delivering routes at all.
+	inRegion := ixpInRegion(env)
 	var got bgpRouteJSON
 	body, verr := env.Vtysh(ctx, router,
 		fmt.Sprintf("show ip bgp neighbors %s routes json", ixpPeer))
@@ -1787,53 +1800,6 @@ func routesViaIXP(ctx context.Context, env *Env, router, ixpPeer string) (in, ou
 	sort.Strings(in)
 	sort.Strings(out)
 	return uniq(in), uniq(out), nil
-}
-
-func inRegionRoutesViaIXP(ctx context.Context, env *Env, router, ixpPeer string) ([]string, error) {
-	me, ok := env.Topology.ASes[env.AS]
-	if !ok || me.Region == "" {
-		// Without regions in the model there is nothing to be in or out of.
-		return nil, nil
-	}
-	// Every other system in this region counts, staff ASes included: the
-	// controlled announcers the exercise uses to test the filter are exactly
-	// the ones a student's policy must refuse, and excluding them left the
-	// check testing only the systems that had no reason to be there.
-	inRegion := map[int]bool{}
-	for asn, as := range env.Topology.ASes {
-		if asn != env.AS && as.Region == me.Region && as.Role != model.RoleIXP {
-			inRegion[asn] = true
-		}
-	}
-	if len(inRegion) == 0 {
-		return nil, nil
-	}
-
-	var got bgpRouteJSON
-	out, err := env.Vtysh(ctx, router,
-		fmt.Sprintf("show ip bgp neighbors %s routes json", ixpPeer))
-	if err != nil {
-		return nil, fmt.Errorf("reading what %s accepted from the exchange: %w", router, err)
-	}
-	if err := jsonUnmarshalLoose(out, &got); err != nil {
-		return nil, fmt.Errorf("reading what %s accepted from the exchange: %w", router, err)
-	}
-
-	var bad []string
-	for prefix, entries := range got.Table() {
-		for _, e := range entries {
-			for _, f := range strings.Fields(e.Path) {
-				n, cerr := strconv.Atoi(f)
-				if cerr != nil || !inRegion[n] {
-					continue
-				}
-				bad = append(bad, fmt.Sprintf("%s (path %q)", prefix, strings.TrimSpace(e.Path)))
-				break
-			}
-		}
-	}
-	sort.Strings(bad)
-	return uniq(bad), nil
 }
 
 // tunnelEndpointsWrong reports why a tunnel's endpoints are not the two
