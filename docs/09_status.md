@@ -323,6 +323,23 @@ reached students, and each motivated a permanent test.
     dropped, left all four probes succeeding and the mark untouched. The
     customer's own hosts now have to have received the probes; unlike the
     single-AS case, they belong to somebody else, so this evidence is decisive.
+33. **The right prefix, advertised by the wrong router.** Whether a subnet was
+    in OSPF was decided by asking every router whether it held that prefix as an
+    intra-area route. A prefix carries no record of where it came from: taking
+    the measurement network out of OSPF on the router it is attached to and
+    putting the same numbers on a dummy interface on another router left every
+    table holding it, and the check gave full credit for a network OSPF no
+    longer reached. Each subnet is now bound to the interface the plan puts in
+    it, and the check reads what OSPF believes it is running on, per interface.
+34. **A network nothing ever sent a packet to.** The measurement and DNS subnets
+    are part of the assignment, and grading established only that a prefix was
+    carried. The echo counter inside the measurement container read zero after
+    every run this project had ever done -- so when the prefix above was moved
+    and the network went dark, the data-plane check saw nothing, because it
+    probed only hosts. Reachability now also probes from each service container
+    into the AS, pinned to the interface facing it: the platform owns that
+    container, so the traffic is not something a submission can arrange, and the
+    reply has to come back through the subnet being graded.
 
 ## Environment findings
 
