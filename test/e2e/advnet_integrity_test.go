@@ -4,6 +4,7 @@ package e2e
 
 import (
 	"os"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -144,23 +145,34 @@ func TestABrokenVPNLosesTheRightMarks(t *testing.T) {
 			question: "q2",
 			undo: func(t *testing.T) {
 				for _, dev := range routersOf(t, dir, provider) {
-					_, _ = twinet(t, "exec", "-m", dir, dev, "--", "sh", "-c",
-						`for i in $(ip -o link | awk -F": " "{print $2}" | cut -d@ -f1 | `+
-							`grep "^port_"); do tc qdisc del dev $i clsact 2>/dev/null; done; `+
-							`echo -n ""`)
+					for _, port := range interiorPorts(t, dir, dev) {
+						_, _ = twinet(t, "exec", "-m", dir, dev, "--",
+							"tc", "qdisc", "del", "dev", port, "clsact")
+					}
 				}
 			},
 			apply: func(t *testing.T) {
+				dropped := 0
 				for _, dev := range routersOf(t, dir, provider) {
-					if _, err := twinet(t, "exec", "-m", dir, dev, "--", "sh", "-c",
-						`for i in $(ip -o link | awk -F": " "{print $2}" | cut -d@ -f1 | `+
-							`grep "^port_"); do tc qdisc add dev $i clsact 2>/dev/null; `+
-							`tc filter add dev $i ingress protocol mpls_uc flower action drop `+
-							`2>/dev/null; done; echo -n ""`); err != nil {
-						t.Fatalf("dropping labelled frames on %s: %v", dev, err)
+					for _, port := range interiorPorts(t, dir, dev) {
+						if _, err := twinet(t, "exec", "-m", dir, dev, "--",
+							"tc", "qdisc", "add", "dev", port, "clsact"); err != nil {
+							t.Fatalf("preparing %s on %s: %v", port, dev, err)
+						}
+						if _, err := twinet(t, "exec", "-m", dir, dev, "--",
+							"tc", "filter", "add", "dev", port, "ingress",
+							"protocol", "mpls_uc", "flower", "action", "drop"); err != nil {
+							t.Fatalf("dropping labelled frames on %s of %s: %v", port, dev, err)
+						}
+						dropped++
 					}
 				}
-				t.Logf("dropped every labelled frame on the interior links of AS %d", provider)
+				if dropped == 0 {
+					t.Fatal("no interior link was found, so nothing was dropped and this " +
+						"case would prove nothing")
+				}
+				t.Logf("dropped every labelled frame on %d interior link(s) of AS %d",
+					dropped, provider)
 				time.Sleep(10 * time.Second)
 			},
 		},
@@ -207,6 +219,29 @@ func TestABrokenVPNLosesTheRightMarks(t *testing.T) {
 			}
 		})
 	}
+}
+
+// interiorPorts lists a router's links to other routers, by name.
+//
+// Read from /sys/class/net rather than parsed out of `ip link`, whose output
+// carries the peer index on the same field and needs quoting that does not
+// survive being passed through two shells -- which is how the first version of
+// this mutation silently dropped nothing at all and reported that the grader
+// had missed it.
+func interiorPorts(t *testing.T, dir, device string) []string {
+	t.Helper()
+	out, err := twinet(t, "exec", "-m", dir, device, "--", "ls", "/sys/class/net")
+	if err != nil {
+		t.Fatalf("listing the interfaces of %s: %v", device, err)
+	}
+	var ports []string
+	for _, f := range strings.Fields(out) {
+		if strings.HasPrefix(f, "port_") {
+			ports = append(ports, f)
+		}
+	}
+	sort.Strings(ports)
+	return ports
 }
 
 // vrfSite finds a routing table on a provider edge router, and the route target
