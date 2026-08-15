@@ -244,6 +244,21 @@ reached students, and each motivated a permanent test.
     check now requires a member to accept what the exchange is relaying to it
     from outside its region.
 
+24. **A refusal read without a background of acceptance.** "No invalid route is
+    selected" is trivially true of an AS that selected no external route at
+    all. A deny-everything clause ahead of the RPKI one -- the legitimate
+    clause still present and reachable -- left the AS holding only its own
+    prefix and kept full marks for origin validation. The check now counts
+    what was accepted before reading what was not.
+
+25. **A targeted LDP session accepted as a link adjacency.** LDP will bring up a
+    session between two loopbacks over whatever path the IGP offers: right
+    peer, right address, operational, labels installed. A submission could take
+    LDP off an interior link, replace it with a targeted session, and keep full
+    marks for label distribution across a link that distributes none.
+    `show mpls ldp discovery` names the kind, and every interior interface must
+    now carry a link adjacency with the router on the other side.
+
 ## Environment findings
 
 - **Jumbo frames are unavailable.** Raising `eno2` to MTU 9000 dropped the
