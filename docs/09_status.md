@@ -301,6 +301,13 @@ reached students, and each motivated a permanent test.
     owner controls could catch it. It is recorded here rather than left to be
     discovered.
 
+30. **The rendezvous point PIM would use, rather than the one written for the
+    declared range.** The check compared each router's mapping against the
+    declared group range exactly and ignored every other row; PIM takes the
+    most specific prefix covering the group. A second mapping for a /32 inside
+    the range pointed the group the exercise actually sends to at a different
+    router, on all six of them, while the question reported agreement.
+
 ## Environment findings
 
 - **Jumbo frames are unavailable.** Raising `eno2` to MTU 9000 dropped the
