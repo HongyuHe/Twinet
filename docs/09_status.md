@@ -340,6 +340,17 @@ reached students, and each motivated a permanent test.
     into the AS, pinned to the interface facing it: the platform owns that
     container, so the traffic is not something a submission can arrange, and the
     reply has to come back through the subnet being graded.
+35. **An address the plan does not mention, costing nothing.** Whether the
+    addressing matched the plan was decided by looking for the prescribed
+    addresses and nothing else; anything extra was reported and scored neither
+    way. Two reviewers made the same objection, and they were right twice over:
+    the claim is that the addressing matches, which an unplanned address
+    falsifies, and an unplanned address is the raw material for impersonation --
+    claiming a subnet that lives somewhere else is how most of the defects above
+    were built. An address outside every subnet in the lab now costs half the
+    mark for the question, because "and nothing else" is a property of the whole
+    system rather than a fiftieth of a count. An address inside a subnet the
+    plan assigns elsewhere fails the check outright.
 
 ## Environment findings
 
