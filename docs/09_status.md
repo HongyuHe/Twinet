@@ -259,6 +259,17 @@ reached students, and each motivated a permanent test.
     `show mpls ldp discovery` names the kind, and every interior interface must
     now carry a link adjacency with the router on the other side.
 
+26. **Evidence taken from the thing being marked.** Two checks read facts about
+    the world out of the submission's own routers. Whether an external session
+    was established came from its BGP summary: taking the real link down,
+    routing the neighbour's address into the interior and running a
+    four-message BGP speaker on a host produced "Established, remote AS 4" for
+    a system never contacted. And whether a ROA had been published came from
+    `show rpki prefix-table`: withdraw the real authorisation, run an RTR
+    server on a host, point the validator at it, and the table says whatever
+    the student likes. Sessions are now confirmed from the neighbour's side,
+    and publication from the trust anchor's own container.
+
 ## Environment findings
 
 - **Jumbo frames are unavailable.** Raising `eno2` to MTU 9000 dropped the
