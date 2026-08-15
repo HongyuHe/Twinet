@@ -20,8 +20,8 @@ import (
 func init() {
 	Register(&Check{
 		Name: "l3.addressing_matches_plan",
-		Describe: "every router interface carries the address the assignment prescribes; " +
-			"anything extra is reported and not marked",
+		Describe: "every router interface carries the address the assignment prescribes, " +
+			"and no router carries one the plan does not mention",
 		Run: checkAddressing,
 	})
 	Register(&Check{
@@ -64,16 +64,25 @@ func checkAddressing(ctx context.Context, env *Env) Result {
 	var missing []string
 	checked := 0
 
-	// Addresses the plan does not mention are reported, not marked.
+	// Addresses the plan does not mention are marked, not merely mentioned.
 	//
-	// The question is whether the prescribed address is there, and it is
-	// deliberately not whether anything else is: a student who adds a second
-	// address while testing has not got the addressing wrong, and failing them
-	// for it would be worse than the check that reads configuration instead of
-	// state. But an unexplained address on a router is worth a marker's
-	// attention -- it is how a submission would stand in for a neighbour it is
-	// meant to be peering with -- so it is put in front of them.
-	var extra []string
+	// This used to report them and score them neither way, on the reasoning
+	// that a student who adds an address while testing has not got the
+	// addressing wrong. Two reviewers put the same objection: the question is
+	// whether the addressing matches the plan, and a router carrying an address
+	// the plan does not mention does not match it. Worse, an unplanned address
+	// is the raw material for impersonation -- claiming a subnet that lives
+	// somewhere else is exactly how a submission stands in for a part of the
+	// network it is not, and that has been the shape of most of the defects
+	// found in this grader.
+	//
+	// So an address outside every subnet in the lab is clutter and costs the
+	// same as one wrong interface, while an address inside a subnet the plan
+	// assigns elsewhere is a counterfeit and fails the check outright. An
+	// address inside the interface's own subnet is neither: that is the
+	// student's own choice, which the plan leaves to them.
+	var extra, counterfeit []string
+	planned := plannedSubnets(env)
 
 	for _, r := range env.Routers() {
 		out, err := env.Probe(ctx, r.ID, []string{"ip", "-o", "-4", "addr", "show", "scope", "global"})
@@ -81,20 +90,25 @@ func checkAddressing(ctx context.Context, env *Env) Result {
 			return Errored("l3.addressing_matches_plan", err)
 		}
 		have := parseIPAddrOutput(out.Stdout)
-		planned := map[string]bool{}
+		known := map[string]bool{}
 		for _, i := range r.Ifaces {
 			if i.Addr4 != "" {
-				planned[i.Name+" "+i.Addr4] = true
+				known[i.Name+" "+i.Addr4] = true
 			}
 		}
 		for iface, addrs := range have {
 			for _, a := range addrs {
-				if planned[iface+" "+a] {
+				if known[iface+" "+a] {
 					continue
 				}
-				if i, ok := r.IfaceByName(iface); ok && !i.Prescribed && i.Subnet != "" &&
-					anyInSubnet([]string{a}, i.Subnet) {
+				if i, ok := r.IfaceByName(iface); ok && ownSubnet(i, a) {
 					continue // the student's own choice inside the mandated prefix
+				}
+				if where := impersonates(planned, a); where != "" {
+					counterfeit = append(counterfeit, fmt.Sprintf(
+						"%s:%s carries %s, which is inside %s -- a subnet the plan puts on %s",
+						r.Name, iface, a, where, planned[where]))
+					continue
 				}
 				extra = append(extra, fmt.Sprintf("%s:%s carries %s, which the plan does "+
 					"not mention", r.Name, iface, a))
@@ -136,13 +150,21 @@ func checkAddressing(ctx context.Context, env *Env) Result {
 	}
 
 	sort.Strings(extra)
-	if len(bad) == 0 && len(missing) == 0 {
-		detail := fmt.Sprintf("all %d required addresses are configured", checked)
-		if len(extra) > 0 {
-			detail += fmt.Sprintf("\n%d address(es) the plan does not mention, which are not "+
-				"marked either way:\n%s", len(extra), strings.Join(truncate(extra, 6), "\n"))
-		}
-		return Pass("l3.addressing_matches_plan", Evidence{Detail: detail})
+	sort.Strings(counterfeit)
+	if len(counterfeit) > 0 {
+		return Fail("l3.addressing_matches_plan", Evidence{
+			Expected: "no router carrying an address out of a subnet that belongs elsewhere",
+			Observed: fmt.Sprintf("%d address(es) claim a subnet the plan puts on another "+
+				"interface", len(counterfeit)),
+			Detail:  strings.Join(truncate(counterfeit, 6), "\n"),
+			Hint:    "an address from somebody else's subnet makes this router answer for a part of the network it is not",
+			Command: "ip -o -4 addr show scope global",
+		})
+	}
+	if len(bad) == 0 && len(missing) == 0 && len(extra) == 0 {
+		return Pass("l3.addressing_matches_plan", Evidence{
+			Detail: fmt.Sprintf("all %d required addresses are configured, and no router "+
+				"carries an address the plan does not mention", checked)})
 	}
 	var detail strings.Builder
 	sort.Strings(missing)
@@ -153,14 +175,98 @@ func checkAddressing(ctx context.Context, env *Env) Result {
 	for _, m := range bad {
 		fmt.Fprintf(&detail, "%s:%s has %s, expected %s\n", m.Device, m.Iface, m.Got, m.Want)
 	}
-	wrong := len(bad) + len(missing)
-	return Partial("l3.addressing_matches_plan", ratio(checked-wrong, checked), Evidence{
-		Expected: fmt.Sprintf("%d addresses", checked),
-		Observed: fmt.Sprintf("%d correct", checked-wrong),
-		Detail:   strings.TrimRight(detail.String(), "\n"),
-		Hint:     "the required addresses are in the assignment's L3 topology figure",
-		Command:  "ip -o -4 addr show",
+	for _, e := range truncate(extra, 6) {
+		fmt.Fprintf(&detail, "%s\n", e)
+	}
+	wrong := len(bad) + len(missing) + len(extra)
+	return Partial("l3.addressing_matches_plan", ratio(checked-len(bad)-len(missing), checked+len(extra)), Evidence{
+		Expected: fmt.Sprintf("%d addresses and nothing else", checked),
+		Observed: fmt.Sprintf("%d of them wrong or missing, %d not in the plan",
+			wrong-len(extra), len(extra)),
+		Detail:  strings.TrimRight(detail.String(), "\n"),
+		Hint:    "the required addresses are in the assignment's L3 topology figure",
+		Command: "ip -o -4 addr show",
 	})
+}
+
+// plannedSubnets maps every subnet in the lab to a short description of where
+// it belongs, so an address found somewhere else can be named for what it is.
+func plannedSubnets(env *Env) map[string]string {
+	out := map[string]string{}
+	for _, l := range env.Topology.Links {
+		if l.Subnet == "" {
+			continue
+		}
+		var ends []string
+		for _, e := range []*model.Iface{l.A, l.B} {
+			if e != nil && e.Device != nil {
+				ends = append(ends, e.Device.ID+":"+e.Name)
+			}
+		}
+		out[l.Subnet] = strings.Join(ends, " and ")
+	}
+	for _, d := range env.Topology.Devices {
+		for _, i := range d.Ifaces {
+			if i.Subnet == "" {
+				continue
+			}
+			if _, ok := out[i.Subnet]; !ok {
+				out[i.Subnet] = d.ID + ":" + i.Name
+			}
+		}
+		if lo, ok := d.IfaceByName("lo"); ok && lo.Addr4 != "" {
+			if p, err := netip.ParsePrefix(lo.Addr4); err == nil {
+				s := p.Masked().String()
+				if _, ok := out[s]; !ok {
+					out[s] = d.ID + ":lo"
+				}
+			}
+		}
+	}
+	return out
+}
+
+// ownSubnet reports whether an address is inside the prefix this interface is
+// meant to sit in, which is the student's to choose within.
+func ownSubnet(i *model.Iface, addr string) bool {
+	if i.Subnet != "" && anyInSubnet([]string{addr}, i.Subnet) {
+		return true
+	}
+	// A link the plan addresses but does not prescribe -- an inter-AS session,
+	// whose numbering is agreed with the neighbour rather than dictated.
+	if i.Link != nil && i.Link.Subnet != "" && anyInSubnet([]string{addr}, i.Link.Subnet) {
+		return true
+	}
+	if i.Addr4 != "" {
+		if p, err := netip.ParsePrefix(i.Addr4); err == nil &&
+			anyInSubnet([]string{addr}, p.Masked().String()) {
+			return true
+		}
+	}
+	return false
+}
+
+// impersonates names the planned subnet an address has been taken from, if any.
+func impersonates(planned map[string]string, addr string) string {
+	ip, err := netip.ParsePrefix(addr)
+	if err != nil {
+		a, err2 := netip.ParseAddr(addr)
+		if err2 != nil {
+			return ""
+		}
+		ip = netip.PrefixFrom(a, a.BitLen())
+	}
+	best, bestBits := "", -1
+	for s := range planned {
+		p, err := netip.ParsePrefix(s)
+		if err != nil || p.Addr().Is4() != ip.Addr().Is4() {
+			continue
+		}
+		if p.Contains(ip.Addr()) && p.Bits() > bestBits {
+			best, bestBits = s, p.Bits()
+		}
+	}
+	return best
 }
 
 // anyInSubnet reports whether any of the configured addresses falls inside the

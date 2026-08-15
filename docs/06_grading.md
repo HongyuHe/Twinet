@@ -129,7 +129,7 @@ Library, mapped to the COS-461 questions:
 |---|---|
 | `l2.vlan_isolation` | admin↔admin and patient↔patient reachable; admin↔patient only via the L3 gateway (assert the traceroute has the gateway hop) |
 | `l2.gateway_configured` | hosts' default gateway is the prescribed router |
-| `l3.addressing_matches_plan` | every interface matches the manifest's `expected` addressing (Q1.2) |
+| `l3.addressing_matches_plan` | every interface matches the manifest's `expected` addressing, and no router carries an address the plan does not mention (Q1.2) |
 | `ospf.full_adjacency` | all OSPF neighbours `Full` |
 | `ospf.subnets_advertised` | every required subnet, incl. DNS/measurement/matrix, in the OSPF LSDB |
 | `ospf.ecmp_paths` | compute the shortest-path DAG from `show ip ospf … json` **and** confirm empirically (repeated traceroutes / marker packets) that exactly the three prescribed `ATL`↔`BOS` paths carry traffic (Q1.3) |
