@@ -1071,18 +1071,37 @@ func interiorLinkEnds(t *testing.T, dir string, as int) (a, b, aIf, bIf string) 
 	t.Helper()
 	routers := routersOf(t, dir, as)
 	short := func(id string) string { return id[strings.LastIndexByte(id, '/')+1:] }
+	// Not a link between the two datacentre gateways.
+	//
+	// Breaking that one takes the 6in4 question down with it, which is honest
+	// collateral but makes the case about two questions instead of one. Any
+	// other interior link isolates the adjacency question.
+	ifaces := map[string][]string{}
+	gateway := map[string]bool{}
 	for _, dev := range routers {
 		out, err := twinet(t, "exec", "-m", dir, dev, "--", "ls", "/sys/class/net")
 		if err != nil {
 			continue
 		}
+		ifaces[dev] = strings.Fields(out)
+		for _, f := range ifaces[dev] {
+			if strings.HasPrefix(f, "tun") {
+				gateway[dev] = true
+			}
+		}
+	}
+	for _, dev := range routers {
+		if gateway[dev] {
+			continue
+		}
+		out := strings.Join(ifaces[dev], " ")
 		for _, f := range strings.Fields(out) {
 			if !strings.HasPrefix(f, "port_") {
 				continue
 			}
 			peer := strings.TrimPrefix(f, "port_")
 			for _, other := range routers {
-				if short(other) == peer {
+				if short(other) == peer && !gateway[other] {
 					return dev, other, f, "port_" + short(dev)
 				}
 			}
