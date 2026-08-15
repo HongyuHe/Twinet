@@ -286,6 +286,21 @@ reached students, and each motivated a permanent test.
     peer's cost nothing. A path's peerId is the session it came in on and no
     policy can change it; provenance is read from there now.
 
+29. **A reply is not proof the right machine answered.** Internal reachability
+    was established by pinging. A DNAT rule on the source redirects the echo
+    requests for one host to another, and conntrack rewrites the reply so the
+    source sees a perfectly ordinary answer from the address it asked about.
+    Each host's own count of echo requests the kernel delivered to it is now
+    read before and after the matrix, and a host that answered probes it never
+    received fails the question by name.
+
+    What this does *not* establish: a submission controls every host in its own
+    AS, so it can redirect an individual probe and leave the destination's
+    count rising from the other seven sources. The wholesale case is caught;
+    the single-pair case is not, and no evidence gathered inside a network its
+    owner controls could catch it. It is recorded here rather than left to be
+    discovered.
+
 ## Environment findings
 
 - **Jumbo frames are unavailable.** Raising `eno2` to MTU 9000 dropped the

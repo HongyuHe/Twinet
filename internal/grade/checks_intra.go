@@ -813,6 +813,21 @@ func checkInternalReachability(ctx context.Context, env *Env) Result {
 			fmt.Errorf("AS %d has no addressed host to probe", env.AS))
 	}
 
+	// What each host received, before and after.
+	//
+	// A ping proves that something answered, not that the intended host did.
+	// Redirecting echo requests for one host to another with a DNAT rule --
+	// conntrack rewrites the reply on the way back, so the source sees a
+	// perfectly ordinary answer from the address it asked about -- left every
+	// probe succeeding while the host in question received nothing at all.
+	// The kernel's own count of echo requests delivered to it is not something
+	// a route or a NAT rule can arrange: if it did not go up, the packets did
+	// not arrive there.
+	//
+	// Read once per host rather than once per pair, so 56 probes cost 16 extra
+	// reads and not 112.
+	echoesBefore := receivedEchoes(ctx, env, hosts)
+
 	var (
 		mu     sync.Mutex
 		failed []string
@@ -839,9 +854,44 @@ func checkInternalReachability(ctx context.Context, env *Env) Result {
 	wg.Wait()
 
 	tried := len(pairs)
+	// Every host that was probed must have seen the probes.
+	echoesAfter := receivedEchoes(ctx, env, hosts)
+	var unseen []string
+	sentTo := map[string]int{}
+	for _, p := range pairs {
+		sentTo[p.to.ID]++
+	}
+	for _, h := range hosts {
+		want, ok := sentTo[h.ID]
+		if !ok || want == 0 {
+			continue
+		}
+		before, okB := echoesBefore[h.ID]
+		after, okA := echoesAfter[h.ID]
+		if !okB || !okA {
+			continue // the counter could not be read; the ping stands on its own
+		}
+		if after <= before {
+			unseen = append(unseen, fmt.Sprintf("%s answered %d probe(s) it never received: "+
+				"something else is replying for it", h.Name, want))
+		}
+	}
+	if len(unseen) > 0 {
+		sort.Strings(unseen)
+		return Fail("dataplane.internal_reachability", Evidence{
+			Expected: "every host reachable from every other, and the packets arriving at the " +
+				"host they were addressed to",
+			Observed: fmt.Sprintf("%d host(s) never saw the traffic addressed to them", len(unseen)),
+			Detail:   strings.Join(truncate(unseen, 6), "\n"),
+			Hint: "a reply proves something answered, not that the right machine did; check " +
+				"for address translation on the path",
+			Command: "ping; /proc/net/snmp",
+		})
+	}
 	if len(failed) == 0 {
 		return Pass("dataplane.internal_reachability", Evidence{
-			Observed: fmt.Sprintf("all %d ordered host pairs reach each other", tried)})
+			Observed: fmt.Sprintf("all %d ordered host pairs reach each other, and every host "+
+				"received the traffic addressed to it", tried)})
 	}
 	sort.Strings(failed)
 	return Partial("dataplane.internal_reachability", ratio(tried-len(failed), tried), Evidence{
@@ -851,6 +901,57 @@ func checkInternalReachability(ctx context.Context, env *Env) Result {
 		Hint:     "every internal subnet, including the router-host links, must be advertised in OSPF",
 		Command:  "ping",
 	})
+}
+
+// receivedEchoes reads each host's count of ICMP echo requests delivered to it.
+//
+// The kernel keeps it; nothing a submission configures can raise it without the
+// packets actually arriving.
+func receivedEchoes(ctx context.Context, env *Env, hosts []*model.Device) map[string]int {
+	out := map[string]int{}
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 16)
+	for _, h := range hosts {
+		wg.Add(1)
+		go func(h *model.Device) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			res, err := env.Probe(ctx, h.ID, []string{"cat", "/proc/net/snmp"})
+			if err != nil || res.ExitCode != 0 {
+				return
+			}
+			if n, ok := icmpInEchos(res.Stdout); ok {
+				mu.Lock()
+				out[h.ID] = n
+				mu.Unlock()
+			}
+		}(h)
+	}
+	wg.Wait()
+	return out
+}
+
+// icmpInEchos pulls InEchos out of /proc/net/snmp, by name rather than by
+// column: the set of counters differs between kernels, and counting fields
+// would read a different one on a different machine.
+func icmpInEchos(body string) (int, bool) {
+	lines := strings.Split(body, "\n")
+	for i := 0; i+1 < len(lines); i++ {
+		if !strings.HasPrefix(lines[i], "Icmp:") {
+			continue
+		}
+		names := strings.Fields(lines[i])
+		values := strings.Fields(lines[i+1])
+		for j, n := range names {
+			if n == "InEchos" && j < len(values) {
+				v, err := strconv.Atoi(values[j])
+				return v, err == nil
+			}
+		}
+	}
+	return 0, false
 }
 
 // traceHops counts the hops between two hosts.
