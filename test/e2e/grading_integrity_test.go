@@ -162,6 +162,7 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 	// to find them again in a lab they have just changed.
 	var counterfeit string
 	var blackholed struct{ router, nh string }
+	var ecmpBlock struct{ router, addr string }
 
 	cases := []struct {
 		name string
@@ -481,6 +482,36 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 			},
 		},
 		{
+			// Installed paths that carry nothing.
+			//
+			// The equal-cost question is decided from the forwarding tables,
+			// which is the only honest way to establish that a path exists --
+			// sampling traceroutes can miss a live one. What the tables cannot
+			// say is whether anything gets through, and a rule dropping this
+			// exact traffic left every prescribed next hop installed, every
+			// packet discarded, and the mark untouched.
+			name:     "the equal-cost paths installed but dropping every packet",
+			question: "q1.3",
+			undo: func(t *testing.T) {
+				if ecmpBlock.router == "" {
+					return
+				}
+				_, _ = twinet(t, "exec", "-m", dir, ecmpBlock.router, "--", "iptables", "-D",
+					"OUTPUT", "-p", "icmp", "-d", ecmpBlock.addr, "-j", "DROP")
+			},
+			apply: func(t *testing.T) {
+				router, addr := ecmpEndpoints(t, dir, 3)
+				ecmpBlock = struct{ router, addr string }{router, addr}
+				t.Logf("dropping ICMP from %s to %s, the far end of the equal-cost paths",
+					router, addr)
+				if out, err := twinet(t, "exec", "-m", dir, router, "--", "iptables", "-I",
+					"OUTPUT", "1", "-p", "icmp", "-d", addr, "-j", "DROP"); err != nil {
+					t.Fatalf("installing the block: %v\n%s", err, out)
+				}
+				time.Sleep(5 * time.Second)
+			},
+		},
+		{
 			// A next hop that is present and discards everything.
 			//
 			// The check asked whether the router had a route to the next hop.
@@ -727,6 +758,44 @@ func findNotFoundPrefix(t *testing.T, dir string, as int) string {
 		}
 	}
 	return ""
+}
+
+// ecmpEndpoints returns the two ends of the equal-cost question: the router the
+// rubric measures from, and the loopback address it measures to.
+//
+// Read from the rubric rather than hardcoded, so the mutation follows the lab
+// rather than a memory of it.
+func ecmpEndpoints(t *testing.T, dir string, as int) (router, addr string) {
+	t.Helper()
+	from, to := "ATL", "BOS"
+	raw, err := os.ReadFile(filepath.Join(dir, "rubric", "cos461.yaml"))
+	if err == nil {
+		body := string(raw)
+		if i := strings.Index(body, "ospf.ecmp_paths"); i >= 0 {
+			for _, line := range strings.Split(body[i:], "\n") {
+				f := strings.Fields(strings.TrimSpace(line))
+				if len(f) == 2 && f[0] == "a:" {
+					from = strings.Trim(f[1], `"`)
+				}
+				if len(f) == 2 && f[0] == "b:" {
+					to = strings.Trim(f[1], `"`)
+					break
+				}
+			}
+		}
+	}
+	out, err := twinet(t, "exec", "-m", dir, "as"+itoa(as)+"/"+to, "--",
+		"sh", "-c", "ip -4 -o addr show dev lo scope global | awk '{print $4}' | head -1")
+	if err != nil {
+		t.Fatalf("reading %s's loopback: %v", to, err)
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if s := strings.TrimSpace(line); strings.Count(s, ".") == 3 {
+			return "as" + itoa(as) + "/" + from, strings.SplitN(s, "/", 2)[0]
+		}
+	}
+	t.Fatalf("%s has no loopback address", to)
+	return "", ""
 }
 
 // internalNextHop finds a router of this AS and an address it uses as the next

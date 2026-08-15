@@ -464,11 +464,50 @@ func checkECMP(ctx context.Context, env *Env) Result {
 		sort.Strings(extra)
 	}
 
+	// And the paths have to carry a packet.
+	//
+	// Everything above reads the forwarding tables, which say exactly which
+	// next hops are installed and are the only honest way to establish that a
+	// path exists -- sampling traceroutes can miss a live path entirely. What
+	// the tables cannot say is whether anything gets through: a firewall rule
+	// dropping this very traffic leaves every prescribed next hop installed
+	// and every packet discarded, and that scored full marks for a question
+	// about how traffic is carried. So the tables decide which paths exist and
+	// a probe decides whether they work; neither substitutes for the other.
+	var dead string
+	if src, ok := env.Device(from); ok {
+		addr := addrOnly(lo.Addr4)
+		reached, err := env.reaches(ctx, src.ID, addr)
+		switch {
+		case err != nil:
+			return Errored("ospf.ecmp_paths", fmt.Errorf(
+				"probing %s from %s: %w", addr, from, err))
+		case !reached:
+			dead = fmt.Sprintf("%s cannot reach %s (%s) at all, so none of the installed "+
+				"paths is carrying anything", from, to, addr)
+			fmt.Fprintf(&detail, "%s\n", dead)
+		}
+	}
+
 	got := make([]string, 0)
 	for h := range nextHops[from] {
 		got = append(got, h)
 	}
 	sort.Strings(got)
+
+	if dead != "" {
+		// Installed and useless is worse than partially installed: the marks
+		// for this question are for traffic taking the intended paths.
+		return Partial("ospf.ecmp_paths", 0, Evidence{
+			Expected: fmt.Sprintf("%d equal-cost paths from %s to %s, carrying traffic",
+				len(wantPaths), from, to),
+			Observed: dead,
+			Detail:   strings.TrimRight(detail.String(), "\n"),
+			Hint: "the routes are installed, so this is not a routing problem: something " +
+				"between the two is discarding the packets",
+			Command: "show ip route json; ping",
+		})
+	}
 
 	if present == len(wantPaths) && len(extra) == 0 {
 		return Pass("ospf.ecmp_paths", Evidence{
