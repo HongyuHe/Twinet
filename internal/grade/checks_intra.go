@@ -1085,6 +1085,7 @@ func checkInternalReachability(ctx context.Context, env *Env) Result {
 	}
 	type probe struct {
 		from, to *model.Device
+		srcIface string // set when probing from a shared service container
 	}
 	var pairs []probe
 	for _, a := range hosts {
@@ -1092,7 +1093,31 @@ func checkInternalReachability(ctx context.Context, env *Env) Result {
 			if a.ID == b.ID || addrOf[b.ID] == "" {
 				continue
 			}
-			pairs = append(pairs, probe{a, b})
+			pairs = append(pairs, probe{from: a, to: b})
+		}
+	}
+
+	// The service networks, probed from the service's side.
+	//
+	// The measurement and DNS subnets are part of the assignment and were
+	// graded only by whether OSPF carried the prefix -- no packet was ever sent
+	// to or from them, and the counter on the measurement container read zero
+	// after every run this project has ever done. That left the whole of a
+	// service network's data plane resting on a routing table entry: a
+	// reviewer moved the measurement prefix onto a dummy interface on another
+	// router, and although the network was then unreachable the reachability
+	// check never noticed, because it only ever probed hosts.
+	//
+	// The probe runs from the service container, which the platform owns and a
+	// student cannot touch, so the source of the traffic is not something a
+	// submission can arrange. Its reply has to find its way back through the
+	// service subnet, which is the part that has to be advertised.
+	for _, s := range serviceAttachments(env) {
+		for _, h := range hosts {
+			if addrOf[h.ID] == "" {
+				continue
+			}
+			pairs = append(pairs, probe{from: s.Device, to: h, srcIface: s.Iface})
 		}
 	}
 	if len(pairs) == 0 {
@@ -1128,12 +1153,20 @@ func checkInternalReachability(ctx context.Context, env *Env) Result {
 			sem <- struct{}{}
 			defer func() { <-sem }()
 			addr := addrOf[p.to.ID]
-			res, err := env.Probe(ctx, p.from.ID,
-				[]string{"ping", "-c", "2", "-W", "2", "-i", "0.2", addr})
+			args := []string{"ping", "-c", "2", "-W", "2", "-i", "0.2"}
+			if p.srcIface != "" {
+				args = append(args, "-I", p.srcIface)
+			}
+			args = append(args, addr)
+			res, err := env.Probe(ctx, p.from.ID, args)
 			if err != nil || res.ExitCode != 0 {
+				from := p.from.Name
+				if p.srcIface != "" {
+					from = p.from.ID + " (the " + p.from.Name + " network)"
+				}
 				mu.Lock()
 				failed = append(failed, fmt.Sprintf("%s cannot reach %s (%s)",
-					p.from.Name, p.to.Name, addr))
+					from, p.to.Name, addr))
 				mu.Unlock()
 			}
 		}(p)
@@ -1177,8 +1210,8 @@ func checkInternalReachability(ctx context.Context, env *Env) Result {
 	}
 	if len(failed) == 0 {
 		return Pass("dataplane.internal_reachability", Evidence{
-			Observed: fmt.Sprintf("all %d ordered host pairs reach each other, and every host "+
-				"received the traffic addressed to it", tried)})
+			Observed: fmt.Sprintf("all %d ordered probes arrive, host to host and from every "+
+				"service network, and every host received the traffic addressed to it", tried)})
 	}
 	sort.Strings(failed)
 	return Partial("dataplane.internal_reachability", ratio(tried-len(failed), tried), Evidence{
@@ -1190,8 +1223,53 @@ func checkInternalReachability(ctx context.Context, env *Env) Result {
 	})
 }
 
-// receivedEchoes reads each host's count of ICMP echo requests delivered to it.
+// svcAttachment is one shared service container's connection into an AS.
+type svcAttachment struct {
+	Device *model.Device
+	Iface  string
+	Addr   string
+}
+
+// serviceAttachments finds the platform's service containers that hang off
+// this AS, together with the interface facing it.
 //
+// A service container is wired to every AS at once, so which interface it uses
+// decides which network the traffic goes through; probing without pinning it
+// would let a working neighbour's link stand in for a broken one.
+func serviceAttachments(env *Env) []svcAttachment {
+	var out []svcAttachment
+	for _, d := range env.Topology.Devices {
+		if d.Kind != model.KindService {
+			continue
+		}
+		for _, i := range d.Ifaces {
+			if i.Link == nil || i.Addr4 == "" || i.Name == "lo" {
+				continue
+			}
+			other := i.Link.A
+			if other == i {
+				other = i.Link.B
+			}
+			if other == nil || other.Device == nil || other.Device.ASN != env.AS {
+				continue
+			}
+			addr := i.Addr4
+			if j := strings.IndexByte(addr, '/'); j > 0 {
+				addr = addr[:j]
+			}
+			out = append(out, svcAttachment{Device: d, Iface: i.Name, Addr: addr})
+		}
+	}
+	sort.Slice(out, func(a, b int) bool {
+		if out[a].Device.ID != out[b].Device.ID {
+			return out[a].Device.ID < out[b].Device.ID
+		}
+		return out[a].Iface < out[b].Iface
+	})
+	return out
+}
+
+// receivedEchoes reads each host's count of ICMP echo requests delivered to it.//
 // The kernel keeps it; nothing a submission configures can raise it without the
 // packets actually arriving.
 func receivedEchoes(ctx context.Context, env *Env, hosts []*model.Device) map[string]int {
