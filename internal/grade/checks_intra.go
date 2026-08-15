@@ -178,11 +178,21 @@ func checkAddressing(ctx context.Context, env *Env) Result {
 	for _, e := range truncate(extra, 6) {
 		fmt.Fprintf(&detail, "%s\n", e)
 	}
-	wrong := len(bad) + len(missing) + len(extra)
-	return Partial("l3.addressing_matches_plan", ratio(checked-len(bad)-len(missing), checked+len(extra)), Evidence{
+	wrong := len(bad) + len(missing)
+	// Two claims, weighted equally, because they are not the same kind of
+	// thing. "Every prescribed address is there" is a count, and being short
+	// one of forty-nine is being short one. "And nothing else is" is a property
+	// of the whole system: one unplanned address falsifies it completely, and
+	// scoring it as a fiftieth of the mark made a deduction too small to print.
+	prescribed := ratio(checked-wrong, checked)
+	clean := 1.0
+	if len(extra) > 0 {
+		clean = 0
+	}
+	return Partial("l3.addressing_matches_plan", 0.5*prescribed+0.5*clean, Evidence{
 		Expected: fmt.Sprintf("%d addresses and nothing else", checked),
 		Observed: fmt.Sprintf("%d of them wrong or missing, %d not in the plan",
-			wrong-len(extra), len(extra)),
+			wrong, len(extra)),
 		Detail:  strings.TrimRight(detail.String(), "\n"),
 		Hint:    "the required addresses are in the assignment's L3 topology figure",
 		Command: "ip -o -4 addr show",
