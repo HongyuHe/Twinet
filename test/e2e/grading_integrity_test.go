@@ -476,6 +476,43 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 			},
 		},
 		{
+			// A route you announce yourself is not a route you preserved.
+			//
+			// The question asks that an origin nobody has signed is still
+			// carried rather than filtered away. It was marked by looking for
+			// the prefix in every router's table, and a submission that
+			// announced the prefix itself -- to Null0, so nothing could ever
+			// reach it -- had it in every table and passed. The AS path can be
+			// made to say anything; where the route entered cannot.
+			name:     "the unsigned prefix announced locally instead of carried",
+			question: "q2.6",
+			undo: func(t *testing.T) {
+				prefix := notFoundPrefix(t, dir, 3)
+				router := routersOf(t, dir, 3)[0]
+				vtysh(t, dir, router, "configure terminal",
+					"router bgp 3",
+					" address-family ipv4 unicast",
+					"  no network "+prefix,
+					" exit-address-family",
+					"exit",
+					"no ip route "+prefix+" Null0",
+					"end")
+			},
+			apply: func(t *testing.T) {
+				prefix := notFoundPrefix(t, dir, 3)
+				router := routersOf(t, dir, 3)[0]
+				t.Logf("originating %s on %s, pointed at Null0", prefix, router)
+				vtysh(t, dir, router, "configure terminal",
+					"ip route "+prefix+" Null0",
+					"router bgp 3",
+					" address-family ipv4 unicast",
+					"  network "+prefix,
+					" exit-address-family",
+					"end")
+				time.Sleep(15 * time.Second)
+			},
+		},
+		{
 			// One direction of one layer-2 pair.
 			//
 			// The same-VLAN half of the VLAN question probed i<j -- one
@@ -583,6 +620,10 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 // something false about networks.
 func unrelated(id, broken string) bool {
 	coupled := map[string][]string{
+		// Announcing somebody else's prefix is the subject of two questions at
+		// once: the one about originating only your own, and the one about
+		// preserving an unsigned origin rather than replacing it.
+		"q2.6": {"q2.2"},
 		// Everything that needs routes to exist depends on the routing ones.
 		"q2.1": {"q2.2", "q2.3", "q2.4", "q2.5", "q2.6", "q1.2", "q1.3"},
 		"q2.3": {"q2.4", "q2.5", "q2.6"},
@@ -594,6 +635,39 @@ func unrelated(id, broken string) bool {
 		}
 	}
 	return true
+}
+
+// notFoundPrefix is a prefix this AS carries whose origin nobody has signed,
+// which is what the preservation question is about.
+//
+// It is read from the router rather than assumed, so the test does not go
+// quietly stale if the lab publishes a ROA for it later, and only prefixes
+// learned from somewhere else count -- a prefix this AS originates is not one
+// it was asked to preserve.
+func notFoundPrefix(t *testing.T, dir string, as int) string {
+	t.Helper()
+	for _, router := range routersOf(t, dir, as) {
+		out, err := twinet(t, "exec", "-m", dir, router, "--", "vtysh",
+			"-c", "show bgp ipv4 unicast rpki notfound")
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(out, "\n") {
+			f := strings.Fields(line)
+			// "N*> 1.0.0.0/8  179.2.3.1  75  0  2 1 i"
+			if len(f) < 7 || !strings.HasPrefix(f[0], "N") || !strings.Contains(f[1], "/") {
+				continue
+			}
+			// The last field is the origin code; anything before it and after
+			// the weight is the AS path. An empty path is a route of our own.
+			if f[len(f)-2] == f[5] {
+				continue
+			}
+			return f[1]
+		}
+	}
+	t.Fatalf("AS %d carries no unsigned origin, so there is nothing to preserve", as)
+	return ""
 }
 
 // firstIBGPPeer finds a neighbour in the router's own AS.

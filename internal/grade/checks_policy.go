@@ -1329,6 +1329,9 @@ func missingNotFoundRoutes(ctx context.Context, env *Env) ([]string, int, error)
 	// concludes from what it does not find, so an unreadable router is one
 	// whose missing routes would also not have been found.
 	haveOn := map[string]map[string]bool{}
+	// Where the selected route came from, per prefix. A route this AS
+	// originated itself is not a route it preserved.
+	forged := map[string][]string{}
 	for _, r := range routers {
 		tbl, err := bgpTable(ctx, env, r.Name)
 		if err != nil {
@@ -1340,8 +1343,20 @@ func missingNotFoundRoutes(ctx context.Context, env *Env) ([]string, int, error)
 			for _, e := range entries {
 				// Selected, not merely present: a route the router holds and
 				// does not use carries no traffic.
-				if e.IsBest() {
-					seen[prefix] = true
+				if !e.IsBest() {
+					continue
+				}
+				seen[prefix] = true
+				// Originated here, not learned from anybody.
+				//
+				// A submission that filtered the real route away and then
+				// announced the same prefix itself -- to Null0, with a forged
+				// AS path -- had the prefix selected on every router and
+				// passed. The AS path can be written to say anything; where
+				// the route entered cannot. FRR gives a locally sourced route
+				// a next hop of 0.0.0.0.
+				if locallySourced(e) {
+					forged[prefix] = append(forged[prefix], r.Name)
 				}
 			}
 		}
@@ -1368,9 +1383,57 @@ func missingNotFoundRoutes(ctx context.Context, env *Env) ([]string, int, error)
 			sort.Strings(without)
 			missing = append(missing, fmt.Sprintf("%s (AS %d) is not selected on %s",
 				as.Block, asn, strings.Join(truncate(without, 4), ", ")))
+			continue
+		}
+		if who := forged[as.Block]; len(who) > 0 {
+			sort.Strings(who)
+			missing = append(missing, fmt.Sprintf(
+				"%s (AS %d) is selected, but %s originates it rather than having learned it: "+
+					"a route you announce yourself is not the route you were asked to preserve",
+				as.Block, asn, strings.Join(truncate(who, 4), ", ")))
+			continue
+		}
+		// And it has to carry traffic.
+		//
+		// The whole point of not over-filtering an unsigned origin is that the
+		// network stays reachable. A route to Null0 is selected on every
+		// router and reaches nobody, and so is a route whose next hop does not
+		// resolve; both used to pass. The probe is the only thing that can
+		// tell a preserved route from a convincing imitation of one.
+		src, dst := hostIn(env.Topology, env.AS), hostIn(env.Topology, asn)
+		if src == nil || dst == nil {
+			continue
+		}
+		addr := siteAddr(dst)
+		if addr == "" {
+			continue
+		}
+		ok, err := env.reaches(ctx, src.ID, addr)
+		if err != nil {
+			return nil, 0, fmt.Errorf("probing %s from %s: %w", addr, src.ID, err)
+		}
+		if !ok {
+			missing = append(missing, fmt.Sprintf(
+				"%s (AS %d) is in every table, but %s cannot reach %s: the route is preserved "+
+					"in name only", as.Block, asn, src.Name, addr))
 		}
 	}
 	return missing, checked, nil
+}
+
+// locallySourced reports whether a route was originated by this AS rather than
+// learned from a neighbour. FRR gives such a route a next hop of 0.0.0.0.
+func locallySourced(e bgpRoute) bool {
+	hops := e.NextHops()
+	if len(hops) == 0 {
+		return false
+	}
+	for _, h := range hops {
+		if h != "0.0.0.0" {
+			return false
+		}
+	}
+	return true
 }
 
 // roaPrefixes is the set of prefixes the validator has a ROA for.
