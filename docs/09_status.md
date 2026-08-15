@@ -164,6 +164,20 @@ reached students, and each motivated a permanent test.
     Found by the advanced course's new discrimination suite on its first run,
     which is what that suite is for.
 
+15. **One multicast site was never tested as a receiver.** Delivery sent from
+    one host and required every other one to receive; the sender was always the
+    same host, so that site was never on the receiving end. One `iptables` rule
+    on its own router -- a thing a student can write, because a student has root
+    in their containers -- blocked the group to it for full marks. The
+    no-flooding half had the mirror hole: the source and the single receiver
+    were never bystanders, so a submission flooding to exactly those two passed.
+    Both now run two rounds with the source moved, and a host covered by
+    neither makes the check say it cannot give a verdict.
+
+16. **The multicast rubric's only discrimination test never ran.** It was
+    guarded on an environment variable nothing sets. There is now a suite that
+    runs by default, and its first execution found the two holes above.
+
 ## Environment findings
 
 - **Jumbo frames are unavailable.** Raising `eno2` to MTU 9000 dropped the
