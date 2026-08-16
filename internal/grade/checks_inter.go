@@ -291,9 +291,7 @@ func checkOwnPrefix(ctx context.Context, env *Env) Result {
 		}
 		for prefix, entries := range tbl.Table() {
 			for _, e := range entries {
-				// An empty AS path on a locally injected route means we
-				// originate it.
-				if strings.TrimSpace(e.Path) == "" {
+				if e.Originated() {
 					originated[prefix] = true
 				}
 			}
@@ -317,7 +315,11 @@ func checkOwnPrefix(ctx context.Context, env *Env) Result {
 		}
 		for prefix, entries := range adv.Table() {
 			for _, e := range entries {
-				if strings.TrimSpace(e.Path) != "" {
+				// The advertised view carries no peer, so origination is
+				// decided from the tables above; an empty path here still
+				// means the same thing and catches a prefix that only appears
+				// on the way out.
+				if !originated[prefix] && !e.Originated() {
 					continue // somebody else's route, passing through
 				}
 				originated[prefix] = true
@@ -652,8 +654,8 @@ func checkNoTransit(ctx context.Context, env *Env) Result {
 				sawOwn = true
 			}
 			for _, e := range entries {
-				// A route we originate has an empty path and may go anywhere.
-				if strings.TrimSpace(e.Path) == "" {
+				// A route we originate may go anywhere.
+				if e.Originated() {
 					continue
 				}
 				// Otherwise it came from someone: if it came from a peer or
