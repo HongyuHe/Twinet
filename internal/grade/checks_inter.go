@@ -222,6 +222,33 @@ func checkIBGPFullMesh(ctx context.Context, env *Env) Result {
 	})
 }
 
+// refreshExternal asks each router to re-send its table to every external
+// neighbour it has, so each session has to carry a message while the check is
+// watching. It disturbs nothing: the peer re-sends routes the receiver already
+// has.
+func refreshExternal(ctx context.Context, env *Env, byRouter map[string][]string) {
+	var wg sync.WaitGroup
+	for router, peers := range byRouter {
+		if len(peers) == 0 {
+			continue
+		}
+		wg.Add(1)
+		go func(router string, peers []string) {
+			defer wg.Done()
+			args := []string{"vtysh"}
+			for _, p := range peers {
+				args = append(args, "-c", "clear bgp "+p+" soft in")
+			}
+			_, _ = env.Probe(ctx, model.DeviceID(env.AS, router), args)
+		}(router, peers)
+	}
+	wg.Wait()
+	select {
+	case <-ctx.Done():
+	case <-time.After(5 * time.Second):
+	}
+}
+
 func checkEBGPEstablished(ctx context.Context, env *Env) Result {
 	// The model knows exactly which external sessions should exist.
 	type want struct {
@@ -251,6 +278,21 @@ func checkEBGPEstablished(ctx context.Context, env *Env) Result {
 	if len(wanted) == 0 {
 		return Errored("bgp.ebgp_established", fmt.Errorf("AS %d has no external links in the lab", env.AS))
 	}
+
+	// "Established" is a memory here too.
+	//
+	// A session whose packets are being discarded stays Established until the
+	// hold timer expires, which is longer than a grading run: dropping both
+	// directions of the TCP flow left every external session reported up and
+	// carrying nothing. Each router is asked to send a route refresh first --
+	// a real message that has to cross the connection and be answered -- and
+	// the counts are compared either side of it.
+	before := bgpSummaries(ctx, env, env.Routers())
+	peersOf := map[string][]string{}
+	for _, w := range wanted {
+		peersOf[w.router] = append(peersOf[w.router], w.peerAddr)
+	}
+	refreshExternal(ctx, env, peersOf)
 
 	byRouter := map[string]bgpSummaryJSON{}
 	up := 0
@@ -290,6 +332,14 @@ func checkEBGPEstablished(ctx context.Context, env *Env) Result {
 				problems = append(problems, fmt.Sprintf(
 					"%s reports a session with AS %d at %s, but %s", w.router, w.peerAS,
 					w.peerAddr, why))
+				continue
+			}
+			if was, had := before[w.router].IPv4Unicast.Peers[w.peerAddr]; had &&
+				p.MsgRcvd <= was.MsgRcvd {
+				problems = append(problems, fmt.Sprintf(
+					"%s -> AS %d (%s) says Established, but nothing arrived from it while it "+
+						"was asked to send: the session is held open by a timer that has not "+
+						"expired yet, and carries nothing", w.router, w.peerAS, w.peerAddr))
 				continue
 			}
 			up++
