@@ -1137,6 +1137,34 @@ func checkTransitForCustomers(ctx context.Context, env *Env) Result {
 			"AS %d has no customers, so it owes nobody transit", env.AS))
 	}
 
+	// What the AS as a whole has learned from outside.
+	//
+	// What a customer is owed was taken from the table of the router holding
+	// its session, and that table is the submission's to empty: denying
+	// everything inbound on every session left one router holding only this
+	// AS's own prefix, advertising exactly that to its customers, and the
+	// check reporting that every selected route had been passed on. Nothing
+	// had been selected. A customer buys the internet, and the internet is
+	// what the AS knows, not what one of its routers has been left with.
+	own := ""
+	if as, ok := env.Topology.ASes[env.AS]; ok {
+		own = as.Block
+	}
+	asWide := map[string]string{} // prefix -> the path the AS has for it
+	for _, r := range env.Routers() {
+		tbl, err := bgpTable(ctx, env, r.Name)
+		if err != nil {
+			continue
+		}
+		for prefix, entries := range tbl.Table() {
+			for _, e := range entries {
+				if e.IsBest() && strings.TrimSpace(e.Path) != "" {
+					asWide[prefix] = strings.TrimSpace(e.Path)
+				}
+			}
+		}
+	}
+
 	var missing []string
 	var silent []string
 	var dropped []string
@@ -1203,6 +1231,25 @@ func checkTransitForCustomers(ctx context.Context, env *Env) Result {
 				"%s withholds %d of %d selected route(s) from the customer at %s: %s",
 				sess.Router, len(absent), len(owed), sess.Addr,
 				strings.Join(truncate(absent, 6), ", ")))
+		}
+		// And what the router never selected in the first place.
+		var short []string
+		for p, path := range asWide {
+			if _, has := owed[p]; has || p == own {
+				continue
+			}
+			// A route this customer taught us is not owed back to them.
+			if sess.ASN != 0 && pathContainsASN(path, sess.ASN) {
+				continue
+			}
+			short = append(short, p)
+		}
+		if len(short) > 0 {
+			sort.Strings(short)
+			missing = append(missing, fmt.Sprintf(
+				"%s holds %d fewer destination(s) than the rest of this AS has learned, so the "+
+					"customer at %s receives less than the internet: %s",
+				sess.Router, len(short), sess.Addr, strings.Join(truncate(short, 4), ", ")))
 		}
 
 		// And then the transit itself.
