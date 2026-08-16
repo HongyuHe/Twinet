@@ -408,6 +408,20 @@ reached students, and each motivated a permanent test.
     be arranged anywhere: the answer is a reset, and the far side's own count of
     resets it has sent records that the attempt arrived. A datacentre that can
     only be pinged is not reachable in any sense the assignment means.
+42. **A route in the table and no packet on the wire.** Whether a next hop was
+    usable was decided from what the routing daemon believes, and the daemon is
+    not the forwarding plane. A policy rule sending a destination to another
+    table, with a discard in it, leaves the route in zebra's main table exactly
+    as it should be while the kernel drops the packet: `ip rule add to X lookup
+    123` and a blackhole in 123 was measured as a fully resolved next hop and an
+    unreachable network, for no loss of marks. The kernel is now asked how it
+    would forward, and every router has to reach a host in every other system it
+    holds routes for. Those hosts belong to other people, so nothing the
+    submission does makes them answer. The probe is sourced from the router's
+    loopback: its own choice for a packet leaving over an inter-AS link is that
+    link's numbering, which is advertised nowhere, so the answer would have no
+    way back and a healthy router would read as unable to reach half the
+    internet.
 
 ## Environment findings
 

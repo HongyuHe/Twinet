@@ -788,6 +788,29 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 			},
 		},
 		{
+			// A route in the table and no packet on the wire.
+			//
+			// A policy rule sending one destination to another table, with a
+			// discard in it, leaves every next hop resolved and every route
+			// held in the daemon's own view, while the kernel drops the
+			// traffic.
+			name:     "an external destination discarded by a policy rule",
+			question: "q2.2",
+			undo: func(t *testing.T) {
+				_, _ = twinet(t, "exec", "-m", dir, "as3/ATL", "--", "sh", "-c",
+					"ip rule del pref 100 to 8.0.0.0/8 lookup 123; "+
+						"ip route del blackhole 8.0.0.0/8 table 123")
+			},
+			apply: func(t *testing.T) {
+				out, err := twinet(t, "exec", "-m", dir, "as3/ATL", "--", "sh", "-c",
+					"ip route add blackhole 8.0.0.0/8 table 123 && "+
+						"ip rule add pref 100 to 8.0.0.0/8 lookup 123")
+				if err != nil {
+					t.Fatalf("diverting a destination into a discard: %v\n%s", err, out)
+				}
+			},
+		},
+		{
 			// A tunnel that only carries pings.
 			//
 			// Every probe of the 6in4 question was ICMPv6, so a rule
