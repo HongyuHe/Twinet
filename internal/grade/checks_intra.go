@@ -1671,9 +1671,8 @@ func checkInternalReachability(ctx context.Context, env *Env) Result {
 	// attempted to a port nothing is listening on, so no service has to be
 	// arranged: being refused proves the packets made the journey both ways,
 	// where being dropped is silence.
-	for _, f := range unreachableByTCP(ctx, env, hosts, addrOf) {
-		failed = append(failed, f)
-	}
+	pingOnly := unreachableByTCP(ctx, env, hosts, addrOf)
+	failed = append(failed, pingOnly...)
 
 	tried := len(pairs) + len(hosts)*(len(hosts)-1)
 	// Every host that was probed must have seen the probes.
@@ -1716,7 +1715,15 @@ func checkInternalReachability(ctx context.Context, env *Env) Result {
 				"service network, and every host received the traffic addressed to it", tried)})
 	}
 	sort.Strings(failed)
-	return Partial("dataplane.internal_reachability", ratio(tried-len(failed), tried), Evidence{
+	// A path that carries pings and nothing else is half a working network,
+	// however few pairs show it. Counted as a fraction of a hundred and
+	// forty-four probes the deduction was three thousandths and the total
+	// still printed ten out of ten, which is the same as not noticing.
+	score := ratio(tried-len(failed), tried)
+	if len(pingOnly) > 0 && score > 0.5 {
+		score = 0.5
+	}
+	return Partial("dataplane.internal_reachability", score, Evidence{
 		Expected: fmt.Sprintf("%d reachable ordered pairs", tried),
 		Observed: fmt.Sprintf("%d unreachable", len(failed)),
 		Detail:   strings.Join(truncate(failed, 8), "\n"),
