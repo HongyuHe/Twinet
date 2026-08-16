@@ -9,6 +9,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/HongyuHe/twinet/internal/model"
 )
@@ -66,6 +68,8 @@ type bgpSummaryJSON struct {
 			PfxSnt        int    `json:"pfxSnt"`
 			PeerUptimeMs  int64  `json:"peerUptimeMsec"`
 			ConnectionsEs int    `json:"connectionsEstablished"`
+			MsgRcvd       int64  `json:"msgRcvd"`
+			MsgSent       int64  `json:"msgSent"`
 		} `json:"peers"`
 	} `json:"ipv4Unicast"`
 }
@@ -75,6 +79,62 @@ func bgpSummary(ctx context.Context, env *Env, router string) (bgpSummaryJSON, e
 	var out bgpSummaryJSON
 	err := env.VtyshJSON(ctx, router, "show ip bgp summary json", &out)
 	return out, err
+}
+
+// bgpSummaries reads every router's BGP summary at once.
+func bgpSummaries(ctx context.Context, env *Env, routers []*model.Device) map[string]bgpSummaryJSON {
+	out := map[string]bgpSummaryJSON{}
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for _, r := range routers {
+		wg.Add(1)
+		go func(r *model.Device) {
+			defer wg.Done()
+			sum, err := bgpSummary(ctx, env, r.Name)
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			out[r.Name] = sum
+			mu.Unlock()
+		}(r)
+	}
+	wg.Wait()
+	return out
+}
+
+// refreshIBGP asks every router to re-send its table to every other, so that
+// each session has to carry a message while the check is watching.
+func refreshIBGP(ctx context.Context, env *Env, routers []*model.Device, loopback map[string]string) {
+	var wg sync.WaitGroup
+	for _, r := range routers {
+		var cmds []string
+		for _, other := range routers {
+			if other == r || loopback[other.Name] == "" {
+				continue
+			}
+			cmds = append(cmds, "clear bgp "+loopback[other.Name]+" soft in")
+		}
+		if len(cmds) == 0 {
+			continue
+		}
+		wg.Add(1)
+		go func(r *model.Device, cmds []string) {
+			defer wg.Done()
+			args := []string{"vtysh"}
+			for _, c := range cmds {
+				args = append(args, "-c", c)
+			}
+			_, _ = env.Probe(ctx, model.DeviceID(env.AS, r.Name), args)
+		}(r, cmds)
+	}
+	wg.Wait()
+	// Long enough for a refresh and the answer to it to cross a link that may
+	// be on another machine, and short enough not to matter.
+	select {
+	case <-ctx.Done():
+	case <-time.After(5 * time.Second):
+	}
 }
 
 func checkIBGPFullMesh(ctx context.Context, env *Env) Result {
@@ -96,10 +156,27 @@ func checkIBGPFullMesh(ctx context.Context, env *Env) Result {
 	established := 0
 	var problems []string
 
+	// "Established" is a memory, not an observation.
+	//
+	// A session whose packets are being discarded stays Established until the
+	// hold timer expires -- three minutes with the default timers, longer than
+	// a grading run. A reviewer blackholed an iBGP session in both directions
+	// immediately after a keepalive, confirmed ten packets dropped each way,
+	// and the mesh scored full marks for a session that was carrying nothing.
+	//
+	// So each router is asked to send something now. A route refresh is a real
+	// message that must cross the connection, and the peer's own received
+	// count records its arrival; it also makes the peer answer, so the counts
+	// move in both directions. It disturbs nothing: the peer re-sends routes
+	// the receiver already has.
+	before := bgpSummaries(ctx, env, routers)
+	refreshIBGP(ctx, env, routers, loopback)
+	after := bgpSummaries(ctx, env, routers)
+
 	for _, r := range routers {
-		sum, err := bgpSummary(ctx, env, r.Name)
-		if err != nil {
-			problems = append(problems, fmt.Sprintf("%s: %v", r.Name, err))
+		sum, ok := after[r.Name]
+		if !ok {
+			problems = append(problems, fmt.Sprintf("%s: its BGP summary could not be read", r.Name))
 			continue
 		}
 		for _, other := range routers {
@@ -111,6 +188,7 @@ func checkIBGPFullMesh(ctx context.Context, env *Env) Result {
 				continue
 			}
 			p, ok := sum.IPv4Unicast.Peers[addr]
+			was, had := before[r.Name].IPv4Unicast.Peers[addr]
 			switch {
 			case !ok:
 				problems = append(problems, fmt.Sprintf("%s has no session with %s (%s)", r.Name, other.Name, addr))
@@ -119,6 +197,11 @@ func checkIBGPFullMesh(ctx context.Context, env *Env) Result {
 					r.Name, other.Name, p.RemoteAs, env.AS))
 			case !strings.EqualFold(p.State, "Established"):
 				problems = append(problems, fmt.Sprintf("%s -> %s is %s", r.Name, other.Name, p.State))
+			case had && p.MsgRcvd <= was.MsgRcvd:
+				problems = append(problems, fmt.Sprintf(
+					"%s -> %s says Established, but nothing arrived from %s while it was "+
+						"asked to send: the session is held open by a timer that has not "+
+						"expired yet, and carries nothing", r.Name, other.Name, other.Name))
 			default:
 				established++
 			}
