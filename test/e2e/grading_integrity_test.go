@@ -169,6 +169,7 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 	var customerDrops []string
 	var vlanMirror struct{ switchID, from string }
 	var ibgpBlackhole struct{ router, peer string }
+	var leakedRange string
 	var ixpDeny struct{ router, peer, routeMap string }
 	var importMapNames []string
 	var roaWithdrawn struct{ router, anchor, prefix string }
@@ -783,6 +784,40 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 					" redistribute static",
 					"end")
 				time.Sleep(20 * time.Second)
+			},
+		},
+		{
+			// A prefix in OSPF that no routing table holds.
+			//
+			// Redistributed with the maximum metric, an inter-AS range is
+			// flooded to every router in the area and installed by none of
+			// them: LSInfinity means "do not use this", so `show ip route
+			// ospf` is empty and a check that reads routing tables sees
+			// nothing. The database is where being in OSPF is decided.
+			name:     "an inter-AS range flooded into OSPF at infinite metric",
+			question: "q1.2",
+			undo: func(t *testing.T) {
+				vtysh(t, dir, "as3/NYC", "configure terminal",
+					"router ospf",
+					" no redistribute connected route-map TWGRADE-LEAK",
+					"exit",
+					"no route-map TWGRADE-LEAK permit 10",
+					"no ip prefix-list TWGRADE-LEAK seq 5 permit "+leakedRange,
+					"end")
+			},
+			apply: func(t *testing.T) {
+				leakedRange = interASRange(t, dir, as)
+				t.Logf("flooding %s into OSPF as an unusable external route", leakedRange)
+				vtysh(t, dir, "as3/NYC", "configure terminal",
+					"ip prefix-list TWGRADE-LEAK seq 5 permit "+leakedRange,
+					"route-map TWGRADE-LEAK permit 10",
+					" match ip address prefix-list TWGRADE-LEAK",
+					" set metric 16777215",
+					"exit",
+					"router ospf",
+					" redistribute connected route-map TWGRADE-LEAK",
+					"end")
+				time.Sleep(15 * time.Second)
 			},
 		},
 		{
@@ -1473,6 +1508,33 @@ func ixpImport(t *testing.T, dir string, as int) (router, peer, routeMap string)
 // serviceSubnet finds a subnet one router advertises into OSPF, another router
 // that does not, and the prefix itself.
 //
+// interASRange finds the subnet of one of this AS's external links, read from
+// the router that terminates it.
+func interASRange(t *testing.T, dir string, as int) string {
+	t.Helper()
+	out, err := twinet(t, "exec", "-m", dir, "as"+itoa(as)+"/NYC", "--",
+		"ip", "-o", "-4", "addr", "show")
+	if err != nil {
+		t.Fatalf("reading addresses: %v\n%s", err, out)
+	}
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		if len(f) < 4 || !strings.HasPrefix(f[1], "ext_") {
+			continue
+		}
+		for i, tok := range f {
+			if tok == "inet" && i+1 < len(f) {
+				pfx, err := netip.ParsePrefix(f[i+1])
+				if err == nil {
+					return pfx.Masked().String()
+				}
+			}
+		}
+	}
+	t.Skip("no external link found on as3/NYC")
+	return ""
+}
+
 // vlanPortPair finds a switch with access ports in two different VLANs and
 // returns it with one port from each, read from the lab rather than assumed.
 func vlanPortPair(t *testing.T, dir string, as int) (sw, from, to string) {

@@ -390,6 +390,16 @@ reached students, and each motivated a permanent test.
     connection, and the peer's own received count records its arrival. It also
     makes the peer answer, so the counts move in both directions, and it
     disturbs nothing: the peer re-sends routes the receiver already has.
+40. **A prefix in OSPF that no routing table holds.** Whether an inter-AS range
+    had been put into the interior was decided from `network` statements and
+    from the OSPF routing table. Redistributed with the maximum metric, a range
+    is flooded to every router in the area and installed by none of them:
+    LSInfinity means "do not use this", so the routing table is empty and the
+    check passed. The link-state database is where being in OSPF is decided; a
+    routing table is only what a router chose to do about it. All four kinds of
+    advertisement are read now -- router, network, summary and external -- so a
+    stub link, a transit segment, an inter-area summary and a redistribution are
+    all caught, whatever metric they carry.
 
 ## Environment findings
 
