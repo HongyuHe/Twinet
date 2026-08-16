@@ -1291,6 +1291,13 @@ func crossVLANForwarding(ctx context.Context, env *Env, domain string) []string 
 			continue
 		}
 		byNum, vlanOfPort := ovsPortMap(ports.Stdout, tags.Stdout)
+		// Anything the kernel has been told to copy, before the switch's own
+		// tables. `tc filter ... action mirred egress mirror dev <other>` on
+		// an access port copies frames into another VLAN without touching a
+		// single OpenFlow rule, and reading only the flow table missed it
+		// entirely.
+		out = append(out, mirroredPorts(ctx, env, d, vlanOfPort)...)
+
 		flows, err := env.Probe(ctx, d.ID, []string{"ovs-ofctl", "dump-flows", "br0"})
 		if err != nil || flows.ExitCode != 0 {
 			continue
@@ -1313,6 +1320,51 @@ func crossVLANForwarding(ctx context.Context, env *Env, domain string) []string 
 						"%s is told to send frames out of %s (VLAN %d) whatever port they "+
 							"arrived on", d.Name, o, ov))
 				}
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// mirroredPorts names the traffic-control rules on a switch that copy frames
+// from a port in one VLAN to a port in another.
+//
+// The switch's own flow table is not the only place a frame can be told to go
+// somewhere: the kernel will copy one for anybody who asks, and a rule doing
+// that leaves the flow table exactly as it should be.
+func mirroredPorts(ctx context.Context, env *Env, d *model.Device,
+	vlanOf map[string]int) []string {
+	var out []string
+	for port, iv := range vlanOf {
+		for _, dir := range []string{"ingress", "egress"} {
+			res, err := env.Probe(ctx, d.ID,
+				[]string{"tc", "filter", "show", "dev", port, dir})
+			if err != nil || res.ExitCode != 0 {
+				continue
+			}
+			for _, line := range strings.Split(res.Stdout, "\n") {
+				t := strings.TrimSpace(line)
+				if !strings.Contains(t, "mirred") {
+					continue
+				}
+				// "... (Egress Mirror to device port_P_EUH) pipe"
+				i := strings.LastIndex(t, "device ")
+				if i < 0 {
+					continue
+				}
+				target := strings.Fields(t[i+len("device "):])
+				if len(target) == 0 {
+					continue
+				}
+				to := strings.Trim(target[0], "()")
+				ov, ok := vlanOf[to]
+				if !ok || ov == iv {
+					continue
+				}
+				out = append(out, fmt.Sprintf(
+					"%s is told to copy frames %s on %s (VLAN %d) to %s (VLAN %d)",
+					d.Name, dir, port, iv, to, ov))
 			}
 		}
 	}
