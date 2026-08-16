@@ -1013,7 +1013,7 @@ func checkTrafficEngineering(ctx context.Context, env *Env) Result {
 			continue
 		}
 		checks++
-		sLen, sAdv := advertisedOwnPrefix(ctx, env, s.router, s.addr, own)
+		sLen, sForeign, sAdv := advertisedOwnPath(ctx, env, s.router, s.addr, own)
 		fLen, fAdv := advertisedOwnPrefix(ctx, env, f.router, f.addr, own)
 
 		// Filtering is explicitly forbidden here: the slow neighbour must still
@@ -1028,12 +1028,23 @@ func checkTrafficEngineering(ctx context.Context, env *Env) Result {
 			fmt.Fprintf(&detail, "inbound: %s is not advertised to AS%d\n", own, f.asn)
 			continue
 		}
-		if sLen > fLen {
-			passed++
-		} else {
+		switch {
+		case len(sForeign) > 0:
+			fmt.Fprintf(&detail,
+				"inbound: the path advertised to the slow AS%d contains %s, which is not this "+
+					"AS: a path through a neighbour's own number is a loop to it and the "+
+					"announcement is discarded, so the slow link stops being a backup at all\n",
+				s.asn, strings.Join(truncate(sForeign, 3), ", "))
+		case sLen <= fLen:
 			fmt.Fprintf(&detail,
 				"inbound: the path advertised to the slow AS%d is %d long, no longer than the %d sent to AS%d; prepend to make it less attractive\n",
 				s.asn, sLen, fLen, f.asn)
+		case !neighbourHolds(ctx, env, s.asn, own):
+			fmt.Fprintf(&detail,
+				"inbound: AS%d does not hold %s at all, so the slow link is not the backup "+
+					"the question asks for\n", s.asn, own)
+		default:
+			passed++
 		}
 	}
 
@@ -1095,21 +1106,79 @@ func checkTrafficEngineering(ctx context.Context, env *Env) Result {
 // advertisedOwnPrefix returns the AS-path length of our own prefix as
 // advertised to a neighbour, and whether it is advertised at all.
 func advertisedOwnPrefix(ctx context.Context, env *Env, router, peer, own string) (int, bool) {
+	n, _, ok := advertisedOwnPath(ctx, env, router, peer, own)
+	return n, ok
+}
+
+// advertisedOwnPath returns the length of the longest path sent for our own
+// prefix, and every AS number in it that is not ours.
+//
+// The second half matters. Making the path longer is not the same as making it
+// longer with our own number: `set as-path prepend 1 1 1` towards AS 1 is
+// three hops longer and AS 1 discards the announcement outright, because a
+// path through itself is a loop. The slow link stops being a backup at all,
+// which is the one thing the question forbids, and a check that counted hops
+// called it a correct answer.
+func advertisedOwnPath(ctx context.Context, env *Env, router, peer, own string) (int, []string, bool) {
 	adv, err := advertisedRoutes(ctx, env, router, peer)
 	if err != nil {
-		return 0, false
+		return 0, nil, false
 	}
 	entries, ok := adv.Table()[own]
 	if !ok || len(entries) == 0 {
-		return 0, false
+		return 0, nil, false
 	}
 	longest := 0
+	var foreign []string
 	for _, e := range entries {
-		if n := len(strings.Fields(e.Path)); n > longest {
-			longest = n
+		f := strings.Fields(e.Path)
+		if len(f) > longest {
+			longest = len(f)
+		}
+		for _, a := range f {
+			if a != strconv.Itoa(env.AS) {
+				foreign = append(foreign, a)
+			}
 		}
 	}
-	return longest, true
+	sort.Strings(foreign)
+	return longest, uniq(foreign), true
+}
+
+// neighbourHolds asks a neighbour whether it actually has our prefix.
+//
+// The neighbour is somebody else's system, so its table is not the
+// submission's to arrange: what it holds is the only account of whether an
+// announcement survived the journey. An announcement that is sent and
+// discarded on arrival looks identical, from this side, to one that worked.
+func neighbourHolds(ctx context.Context, env *Env, asn int, prefix string) bool {
+	as, ok := env.Topology.ASes[asn]
+	if !ok {
+		return true // not in the lab, so nothing can be concluded
+	}
+	for _, r := range as.Routers {
+		res, err := env.Probe(ctx, r.ID, []string{"vtysh", "-c",
+			fmt.Sprintf("show ip bgp %s json", prefix)})
+		if err != nil || res.ExitCode != 0 {
+			continue
+		}
+		var doc struct {
+			Paths []struct {
+				ASPath struct {
+					String string `json:"string"`
+				} `json:"aspath"`
+			} `json:"paths"`
+		}
+		if json.Unmarshal([]byte(res.Stdout), &doc) != nil {
+			continue
+		}
+		for _, p := range doc.Paths {
+			if pathContainsASN(p.ASPath.String, env.AS) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // advertisedPrefixes returns the set of prefixes advertised to a neighbour.
