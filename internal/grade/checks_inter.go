@@ -454,6 +454,21 @@ func checkOwnPrefix(ctx context.Context, env *Env) Result {
 // It reads the ordering out of the routing table rather than pattern-matching
 // the configuration, so any correct implementation passes and a configuration
 // that merely looks right does not.
+// relRank orders the business relationships by how much a route from one is
+// worth: a customer pays to be carried, a peer costs nothing, a provider is
+// billed for.
+func relRank(rel model.Relationship) int {
+	switch rel {
+	case model.RelCustomer:
+		return 3
+	case model.RelPeer:
+		return 2
+	case model.RelProvider:
+		return 1
+	}
+	return 0
+}
+
 func checkGaoRexford(ctx context.Context, env *Env) Result {
 	routers := env.Routers()
 	if len(routers) == 0 {
@@ -493,19 +508,46 @@ func checkGaoRexford(ctx context.Context, env *Env) Result {
 		router string
 	}
 	seen := map[model.Relationship][]observed{}
+	// And which path each router actually chose.
+	//
+	// Local preference is what a student configures; which route wins is what
+	// the rule is for, and they are not the same thing. Local preference is
+	// only the second tie-break in the decision process, so `set weight 65535`
+	// on a provider's route puts it ahead of a peer's while every local
+	// preference in the table still reads correctly -- measured, and worth
+	// full marks before this. Whatever attribute is used to arrange it, a
+	// provider's route selected while a peer offers the same prefix is the
+	// ordering broken.
+	var misranked []string
 	for _, r := range routers {
 		tbl, err := bgpTable(ctx, env, r.Name)
 		if err != nil {
 			continue
 		}
 		for prefix, entries := range tbl.Table() {
+			var chosen, available model.Relationship
+			chosenOK := false
 			for _, e := range entries {
-				if rel, via, ok := learnedFromRelationship(e, relOf); ok {
-					seen[rel] = append(seen[rel], observed{e.LocalPref, prefix, via, r.Name})
+				rel, via, ok := learnedFromRelationship(e, relOf)
+				if !ok {
+					continue
 				}
+				seen[rel] = append(seen[rel], observed{e.LocalPref, prefix, via, r.Name})
+				if relRank(rel) > relRank(available) {
+					available = rel
+				}
+				if e.IsBest() {
+					chosen, chosenOK = rel, true
+				}
+			}
+			if chosenOK && relRank(available) > relRank(chosen) {
+				misranked = append(misranked, fmt.Sprintf(
+					"%s sends %s to a %s while a %s offers the same prefix",
+					r.Name, prefix, chosen, available))
 			}
 		}
 	}
+	sort.Strings(misranked)
 
 	worst := func(rel model.Relationship) (observed, bool) {
 		v := seen[rel]
@@ -578,6 +620,15 @@ func checkGaoRexford(ctx context.Context, env *Env) Result {
 	compare(model.RelCustomer, model.RelPeer, hasCust, hasPeer, custLo, peerHi)
 	compare(model.RelPeer, model.RelProvider, hasPeer, hasProv, peerLo, provHi)
 	compare(model.RelCustomer, model.RelProvider, hasCust, hasProv, custLo, provHi)
+
+	// The ordering as it came out, which is the point of arranging it.
+	checks++
+	if len(misranked) == 0 {
+		passed++
+	} else {
+		fmt.Fprintf(&detail, "%d prefix(es) are sent to a worse relationship than one that "+
+			"offers them:\n%s\n", len(misranked), strings.Join(truncate(misranked, 5), "\n"))
+	}
 
 	// Every relationship this AS actually has must be represented.
 	//
