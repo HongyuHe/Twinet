@@ -547,6 +547,16 @@ reached students, and each motivated a permanent test.
     worked. The port is now drawn when the check runs, above the registered
     range and below the ephemeral one, so it is unlikely to find a listener and
     cannot be permitted in advance.
+57. **A prepend that emptied the slow link instead of lengthening it.** The
+    traffic-engineering question was marked by comparing the length of the
+    announcement sent to the slow neighbour with the one sent to the fast. `set
+    as-path prepend 1 1 1` towards AS 1 is three hops longer and AS 1 discards
+    it outright, because a path through itself is a loop: the slow link stops
+    being a backup at all, which is the one thing the question forbids. The
+    prepended numbers must now be this AS's own, and the slow neighbour must
+    actually hold the prefix -- that neighbour is somebody else's system, so
+    what it holds is not the submission's to arrange, and from this side an
+    announcement discarded on arrival looks exactly like one that worked.
 
 ## Environment findings
 
