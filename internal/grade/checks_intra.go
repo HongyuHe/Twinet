@@ -1233,6 +1233,131 @@ func checkECMP(ctx context.Context, env *Env) Result {
 
 // checkVLANIsolation verifies that hosts in the same VLAN reach each other
 // directly while hosts in different VLANs are forced through the gateway.
+// crossVLANForwarding names any rule a switch of this domain has been given
+// that forwards a frame from a port in one VLAN out of a port in another.
+//
+// A broadcast probe finds a shared broadcast domain; it does not find a rule
+// aimed at one flow. This reads what the switch has actually been told to do,
+// which covers every protocol at once and needs no packet.
+func crossVLANForwarding(ctx context.Context, env *Env, domain string) []string {
+	as, ok := env.Topology.ASes[env.AS]
+	if !ok {
+		return nil
+	}
+	var out []string
+	for _, d := range as.Devices {
+		if d.Kind != model.KindSwitch {
+			continue
+		}
+		if domain != "" && d.L2Domain != "" && d.L2Domain != domain {
+			continue
+		}
+		ports, err := env.Probe(ctx, d.ID, []string{"ovs-ofctl", "show", "br0"})
+		if err != nil || ports.ExitCode != 0 {
+			continue
+		}
+		tags, err := env.Probe(ctx, d.ID,
+			[]string{"ovs-vsctl", "--columns=name,tag", "--format=csv", "list", "port"})
+		if err != nil || tags.ExitCode != 0 {
+			continue
+		}
+		byNum, vlanOfPort := ovsPortMap(ports.Stdout, tags.Stdout)
+		flows, err := env.Probe(ctx, d.ID, []string{"ovs-ofctl", "dump-flows", "br0"})
+		if err != nil || flows.ExitCode != 0 {
+			continue
+		}
+		for _, line := range strings.Split(flows.Stdout, "\n") {
+			if !strings.Contains(line, "actions=") {
+				continue
+			}
+			in, outs := ovsFlowPorts(line, byNum)
+			for _, o := range outs {
+				iv, ok1 := vlanOfPort[in]
+				ov, ok2 := vlanOfPort[o]
+				switch {
+				case in != "" && ok1 && ok2 && iv != ov:
+					out = append(out, fmt.Sprintf(
+						"%s is told to send frames from %s (VLAN %d) out of %s (VLAN %d)",
+						d.Name, in, iv, o, ov))
+				case in == "" && ok2:
+					out = append(out, fmt.Sprintf(
+						"%s is told to send frames out of %s (VLAN %d) whatever port they "+
+							"arrived on", d.Name, o, ov))
+				}
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// ovsPortMap reads the switch's port numbering and each port's access VLAN.
+func ovsPortMap(show, csv string) (map[string]string, map[string]int) {
+	byNum := map[string]string{}
+	for _, line := range strings.Split(show, "\n") {
+		t := strings.TrimSpace(line)
+		i := strings.IndexByte(t, '(')
+		j := strings.IndexByte(t, ')')
+		if i <= 0 || j <= i {
+			continue
+		}
+		if _, err := strconv.Atoi(t[:i]); err != nil {
+			continue
+		}
+		byNum[t[:i]] = t[i+1 : j]
+	}
+	vlan := map[string]int{}
+	for _, line := range strings.Split(csv, "\n") {
+		f := strings.Split(strings.TrimSpace(line), ",")
+		if len(f) < 2 {
+			continue
+		}
+		n, err := strconv.Atoi(strings.Trim(f[1], "\"[] "))
+		if err != nil {
+			continue
+		}
+		vlan[strings.TrimSpace(f[0])] = n
+	}
+	return byNum, vlan
+}
+
+// ovsFlowPorts pulls the ingress port and every explicit output port out of one
+// line of `ovs-ofctl dump-flows`, resolving numbers to names.
+func ovsFlowPorts(line string, byNum map[string]string) (string, []string) {
+	name := func(tok string) string {
+		tok = strings.Trim(tok, " \t,)")
+		if n, ok := byNum[tok]; ok {
+			return n
+		}
+		return tok
+	}
+	in := ""
+	for _, f := range strings.Split(line, ",") {
+		t := strings.TrimSpace(f)
+		if v, ok := strings.CutPrefix(t, "in_port="); ok {
+			in = name(v)
+		}
+	}
+	var outs []string
+	rest := line
+	for {
+		i := strings.Index(rest, "output:")
+		if i < 0 {
+			break
+		}
+		rest = rest[i+len("output:"):]
+		end := strings.IndexAny(rest, ", \t")
+		tok := rest
+		if end >= 0 {
+			tok = rest[:end]
+		}
+		if tok != "" {
+			outs = append(outs, name(tok))
+		}
+	}
+	return in, outs
+}
+
 // crossVLANFrames sends a broadcast in one VLAN and asks the other whether it
 // arrived, returning what leaked and how many ordered pairs were tried.
 //
@@ -1494,8 +1619,19 @@ func checkVLANIsolation(ctx context.Context, env *Env) Result {
 	// VLANs are separate, and when they are not the target's own kernel records
 	// the sender -- which it does even when the copy is one-directional and the
 	// reply never comes back, as the reviewer's was.
-	leaks, tested := crossVLANFrames(ctx, env, vlans, hosts, sem)
-	for i := 0; i < tested-len(leaks); i++ {
+	// And what the switches have been told to forward.
+	//
+	// The probe above sends a broadcast, which is what a shared broadcast
+	// domain leaks. It is not what a rule aimed at one flow leaks: an
+	// OpenFlow entry copying HTTPS from a VLAN 10 port to a VLAN 20 port
+	// carried a connection between two VLANs while every broadcast stayed
+	// where it belonged, and the question kept its mark. A switch that has
+	// been told to send a frame from a port in one VLAN out of a port in
+	// another is not keeping them apart, whatever the frame is.
+	rules := crossVLANForwarding(ctx, env, domain)
+	probed, tested := crossVLANFrames(ctx, env, vlans, hosts, sem)
+	leaks := append(rules, probed...)
+	for i := 0; i < tested-len(probed); i++ {
 		record(true, "")
 	}
 	// Isolation is a property of the domain and not a proportion of it. One
@@ -1509,12 +1645,12 @@ func checkVLANIsolation(ctx context.Context, env *Env) Result {
 			}
 		}
 		return Fail("l2.vlan_isolation", Evidence{
-			Expected: "no frame sent in one VLAN reaching another",
-			Observed: fmt.Sprintf("%d of %d ordered pairs across VLANs are one broadcast domain",
-				crossed, tested),
+			Expected: "no frame sent in one VLAN reaching another, and nothing arranged to send one",
+			Observed: fmt.Sprintf("%d way(s) across, from %d forwarding rule(s) and %d of %d "+
+				"probed pairs", crossed, len(rules), len(probed), tested),
 			Detail:  strings.Join(truncate(leaks, 8), "\n"),
-			Hint:    "an access port belongs to one VLAN; check for anything bridging or mirroring between them",
-			Command: "arping; ip neigh show",
+			Hint:    "an access port belongs to one VLAN; check for anything bridging, mirroring or forwarding between them",
+			Command: "arping; ip neigh show; ovs-ofctl dump-flows br0",
 		})
 	}
 
