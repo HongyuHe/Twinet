@@ -1663,7 +1663,19 @@ func checkInternalReachability(ctx context.Context, env *Env) Result {
 	}
 	wg.Wait()
 
-	tried := len(pairs)
+	// And the same pairs, with something other than a ping.
+	//
+	// Every probe above is ICMP. A rule discarding TCP between two hosts left
+	// all eighty-eight of them succeeding and the question at full marks,
+	// while nothing but a ping could cross between the two. A connection is
+	// attempted to a port nothing is listening on, so no service has to be
+	// arranged: being refused proves the packets made the journey both ways,
+	// where being dropped is silence.
+	for _, f := range unreachableByTCP(ctx, env, hosts, addrOf) {
+		failed = append(failed, f)
+	}
+
+	tried := len(pairs) + len(hosts)*(len(hosts)-1)
 	// Every host that was probed must have seen the probes.
 	echoesAfter := receivedEchoes(ctx, env, hosts)
 	var unseen []string
@@ -1756,6 +1768,58 @@ func serviceAttachments(env *Env) []svcAttachment {
 		}
 		return out[a].Iface < out[b].Iface
 	})
+	return out
+}
+
+// unreachableByTCP tries a connection between every ordered pair of hosts and
+// names the ones where the packets do not arrive.
+//
+// The port is one nothing listens on, so the answer is a reset: "refused" is
+// the far side speaking, and silence is something on the path swallowing the
+// attempt. That distinction is the whole test -- both look like a failed
+// connection to the program making it.
+func unreachableByTCP(ctx context.Context, env *Env, hosts []*model.Device,
+	addrOf map[string]string) []string {
+	var (
+		mu  sync.Mutex
+		out []string
+		wg  sync.WaitGroup
+	)
+	sem := make(chan struct{}, 16)
+	for _, a := range hosts {
+		for _, b := range hosts {
+			if a.ID == b.ID || addrOf[b.ID] == "" {
+				continue
+			}
+			wg.Add(1)
+			go func(a, b *model.Device) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+				addr := addrOf[b.ID]
+				res, err := env.Probe(ctx, a.ID,
+					[]string{"nc", "-v", "-w", "3", "-z", addr, "9"})
+				if err != nil {
+					return // the machinery failed, which is not a verdict
+				}
+				answered := res.ExitCode == 0
+				said := strings.ToLower(res.Stderr + res.Stdout)
+				if strings.Contains(said, "refused") || strings.Contains(said, "reset") {
+					answered = true
+				}
+				if answered {
+					return
+				}
+				mu.Lock()
+				out = append(out, fmt.Sprintf(
+					"%s can ping %s (%s) but no connection to it arrives: something on the "+
+						"path carries ICMP and discards the rest", a.Name, b.Name, addr))
+				mu.Unlock()
+			}(a, b)
+		}
+	}
+	wg.Wait()
+	sort.Strings(out)
 	return out
 }
 
