@@ -982,14 +982,43 @@ func carriesTCPBothWays(ctx context.Context, env *Env, from, to string) (string,
 		before, okB := tcpResetsSent(ctx, env, dst.ID)
 		_, _ = env.Probe(ctx, src.ID, args)
 		after, okA := tcpResetsSent(ctx, env, dst.ID)
-		if !okB || !okA || after > before {
-			continue
+		if okB && okA && after <= before {
+			return fmt.Sprintf(
+				"%s answers pings from %s but no connection to it arrives: the paths carry "+
+					"ICMP and nothing else", e[1], e[0]), false
 		}
-		return fmt.Sprintf(
-			"%s answers pings from %s but no connection to it arrives: the paths carry "+
-				"ICMP and nothing else", e[1], e[0]), false
+		// And a datagram. A filter is written per protocol as easily as per
+		// port: dropping UDP between the two loopbacks left the pings and the
+		// connections working and the paths carrying two thirds of what they
+		// should.
+		src4 := ""
+		if slo, ok := src.IfaceByName("lo"); ok && slo.Addr4 != "" {
+			src4 = addrOnly(slo.Addr4)
+		}
+		udpBefore, okU := udpNoPortsV4(ctx, env, dst.ID)
+		cmd := "echo twinet | nc -u -w 2"
+		if src4 != "" {
+			cmd += " -s " + src4
+		}
+		_, _ = env.Probe(ctx, src.ID, []string{"sh", "-c", cmd + " " + addr + " " + probePort()})
+		udpAfter, okU2 := udpNoPortsV4(ctx, env, dst.ID)
+		if okU && okU2 && udpAfter <= udpBefore {
+			return fmt.Sprintf(
+				"%s answers pings and connections from %s but no datagram from it arrives: "+
+					"something on the paths is filtering by protocol", e[1], e[0]), false
+		}
 	}
 	return "", true
+}
+
+// udpNoPortsV4 reads a host's count of datagrams delivered to it for a port
+// nothing is bound to.
+func udpNoPortsV4(ctx context.Context, env *Env, device string) (int, bool) {
+	res, err := env.Probe(ctx, device, []string{"cat", "/proc/net/snmp"})
+	if err != nil || res.ExitCode != 0 {
+		return 0, false
+	}
+	return snmpCounter(res.Stdout, "Udp:", "NoPorts")
 }
 
 func checkECMP(ctx context.Context, env *Env) Result {
