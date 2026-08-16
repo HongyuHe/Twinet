@@ -855,8 +855,17 @@ func carriesTCPBothWays(ctx context.Context, env *Env, from, to string) (string,
 			return "", true
 		}
 		addr := addrOnly(lo.Addr4)
+		// Between the loopbacks, which is the pair the question is about and
+		// the pair a rule aimed at this traffic would name. Sourced from an
+		// interface address instead, a probe misses a drop written against the
+		// routers themselves and reads as a healthy path.
+		args := []string{"nc", "-w", "3", "-z"}
+		if slo, ok := src.IfaceByName("lo"); ok && slo.Addr4 != "" {
+			args = append(args, "-s", addrOnly(slo.Addr4))
+		}
+		args = append(args, addr, "9")
 		before, okB := tcpResetsSent(ctx, env, dst.ID)
-		_, _ = env.Probe(ctx, src.ID, []string{"nc", "-w", "3", "-z", addr, "9"})
+		_, _ = env.Probe(ctx, src.ID, args)
 		after, okA := tcpResetsSent(ctx, env, dst.ID)
 		if !okB || !okA || after > before {
 			continue
