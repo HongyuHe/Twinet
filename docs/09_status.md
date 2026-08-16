@@ -433,6 +433,16 @@ reached students, and each motivated a permanent test.
     path rather than by the session this router heard it on: the routes being
     compared mostly arrive over iBGP, where the session says nothing about where
     they entered.
+44. **Paths that answered pings and carried nothing else.** The equal-cost
+    question was decided from the forwarding tables plus one ICMP probe from end
+    to end. That probe takes one of the three paths -- which one is a hash of
+    the two addresses, and it is the same hash every time -- so two of three
+    prescribed paths could be discarding everything at full marks, and a rule
+    permitting ICMP and dropping the rest cost nothing. Every hop of every
+    prescribed path is now tried, on the link that hop uses, which the plan
+    decides rather than a hash; and a connection is attempted each way between
+    the two loopbacks, which is the pair the question names and the pair a rule
+    aimed at this traffic would name.
 
 ## Environment findings
 

@@ -172,6 +172,7 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 	var leakedRange string
 	var tunnelTCP struct{ gateway, iface string }
 	var weighted struct{ router, routeMap, prefix string }
+	var ecmpTCP struct{ router, from string }
 	var ixpDeny struct{ router, peer, routeMap string }
 	var importMapNames []string
 	var roaWithdrawn struct{ router, anchor, prefix string }
@@ -786,6 +787,35 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 					" redistribute static",
 					"end")
 				time.Sleep(20 * time.Second)
+			},
+		},
+		{
+			// Paths that answer pings and carry nothing else.
+			//
+			// The equal-cost question was decided from the forwarding tables
+			// plus one ICMP probe from end to end. That probe takes one of the
+			// three paths -- which one is a hash, and it is the same hash every
+			// time -- and it says nothing about any other protocol.
+			name:        "the prescribed paths dropping everything but ICMP",
+			question:    "q1.3",
+			alsoAffects: []string{"q2.1", "q2.2"},
+			undo: func(t *testing.T) {
+				if ecmpTCP.router == "" {
+					return
+				}
+				_, _ = twinet(t, "exec", "-m", dir, ecmpTCP.router, "--",
+					"iptables", "-D", "INPUT", "-p", "tcp", "-s", ecmpTCP.from, "-j", "DROP")
+			},
+			apply: func(t *testing.T) {
+				a, b := "as3/ATL", "as3/BOS"
+				src := loopbackOf(t, dir, a)
+				ecmpTCP = struct{ router, from string }{b, src}
+				t.Logf("discarding TCP from %s at %s", src, b)
+				out, err := twinet(t, "exec", "-m", dir, b, "--",
+					"iptables", "-I", "INPUT", "1", "-p", "tcp", "-s", src, "-j", "DROP")
+				if err != nil {
+					t.Fatalf("discarding TCP: %v\n%s", err, out)
+				}
 			},
 		},
 		{
