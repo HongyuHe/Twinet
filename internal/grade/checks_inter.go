@@ -398,6 +398,22 @@ func checkOwnPrefix(ctx context.Context, env *Env) Result {
 		}
 		for prefix, entries := range adv.Table() {
 			for _, e := range entries {
+				// Claiming to be the origin of somebody else's prefix.
+				//
+				// A route this AS relays keeps the origin at the end of its
+				// path, and our own prepends go on the front. Rewriting the
+				// end -- `set as-path exclude` and a prepend, or a
+				// wholesale replacement -- makes the neighbour believe this AS
+				// originates address space it does not hold, which is a hijack
+				// with a different spelling. It never appears as a locally
+				// injected route here, so nothing above notices it.
+				if prefix != as.Block && originASN(e.Path) == env.AS {
+					originated[prefix] = true
+					advertised[prefix] = fmt.Sprintf(
+						"%s tells %s that this AS originates it (path %q)",
+						sess.Router, sess.Addr, strings.TrimSpace(e.Path))
+					continue
+				}
 				// The advertised view carries no peer, so origination is
 				// decided from the tables above; an empty path here still
 				// means the same thing and catches a prefix that only appears
@@ -446,6 +462,20 @@ func checkOwnPrefix(ctx context.Context, env *Env) Result {
 			Command:  "show ip bgp json",
 		})
 	}
+}
+
+// originASN is the AS at the end of a path, which is the one claiming to have
+// originated the prefix. Prepends go on the front, so the end is the claim.
+func originASN(path string) int {
+	f := strings.Fields(strings.TrimSpace(path))
+	if len(f) == 0 {
+		return 0
+	}
+	n, err := strconv.Atoi(f[len(f)-1])
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 // checkGaoRexford verifies the local-preference ordering that implements the
