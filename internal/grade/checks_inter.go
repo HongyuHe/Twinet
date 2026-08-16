@@ -809,7 +809,14 @@ func checkNoTransit(ctx context.Context, env *Env) Result {
 			for _, e := range entries {
 				// A route we originate may go anywhere, and so may a
 				// customer's.
-				if e.Originated() {
+				//
+				// Our own prefix is named, not inferred from an empty path:
+				// the traffic-engineering question asks for `set as-path
+				// prepend <own> <own> <own>` towards the slow provider, so the
+				// advertisement of our own address space leaves carrying a
+				// path, and reading only the path called the correct answer a
+				// leak.
+				if e.Originated() || (own != "" && prefix == own) {
 					continue
 				}
 				if _, ours := custPrefixes[prefix]; ours {
