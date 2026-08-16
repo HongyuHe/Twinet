@@ -181,6 +181,7 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 	var vlanFlow struct{ switchID string }
 	var forgedLeak struct{ router, routeMap, prefix string }
 	var custTCP string
+	var reorigin struct{ router, routeMap, prefix string }
 	var looseROA struct {
 		router, anchor, prefix string
 		length                 int
@@ -798,6 +799,39 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 					"router ospf",
 					" redistribute static",
 					"end")
+				time.Sleep(20 * time.Second)
+			},
+		},
+		{
+			// Somebody else's prefix, re-originated on the way out.
+			//
+			// A relayed route keeps its origin at the end of the path, and our
+			// own prepends go on the front. Rewriting the end makes the
+			// neighbour believe this AS originates address space it does not
+			// hold, and it never appears as a locally injected route.
+			name:     "a transit route re-originated as ours towards a customer",
+			question: "q2.2",
+			undo: func(t *testing.T) {
+				if reorigin.router == "" {
+					return
+				}
+				vtysh(t, dir, reorigin.router, "configure terminal",
+					"no route-map "+reorigin.routeMap+" permit 3",
+					"no ip prefix-list TWGRADE-STEAL seq 5 permit "+reorigin.prefix,
+					"end")
+			},
+			apply: func(t *testing.T) {
+				router, peer, rmap, prefix, origin := leakableRoute(t, dir, as)
+				reorigin = struct{ router, routeMap, prefix string }{router, rmap, prefix}
+				t.Logf("telling %s that %s originates %s", peer, "AS"+itoa(as), prefix)
+				vtysh(t, dir, router, "configure terminal",
+					"ip prefix-list TWGRADE-STEAL seq 5 permit "+prefix,
+					"route-map "+rmap+" permit 3",
+					" match ip address prefix-list TWGRADE-STEAL",
+					" set as-path exclude "+origin,
+					" set as-path prepend "+itoa(as),
+					"end")
+				vtysh(t, dir, router, "clear ip bgp "+peer+" out")
 				time.Sleep(20 * time.Second)
 			},
 		},
