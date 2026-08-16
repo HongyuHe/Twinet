@@ -1217,7 +1217,7 @@ func transitProbe(ctx context.Context, env *Env, sess externalSession, cand tran
 	if src != "" {
 		conn = append(conn, "-s", src)
 	}
-	conn = append(conn, cand.Addr, "9")
+	conn = append(conn, cand.Addr, probePort())
 	res, cerr := env.Probe(ctx, sess.PeerDevice, conn)
 	rstAfter, okR2 := tcpResetsSent(ctx, env, cand.Host)
 	said := ""

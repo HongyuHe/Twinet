@@ -76,7 +76,7 @@ func tunnelCarriesTransport(ctx context.Context, env *Env, hosts map[string]*mod
 		}
 		before, okB := tcpResetsSent(ctx, env, dst.ID)
 		res, err := env.Probe(ctx, src.ID,
-			[]string{"nc", "-6", "-w", "3", "-z", addr, "9"})
+			[]string{"nc", "-6", "-w", "3", "-z", addr, probePort()})
 		after, okA := tcpResetsSent(ctx, env, dst.ID)
 		if !okB || !okA {
 			// The counter could not be read, so a refusal is the only

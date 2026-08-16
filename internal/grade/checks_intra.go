@@ -978,7 +978,7 @@ func carriesTCPBothWays(ctx context.Context, env *Env, from, to string) (string,
 		if slo, ok := src.IfaceByName("lo"); ok && slo.Addr4 != "" {
 			args = append(args, "-s", addrOnly(slo.Addr4))
 		}
-		args = append(args, addr, "9")
+		args = append(args, addr, probePort())
 		before, okB := tcpResetsSent(ctx, env, dst.ID)
 		_, _ = env.Probe(ctx, src.ID, args)
 		after, okA := tcpResetsSent(ctx, env, dst.ID)
@@ -1941,7 +1941,7 @@ func unreachableByTCP(ctx context.Context, env *Env, hosts []*model.Device,
 				defer func() { <-sem }()
 				addr := addrOf[b.ID]
 				res, err := env.Probe(ctx, a.ID,
-					[]string{"nc", "-v", "-w", "3", "-z", addr, "9"})
+					[]string{"nc", "-v", "-w", "3", "-z", addr, probePort()})
 				if err != nil {
 					return // the machinery failed, which is not a verdict
 				}
