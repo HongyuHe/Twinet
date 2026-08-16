@@ -2,6 +2,7 @@ package grade
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/netip"
 	"regexp"
@@ -11,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/HongyuHe/twinet/internal/alloc"
 	"github.com/HongyuHe/twinet/internal/model"
 )
 
@@ -310,6 +312,57 @@ type ospfNeighborJSON struct {
 	} `json:"neighbors"`
 }
 
+// linkDevice is what an interface says about itself beyond its name.
+type linkDevice struct {
+	Kind     string
+	MAC      string
+	Altnames []string
+}
+
+// linkIdentities reads every router's interfaces and returns, per router, what
+// each name is actually attached to.
+//
+// The name is the student's to change; the tag Twinet stamps on the veth when
+// it creates the link is not, and neither is whether the thing is a veth at
+// all. Read together they say whether the interface carrying an adjacency is
+// the link the plan drew or something wearing its name.
+func linkIdentities(ctx context.Context, env *Env) map[string]map[string]linkDevice {
+	out := map[string]map[string]linkDevice{}
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for _, r := range env.Routers() {
+		wg.Add(1)
+		go func(r *model.Device) {
+			defer wg.Done()
+			res, err := env.Probe(ctx, r.ID, []string{"ip", "-d", "-j", "link", "show"})
+			if err != nil || res.ExitCode != 0 {
+				return
+			}
+			var devs []struct {
+				IfName   string   `json:"ifname"`
+				Address  string   `json:"address"`
+				Altnames []string `json:"altnames"`
+				LinkInfo struct {
+					InfoKind string `json:"info_kind"`
+				} `json:"linkinfo"`
+			}
+			if json.Unmarshal([]byte(res.Stdout), &devs) != nil {
+				return
+			}
+			byName := map[string]linkDevice{}
+			for _, d := range devs {
+				byName[d.IfName] = linkDevice{
+					Kind: d.LinkInfo.InfoKind, MAC: d.Address, Altnames: d.Altnames}
+			}
+			mu.Lock()
+			out[r.Name] = byName
+			mu.Unlock()
+		}(r)
+	}
+	wg.Wait()
+	return out
+}
+
 func checkOSPFAdjacency(ctx context.Context, env *Env) Result {
 	// Which adjacency, not how many.
 	//
@@ -320,7 +373,7 @@ func checkOSPFAdjacency(ctx context.Context, env *Env) Result {
 	// and the question -- which is about the interior links being adjacent --
 	// reported all twenty-four of them Full. The topology says which interface
 	// faces which router, and that is what is required to be adjacent.
-	type want struct{ router, iface, peer string }
+	type want struct{ router, iface, peer, altname, mac string }
 	var wanted []want
 	for _, r := range env.Routers() {
 		for _, i := range r.Ifaces {
@@ -330,7 +383,8 @@ func checkOSPFAdjacency(ctx context.Context, env *Env) Result {
 			if !i.Peer.Device.IsRouter() || i.Peer.Device.ASN != env.AS {
 				continue
 			}
-			wanted = append(wanted, want{r.Name, i.Name, i.Peer.Device.Name})
+			wanted = append(wanted, want{r.Name, i.Name, i.Peer.Device.Name,
+				alloc.LinkAltname(env.Topology.Name, i.Link.ID), i.MAC})
 		}
 	}
 	if len(wanted) == 0 {
@@ -376,9 +430,50 @@ func checkOSPFAdjacency(ctx context.Context, env *Env) Result {
 		}
 	}
 
+	// An interface name is a label the student can move.
+	//
+	// The adjacency was bound to the plan by the name of the interface it ran
+	// on, and a name is the one part of an interface anyone with root can
+	// change. Renaming the real veth, building a GRE tunnel between the same
+	// two routers and calling it by the planned name put every adjacency on a
+	// tunnel while the planned links were down, and the check reported all
+	// twenty-four Full "each on the link the plan gives it".
+	//
+	// Twinet stamps a tag derived from the link's identity onto both halves of
+	// the veth it creates, so the link says which link it is. That, and its
+	// being a veth rather than an encapsulation, is what the name was standing
+	// in for.
+	links := linkIdentities(ctx, env)
+
 	var stuck []string
 	got := 0
 	for _, w := range wanted {
+		if id, known := links[w.router]; known {
+			dev, present := id[w.iface]
+			switch {
+			case !present:
+				stuck = append(stuck, fmt.Sprintf("%s has no interface called %s at all",
+					w.router, w.iface))
+				continue
+			case dev.Kind != "" && dev.Kind != "veth":
+				stuck = append(stuck, fmt.Sprintf(
+					"%s's %s is a %s, not the link the plan puts there: an adjacency over an "+
+						"encapsulation is not the interior link being adjacent",
+					w.router, w.iface, dev.Kind))
+				continue
+			case w.altname != "" && !containsStr(dev.Altnames, w.altname):
+				stuck = append(stuck, fmt.Sprintf(
+					"%s's %s is not the interface Twinet created for the link to %s: it does "+
+						"not carry that link's identity, so something else has been given "+
+						"its name", w.router, w.iface, w.peer))
+				continue
+			case w.mac != "" && dev.MAC != "" && !strings.EqualFold(dev.MAC, w.mac):
+				stuck = append(stuck, fmt.Sprintf(
+					"%s's %s does not have the address Twinet gave the link to %s (%s, not %s)",
+					w.router, w.iface, w.peer, dev.MAC, w.mac))
+				continue
+			}
+		}
 		switch {
 		case full[w.router][w.iface]:
 			got++
