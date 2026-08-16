@@ -999,6 +999,106 @@ func checkECMP(ctx context.Context, env *Env) Result {
 
 // checkVLANIsolation verifies that hosts in the same VLAN reach each other
 // directly while hosts in different VLANs are forced through the gateway.
+// crossVLANFrames sends a broadcast in one VLAN and asks the other whether it
+// arrived, returning what leaked and how many ordered pairs were tried.
+//
+// The observation is the target's own neighbour table. An ARP request names its
+// sender, and a kernel that answers one records who asked; a kernel that never
+// sees the frame has nothing to record. This works where watching for a reply
+// does not, because a switch can be made to copy frames one way only, and then
+// the answer goes back into the VLAN it came from and the sender hears nothing
+// while the other VLAN has seen everything.
+func crossVLANFrames(ctx context.Context, env *Env, vlans []int,
+	hosts map[int][]*model.Device, sem chan struct{}) ([]string, int) {
+	type pair struct{ src, dst *model.Device }
+	var pairs []pair
+	for a := range vlans {
+		for b := range vlans {
+			if a == b {
+				continue
+			}
+			for _, src := range hosts[vlans[a]] {
+				for _, dst := range hosts[vlans[b]] {
+					pairs = append(pairs, pair{src, dst})
+				}
+			}
+		}
+	}
+	var (
+		mu     sync.Mutex
+		leaks  []string
+		tested int
+		wg     sync.WaitGroup
+	)
+	for _, p := range pairs {
+		wg.Add(1)
+		go func(p pair) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			srcIf, srcAddr := accessPort(p.src)
+			dstIf, dstAddr := accessPort(p.dst)
+			if srcIf == "" || srcAddr == "" || dstIf == "" || dstAddr == "" {
+				return
+			}
+			// Forget anything already known about the sender, so what is there
+			// afterwards can only have arrived during the probe.
+			_, _ = env.Probe(ctx, p.dst.ID, []string{"ip", "neigh", "del", srcAddr, "dev", dstIf})
+			res, err := env.Probe(ctx, p.src.ID,
+				[]string{"arping", "-c", "2", "-w", "3", "-I", srcIf, dstAddr})
+			// Exit 1 is "nobody answered", which is the correct answer here.
+			// Anything that means the probe never ran -- no such command, no
+			// such interface -- must not be counted as an isolated pair.
+			if err != nil || res.ExitCode > 1 {
+				return
+			}
+			mu.Lock()
+			tested++
+			mu.Unlock()
+			seen, err := env.Probe(ctx, p.dst.ID,
+				[]string{"ip", "neigh", "show", srcAddr, "dev", dstIf})
+			if err != nil || !strings.Contains(seen.Stdout, "lladdr") {
+				return
+			}
+			mu.Lock()
+			leaks = append(leaks, fmt.Sprintf(
+				"a broadcast frame sent by %s in VLAN %d arrived at %s in VLAN %d, "+
+					"which recorded the sender: the two VLANs are one broadcast domain",
+				p.src.Name, vlanOf(p.src), p.dst.Name, vlanOf(p.dst)))
+			mu.Unlock()
+		}(p)
+	}
+	wg.Wait()
+	sort.Strings(leaks)
+	return leaks, tested
+}
+
+// accessPort names the interface a host sits on in its layer-2 domain, and the
+// address it answers to there.
+func accessPort(d *model.Device) (string, string) {
+	for _, i := range d.Ifaces {
+		if i.Name == "lo" || i.Addr4 == "" {
+			continue
+		}
+		addr := i.Addr4
+		if j := strings.IndexByte(addr, '/'); j > 0 {
+			addr = addr[:j]
+		}
+		return i.Name, addr
+	}
+	return "", ""
+}
+
+// vlanOf reports the VLAN a host is meant to be in.
+func vlanOf(d *model.Device) int {
+	for _, i := range d.Ifaces {
+		if i.VLAN > 0 {
+			return i.VLAN
+		}
+	}
+	return 0
+}
+
 func checkVLANIsolation(ctx context.Context, env *Env) Result {
 	domain := env.ArgString("domain", "")
 	hosts := map[int][]*model.Device{} // vlan -> hosts
@@ -1143,6 +1243,30 @@ func checkVLANIsolation(ctx context.Context, env *Env) Result {
 		}
 	}
 	wg.Wait()
+
+	// And then layer 2 itself.
+	//
+	// Everything above is about IP: hosts in one VLAN are adjacent, hosts in
+	// two are separated by the gateway. None of it looks at frames, and a
+	// switch that copies frames from one VLAN's port onto another's leaves all
+	// of it true -- off-subnet traffic still goes through the gateway, because
+	// that is a routing decision the host makes before any frame exists. A
+	// reviewer mirrored one access port onto another with `tc ... mirred` and
+	// the check gave full marks to two VLANs that were the same broadcast
+	// domain.
+	//
+	// So a broadcast is sent, and the far side is asked whether it saw it. An
+	// ARP request for the other host's address is answered by nobody when the
+	// VLANs are separate, and when they are not the target's own kernel records
+	// the sender -- which it does even when the copy is one-directional and the
+	// reply never comes back, as the reviewer's was.
+	leaks, tested := crossVLANFrames(ctx, env, vlans, hosts, sem)
+	for _, leak := range leaks {
+		record(false, "%s", leak)
+	}
+	for i := 0; i < tested-len(leaks); i++ {
+		record(true, "")
+	}
 
 	var problems []string
 	passed, total := 0, len(results)
