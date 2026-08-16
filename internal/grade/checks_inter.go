@@ -9,6 +9,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/HongyuHe/twinet/internal/model"
 )
@@ -66,6 +68,8 @@ type bgpSummaryJSON struct {
 			PfxSnt        int    `json:"pfxSnt"`
 			PeerUptimeMs  int64  `json:"peerUptimeMsec"`
 			ConnectionsEs int    `json:"connectionsEstablished"`
+			MsgRcvd       int64  `json:"msgRcvd"`
+			MsgSent       int64  `json:"msgSent"`
 		} `json:"peers"`
 	} `json:"ipv4Unicast"`
 }
@@ -75,6 +79,62 @@ func bgpSummary(ctx context.Context, env *Env, router string) (bgpSummaryJSON, e
 	var out bgpSummaryJSON
 	err := env.VtyshJSON(ctx, router, "show ip bgp summary json", &out)
 	return out, err
+}
+
+// bgpSummaries reads every router's BGP summary at once.
+func bgpSummaries(ctx context.Context, env *Env, routers []*model.Device) map[string]bgpSummaryJSON {
+	out := map[string]bgpSummaryJSON{}
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for _, r := range routers {
+		wg.Add(1)
+		go func(r *model.Device) {
+			defer wg.Done()
+			sum, err := bgpSummary(ctx, env, r.Name)
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			out[r.Name] = sum
+			mu.Unlock()
+		}(r)
+	}
+	wg.Wait()
+	return out
+}
+
+// refreshIBGP asks every router to re-send its table to every other, so that
+// each session has to carry a message while the check is watching.
+func refreshIBGP(ctx context.Context, env *Env, routers []*model.Device, loopback map[string]string) {
+	var wg sync.WaitGroup
+	for _, r := range routers {
+		var cmds []string
+		for _, other := range routers {
+			if other == r || loopback[other.Name] == "" {
+				continue
+			}
+			cmds = append(cmds, "clear bgp "+loopback[other.Name]+" soft in")
+		}
+		if len(cmds) == 0 {
+			continue
+		}
+		wg.Add(1)
+		go func(r *model.Device, cmds []string) {
+			defer wg.Done()
+			args := []string{"vtysh"}
+			for _, c := range cmds {
+				args = append(args, "-c", c)
+			}
+			_, _ = env.Probe(ctx, model.DeviceID(env.AS, r.Name), args)
+		}(r, cmds)
+	}
+	wg.Wait()
+	// Long enough for a refresh and the answer to it to cross a link that may
+	// be on another machine, and short enough not to matter.
+	select {
+	case <-ctx.Done():
+	case <-time.After(5 * time.Second):
+	}
 }
 
 func checkIBGPFullMesh(ctx context.Context, env *Env) Result {
@@ -96,10 +156,27 @@ func checkIBGPFullMesh(ctx context.Context, env *Env) Result {
 	established := 0
 	var problems []string
 
+	// "Established" is a memory, not an observation.
+	//
+	// A session whose packets are being discarded stays Established until the
+	// hold timer expires -- three minutes with the default timers, longer than
+	// a grading run. A reviewer blackholed an iBGP session in both directions
+	// immediately after a keepalive, confirmed ten packets dropped each way,
+	// and the mesh scored full marks for a session that was carrying nothing.
+	//
+	// So each router is asked to send something now. A route refresh is a real
+	// message that must cross the connection, and the peer's own received
+	// count records its arrival; it also makes the peer answer, so the counts
+	// move in both directions. It disturbs nothing: the peer re-sends routes
+	// the receiver already has.
+	before := bgpSummaries(ctx, env, routers)
+	refreshIBGP(ctx, env, routers, loopback)
+	after := bgpSummaries(ctx, env, routers)
+
 	for _, r := range routers {
-		sum, err := bgpSummary(ctx, env, r.Name)
-		if err != nil {
-			problems = append(problems, fmt.Sprintf("%s: %v", r.Name, err))
+		sum, ok := after[r.Name]
+		if !ok {
+			problems = append(problems, fmt.Sprintf("%s: its BGP summary could not be read", r.Name))
 			continue
 		}
 		for _, other := range routers {
@@ -111,6 +188,7 @@ func checkIBGPFullMesh(ctx context.Context, env *Env) Result {
 				continue
 			}
 			p, ok := sum.IPv4Unicast.Peers[addr]
+			was, had := before[r.Name].IPv4Unicast.Peers[addr]
 			switch {
 			case !ok:
 				problems = append(problems, fmt.Sprintf("%s has no session with %s (%s)", r.Name, other.Name, addr))
@@ -119,6 +197,11 @@ func checkIBGPFullMesh(ctx context.Context, env *Env) Result {
 					r.Name, other.Name, p.RemoteAs, env.AS))
 			case !strings.EqualFold(p.State, "Established"):
 				problems = append(problems, fmt.Sprintf("%s -> %s is %s", r.Name, other.Name, p.State))
+			case had && p.MsgRcvd <= was.MsgRcvd:
+				problems = append(problems, fmt.Sprintf(
+					"%s -> %s says Established, but nothing arrived from %s while it was "+
+						"asked to send: the session is held open by a timer that has not "+
+						"expired yet, and carries nothing", r.Name, other.Name, other.Name))
 			default:
 				established++
 			}
@@ -137,6 +220,33 @@ func checkIBGPFullMesh(ctx context.Context, env *Env) Result {
 		Hint:     "peer with each router's loopback and set update-source lo on both ends",
 		Command:  "show ip bgp summary json",
 	})
+}
+
+// refreshExternal asks each router to re-send its table to every external
+// neighbour it has, so each session has to carry a message while the check is
+// watching. It disturbs nothing: the peer re-sends routes the receiver already
+// has.
+func refreshExternal(ctx context.Context, env *Env, byRouter map[string][]string) {
+	var wg sync.WaitGroup
+	for router, peers := range byRouter {
+		if len(peers) == 0 {
+			continue
+		}
+		wg.Add(1)
+		go func(router string, peers []string) {
+			defer wg.Done()
+			args := []string{"vtysh"}
+			for _, p := range peers {
+				args = append(args, "-c", "clear bgp "+p+" soft in")
+			}
+			_, _ = env.Probe(ctx, model.DeviceID(env.AS, router), args)
+		}(router, peers)
+	}
+	wg.Wait()
+	select {
+	case <-ctx.Done():
+	case <-time.After(5 * time.Second):
+	}
 }
 
 func checkEBGPEstablished(ctx context.Context, env *Env) Result {
@@ -168,6 +278,21 @@ func checkEBGPEstablished(ctx context.Context, env *Env) Result {
 	if len(wanted) == 0 {
 		return Errored("bgp.ebgp_established", fmt.Errorf("AS %d has no external links in the lab", env.AS))
 	}
+
+	// "Established" is a memory here too.
+	//
+	// A session whose packets are being discarded stays Established until the
+	// hold timer expires, which is longer than a grading run: dropping both
+	// directions of the TCP flow left every external session reported up and
+	// carrying nothing. Each router is asked to send a route refresh first --
+	// a real message that has to cross the connection and be answered -- and
+	// the counts are compared either side of it.
+	before := bgpSummaries(ctx, env, env.Routers())
+	peersOf := map[string][]string{}
+	for _, w := range wanted {
+		peersOf[w.router] = append(peersOf[w.router], w.peerAddr)
+	}
+	refreshExternal(ctx, env, peersOf)
 
 	byRouter := map[string]bgpSummaryJSON{}
 	up := 0
@@ -207,6 +332,14 @@ func checkEBGPEstablished(ctx context.Context, env *Env) Result {
 				problems = append(problems, fmt.Sprintf(
 					"%s reports a session with AS %d at %s, but %s", w.router, w.peerAS,
 					w.peerAddr, why))
+				continue
+			}
+			if was, had := before[w.router].IPv4Unicast.Peers[w.peerAddr]; had &&
+				p.MsgRcvd <= was.MsgRcvd {
+				problems = append(problems, fmt.Sprintf(
+					"%s -> AS %d (%s) says Established, but nothing arrived from it while it "+
+						"was asked to send: the session is held open by a timer that has not "+
+						"expired yet, and carries nothing", w.router, w.peerAS, w.peerAddr))
 				continue
 			}
 			up++
@@ -315,6 +448,22 @@ func checkOwnPrefix(ctx context.Context, env *Env) Result {
 		}
 		for prefix, entries := range adv.Table() {
 			for _, e := range entries {
+				// Claiming to be the origin of somebody else's prefix.
+				//
+				// A route this AS relays keeps the origin at the end of its
+				// path, and our own prepends go on the front. Rewriting the
+				// end -- `set as-path exclude` and a prepend, or a
+				// wholesale replacement -- makes the neighbour believe this AS
+				// originates address space it does not hold, which is a hijack
+				// with a different spelling. It never appears as a locally
+				// injected route here, so nothing above notices it.
+				if prefix != as.Block && originASN(e.Path) == env.AS {
+					originated[prefix] = true
+					advertised[prefix] = fmt.Sprintf(
+						"%s tells %s that this AS originates it (path %q)",
+						sess.Router, sess.Addr, strings.TrimSpace(e.Path))
+					continue
+				}
 				// The advertised view carries no peer, so origination is
 				// decided from the tables above; an empty path here still
 				// means the same thing and catches a prefix that only appears
@@ -365,12 +514,102 @@ func checkOwnPrefix(ctx context.Context, env *Env) Result {
 	}
 }
 
+// originASN is the AS at the end of a path, which is the one claiming to have
+// originated the prefix. Prepends go on the front, so the end is the claim.
+func originASN(path string) int {
+	f := strings.Fields(strings.TrimSpace(path))
+	if len(f) == 0 {
+		return 0
+	}
+	n, err := strconv.Atoi(f[len(f)-1])
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
 // checkGaoRexford verifies the local-preference ordering that implements the
 // business relationships: customer over peer over provider.
 //
 // It reads the ordering out of the routing table rather than pattern-matching
 // the configuration, so any correct implementation passes and a configuration
 // that merely looks right does not.
+// overriddenByStatic names the externally learned prefixes a router forwards
+// by some route other than the BGP one.
+//
+// A ranking that does not decide where packets go is not a ranking. Anything
+// installed above BGP -- a static route, a kernel route, a policy table --
+// takes the traffic wherever it says, whatever the BGP table shows.
+func overriddenByStatic(ctx context.Context, env *Env, routers []*model.Device) []string {
+	var (
+		mu  sync.Mutex
+		out []string
+		wg  sync.WaitGroup
+	)
+	for _, r := range routers {
+		wg.Add(1)
+		go func(r *model.Device) {
+			defer wg.Done()
+			tbl, err := bgpTable(ctx, env, r.Name)
+			if err != nil {
+				return
+			}
+			external := map[string]bool{}
+			for prefix, entries := range tbl.Table() {
+				for _, e := range entries {
+					if e.IsBest() && strings.TrimSpace(e.Path) != "" {
+						external[prefix] = true
+					}
+				}
+			}
+			if len(external) == 0 {
+				return
+			}
+			var routes ospfRouteJSON
+			if err := env.VtyshJSON(ctx, r.Name, "show ip route json", &routes); err != nil {
+				return
+			}
+			for prefix, entries := range routes {
+				if !external[prefix] {
+					continue
+				}
+				for _, e := range entries {
+					if !e.Selected && !e.Installed {
+						continue
+					}
+					switch e.Protocol {
+					case "bgp", "connected", "":
+					default:
+						mu.Lock()
+						out = append(out, fmt.Sprintf(
+							"%s forwards %s by a %s route, not the one BGP chose",
+							r.Name, prefix, e.Protocol))
+						mu.Unlock()
+					}
+				}
+			}
+		}(r)
+	}
+	wg.Wait()
+	sort.Strings(out)
+	return uniq(out)
+}
+
+// relRank orders the business relationships by how much a route from one is
+// worth: a customer pays to be carried, a peer costs nothing, a provider is
+// billed for.
+func relRank(rel model.Relationship) int {
+	switch rel {
+	case model.RelCustomer:
+		return 3
+	case model.RelPeer:
+		return 2
+	case model.RelProvider:
+		return 1
+	}
+	return 0
+}
+
 func checkGaoRexford(ctx context.Context, env *Env) Result {
 	routers := env.Routers()
 	if len(routers) == 0 {
@@ -386,8 +625,12 @@ func checkGaoRexford(ctx context.Context, env *Env) Result {
 	// which is most of them, and all of the ones the assignment cares about --
 	// was marked on customer-versus-provider alone.
 	relOf := map[string]model.Relationship{}
+	relOfASN := map[int]model.Relationship{}
 	for _, sess := range externalSessions(ctx, env) {
 		relOf[sess.Addr] = sess.Rel
+		if sess.ASN != 0 {
+			relOfASN[sess.ASN] = sess.Rel
+		}
 	}
 	if len(relOf) == 0 {
 		return Errored("policy.gao_rexford", fmt.Errorf("AS %d has no external neighbours", env.AS))
@@ -410,19 +653,55 @@ func checkGaoRexford(ctx context.Context, env *Env) Result {
 		router string
 	}
 	seen := map[model.Relationship][]observed{}
+	// And which path each router actually chose.
+	//
+	// Local preference is what a student configures; which route wins is what
+	// the rule is for, and they are not the same thing. Local preference is
+	// only the second tie-break in the decision process, so `set weight 65535`
+	// on a provider's route puts it ahead of a peer's while every local
+	// preference in the table still reads correctly -- measured, and worth
+	// full marks before this. Whatever attribute is used to arrange it, a
+	// provider's route selected while a peer offers the same prefix is the
+	// ordering broken.
+	var misranked []string
 	for _, r := range routers {
 		tbl, err := bgpTable(ctx, env, r.Name)
 		if err != nil {
 			continue
 		}
 		for prefix, entries := range tbl.Table() {
+			var chosen, available model.Relationship
+			chosenOK := false
 			for _, e := range entries {
 				if rel, via, ok := learnedFromRelationship(e, relOf); ok {
 					seen[rel] = append(seen[rel], observed{e.LocalPref, prefix, via, r.Name})
 				}
+				// Which relationship the route entered this AS through, which
+				// is a different question from which session this router
+				// happened to hear it on. A route another router of the AS
+				// learned from a peer arrives here over iBGP, where the
+				// session says nothing about its origin -- and the whole
+				// comparison is between routes that mostly arrive that way.
+				// The neighbour at the head of the AS path is the answer.
+				rel := sourceRelationship(e, env.AS, relOf, relOfASN)
+				if rel == "" {
+					continue
+				}
+				if relRank(rel) > relRank(available) {
+					available = rel
+				}
+				if e.IsBest() {
+					chosen, chosenOK = rel, true
+				}
+			}
+			if chosenOK && relRank(available) > relRank(chosen) {
+				misranked = append(misranked, fmt.Sprintf(
+					"%s sends %s to a %s while a %s offers the same prefix",
+					r.Name, prefix, chosen, available))
 			}
 		}
 	}
+	sort.Strings(misranked)
 
 	worst := func(rel model.Relationship) (observed, bool) {
 		v := seen[rel]
@@ -495,6 +774,31 @@ func checkGaoRexford(ctx context.Context, env *Env) Result {
 	compare(model.RelCustomer, model.RelPeer, hasCust, hasPeer, custLo, peerHi)
 	compare(model.RelPeer, model.RelProvider, hasPeer, hasProv, peerLo, provHi)
 	compare(model.RelCustomer, model.RelProvider, hasCust, hasProv, custLo, provHi)
+
+	// And that the ranking is what decides where packets go.
+	//
+	// Everything above is BGP's decision. The kernel's is what forwards, and
+	// they are not the same: `ip route replace 4.0.0.0/8 via <provider>` sends
+	// the traffic to a provider while BGP's table still shows the peer path
+	// selected at a higher local preference. The ordering was arranged, agreed
+	// with, and then ignored, for full marks.
+	checks++
+	if over := overriddenByStatic(ctx, env, routers); len(over) == 0 {
+		passed++
+	} else {
+		fmt.Fprintf(&detail, "%d externally learned prefix(es) are forwarded by something "+
+			"other than BGP, so the ordering does not decide where traffic goes:\n%s\n",
+			len(over), strings.Join(truncate(over, 5), "\n"))
+	}
+
+	// The ordering as it came out, which is the point of arranging it.
+	checks++
+	if len(misranked) == 0 {
+		passed++
+	} else {
+		fmt.Fprintf(&detail, "%d prefix(es) are sent to a worse relationship than one that "+
+			"offers them:\n%s\n", len(misranked), strings.Join(truncate(misranked, 5), "\n"))
+	}
 
 	// Every relationship this AS actually has must be represented.
 	//
@@ -600,9 +904,15 @@ func checkNoTransit(ctx context.Context, env *Env) Result {
 	// while leaving that customer unreachable from the rest of the internet,
 	// which is the single most consequential thing a transit AS can get wrong.
 	custPrefixes := map[string]string{}
+	var unreadableTables []string
 	for _, r := range env.Routers() {
 		tbl, err := bgpTable(ctx, env, r.Name)
 		if err != nil {
+			// A table that could not be read is a customer's routes that
+			// might be in it. Since what may be exported is now decided by
+			// what was learned from customers, not reading one would turn
+			// missing knowledge into an accusation.
+			unreadableTables = append(unreadableTables, fmt.Sprintf("%s: %v", r.Name, err))
 			continue
 		}
 		for prefix, entries := range tbl.Table() {
@@ -654,18 +964,39 @@ func checkNoTransit(ctx context.Context, env *Env) Result {
 				sawOwn = true
 			}
 			for _, e := range entries {
-				// A route we originate may go anywhere.
-				if e.Originated() {
+				// A route we originate may go anywhere, and so may a
+				// customer's.
+				//
+				// Our own prefix is named, not inferred from an empty path:
+				// the traffic-engineering question asks for `set as-path
+				// prepend <own> <own> <own>` towards the slow provider, so the
+				// advertisement of our own address space leaves carrying a
+				// path, and reading only the path called the correct answer a
+				// leak.
+				if e.Originated() || (own != "" && prefix == own) {
 					continue
 				}
-				// Otherwise it came from someone: if it came from a peer or
-				// provider, exporting it here is a leak.
-				src := sourceRelationship(e, env.AS, relOf, relOfASN)
-				if src == model.RelPeer || src == model.RelProvider {
-					leaks = append(leaks, fmt.Sprintf(
-						"%s advertises %s (learned from a %s, path %q) to a %s at %s",
-						name, prefix, src, strings.TrimSpace(e.Path), rel, addr))
+				if _, ours := custPrefixes[prefix]; ours {
+					continue
 				}
+				// Anything else came from a peer or a provider, and exporting
+				// it here is a leak.
+				//
+				// Which it came from is decided by the session it arrived on,
+				// recorded above, and not by the path in the advertisement. A
+				// path on the way out is the submission's to write: prepending
+				// a customer's ASN in front of a peer's route -- `set as-path
+				// prepend 3 3 3 7` -- made a leak read as a customer's route
+				// being passed on, which is exactly what the rule permits, and
+				// the whole question kept its marks.
+				src := sourceRelationship(e, env.AS, relOf, relOfASN)
+				from := "which is neither yours nor a customer's"
+				if src != "" {
+					from = "learned from a " + string(src)
+				}
+				leaks = append(leaks, fmt.Sprintf(
+					"%s advertises %s (%s, sent with path %q) to a %s at %s",
+					name, prefix, from, strings.TrimSpace(e.Path), rel, addr))
 			}
 		}
 		if !sawOwn {
@@ -691,6 +1022,13 @@ func checkNoTransit(ctx context.Context, env *Env) Result {
 	// A session that could not be read has not been assessed, and a check that
 	// reports "no leaks" while some of the sessions it is about were never read
 	// is reporting on a question it did not finish asking.
+	if len(unreadableTables) > 0 {
+		sort.Strings(unreadableTables)
+		return Errored("policy.no_transit_for_peers", fmt.Errorf(
+			"%d router table(s) could not be read, and what may be exported is decided by "+
+				"what was learned from customers, so nothing can be concluded: %s",
+			len(unreadableTables), strings.Join(truncate(unreadableTables, 3), "; ")))
+	}
 	if len(unreadable) > 0 {
 		sort.Strings(unreadable)
 		return Errored("policy.no_transit_for_peers", fmt.Errorf(
@@ -982,16 +1320,50 @@ func transitProbe(ctx context.Context, env *Env, sess externalSession, cand tran
 	ping, err := env.Probe(ctx, sess.PeerDevice, args)
 	arrived := err == nil && ping.ExitCode == 0
 	after, okA := echoesDeliveredTo(ctx, env, cand.Host)
-	if okB && okA && after > before {
-		return "", true
+	switch {
+	case okB && okA && after > before:
+	case arrived && (!okB || !okA):
+		// The counter could not be read; the reply stands on its own.
+	default:
+		return fmt.Sprintf(
+			"the customer at %s is offered %s but its traffic does not cross this AS: "+
+				"a packet from %s to %s in AS %d was not delivered",
+			sess.Addr, cand.Prefix, sess.PeerDevice, cand.Addr, cand.ASN), false
 	}
-	if arrived && (!okB || !okA) {
-		return "", true // the counter could not be read; the reply stands on its own
+
+	// And something other than a ping.
+	//
+	// Transit that carries ICMP and discards the rest is not transit. A rule
+	// dropping forwarded TCP arriving from one customer left every probe
+	// answered and the question at full marks, while no connection from that
+	// customer could cross this AS. The destination counts the resets it sends,
+	// so being refused is the far side speaking and silence is the packets
+	// being swallowed on the way.
+	rstBefore, okR := tcpResetsSent(ctx, env, cand.Host)
+	conn := []string{"nc", "-v", "-w", "3", "-z"}
+	if src != "" {
+		conn = append(conn, "-s", src)
 	}
-	return fmt.Sprintf(
-		"the customer at %s is offered %s but its traffic does not cross this AS: "+
-			"a packet from %s to %s in AS %d was not delivered",
-		sess.Addr, cand.Prefix, sess.PeerDevice, cand.Addr, cand.ASN), false
+	conn = append(conn, cand.Addr, probePort())
+	res, cerr := env.Probe(ctx, sess.PeerDevice, conn)
+	rstAfter, okR2 := tcpResetsSent(ctx, env, cand.Host)
+	said := ""
+	if cerr == nil {
+		said = strings.ToLower(res.Stderr + res.Stdout)
+	}
+	switch {
+	case okR && okR2 && rstAfter > rstBefore:
+	case strings.Contains(said, "refused"), strings.Contains(said, "reset"):
+	case cerr == nil && res.ExitCode == 0:
+	case cerr != nil, !okR, !okR2:
+		// Nothing could be established either way, so nothing is concluded.
+	default:
+		return fmt.Sprintf(
+			"the customer at %s can ping across this AS but not connect: a connection from "+
+				"%s to %s in AS %d never arrived, so the transit carries ICMP and nothing else",
+			sess.Addr, sess.PeerDevice, cand.Addr, cand.ASN), false
+	}
+	return "", true
 }
 
 // sessionAddrOf finds our own address on this link, as the customer sees it:
@@ -1292,9 +1664,24 @@ func checkNoForbiddenOSPF(ctx context.Context, env *Env) Result {
 		}
 	}
 
+	// And what OSPF is carrying that never reaches a routing table.
+	//
+	// A prefix redistributed with the maximum metric is flooded to every
+	// router in the area and installed by none of them: LSInfinity means "do
+	// not use this", so `show ip route ospf` is empty and the RIB test above
+	// sees nothing. A reviewer put an inter-AS range into OSPF exactly that
+	// way and the check passed. The database is where a prefix being "in OSPF"
+	// is decided; a routing table is only what a router chose to do about it.
+	lsdb, err := forbiddenInLSDB(ctx, env, external)
+	if err != nil {
+		return Errored("config.no_forbidden_ospf", err)
+	}
+	found = append(found, lsdb...)
+
 	if len(found) == 0 {
 		return Pass("config.no_forbidden_ospf", Evidence{
-			Observed: "no inter-AS subnet is advertised in OSPF or carried as an OSPF route"})
+			Observed: "no inter-AS subnet is advertised in OSPF, carried as an OSPF route, " +
+				"or present in the link-state database"})
 	}
 	sort.Strings(found)
 	return Fail("config.no_forbidden_ospf", Evidence{
@@ -1305,6 +1692,146 @@ func checkNoForbiddenOSPF(ctx context.Context, env *Env) Result {
 			"`redistribute connected` puts them there as surely as a network statement does",
 		Command: "show running-config; show ip route ospf",
 	})
+}
+
+// ospfLSDB is the part of each link-state advertisement that names a prefix.
+type ospfLSDB struct {
+	RouterLinkStates struct {
+		Areas map[string][]struct {
+			AdvertisingRouter string `json:"advertisingRouter"`
+			RouterLinks       map[string]struct {
+				LinkType       string `json:"linkType"`
+				NetworkAddress string `json:"networkAddress"`
+				NetworkMask    string `json:"networkMask"`
+			} `json:"routerLinks"`
+		} `json:"areas"`
+	} `json:"routerLinkStates"`
+	NetworkLinkStates struct {
+		Areas map[string][]ospfPrefixLSA `json:"areas"`
+	} `json:"networkLinkStates"`
+	SummaryLinkStates struct {
+		Areas map[string][]ospfPrefixLSA `json:"areas"`
+	} `json:"summaryLinkStates"`
+	ASExternalLinkStates []ospfPrefixLSA `json:"asExternalLinkStates"`
+}
+
+type ospfPrefixLSA struct {
+	LinkStateID       string `json:"linkStateId"`
+	AdvertisingRouter string `json:"advertisingRouter"`
+	NetworkMask       int    `json:"networkMask"`
+	Metric            int    `json:"metric"`
+}
+
+// forbiddenInLSDB reports every inter-AS prefix that appears in the area's
+// link-state database, whatever kind of advertisement carried it there and
+// whatever metric it was given.
+func forbiddenInLSDB(ctx context.Context, env *Env, external externalRanges) ([]string, error) {
+	kinds := []string{"router", "network", "summary", "external"}
+	type finding struct{ where, what string }
+	var (
+		mu       sync.Mutex
+		out      []string
+		firstErr error
+		seen     = map[string]bool{}
+		wg       sync.WaitGroup
+	)
+	for _, r := range env.Routers() {
+		for _, kind := range kinds {
+			wg.Add(1)
+			go func(router, kind string) {
+				defer wg.Done()
+				var db ospfLSDB
+				cmd := "show ip ospf database " + kind + " json"
+				if err := env.VtyshJSON(ctx, router, cmd, &db); err != nil {
+					// A router with no OSPF prints nothing at all, which is an
+					// empty database and not a failure to read one.
+					if s, verr := env.Vtysh(ctx, router, cmd); verr == nil &&
+						strings.TrimSpace(s) == "" {
+						return
+					}
+					mu.Lock()
+					if firstErr == nil {
+						firstErr = fmt.Errorf(
+							"%s: its OSPF database could not be read, so whether the "+
+								"inter-AS ranges are in its interior routing cannot be "+
+								"decided: %w", router, err)
+					}
+					mu.Unlock()
+					return
+				}
+				var hits []finding
+				for _, lsas := range db.RouterLinkStates.Areas {
+					for _, lsa := range lsas {
+						for _, l := range lsa.RouterLinks {
+							if l.NetworkAddress == "" {
+								continue
+							}
+							p := l.NetworkAddress + "/" + strconv.Itoa(maskBits(l.NetworkMask))
+							if external.matches(p) {
+								hits = append(hits, finding{lsa.AdvertisingRouter,
+									fmt.Sprintf("%s as a %s in its router advertisement", p,
+										strings.ToLower(l.LinkType))})
+							}
+						}
+					}
+				}
+				add := func(lsas []ospfPrefixLSA, what string) {
+					for _, lsa := range lsas {
+						p := lsa.LinkStateID + "/" + strconv.Itoa(lsa.NetworkMask)
+						if external.matches(p) {
+							hits = append(hits, finding{lsa.AdvertisingRouter,
+								fmt.Sprintf("%s as %s (metric %d)", p, what, lsa.Metric)})
+						}
+					}
+				}
+				for _, lsas := range db.NetworkLinkStates.Areas {
+					add(lsas, "a transit network")
+				}
+				for _, lsas := range db.SummaryLinkStates.Areas {
+					add(lsas, "an inter-area summary")
+				}
+				add(db.ASExternalLinkStates, "an external route redistributed into OSPF")
+				mu.Lock()
+				for _, h := range hits {
+					line := fmt.Sprintf("%s floods %s", h.where, h.what)
+					if !seen[line] {
+						seen[line] = true
+						out = append(out, line)
+					}
+				}
+				mu.Unlock()
+			}(r.Name, kind)
+		}
+	}
+	wg.Wait()
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// maskBits turns OSPF's dotted network mask into a prefix length.
+func maskBits(mask string) int {
+	parts := strings.Split(mask, ".")
+	if len(parts) != 4 {
+		if n, err := strconv.Atoi(mask); err == nil {
+			return n
+		}
+		return 32
+	}
+	bits := 0
+	for _, p := range parts {
+		n, err := strconv.Atoi(p)
+		if err != nil {
+			return 32
+		}
+		for ; n > 0; n <<= 1 {
+			bits++
+			n &= 0xff
+		}
+	}
+	return bits
 }
 
 // peerPlannedAddr is the address the manifest gave the far end of a link.

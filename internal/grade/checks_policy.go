@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/HongyuHe/twinet/internal/model"
@@ -53,6 +54,91 @@ func init() {
 // Testing reachability alone would pass a student who configured native IPv6
 // routing, which is not what the question asks for; testing only for a tunnel
 // device would pass one who built a tunnel that does not carry traffic.
+// tunnelCarriesTransport opens a connection each way and says whether the far
+// side saw it.
+//
+// The target is a port nothing is listening on, so the answer is a reset: no
+// service has to be arranged anywhere, and the far side's own count of resets
+// it has sent records that the connection attempt arrived. A reply forged on
+// the path does not move that counter, and a rule that discards forwarded TCP
+// while permitting ICMP -- which is what makes a ping-only test worthless --
+// stops it moving at all.
+func tunnelCarriesTransport(ctx context.Context, env *Env, hosts map[string]*model.Device,
+	domains []string) (string, bool) {
+	for i := 0; i < 2; i++ {
+		src, dst := hosts[domains[i]], hosts[domains[1-i]]
+		if src == nil || dst == nil {
+			continue
+		}
+		addr := deviceAddr6(ctx, env, dst)
+		if addr == "" {
+			continue
+		}
+		before, okB := tcpResetsSent(ctx, env, dst.ID)
+		res, err := env.Probe(ctx, src.ID,
+			[]string{"nc", "-6", "-w", "3", "-z", addr, probePort()})
+		after, okA := tcpResetsSent(ctx, env, dst.ID)
+		if !okB || !okA {
+			// The counter could not be read, so a refusal is the only
+			// evidence there is; a timeout leaves nothing to conclude from.
+			if err == nil && res.ExitCode == 0 {
+				continue
+			}
+			continue
+		}
+		if after <= before {
+			return fmt.Sprintf(
+				"IPv6 pings cross the tunnel, but a connection from %s to %s at %s never "+
+					"arrived: %s answered no TCP at all, so the tunnel carries ICMP and "+
+					"nothing else", src.Name, dst.Name, addr, dst.Name), false
+		}
+		// And a datagram, which is neither of the two things already tried.
+		//
+		// A filter can be written per protocol as easily as per port. The far
+		// side counts the datagrams it received for a port nothing is bound
+		// to, which is a fact about arrival and not about any answer.
+		udpBefore, okU := udpNoPorts(ctx, env, dst.ID)
+		_, _ = env.Probe(ctx, src.ID, []string{"sh", "-c",
+			"echo twinet | nc -6 -u -w 2 " + addr + " " + probePort()})
+		udpAfter, okU2 := udpNoPorts(ctx, env, dst.ID)
+		if okU && okU2 && udpAfter <= udpBefore {
+			return fmt.Sprintf(
+				"IPv6 pings and connections cross the tunnel, but a datagram from %s to %s "+
+					"at %s never arrived: something on the path is filtering by protocol",
+				src.Name, dst.Name, addr), false
+		}
+	}
+	return "", true
+}
+
+// udpNoPorts reads a host's count of datagrams delivered to it for a port
+// nothing is bound to, which the kernel keeps and nothing on the path can
+// raise without the datagram arriving.
+func udpNoPorts(ctx context.Context, env *Env, device string) (int, bool) {
+	res, err := env.Probe(ctx, device, []string{"cat", "/proc/net/snmp6"})
+	if err != nil || res.ExitCode != 0 {
+		return 0, false
+	}
+	for _, line := range strings.Split(res.Stdout, "\n") {
+		f := strings.Fields(line)
+		if len(f) == 2 && f[0] == "Udp6NoPorts" {
+			n, err := strconv.Atoi(f[1])
+			return n, err == nil
+		}
+	}
+	return 0, false
+}
+
+// tcpResetsSent reads a host's count of TCP resets it has sent, which is the
+// kernel's own record of a connection attempt having reached it.
+func tcpResetsSent(ctx context.Context, env *Env, device string) (int, bool) {
+	res, err := env.Probe(ctx, device, []string{"cat", "/proc/net/snmp"})
+	if err != nil || res.ExitCode != 0 {
+		return 0, false
+	}
+	return snmpCounter(res.Stdout, "Tcp:", "OutRsts")
+}
+
 func checkSixIn4(ctx context.Context, env *Env) Result {
 	as, ok := env.Topology.ASes[env.AS]
 	if !ok {
@@ -289,7 +375,32 @@ func checkSixIn4(ctx context.Context, env *Env) Result {
 		}
 	}
 
+	// And whether anything other than a ping crosses it.
+	//
+	// Every probe above is ICMPv6. A rule on the gateway discarding forwarded
+	// TCP left every ping answered, the tunnel counters moving, and the whole
+	// point awarded for a tunnel across which no connection could be made. A
+	// datacentre that can only be pinged is not reachable in any sense the
+	// assignment means.
+	transportBlocked := ""
+	if throughTunnel && len(domains) >= 2 {
+		if why, ok := tunnelCarriesTransport(ctx, env, hosts, domains); !ok {
+			throughTunnel = false
+			reach = why
+			transportBlocked = why
+		}
+	}
+
 	switch {
+	case transportBlocked != "":
+		return Partial("tunnel.sixin4", 0.5, Evidence{
+			Expected: "the datacentres reaching each other over IPv6, not only answering pings",
+			Observed: "the tunnel carries ICMPv6 and nothing else",
+			Detail:   transportBlocked,
+			Hint: "something on the path is permitting ICMP and discarding the rest; " +
+				"a datacentre that can only be pinged is not reachable",
+			Command: "nc -6 -z <the other datacentre's host> 9; /proc/net/snmp",
+		})
 	case len(missing) == 0 && reachable && throughTunnel && len(unreached) > 0:
 		// The tunnel works and the answer does not cover the datacentres.
 		return Partial("tunnel.sixin4", 0.5, Evidence{
@@ -461,7 +572,25 @@ func checkIXPCommunities(ctx context.Context, env *Env) Result {
 			emptyList = name
 		}
 	}
-	admitted, accepted, aerr := routesViaIXP(ctx, env, ixpRouter.Name, ixpPeer)
+	// What the exchange sent us, in the exchange's own words.
+	//
+	// Which routes are in-region was decided from the AS path the member holds
+	// after its own import policy has run, and an import policy can rewrite a
+	// path: `set as-path exclude 5` on an accepted route turns "5 10" into
+	// "10", and a route relayed by an in-region member reads as coming
+	// straight from outside it. The route server belongs to the exchange, and
+	// what it advertised is not the submission's to edit.
+	ourAddr := ""
+	for _, i := range ixpRouter.Ifaces {
+		if i.Role == model.RoleIXPLink && i.Addr4 != "" {
+			ourAddr = addrOnly(i.Addr4)
+		}
+	}
+	offeredPaths, rerr := ixpOfferedPaths(ctx, env, rs.ID, ourAddr)
+	if rerr != nil {
+		return Errored("policy.ixp_communities", rerr)
+	}
+	admitted, accepted, aerr := routesViaIXP(ctx, env, ixpRouter.Name, ixpPeer, offeredPaths)
 	if aerr != nil {
 		return Errored("policy.ixp_communities", aerr)
 	}
@@ -475,12 +604,6 @@ func checkIXPCommunities(ctx context.Context, env *Env) Result {
 	// accepts nothing from the exchange has not written a peering policy; it
 	// has switched the exchange off, and the point of the question is the
 	// traffic that does cross it.
-	ourAddr := ""
-	for _, i := range ixpRouter.Ifaces {
-		if i.Role == model.RoleIXPLink && i.Addr4 != "" {
-			ourAddr = addrOnly(i.Addr4)
-		}
-	}
 	offered := 0
 	if ourAddr != "" {
 		offered, aerr = routeServerOffersOutOfRegion(ctx, env, rs.ID, ourAddr, ixpInRegion(env))
@@ -922,7 +1045,7 @@ func checkTrafficEngineering(ctx context.Context, env *Env) Result {
 			continue
 		}
 		checks++
-		sLen, sAdv := advertisedOwnPrefix(ctx, env, s.router, s.addr, own)
+		sLen, sForeign, sAdv := advertisedOwnPath(ctx, env, s.router, s.addr, own)
 		fLen, fAdv := advertisedOwnPrefix(ctx, env, f.router, f.addr, own)
 
 		// Filtering is explicitly forbidden here: the slow neighbour must still
@@ -937,12 +1060,23 @@ func checkTrafficEngineering(ctx context.Context, env *Env) Result {
 			fmt.Fprintf(&detail, "inbound: %s is not advertised to AS%d\n", own, f.asn)
 			continue
 		}
-		if sLen > fLen {
-			passed++
-		} else {
+		switch {
+		case len(sForeign) > 0:
+			fmt.Fprintf(&detail,
+				"inbound: the path advertised to the slow AS%d contains %s, which is not this "+
+					"AS: a path through a neighbour's own number is a loop to it and the "+
+					"announcement is discarded, so the slow link stops being a backup at all\n",
+				s.asn, strings.Join(truncate(sForeign, 3), ", "))
+		case sLen <= fLen:
 			fmt.Fprintf(&detail,
 				"inbound: the path advertised to the slow AS%d is %d long, no longer than the %d sent to AS%d; prepend to make it less attractive\n",
 				s.asn, sLen, fLen, f.asn)
+		case !neighbourHolds(ctx, env, s.asn, own):
+			fmt.Fprintf(&detail,
+				"inbound: AS%d does not hold %s at all, so the slow link is not the backup "+
+					"the question asks for\n", s.asn, own)
+		default:
+			passed++
 		}
 	}
 
@@ -1004,21 +1138,79 @@ func checkTrafficEngineering(ctx context.Context, env *Env) Result {
 // advertisedOwnPrefix returns the AS-path length of our own prefix as
 // advertised to a neighbour, and whether it is advertised at all.
 func advertisedOwnPrefix(ctx context.Context, env *Env, router, peer, own string) (int, bool) {
+	n, _, ok := advertisedOwnPath(ctx, env, router, peer, own)
+	return n, ok
+}
+
+// advertisedOwnPath returns the length of the longest path sent for our own
+// prefix, and every AS number in it that is not ours.
+//
+// The second half matters. Making the path longer is not the same as making it
+// longer with our own number: `set as-path prepend 1 1 1` towards AS 1 is
+// three hops longer and AS 1 discards the announcement outright, because a
+// path through itself is a loop. The slow link stops being a backup at all,
+// which is the one thing the question forbids, and a check that counted hops
+// called it a correct answer.
+func advertisedOwnPath(ctx context.Context, env *Env, router, peer, own string) (int, []string, bool) {
 	adv, err := advertisedRoutes(ctx, env, router, peer)
 	if err != nil {
-		return 0, false
+		return 0, nil, false
 	}
 	entries, ok := adv.Table()[own]
 	if !ok || len(entries) == 0 {
-		return 0, false
+		return 0, nil, false
 	}
 	longest := 0
+	var foreign []string
 	for _, e := range entries {
-		if n := len(strings.Fields(e.Path)); n > longest {
-			longest = n
+		f := strings.Fields(e.Path)
+		if len(f) > longest {
+			longest = len(f)
+		}
+		for _, a := range f {
+			if a != strconv.Itoa(env.AS) {
+				foreign = append(foreign, a)
+			}
 		}
 	}
-	return longest, true
+	sort.Strings(foreign)
+	return longest, uniq(foreign), true
+}
+
+// neighbourHolds asks a neighbour whether it actually has our prefix.
+//
+// The neighbour is somebody else's system, so its table is not the
+// submission's to arrange: what it holds is the only account of whether an
+// announcement survived the journey. An announcement that is sent and
+// discarded on arrival looks identical, from this side, to one that worked.
+func neighbourHolds(ctx context.Context, env *Env, asn int, prefix string) bool {
+	as, ok := env.Topology.ASes[asn]
+	if !ok {
+		return true // not in the lab, so nothing can be concluded
+	}
+	for _, r := range as.Routers {
+		res, err := env.Probe(ctx, r.ID, []string{"vtysh", "-c",
+			fmt.Sprintf("show ip bgp %s json", prefix)})
+		if err != nil || res.ExitCode != 0 {
+			continue
+		}
+		var doc struct {
+			Paths []struct {
+				ASPath struct {
+					String string `json:"string"`
+				} `json:"aspath"`
+			} `json:"paths"`
+		}
+		if json.Unmarshal([]byte(res.Stdout), &doc) != nil {
+			continue
+		}
+		for _, p := range doc.Paths {
+			if pathContainsASN(p.ASPath.String, env.AS) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // advertisedPrefixes returns the set of prefixes advertised to a neighbour.
@@ -1513,25 +1705,77 @@ func missingNotFoundRoutes(ctx context.Context, env *Env) ([]string, int, error)
 		// router and reaches nobody, and so is a route whose next hop does not
 		// resolve; both used to pass. The probe is the only thing that can
 		// tell a preserved route from a convincing imitation of one.
-		src, dst := hostIn(env.Topology, env.AS), hostIn(env.Topology, asn)
-		if src == nil || dst == nil {
+		// From every host, not the first one the topology happens to list.
+		//
+		// One probe is a statement about one host: a blackhole for this prefix
+		// on any other left the sole probe succeeding and the question at full
+		// marks, while the site behind it could not reach the network the
+		// question is about. Which host the list starts with is an accident of
+		// the manifest's ordering.
+		dst := hostIn(env.Topology, asn)
+		if dst == nil {
 			continue
 		}
 		addr := siteAddr(dst)
 		if addr == "" {
 			continue
 		}
-		ok, err := env.reaches(ctx, src.ID, addr)
+		unreachable, err := hostsThatCannotReach(ctx, env, addr)
 		if err != nil {
-			return nil, 0, fmt.Errorf("probing %s from %s: %w", addr, src.ID, err)
+			return nil, 0, err
 		}
-		if !ok {
+		if len(unreachable) > 0 {
 			missing = append(missing, fmt.Sprintf(
-				"%s (AS %d) is in every table, but %s cannot reach %s: the route is preserved "+
-					"in name only", as.Block, asn, src.Name, addr))
+				"%s (AS %d) is in every table, but %d host(s) cannot reach %s (%s): the route "+
+					"is preserved in name only", as.Block, asn, len(unreachable), addr,
+				strings.Join(truncate(unreachable, 3), ", ")))
 		}
 	}
 	return missing, checked, nil
+}
+
+// hostsThatCannotReach probes an address from every host of this AS at once and
+// names the ones it does not reach.
+func hostsThatCannotReach(ctx context.Context, env *Env, addr string) ([]string, error) {
+	as, ok := env.Topology.ASes[env.AS]
+	if !ok {
+		return nil, fmt.Errorf("AS %d not in the lab", env.AS)
+	}
+	var (
+		mu   sync.Mutex
+		out  []string
+		wg   sync.WaitGroup
+		perr error
+	)
+	sem := make(chan struct{}, 8)
+	for _, d := range as.Devices {
+		if d.Kind != model.KindHost || d.L2Domain != "" || siteAddr(d) == "" {
+			continue
+		}
+		wg.Add(1)
+		go func(d *model.Device) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			reached, err := env.reaches(ctx, d.ID, addr)
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err != nil:
+				if perr == nil {
+					perr = fmt.Errorf("probing %s from %s: %w", addr, d.ID, err)
+				}
+			case !reached:
+				out = append(out, d.Name)
+			}
+		}(d)
+	}
+	wg.Wait()
+	if perr != nil {
+		return nil, perr
+	}
+	sort.Strings(out)
+	return out, nil
 }
 
 // locallySourced reports whether a route was originated by this AS rather than
@@ -1777,6 +2021,37 @@ func fieldAfter(line, key string) string {
 // check passes for everybody -- vacuous in exactly the way it was written to
 // stop. `show ip bgp neighbors <rs> routes` is what the router itself
 // considers to have come from that session, after policy.
+// ixpOfferedPaths reads what the exchange relayed to one member, keyed by
+// prefix, as the exchange itself records it.
+//
+// This is the only account of the path that a member's import policy cannot
+// edit: what arrives is what the route server sent, whatever the member's
+// route-maps then make of it.
+func ixpOfferedPaths(ctx context.Context, env *Env, rsDevice, ourAddr string) (map[string]string, error) {
+	out := map[string]string{}
+	if ourAddr == "" {
+		return out, nil
+	}
+	res, err := env.Probe(ctx, rsDevice, []string{"vtysh", "-c",
+		fmt.Sprintf("show ip bgp neighbors %s advertised-routes json", ourAddr)})
+	if err != nil {
+		return nil, fmt.Errorf("asking the route server what it relays to %s: %w", ourAddr, err)
+	}
+	var got bgpRouteJSON
+	if jerr := jsonUnmarshalLoose(res.Stdout, &got); jerr != nil {
+		return nil, fmt.Errorf("reading what the route server relays to %s: %w", ourAddr, jerr)
+	}
+	for prefix, entries := range got.Table() {
+		for _, e := range entries {
+			if p := strings.TrimSpace(e.Path); p != "" {
+				out[prefix] = p
+				break
+			}
+		}
+	}
+	return out, nil
+}
+
 // routeServerOffersOutOfRegion reports how many of the routes the exchange is
 // relaying to this AS are ones it ought to accept.
 //
@@ -1843,7 +2118,8 @@ func ixpInRegion(env *Env) map[int]bool {
 	return out
 }
 
-func routesViaIXP(ctx context.Context, env *Env, router, ixpPeer string) (in, out []string, err error) {
+func routesViaIXP(ctx context.Context, env *Env, router, ixpPeer string,
+	relayed map[string]string) (in, out []string, err error) {
 	if _, ok := env.Topology.ASes[env.AS]; !ok {
 		return nil, nil, fmt.Errorf("AS %d not in the lab", env.AS)
 	}
@@ -1865,15 +2141,22 @@ func routesViaIXP(ctx context.Context, env *Env, router, ixpPeer string) (in, ou
 	}
 	for prefix, entries := range got.Table() {
 		for _, e := range entries {
+			// The path the exchange relayed, where it is known; the local one
+			// only as a fallback, for a prefix the route server no longer has.
+			path := e.Path
+			if p, ok := relayed[prefix]; ok {
+				path = p
+			}
 			crosses := false
-			for _, f := range strings.Fields(e.Path) {
+			for _, f := range strings.Fields(path) {
 				if n, cerr := strconv.Atoi(f); cerr == nil && inRegion[n] {
 					crosses = true
 					break
 				}
 			}
 			if crosses {
-				in = append(in, fmt.Sprintf("%s (path %q)", prefix, strings.TrimSpace(e.Path)))
+				in = append(in, fmt.Sprintf("%s (relayed with path %q)", prefix,
+					strings.TrimSpace(path)))
 			} else {
 				out = append(out, prefix)
 			}

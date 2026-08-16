@@ -300,13 +300,51 @@ func denyMatches(body, condition string) bool {
 		if len(c.matches) == 0 {
 			return false
 		}
+		// A permit clause reached first is a way in. Route-maps stop at the
+		// first clause that matches, so `permit 4: match ip address
+		// prefix-list EVERYTHING-BUT-THE-ONE-THEY-TEST` in front of the deny
+		// admits every invalid route but the one the grader knows about. A
+		// preceding permit is only harmless when nothing it matches on could
+		// be true of a route in the state being denied -- which is to say,
+		// when it selects on the validation state itself.
+		if !c.deny && !onlyValidationMatches(c.matches, want) {
+			return false
+		}
 		for _, m := range c.matches {
-			if strings.Contains(m, want) {
-				return c.deny
+			if !strings.Contains(m, want) {
+				continue
 			}
+			// FRR requires every match in a clause to hold, so a second one
+			// narrows the first. A deny clause that matches `rpki invalid`
+			// *and* a prefix list rejects invalid routes from that list and
+			// accepts every other invalid route -- which was measured as full
+			// protection, because the check stopped at the words it was
+			// looking for and the one announcement it then tested was on the
+			// list. A condition narrowed by something else is not that
+			// condition.
+			if len(c.matches) > 1 {
+				return false
+			}
+			return c.deny
 		}
 	}
 	return false
+}
+
+// onlyValidationMatches reports whether every match in a clause selects on the
+// RPKI validation state, and on a state other than the one being asked about.
+//
+// Such a clause cannot be the way an invalid route gets in: it does not match
+// one. Anything else -- a prefix list, an AS path, a community -- can be true
+// of an invalid route as easily as of a valid one.
+func onlyValidationMatches(matches []string, want string) bool {
+	for _, m := range matches {
+		t := strings.TrimSpace(strings.ToLower(m))
+		if !strings.HasPrefix(t, "match rpki ") || strings.Contains(t, want) {
+			return false
+		}
+	}
+	return len(matches) > 0
 }
 
 // hasRemoteAS reports whether a neighbour's settings name this AS number,

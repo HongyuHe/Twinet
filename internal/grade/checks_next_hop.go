@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
+
+	"github.com/HongyuHe/twinet/internal/model"
 )
 
 func init() {
@@ -173,11 +176,32 @@ func checkNextHopSelf(ctx context.Context, env *Env) Result {
 			Command: "show ip bgp json; show ip route <next-hop> json",
 		})
 	}
+	// And then a packet, from each router to the outside.
+	//
+	// Everything above is a table lookup, and a table is a claim about what a
+	// router would do. A policy rule sending one destination to another table
+	// with a discard in it leaves every next hop resolved, every route held,
+	// and every packet for that destination dropped -- measured, and worth
+	// nothing at all before this. The point of carrying external routes is
+	// that traffic reaches the networks they name.
+	if dark := unreachedOutside(ctx, env, routers); len(dark) > 0 {
+		return Partial("bgp.next_hop_self", ratio(maxInt(readable-len(dark), 0), maxInt(readable, 1)),
+			Evidence{
+				Expected: "every router able to send a packet to the networks it has learned",
+				Observed: fmt.Sprintf("%d of %d router(s) hold the routes and drop the traffic",
+					len(dark), readable),
+				Detail: strings.Join(truncate(dark, 6), "\n"),
+				Hint: "a route in the table is not a packet leaving the machine; check for " +
+					"policy rules, alternate tables and firewall rules on the routers",
+				Command: "ping; ip route get",
+			})
+	}
+
 	if len(unusable) == 0 {
 		return Pass("bgp.next_hop_self", Evidence{
-			Observed: fmt.Sprintf("all %d internally carried next hop(s) resolve in the "+
-				"interior routing table", checked),
-			Command: "show ip bgp json; show ip route <next-hop> json",
+			Observed: fmt.Sprintf("all %d internally carried next hop(s) resolve, and every "+
+				"router reaches the networks it has learned", checked),
+			Command: "show ip bgp json; show ip route <next-hop> json; ping",
 		})
 	}
 
@@ -203,6 +227,88 @@ func checkNextHopSelf(ctx context.Context, env *Env) Result {
 			"everywhere, and the traffic is dropped",
 		Command: "show ip bgp json; show ip route <next-hop> json",
 	})
+}
+
+// unreachedOutside names the routers that hold external routes and cannot send
+// a packet along them.
+//
+// Every router is tried against a host in every other AS it has a route for.
+// The destinations belong to other systems, so nothing the submission does
+// makes them answer, and a router that has the route and drops the traffic --
+// a policy rule, an alternate table, a firewall -- is the difference between a
+// routing table and a network.
+func unreachedOutside(ctx context.Context, env *Env, routers []*model.Device) []string {
+	type target struct {
+		asn  int
+		addr string
+	}
+	var targets []target
+	for asn, as := range env.Topology.ASes {
+		if asn == env.AS {
+			continue
+		}
+		for _, d := range as.Devices {
+			if d.Kind != model.KindHost || d.L2Domain != "" {
+				continue
+			}
+			if a := firstAddr(d); a != "" {
+				targets = append(targets, target{asn, a})
+				break
+			}
+		}
+	}
+	sort.Slice(targets, func(a, b int) bool { return targets[a].asn < targets[b].asn })
+	if len(targets) == 0 {
+		return nil
+	}
+	var (
+		mu   sync.Mutex
+		lost = map[string][]string{}
+		wg   sync.WaitGroup
+	)
+	sem := make(chan struct{}, 16)
+	for _, r := range routers {
+		// From the loopback, always.
+		//
+		// A router's own choice of source address for a packet leaving over an
+		// inter-AS link is that link's numbering, which is advertised nowhere:
+		// the probe arrives and the answer has no way back, and a perfectly
+		// healthy router reads as unable to reach half the internet. The
+		// loopback is inside this AS's own address space, so a reply can find
+		// its way home.
+		src := ""
+		if lo, ok := r.IfaceByName("lo"); ok && lo.Addr4 != "" {
+			src = addrOf(lo.Addr4)
+		}
+		if src == "" {
+			continue
+		}
+		for _, t := range targets {
+			wg.Add(1)
+			go func(r *model.Device, t target) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+				res, err := env.Probe(ctx, r.ID,
+					[]string{"ping", "-c", "2", "-W", "2", "-i", "0.2", "-I", src, t.addr})
+				if err == nil && res.ExitCode == 0 {
+					return
+				}
+				mu.Lock()
+				lost[r.Name] = append(lost[r.Name], fmt.Sprintf("AS %d at %s", t.asn, t.addr))
+				mu.Unlock()
+			}(r, t)
+		}
+	}
+	wg.Wait()
+	var out []string
+	for name, misses := range lost {
+		sort.Strings(misses)
+		out = append(out, fmt.Sprintf("%s cannot reach %d of %d other system(s) it has routes "+
+			"for: %s", name, len(misses), len(targets), strings.Join(truncate(misses, 3), ", ")))
+	}
+	sort.Strings(out)
+	return out
 }
 
 // resolves reports whether a router has a route to an address that would
@@ -263,6 +369,20 @@ func (e *Env) resolves(ctx context.Context, deviceID, addr string) (bool, string
 							entry.Protocol)
 					}
 				default:
+					// FRR is not the forwarding plane. A policy rule sending
+					// this destination to another table, with a discard in it,
+					// leaves the route in zebra's main table exactly as it
+					// should be while the kernel drops the packet: `ip rule
+					// add to X lookup 123` and a blackhole in 123 was measured
+					// as a fully resolved next hop. Asking the kernel how it
+					// would actually forward is the same question the packet
+					// asks.
+					if why, ok := e.kernelForwards(ctx, deviceID, addr); !ok {
+						if discard == "" {
+							discard = why
+						}
+						continue
+					}
 					return true, "", nil
 				}
 			}
@@ -272,6 +392,28 @@ func (e *Env) resolves(ctx context.Context, deviceID, addr string) (bool, string
 		discard = "no route the kernel installed"
 	}
 	return false, discard, nil
+}
+
+// kernelForwards asks the kernel what it would do with a packet for this
+// address, which is a different question from what the routing daemon believes:
+// policy rules, alternate tables and anything else installed outside the
+// daemon's view all take effect here and nowhere else.
+func (e *Env) kernelForwards(ctx context.Context, deviceID, addr string) (string, bool) {
+	res, err := e.Probe(ctx, deviceID, []string{"ip", "route", "get", addr})
+	if err != nil {
+		return "", true // the machinery failed; that is not the submission's fault
+	}
+	out := strings.ToLower(res.Stdout + " " + res.Stderr)
+	switch {
+	case res.ExitCode != 0:
+		return fmt.Sprintf("a route the routing daemon installed, which the kernel will not "+
+			"use: %s", firstLine(strings.TrimSpace(res.Stderr+res.Stdout))), false
+	case strings.Contains(out, "blackhole"), strings.Contains(out, "unreachable"),
+		strings.Contains(out, "prohibit"):
+		return "a route the routing daemon installed, which a policy rule sends somewhere " +
+			"that discards it", false
+	}
+	return "", true
 }
 
 // routeEntryJSON is one entry of `show ip route <addr> json`.

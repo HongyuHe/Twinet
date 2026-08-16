@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/HongyuHe/twinet/internal/model"
@@ -84,7 +85,7 @@ func checkROAPublished(ctx context.Context, env *Env) Result {
 		length = want[1]
 	}
 
-	var mine, others []string
+	var mine, loose, others []string
 	for _, v := range published {
 		p, l, ok := strings.Cut(v.Prefix, "/")
 		if !ok || p != network {
@@ -95,12 +96,35 @@ func checkROAPublished(ctx context.Context, env *Env) Result {
 		}
 		line := fmt.Sprintf("%s maxlen %d origin AS%d", v.Prefix, v.MaxLength, v.ASN)
 		if v.ASN == env.AS {
+			// A maximum length longer than the prefix authorises every
+			// more-specific announcement inside it. That is the attack the
+			// exercise is about: with `maxlen 32`, somebody announcing a /16
+			// out of this block with this AS forged as the origin is
+			// RPKI-valid to everybody who checks, and the ROA that was
+			// supposed to stop them is what makes it so. Only the prefix
+			// itself is being authorised here.
+			if n, err := strconv.Atoi(l); err == nil && v.MaxLength > n {
+				loose = append(loose, line)
+				continue
+			}
 			mine = append(mine, line)
 			continue
 		}
 		others = append(others, line)
 	}
 
+	if len(mine) == 0 && len(loose) > 0 {
+		return Partial("rpki.roa_published", 0.5, Evidence{
+			Expected: fmt.Sprintf("a ROA authorising AS %d to originate %s, and nothing "+
+				"more specific", env.AS, as.Block),
+			Observed: "the ROA authorises every more-specific announcement inside the block",
+			Detail:   strings.Join(loose, "\n"),
+			Hint: "a maximum length longer than the prefix makes a hijack of a smaller " +
+				"piece of your address space valid to everybody who checks; set it to the " +
+				"length of the block",
+			Command: "GET /roas on the publication service",
+		})
+	}
 	if len(mine) > 0 {
 		return Pass("rpki.roa_published", Evidence{
 			Observed: fmt.Sprintf("the trust anchor holds a ROA authorising AS %d to originate %s",

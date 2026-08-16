@@ -370,6 +370,220 @@ reached students, and each motivated a permanent test.
     on their router -- with a source address of theirs that the internet can
     route back to, because the link's own numbering is advertised nowhere and
     the first reverse-path check on the way drops it.
+38. **Two VLANs that were one broadcast domain.** Everything the isolation check
+    asked about was IP: hosts in one VLAN adjacent, hosts in two separated by
+    the gateway. Mirroring one access port onto another with `tc ... mirred`
+    leaves all of that true, because off-subnet traffic goes through the gateway
+    by a routing decision the host makes before any frame exists. A broadcast is
+    now sent and the far side asked whether it saw it: an ARP request names its
+    sender, and a kernel that answers one records who asked. That works where
+    watching for a reply does not, because a copy can be made one way only, and
+    then the answer goes back into the VLAN it came from while the other VLAN
+    has seen everything. One frame crossing fails the question; isolation is a
+    property of the domain, not a proportion of it.
+39. **A session held open by a timer.** "Established" is a memory, not an
+    observation. A session whose packets are being discarded stays Established
+    until the hold timer expires -- three minutes with the default timers, which
+    is longer than a grading run -- so an iBGP session blackholed in both
+    directions scored full marks while carrying nothing. Each router is now
+    asked to send a route refresh, which is a real message that has to cross the
+    connection, and the peer's own received count records its arrival. It also
+    makes the peer answer, so the counts move in both directions, and it
+    disturbs nothing: the peer re-sends routes the receiver already has.
+40. **A prefix in OSPF that no routing table holds.** Whether an inter-AS range
+    had been put into the interior was decided from `network` statements and
+    from the OSPF routing table. Redistributed with the maximum metric, a range
+    is flooded to every router in the area and installed by none of them:
+    LSInfinity means "do not use this", so the routing table is empty and the
+    check passed. The link-state database is where being in OSPF is decided; a
+    routing table is only what a router chose to do about it. All four kinds of
+    advertisement are read now -- router, network, summary and external -- so a
+    stub link, a transit segment, an inter-area summary and a redistribution are
+    all caught, whatever metric they carry.
+41. **A tunnel that only carried pings.** Every probe of the 6in4 question was
+    ICMPv6. A rule on the gateway discarding forwarded TCP left every ping
+    answered, the tunnel counters moving, and the whole point awarded for a
+    tunnel across which no connection could be made. A connection is now
+    attempted each way, to a port nothing is listening on, so no service has to
+    be arranged anywhere: the answer is a reset, and the far side's own count of
+    resets it has sent records that the attempt arrived. A datacentre that can
+    only be pinged is not reachable in any sense the assignment means.
+42. **A route in the table and no packet on the wire.** Whether a next hop was
+    usable was decided from what the routing daemon believes, and the daemon is
+    not the forwarding plane. A policy rule sending a destination to another
+    table, with a discard in it, leaves the route in zebra's main table exactly
+    as it should be while the kernel drops the packet: `ip rule add to X lookup
+    123` and a blackhole in 123 was measured as a fully resolved next hop and an
+    unreachable network, for no loss of marks. The kernel is now asked how it
+    would forward, and every router has to reach a host in every other system it
+    holds routes for. Those hosts belong to other people, so nothing the
+    submission does makes them answer. The probe is sourced from the router's
+    loopback: its own choice for a packet leaving over an inter-AS link is that
+    link's numbering, which is advertised nowhere, so the answer would have no
+    way back and a healthy router would read as unable to reach half the
+    internet.
+43. **An ordering arranged by an attribute nobody looked at.** Gao-Rexford was
+    graded by comparing local-preference values, which is what a student
+    configures and not what the rule is for. Local preference is only the second
+    tie-break in the decision process, so `set weight 65535` on a provider's
+    route puts it ahead of a peer's while every local preference in the table
+    still reads correctly -- and the whole question kept full marks while
+    traffic went to the provider. Which route was *selected* is now its own
+    comparison, and a path is classified by the neighbour at the head of its AS
+    path rather than by the session this router heard it on: the routes being
+    compared mostly arrive over iBGP, where the session says nothing about where
+    they entered.
+44. **Paths that answered pings and carried nothing else.** The equal-cost
+    question was decided from the forwarding tables plus one ICMP probe from end
+    to end. That probe takes one of the three paths -- which one is a hash of
+    the two addresses, and it is the same hash every time -- so two of three
+    prescribed paths could be discarding everything at full marks, and a rule
+    permitting ICMP and dropping the rest cost nothing. Every hop of every
+    prescribed path is now tried, on the link that hop uses, which the plan
+    decides rather than a hash; and a connection is attempted each way between
+    the two loopbacks, which is the pair the question names and the pair a rule
+    aimed at this traffic would name.
+45. **An adjacency on something wearing the link's name.** The interior
+    adjacencies were bound to the plan by the name of the interface each ran on,
+    and a name is the one part of an interface that anyone with root can change.
+    Renaming the real veths, building a GRE tunnel between the same two routers
+    and giving it the planned name and addresses put an adjacency on a tunnel
+    while the planned link was down, reported as Full "on the link the plan gives
+    it". Twinet stamps a tag derived from the link's identity onto both halves of
+    the veth it creates, and a veth is not an encapsulation: an interface
+    carrying an adjacency now has to be a veth, to carry that link's tag, and to
+    have the address Twinet gave it.
+46. **An address hidden in another scope.** The addressing check read `scope
+    global`, so the scope it filtered on was a place to put an address it would
+    never look at: `ip addr add X/32 dev lo scope link` is live, the router
+    answers for X, and the claim that nothing unplanned is configured was true
+    only of the one shelf the check opened. Every scope is read now, with the
+    kernel's own -- loopback and link-local -- exempt, because nobody configured
+    them.
+47. **An in-region route accepted with its evidence erased.** Which routes
+    crossed a system of this AS's own region was decided from the AS path the
+    member holds after its own import policy has run, and an import policy can
+    rewrite a path: `set as-path exclude 5` turns "5 10" into "10", and a route
+    relayed by an in-region member reads as coming straight from outside it.
+    Exactly what the question says to refuse was accepted, at full marks. The
+    route server belongs to the exchange, and what it advertised is not the
+    submission's to edit; its account of the path is what the routes are now
+    classified by.
+48. **A prohibition narrowed until it prohibits one thing.** Whether a session
+    rejects invalid origins was decided by finding a deny clause that matches
+    `rpki invalid`. FRR requires every match in a clause to hold, so a second
+    one narrows the first: a deny that matches `rpki invalid` *and* a prefix
+    list rejects invalid routes on that list and accepts every other. Listing
+    the one prefix the lab announces kept full marks, because the check stopped
+    at the words it was looking for and the only announcement it then tested was
+    on the list. A clause carrying any other match no longer counts, and neither
+    does a deny that a permit can be reached before -- route-maps stop at the
+    first clause that matches. A preceding permit is allowed only when it
+    selects on the validation state itself.
+49. **One host that could not reach the preserved network.** Whether an unsigned
+    origin was still reachable was decided by one ping from whichever host the
+    manifest happened to list first. One probe is a statement about one host: a
+    blackhole for that prefix on any other left the sole probe succeeding and
+    the question at full marks, while the site behind it could not reach the
+    network the question is about. Every host of the AS is asked now, at once,
+    and the ones that cannot reach it are named.
+50. **A pair that could be pinged and not spoken to.** Every probe of the
+    internal data plane was ICMP. A rule discarding TCP between two hosts left
+    all eighty-eight succeeding and the question at full marks, while nothing
+    but a ping could cross between them. Every ordered pair is now also asked
+    for a connection, to a port nothing is listening on: being refused is the
+    far side speaking and proves the packets made the journey both ways, while
+    silence is something on the path swallowing them. Both look alike to the
+    program making the connection, and telling them apart is the whole test. A
+    path that carries pings and nothing else caps the check at half, because as
+    a fraction of a hundred and forty-four probes the deduction was three
+    thousandths, which is the same as not noticing.
+51. **A way across that carried one flow and no broadcast.** The isolation probe
+    sends a broadcast, which is what a shared broadcast domain leaks. It is not
+    what a rule aimed at one flow leaks: an OpenFlow entry copying HTTPS from a
+    VLAN 10 port to a VLAN 20 port carried a connection between two VLANs while
+    every broadcast stayed where it belonged, at full marks. Each switch's flow
+    table is now read, with its port numbering and each port's access VLAN, and
+    any rule that sends a frame from a port in one VLAN out of a port in another
+    -- or out of a port whatever the frame arrived on -- is a way across. That
+    covers every protocol at once and needs no packet, which is what a broadcast
+    probe cannot do.
+52. **A leak wearing a customer's number.** Whether an advertisement to a peer
+    or a provider was a leak was decided from the AS path in that
+    advertisement, and a path on the way out is the submission's to write:
+    prepending a customer's number in front of a peer's route made a leak read
+    as a customer's route being passed on, which is what the rule permits. What
+    may leave is now the set learned from customers, recorded at the session
+    each route arrived on, plus this AS's own prefix -- named explicitly,
+    because the traffic-engineering answer prepends our own number and an empty
+    path no longer identifies it. A router table that could not be read stops
+    the check rather than turning missing knowledge into an accusation.
+53. **Transit that carried pings and nothing else.** The customer-transit probe
+    was ICMP. A rule dropping forwarded TCP arriving from one customer left
+    every probe answered and the question at full marks, while no connection
+    from that customer could cross this AS. A connection is now attempted as
+    well, to a port nothing is listening on in a third AS, with the destination
+    counting the resets it sends.
+54. **A ROA that authorised everything smaller.** Whether a system had published
+    a ROA was decided from the prefix and the origin; the maximum length was
+    printed and not read. A maximum length longer than the prefix authorises
+    every more-specific announcement inside it, so with `maxlen 32` somebody
+    announcing a /16 out of the block with this AS forged as the origin is
+    RPKI-valid to everybody who checks -- and the ROA that was supposed to stop
+    them is what makes it so. Only the block itself counts now.
+55. **Somebody else's prefix, re-originated on the way out.** A relayed route
+    keeps its origin at the end of its path, and this AS's own prepends go on
+    the front. Rewriting the end -- excluding AS 1 and prepending ourselves --
+    makes the neighbour believe this AS originates address space it does not
+    hold, and it never appears as a locally injected route, so the check that
+    exists to catch a hijack saw nothing while the customer's traffic for that
+    network came here. The advertised paths are now read for what they claim:
+    an origin of ours on a prefix that is not ours is a claim on somebody's
+    address space, whatever the local table says.
+56. **One port open and the rest of TCP discarded.** The connection probes all
+    used port 9, and a fixed port is a published answer: resetting that one port
+    and dropping every other connection was measured as a network in perfect
+    health, because the one port the grader ever tried was the one port that
+    worked. The port is now drawn when the check runs, above the registered
+    range and below the ephemeral one, so it is unlikely to find a listener and
+    cannot be permitted in advance.
+57. **A prepend that emptied the slow link instead of lengthening it.** The
+    traffic-engineering question was marked by comparing the length of the
+    announcement sent to the slow neighbour with the one sent to the fast. `set
+    as-path prepend 1 1 1` towards AS 1 is three hops longer and AS 1 discards
+    it outright, because a path through itself is a loop: the slow link stops
+    being a backup at all, which is the one thing the question forbids. The
+    prepended numbers must now be this AS's own, and the slow neighbour must
+    actually hold the prefix -- that neighbour is somebody else's system, so
+    what it holds is not the submission's to arrange, and from this side an
+    announcement discarded on arrival looks exactly like one that worked.
+58. **The ordering agreed with and then ignored.** Gao-Rexford was marked from
+    BGP's decision, and the kernel's is what forwards. `ip route replace
+    4.0.0.0/8 via <provider>` sends the traffic to a provider while the BGP
+    table still shows the peer path selected at a higher local preference: the
+    ranking was arranged, agreed with, and overruled, at full marks. An
+    externally learned prefix now has to be forwarded by the route BGP chose.
+59. **An external session held open by a timer.** The same memory that made an
+    iBGP session read as live made an eBGP one: dropping both directions of the
+    TCP flow left every external session reported Established, and carrying
+    nothing, for the whole of a grading run. Each router is now asked to send a
+    route refresh before the states are read, and a session whose received count
+    does not move while it is being asked to send is not carrying anything.
+60. **A range of ports is a published answer too.** The probe port was drawn
+    from twenty thousand to forty thousand, and the file that says so is public:
+    permitting exactly that range and discarding every other connection was
+    measured as a working network. The draw now covers every port a user may
+    bind, so permitting "the range the grader uses" means permitting
+    everything. The tunnel is also asked to carry a datagram, because a filter
+    can be written per protocol as easily as per port, and the far side's count
+    of datagrams arriving for an unbound port is a fact about arrival rather
+    than about any answer.
+61. **Paths that carried two protocols of three.** The equal-cost paths were
+    tried with a ping and a connection. A filter is written per protocol as
+    easily as per port: dropping UDP between the two loopbacks left the pings
+    and the connections working, and the paths carrying two thirds of what they
+    should, at full marks. A datagram is now sent to a port nothing is bound to,
+    and the far side's count of those records its arrival.
 
 ## Environment findings
 

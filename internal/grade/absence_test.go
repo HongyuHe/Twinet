@@ -59,6 +59,8 @@ func execFunc(reply map[string]string) func(context.Context, string, []string) (
 			return rt.ExecResult{Stdout: `{"routes":{}}`}, nil
 		case strings.Contains(body, "show ip route"):
 			return rt.ExecResult{Stdout: "{}"}, nil
+		case strings.Contains(body, "ospf database"):
+			return rt.ExecResult{Stdout: `{"routerId":"3.0.0.1"}`}, nil
 		case strings.Contains(body, "rpki prefix-table"):
 			return rt.ExecResult{Stdout: "RPKI/RTR prefix table\n"}, nil
 		}

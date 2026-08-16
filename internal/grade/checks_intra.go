@@ -2,6 +2,7 @@ package grade
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/netip"
 	"regexp"
@@ -11,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/HongyuHe/twinet/internal/alloc"
 	"github.com/HongyuHe/twinet/internal/model"
 )
 
@@ -85,7 +87,13 @@ func checkAddressing(ctx context.Context, env *Env) Result {
 	planned := plannedSubnets(env)
 
 	for _, r := range env.Routers() {
-		out, err := env.Probe(ctx, r.ID, []string{"ip", "-o", "-4", "addr", "show", "scope", "global"})
+		// Every scope, not only the global one.
+		//
+		// A scope the reader filtered on is a place to put an address it will
+		// not look at: `ip addr add X/32 dev lo scope link` is live, answers
+		// for X, and was invisible here. The kernel's own -- 127.0.0.0/8 and
+		// link-local -- are exempt because nobody configured them.
+		out, err := env.Probe(ctx, r.ID, []string{"ip", "-o", "-4", "addr", "show"})
 		if err != nil {
 			return Errored("l3.addressing_matches_plan", err)
 		}
@@ -98,7 +106,7 @@ func checkAddressing(ctx context.Context, env *Env) Result {
 		}
 		for iface, addrs := range have {
 			for _, a := range addrs {
-				if known[iface+" "+a] {
+				if known[iface+" "+a] || kernelOwned(a) {
 					continue
 				}
 				if i, ok := r.IfaceByName(iface); ok && ownSubnet(i, a) {
@@ -279,6 +287,20 @@ func impersonates(planned map[string]string, addr string) string {
 	return best
 }
 
+// kernelOwned reports whether an address is one the kernel puts there itself,
+// which no submission chose and none should be marked for.
+func kernelOwned(addr string) bool {
+	ip, err := netip.ParsePrefix(addr)
+	if err != nil {
+		a, err2 := netip.ParseAddr(addr)
+		if err2 != nil {
+			return false
+		}
+		ip = netip.PrefixFrom(a, a.BitLen())
+	}
+	return ip.Addr().IsLoopback() || ip.Addr().IsLinkLocalUnicast()
+}
+
 // anyInSubnet reports whether any of the configured addresses falls inside the
 // mandated prefix.
 func anyInSubnet(addrs []string, subnet string) bool {
@@ -310,6 +332,57 @@ type ospfNeighborJSON struct {
 	} `json:"neighbors"`
 }
 
+// linkDevice is what an interface says about itself beyond its name.
+type linkDevice struct {
+	Kind     string
+	MAC      string
+	Altnames []string
+}
+
+// linkIdentities reads every router's interfaces and returns, per router, what
+// each name is actually attached to.
+//
+// The name is the student's to change; the tag Twinet stamps on the veth when
+// it creates the link is not, and neither is whether the thing is a veth at
+// all. Read together they say whether the interface carrying an adjacency is
+// the link the plan drew or something wearing its name.
+func linkIdentities(ctx context.Context, env *Env) map[string]map[string]linkDevice {
+	out := map[string]map[string]linkDevice{}
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for _, r := range env.Routers() {
+		wg.Add(1)
+		go func(r *model.Device) {
+			defer wg.Done()
+			res, err := env.Probe(ctx, r.ID, []string{"ip", "-d", "-j", "link", "show"})
+			if err != nil || res.ExitCode != 0 {
+				return
+			}
+			var devs []struct {
+				IfName   string   `json:"ifname"`
+				Address  string   `json:"address"`
+				Altnames []string `json:"altnames"`
+				LinkInfo struct {
+					InfoKind string `json:"info_kind"`
+				} `json:"linkinfo"`
+			}
+			if json.Unmarshal([]byte(res.Stdout), &devs) != nil {
+				return
+			}
+			byName := map[string]linkDevice{}
+			for _, d := range devs {
+				byName[d.IfName] = linkDevice{
+					Kind: d.LinkInfo.InfoKind, MAC: d.Address, Altnames: d.Altnames}
+			}
+			mu.Lock()
+			out[r.Name] = byName
+			mu.Unlock()
+		}(r)
+	}
+	wg.Wait()
+	return out
+}
+
 func checkOSPFAdjacency(ctx context.Context, env *Env) Result {
 	// Which adjacency, not how many.
 	//
@@ -320,7 +393,7 @@ func checkOSPFAdjacency(ctx context.Context, env *Env) Result {
 	// and the question -- which is about the interior links being adjacent --
 	// reported all twenty-four of them Full. The topology says which interface
 	// faces which router, and that is what is required to be adjacent.
-	type want struct{ router, iface, peer string }
+	type want struct{ router, iface, peer, altname, mac string }
 	var wanted []want
 	for _, r := range env.Routers() {
 		for _, i := range r.Ifaces {
@@ -330,7 +403,8 @@ func checkOSPFAdjacency(ctx context.Context, env *Env) Result {
 			if !i.Peer.Device.IsRouter() || i.Peer.Device.ASN != env.AS {
 				continue
 			}
-			wanted = append(wanted, want{r.Name, i.Name, i.Peer.Device.Name})
+			wanted = append(wanted, want{r.Name, i.Name, i.Peer.Device.Name,
+				alloc.LinkAltname(env.Topology.Name, i.Link.ID), i.MAC})
 		}
 	}
 	if len(wanted) == 0 {
@@ -376,9 +450,50 @@ func checkOSPFAdjacency(ctx context.Context, env *Env) Result {
 		}
 	}
 
+	// An interface name is a label the student can move.
+	//
+	// The adjacency was bound to the plan by the name of the interface it ran
+	// on, and a name is the one part of an interface anyone with root can
+	// change. Renaming the real veth, building a GRE tunnel between the same
+	// two routers and calling it by the planned name put every adjacency on a
+	// tunnel while the planned links were down, and the check reported all
+	// twenty-four Full "each on the link the plan gives it".
+	//
+	// Twinet stamps a tag derived from the link's identity onto both halves of
+	// the veth it creates, so the link says which link it is. That, and its
+	// being a veth rather than an encapsulation, is what the name was standing
+	// in for.
+	links := linkIdentities(ctx, env)
+
 	var stuck []string
 	got := 0
 	for _, w := range wanted {
+		if id, known := links[w.router]; known {
+			dev, present := id[w.iface]
+			switch {
+			case !present:
+				stuck = append(stuck, fmt.Sprintf("%s has no interface called %s at all",
+					w.router, w.iface))
+				continue
+			case dev.Kind != "" && dev.Kind != "veth":
+				stuck = append(stuck, fmt.Sprintf(
+					"%s's %s is a %s, not the link the plan puts there: an adjacency over an "+
+						"encapsulation is not the interior link being adjacent",
+					w.router, w.iface, dev.Kind))
+				continue
+			case w.altname != "" && !containsStr(dev.Altnames, w.altname):
+				stuck = append(stuck, fmt.Sprintf(
+					"%s's %s is not the interface Twinet created for the link to %s: it does "+
+						"not carry that link's identity, so something else has been given "+
+						"its name", w.router, w.iface, w.peer))
+				continue
+			case w.mac != "" && dev.MAC != "" && !strings.EqualFold(dev.MAC, w.mac):
+				stuck = append(stuck, fmt.Sprintf(
+					"%s's %s does not have the address Twinet gave the link to %s (%s, not %s)",
+					w.router, w.iface, w.peer, dev.MAC, w.mac))
+				continue
+			}
+		}
 		switch {
 		case full[w.router][w.iface]:
 			got++
@@ -781,6 +896,131 @@ type ospfRouteClass struct {
 // tables state exactly which next hops are installed, whereas repeated
 // traceroutes only sample the hash: they can miss a live path entirely, which
 // the legacy platform's own bug list records as an unresolved complaint.
+// deadHops probes every link the prescribed paths are made of, on the link
+// itself, and names the ones that carry nothing.
+//
+// An end-to-end probe takes one path -- which one is a hash of the two
+// addresses, and it is the same hash every time -- so two of three prescribed
+// paths can be discarding everything while the question keeps its mark.
+func deadHops(ctx context.Context, env *Env, paths [][]string) []string {
+	type hop struct{ a, b string }
+	seen := map[hop]bool{}
+	var hops []hop
+	for _, p := range paths {
+		for i := 0; i+1 < len(p); i++ {
+			h := hop{p[i], p[i+1]}
+			if !seen[h] {
+				seen[h] = true
+				hops = append(hops, h)
+			}
+		}
+	}
+	var (
+		mu     sync.Mutex
+		broken []string
+		wg     sync.WaitGroup
+	)
+	sem := make(chan struct{}, 8)
+	for _, h := range hops {
+		a, ok := env.Device(h.a)
+		if !ok {
+			continue
+		}
+		i, ok := a.IfaceByName("port_" + h.b)
+		if !ok || i.Peer == nil || i.Peer.Addr4 == "" {
+			continue
+		}
+		wg.Add(1)
+		go func(h hop, from *model.Device, addr string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			reached, err := env.reaches(ctx, from.ID, addrOnly(addr))
+			if err != nil || reached {
+				return
+			}
+			mu.Lock()
+			broken = append(broken, fmt.Sprintf(
+				"%s cannot reach %s over the link between them (%s), so the path through "+
+					"it carries nothing", h.a, h.b, addrOnly(addr)))
+			mu.Unlock()
+		}(h, a, i.Peer.Addr4)
+	}
+	wg.Wait()
+	sort.Strings(broken)
+	return broken
+}
+
+// carriesTCPBothWays opens a connection each way between two routers, to a
+// port nothing is listening on, and reads the far side's own count of the
+// resets it sent.
+func carriesTCPBothWays(ctx context.Context, env *Env, from, to string) (string, bool) {
+	ends := [][2]string{{from, to}, {to, from}}
+	for _, e := range ends {
+		src, ok := env.Device(e[0])
+		if !ok {
+			return "", true
+		}
+		dst, ok := env.Device(e[1])
+		if !ok {
+			return "", true
+		}
+		lo, ok := dst.IfaceByName("lo")
+		if !ok || lo.Addr4 == "" {
+			return "", true
+		}
+		addr := addrOnly(lo.Addr4)
+		// Between the loopbacks, which is the pair the question is about and
+		// the pair a rule aimed at this traffic would name. Sourced from an
+		// interface address instead, a probe misses a drop written against the
+		// routers themselves and reads as a healthy path.
+		args := []string{"nc", "-w", "3", "-z"}
+		if slo, ok := src.IfaceByName("lo"); ok && slo.Addr4 != "" {
+			args = append(args, "-s", addrOnly(slo.Addr4))
+		}
+		args = append(args, addr, probePort())
+		before, okB := tcpResetsSent(ctx, env, dst.ID)
+		_, _ = env.Probe(ctx, src.ID, args)
+		after, okA := tcpResetsSent(ctx, env, dst.ID)
+		if okB && okA && after <= before {
+			return fmt.Sprintf(
+				"%s answers pings from %s but no connection to it arrives: the paths carry "+
+					"ICMP and nothing else", e[1], e[0]), false
+		}
+		// And a datagram. A filter is written per protocol as easily as per
+		// port: dropping UDP between the two loopbacks left the pings and the
+		// connections working and the paths carrying two thirds of what they
+		// should.
+		src4 := ""
+		if slo, ok := src.IfaceByName("lo"); ok && slo.Addr4 != "" {
+			src4 = addrOnly(slo.Addr4)
+		}
+		udpBefore, okU := udpNoPortsV4(ctx, env, dst.ID)
+		cmd := "echo twinet | nc -u -w 2"
+		if src4 != "" {
+			cmd += " -s " + src4
+		}
+		_, _ = env.Probe(ctx, src.ID, []string{"sh", "-c", cmd + " " + addr + " " + probePort()})
+		udpAfter, okU2 := udpNoPortsV4(ctx, env, dst.ID)
+		if okU && okU2 && udpAfter <= udpBefore {
+			return fmt.Sprintf(
+				"%s answers pings and connections from %s but no datagram from it arrives: "+
+					"something on the paths is filtering by protocol", e[1], e[0]), false
+		}
+	}
+	return "", true
+}
+
+// udpNoPortsV4 reads a host's count of datagrams delivered to it for a port
+// nothing is bound to.
+func udpNoPortsV4(ctx context.Context, env *Env, device string) (int, bool) {
+	res, err := env.Probe(ctx, device, []string{"cat", "/proc/net/snmp"})
+	if err != nil || res.ExitCode != 0 {
+		return 0, false
+	}
+	return snmpCounter(res.Stdout, "Udp:", "NoPorts")
+}
+
 func checkECMP(ctx context.Context, env *Env) Result {
 	from := env.ArgString("a", "ATL")
 	to := env.ArgString("b", "BOS")
@@ -955,6 +1195,29 @@ func checkECMP(ctx context.Context, env *Env) Result {
 				"paths is carrying anything", from, to, addr)
 			fmt.Fprintf(&detail, "%s\n", dead)
 		}
+		// One probe from end to end takes one of the paths, and says nothing
+		// about the other two: which one it takes is a hash of the addresses,
+		// and it is the same hash every time. So every hop of every prescribed
+		// path is tried, on the link that hop uses, which is decided by the
+		// plan and not by a hash.
+		if dead == "" {
+			if broken := deadHops(ctx, env, wantPaths); len(broken) > 0 {
+				dead = fmt.Sprintf("%d hop(s) of the prescribed paths carry nothing",
+					len(broken))
+				for _, b := range broken {
+					fmt.Fprintf(&detail, "%s\n", b)
+				}
+			}
+		}
+		// And something other than a ping. A path that answers ICMP and
+		// discards the rest is not carrying traffic in any sense the question
+		// means.
+		if dead == "" {
+			if why, ok := carriesTCPBothWays(ctx, env, from, to); !ok {
+				dead = why
+				fmt.Fprintf(&detail, "%s\n", why)
+			}
+		}
 	}
 
 	got := make([]string, 0)
@@ -999,6 +1262,231 @@ func checkECMP(ctx context.Context, env *Env) Result {
 
 // checkVLANIsolation verifies that hosts in the same VLAN reach each other
 // directly while hosts in different VLANs are forced through the gateway.
+// crossVLANForwarding names any rule a switch of this domain has been given
+// that forwards a frame from a port in one VLAN out of a port in another.
+//
+// A broadcast probe finds a shared broadcast domain; it does not find a rule
+// aimed at one flow. This reads what the switch has actually been told to do,
+// which covers every protocol at once and needs no packet.
+func crossVLANForwarding(ctx context.Context, env *Env, domain string) []string {
+	as, ok := env.Topology.ASes[env.AS]
+	if !ok {
+		return nil
+	}
+	var out []string
+	for _, d := range as.Devices {
+		if d.Kind != model.KindSwitch {
+			continue
+		}
+		if domain != "" && d.L2Domain != "" && d.L2Domain != domain {
+			continue
+		}
+		ports, err := env.Probe(ctx, d.ID, []string{"ovs-ofctl", "show", "br0"})
+		if err != nil || ports.ExitCode != 0 {
+			continue
+		}
+		tags, err := env.Probe(ctx, d.ID,
+			[]string{"ovs-vsctl", "--columns=name,tag", "--format=csv", "list", "port"})
+		if err != nil || tags.ExitCode != 0 {
+			continue
+		}
+		byNum, vlanOfPort := ovsPortMap(ports.Stdout, tags.Stdout)
+		flows, err := env.Probe(ctx, d.ID, []string{"ovs-ofctl", "dump-flows", "br0"})
+		if err != nil || flows.ExitCode != 0 {
+			continue
+		}
+		for _, line := range strings.Split(flows.Stdout, "\n") {
+			if !strings.Contains(line, "actions=") {
+				continue
+			}
+			in, outs := ovsFlowPorts(line, byNum)
+			for _, o := range outs {
+				iv, ok1 := vlanOfPort[in]
+				ov, ok2 := vlanOfPort[o]
+				switch {
+				case in != "" && ok1 && ok2 && iv != ov:
+					out = append(out, fmt.Sprintf(
+						"%s is told to send frames from %s (VLAN %d) out of %s (VLAN %d)",
+						d.Name, in, iv, o, ov))
+				case in == "" && ok2:
+					out = append(out, fmt.Sprintf(
+						"%s is told to send frames out of %s (VLAN %d) whatever port they "+
+							"arrived on", d.Name, o, ov))
+				}
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// ovsPortMap reads the switch's port numbering and each port's access VLAN.
+func ovsPortMap(show, csv string) (map[string]string, map[string]int) {
+	byNum := map[string]string{}
+	for _, line := range strings.Split(show, "\n") {
+		t := strings.TrimSpace(line)
+		i := strings.IndexByte(t, '(')
+		j := strings.IndexByte(t, ')')
+		if i <= 0 || j <= i {
+			continue
+		}
+		if _, err := strconv.Atoi(t[:i]); err != nil {
+			continue
+		}
+		byNum[t[:i]] = t[i+1 : j]
+	}
+	vlan := map[string]int{}
+	for _, line := range strings.Split(csv, "\n") {
+		f := strings.Split(strings.TrimSpace(line), ",")
+		if len(f) < 2 {
+			continue
+		}
+		n, err := strconv.Atoi(strings.Trim(f[1], "\"[] "))
+		if err != nil {
+			continue
+		}
+		vlan[strings.TrimSpace(f[0])] = n
+	}
+	return byNum, vlan
+}
+
+// ovsFlowPorts pulls the ingress port and every explicit output port out of one
+// line of `ovs-ofctl dump-flows`, resolving numbers to names.
+func ovsFlowPorts(line string, byNum map[string]string) (string, []string) {
+	name := func(tok string) string {
+		tok = strings.Trim(tok, " \t,)")
+		if n, ok := byNum[tok]; ok {
+			return n
+		}
+		return tok
+	}
+	in := ""
+	for _, f := range strings.Split(line, ",") {
+		t := strings.TrimSpace(f)
+		if v, ok := strings.CutPrefix(t, "in_port="); ok {
+			in = name(v)
+		}
+	}
+	var outs []string
+	rest := line
+	for {
+		i := strings.Index(rest, "output:")
+		if i < 0 {
+			break
+		}
+		rest = rest[i+len("output:"):]
+		end := strings.IndexAny(rest, ", \t")
+		tok := rest
+		if end >= 0 {
+			tok = rest[:end]
+		}
+		if tok != "" {
+			outs = append(outs, name(tok))
+		}
+	}
+	return in, outs
+}
+
+// crossVLANFrames sends a broadcast in one VLAN and asks the other whether it
+// arrived, returning what leaked and how many ordered pairs were tried.
+//
+// The observation is the target's own neighbour table. An ARP request names its
+// sender, and a kernel that answers one records who asked; a kernel that never
+// sees the frame has nothing to record. This works where watching for a reply
+// does not, because a switch can be made to copy frames one way only, and then
+// the answer goes back into the VLAN it came from and the sender hears nothing
+// while the other VLAN has seen everything.
+func crossVLANFrames(ctx context.Context, env *Env, vlans []int,
+	hosts map[int][]*model.Device, sem chan struct{}) ([]string, int) {
+	type pair struct{ src, dst *model.Device }
+	var pairs []pair
+	for a := range vlans {
+		for b := range vlans {
+			if a == b {
+				continue
+			}
+			for _, src := range hosts[vlans[a]] {
+				for _, dst := range hosts[vlans[b]] {
+					pairs = append(pairs, pair{src, dst})
+				}
+			}
+		}
+	}
+	var (
+		mu     sync.Mutex
+		leaks  []string
+		tested int
+		wg     sync.WaitGroup
+	)
+	for _, p := range pairs {
+		wg.Add(1)
+		go func(p pair) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			srcIf, srcAddr := accessPort(p.src)
+			dstIf, dstAddr := accessPort(p.dst)
+			if srcIf == "" || srcAddr == "" || dstIf == "" || dstAddr == "" {
+				return
+			}
+			// Forget anything already known about the sender, so what is there
+			// afterwards can only have arrived during the probe.
+			_, _ = env.Probe(ctx, p.dst.ID, []string{"ip", "neigh", "del", srcAddr, "dev", dstIf})
+			res, err := env.Probe(ctx, p.src.ID,
+				[]string{"arping", "-c", "2", "-w", "3", "-I", srcIf, dstAddr})
+			// Exit 1 is "nobody answered", which is the correct answer here.
+			// Anything that means the probe never ran -- no such command, no
+			// such interface -- must not be counted as an isolated pair.
+			if err != nil || res.ExitCode > 1 {
+				return
+			}
+			mu.Lock()
+			tested++
+			mu.Unlock()
+			seen, err := env.Probe(ctx, p.dst.ID,
+				[]string{"ip", "neigh", "show", srcAddr, "dev", dstIf})
+			if err != nil || !strings.Contains(seen.Stdout, "lladdr") {
+				return
+			}
+			mu.Lock()
+			leaks = append(leaks, fmt.Sprintf(
+				"a broadcast frame sent by %s in VLAN %d arrived at %s in VLAN %d, "+
+					"which recorded the sender: the two VLANs are one broadcast domain",
+				p.src.Name, vlanOf(p.src), p.dst.Name, vlanOf(p.dst)))
+			mu.Unlock()
+		}(p)
+	}
+	wg.Wait()
+	sort.Strings(leaks)
+	return leaks, tested
+}
+
+// accessPort names the interface a host sits on in its layer-2 domain, and the
+// address it answers to there.
+func accessPort(d *model.Device) (string, string) {
+	for _, i := range d.Ifaces {
+		if i.Name == "lo" || i.Addr4 == "" {
+			continue
+		}
+		addr := i.Addr4
+		if j := strings.IndexByte(addr, '/'); j > 0 {
+			addr = addr[:j]
+		}
+		return i.Name, addr
+	}
+	return "", ""
+}
+
+// vlanOf reports the VLAN a host is meant to be in.
+func vlanOf(d *model.Device) int {
+	for _, i := range d.Ifaces {
+		if i.VLAN > 0 {
+			return i.VLAN
+		}
+	}
+	return 0
+}
+
 func checkVLANIsolation(ctx context.Context, env *Env) Result {
 	domain := env.ArgString("domain", "")
 	hosts := map[int][]*model.Device{} // vlan -> hosts
@@ -1143,6 +1631,57 @@ func checkVLANIsolation(ctx context.Context, env *Env) Result {
 		}
 	}
 	wg.Wait()
+
+	// And then layer 2 itself.
+	//
+	// Everything above is about IP: hosts in one VLAN are adjacent, hosts in
+	// two are separated by the gateway. None of it looks at frames, and a
+	// switch that copies frames from one VLAN's port onto another's leaves all
+	// of it true -- off-subnet traffic still goes through the gateway, because
+	// that is a routing decision the host makes before any frame exists. A
+	// reviewer mirrored one access port onto another with `tc ... mirred` and
+	// the check gave full marks to two VLANs that were the same broadcast
+	// domain.
+	//
+	// So a broadcast is sent, and the far side is asked whether it saw it. An
+	// ARP request for the other host's address is answered by nobody when the
+	// VLANs are separate, and when they are not the target's own kernel records
+	// the sender -- which it does even when the copy is one-directional and the
+	// reply never comes back, as the reviewer's was.
+	// And what the switches have been told to forward.
+	//
+	// The probe above sends a broadcast, which is what a shared broadcast
+	// domain leaks. It is not what a rule aimed at one flow leaks: an
+	// OpenFlow entry copying HTTPS from a VLAN 10 port to a VLAN 20 port
+	// carried a connection between two VLANs while every broadcast stayed
+	// where it belonged, and the question kept its mark. A switch that has
+	// been told to send a frame from a port in one VLAN out of a port in
+	// another is not keeping them apart, whatever the frame is.
+	rules := crossVLANForwarding(ctx, env, domain)
+	probed, tested := crossVLANFrames(ctx, env, vlans, hosts, sem)
+	leaks := append(rules, probed...)
+	for i := 0; i < tested-len(probed); i++ {
+		record(true, "")
+	}
+	// Isolation is a property of the domain and not a proportion of it. One
+	// frame crossing means the two VLANs are one broadcast domain, however
+	// many pairs behaved; scoring it as a twentieth of the question made a
+	// deduction of three hundredths for two VLANs that were not separate.
+	if crossed := len(leaks); crossed > 0 {
+		for _, r := range results {
+			if !r.ok {
+				leaks = append(leaks, r.detail)
+			}
+		}
+		return Fail("l2.vlan_isolation", Evidence{
+			Expected: "no frame sent in one VLAN reaching another, and nothing arranged to send one",
+			Observed: fmt.Sprintf("%d way(s) across, from %d forwarding rule(s) and %d of %d "+
+				"probed pairs", crossed, len(rules), len(probed), tested),
+			Detail:  strings.Join(truncate(leaks, 8), "\n"),
+			Hint:    "an access port belongs to one VLAN; check for anything bridging, mirroring or forwarding between them",
+			Command: "arping; ip neigh show; ovs-ofctl dump-flows br0",
+		})
+	}
 
 	var problems []string
 	passed, total := 0, len(results)
@@ -1289,7 +1828,18 @@ func checkInternalReachability(ctx context.Context, env *Env) Result {
 	}
 	wg.Wait()
 
-	tried := len(pairs)
+	// And the same pairs, with something other than a ping.
+	//
+	// Every probe above is ICMP. A rule discarding TCP between two hosts left
+	// all eighty-eight of them succeeding and the question at full marks,
+	// while nothing but a ping could cross between the two. A connection is
+	// attempted to a port nothing is listening on, so no service has to be
+	// arranged: being refused proves the packets made the journey both ways,
+	// where being dropped is silence.
+	pingOnly := unreachableByTCP(ctx, env, hosts, addrOf)
+	failed = append(failed, pingOnly...)
+
+	tried := len(pairs) + len(hosts)*(len(hosts)-1)
 	// Every host that was probed must have seen the probes.
 	echoesAfter := receivedEchoes(ctx, env, hosts)
 	var unseen []string
@@ -1330,7 +1880,15 @@ func checkInternalReachability(ctx context.Context, env *Env) Result {
 				"service network, and every host received the traffic addressed to it", tried)})
 	}
 	sort.Strings(failed)
-	return Partial("dataplane.internal_reachability", ratio(tried-len(failed), tried), Evidence{
+	// A path that carries pings and nothing else is half a working network,
+	// however few pairs show it. Counted as a fraction of a hundred and
+	// forty-four probes the deduction was three thousandths and the total
+	// still printed ten out of ten, which is the same as not noticing.
+	score := ratio(tried-len(failed), tried)
+	if len(pingOnly) > 0 && score > 0.5 {
+		score = 0.5
+	}
+	return Partial("dataplane.internal_reachability", score, Evidence{
 		Expected: fmt.Sprintf("%d reachable ordered pairs", tried),
 		Observed: fmt.Sprintf("%d unreachable", len(failed)),
 		Detail:   strings.Join(truncate(failed, 8), "\n"),
@@ -1385,6 +1943,58 @@ func serviceAttachments(env *Env) []svcAttachment {
 	return out
 }
 
+// unreachableByTCP tries a connection between every ordered pair of hosts and
+// names the ones where the packets do not arrive.
+//
+// The port is one nothing listens on, so the answer is a reset: "refused" is
+// the far side speaking, and silence is something on the path swallowing the
+// attempt. That distinction is the whole test -- both look like a failed
+// connection to the program making it.
+func unreachableByTCP(ctx context.Context, env *Env, hosts []*model.Device,
+	addrOf map[string]string) []string {
+	var (
+		mu  sync.Mutex
+		out []string
+		wg  sync.WaitGroup
+	)
+	sem := make(chan struct{}, 16)
+	for _, a := range hosts {
+		for _, b := range hosts {
+			if a.ID == b.ID || addrOf[b.ID] == "" {
+				continue
+			}
+			wg.Add(1)
+			go func(a, b *model.Device) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+				addr := addrOf[b.ID]
+				res, err := env.Probe(ctx, a.ID,
+					[]string{"nc", "-v", "-w", "3", "-z", addr, probePort()})
+				if err != nil {
+					return // the machinery failed, which is not a verdict
+				}
+				answered := res.ExitCode == 0
+				said := strings.ToLower(res.Stderr + res.Stdout)
+				if strings.Contains(said, "refused") || strings.Contains(said, "reset") {
+					answered = true
+				}
+				if answered {
+					return
+				}
+				mu.Lock()
+				out = append(out, fmt.Sprintf(
+					"%s can ping %s (%s) but no connection to it arrives: something on the "+
+						"path carries ICMP and discards the rest", a.Name, b.Name, addr))
+				mu.Unlock()
+			}(a, b)
+		}
+	}
+	wg.Wait()
+	sort.Strings(out)
+	return out
+}
+
 // receivedEchoes reads each host's count of ICMP echo requests delivered to it.//
 // The kernel keeps it; nothing a submission configures can raise it without the
 // packets actually arriving.
@@ -1418,15 +2028,24 @@ func receivedEchoes(ctx context.Context, env *Env, hosts []*model.Device) map[st
 // column: the set of counters differs between kernels, and counting fields
 // would read a different one on a different machine.
 func icmpInEchos(body string) (int, bool) {
+	return snmpCounter(body, "Icmp:", "InEchos")
+}
+
+// snmpCounter reads one named counter out of /proc/net/snmp, which prints a
+// row of names and then a row of values.
+//
+// By name, never by position: the columns differ between kernels, and reading
+// the wrong one is a number that looks plausible and means something else.
+func snmpCounter(body, section, field string) (int, bool) {
 	lines := strings.Split(body, "\n")
 	for i := 0; i+1 < len(lines); i++ {
-		if !strings.HasPrefix(lines[i], "Icmp:") {
+		if !strings.HasPrefix(lines[i], section) || !strings.HasPrefix(lines[i+1], section) {
 			continue
 		}
 		names := strings.Fields(lines[i])
 		values := strings.Fields(lines[i+1])
 		for j, n := range names {
-			if n == "InEchos" && j < len(values) {
+			if n == field && j < len(values) {
 				v, err := strconv.Atoi(values[j])
 				return v, err == nil
 			}
