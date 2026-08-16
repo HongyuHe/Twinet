@@ -781,6 +781,93 @@ type ospfRouteClass struct {
 // tables state exactly which next hops are installed, whereas repeated
 // traceroutes only sample the hash: they can miss a live path entirely, which
 // the legacy platform's own bug list records as an unresolved complaint.
+// deadHops probes every link the prescribed paths are made of, on the link
+// itself, and names the ones that carry nothing.
+//
+// An end-to-end probe takes one path -- which one is a hash of the two
+// addresses, and it is the same hash every time -- so two of three prescribed
+// paths can be discarding everything while the question keeps its mark.
+func deadHops(ctx context.Context, env *Env, paths [][]string) []string {
+	type hop struct{ a, b string }
+	seen := map[hop]bool{}
+	var hops []hop
+	for _, p := range paths {
+		for i := 0; i+1 < len(p); i++ {
+			h := hop{p[i], p[i+1]}
+			if !seen[h] {
+				seen[h] = true
+				hops = append(hops, h)
+			}
+		}
+	}
+	var (
+		mu     sync.Mutex
+		broken []string
+		wg     sync.WaitGroup
+	)
+	sem := make(chan struct{}, 8)
+	for _, h := range hops {
+		a, ok := env.Device(h.a)
+		if !ok {
+			continue
+		}
+		i, ok := a.IfaceByName("port_" + h.b)
+		if !ok || i.Peer == nil || i.Peer.Addr4 == "" {
+			continue
+		}
+		wg.Add(1)
+		go func(h hop, from *model.Device, addr string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			reached, err := env.reaches(ctx, from.ID, addrOnly(addr))
+			if err != nil || reached {
+				return
+			}
+			mu.Lock()
+			broken = append(broken, fmt.Sprintf(
+				"%s cannot reach %s over the link between them (%s), so the path through "+
+					"it carries nothing", h.a, h.b, addrOnly(addr)))
+			mu.Unlock()
+		}(h, a, i.Peer.Addr4)
+	}
+	wg.Wait()
+	sort.Strings(broken)
+	return broken
+}
+
+// carriesTCPBothWays opens a connection each way between two routers, to a
+// port nothing is listening on, and reads the far side's own count of the
+// resets it sent.
+func carriesTCPBothWays(ctx context.Context, env *Env, from, to string) (string, bool) {
+	ends := [][2]string{{from, to}, {to, from}}
+	for _, e := range ends {
+		src, ok := env.Device(e[0])
+		if !ok {
+			return "", true
+		}
+		dst, ok := env.Device(e[1])
+		if !ok {
+			return "", true
+		}
+		lo, ok := dst.IfaceByName("lo")
+		if !ok || lo.Addr4 == "" {
+			return "", true
+		}
+		addr := addrOnly(lo.Addr4)
+		before, okB := tcpResetsSent(ctx, env, dst.ID)
+		_, _ = env.Probe(ctx, src.ID, []string{"nc", "-w", "3", "-z", addr, "9"})
+		after, okA := tcpResetsSent(ctx, env, dst.ID)
+		if !okB || !okA || after > before {
+			continue
+		}
+		return fmt.Sprintf(
+			"%s answers pings from %s but no connection to it arrives: the paths carry "+
+				"ICMP and nothing else", e[1], e[0]), false
+	}
+	return "", true
+}
+
 func checkECMP(ctx context.Context, env *Env) Result {
 	from := env.ArgString("a", "ATL")
 	to := env.ArgString("b", "BOS")
@@ -954,6 +1041,29 @@ func checkECMP(ctx context.Context, env *Env) Result {
 			dead = fmt.Sprintf("%s cannot reach %s (%s) at all, so none of the installed "+
 				"paths is carrying anything", from, to, addr)
 			fmt.Fprintf(&detail, "%s\n", dead)
+		}
+		// One probe from end to end takes one of the paths, and says nothing
+		// about the other two: which one it takes is a hash of the addresses,
+		// and it is the same hash every time. So every hop of every prescribed
+		// path is tried, on the link that hop uses, which is decided by the
+		// plan and not by a hash.
+		if dead == "" {
+			if broken := deadHops(ctx, env, wantPaths); len(broken) > 0 {
+				dead = fmt.Sprintf("%d hop(s) of the prescribed paths carry nothing",
+					len(broken))
+				for _, b := range broken {
+					fmt.Fprintf(&detail, "%s\n", b)
+				}
+			}
+		}
+		// And something other than a ping. A path that answers ICMP and
+		// discards the rest is not carrying traffic in any sense the question
+		// means.
+		if dead == "" {
+			if why, ok := carriesTCPBothWays(ctx, env, from, to); !ok {
+				dead = why
+				fmt.Fprintf(&detail, "%s\n", why)
+			}
 		}
 	}
 
