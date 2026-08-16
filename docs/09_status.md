@@ -569,6 +569,15 @@ reached students, and each motivated a permanent test.
     nothing, for the whole of a grading run. Each router is now asked to send a
     route refresh before the states are read, and a session whose received count
     does not move while it is being asked to send is not carrying anything.
+60. **A range of ports is a published answer too.** The probe port was drawn
+    from twenty thousand to forty thousand, and the file that says so is public:
+    permitting exactly that range and discarding every other connection was
+    measured as a working network. The draw now covers every port a user may
+    bind, so permitting "the range the grader uses" means permitting
+    everything. The tunnel is also asked to carry a datagram, because a filter
+    can be written per protocol as easily as per port, and the far side's count
+    of datagrams arriving for an unbound port is a fact about arrival rather
+    than about any answer.
 
 ## Environment findings
 

@@ -171,6 +171,7 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 	var ibgpBlackhole struct{ router, peer string }
 	var leakedRange string
 	var tunnelTCP struct{ gateway, iface string }
+	var rangeAllow []string
 	var weighted struct{ router, routeMap, prefix string }
 	var ecmpTCP struct{ router, from string }
 	var impostorLink struct{ router, iface, moved string }
@@ -1276,6 +1277,37 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 						"ip rule add pref 100 to 8.0.0.0/8 lookup 123")
 				if err != nil {
 					t.Fatalf("diverting a destination into a discard: %v\n%s", err, out)
+				}
+			},
+		},
+		{
+			// The probe's own port range, permitted and nothing else.
+			//
+			// A range is a published answer as surely as a single port. This
+			// permits the range the grader used to draw from, and discards
+			// every other connection and every datagram.
+			name:     "only the grader's old port range allowed across the tunnel",
+			question: "q1.4",
+			undo: func(t *testing.T) {
+				for _, r := range rangeAllow {
+					_, _ = twinet(t, "exec", "-m", dir, r, "--", "sh", "-c",
+						"ip6tables -D FORWARD -p tcp --dport 20000:39999 -j ACCEPT; "+
+							"ip6tables -D FORWARD -p tcp --tcp-flags RST RST -j ACCEPT; "+
+							"ip6tables -D FORWARD -p tcp -j DROP; "+
+							"ip6tables -D FORWARD -p udp -j DROP")
+				}
+			},
+			apply: func(t *testing.T) {
+				gw, _ := tunnelGateway(t, dir, as)
+				rangeAllow = []string{gw}
+				t.Logf("permitting only 20000-39999 across the tunnel on %s", gw)
+				out, err := twinet(t, "exec", "-m", dir, gw, "--", "sh", "-c",
+					"ip6tables -I FORWARD 1 -p tcp --dport 20000:39999 -j ACCEPT && "+
+						"ip6tables -I FORWARD 2 -p tcp --tcp-flags RST RST -j ACCEPT && "+
+						"ip6tables -A FORWARD -p tcp -j DROP && "+
+						"ip6tables -A FORWARD -p udp -j DROP")
+				if err != nil {
+					t.Fatalf("permitting one range: %v\n%s", err, out)
 				}
 			},
 		},
