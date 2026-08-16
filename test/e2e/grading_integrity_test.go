@@ -1544,8 +1544,11 @@ func findNotFoundPrefix(t *testing.T, dir string, as int) string {
 	return ""
 }
 
-// rpkiDenyClause finds a route-map clause that denies RPKI-invalid routes, and
-// the router it is on.
+// rpkiDenyClause finds a route-map clause that denies RPKI-invalid routes and
+// is actually applied inbound on a session bringing routes in from outside.
+//
+// An unattached route-map does not run, so narrowing one costs nothing and
+// proves nothing about the check.
 func rpkiDenyClause(t *testing.T, dir string, as int) (router, routeMap, seq string) {
 	t.Helper()
 	for _, r := range routersOf(t, dir, as) {
@@ -1554,9 +1557,16 @@ func rpkiDenyClause(t *testing.T, dir string, as int) (router, routeMap, seq str
 			continue
 		}
 		lines := strings.Split(cfg, "\n")
+		applied := map[string]bool{}
+		for _, line := range lines {
+			f := strings.Fields(strings.TrimSpace(line))
+			if len(f) == 5 && f[0] == "neighbor" && f[2] == "route-map" && f[4] == "in" {
+				applied[f[3]] = true
+			}
+		}
 		for i, line := range lines {
 			f := strings.Fields(strings.TrimSpace(line))
-			if len(f) != 4 || f[0] != "route-map" || f[2] != "deny" {
+			if len(f) != 4 || f[0] != "route-map" || f[2] != "deny" || !applied[f[1]] {
 				continue
 			}
 			for j := i + 1; j < len(lines) && j < i+4; j++ {
@@ -1566,7 +1576,7 @@ func rpkiDenyClause(t *testing.T, dir string, as int) (router, routeMap, seq str
 			}
 		}
 	}
-	t.Skip("no RPKI deny clause found")
+	t.Skip("no applied RPKI deny clause found")
 	return "", "", ""
 }
 
