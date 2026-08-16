@@ -87,7 +87,13 @@ func checkAddressing(ctx context.Context, env *Env) Result {
 	planned := plannedSubnets(env)
 
 	for _, r := range env.Routers() {
-		out, err := env.Probe(ctx, r.ID, []string{"ip", "-o", "-4", "addr", "show", "scope", "global"})
+		// Every scope, not only the global one.
+		//
+		// A scope the reader filtered on is a place to put an address it will
+		// not look at: `ip addr add X/32 dev lo scope link` is live, answers
+		// for X, and was invisible here. The kernel's own -- 127.0.0.0/8 and
+		// link-local -- are exempt because nobody configured them.
+		out, err := env.Probe(ctx, r.ID, []string{"ip", "-o", "-4", "addr", "show"})
 		if err != nil {
 			return Errored("l3.addressing_matches_plan", err)
 		}
@@ -100,7 +106,7 @@ func checkAddressing(ctx context.Context, env *Env) Result {
 		}
 		for iface, addrs := range have {
 			for _, a := range addrs {
-				if known[iface+" "+a] {
+				if known[iface+" "+a] || kernelOwned(a) {
 					continue
 				}
 				if i, ok := r.IfaceByName(iface); ok && ownSubnet(i, a) {
@@ -279,6 +285,20 @@ func impersonates(planned map[string]string, addr string) string {
 		}
 	}
 	return best
+}
+
+// kernelOwned reports whether an address is one the kernel puts there itself,
+// which no submission chose and none should be marked for.
+func kernelOwned(addr string) bool {
+	ip, err := netip.ParsePrefix(addr)
+	if err != nil {
+		a, err2 := netip.ParseAddr(addr)
+		if err2 != nil {
+			return false
+		}
+		ip = netip.PrefixFrom(a, a.BitLen())
+	}
+	return ip.Addr().IsLoopback() || ip.Addr().IsLinkLocalUnicast()
 }
 
 // anyInSubnet reports whether any of the configured addresses falls inside the
