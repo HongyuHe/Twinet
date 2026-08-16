@@ -590,6 +590,13 @@ reached students, and each motivated a permanent test.
     from one VLAN into another with the flow table exactly as it should be, at
     full marks. Every access port's traffic-control rules are now read too, in
     both directions.
+63. **A table emptied so that nothing is owed.** What a customer was owed came
+    from the table of the router holding its session, and that table is the
+    submission's to empty. Denying every announcement inbound left the router
+    holding only this AS's own prefix, advertising exactly that to its
+    customers, and the check reporting that every selected route had been passed
+    on -- nothing had been selected. What the AS as a whole has learned is now
+    the measure, minus what that customer taught us itself.
 
 ## Environment findings
 

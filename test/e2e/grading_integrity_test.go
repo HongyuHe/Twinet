@@ -184,6 +184,10 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 	var tcMirror struct{ switchID, from string }
 	var forgedLeak struct{ router, routeMap, prefix string }
 	var custTCP string
+	var starved struct {
+		router string
+		peers  []string
+	}
 	var reorigin struct{ router, routeMap, prefix string }
 	var slowPrepend struct{ router, routeMap, seq, peer, original string }
 	var staticOverride struct{ router, prefix string }
@@ -1529,6 +1533,54 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 			},
 		},
 		{
+			// A table emptied so that nothing is owed.
+			//
+			// What a customer was owed came from the table of the router
+			// holding its session, and that table is the submission's to
+			// empty: denying everything inbound left the router with only its
+			// own prefix and the check reporting that everything selected had
+			// been passed on.
+			name:        "a border router that selects nothing to give its customers",
+			question:    "q2.3",
+			alsoAffects: []string{"q2.2", "q2.5", "q2.6"},
+			undo: func(t *testing.T) {
+				if starved.router == "" {
+					return
+				}
+				for _, p := range starved.peers {
+					vtysh(t, dir, starved.router, "configure terminal",
+						"router bgp "+itoa(as),
+						" address-family ipv4 unicast",
+						"  no neighbor "+p+" route-map TWGRADE-DENY in",
+						"end")
+				}
+				vtysh(t, dir, starved.router, "configure terminal",
+					"no route-map TWGRADE-DENY deny 10", "end")
+			},
+			apply: func(t *testing.T) {
+				router := "as" + itoa(as) + "/SFO"
+				peers := bgpPeersOf(t, dir, router)
+				if len(peers) == 0 {
+					t.Skip("no BGP peers found")
+				}
+				starved = struct {
+					router string
+					peers  []string
+				}{router, peers}
+				t.Logf("denying every inbound announcement on %s", router)
+				vtysh(t, dir, router, "configure terminal", "route-map TWGRADE-DENY deny 10", "end")
+				for _, p := range peers {
+					vtysh(t, dir, router, "configure terminal",
+						"router bgp "+itoa(as),
+						" address-family ipv4 unicast",
+						"  neighbor "+p+" route-map TWGRADE-DENY in",
+						"end")
+				}
+				vtysh(t, dir, router, "clear ip bgp * soft in")
+				time.Sleep(25 * time.Second)
+			},
+		},
+		{
 			// Transit that carries pings and nothing else.
 			//
 			// The customer-transit probe was ICMP, so a rule dropping
@@ -1958,6 +2010,30 @@ func findNotFoundPrefix(t *testing.T, dir string, as int) string {
 		}
 	}
 	return ""
+}
+
+// bgpPeersOf lists the BGP neighbour addresses a router holds sessions with.
+func bgpPeersOf(t *testing.T, dir, router string) []string {
+	t.Helper()
+	out, err := twinet(t, "exec", "-m", dir, router, "--", "vtysh", "-c",
+		"show ip bgp summary json")
+	if err != nil {
+		t.Fatalf("reading %s's sessions: %v\n%s", router, err, out)
+	}
+	var doc struct {
+		IPv4Unicast struct {
+			Peers map[string]struct{} `json:"peers"`
+		} `json:"ipv4Unicast"`
+	}
+	if json.Unmarshal([]byte(out), &doc) != nil {
+		return nil
+	}
+	var peers []string
+	for addr := range doc.IPv4Unicast.Peers {
+		peers = append(peers, addr)
+	}
+	sort.Strings(peers)
+	return peers
 }
 
 // externalSessionOf finds one router of this AS and an external neighbour it
