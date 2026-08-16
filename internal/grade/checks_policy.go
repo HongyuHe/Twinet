@@ -53,6 +53,59 @@ func init() {
 // Testing reachability alone would pass a student who configured native IPv6
 // routing, which is not what the question asks for; testing only for a tunnel
 // device would pass one who built a tunnel that does not carry traffic.
+// tunnelCarriesTransport opens a connection each way and says whether the far
+// side saw it.
+//
+// The target is a port nothing is listening on, so the answer is a reset: no
+// service has to be arranged anywhere, and the far side's own count of resets
+// it has sent records that the connection attempt arrived. A reply forged on
+// the path does not move that counter, and a rule that discards forwarded TCP
+// while permitting ICMP -- which is what makes a ping-only test worthless --
+// stops it moving at all.
+func tunnelCarriesTransport(ctx context.Context, env *Env, hosts map[string]*model.Device,
+	domains []string) (string, bool) {
+	for i := 0; i < 2; i++ {
+		src, dst := hosts[domains[i]], hosts[domains[1-i]]
+		if src == nil || dst == nil {
+			continue
+		}
+		addr := deviceAddr6(ctx, env, dst)
+		if addr == "" {
+			continue
+		}
+		before, okB := tcpResetsSent(ctx, env, dst.ID)
+		res, err := env.Probe(ctx, src.ID,
+			[]string{"nc", "-6", "-w", "3", "-z", addr, "9"})
+		after, okA := tcpResetsSent(ctx, env, dst.ID)
+		if !okB || !okA {
+			// The counter could not be read, so a refusal is the only
+			// evidence there is; a timeout leaves nothing to conclude from.
+			if err == nil && res.ExitCode == 0 {
+				continue
+			}
+			continue
+		}
+		if after > before {
+			continue
+		}
+		return fmt.Sprintf(
+			"IPv6 pings cross the tunnel, but a connection from %s to %s at %s never "+
+				"arrived: %s answered no TCP at all, so the tunnel carries ICMP and "+
+				"nothing else", src.Name, dst.Name, addr, dst.Name), false
+	}
+	return "", true
+}
+
+// tcpResetsSent reads a host's count of TCP resets it has sent, which is the
+// kernel's own record of a connection attempt having reached it.
+func tcpResetsSent(ctx context.Context, env *Env, device string) (int, bool) {
+	res, err := env.Probe(ctx, device, []string{"cat", "/proc/net/snmp"})
+	if err != nil || res.ExitCode != 0 {
+		return 0, false
+	}
+	return snmpCounter(res.Stdout, "Tcp:", "OutRsts")
+}
+
 func checkSixIn4(ctx context.Context, env *Env) Result {
 	as, ok := env.Topology.ASes[env.AS]
 	if !ok {
@@ -286,6 +339,20 @@ func checkSixIn4(ctx context.Context, env *Env) Result {
 					}
 				}
 			}
+		}
+	}
+
+	// And whether anything other than a ping crosses it.
+	//
+	// Every probe above is ICMPv6. A rule on the gateway discarding forwarded
+	// TCP left every ping answered, the tunnel counters moving, and the whole
+	// point awarded for a tunnel across which no connection could be made. A
+	// datacentre that can only be pinged is not reachable in any sense the
+	// assignment means.
+	if throughTunnel && len(domains) >= 2 {
+		if why, ok := tunnelCarriesTransport(ctx, env, hosts, domains); !ok {
+			throughTunnel = false
+			reach = why
 		}
 	}
 

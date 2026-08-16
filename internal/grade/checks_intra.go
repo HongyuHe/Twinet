@@ -1558,15 +1558,24 @@ func receivedEchoes(ctx context.Context, env *Env, hosts []*model.Device) map[st
 // column: the set of counters differs between kernels, and counting fields
 // would read a different one on a different machine.
 func icmpInEchos(body string) (int, bool) {
+	return snmpCounter(body, "Icmp:", "InEchos")
+}
+
+// snmpCounter reads one named counter out of /proc/net/snmp, which prints a
+// row of names and then a row of values.
+//
+// By name, never by position: the columns differ between kernels, and reading
+// the wrong one is a number that looks plausible and means something else.
+func snmpCounter(body, section, field string) (int, bool) {
 	lines := strings.Split(body, "\n")
 	for i := 0; i+1 < len(lines); i++ {
-		if !strings.HasPrefix(lines[i], "Icmp:") {
+		if !strings.HasPrefix(lines[i], section) || !strings.HasPrefix(lines[i+1], section) {
 			continue
 		}
 		names := strings.Fields(lines[i])
 		values := strings.Fields(lines[i+1])
 		for j, n := range names {
-			if n == "InEchos" && j < len(values) {
+			if n == field && j < len(values) {
 				v, err := strconv.Atoi(values[j])
 				return v, err == nil
 			}
