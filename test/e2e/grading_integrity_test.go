@@ -182,6 +182,7 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 	var forgedLeak struct{ router, routeMap, prefix string }
 	var custTCP string
 	var reorigin struct{ router, routeMap, prefix string }
+	var slowPrepend struct{ router, routeMap, seq, peer, original string }
 	var looseROA struct {
 		router, anchor, prefix string
 		length                 int
@@ -799,6 +800,37 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 					"router ospf",
 					" redistribute static",
 					"end")
+				time.Sleep(20 * time.Second)
+			},
+		},
+		{
+			// A prepend that empties the slow link instead of lengthening it.
+			//
+			// Prepending the neighbour's own number is three hops longer and
+			// discarded on arrival as a loop, so the backup link stops
+			// carrying anything -- which counting hops read as correct.
+			name:     "the slow link prepended with the neighbour's own ASN",
+			question: "q2.5",
+			undo: func(t *testing.T) {
+				if slowPrepend.router == "" {
+					return
+				}
+				vtysh(t, dir, slowPrepend.router, "configure terminal",
+					"route-map "+slowPrepend.routeMap+" permit "+slowPrepend.seq,
+					" set as-path prepend "+slowPrepend.original,
+					"end")
+				vtysh(t, dir, slowPrepend.router, "clear ip bgp "+slowPrepend.peer+" out")
+			},
+			apply: func(t *testing.T) {
+				router, rmap, seq, peer, orig, asn := slowPrependClause(t, dir, as)
+				slowPrepend = struct{ router, routeMap, seq, peer, original string }{
+					router, rmap, seq, peer, orig}
+				t.Logf("prepending AS%s instead of AS%d towards %s", asn, as, peer)
+				vtysh(t, dir, router, "configure terminal",
+					"route-map "+rmap+" permit "+seq,
+					" set as-path prepend "+asn+" "+asn+" "+asn,
+					"end")
+				vtysh(t, dir, router, "clear ip bgp "+peer+" out")
 				time.Sleep(20 * time.Second)
 			},
 		},
@@ -1781,6 +1813,49 @@ func findNotFoundPrefix(t *testing.T, dir string, as int) string {
 		}
 	}
 	return ""
+}
+
+// slowPrependClause finds the route-map clause that prepends towards the slow
+// neighbour, the session it applies to, and that neighbour's AS number.
+func slowPrependClause(t *testing.T, dir string, as int) (router, routeMap, seq, peer, orig, asn string) {
+	t.Helper()
+	for _, r := range routersOf(t, dir, as) {
+		cfg, err := twinet(t, "exec", "-m", dir, r, "--", "vtysh", "-c", "show running-config")
+		if err != nil {
+			continue
+		}
+		lines := strings.Split(cfg, "\n")
+		applied := map[string]string{} // route-map -> neighbour
+		remote := map[string]string{}  // neighbour -> remote AS
+		for _, line := range lines {
+			f := strings.Fields(strings.TrimSpace(line))
+			if len(f) == 5 && f[0] == "neighbor" && f[2] == "route-map" && f[4] == "out" {
+				applied[f[3]] = f[1]
+			}
+			if len(f) == 3 && f[0] == "neighbor" && f[1] != "" && f[2] != "" &&
+				strings.Contains(line, "remote-as") {
+				remote[f[1]] = f[2]
+			}
+		}
+		for i, line := range lines {
+			f := strings.Fields(strings.TrimSpace(line))
+			if len(f) != 4 || f[0] != "route-map" || applied[f[1]] == "" {
+				continue
+			}
+			for j := i + 1; j < len(lines) && j < i+5; j++ {
+				t2 := strings.TrimSpace(lines[j])
+				if v, ok := strings.CutPrefix(t2, "set as-path prepend "); ok {
+					p := applied[f[1]]
+					if remote[p] == "" {
+						continue
+					}
+					return r, f[1], f[3], p, v, remote[p]
+				}
+			}
+		}
+	}
+	t.Skip("no prepend towards a neighbour was found")
+	return "", "", "", "", "", ""
 }
 
 // leakableRoute finds a router with an export policy towards a peer or
