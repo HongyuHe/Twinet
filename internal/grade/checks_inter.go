@@ -933,30 +933,133 @@ func carriesCustomerTraffic(ctx context.Context, env *Env, sess externalSession,
 	if sess.PeerDevice == "" || sess.PeerIface == "" {
 		return "", false
 	}
-	for _, cand := range transitTargets(env, sess, owed) {
-		// Does the customer actually send this destination our way? If not,
-		// nothing about the submission can be concluded from the probe.
+	cands := transitTargets(env, sess, owed)
+	for _, cand := range cands {
+		// Does the customer already send this destination our way? Then the
+		// probe needs no help: the traffic is the customer's own.
 		res, err := env.Probe(ctx, sess.PeerDevice, []string{"ip", "route", "get", cand.Addr})
 		if err != nil || res.ExitCode != 0 || !strings.Contains(res.Stdout, " dev "+sess.PeerIface) {
 			continue
 		}
-		before, okB := echoesDeliveredTo(ctx, env, cand.Host)
-		ping, err := env.Probe(ctx, sess.PeerDevice,
-			[]string{"ping", "-c", "2", "-W", "2", "-i", "0.2", cand.Addr})
-		arrived := err == nil && ping.ExitCode == 0
-		after, okA := echoesDeliveredTo(ctx, env, cand.Host)
-		if okB && okA && after > before {
-			return "", true
-		}
-		if arrived && (!okB || !okA) {
-			return "", true // the counter could not be read; the reply stands on its own
-		}
-		return fmt.Sprintf(
-			"the customer at %s is offered %s but its traffic does not cross this AS: "+
-				"a packet from %s to %s in AS %d was not delivered",
-			sess.Addr, cand.Prefix, sess.PeerDevice, cand.Addr, cand.ASN), false
+		return transitProbe(ctx, env, sess, cand, "")
 	}
-	return "", false
+	// Nothing is routed this way, which is a fact about the customer -- they
+	// may prefer another provider -- and not an answer about the submission. A
+	// session nobody happens to use is still a session that has to work, so the
+	// traffic is put onto it: one host route on the customer's own router,
+	// pointed at our address on this link, and a source address of theirs that
+	// the rest of the internet has a route back to. Without the second part the
+	// packet carries the link's own numbering, which is advertised nowhere, and
+	// the first router that applies a reverse-path check drops it -- measured,
+	// before this was understood, as a correct AS failing to carry anything.
+	via := sessionAddrOf(ctx, env, sess)
+	src := routableAddrOn(ctx, env, sess)
+	if via == "" || src == "" || len(cands) == 0 {
+		return "", false
+	}
+	cand := cands[0]
+	route := []string{cand.Addr + "/32", "via", via, "dev", sess.PeerIface}
+	if res, err := env.Probe(ctx, sess.PeerDevice,
+		append([]string{"ip", "route", "replace"}, route...)); err != nil || res.ExitCode != 0 {
+		return "", false
+	}
+	defer func() {
+		_, _ = env.Probe(context.WithoutCancel(ctx), sess.PeerDevice,
+			append([]string{"ip", "route", "del"}, route...))
+	}()
+	return transitProbe(ctx, env, sess, cand, src)
+}
+
+// transitProbe sends the packets and reads the destination's own counter.
+func transitProbe(ctx context.Context, env *Env, sess externalSession, cand transitTarget,
+	src string) (string, bool) {
+	before, okB := echoesDeliveredTo(ctx, env, cand.Host)
+	args := []string{"ping", "-c", "2", "-W", "2", "-i", "0.2"}
+	if src != "" {
+		args = append(args, "-I", src)
+	}
+	args = append(args, cand.Addr)
+	ping, err := env.Probe(ctx, sess.PeerDevice, args)
+	arrived := err == nil && ping.ExitCode == 0
+	after, okA := echoesDeliveredTo(ctx, env, cand.Host)
+	if okB && okA && after > before {
+		return "", true
+	}
+	if arrived && (!okB || !okA) {
+		return "", true // the counter could not be read; the reply stands on its own
+	}
+	return fmt.Sprintf(
+		"the customer at %s is offered %s but its traffic does not cross this AS: "+
+			"a packet from %s to %s in AS %d was not delivered",
+		sess.Addr, cand.Prefix, sess.PeerDevice, cand.Addr, cand.ASN), false
+}
+
+// sessionAddrOf finds our own address on this link, as the customer sees it:
+// the neighbour they hold a session with whose remote AS is ours.
+func sessionAddrOf(ctx context.Context, env *Env, sess externalSession) string {
+	res, err := env.Probe(ctx, sess.PeerDevice, []string{"vtysh", "-c", "show ip bgp summary json"})
+	if err != nil || res.ExitCode != 0 {
+		return ""
+	}
+	var doc struct {
+		IPv4Unicast struct {
+			Peers map[string]struct {
+				RemoteAs int `json:"remoteAs"`
+			} `json:"peers"`
+		} `json:"ipv4Unicast"`
+	}
+	if json.Unmarshal([]byte(res.Stdout), &doc) != nil {
+		return ""
+	}
+	var found []string
+	for addr, p := range doc.IPv4Unicast.Peers {
+		if p.RemoteAs == env.AS {
+			found = append(found, addr)
+		}
+	}
+	sort.Strings(found)
+	for _, addr := range found {
+		// The one on this link, which is the only one the host route can use.
+		if r, err := env.Probe(ctx, sess.PeerDevice,
+			[]string{"ip", "route", "get", addr}); err == nil && r.ExitCode == 0 &&
+			strings.Contains(r.Stdout, " dev "+sess.PeerIface) {
+			return addr
+		}
+	}
+	return ""
+}
+
+// routableAddrOn picks an address of the customer's that the rest of the
+// internet has a route back to, which an inter-AS link's own numbering is not.
+func routableAddrOn(ctx context.Context, env *Env, sess externalSession) string {
+	as, ok := env.Topology.ASes[sess.ASN]
+	if !ok || as.Block == "" {
+		return ""
+	}
+	res, err := env.Probe(ctx, sess.PeerDevice,
+		[]string{"ip", "-o", "-4", "addr", "show", "scope", "global"})
+	if err != nil || res.ExitCode != 0 {
+		return ""
+	}
+	best := ""
+	for iface, addrs := range parseIPAddrOutput(res.Stdout) {
+		for _, a := range addrs {
+			if !anyInSubnet([]string{a}, as.Block) {
+				continue
+			}
+			bare := a
+			if j := strings.IndexByte(bare, '/'); j > 0 {
+				bare = bare[:j]
+			}
+			if iface == "lo" {
+				return bare // a loopback is up as long as the router is
+			}
+			if best == "" {
+				best = bare
+			}
+		}
+	}
+	return best
 }
 
 // echoesDeliveredTo reads one host's count of ICMP echo requests delivered to
