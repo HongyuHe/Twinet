@@ -484,6 +484,67 @@ func originASN(path string) int {
 // It reads the ordering out of the routing table rather than pattern-matching
 // the configuration, so any correct implementation passes and a configuration
 // that merely looks right does not.
+// overriddenByStatic names the externally learned prefixes a router forwards
+// by some route other than the BGP one.
+//
+// A ranking that does not decide where packets go is not a ranking. Anything
+// installed above BGP -- a static route, a kernel route, a policy table --
+// takes the traffic wherever it says, whatever the BGP table shows.
+func overriddenByStatic(ctx context.Context, env *Env, routers []*model.Device) []string {
+	var (
+		mu  sync.Mutex
+		out []string
+		wg  sync.WaitGroup
+	)
+	for _, r := range routers {
+		wg.Add(1)
+		go func(r *model.Device) {
+			defer wg.Done()
+			tbl, err := bgpTable(ctx, env, r.Name)
+			if err != nil {
+				return
+			}
+			external := map[string]bool{}
+			for prefix, entries := range tbl.Table() {
+				for _, e := range entries {
+					if e.IsBest() && strings.TrimSpace(e.Path) != "" {
+						external[prefix] = true
+					}
+				}
+			}
+			if len(external) == 0 {
+				return
+			}
+			var routes ospfRouteJSON
+			if err := env.VtyshJSON(ctx, r.Name, "show ip route json", &routes); err != nil {
+				return
+			}
+			for prefix, entries := range routes {
+				if !external[prefix] {
+					continue
+				}
+				for _, e := range entries {
+					if !e.Selected && !e.Installed {
+						continue
+					}
+					switch e.Protocol {
+					case "bgp", "connected", "":
+					default:
+						mu.Lock()
+						out = append(out, fmt.Sprintf(
+							"%s forwards %s by a %s route, not the one BGP chose",
+							r.Name, prefix, e.Protocol))
+						mu.Unlock()
+					}
+				}
+			}
+		}(r)
+	}
+	wg.Wait()
+	sort.Strings(out)
+	return uniq(out)
+}
+
 // relRank orders the business relationships by how much a route from one is
 // worth: a customer pays to be carried, a peer costs nothing, a provider is
 // billed for.
@@ -663,6 +724,22 @@ func checkGaoRexford(ctx context.Context, env *Env) Result {
 	compare(model.RelCustomer, model.RelPeer, hasCust, hasPeer, custLo, peerHi)
 	compare(model.RelPeer, model.RelProvider, hasPeer, hasProv, peerLo, provHi)
 	compare(model.RelCustomer, model.RelProvider, hasCust, hasProv, custLo, provHi)
+
+	// And that the ranking is what decides where packets go.
+	//
+	// Everything above is BGP's decision. The kernel's is what forwards, and
+	// they are not the same: `ip route replace 4.0.0.0/8 via <provider>` sends
+	// the traffic to a provider while BGP's table still shows the peer path
+	// selected at a higher local preference. The ordering was arranged, agreed
+	// with, and then ignored, for full marks.
+	checks++
+	if over := overriddenByStatic(ctx, env, routers); len(over) == 0 {
+		passed++
+	} else {
+		fmt.Fprintf(&detail, "%d externally learned prefix(es) are forwarded by something "+
+			"other than BGP, so the ordering does not decide where traffic goes:\n%s\n",
+			len(over), strings.Join(truncate(over, 5), "\n"))
+	}
 
 	// The ordering as it came out, which is the point of arranging it.
 	checks++
