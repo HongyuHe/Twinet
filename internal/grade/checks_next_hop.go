@@ -268,6 +268,21 @@ func unreachedOutside(ctx context.Context, env *Env, routers []*model.Device) []
 	)
 	sem := make(chan struct{}, 16)
 	for _, r := range routers {
+		// From the loopback, always.
+		//
+		// A router's own choice of source address for a packet leaving over an
+		// inter-AS link is that link's numbering, which is advertised nowhere:
+		// the probe arrives and the answer has no way back, and a perfectly
+		// healthy router reads as unable to reach half the internet. The
+		// loopback is inside this AS's own address space, so a reply can find
+		// its way home.
+		src := ""
+		if lo, ok := r.IfaceByName("lo"); ok && lo.Addr4 != "" {
+			src = addrOf(lo.Addr4)
+		}
+		if src == "" {
+			continue
+		}
 		for _, t := range targets {
 			wg.Add(1)
 			go func(r *model.Device, t target) {
@@ -275,7 +290,7 @@ func unreachedOutside(ctx context.Context, env *Env, routers []*model.Device) []
 				sem <- struct{}{}
 				defer func() { <-sem }()
 				res, err := env.Probe(ctx, r.ID,
-					[]string{"ping", "-c", "2", "-W", "2", "-i", "0.2", t.addr})
+					[]string{"ping", "-c", "2", "-W", "2", "-i", "0.2", "-I", src, t.addr})
 				if err == nil && res.ExitCode == 0 {
 					return
 				}
