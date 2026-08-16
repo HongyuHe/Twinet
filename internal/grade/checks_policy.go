@@ -539,7 +539,25 @@ func checkIXPCommunities(ctx context.Context, env *Env) Result {
 			emptyList = name
 		}
 	}
-	admitted, accepted, aerr := routesViaIXP(ctx, env, ixpRouter.Name, ixpPeer)
+	// What the exchange sent us, in the exchange's own words.
+	//
+	// Which routes are in-region was decided from the AS path the member holds
+	// after its own import policy has run, and an import policy can rewrite a
+	// path: `set as-path exclude 5` on an accepted route turns "5 10" into
+	// "10", and a route relayed by an in-region member reads as coming
+	// straight from outside it. The route server belongs to the exchange, and
+	// what it advertised is not the submission's to edit.
+	ourAddr := ""
+	for _, i := range ixpRouter.Ifaces {
+		if i.Role == model.RoleIXPLink && i.Addr4 != "" {
+			ourAddr = addrOnly(i.Addr4)
+		}
+	}
+	offeredPaths, rerr := ixpOfferedPaths(ctx, env, rs.ID, ourAddr)
+	if rerr != nil {
+		return Errored("policy.ixp_communities", rerr)
+	}
+	admitted, accepted, aerr := routesViaIXP(ctx, env, ixpRouter.Name, ixpPeer, offeredPaths)
 	if aerr != nil {
 		return Errored("policy.ixp_communities", aerr)
 	}
@@ -553,12 +571,6 @@ func checkIXPCommunities(ctx context.Context, env *Env) Result {
 	// accepts nothing from the exchange has not written a peering policy; it
 	// has switched the exchange off, and the point of the question is the
 	// traffic that does cross it.
-	ourAddr := ""
-	for _, i := range ixpRouter.Ifaces {
-		if i.Role == model.RoleIXPLink && i.Addr4 != "" {
-			ourAddr = addrOnly(i.Addr4)
-		}
-	}
 	offered := 0
 	if ourAddr != "" {
 		offered, aerr = routeServerOffersOutOfRegion(ctx, env, rs.ID, ourAddr, ixpInRegion(env))
@@ -1855,6 +1867,37 @@ func fieldAfter(line, key string) string {
 // check passes for everybody -- vacuous in exactly the way it was written to
 // stop. `show ip bgp neighbors <rs> routes` is what the router itself
 // considers to have come from that session, after policy.
+// ixpOfferedPaths reads what the exchange relayed to one member, keyed by
+// prefix, as the exchange itself records it.
+//
+// This is the only account of the path that a member's import policy cannot
+// edit: what arrives is what the route server sent, whatever the member's
+// route-maps then make of it.
+func ixpOfferedPaths(ctx context.Context, env *Env, rsDevice, ourAddr string) (map[string]string, error) {
+	out := map[string]string{}
+	if ourAddr == "" {
+		return out, nil
+	}
+	res, err := env.Probe(ctx, rsDevice, []string{"vtysh", "-c",
+		fmt.Sprintf("show ip bgp neighbors %s advertised-routes json", ourAddr)})
+	if err != nil {
+		return nil, fmt.Errorf("asking the route server what it relays to %s: %w", ourAddr, err)
+	}
+	var got bgpRouteJSON
+	if jerr := jsonUnmarshalLoose(res.Stdout, &got); jerr != nil {
+		return nil, fmt.Errorf("reading what the route server relays to %s: %w", ourAddr, jerr)
+	}
+	for prefix, entries := range got.Table() {
+		for _, e := range entries {
+			if p := strings.TrimSpace(e.Path); p != "" {
+				out[prefix] = p
+				break
+			}
+		}
+	}
+	return out, nil
+}
+
 // routeServerOffersOutOfRegion reports how many of the routes the exchange is
 // relaying to this AS are ones it ought to accept.
 //
@@ -1921,7 +1964,8 @@ func ixpInRegion(env *Env) map[int]bool {
 	return out
 }
 
-func routesViaIXP(ctx context.Context, env *Env, router, ixpPeer string) (in, out []string, err error) {
+func routesViaIXP(ctx context.Context, env *Env, router, ixpPeer string,
+	relayed map[string]string) (in, out []string, err error) {
 	if _, ok := env.Topology.ASes[env.AS]; !ok {
 		return nil, nil, fmt.Errorf("AS %d not in the lab", env.AS)
 	}
@@ -1943,15 +1987,22 @@ func routesViaIXP(ctx context.Context, env *Env, router, ixpPeer string) (in, ou
 	}
 	for prefix, entries := range got.Table() {
 		for _, e := range entries {
+			// The path the exchange relayed, where it is known; the local one
+			// only as a fallback, for a prefix the route server no longer has.
+			path := e.Path
+			if p, ok := relayed[prefix]; ok {
+				path = p
+			}
 			crosses := false
-			for _, f := range strings.Fields(e.Path) {
+			for _, f := range strings.Fields(path) {
 				if n, cerr := strconv.Atoi(f); cerr == nil && inRegion[n] {
 					crosses = true
 					break
 				}
 			}
 			if crosses {
-				in = append(in, fmt.Sprintf("%s (path %q)", prefix, strings.TrimSpace(e.Path)))
+				in = append(in, fmt.Sprintf("%s (relayed with path %q)", prefix,
+					strings.TrimSpace(path)))
 			} else {
 				out = append(out, prefix)
 			}
