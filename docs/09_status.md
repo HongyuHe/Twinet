@@ -422,6 +422,17 @@ reached students, and each motivated a permanent test.
     link's numbering, which is advertised nowhere, so the answer would have no
     way back and a healthy router would read as unable to reach half the
     internet.
+43. **An ordering arranged by an attribute nobody looked at.** Gao-Rexford was
+    graded by comparing local-preference values, which is what a student
+    configures and not what the rule is for. Local preference is only the second
+    tie-break in the decision process, so `set weight 65535` on a provider's
+    route puts it ahead of a peer's while every local preference in the table
+    still reads correctly -- and the whole question kept full marks while
+    traffic went to the provider. Which route was *selected* is now its own
+    comparison, and a path is classified by the neighbour at the head of its AS
+    path rather than by the session this router heard it on: the routes being
+    compared mostly arrive over iBGP, where the session says nothing about where
+    they entered.
 
 ## Environment findings
 
