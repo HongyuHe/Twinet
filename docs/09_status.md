@@ -508,6 +508,16 @@ reached students, and each motivated a permanent test.
     -- or out of a port whatever the frame arrived on -- is a way across. That
     covers every protocol at once and needs no packet, which is what a broadcast
     probe cannot do.
+52. **A leak wearing a customer's number.** Whether an advertisement to a peer
+    or a provider was a leak was decided from the AS path in that
+    advertisement, and a path on the way out is the submission's to write:
+    prepending a customer's number in front of a peer's route made a leak read
+    as a customer's route being passed on, which is what the rule permits. What
+    may leave is now the set learned from customers, recorded at the session
+    each route arrived on, plus this AS's own prefix -- named explicitly,
+    because the traffic-engineering answer prepends our own number and an empty
+    path no longer identifies it. A router table that could not be read stops
+    the check rather than turning missing knowledge into an accusation.
 
 ## Environment findings
 
