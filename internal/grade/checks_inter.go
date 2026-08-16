@@ -1375,9 +1375,24 @@ func checkNoForbiddenOSPF(ctx context.Context, env *Env) Result {
 		}
 	}
 
+	// And what OSPF is carrying that never reaches a routing table.
+	//
+	// A prefix redistributed with the maximum metric is flooded to every
+	// router in the area and installed by none of them: LSInfinity means "do
+	// not use this", so `show ip route ospf` is empty and the RIB test above
+	// sees nothing. A reviewer put an inter-AS range into OSPF exactly that
+	// way and the check passed. The database is where a prefix being "in OSPF"
+	// is decided; a routing table is only what a router chose to do about it.
+	lsdb, err := forbiddenInLSDB(ctx, env, external)
+	if err != nil {
+		return Errored("config.no_forbidden_ospf", err)
+	}
+	found = append(found, lsdb...)
+
 	if len(found) == 0 {
 		return Pass("config.no_forbidden_ospf", Evidence{
-			Observed: "no inter-AS subnet is advertised in OSPF or carried as an OSPF route"})
+			Observed: "no inter-AS subnet is advertised in OSPF, carried as an OSPF route, " +
+				"or present in the link-state database"})
 	}
 	sort.Strings(found)
 	return Fail("config.no_forbidden_ospf", Evidence{
@@ -1388,6 +1403,146 @@ func checkNoForbiddenOSPF(ctx context.Context, env *Env) Result {
 			"`redistribute connected` puts them there as surely as a network statement does",
 		Command: "show running-config; show ip route ospf",
 	})
+}
+
+// ospfLSDB is the part of each link-state advertisement that names a prefix.
+type ospfLSDB struct {
+	RouterLinkStates struct {
+		Areas map[string][]struct {
+			AdvertisingRouter string `json:"advertisingRouter"`
+			RouterLinks       map[string]struct {
+				LinkType       string `json:"linkType"`
+				NetworkAddress string `json:"networkAddress"`
+				NetworkMask    string `json:"networkMask"`
+			} `json:"routerLinks"`
+		} `json:"areas"`
+	} `json:"routerLinkStates"`
+	NetworkLinkStates struct {
+		Areas map[string][]ospfPrefixLSA `json:"areas"`
+	} `json:"networkLinkStates"`
+	SummaryLinkStates struct {
+		Areas map[string][]ospfPrefixLSA `json:"areas"`
+	} `json:"summaryLinkStates"`
+	ASExternalLinkStates []ospfPrefixLSA `json:"asExternalLinkStates"`
+}
+
+type ospfPrefixLSA struct {
+	LinkStateID       string `json:"linkStateId"`
+	AdvertisingRouter string `json:"advertisingRouter"`
+	NetworkMask       int    `json:"networkMask"`
+	Metric            int    `json:"metric"`
+}
+
+// forbiddenInLSDB reports every inter-AS prefix that appears in the area's
+// link-state database, whatever kind of advertisement carried it there and
+// whatever metric it was given.
+func forbiddenInLSDB(ctx context.Context, env *Env, external externalRanges) ([]string, error) {
+	kinds := []string{"router", "network", "summary", "external"}
+	type finding struct{ where, what string }
+	var (
+		mu       sync.Mutex
+		out      []string
+		firstErr error
+		seen     = map[string]bool{}
+		wg       sync.WaitGroup
+	)
+	for _, r := range env.Routers() {
+		for _, kind := range kinds {
+			wg.Add(1)
+			go func(router, kind string) {
+				defer wg.Done()
+				var db ospfLSDB
+				cmd := "show ip ospf database " + kind + " json"
+				if err := env.VtyshJSON(ctx, router, cmd, &db); err != nil {
+					// A router with no OSPF prints nothing at all, which is an
+					// empty database and not a failure to read one.
+					if s, verr := env.Vtysh(ctx, router, cmd); verr == nil &&
+						strings.TrimSpace(s) == "" {
+						return
+					}
+					mu.Lock()
+					if firstErr == nil {
+						firstErr = fmt.Errorf(
+							"%s: its OSPF database could not be read, so whether the "+
+								"inter-AS ranges are in its interior routing cannot be "+
+								"decided: %w", router, err)
+					}
+					mu.Unlock()
+					return
+				}
+				var hits []finding
+				for _, lsas := range db.RouterLinkStates.Areas {
+					for _, lsa := range lsas {
+						for _, l := range lsa.RouterLinks {
+							if l.NetworkAddress == "" {
+								continue
+							}
+							p := l.NetworkAddress + "/" + strconv.Itoa(maskBits(l.NetworkMask))
+							if external.matches(p) {
+								hits = append(hits, finding{lsa.AdvertisingRouter,
+									fmt.Sprintf("%s as a %s in its router advertisement", p,
+										strings.ToLower(l.LinkType))})
+							}
+						}
+					}
+				}
+				add := func(lsas []ospfPrefixLSA, what string) {
+					for _, lsa := range lsas {
+						p := lsa.LinkStateID + "/" + strconv.Itoa(lsa.NetworkMask)
+						if external.matches(p) {
+							hits = append(hits, finding{lsa.AdvertisingRouter,
+								fmt.Sprintf("%s as %s (metric %d)", p, what, lsa.Metric)})
+						}
+					}
+				}
+				for _, lsas := range db.NetworkLinkStates.Areas {
+					add(lsas, "a transit network")
+				}
+				for _, lsas := range db.SummaryLinkStates.Areas {
+					add(lsas, "an inter-area summary")
+				}
+				add(db.ASExternalLinkStates, "an external route redistributed into OSPF")
+				mu.Lock()
+				for _, h := range hits {
+					line := fmt.Sprintf("%s floods %s", h.where, h.what)
+					if !seen[line] {
+						seen[line] = true
+						out = append(out, line)
+					}
+				}
+				mu.Unlock()
+			}(r.Name, kind)
+		}
+	}
+	wg.Wait()
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// maskBits turns OSPF's dotted network mask into a prefix length.
+func maskBits(mask string) int {
+	parts := strings.Split(mask, ".")
+	if len(parts) != 4 {
+		if n, err := strconv.Atoi(mask); err == nil {
+			return n
+		}
+		return 32
+	}
+	bits := 0
+	for _, p := range parts {
+		n, err := strconv.Atoi(p)
+		if err != nil {
+			return 32
+		}
+		for ; n > 0; n <<= 1 {
+			bits++
+			n &= 0xff
+		}
+	}
+	return bits
 }
 
 // peerPlannedAddr is the address the manifest gave the far end of a link.
