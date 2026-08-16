@@ -174,6 +174,7 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 	var rangeAllow []string
 	var weighted struct{ router, routeMap, prefix string }
 	var ecmpTCP struct{ router, from string }
+	var udpBlock struct{ router, src, dst string }
 	var impostorLink struct{ router, iface, moved string }
 	var ixpRewrite struct{ router, routeMap, match, peer string }
 	var rpkiNarrow struct{ router, routeMap, seq string }
@@ -1190,6 +1191,33 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 					t.Fatalf("substituting a tunnel for the link: %v\n%s", err, out)
 				}
 				time.Sleep(20 * time.Second)
+			},
+		},
+		{
+			// Paths that carry two protocols of three.
+			//
+			// A filter is written per protocol as easily as per port: dropping
+			// UDP between the two loopbacks leaves the pings and the
+			// connections working.
+			name:     "the prescribed paths dropping datagrams alone",
+			question: "q1.3",
+			undo: func(t *testing.T) {
+				if udpBlock.router == "" {
+					return
+				}
+				_, _ = twinet(t, "exec", "-m", dir, udpBlock.router, "--", "iptables", "-D",
+					"OUTPUT", "-p", "udp", "-s", udpBlock.src, "-d", udpBlock.dst, "-j", "DROP")
+			},
+			apply: func(t *testing.T) {
+				a, b := "as3/ATL", "as3/BOS"
+				udpBlock = struct{ router, src, dst string }{
+					a, loopbackOf(t, dir, a), loopbackOf(t, dir, b)}
+				t.Logf("discarding UDP from %s to %s", udpBlock.src, udpBlock.dst)
+				out, err := twinet(t, "exec", "-m", dir, a, "--", "iptables", "-I", "OUTPUT",
+					"1", "-p", "udp", "-s", udpBlock.src, "-d", udpBlock.dst, "-j", "DROP")
+				if err != nil {
+					t.Fatalf("discarding datagrams: %v\n%s", err, out)
+				}
 			},
 		},
 		{

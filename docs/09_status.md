@@ -578,6 +578,12 @@ reached students, and each motivated a permanent test.
     can be written per protocol as easily as per port, and the far side's count
     of datagrams arriving for an unbound port is a fact about arrival rather
     than about any answer.
+61. **Paths that carried two protocols of three.** The equal-cost paths were
+    tried with a ping and a connection. A filter is written per protocol as
+    easily as per port: dropping UDP between the two loopbacks left the pings
+    and the connections working, and the paths carrying two thirds of what they
+    should, at full marks. A datagram is now sent to a port nothing is bound to,
+    and the far side's count of those records its arrival.
 
 ## Environment findings
 
