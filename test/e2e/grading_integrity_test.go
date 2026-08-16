@@ -178,6 +178,7 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 	var rpkiNarrow struct{ router, routeMap, seq string }
 	var notFoundBlock struct{ host, prefix string }
 	var tcpBlock struct{ router, src, dst string }
+	var vlanFlow struct{ switchID string }
 	var ixpDeny struct{ router, peer, routeMap string }
 	var importMapNames []string
 	var roaWithdrawn struct{ router, anchor, prefix string }
@@ -792,6 +793,34 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 					" redistribute static",
 					"end")
 				time.Sleep(20 * time.Second)
+			},
+		},
+		{
+			// A way across that carries one flow and no broadcast.
+			//
+			// The isolation probe sends a broadcast, which is what a shared
+			// broadcast domain leaks. An OpenFlow entry copying one protocol
+			// from a port in one VLAN to a port in another leaks nothing else,
+			// and cost nothing.
+			name:     "one flow mirrored across VLANs by a forwarding rule",
+			question: "q1.1",
+			undo: func(t *testing.T) {
+				if vlanFlow.switchID == "" {
+					return
+				}
+				_, _ = twinet(t, "exec", "-m", dir, vlanFlow.switchID, "--",
+					"ovs-ofctl", "del-flows", "br0", "cookie=0x461bad/-1")
+			},
+			apply: func(t *testing.T) {
+				sw, from, to := vlanPortPair(t, dir, as)
+				vlanFlow = struct{ switchID string }{sw}
+				t.Logf("mirroring one flow from %s to %s on %s", from, to, sw)
+				out, err := twinet(t, "exec", "-m", dir, sw, "--", "ovs-ofctl", "add-flow", "br0",
+					"cookie=0x461bad,priority=200,in_port="+from+",ip,tcp,tp_dst=443,"+
+						"actions=normal,output:"+to)
+				if err != nil {
+					t.Fatalf("mirroring one flow across VLANs: %v\n%s", err, out)
+				}
 			},
 		},
 		{
