@@ -177,6 +177,7 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 	var ixpRewrite struct{ router, routeMap, match, peer string }
 	var rpkiNarrow struct{ router, routeMap, seq string }
 	var notFoundBlock struct{ host, prefix string }
+	var tcpBlock struct{ router, src, dst string }
 	var ixpDeny struct{ router, peer, routeMap string }
 	var importMapNames []string
 	var roaWithdrawn struct{ router, anchor, prefix string }
@@ -791,6 +792,34 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 					" redistribute static",
 					"end")
 				time.Sleep(20 * time.Second)
+			},
+		},
+		{
+			// A pair that can be pinged and not spoken to.
+			//
+			// Every probe of the internal data plane was ICMP, so a rule
+			// discarding TCP between two hosts left every probe succeeding.
+			name:     "two hosts that can ping each other and nothing more",
+			question: "q1.2",
+			undo: func(t *testing.T) {
+				if tcpBlock.router == "" {
+					return
+				}
+				_, _ = twinet(t, "exec", "-m", dir, tcpBlock.router, "--", "iptables", "-D",
+					"FORWARD", "-s", tcpBlock.src, "-d", tcpBlock.dst, "-p", "tcp", "-j", "DROP")
+			},
+			apply: func(t *testing.T) {
+				src := hostAddr(t, dir, "as"+itoa(as)+"/NYC_host")
+				dst := hostAddr(t, dir, "as"+itoa(as)+"/BOS_host")
+				tcpBlock = struct{ router, src, dst string }{
+					"as" + itoa(as) + "/NYC", src + "/32", dst + "/32"}
+				t.Logf("discarding TCP from %s to %s", src, dst)
+				out, err := twinet(t, "exec", "-m", dir, tcpBlock.router, "--", "iptables",
+					"-I", "FORWARD", "1", "-s", tcpBlock.src, "-d", tcpBlock.dst,
+					"-p", "tcp", "-j", "DROP")
+				if err != nil {
+					t.Fatalf("discarding TCP between two hosts: %v\n%s", err, out)
+				}
 			},
 		},
 		{

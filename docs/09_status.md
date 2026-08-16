@@ -487,6 +487,17 @@ reached students, and each motivated a permanent test.
     the question at full marks, while the site behind it could not reach the
     network the question is about. Every host of the AS is asked now, at once,
     and the ones that cannot reach it are named.
+50. **A pair that could be pinged and not spoken to.** Every probe of the
+    internal data plane was ICMP. A rule discarding TCP between two hosts left
+    all eighty-eight succeeding and the question at full marks, while nothing
+    but a ping could cross between them. Every ordered pair is now also asked
+    for a connection, to a port nothing is listening on: being refused is the
+    far side speaking and proves the packets made the journey both ways, while
+    silence is something on the path swallowing them. Both look alike to the
+    program making the connection, and telling them apart is the whole test. A
+    path that carries pings and nothing else caps the check at half, because as
+    a fraction of a hundred and forty-four probes the deduction was three
+    thousandths, which is the same as not noticing.
 
 ## Environment findings
 
