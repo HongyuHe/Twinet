@@ -184,6 +184,7 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 	var reorigin struct{ router, routeMap, prefix string }
 	var slowPrepend struct{ router, routeMap, seq, peer, original string }
 	var staticOverride struct{ router, prefix string }
+	var ebgpBlackhole struct{ router, peer string }
 	var looseROA struct {
 		router, anchor, prefix string
 		length                 int
@@ -802,6 +803,34 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 					" redistribute static",
 					"end")
 				time.Sleep(20 * time.Second)
+			},
+		},
+		{
+			// An external session held open by a timer.
+			//
+			// Dropping both directions of the TCP flow leaves the session
+			// reported Established until the hold timer expires, which is
+			// longer than a grading run.
+			name:     "an eBGP session blackholed but still called Established",
+			question: "q2.1",
+			undo: func(t *testing.T) {
+				if ebgpBlackhole.router == "" {
+					return
+				}
+				_, _ = twinet(t, "exec", "-m", dir, ebgpBlackhole.router, "--", "sh", "-c",
+					"iptables -D INPUT -p tcp -s "+ebgpBlackhole.peer+" -j DROP; "+
+						"iptables -D OUTPUT -p tcp -d "+ebgpBlackhole.peer+" -j DROP")
+			},
+			apply: func(t *testing.T) {
+				router, peer := externalSessionOf(t, dir, as)
+				ebgpBlackhole = struct{ router, peer string }{router, peer}
+				t.Logf("discarding BGP packets between %s and %s", router, peer)
+				out, err := twinet(t, "exec", "-m", dir, router, "--", "sh", "-c",
+					"iptables -I INPUT 1 -p tcp -s "+peer+" -j DROP && "+
+						"iptables -I OUTPUT 1 -p tcp -d "+peer+" -j DROP")
+				if err != nil {
+					t.Fatalf("blackholing an external session: %v\n%s", err, out)
+				}
 			},
 		},
 		{
@@ -1840,6 +1869,26 @@ func findNotFoundPrefix(t *testing.T, dir string, as int) string {
 		}
 	}
 	return ""
+}
+
+// externalSessionOf finds one router of this AS and an external neighbour it
+// holds a session with.
+func externalSessionOf(t *testing.T, dir string, as int) (string, string) {
+	t.Helper()
+	for _, r := range routersOf(t, dir, as) {
+		cfg, err := twinet(t, "exec", "-m", dir, r, "--", "vtysh", "-c", "show running-config")
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(cfg, "\n") {
+			f := strings.Fields(strings.TrimSpace(line))
+			if len(f) == 4 && f[0] == "neighbor" && f[2] == "remote-as" && f[3] != itoa(as) {
+				return r, f[1]
+			}
+		}
+	}
+	t.Skip("no external session found")
+	return "", ""
 }
 
 // slowPrependClause finds the route-map clause that prepends towards the slow

@@ -563,6 +563,12 @@ reached students, and each motivated a permanent test.
     table still shows the peer path selected at a higher local preference: the
     ranking was arranged, agreed with, and overruled, at full marks. An
     externally learned prefix now has to be forwarded by the route BGP chose.
+59. **An external session held open by a timer.** The same memory that made an
+    iBGP session read as live made an eBGP one: dropping both directions of the
+    TCP flow left every external session reported Established, and carrying
+    nothing, for the whole of a grading run. Each router is now asked to send a
+    route refresh before the states are read, and a session whose received count
+    does not move while it is being asked to send is not carrying anything.
 
 ## Environment findings
 
