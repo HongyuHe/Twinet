@@ -139,3 +139,23 @@ func TestUnrecognisedOutputIsNotAnEmptyTable(t *testing.T) {
 		t.Error("an unrecognised document must not yield a table")
 	}
 }
+
+// TestOriginatedCatchesAForgedPath pins the sign that a route-map cannot
+// change. A prefix injected with `network X route-map M` where M prepends an
+// ASN is locally sourced and has a non-empty AS path; reading only the path
+// called it somebody else's route and let a hijack through.
+func TestOriginatedCatchesAForgedPath(t *testing.T) {
+	forged := bgpRoute{PeerID: "(unspec)", Path: "65000"}
+	if !forged.Originated() {
+		t.Error("a locally sourced route with a prepended AS path was not recognised as ours")
+	}
+	learned := bgpRoute{PeerID: "179.2.3.1", Path: "2 65000"}
+	if learned.Originated() {
+		t.Error("a route learned from a neighbour was counted as locally originated")
+	}
+	// The advertised-routes view carries no peer at all, where an empty path
+	// still has to mean local origination.
+	if !(bgpRoute{Path: ""}).Originated() {
+		t.Error("an empty AS path was not recognised as local origination")
+	}
+}

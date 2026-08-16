@@ -351,6 +351,14 @@ reached students, and each motivated a permanent test.
     mark for the question, because "and nothing else" is a property of the whole
     system rather than a fiftieth of a count. An address inside a subnet the
     plan assigns elsewhere fails the check outright.
+36. **A hijack dressed as transit.** Whether this AS had originated a prefix was
+    decided by the AS path being empty. Injecting one with `network X route-map
+    M`, where M prepends an ASN, produces a locally sourced route with a path,
+    which read as somebody else's route passing through: 203.0.113.0/24
+    announced that way propagated to AS 3's customers while the check that
+    exists to catch a hijack gave full marks. FRR gives a path it injected no
+    peer at all -- `peerId` reads `(unspec)` -- and no route-map can change
+    that, because there is no session to name. Either sign is now decisive.
 
 ## Environment findings
 

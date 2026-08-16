@@ -783,6 +783,38 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 			},
 		},
 		{
+			// A hijack dressed as transit.
+			//
+			// Whether the AS originated a prefix was decided by the AS path
+			// being empty. Injecting one through a route-map that prepends an
+			// ASN produces a locally sourced route with a path, which read as
+			// somebody else's route passing through -- so the check that exists
+			// to catch a hijack gave full marks to one.
+			name:     "somebody else's prefix announced with a forged AS path",
+			question: "q2.2",
+			undo: func(t *testing.T) {
+				vtysh(t, dir, "as3/NYC", "configure terminal",
+					"router bgp 3",
+					" address-family ipv4 unicast",
+					"  no network 203.0.113.0/24 route-map TWGRADE-HIJACK",
+					" exit",
+					"exit",
+					"no route-map TWGRADE-HIJACK permit 10",
+					"end")
+			},
+			apply: func(t *testing.T) {
+				vtysh(t, dir, "as3/NYC", "configure terminal",
+					"route-map TWGRADE-HIJACK permit 10",
+					" set as-path prepend 65000",
+					"exit",
+					"router bgp 3",
+					" address-family ipv4 unicast",
+					"  network 203.0.113.0/24 route-map TWGRADE-HIJACK",
+					"end")
+				time.Sleep(15 * time.Second)
+			},
+		},
+		{
 			// An address the plan does not mention.
 			//
 			// Reported and scored neither way until two reviewers made the
