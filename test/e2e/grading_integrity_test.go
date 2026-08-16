@@ -166,6 +166,7 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 	var ecmpBlock struct{ router, addr string }
 	var redistributed struct{ faker, prefix string }
 	var impostorSubnet struct{ faker, prefix string }
+	var customerDrops []string
 	var ixpDeny struct{ router, peer, routeMap string }
 	var importMapNames []string
 	var roaWithdrawn struct{ router, anchor, prefix string }
@@ -783,6 +784,36 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 			},
 		},
 		{
+			// Transit promised and not delivered.
+			//
+			// Everything the transit check asked about was the routes a
+			// customer is offered, which is a promise rather than a service.
+			// Leaving every session established and every route advertised
+			// while dropping the customers' packets in the FORWARD chain cost
+			// nothing at all.
+			name:     "customers' packets dropped while their routes are advertised",
+			question: "q2.3",
+			undo: func(t *testing.T) {
+				for _, iface := range customerDrops {
+					_, _ = twinet(t, "exec", "-m", dir, "as3/SFO", "--",
+						"iptables", "-D", "FORWARD", "-i", iface, "-j", "DROP")
+				}
+			},
+			apply: func(t *testing.T) {
+				customerDrops = customerIfaces(t, dir, as)
+				if len(customerDrops) == 0 {
+					t.Skip("AS 3 has no customer-facing interface to block")
+				}
+				for _, iface := range customerDrops {
+					out, err := twinet(t, "exec", "-m", dir, "as3/SFO", "--",
+						"iptables", "-I", "FORWARD", "-i", iface, "-j", "DROP")
+					if err != nil {
+						t.Fatalf("blocking %s: %v\n%s", iface, err, out)
+					}
+				}
+			},
+		},
+		{
 			// A hijack dressed as transit.
 			//
 			// Whether the AS originated a prefix was decided by the AS path
@@ -1373,6 +1404,26 @@ func ixpImport(t *testing.T, dir string, as int) (router, peer, routeMap string)
 // serviceSubnet finds a subnet one router advertises into OSPF, another router
 // that does not, and the prefix itself.
 //
+// customerIfaces names the interfaces of as3/SFO that face a customer, read
+// from the running lab so the mutation follows the topology rather than a
+// memory of it.
+func customerIfaces(t *testing.T, dir string, as int) []string {
+	t.Helper()
+	out, err := twinet(t, "exec", "-m", dir, "as"+itoa(as)+"/SFO", "--",
+		"sh", "-c", "ls /sys/class/net")
+	if err != nil {
+		t.Fatalf("listing interfaces: %v\n%s", err, out)
+	}
+	var ifaces []string
+	for _, f := range strings.Fields(out) {
+		if strings.HasPrefix(f, "ext_") {
+			ifaces = append(ifaces, f)
+		}
+	}
+	sort.Strings(ifaces)
+	return ifaces
+}
+
 // impostorAddr picks an address inside a prefix that nothing else is using, so
 // a dummy interface can claim to be that subnet.
 func impostorAddr(prefix string) string {

@@ -359,6 +359,17 @@ reached students, and each motivated a permanent test.
     exists to catch a hijack gave full marks. FRR gives a path it injected no
     peer at all -- `peerId` reads `(unspec)` -- and no route-map can change
     that, because there is no session to name. Either sign is now decisive.
+37. **Transit promised and not delivered.** Everything the customer-transit
+    check asked about was the routes a customer is *offered*, which is a promise
+    rather than a service. Leaving every session established and every route
+    advertised while dropping the customers' packets in the FORWARD chain cost
+    nothing. A packet now leaves the customer's own router, which the submission
+    does not configure, and the destination in a third AS counts what it
+    received. A multi-homed customer that prefers another provider routes
+    nothing this way, so the traffic is put onto the session with one host route
+    on their router -- with a source address of theirs that the internet can
+    route back to, because the link's own numbering is advertised nowhere and
+    the first reverse-path check on the way drops it.
 
 ## Environment findings
 
