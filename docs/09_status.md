@@ -584,6 +584,12 @@ reached students, and each motivated a permanent test.
     and the connections working, and the paths carrying two thirds of what they
     should, at full marks. A datagram is now sent to a port nothing is bound to,
     and the far side's count of those records its arrival.
+62. **A copy the switch's own tables knew nothing about.** The isolation check
+    reads the flow table, and the kernel will copy a frame for anybody who asks:
+    `tc filter ... action mirred egress mirror dev <other port>` carried ICMP
+    from one VLAN into another with the flow table exactly as it should be, at
+    full marks. Every access port's traffic-control rules are now read too, in
+    both directions.
 
 ## Environment findings
 

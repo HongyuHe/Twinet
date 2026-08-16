@@ -181,6 +181,7 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 	var notFoundBlock struct{ host, prefix string }
 	var tcpBlock struct{ router, src, dst string }
 	var vlanFlow struct{ switchID string }
+	var tcMirror struct{ switchID, from string }
 	var forgedLeak struct{ router, routeMap, prefix string }
 	var custTCP string
 	var reorigin struct{ router, routeMap, prefix string }
@@ -985,6 +986,34 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 					"end")
 				vtysh(t, dir, router, "clear ip bgp "+peer+" out")
 				time.Sleep(20 * time.Second)
+			},
+		},
+		{
+			// A copy the switch's own tables know nothing about.
+			//
+			// The kernel will copy a frame for anybody who asks, and a `tc`
+			// mirror on an access port carries one VLAN's traffic into another
+			// with the flow table exactly as it should be.
+			name:     "one protocol mirrored across VLANs by a traffic-control rule",
+			question: "q1.1",
+			undo: func(t *testing.T) {
+				if tcMirror.switchID == "" {
+					return
+				}
+				_, _ = twinet(t, "exec", "-m", dir, tcMirror.switchID, "--",
+					"tc", "qdisc", "del", "dev", tcMirror.from, "clsact")
+			},
+			apply: func(t *testing.T) {
+				sw, from, to := vlanPortPair(t, dir, as)
+				tcMirror = struct{ switchID, from string }{sw, from}
+				t.Logf("mirroring ICMP from %s to %s on %s", from, to, sw)
+				out, err := twinet(t, "exec", "-m", dir, sw, "--", "sh", "-c",
+					"tc qdisc add dev "+from+" clsact && "+
+						"tc filter add dev "+from+" ingress protocol ip pref 49152 flower "+
+						"ip_proto icmp action mirred egress mirror dev "+to)
+				if err != nil {
+					t.Fatalf("mirroring across VLANs with tc: %v\n%s", err, out)
+				}
 			},
 		},
 		{
