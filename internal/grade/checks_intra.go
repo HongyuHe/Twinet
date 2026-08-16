@@ -1261,11 +1261,27 @@ func checkVLANIsolation(ctx context.Context, env *Env) Result {
 	// the sender -- which it does even when the copy is one-directional and the
 	// reply never comes back, as the reviewer's was.
 	leaks, tested := crossVLANFrames(ctx, env, vlans, hosts, sem)
-	for _, leak := range leaks {
-		record(false, "%s", leak)
-	}
 	for i := 0; i < tested-len(leaks); i++ {
 		record(true, "")
+	}
+	// Isolation is a property of the domain and not a proportion of it. One
+	// frame crossing means the two VLANs are one broadcast domain, however
+	// many pairs behaved; scoring it as a twentieth of the question made a
+	// deduction of three hundredths for two VLANs that were not separate.
+	if crossed := len(leaks); crossed > 0 {
+		for _, r := range results {
+			if !r.ok {
+				leaks = append(leaks, r.detail)
+			}
+		}
+		return Fail("l2.vlan_isolation", Evidence{
+			Expected: "no frame sent in one VLAN reaching another",
+			Observed: fmt.Sprintf("%d of %d ordered pairs across VLANs are one broadcast domain",
+				crossed, tested),
+			Detail:  strings.Join(truncate(leaks, 8), "\n"),
+			Hint:    "an access port belongs to one VLAN; check for anything bridging or mirroring between them",
+			Command: "arping; ip neigh show",
+		})
 	}
 
 	var problems []string
