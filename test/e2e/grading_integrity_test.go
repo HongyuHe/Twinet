@@ -175,6 +175,7 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 	var ecmpTCP struct{ router, from string }
 	var impostorLink struct{ router, iface, moved string }
 	var ixpRewrite struct{ router, routeMap, match, peer string }
+	var rpkiNarrow struct{ router, routeMap, seq string }
 	var ixpDeny struct{ router, peer, routeMap string }
 	var importMapNames []string
 	var roaWithdrawn struct{ router, anchor, prefix string }
@@ -789,6 +790,36 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 					" redistribute static",
 					"end")
 				time.Sleep(20 * time.Second)
+			},
+		},
+		{
+			// A prohibition narrowed until it prohibits one thing.
+			//
+			// FRR requires every match in a clause to hold, so a deny that
+			// matches `rpki invalid` and a prefix list rejects invalid routes
+			// on that list and accepts every other one.
+			name:     "the RPKI deny narrowed to the one prefix the lab announces",
+			question: "q2.6",
+			undo: func(t *testing.T) {
+				if rpkiNarrow.router == "" {
+					return
+				}
+				vtysh(t, dir, rpkiNarrow.router, "configure terminal",
+					"route-map "+rpkiNarrow.routeMap+" deny "+rpkiNarrow.seq,
+					" no match ip address prefix-list TWGRADE-ONLY",
+					"exit",
+					"no ip prefix-list TWGRADE-ONLY seq 5 permit 10.128.0.0/9",
+					"end")
+			},
+			apply: func(t *testing.T) {
+				router, rmap, seq := rpkiDenyClause(t, dir, as)
+				rpkiNarrow = struct{ router, routeMap, seq string }{router, rmap, seq}
+				t.Logf("narrowing %s deny %s on %s to one prefix", rmap, seq, router)
+				vtysh(t, dir, router, "configure terminal",
+					"ip prefix-list TWGRADE-ONLY seq 5 permit 10.128.0.0/9",
+					"route-map "+rmap+" deny "+seq,
+					" match ip address prefix-list TWGRADE-ONLY",
+					"end")
 			},
 		},
 		{
@@ -1511,6 +1542,32 @@ func findNotFoundPrefix(t *testing.T, dir string, as int) string {
 		}
 	}
 	return ""
+}
+
+// rpkiDenyClause finds a route-map clause that denies RPKI-invalid routes, and
+// the router it is on.
+func rpkiDenyClause(t *testing.T, dir string, as int) (router, routeMap, seq string) {
+	t.Helper()
+	for _, r := range routersOf(t, dir, as) {
+		cfg, err := twinet(t, "exec", "-m", dir, r, "--", "vtysh", "-c", "show running-config")
+		if err != nil {
+			continue
+		}
+		lines := strings.Split(cfg, "\n")
+		for i, line := range lines {
+			f := strings.Fields(strings.TrimSpace(line))
+			if len(f) != 4 || f[0] != "route-map" || f[2] != "deny" {
+				continue
+			}
+			for j := i + 1; j < len(lines) && j < i+4; j++ {
+				if strings.Contains(lines[j], "match rpki invalid") {
+					return r, f[1], f[3]
+				}
+			}
+		}
+	}
+	t.Skip("no RPKI deny clause found")
+	return "", "", ""
 }
 
 // ixpInRegionRoute finds a route the exchange relays whose path crosses a

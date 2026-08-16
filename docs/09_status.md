@@ -469,6 +469,17 @@ reached students, and each motivated a permanent test.
     route server belongs to the exchange, and what it advertised is not the
     submission's to edit; its account of the path is what the routes are now
     classified by.
+48. **A prohibition narrowed until it prohibits one thing.** Whether a session
+    rejects invalid origins was decided by finding a deny clause that matches
+    `rpki invalid`. FRR requires every match in a clause to hold, so a second
+    one narrows the first: a deny that matches `rpki invalid` *and* a prefix
+    list rejects invalid routes on that list and accepts every other. Listing
+    the one prefix the lab announces kept full marks, because the check stopped
+    at the words it was looking for and the only announcement it then tested was
+    on the list. A clause carrying any other match no longer counts, and neither
+    does a deny that a permit can be reached before -- route-maps stop at the
+    first clause that matches. A preceding permit is allowed only when it
+    selects on the validation state itself.
 
 ## Environment findings
 
