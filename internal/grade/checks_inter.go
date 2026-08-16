@@ -747,9 +747,15 @@ func checkNoTransit(ctx context.Context, env *Env) Result {
 	// while leaving that customer unreachable from the rest of the internet,
 	// which is the single most consequential thing a transit AS can get wrong.
 	custPrefixes := map[string]string{}
+	var unreadableTables []string
 	for _, r := range env.Routers() {
 		tbl, err := bgpTable(ctx, env, r.Name)
 		if err != nil {
+			// A table that could not be read is a customer's routes that
+			// might be in it. Since what may be exported is now decided by
+			// what was learned from customers, not reading one would turn
+			// missing knowledge into an accusation.
+			unreadableTables = append(unreadableTables, fmt.Sprintf("%s: %v", r.Name, err))
 			continue
 		}
 		for prefix, entries := range tbl.Table() {
@@ -801,18 +807,32 @@ func checkNoTransit(ctx context.Context, env *Env) Result {
 				sawOwn = true
 			}
 			for _, e := range entries {
-				// A route we originate may go anywhere.
+				// A route we originate may go anywhere, and so may a
+				// customer's.
 				if e.Originated() {
 					continue
 				}
-				// Otherwise it came from someone: if it came from a peer or
-				// provider, exporting it here is a leak.
-				src := sourceRelationship(e, env.AS, relOf, relOfASN)
-				if src == model.RelPeer || src == model.RelProvider {
-					leaks = append(leaks, fmt.Sprintf(
-						"%s advertises %s (learned from a %s, path %q) to a %s at %s",
-						name, prefix, src, strings.TrimSpace(e.Path), rel, addr))
+				if _, ours := custPrefixes[prefix]; ours {
+					continue
 				}
+				// Anything else came from a peer or a provider, and exporting
+				// it here is a leak.
+				//
+				// Which it came from is decided by the session it arrived on,
+				// recorded above, and not by the path in the advertisement. A
+				// path on the way out is the submission's to write: prepending
+				// a customer's ASN in front of a peer's route -- `set as-path
+				// prepend 3 3 3 7` -- made a leak read as a customer's route
+				// being passed on, which is exactly what the rule permits, and
+				// the whole question kept its marks.
+				src := sourceRelationship(e, env.AS, relOf, relOfASN)
+				from := "which is neither yours nor a customer's"
+				if src != "" {
+					from = "learned from a " + string(src)
+				}
+				leaks = append(leaks, fmt.Sprintf(
+					"%s advertises %s (%s, sent with path %q) to a %s at %s",
+					name, prefix, from, strings.TrimSpace(e.Path), rel, addr))
 			}
 		}
 		if !sawOwn {
@@ -838,6 +858,13 @@ func checkNoTransit(ctx context.Context, env *Env) Result {
 	// A session that could not be read has not been assessed, and a check that
 	// reports "no leaks" while some of the sessions it is about were never read
 	// is reporting on a question it did not finish asking.
+	if len(unreadableTables) > 0 {
+		sort.Strings(unreadableTables)
+		return Errored("policy.no_transit_for_peers", fmt.Errorf(
+			"%d router table(s) could not be read, and what may be exported is decided by "+
+				"what was learned from customers, so nothing can be concluded: %s",
+			len(unreadableTables), strings.Join(truncate(unreadableTables, 3), "; ")))
+	}
 	if len(unreadable) > 0 {
 		sort.Strings(unreadable)
 		return Errored("policy.no_transit_for_peers", fmt.Errorf(
