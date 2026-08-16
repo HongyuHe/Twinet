@@ -33,6 +33,8 @@ func (l *Loaded) Validate() *Diagnostics {
 	l.validateASes(d, file)
 	l.validatePeerings(d, file)
 	l.validateServices(d, file)
+	l.validateBehaviours(d, file)
+	l.validateEgress(d, file)
 	l.validateResources(d, file)
 	l.validatePlacement(d, file)
 	l.validateAccess(d, file)
@@ -378,6 +380,42 @@ func (l *Loaded) validatePeerings(d *Diagnostics, file string) {
 	}
 }
 
+// validateBehaviours refuses a behaviour that cannot be carried out.
+//
+// `behaviours:` validated and did nothing at all for the whole life of the
+// project: it appeared in the schema, was documented as the replacement for the
+// legacy platform's hijack.sh, and no code read it. The COS-461 RPKI question
+// is built on one, so the exercise had a permanent invalid announcement in
+// place of an event that could be started and stopped.
+func (l *Loaded) validateBehaviours(d *Diagnostics, file string) {
+	root := l.Nodes[file]
+	for _, name := range sortedMapKeys(l.Lab.Behaviours) {
+		b := l.Lab.Behaviours[name]
+		path := "behaviours." + name
+		node := nodeAt(root, path)
+		if _, ok := model.BehaviourFault(b.Kind); !ok {
+			d.AddHint(file, path+".kind", node,
+				fmt.Sprintf("no implementation for behaviour kind %q", b.Kind),
+				"known kinds: "+strings.Join(model.BehaviourKinds(), ", "))
+		}
+		if b.Params["by"] == "" {
+			d.AddHint(file, path+".params", node,
+				"this behaviour does not say which AS performs it",
+				"set params.by to the AS number; a hijack with no hijacker cannot be started")
+		}
+		if b.Victims == nil && b.Prefix == "" {
+			d.Add(file, path, "this behaviour names neither victims nor a prefix", node)
+		}
+		switch b.Start {
+		case "", "manual", "deploy":
+		default:
+			d.AddHint(file, path+".start", node,
+				fmt.Sprintf("unknown start condition %q", b.Start),
+				"`start` may be manual (the default) or deploy")
+		}
+	}
+}
+
 func (l *Loaded) validateServices(d *Diagnostics, file string) {
 	root := l.Nodes[file]
 	known := map[string]bool{
@@ -718,4 +756,26 @@ func (l *Loaded) validateProvisioning(d *Diagnostics, file string, root *yaml.No
 				"known domains: "+known)
 		}
 	}
+}
+
+// validateEgress refuses a block nothing carries out.
+//
+// `egress:` has been in the manifest, the schema and the design document since
+// the first version, documented as the replacement for the legacy platform's
+// blanket nat_setup.sh, with the specific example of a validator fetching real
+// trust anchors. No code has ever read it. A lab that declares it gets exactly
+// the internet access it would have got without it, which is none, and finds
+// out when something inside fails to resolve a name.
+//
+// Refusing is better than ignoring. It costs an author one line and a link to
+// the status ledger; ignoring costs them an afternoon.
+func (l *Loaded) validateEgress(d *Diagnostics, file string) {
+	if len(l.Lab.Egress) == 0 {
+		return
+	}
+	root := l.Nodes[file]
+	d.AddHint(file, "egress", nodeAt(root, "egress"),
+		"outbound access is not implemented, so this block would do nothing",
+		"devices reach only the lab. Remove the block; the design for it is in "+
+			"docs/04 section 5 and it is listed as unimplemented in docs/09")
 }

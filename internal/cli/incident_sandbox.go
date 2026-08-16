@@ -6,10 +6,13 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/HongyuHe/twinet/internal/model"
+	"github.com/HongyuHe/twinet/internal/pki"
 )
 
 // An RCA agent under evaluation runs here: as somebody else, somewhere else.
@@ -31,6 +34,27 @@ type sandbox struct {
 	User     string
 	UID      int
 	GID      int
+	// TLS material the agent presents to the node agents, where the cluster
+	// requires it.
+	TLSCert string
+	TLSKey  string
+	TLSCA   string
+	// Hide is every path the agent must not be able to open: the lab it is
+	// diagnosing, the repository that lab lives in, and any episode record.
+	//
+	// A copy is not isolation. The agent ran as an unprivileged account in a
+	// filtered copy and could still open the original by absolute path, where
+	// the scenario file says in plain YAML which fault was injected on which
+	// device -- and so does the end-to-end test that exercises it. An agent
+	// whose whole strategy is to grep the repository for its brief scored a
+	// perfect 1.00.
+	Hide []string
+
+	// Net is the network the agent gets: the node agents and nothing else.
+	//
+	// Hiding the answer on this machine while leaving a route to the internet
+	// hid nothing, because the scenarios are published in a public repository.
+	Net *agentNetwork
 }
 
 // sandboxUser is the account agents run as. It owns nothing, has no shell, and
@@ -45,7 +69,7 @@ const sandboxUser = "twinet-rca"
 // the student credentials, the roster and the PKI, and none of those are
 // anybody's to read but the operator's. The placement record is copied back in
 // on its own, because without it the agent cannot find the devices.
-func newSandbox(top *model.Topology, manifest, name string) (*sandbox, error) {
+func newSandbox(top *model.Topology, manifest, name string, egress []string) (*sandbox, error) {
 	u, err := ensureSandboxUser(sandboxUser)
 	if err != nil {
 		return nil, err
@@ -59,7 +83,11 @@ func newSandbox(top *model.Topology, manifest, name string) (*sandbox, error) {
 		return nil, fmt.Errorf("gid of %s: %w", u.Username, err)
 	}
 
-	dir, err := os.MkdirTemp("", "twinet-rca-"+sanitiseName(name)+"-")
+	// A neutral name. Putting the scenario's name in the path told the agent
+	// which episode it was in, which is most of the answer for a suite whose
+	// scenarios are named after what they do.
+	_ = name
+	dir, err := os.MkdirTemp("", "twinet-work-")
 	if err != nil {
 		return nil, err
 	}
@@ -89,7 +117,141 @@ func newSandbox(top *model.Topology, manifest, name string) (*sandbox, error) {
 		sb.Remove()
 		return nil, err
 	}
+	sb.Hide = pathsToHide(top, manifest)
+	// A transport identity of its own, where the cluster wants one.
+	//
+	// On a cluster with mutual TLS a bearer token is not enough: every
+	// observation the agent tried came back "certificate required", so the
+	// benchmark could not be run at all -- the failure that looks exactly like
+	// an agent finding nothing. It gets a short-lived client certificate of its
+	// own rather than the controller's, because transport identity is not
+	// authorisation here (the node agents decide what a caller may do from its
+	// token, and the agent's is the read-only, single-lab one) and handing the
+	// controller's private key to something under evaluation is not a thing to
+	// do when issuing another costs nothing.
+	if dir := labPKIDir(top); dir != "" {
+		m, err := pki.IssueDiagnostic(dir, filepath.Join(sb.Dir, "tls"), 6*time.Hour)
+		if err != nil {
+			sb.Remove()
+			return nil, fmt.Errorf("issuing the agent's client certificate: %w", err)
+		}
+		sb.TLSCert, sb.TLSKey, sb.TLSCA = m.CertPath, m.KeyPath, m.CAPath
+		if err := chownTree(filepath.Join(sb.Dir, "tls"), uid, gid); err != nil {
+			sb.Remove()
+			return nil, err
+		}
+	}
+	// A network with the node agents on it and nothing else.
+	//
+	// This is the last of the ways the answer used to be readable. The agent
+	// could not open the scenario file, and could fetch the repository that
+	// contains it from the internet -- so an agent that never looked at a
+	// router scored 1.00. See internal/cli/incident_netns.go.
+	net, err := newAgentNetwork(top, egress)
+	if err != nil {
+		sb.Remove()
+		return nil, err
+	}
+	sb.Net = net
 	return sb, nil
+}
+
+// labPKIDir is the mutual-TLS material for this lab, or "" when the cluster
+// does not use any.
+func labPKIDir(top *model.Topology) string {
+	var dirs []string
+	if top.Lab.Dir != "" {
+		dirs = append(dirs, filepath.Join(top.Lab.Dir, ".twinet", "pki"))
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		dirs = append(dirs, filepath.Join(home, ".twinet", "pki"))
+	}
+	dirs = append(dirs, "/etc/twinet/pki")
+	for _, d := range dirs {
+		// The authority's key is what says this directory can issue; a
+		// directory with only a certificate belongs to somebody else.
+		if _, err := os.Stat(filepath.Join(d, "ca_key.pem")); err == nil {
+			return d
+		}
+	}
+	return ""
+}
+
+// pathsToHide lists the directories an evaluated agent must not be able to
+// read: the lab, whatever repository it lives in, and any episode record.
+//
+// The repository, not only the lab: the scenario files live under the lab, but
+// the end-to-end tests that exercise them name the same faults, and so does the
+// documentation. Hiding the lab and leaving the tree it sits in is the kind of
+// half-measure this whole mechanism exists to stop.
+func pathsToHide(top *model.Topology, manifest string) []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(p string) {
+		if p == "" || p == "/" {
+			return
+		}
+		abs, err := filepath.Abs(p)
+		if err != nil || abs == "/" || seen[abs] {
+			return
+		}
+		if fi, err := os.Stat(abs); err != nil || !fi.IsDir() {
+			return
+		}
+		seen[abs] = true
+		out = append(out, abs)
+	}
+	add(top.Lab.Dir)
+	if fi, err := os.Stat(manifest); err == nil && fi.IsDir() {
+		add(manifest)
+	} else {
+		add(filepath.Dir(manifest))
+	}
+	// The repository the lab lives in, found by walking up to a .git.
+	if dir, err := filepath.Abs(top.Lab.Dir); err == nil {
+		for d := dir; d != "/" && d != "."; d = filepath.Dir(d) {
+			if _, err := os.Stat(filepath.Join(d, ".git")); err == nil {
+				add(d)
+				break
+			}
+		}
+	}
+	if wd, err := os.Getwd(); err == nil {
+		add(filepath.Join(wd, "episodes"))
+	}
+	// Where this machine keeps the cluster's own secrets.
+	//
+	// The node agent's systemd unit carried TWINET_TOKEN in an Environment
+	// line, and a unit is world-readable: an evaluated agent read the cluster
+	// secret out of it, discarded its own read-only credential and could act as
+	// the controller across every lab. The token has been moved to a root-only
+	// file, and these are masked as well -- one mistake in a unit file should
+	// not be the whole of the defence.
+	for _, d := range []string{"/etc/systemd", "/etc/twinet", "/run/systemd/system"} {
+		add(d)
+	}
+	sort.Strings(out)
+	// Only the outermost of any nested pair.
+	//
+	// Masking a parent removes the child's mount point, so mounting the
+	// repository and then the lab inside it failed with "mount point does not
+	// exist" and the agent never started at all -- which the adversarial test
+	// would have read as "it could not reach anything" had it not been made to
+	// insist the agent ran.
+	var outermost []string
+	for _, p := range out {
+		nested := false
+		for _, q := range outermost {
+			if p == q || strings.HasPrefix(p, q+string(filepath.Separator)) {
+				nested = true
+				break
+			}
+		}
+		if !nested {
+			outermost = append(outermost, p)
+		}
+	}
+	return outermost
 }
 
 // copyPublicTree copies everything in a lab directory that is not private
@@ -108,7 +270,10 @@ func copyPublicTree(src, dst string) error {
 			return nil
 		}
 		head := strings.Split(rel, string(filepath.Separator))[0]
-		if head == ".twinet" || head == "episodes" {
+		// incidents/ holds the scenario files, each of which names the fault,
+		// the device and the interface. Copying them into the agent's own
+		// sandbox was handing over the answer with extra steps.
+		if head == ".twinet" || head == "episodes" || head == "incidents" {
 			if d.IsDir() {
 				return filepath.SkipDir
 			}
@@ -125,7 +290,11 @@ func copyPublicTree(src, dst string) error {
 }
 
 func (s *sandbox) Remove() {
-	if s != nil && s.Dir != "" {
+	if s == nil {
+		return
+	}
+	s.Net.Close()
+	if s.Dir != "" {
 		_ = os.RemoveAll(s.Dir)
 	}
 }
@@ -173,26 +342,49 @@ func chownTree(root string, uid, gid int) error {
 	})
 }
 
-func sanitiseName(s string) string {
-	var b strings.Builder
-	for _, r := range s {
-		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
-			b.WriteRune(r)
-		default:
-			b.WriteRune('-')
-		}
-	}
-	return b.String()
-}
-
 // sealLabState makes a lab's private state unreadable to anyone but its owner,
 // so an agent that guesses the path finds a directory it cannot open. It runs
 // every time a ledger is written, because a lab directory created before this
 // existed would otherwise stay open for the rest of its life.
 func sealLabState(top *model.Topology) {
 	dir := filepath.Join(top.Lab.Dir, ".twinet")
-	if fi, err := os.Stat(dir); err == nil && fi.IsDir() {
-		_ = os.Chmod(dir, 0o700)
+	fi, err := os.Stat(dir)
+	if err != nil || !fi.IsDir() {
+		return
 	}
+	_ = os.Chmod(dir, 0o700)
+	// And it belongs to whoever is running twinet, not to root.
+	//
+	// Running one command under sudo -- which evaluating an agent now requires
+	// -- left the ledger and the directory owned by root and readable by nobody
+	// else, so the operator's next ordinary `twinet fault status` in their own
+	// lab directory failed with "permission denied". Locking a user out of
+	// their own lab is not what sealing it is for.
+	if os.Geteuid() != 0 {
+		return
+	}
+	uid, gid := sudoCaller()
+	if uid < 0 {
+		return
+	}
+	// Errors are ignored deliberately: this is a courtesy to the operator, and
+	// a path that cannot be chowned is not a reason to fail the command that
+	// was actually asked for.
+	_ = filepath.Walk(dir, func(p string, _ os.FileInfo, walkErr error) error {
+		if walkErr == nil {
+			_ = os.Chown(p, uid, gid)
+		}
+		return nil
+	})
+}
+
+// sudoCaller is the user who invoked sudo, or -1 when this is not a sudo
+// session.
+func sudoCaller() (uid, gid int) {
+	u, uerr := strconv.Atoi(os.Getenv("SUDO_UID"))
+	g, gerr := strconv.Atoi(os.Getenv("SUDO_GID"))
+	if uerr != nil || gerr != nil || u == 0 {
+		return -1, -1
+	}
+	return u, g
 }

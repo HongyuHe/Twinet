@@ -156,7 +156,14 @@ func saveInjections(top *model.Topology, in []*fault.Injection) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp.Name(), p)
+	if err := os.Rename(tmp.Name(), p); err != nil {
+		return err
+	}
+	// Again, now the file exists: sealing before writing it left a root-owned
+	// ledger inside a directory the operator owns, and their next ordinary
+	// command in their own lab failed with "permission denied".
+	sealLabState(top)
+	return nil
 }
 
 // lockInjections serialises access to the record.

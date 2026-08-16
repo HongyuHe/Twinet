@@ -125,11 +125,34 @@ func (r *Rubric) Validate() error {
 				"question %q: check weights sum to %.3f, not 1.0", q.ID, weight))
 		}
 	}
-	for _, q := range r.Questions {
+	// Dependencies are resolved as the questions are graded, in the order they
+	// are declared, so a question may only depend on one that comes before it.
+	//
+	// A dependency on a later question was accepted and then ignored: when the
+	// dependent question is graded, the one it depends on has no mark yet, and
+	// the rule that a question with an unmet dependency is not graded reads a
+	// missing mark as "met". A rubric could therefore say "isolation is only
+	// worth marks once traffic flows" and grade isolation anyway, awarding the
+	// mark to a network where nothing works at all -- which is the exact
+	// failure `depends_on` exists to prevent. A cycle is the same defect in a
+	// more obvious costume, and is refused by the same rule.
+	position := map[string]int{}
+	for i, q := range r.Questions {
+		position[q.ID] = i
+	}
+	for i, q := range r.Questions {
 		for _, dep := range q.DependsOn {
-			if !seen[dep] {
+			switch {
+			case !seen[dep]:
 				problems = append(problems, fmt.Sprintf(
 					"question %q depends on %q, which is not declared", q.ID, dep))
+			case dep == q.ID:
+				problems = append(problems, fmt.Sprintf(
+					"question %q depends on itself", q.ID))
+			case position[dep] > i:
+				problems = append(problems, fmt.Sprintf(
+					"question %q depends on %q, which is graded after it, so the dependency "+
+						"would never apply; declare %q first", q.ID, dep, dep))
 			}
 		}
 	}
@@ -173,6 +196,10 @@ func Run(ctx context.Context, r *Rubric, env *Env, opts RunOptions) *Report {
 		AS: env.AS, Lab: env.Topology.Name, Rubric: r.Metadata.Name,
 		Manifest: env.Topology.Hash, GradedAt: time.Now().UTC(),
 		MaxTotal: r.MaxTotal(),
+	}
+	rep.RubricNotes = r.Metadata.Notes
+	if lab := env.Topology.Lab; lab != nil {
+		rep.Course, rep.Term = lab.Metadata.Course, lab.Metadata.Term
 	}
 	if opts.ConvergeTimeout == 0 {
 		opts.ConvergeTimeout = 90 * time.Second
@@ -227,9 +254,13 @@ func Run(ctx context.Context, r *Rubric, env *Env, opts RunOptions) *Report {
 		results := runChecks(ctx, q, env, opts)
 
 		var broken []string
+		inapplicable := 0
 		for i := range q.Checks {
-			if results[i].Status == StatusError {
+			switch results[i].Status {
+			case StatusError:
 				broken = append(broken, results[i].Check)
+			case StatusNotApplicable:
+				inapplicable++
 			}
 		}
 		qr.Awarded = awardFor(q, results)
@@ -250,6 +281,18 @@ func Run(ctx context.Context, r *Rubric, env *Env, opts RunOptions) *Report {
 				// an error rather than a zero.
 				qr.Status = StatusError
 			}
+		}
+		// A question none of whose checks could be asked has not been answered.
+		//
+		// Awarding it zero would read as a student mistake, and awarding it
+		// full marks would be a mark for nothing; either way the rubric is
+		// wrong about this AS and a person should say what to do.
+		if len(broken)+inapplicable == len(q.Checks) && inapplicable > 0 {
+			qr.NeedsReview = true
+			rep.NeedsReview = true
+			qr.Status = StatusError
+			qr.Note = fmt.Sprintf("none of the %d check(s) apply to this AS, so the question was "+
+				"not assessed; the rubric does not fit this topology", len(q.Checks))
 		}
 		earned[q.ID] = qr.Awarded
 
@@ -356,7 +399,7 @@ func awardFor(q QuestionSpec, results []Result) float64 {
 		if w == 0 {
 			w = 1
 		}
-		if results[i].Status == StatusError {
+		if results[i].Status == StatusError || results[i].Status == StatusNotApplicable {
 			continue
 		}
 		weightSum += w

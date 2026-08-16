@@ -43,6 +43,11 @@ func init() {
 		Run:      checkNoTransit,
 	})
 	Register(&Check{
+		Name:     "policy.transit_for_customers",
+		Describe: "a customer receives every route this AS selected, which is the transit it pays for",
+		Run:      checkTransitForCustomers,
+	})
+	Register(&Check{
 		Name:     "config.no_forbidden_ospf",
 		Describe: "inter-AS subnets are kept out of OSPF, as the assignment requires",
 		Run:      checkNoForbiddenOSPF,
@@ -139,6 +144,9 @@ func checkEBGPEstablished(ctx context.Context, env *Env) Result {
 	type want struct {
 		router, peerAddr string
 		peerAS           int
+		// Who the neighbour actually is, and what they should see us as.
+		peerDevice string
+		ourAddr    string
 	}
 	var wanted []want
 	for _, r := range env.Routers() {
@@ -149,7 +157,12 @@ func checkEBGPEstablished(ctx context.Context, env *Env) Result {
 			if i.Peer == nil || i.Peer.Addr4 == "" {
 				continue
 			}
-			wanted = append(wanted, want{r.Name, env.PeerAddr(ctx, i), i.Peer.Device.ASN})
+			w := want{router: r.Name, peerAddr: env.PeerAddr(ctx, i), peerAS: i.Peer.Device.ASN}
+			w.peerDevice = i.Peer.Device.ID
+			if i.Addr4 != "" {
+				w.ourAddr = addrOnly(i.Addr4)
+			}
+			wanted = append(wanted, w)
 		}
 	}
 	if len(wanted) == 0 {
@@ -179,6 +192,23 @@ func checkEBGPEstablished(ctx context.Context, env *Env) Result {
 			problems = append(problems, fmt.Sprintf("%s -> AS %d (%s) is %s",
 				w.router, w.peerAS, w.peerAddr, p.State))
 		default:
+			// And the neighbour has to agree.
+			//
+			// This read the session out of the submission's own router: an
+			// address, a state and a remote AS number, all of them things the
+			// submission controls. Taking the real link down, routing the
+			// neighbour's address to a host of one's own and running a
+			// four-message BGP speaker there that claims to be AS 4 produced
+			// "Established, remote AS 4" and full marks for a session with a
+			// system that was never contacted. The neighbour belongs to
+			// somebody else, and asking it is the one thing a submission
+			// cannot arrange.
+			if why := peerAgrees(ctx, env, w.peerDevice, w.ourAddr, env.AS); why != "" {
+				problems = append(problems, fmt.Sprintf(
+					"%s reports a session with AS %d at %s, but %s", w.router, w.peerAS,
+					w.peerAddr, why))
+				continue
+			}
 			up++
 		}
 	}
@@ -197,6 +227,38 @@ func checkEBGPEstablished(ctx context.Context, env *Env) Result {
 	})
 }
 
+// peerAgrees asks the device on the other side of a link whether it has an
+// established session with this AS at the address we think we are using, and
+// says what is wrong if not.
+//
+// An empty answer means agreement. A neighbour that cannot be read is reported
+// as such rather than assumed to agree: the whole point is that this is the
+// half of the evidence the submission does not control.
+func peerAgrees(ctx context.Context, env *Env, peerDevice, ourAddr string, ourAS int) string {
+	if peerDevice == "" || ourAddr == "" {
+		return ""
+	}
+	res, err := env.Probe(ctx, peerDevice, []string{"vtysh", "-c", "show ip bgp summary json"})
+	if err != nil {
+		return fmt.Sprintf("%s could not be asked whether it sees one (%v)", peerDevice, err)
+	}
+	var sum bgpSummaryJSON
+	if jerr := jsonUnmarshalLoose(res.Stdout, &sum); jerr != nil {
+		return fmt.Sprintf("%s's own view could not be read (%v)", peerDevice, jerr)
+	}
+	p, ok := sum.IPv4Unicast.Peers[ourAddr]
+	switch {
+	case !ok:
+		return fmt.Sprintf("%s has no session with %s at all, so the session is with "+
+			"something else answering at that address", peerDevice, ourAddr)
+	case p.RemoteAs != ourAS:
+		return fmt.Sprintf("%s sees %s as AS %d, not AS %d", peerDevice, ourAddr, p.RemoteAs, ourAS)
+	case !strings.EqualFold(p.State, "Established"):
+		return fmt.Sprintf("%s sees that session as %s", peerDevice, p.State)
+	}
+	return ""
+}
+
 func bgpTable(ctx context.Context, env *Env, router string) (bgpRouteJSON, error) {
 	var out bgpRouteJSON
 	err := env.VtyshJSON(ctx, router, "show ip bgp json", &out)
@@ -212,17 +274,59 @@ func checkOwnPrefix(ctx context.Context, env *Env) Result {
 	if len(routers) == 0 {
 		return Errored("bgp.own_prefix_only", fmt.Errorf("AS %d has no routers", env.AS))
 	}
-	tbl, err := bgpTable(ctx, env, routers[0].Name)
-	if err != nil {
-		return Errored("bgp.own_prefix_only", err)
+	// Every router, and what each of them actually sends.
+	//
+	// This read the table of routers[0] alone. A system originating somebody
+	// else's address space on one router and hiding it from the first with an
+	// outbound route-map kept the whole mark: the prefix was in the neighbour's
+	// table and in the originating router's advertisements, and the grader
+	// looked at neither. Which router happens to be first is an accident of the
+	// template's ordering, and no property of a system is a property of one of
+	// its routers.
+	originated := map[string]bool{}
+	for _, r := range routers {
+		tbl, err := bgpTable(ctx, env, r.Name)
+		if err != nil {
+			return Errored("bgp.own_prefix_only", err)
+		}
+		for prefix, entries := range tbl.Table() {
+			for _, e := range entries {
+				if e.Originated() {
+					originated[prefix] = true
+				}
+			}
+		}
 	}
 
-	originated := map[string]bool{}
-	for prefix, entries := range tbl.Table() {
-		for _, e := range entries {
-			// An empty AS path on a locally injected route means we originate it.
-			if strings.TrimSpace(e.Path) == "" {
+	// And what leaves the system, which is what the neighbours see and what the
+	// question is really about. A prefix originated and withheld is a mistake;
+	// a prefix advertised is a claim on somebody's address space.
+	advertised := map[string]string{}
+	for _, sess := range externalSessions(ctx, env) {
+		adv, err := advertisedRoutes(ctx, env, sess.Router, sess.Addr)
+		if err != nil {
+			if errors.Is(err, errNoSuchNeighbour) {
+				continue
+			}
+			return Errored("bgp.own_prefix_only", fmt.Errorf(
+				"%s: what it advertises to %s could not be read, so whether this system "+
+					"announces address space that is not its own cannot be decided: %w",
+				sess.Router, sess.Addr, err))
+		}
+		for prefix, entries := range adv.Table() {
+			for _, e := range entries {
+				// The advertised view carries no peer, so origination is
+				// decided from the tables above; an empty path here still
+				// means the same thing and catches a prefix that only appears
+				// on the way out.
+				if !originated[prefix] && !e.Originated() {
+					continue // somebody else's route, passing through
+				}
 				originated[prefix] = true
+				if prefix != as.Block {
+					advertised[prefix] = fmt.Sprintf("%s advertises it to %s",
+						sess.Router, sess.Addr)
+				}
 			}
 		}
 	}
@@ -230,9 +334,14 @@ func checkOwnPrefix(ctx context.Context, env *Env) Result {
 	hasOwn := originated[as.Block]
 	var extra []string
 	for p := range originated {
-		if p != as.Block {
-			extra = append(extra, p)
+		if p == as.Block {
+			continue
 		}
+		if where, ok := advertised[p]; ok {
+			extra = append(extra, fmt.Sprintf("%s (%s)", p, where))
+			continue
+		}
+		extra = append(extra, p)
 	}
 	sort.Strings(extra)
 
@@ -308,12 +417,8 @@ func checkGaoRexford(ctx context.Context, env *Env) Result {
 		}
 		for prefix, entries := range tbl.Table() {
 			for _, e := range entries {
-				for _, nh := range e.Nexthops {
-					rel, ok := relOf[nh.IP]
-					if !ok {
-						continue
-					}
-					seen[rel] = append(seen[rel], observed{e.LocalPref, prefix, nh.IP, r.Name})
+				if rel, via, ok := learnedFromRelationship(e, relOf); ok {
+					seen[rel] = append(seen[rel], observed{e.LocalPref, prefix, via, r.Name})
 				}
 			}
 		}
@@ -505,10 +610,12 @@ func checkNoTransit(ctx context.Context, env *Env) Result {
 				if !e.IsBest() {
 					continue
 				}
-				for _, nh := range e.Nexthops {
-					if relOf[nh.IP] == model.RelCustomer {
-						custPrefixes[prefix] = fmt.Sprintf("learned from a customer at %s", nh.IP)
-					}
+				// By the session it arrived on, not the next hop it carries:
+				// an inbound route-map can rewrite the second, and a customer
+				// whose routes are invisible here is a customer whose routes
+				// nobody is required to pass on.
+				if rel, via, ok := learnedFromRelationship(e, relOf); ok && rel == model.RelCustomer {
+					custPrefixes[prefix] = fmt.Sprintf("learned from a customer at %s", via)
 				}
 			}
 		}
@@ -547,8 +654,8 @@ func checkNoTransit(ctx context.Context, env *Env) Result {
 				sawOwn = true
 			}
 			for _, e := range entries {
-				// A route we originate has an empty path and may go anywhere.
-				if strings.TrimSpace(e.Path) == "" {
+				// A route we originate may go anywhere.
+				if e.Originated() {
 					continue
 				}
 				// Otherwise it came from someone: if it came from a peer or
@@ -661,8 +768,389 @@ func checkNoTransit(ctx context.Context, env *Env) Result {
 	})
 }
 
-// sourceRelationship infers which neighbour a route was learned from.
+// checkTransitForCustomers verifies the half of Gao-Rexford's export rule that
+// says what a customer is owed: everything.
 //
+// A customer pays for reachability to the whole internet, so every route this
+// AS has selected is meant to reach them -- its own, its other customers', its
+// peers' and its providers'. The no-transit check deliberately skips customer
+// sessions because a customer may receive anything, and nothing then looked at
+// them at all: an AS could deny its providers' routes to every customer, leave
+// them able to reach nobody outside this AS, and still score full marks for
+// business relationships. That is the transit service not being delivered,
+// which is a worse error than leaking, and it was unassessed.
+//
+// The requirement is per session and per route rather than in aggregate,
+// because withholding the internet from one of two customers is not half an
+// error to that customer.
+func checkTransitForCustomers(ctx context.Context, env *Env) Result {
+	const name = "policy.transit_for_customers"
+	var customers []externalSession
+	for _, s := range externalSessions(ctx, env) {
+		if s.Rel == model.RelCustomer {
+			customers = append(customers, s)
+		}
+	}
+	if len(customers) == 0 {
+		// A stub AS sells transit to nobody. The property is not true or
+		// false here, it does not arise, and the question's other checks
+		// carry its marks.
+		return NotApplicable(name, fmt.Sprintf(
+			"AS %d has no customers, so it owes nobody transit", env.AS))
+	}
+
+	var missing []string
+	var silent []string
+	var dropped []string
+	var unreadable []string
+	checked := 0
+	for _, sess := range customers {
+		// What this router selected is what this router has to give. Asking a
+		// different router's table would excuse a session on a router that had
+		// learned nothing, and blame one whose neighbour is simply elsewhere.
+		tbl, err := bgpTable(ctx, env, sess.Router)
+		if err != nil {
+			unreadable = append(unreadable, fmt.Sprintf("%s: %v", sess.Router, err))
+			continue
+		}
+		owed := map[string]string{}
+		for prefix, entries := range tbl.Table() {
+			for _, e := range entries {
+				if !e.IsBest() {
+					continue
+				}
+				// A route this customer taught us is not owed back to them,
+				// and a route already through their AS would be a loop. Both
+				// are correct to withhold, so neither is counted.
+				if sess.ASN != 0 && pathContainsASN(e.Path, sess.ASN) {
+					continue
+				}
+				if learnedFrom(e, sess.Addr) {
+					continue
+				}
+				owed[prefix] = strings.TrimSpace(e.Path)
+			}
+		}
+		adv, err := advertisedRoutes(ctx, env, sess.Router, sess.Addr)
+		if err != nil {
+			if errors.Is(err, errNoSuchNeighbour) {
+				checked++
+				silent = append(silent, fmt.Sprintf(
+					"%s has no BGP session with the customer at %s, so they get no transit at all",
+					sess.Router, sess.Addr))
+				continue
+			}
+			unreadable = append(unreadable, fmt.Sprintf("%s -> %s: %v", sess.Router, sess.Addr, err))
+			continue
+		}
+		checked++
+		sent := adv.Table()
+		var absent []string
+		for prefix := range owed {
+			if _, ok := sent[prefix]; !ok {
+				absent = append(absent, prefix)
+			}
+		}
+		if len(owed) == 0 {
+			// Nothing selected is nothing to pass on, and that is a finding
+			// about the import side rather than the export side.
+			silent = append(silent, fmt.Sprintf(
+				"%s has selected no routes at all, so the customer at %s receives nothing",
+				sess.Router, sess.Addr))
+			continue
+		}
+		if len(absent) > 0 {
+			sort.Strings(absent)
+			missing = append(missing, fmt.Sprintf(
+				"%s withholds %d of %d selected route(s) from the customer at %s: %s",
+				sess.Router, len(absent), len(owed), sess.Addr,
+				strings.Join(truncate(absent, 6), ", ")))
+		}
+
+		// And then the transit itself.
+		//
+		// Everything above is the routes a customer is offered, which is a
+		// promise rather than a service. A reviewer left every session
+		// established and every route advertised and dropped the customers'
+		// packets in the FORWARD chain: the mark did not move, because nothing
+		// had ever asked whether a packet sent by a customer arrives anywhere.
+		// The probe is launched from the customer's own router, which the
+		// submission does not configure, so it genuinely enters this AS over
+		// this session; the destination is in a third AS and counts what it
+		// received, so an answer forged along the way does not read as
+		// delivery.
+		if why, ok := carriesCustomerTraffic(ctx, env, sess, owed); !ok && why != "" {
+			dropped = append(dropped, why)
+		}
+	}
+	if len(unreadable) > 0 {
+		sort.Strings(unreadable)
+		return Errored(name, fmt.Errorf(
+			"%d of %d customer session(s) could not be read, so no verdict covers them: %s",
+			len(unreadable), len(customers), strings.Join(truncate(unreadable, 3), "; ")))
+	}
+	if checked == 0 {
+		return Errored(name, fmt.Errorf("none of the %d customer session(s) could be assessed",
+			len(customers)))
+	}
+	if len(missing) == 0 && len(silent) == 0 && len(dropped) == 0 {
+		return Pass(name, Evidence{Observed: fmt.Sprintf(
+			"every selected route is advertised to all %d customer session(s), and traffic "+
+				"sent from a customer arrives at a destination beyond this AS", checked)})
+	}
+	detail := append(append(append([]string{}, missing...), silent...), dropped...)
+	sort.Strings(detail)
+	// Withholding some of the internet from a customer and withholding all of
+	// it are different sizes of the same error, and the score says so.
+	bad := len(missing) + len(silent) + len(dropped)
+	return Partial(name, ratio(maxInt(checked-bad, 0), checked), Evidence{
+		Expected: "every route this AS selected, advertised to every customer, and their " +
+			"traffic carried",
+		Observed: fmt.Sprintf("%d of %d customer session(s) do not carry the full table "+
+			"or do not forward", bad, checked),
+		Detail: strings.Join(truncate(detail, 6), "\n"),
+		Hint: "a customer buys reachability to the whole internet from you; an export " +
+			"policy towards them should permit everything you have selected, and their " +
+			"packets have to cross you",
+		Command: "show ip bgp neighbors <addr> advertised-routes; ping",
+	})
+}
+
+// carriesCustomerTraffic sends one packet through the AS on a customer's
+// behalf and says whether it arrived.
+//
+// The probe leaves the customer's own router, so it enters this AS over the
+// session being marked rather than by some other route in. The destination is
+// a host in a third AS, which counts the echo requests delivered to it: a
+// submission that answered on the destination's behalf, or rewrote the address
+// on the way, does not move that counter.
+//
+// A "false" with no reason is not a finding: it means the customer's own
+// routing does not point at this AS for anything, which is a fact about the
+// customer and not about the submission.
+func carriesCustomerTraffic(ctx context.Context, env *Env, sess externalSession,
+	owed map[string]string) (string, bool) {
+	if sess.PeerDevice == "" || sess.PeerIface == "" {
+		return "", false
+	}
+	cands := transitTargets(env, sess, owed)
+	for _, cand := range cands {
+		// Does the customer already send this destination our way? Then the
+		// probe needs no help: the traffic is the customer's own.
+		res, err := env.Probe(ctx, sess.PeerDevice, []string{"ip", "route", "get", cand.Addr})
+		if err != nil || res.ExitCode != 0 || !strings.Contains(res.Stdout, " dev "+sess.PeerIface) {
+			continue
+		}
+		return transitProbe(ctx, env, sess, cand, "")
+	}
+	// Nothing is routed this way, which is a fact about the customer -- they
+	// may prefer another provider -- and not an answer about the submission. A
+	// session nobody happens to use is still a session that has to work, so the
+	// traffic is put onto it: one host route on the customer's own router,
+	// pointed at our address on this link, and a source address of theirs that
+	// the rest of the internet has a route back to. Without the second part the
+	// packet carries the link's own numbering, which is advertised nowhere, and
+	// the first router that applies a reverse-path check drops it -- measured,
+	// before this was understood, as a correct AS failing to carry anything.
+	via := sessionAddrOf(ctx, env, sess)
+	src := routableAddrOn(ctx, env, sess)
+	if via == "" || src == "" || len(cands) == 0 {
+		return "", false
+	}
+	cand := cands[0]
+	route := []string{cand.Addr + "/32", "via", via, "dev", sess.PeerIface}
+	if res, err := env.Probe(ctx, sess.PeerDevice,
+		append([]string{"ip", "route", "replace"}, route...)); err != nil || res.ExitCode != 0 {
+		return "", false
+	}
+	defer func() {
+		_, _ = env.Probe(context.WithoutCancel(ctx), sess.PeerDevice,
+			append([]string{"ip", "route", "del"}, route...))
+	}()
+	return transitProbe(ctx, env, sess, cand, src)
+}
+
+// transitProbe sends the packets and reads the destination's own counter.
+func transitProbe(ctx context.Context, env *Env, sess externalSession, cand transitTarget,
+	src string) (string, bool) {
+	before, okB := echoesDeliveredTo(ctx, env, cand.Host)
+	args := []string{"ping", "-c", "2", "-W", "2", "-i", "0.2"}
+	if src != "" {
+		args = append(args, "-I", src)
+	}
+	args = append(args, cand.Addr)
+	ping, err := env.Probe(ctx, sess.PeerDevice, args)
+	arrived := err == nil && ping.ExitCode == 0
+	after, okA := echoesDeliveredTo(ctx, env, cand.Host)
+	if okB && okA && after > before {
+		return "", true
+	}
+	if arrived && (!okB || !okA) {
+		return "", true // the counter could not be read; the reply stands on its own
+	}
+	return fmt.Sprintf(
+		"the customer at %s is offered %s but its traffic does not cross this AS: "+
+			"a packet from %s to %s in AS %d was not delivered",
+		sess.Addr, cand.Prefix, sess.PeerDevice, cand.Addr, cand.ASN), false
+}
+
+// sessionAddrOf finds our own address on this link, as the customer sees it:
+// the neighbour they hold a session with whose remote AS is ours.
+func sessionAddrOf(ctx context.Context, env *Env, sess externalSession) string {
+	res, err := env.Probe(ctx, sess.PeerDevice, []string{"vtysh", "-c", "show ip bgp summary json"})
+	if err != nil || res.ExitCode != 0 {
+		return ""
+	}
+	var doc struct {
+		IPv4Unicast struct {
+			Peers map[string]struct {
+				RemoteAs int `json:"remoteAs"`
+			} `json:"peers"`
+		} `json:"ipv4Unicast"`
+	}
+	if json.Unmarshal([]byte(res.Stdout), &doc) != nil {
+		return ""
+	}
+	var found []string
+	for addr, p := range doc.IPv4Unicast.Peers {
+		if p.RemoteAs == env.AS {
+			found = append(found, addr)
+		}
+	}
+	sort.Strings(found)
+	for _, addr := range found {
+		// The one on this link, which is the only one the host route can use.
+		if r, err := env.Probe(ctx, sess.PeerDevice,
+			[]string{"ip", "route", "get", addr}); err == nil && r.ExitCode == 0 &&
+			strings.Contains(r.Stdout, " dev "+sess.PeerIface) {
+			return addr
+		}
+	}
+	return ""
+}
+
+// routableAddrOn picks an address of the customer's that the rest of the
+// internet has a route back to, which an inter-AS link's own numbering is not.
+func routableAddrOn(ctx context.Context, env *Env, sess externalSession) string {
+	as, ok := env.Topology.ASes[sess.ASN]
+	if !ok || as.Block == "" {
+		return ""
+	}
+	res, err := env.Probe(ctx, sess.PeerDevice,
+		[]string{"ip", "-o", "-4", "addr", "show", "scope", "global"})
+	if err != nil || res.ExitCode != 0 {
+		return ""
+	}
+	best := ""
+	for iface, addrs := range parseIPAddrOutput(res.Stdout) {
+		for _, a := range addrs {
+			if !anyInSubnet([]string{a}, as.Block) {
+				continue
+			}
+			bare := a
+			if j := strings.IndexByte(bare, '/'); j > 0 {
+				bare = bare[:j]
+			}
+			if iface == "lo" {
+				return bare // a loopback is up as long as the router is
+			}
+			if best == "" {
+				best = bare
+			}
+		}
+	}
+	return best
+}
+
+// echoesDeliveredTo reads one host's count of ICMP echo requests delivered to
+// it, which is the kernel's own and cannot be raised by anything on the path.
+func echoesDeliveredTo(ctx context.Context, env *Env, device string) (int, bool) {
+	res, err := env.Probe(ctx, device, []string{"cat", "/proc/net/snmp"})
+	if err != nil || res.ExitCode != 0 {
+		return 0, false
+	}
+	return icmpInEchos(res.Stdout)
+}
+
+// transitTarget is somewhere beyond this AS that a customer has been offered.
+type transitTarget struct {
+	Prefix string
+	ASN    int
+	Addr   string
+	Host   string
+}
+
+// transitTargets lists destinations whose reachability the customer is buying,
+// nearest relationship first, skipping the customer's own address space and
+// anything this AS originates itself -- reaching the provider is not transit.
+func transitTargets(env *Env, sess externalSession, owed map[string]string) []transitTarget {
+	var out []transitTarget
+	for asn, as := range env.Topology.ASes {
+		if asn == env.AS || asn == sess.ASN || as.Block == "" {
+			continue
+		}
+		if _, ok := owed[as.Block]; !ok {
+			continue
+		}
+		for _, d := range as.Devices {
+			if d.Kind != model.KindHost || d.L2Domain != "" {
+				continue
+			}
+			if a := firstAddr(d); a != "" {
+				out = append(out, transitTarget{Prefix: as.Block, ASN: asn, Addr: a, Host: d.ID})
+				break
+			}
+		}
+	}
+	sort.Slice(out, func(a, b int) bool { return out[a].ASN < out[b].ASN })
+	return out
+}
+
+// learnedFrom reports whether a route came from a particular neighbour address.
+func learnedFrom(e bgpRoute, addr string) bool {
+	for _, nh := range e.NextHops() {
+		if nh == addr {
+			return true
+		}
+	}
+	return false
+}
+
+// pathContainsASN reports whether an AS path traverses a given AS.
+func pathContainsASN(path string, asn int) bool {
+	want := strconv.Itoa(asn)
+	for _, f := range strings.Fields(path) {
+		if f == want {
+			return true
+		}
+	}
+	return false
+}
+
+// learnedFromRelationship says which neighbour a path came from, preferring
+// the evidence the submission cannot alter.
+//
+// A path's peerId is the address of the session it arrived on. An inbound
+// route-map can set the next hop to anything it likes -- rewriting a
+// customer's to an unrelated on-link address made that customer's routes
+// invisible to this check, so ranking them below a peer's cost nothing -- but
+// no policy can change which session a route came in on.
+func learnedFromRelationship(e bgpRoute, relOf map[string]model.Relationship) (
+	model.Relationship, string, bool) {
+	if e.PeerID != "" {
+		if rel, ok := relOf[e.PeerID]; ok {
+			return rel, e.PeerID, true
+		}
+	}
+	for _, nh := range e.NextHops() {
+		if rel, ok := relOf[nh]; ok {
+			return rel, nh, true
+		}
+	}
+	return "", "", false
+}
+
+// sourceRelationship infers which neighbour a route was learned from.//
 // Both spellings of the next hop are read. FRR uses a "nexthops" array for
 // `show ip bgp` and a scalar "nextHop" for advertised routes, and this check
 // runs over the latter -- so reading only the array meant every advertisement
@@ -761,17 +1249,61 @@ func checkNoForbiddenOSPF(ctx context.Context, env *Env) Result {
 			}
 		}
 	}
+
+	// And what OSPF is actually carrying, which is the question.
+	//
+	// Reading `network` statements finds one way of putting a prefix into OSPF
+	// and misses every other. `redistribute connected` under `router ospf` puts
+	// every inter-AS subnet into the interior with no network statement
+	// anywhere, and this check passed a system doing exactly that while the
+	// peering networks appeared as OSPF routes on every other router of the
+	// system. The configuration is the intent; the routing table is the fact.
+	for _, r := range env.Routers() {
+		var routes map[string][]struct {
+			Protocol string `json:"protocol"`
+			Selected bool   `json:"selected"`
+			Nexthops []struct {
+				InterfaceName string `json:"interfaceName"`
+			} `json:"nexthops"`
+		}
+		if err := env.VtyshJSON(ctx, r.Name, "show ip route ospf json", &routes); err != nil {
+			// An empty table is not an error, and FRR prints nothing at all
+			// for it; anything else is.
+			if s, verr := env.Vtysh(ctx, r.Name, "show ip route ospf json"); verr == nil &&
+				strings.TrimSpace(s) == "" {
+				continue
+			}
+			return Errored("config.no_forbidden_ospf", fmt.Errorf(
+				"%s: its OSPF routes could not be read, so whether the inter-AS ranges are "+
+					"in its interior routing cannot be decided: %w", r.Name, err))
+		}
+		for prefix, entries := range routes {
+			if !external.matches(prefix) {
+				continue
+			}
+			for _, e := range entries {
+				if e.Protocol != "ospf" {
+					continue
+				}
+				found = append(found, fmt.Sprintf(
+					"%s carries %s as an OSPF route", r.Name, prefix))
+				break
+			}
+		}
+	}
+
 	if len(found) == 0 {
 		return Pass("config.no_forbidden_ospf", Evidence{
-			Observed: "no inter-AS subnets are advertised in OSPF"})
+			Observed: "no inter-AS subnet is advertised in OSPF or carried as an OSPF route"})
 	}
 	sort.Strings(found)
 	return Fail("config.no_forbidden_ospf", Evidence{
-		Expected: "no inter-AS network under router ospf",
-		Observed: fmt.Sprintf("%d such statement(s)", len(found)),
-		Detail:   strings.Join(found, "\n"),
-		Hint:     "external subnets belong to BGP, not to your interior routing protocol",
-		Command:  "show running-config",
+		Expected: "no inter-AS network in the interior routing protocol, however it got there",
+		Observed: fmt.Sprintf("%d finding(s)", len(found)),
+		Detail:   strings.Join(truncate(found, 8), "\n"),
+		Hint: "external subnets belong to BGP, not to your interior routing protocol; " +
+			"`redistribute connected` puts them there as surely as a network statement does",
+		Command: "show running-config; show ip route ospf",
 	})
 }
 
@@ -886,6 +1418,13 @@ type externalSession struct {
 	Addr   string
 	Rel    model.Relationship
 	ASN    int
+	// PeerDevice is the device on the far side, which is not the submission's
+	// to configure and is therefore where unforgeable evidence comes from.
+	PeerDevice string
+	// PeerIface is the interface the far side terminates this link on, which
+	// is how a probe launched from over there is known to have entered this AS
+	// through this session and not by some other way round.
+	PeerIface string
 }
 
 // externalSessions lists every session with a neighbour outside this AS,
@@ -915,14 +1454,24 @@ func externalSessions(ctx context.Context, env *Env) []externalSession {
 				if addr == "" {
 					continue
 				}
-				out = append(out, externalSession{r.Name, addr, model.RelPeer, asn})
+				rsDev := ""
+				if rs, ok := routeServerDevice(env.Topology, asn); ok {
+					rsDev = rs.ID
+				}
+				out = append(out, externalSession{Router: r.Name, Addr: addr,
+					Rel: model.RelPeer, ASN: asn, PeerDevice: rsDev})
 			case i.Link.InterAS && i.Peer != nil && i.Peer.Addr4 != "":
 				rel := i.Link.PeerRelationship(i)
-				asn := 0
+				asn, dev := 0, ""
 				if i.Peer.Device != nil {
-					asn = i.Peer.Device.ASN
+					asn, dev = i.Peer.Device.ASN, i.Peer.Device.ID
 				}
-				out = append(out, externalSession{r.Name, env.PeerAddr(ctx, i), rel, asn})
+				peerIface := ""
+				if i.Peer != nil {
+					peerIface = i.Peer.Name
+				}
+				out = append(out, externalSession{Router: r.Name, Addr: env.PeerAddr(ctx, i),
+					Rel: rel, ASN: asn, PeerDevice: dev, PeerIface: peerIface})
 			}
 		}
 	}

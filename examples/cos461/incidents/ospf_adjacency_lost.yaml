@@ -14,9 +14,15 @@ brief: >
 
 seed: 461
 
+# Where the fault goes is drawn when the episode runs, not written here.
+#
+# This file is published. A scenario that named the device and the interface
+# would be the answer, and an agent that had read the repository -- or been
+# trained on it -- would score full marks without looking at the network. The
+# run picks one internal link inside AS 3 and records the seed it used, so the
+# episode is reproducible afterwards without being predictable beforehand.
 faults:
   - type: ospf_neighbor_missing
-    target:
-      as: 3
-      device: NYC
-      iface: port_PHY
+    select:
+      kind: internal_link
+      as: [3]

@@ -2,9 +2,12 @@ package grade
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
-	"strconv"
 	"strings"
+
+	"github.com/HongyuHe/twinet/internal/model"
+	"github.com/HongyuHe/twinet/internal/svc"
 )
 
 func init() {
@@ -60,21 +63,18 @@ func checkROAPublished(ctx context.Context, env *Env) Result {
 		}
 	}
 
-	var (
-		table string
-		asked string
-		err   error
-	)
-	for _, r := range env.Routers() {
-		table, err = env.Vtysh(ctx, r.Name, "show rpki prefix-table")
-		if err == nil {
-			asked = r.Name
-			break
-		}
-	}
-	if asked == "" {
-		return Errored("rpki.roa_published",
-			fmt.Errorf("no router of AS %d could be asked for the validator's table: %w", env.AS, err))
+	// Asked of the trust anchor, not of the student's own router.
+	//
+	// This read `show rpki prefix-table` from a router of the system being
+	// marked. A student has root in their own containers: running a four-line
+	// RTR server on one of them and pointing FRR at it produced a prefix table
+	// containing whatever they liked, including a ROA for their own prefix
+	// that the trust anchor had never issued -- and the question about having
+	// published one was answered by the publication being faked. Publication
+	// is a fact about the anchor, and the anchor is not theirs.
+	published, err := publishedROAs(ctx, env)
+	if err != nil {
+		return Errored("rpki.roa_published", err)
 	}
 
 	want := strings.SplitN(as.Block, "/", 2)
@@ -84,33 +84,29 @@ func checkROAPublished(ctx context.Context, env *Env) Result {
 		length = want[1]
 	}
 
-	// Lines read: PREFIX LENGTH - MAXLEN ORIGIN-AS
 	var mine, others []string
-	for _, line := range strings.Split(table, "\n") {
-		f := strings.Fields(line)
-		if len(f) < 4 {
+	for _, v := range published {
+		p, l, ok := strings.Cut(v.Prefix, "/")
+		if !ok || p != network {
 			continue
 		}
-		if f[0] != network {
+		if length != "" && l != length {
 			continue
 		}
-		origin := f[len(f)-1]
-		if length != "" && f[1] != length {
+		line := fmt.Sprintf("%s maxlen %d origin AS%d", v.Prefix, v.MaxLength, v.ASN)
+		if v.ASN == env.AS {
+			mine = append(mine, line)
 			continue
 		}
-		if n, cerr := strconv.Atoi(origin); cerr == nil && n == env.AS {
-			mine = append(mine, strings.TrimSpace(line))
-			continue
-		}
-		others = append(others, strings.TrimSpace(line))
+		others = append(others, line)
 	}
 
 	if len(mine) > 0 {
 		return Pass("rpki.roa_published", Evidence{
-			Observed: fmt.Sprintf("the validator holds a ROA authorising AS %d to originate %s",
+			Observed: fmt.Sprintf("the trust anchor holds a ROA authorising AS %d to originate %s",
 				env.AS, as.Block),
 			Detail:  strings.Join(mine, "\n"),
-			Command: "show rpki prefix-table",
+			Command: "GET /roas on the publication service",
 		})
 	}
 	if len(others) > 0 {
@@ -130,4 +126,54 @@ func checkROAPublished(ctx context.Context, env *Env) Result {
 			"not-found to everybody, and a network that rejects not-found cannot reach you",
 		Command: "show rpki prefix-table",
 	})
+}
+
+// publishedVRP is one authorisation the trust anchor holds.
+type publishedVRP struct {
+	Prefix    string `json:"prefix"`
+	MaxLength int    `json:"maxLength"`
+	ASN       int    `json:"asn"`
+}
+
+// publishedROAs asks the lab's trust anchor what it has published.
+//
+// The request is made from inside the anchor's own container, so it cannot be
+// intercepted by anything a student controls: they have root in their routers
+// and hosts, and can point their validator session wherever they like, but the
+// publication service is the platform's.
+func publishedROAs(ctx context.Context, env *Env) ([]publishedVRP, error) {
+	dev := rpkiServiceDevice(env)
+	if dev == "" {
+		return nil, fmt.Errorf("this lab has no RPKI publication service, so whether a ROA " +
+			"was published cannot be established")
+	}
+	res, err := env.Probe(ctx, dev, []string{"sh", "-c",
+		fmt.Sprintf("wget -qO- http://127.0.0.1%s/roas", svc.PublishListen)})
+	if err != nil {
+		return nil, fmt.Errorf("asking %s what it has published: %w", dev, err)
+	}
+	body := strings.TrimSpace(res.Stdout)
+	if body == "" {
+		return nil, fmt.Errorf("%s returned nothing when asked what it has published", dev)
+	}
+	var out []publishedVRP
+	if jerr := json.Unmarshal([]byte(body), &out); jerr != nil {
+		return nil, fmt.Errorf("reading what %s has published: %w", dev, jerr)
+	}
+	return out, nil
+}
+
+// rpkiServiceDevice finds the trust anchor in the lab.
+func rpkiServiceDevice(env *Env) string {
+	for _, s := range env.Topology.Services {
+		if strings.Contains(strings.ToLower(s.Kind), "rpki") && s.Device != nil {
+			return s.Device.ID
+		}
+	}
+	for id, d := range env.Topology.Devices {
+		if d.Kind == model.KindService && strings.Contains(strings.ToLower(id), "rpki") {
+			return id
+		}
+	}
+	return ""
 }

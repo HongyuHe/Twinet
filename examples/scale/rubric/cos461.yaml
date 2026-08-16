@@ -90,9 +90,11 @@ questions:
     converge: true
     checks:
       - check: policy.gao_rexford
-        weight: 0.5
+        weight: 0.4
       - check: policy.no_transit_for_peers
-        weight: 0.5
+        weight: 0.3
+      - check: policy.transit_for_customers
+        weight: 0.3
 
   - id: q2.4
     title: Peering through an internet exchange

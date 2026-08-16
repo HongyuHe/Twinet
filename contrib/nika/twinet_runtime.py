@@ -28,6 +28,22 @@ from typing import Any, Iterable
 from nika.runtime.base import LabRuntime
 
 
+class TwinetCommandError(RuntimeError):
+    """A command ran inside a device and failed.
+
+    Separate from TwinetError so a caller that genuinely wants to tolerate a
+    non-zero exit -- "is this process running?" is a question whose answer is
+    sometimes no -- can catch this and nothing else.
+    """
+
+    def __init__(self, node: str, cmd: str, code: int, output: str):
+        super().__init__(f"{node}: {cmd!r} exited {code}: {output.strip()[:300]}")
+        self.node = node
+        self.cmd = cmd
+        self.code = code
+        self.output = output
+
+
 class TwinetError(RuntimeError):
     """The controller could not be run, or refused the request.
 
@@ -105,6 +121,47 @@ class TwinetRuntime(LabRuntime):
 
     # ---- the protocol NIKA depends on ----------------------------------
 
+    # What this backend can actually serve.
+    #
+    # "dhcp" is deliberately absent even though Twinet has a DHCP server and
+    # five DHCP faults of its own. NIKA's inherited DHCP operations drive
+    # dhclient, /etc/dhcp/dhcpd.conf and systemd, none of which exist in these
+    # images; the calls fail, the failures were swallowed, and NIKA's own
+    # verifier reads "absent" -- which is what a missing dhcpd.conf produces --
+    # as proof that the edit it never made had worked. Declaring a capability
+    # is a promise about behaviour, not about vocabulary.
+    #
+    # The base class declares a default set that includes "k8s", and its
+    # SR Linux operations are inherited as ordinary methods. Twinet emulates
+    # neither: a Kubernetes fault would be accepted and do nothing, and an
+    # srl_* call would send Nokia CLI syntax to FRR, which answers with an
+    # error that looks like the network being broken. Declaring the truth is
+    # what lets NIKA refuse a scenario this backend cannot serve instead of
+    # running it and scoring the result.
+    CAPABILITIES = frozenset(
+        {
+            "exec",
+            "node_status",
+            "interface",
+            "ip",
+            "route",
+            "dns",
+            "service",
+            "tc",
+            "nft",
+            "iptables",
+            "process",
+            "pidfile",
+            "file",
+            "frr",
+            "traffic",
+        }
+    )
+
+    @property
+    def capabilities(self) -> frozenset[str]:
+        return self.CAPABILITIES
+
     @property
     def backend(self) -> str:
         return self.dialect or "twinet"
@@ -135,7 +192,17 @@ class TwinetRuntime(LabRuntime):
         )
         if res.get("error"):
             raise TwinetError(f"{node}: {res['error']}")
-        return (res.get("stdout") or "") + (res.get("stderr") or "")
+        out = (res.get("stdout") or "") + (res.get("stderr") or "")
+        # A command that failed is not a command that printed nothing.
+        #
+        # The exit status was discarded, so "sh: dhclient: not found" came back
+        # as ordinary output and every caller that looked for a symptom in the
+        # text carried on as though the command had run. NIKA's semantic layer
+        # treats several of those texts as evidence.
+        code = res.get("exit_code")
+        if isinstance(code, int) and code != 0:
+            raise TwinetCommandError(node, cmd, code, out)
+        return out
 
     def exec_cmd(self, host_name: str, command: str, timeout: float = 10) -> str:
         """Alias for :meth:`exec`, for the adapter that expects this name."""
@@ -341,3 +408,46 @@ def _target_args(target: dict[str, Any]) -> list[str]:
         else:
             args += ["--param", f"{key}={value}"]
     return args
+
+
+def _unsupported(name: str, what: str = "an operation this backend does not implement"):
+    """Refuse an operation this backend cannot serve, by name.
+
+    The base class implements the Nokia SR Linux operations by sending SR Linux
+    CLI syntax over exec. Against an FRR router that is not a no-op: the command
+    fails, and the failure is indistinguishable from the network being broken --
+    so a scenario built on one would be scored as though the agent's diagnosis
+    were the problem. Twinet's devices run FRR, so the honest answer is to say
+    so at the point of call.
+    """
+
+    def refuse(self, *_args, **_kwargs):
+        raise TwinetError(
+            f"{name}() is {what}, which this backend cannot serve. "
+            f"It declares the capabilities it has "
+            f"({', '.join(sorted(TwinetRuntime.CAPABILITIES))}); "
+            "run this scenario on a backend that has the rest."
+        )
+
+    refuse.__name__ = name
+    return refuse
+
+
+# Bound after the class body so the list is derived from the base class rather
+# than written out again and left to drift.
+for _name in dir(LabRuntime):
+    if _name.startswith("srl_") and _name not in TwinetRuntime.__dict__:
+        setattr(TwinetRuntime, _name, _unsupported(_name, "a Nokia SR Linux operation"))
+    elif _name.startswith("dhcp_") or _name in ("renew_dhcp_leases", "list_dhcp_client_nodes"):
+        if _name not in TwinetRuntime.__dict__:
+            setattr(
+                TwinetRuntime,
+                _name,
+                _unsupported(
+                    _name,
+                    "an ISC dhclient/dhcpd operation, and Twinet's DHCP server is its own "
+                    "(see `twinet fault list` for dhcp_service_down, dhcp_missing_subnet, "
+                    "dhcp_spoofed_gateway, dhcp_spoofed_dns and dhcp_spoofed_subnet)",
+                ),
+            )
+del _name

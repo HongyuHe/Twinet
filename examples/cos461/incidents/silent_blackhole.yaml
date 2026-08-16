@@ -14,13 +14,15 @@ brief: >
 
 seed: 461
 
+# Drawn at run time; see ospf_adjacency_lost.yaml for why this file must not
+# say which router and which host.
 faults:
   - type: host_static_blackhole
-    target:
-      as: 3
-      device: SFO
+    select:
+      kind: router
+      as: [3]
       prefix: 100.64.0.0/10
   - type: icmp_acl_block
-    target:
-      as: 3
-      device: CHI_host
+    select:
+      kind: host
+      as: [3]

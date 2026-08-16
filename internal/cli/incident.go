@@ -49,9 +49,15 @@ type ScenarioMeta struct {
 }
 
 // FaultSpec is one fault to inject.
+//
+// Either the scenario says where the fault goes, or it says what kind of place
+// it goes and the run draws one. The second is what a published scenario should
+// do: a file that names the device and the interface hands the answer to
+// anybody who has read the repository, and there is no way to un-publish it.
 type FaultSpec struct {
 	Type   string       `yaml:"type" json:"type"`
-	Target fault.Target `yaml:"target" json:"target"`
+	Target fault.Target `yaml:"target,omitempty" json:"target,omitempty"`
+	Select *Selector    `yaml:"select,omitempty" json:"select,omitempty"`
 }
 
 // Episode is the durable record of one incident run.
@@ -73,6 +79,16 @@ type Episode struct {
 	Score     *Score     `json:"score,omitempty"`
 	AgentErr  string     `json:"agent_error,omitempty"`
 	AgentLog  string     `json:"agent_log,omitempty"`
+	// SelectionSeed is what the run drew its targets with, and the only record
+	// of where a scenario that does not name its own answer put the fault.
+	SelectionSeed int64 `json:"selection_seed,omitempty"`
+	// AgentEgress is every address and port the agent could reach while it was
+	// being scored.
+	//
+	// A score earned with a route to the internet is a different measurement
+	// from one earned without, because the scenarios are published: it belongs
+	// beside the number rather than in the operator's memory.
+	AgentEgress []string `json:"agent_egress,omitempty"`
 }
 
 func newIncidentCmd(opts *Options) *cobra.Command {
@@ -143,14 +159,17 @@ func loadScenario(path string) (*Scenario, error) {
 
 func newIncidentRunCmd(opts *Options) *cobra.Command {
 	var (
-		scenarioPath string
-		outDir       string
-		token        string
-		hold         time.Duration
-		keep         bool
-		showTruth    bool
-		agentCmd     string
-		agentTimeout time.Duration
+		scenarioPath     string
+		outDir           string
+		token            string
+		hold             time.Duration
+		keep             bool
+		showTruth        bool
+		agentCmd         string
+		agentTimeout     time.Duration
+		agentEgressAllow []string
+		selectionSeed    int64
+		allowPinned      bool
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -158,6 +177,16 @@ func newIncidentRunCmd(opts *Options) *cobra.Command {
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if scenarioPath == "" {
 				return fmt.Errorf("pass --scenario")
+			}
+			// Before anything is injected.
+			//
+			// The agent has to run somewhere it cannot read the scenario, and
+			// finding out after the faults are live means a lab left broken by
+			// a run that could never have measured anything.
+			if agentCmd != "" {
+				if err := canEvaluateAgents(); err != nil {
+					return err
+				}
 			}
 			sc, err := loadScenario(scenarioPath)
 			if err != nil {
@@ -173,9 +202,37 @@ func newIncidentRunCmd(opts *Options) *cobra.Command {
 			}
 			env.Seed = sc.Seed
 
+			// Where the faults go, if the scenario left that to the run.
+			//
+			// A scenario that names its device and its interface is the answer
+			// written down; published, it measures whether an agent has read
+			// the repository. So the draw happens here, from a seed nobody
+			// could have known in advance, and the choice is recorded in the
+			// episode rather than in the file.
+			drawSeed := selectionSeed
+			if drawSeed == 0 {
+				drawSeed = time.Now().UnixNano()
+			}
+			candidates, err := drawTargets(top, sc.Faults, drawSeed)
+			if err != nil {
+				return err
+			}
+			var drawn []string
+			if pinned := pinnedTargets(sc.Faults); len(pinned) > 0 && agentCmd != "" && !allowPinned {
+				return fmt.Errorf("this scenario names its own answer:\n  %s\n"+
+					"An agent scored against it may have read the file rather than the "+
+					"network -- every scenario shipped with Twinet is on the internet, and "+
+					"so is anything else in a repository. Give the faults a `select:` so the "+
+					"run draws the target, or pass --allow-pinned-target if this scenario is "+
+					"yours and has never been published", strings.Join(pinned, "\n  "))
+			}
+
 			ep := &Episode{
 				Scenario: sc.Metadata.Name, Lab: top.Name, Topology: top.Hash,
 				Seed: sc.Seed, StartedAt: time.Now().UTC(), Brief: sc.Brief,
+			}
+			if len(pinnedTargets(sc.Faults)) < len(sc.Faults) {
+				ep.SelectionSeed = drawSeed
 			}
 			start := time.Now()
 
@@ -242,8 +299,33 @@ func newIncidentRunCmd(opts *Options) *cobra.Command {
 			}
 
 			var injected []*fault.Injection
-			for _, fs := range sc.Faults {
-				inj, err := fault.Inject(cmd.Context(), env, fs.Type, fs.Target)
+			for i, fs := range sc.Faults {
+				// The draw, and then its fallbacks.
+				//
+				// A candidate that cannot host this fault -- a link already
+				// down, a symptom already present -- is refused before
+				// anything is changed, so the next one is tried. Only a
+				// failure that may have touched the device stops the run.
+				var inj *fault.Injection
+				var err error
+				attempts := candidates[i]
+				if len(attempts) > 5 {
+					attempts = attempts[:5]
+				}
+				for n, t := range attempts {
+					inj, err = fault.Inject(cmd.Context(), env, fs.Type, t)
+					if err == nil {
+						if sc.Faults[i].Select != nil {
+							drawn = append(drawn, describeDraw(fs.Type, t, len(candidates[i])))
+						}
+						break
+					}
+					if inj != nil || n == len(attempts)-1 {
+						break
+					}
+					fmt.Fprintf(cmd.ErrOrStderr(),
+						"a drawn target could not host %s (%v); drawing another\n", fs.Type, err)
+				}
 				if err != nil {
 					// A failed injection that still left something live hands
 					// it back. Record it before giving up, or the lab is
@@ -302,13 +384,25 @@ func newIncidentRunCmd(opts *Options) *cobra.Command {
 					// hundred episodes against a broken agent saw a hundred
 					// clean runs and no marks. It is an error now.
 					err := func() error {
-						sb, serr := newSandbox(top, opts.Manifest, sc.Metadata.Name)
+						sb, serr := newSandbox(top, opts.Manifest, sc.Metadata.Name, agentEgressAllow)
 						if serr != nil {
 							return fmt.Errorf("preparing the agent sandbox: %w", serr)
 						}
 						defer sb.Remove()
+						// The cluster secret, resolved the same way every
+						// other command resolves it. Passing the flag through
+						// raw derived the agent's credential from an empty
+						// string whenever the token came from the environment,
+						// so every observation it tried came back 401 and the
+						// episode scored an agent that had been prevented from
+						// looking at anything.
+						secret, terr := tokenFor(token)
+						if terr != nil {
+							return fmt.Errorf("deriving the agent's credential: %w", terr)
+						}
+						ep.AgentEgress = sb.Net.Allowed
 						d, stderr, aerr := runAgent(cmd.Context(), agentCmd, ep,
-							sb, token, agentTimeout)
+							sb, secret, agentTimeout)
 						if strings.TrimSpace(stderr) != "" {
 							ep.AgentLog = stderr
 						}
@@ -388,6 +482,12 @@ func newIncidentRunCmd(opts *Options) *cobra.Command {
 					fmt.Fprintf(cmd.OutOrStdout(), "  ground truth: %s on %s (%s)\n",
 						strings.Join(t.Names, ","), strings.Join(t.FaultyDevices, ","), t.Category)
 				}
+				// Only here. Printing what was drawn is printing the answer,
+				// and a run whose console output names the device is one
+				// screenshot away from being the file it replaced.
+				for _, d := range drawn {
+					fmt.Fprintf(cmd.OutOrStdout(), "  drawn with seed %d: %s\n", drawSeed, d)
+				}
 			}
 			if ep.Err != "" {
 				return fmt.Errorf("the incident did not complete cleanly: %s", ep.Err)
@@ -404,6 +504,16 @@ func newIncidentRunCmd(opts *Options) *cobra.Command {
 	cmd.Flags().StringVar(&agentCmd, "agent", "",
 		"command to run as the agent under evaluation; it is given the brief on stdin "+
 			"and must print a diagnosis as JSON")
+	cmd.Flags().Int64Var(&selectionSeed, "seed", 0,
+		"draw this scenario's targets with this seed instead of a fresh one, to replay an "+
+			"episode exactly; the seed used is recorded in the episode either way")
+	cmd.Flags().BoolVar(&allowPinned, "allow-pinned-target", false,
+		"score an agent against a scenario that names its own device and interface; only "+
+			"sound for a scenario that has never been published")
+	cmd.Flags().StringSliceVar(&agentEgressAllow, "allow-egress", nil,
+		"host:port an evaluated agent may reach beyond the node agents, repeatable; "+
+			"a model endpoint is the usual reason. Recorded in the episode, because a "+
+			"score means something different when the agent could reach the internet")
 	cmd.Flags().DurationVar(&agentTimeout, "agent-timeout", 10*time.Minute,
 		"how long the agent may take")
 	return cmd
@@ -422,7 +532,7 @@ func newIncidentCredentialCmd(opts *Options) *cobra.Command {
 		Long: "An agent given TWINET_TOKEN can read every lab on the cluster, run anything " +
 			"in any container, take a grading hold, and destroy the evidence. This mints a " +
 			"credential that can look at one lab and change nothing: `twinet exec` and " +
-			"`twinet status` work with it, everything else is refused by the node agents.\n\n" +
+			"`twinet node status` work with it, everything else is refused by the node agents.\n\n" +
 			"`twinet incident run --agent` uses one automatically; this is for harnesses that " +
 			"drive the agent themselves.",
 		Args: cobra.NoArgs,

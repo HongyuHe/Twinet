@@ -40,6 +40,14 @@ const (
 	// StatusError means the check itself could not run, which is the grader's
 	// problem and not the student's. It never silently costs marks.
 	StatusError Status = "error"
+	// StatusNotApplicable means the question this check asks cannot arise in
+	// this AS: a stub with no customers cannot withhold transit from one.
+	//
+	// It is distinct from StatusError, which is the grader failing and calls
+	// for a human, and from StatusPass, which would be a mark awarded for a
+	// property nobody established. The check is left out of the weighting, so
+	// the question's marks rest on the checks that could be asked.
+	StatusNotApplicable Status = "not_applicable"
 )
 
 // Evidence is machine-readable proof of what was observed.
@@ -103,6 +111,17 @@ func Errored(check string, err error) Result {
 	return Result{Check: check, Status: StatusError, Score: 0, Err: err.Error()}
 }
 
+// NotApplicable builds a result recording that the property this check is about
+// cannot arise here, so no verdict about it is possible or needed.
+//
+// The reason is carried as evidence rather than as an error, because it is a
+// fact about the topology and not a malfunction: a student reading their report
+// should see why the check was set aside, and a marker should not be summoned.
+func NotApplicable(check, why string) Result {
+	return Result{Check: check, Status: StatusNotApplicable, Score: 0,
+		Evidence: Evidence{Observed: why}}
+}
+
 // QuestionResult aggregates the checks belonging to one assignment question.
 type QuestionResult struct {
 	ID      string   `json:"id"`
@@ -120,18 +139,34 @@ type QuestionResult struct {
 
 // Report is one student's complete result.
 type Report struct {
-	Submission string           `json:"submission"`
-	AS         int              `json:"as"`
-	Lab        string           `json:"lab"`
-	Rubric     string           `json:"rubric"`
-	Manifest   string           `json:"manifest_hash"`
-	GradedAt   time.Time        `json:"graded_at"`
-	Duration   string           `json:"duration"`
-	Total      float64          `json:"total"`
-	MaxTotal   float64          `json:"max_total"`
-	Questions  []QuestionResult `json:"questions"`
-	Warnings   []string         `json:"warnings,omitempty"`
-	Err        string           `json:"error,omitempty"`
+	Submission string `json:"submission"`
+	AS         int    `json:"as"`
+	Lab        string `json:"lab"`
+	// Course and Term identify the class a mark belongs to.
+	//
+	// The manifest has carried them since the first version and nothing read
+	// them, so two runs of the same lab in successive terms produced reports
+	// that were indistinguishable -- which matters exactly when a mark is
+	// disputed a year later.
+	Course string `json:"course,omitempty"`
+	// RubricNotes is what the rubric says about how it splits the marks.
+	//
+	// Every bundled rubric writes several sentences explaining why a question
+	// is worth what it is worth -- why isolation is worth nothing on its own,
+	// why the absence of BGP in the core is the larger share -- and the field
+	// was read by nothing, so none of it ever reached the person being marked.
+	// A student disputing a grade is entitled to the reasoning.
+	RubricNotes string           `json:"rubric_notes,omitempty"`
+	Term        string           `json:"term,omitempty"`
+	Rubric      string           `json:"rubric"`
+	Manifest    string           `json:"manifest_hash"`
+	GradedAt    time.Time        `json:"graded_at"`
+	Duration    string           `json:"duration"`
+	Total       float64          `json:"total"`
+	MaxTotal    float64          `json:"max_total"`
+	Questions   []QuestionResult `json:"questions"`
+	Warnings    []string         `json:"warnings,omitempty"`
+	Err         string           `json:"error,omitempty"`
 	// NeedsReview marks a report that must not be released without a human
 	// looking at it, because some part of the grading did not run correctly.
 	NeedsReview bool `json:"needs_review,omitempty"`
@@ -171,6 +206,13 @@ func (r *Report) Text() string {
 	if r.NeedsReview {
 		b.WriteString("NEEDS REVIEW: part of this run did not complete correctly; " +
 			"the marks below are provisional.\n\n")
+	}
+	if n := strings.TrimSpace(r.RubricNotes); n != "" {
+		b.WriteString("How these marks are split\n")
+		for _, line := range strings.Split(n, "\n") {
+			fmt.Fprintf(&b, "  %s\n", strings.TrimSpace(line))
+		}
+		b.WriteString("\n")
 	}
 	for _, q := range r.Questions {
 		mark := "x"

@@ -25,6 +25,9 @@ type fakeRuntime struct {
 	scripts []string
 	// ps is what the container's process listing would show.
 	ps string
+	// startsNothing makes frrinit.sh a no-op, as it is when the daemons file
+	// says every daemon is disabled.
+	startsNothing bool
 }
 
 func (f *fakeRuntime) Inspect(context.Context, string) (rt.Container, error) {
@@ -49,6 +52,9 @@ func (f *fakeRuntime) Exec(_ context.Context, _ string, c rt.ExecCmd) (rt.ExecRe
 		return rt.ExecResult{Stdout: f.links}, nil
 	case strings.Contains(body, "frrinit.sh start"):
 		f.started = true
+		if f.startsNothing {
+			return rt.ExecResult{}, nil
+		}
 		for _, d := range render.EnabledDaemons() {
 			f.running[d] = true
 		}
@@ -289,4 +295,31 @@ func (f *fakeRuntime) psFile() string {
 	_, _ = tmp.WriteString(f.ps)
 	_ = tmp.Close()
 	return tmp.Name()
+}
+
+// A router whose configuration says not to run the daemons cannot be repaired
+// by starting them.
+//
+// A container recreated by an interrupted deployment comes up with the image's
+// own /etc/frr/daemons, in which bgpd, ospfd and ldpd are all off. frrinit.sh
+// honours that file and starts nothing, so the repair fails three times and the
+// device is abandoned: a router with no BGP, in a lab nobody is watching. One
+// was found in exactly that state with its customer's session down for forty
+// minutes and every ping between the two succeeding.
+func TestARouterWhoseDaemonsAreDisabledIsRebuilt(t *testing.T) {
+	f := &fakeRuntime{
+		links:   "lo\nport_BOS\nport_CHI\n",
+		running: map[string]bool{"zebra": true},
+		// frrinit.sh starts nothing, as it does when the file says no.
+		startsNothing: true,
+	}
+	s := &Server{rt: f}
+	s.cfg.Node = "node-0"
+	err := s.startDaemons(context.Background(), "lab", routerWithTwoCables())
+	if err == nil {
+		t.Fatal("starting daemons reported success while none of them are running")
+	}
+	if !strings.Contains(err.Error(), "still not running") {
+		t.Errorf("the failure does not say what is wrong: %v", err)
+	}
 }

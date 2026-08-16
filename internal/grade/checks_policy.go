@@ -214,8 +214,28 @@ func checkSixIn4(ctx context.Context, env *Env) Result {
 				}
 				break
 			}
-			if reachable && tunnels[domains[0]] != "" && after > before {
+			// The counters say something crossed the tunnel; the routing
+			// table says whether *this* traffic did.
+			//
+			// A counter is a total, and a total can be moved by anything: a
+			// submission that routed every datacentre prefix natively and then
+			// pinged a link-local address across the tunnel in a loop made the
+			// counters climb throughout the test and earned the whole mark
+			// while none of the traffic in question was encapsulated at all.
+			// What the gateway would do with a packet for that host is not a
+			// total, and it is the thing the question asks about.
+			nativeFwd := ""
+			if reachable && tunnels[domains[0]] != "" {
+				if via, ok := forwardsVia(ctx, env, gw.ID, addr, tunnels[domains[0]]); !ok {
+					nativeFwd = fmt.Sprintf("%s forwards traffic for %s over %s, not through "+
+						"%s: the tunnel's counters moved, but not for this traffic",
+						gw.Name, addr, via, tunnels[domains[0]])
+				}
+			}
+			if reachable && tunnels[domains[0]] != "" && after > before && nativeFwd == "" {
 				throughTunnel = true
+			} else if nativeFwd != "" {
+				reach = nativeFwd
 			} else if reachable && tunnels[domains[0]] != "" {
 				reach = fmt.Sprintf("IPv6 reaches %s, but %s carried no packets during the test, "+
 					"so the traffic is being routed natively rather than encapsulated",
@@ -245,7 +265,13 @@ func checkSixIn4(ctx context.Context, env *Env) Result {
 						res, err := env.Probe(ctx, bs.ID,
 							[]string{"ping6", "-c", "3", "-W", "5", "-i", "0.3", addr})
 						after := tunnelTx(ctx, env, back.ID, tunnels[domains[1]])
+						via, encapsulated := forwardsVia(ctx, env, back.ID, addr, tunnels[domains[1]])
 						switch {
+						case !encapsulated:
+							throughTunnel = false
+							reach = fmt.Sprintf("%s forwards traffic for %s over %s, not "+
+								"through %s, so the return path is not encapsulated",
+								back.Name, addr, via, tunnels[domains[1]])
 						case err != nil || res.ExitCode != 0:
 							throughTunnel = false
 							reach = fmt.Sprintf("%s cannot reach %s at %s over IPv6, so the "+
@@ -435,12 +461,43 @@ func checkIXPCommunities(ctx context.Context, env *Env) Result {
 			emptyList = name
 		}
 	}
-	admitted, aerr := inRegionRoutesViaIXP(ctx, env, ixpRouter.Name, ixpPeer)
+	admitted, accepted, aerr := routesViaIXP(ctx, env, ixpRouter.Name, ixpPeer)
 	if aerr != nil {
 		return Errored("policy.ixp_communities", aerr)
 	}
 	if len(admitted) > 0 {
 		filters = false
+	}
+	// What the exchange is for.
+	//
+	// Only the refusals were read, so an inbound policy denying everything the
+	// route server sent admitted no in-region route and passed. A member that
+	// accepts nothing from the exchange has not written a peering policy; it
+	// has switched the exchange off, and the point of the question is the
+	// traffic that does cross it.
+	ourAddr := ""
+	for _, i := range ixpRouter.Ifaces {
+		if i.Role == model.RoleIXPLink && i.Addr4 != "" {
+			ourAddr = addrOnly(i.Addr4)
+		}
+	}
+	offered := 0
+	if ourAddr != "" {
+		offered, aerr = routeServerOffersOutOfRegion(ctx, env, rs.ID, ourAddr, ixpInRegion(env))
+		if aerr != nil {
+			return Errored("policy.ixp_communities", aerr)
+		}
+	}
+	if len(accepted) == 0 && offered > 0 {
+		return Fail("policy.ixp_communities", Evidence{
+			Expected: "the routes the exchange relays from out-of-region members accepted, " +
+				"and the in-region ones refused",
+			Observed: fmt.Sprintf("nothing at all was accepted from %s, though the exchange "+
+				"is relaying %d route(s) from outside this region", ixpPeer, offered),
+			Hint: "an inbound filter that denies everything refuses the in-region routes " +
+				"and the rest with them; match the AS path rather than blocking the session",
+			Command: fmt.Sprintf("show ip bgp neighbors %s routes", ixpPeer),
+		})
 	}
 
 	unapplied := ""
@@ -770,8 +827,11 @@ func checkTrafficEngineering(ctx context.Context, env *Env) Result {
 			continue
 		}
 		checks++
-		sp, sn := medianLocalPref(ctx, env, s.addr)
-		fp, fn := medianLocalPref(ctx, env, f.addr)
+		// Every route, not the middle one: the best route from the slow
+		// neighbour must still be worse than the worst from the fast one.
+		_, slowBest, sn := worstLocalPref(ctx, env, s.addr)
+		fastWorst, _, fn := worstLocalPref(ctx, env, f.addr)
+		sp, fp := slowBest, fastWorst
 		switch {
 		case sn == 0:
 			// Receiving nothing from the slow neighbour used to read as local
@@ -790,8 +850,54 @@ func checkTrafficEngineering(ctx context.Context, env *Env) Result {
 			passed++
 		default:
 			fmt.Fprintf(&detail,
-				"outbound: routes from the fast %s (AS%d, local preference %d) should be preferred over the slow one (AS%d, %d)\n",
-				rel, f.asn, fp, s.asn, sp)
+				"outbound: every route from the fast %s (AS%d) must be preferred over every "+
+					"route from the slow one (AS%d), but the slow one has a route at local "+
+					"preference %d and the fast one has one at %d\n",
+				rel, f.asn, s.asn, sp, fp)
+		}
+	}
+
+	// And what is actually installed, which is the question.
+	//
+	// Everything above reads BGP: the preferences a policy assigned, the paths
+	// it advertised. None of it is the forwarding table. A static route over
+	// the slow link overrides every one of those decisions and was invisible
+	// here -- a submission with textbook BGP policy and `ip route 2.0.0.0/8
+	// <slow neighbour>` sent its traffic over exactly the link the question
+	// asks it to avoid, and kept the mark in full.
+	//
+	// So the installed route is read for every destination that has a path
+	// through a fast neighbour. Being in the table is not the failure: the slow
+	// link must stay usable as a backup, and the question says so. Being
+	// *selected* is.
+	for _, rel := range []model.Relationship{model.RelProvider, model.RelCustomer} {
+		var slowAddrs, fastAddrs []string
+		for _, n := range neighbours {
+			if n.rel != rel {
+				continue
+			}
+			if n.slow {
+				slowAddrs = append(slowAddrs, n.addr)
+			} else {
+				fastAddrs = append(fastAddrs, n.addr)
+			}
+		}
+		if len(slowAddrs) == 0 || len(fastAddrs) == 0 {
+			continue
+		}
+		checks++
+		viaSlow, unreadable := installedVia(ctx, env, slowAddrs, fastAddrs)
+		switch {
+		case unreadable != "":
+			fmt.Fprintf(&detail, "forwarding: %s\n", unreadable)
+		case len(viaSlow) == 0:
+			passed++
+		default:
+			sort.Strings(viaSlow)
+			fmt.Fprintf(&detail,
+				"forwarding: %d destination(s) are installed over the slow %s even though a "+
+					"path through the fast one exists: %s\n",
+				len(viaSlow), rel, strings.Join(truncate(viaSlow, 4), "; "))
 		}
 	}
 
@@ -955,16 +1061,17 @@ func advertisedRoutes(ctx context.Context, env *Env, router, peer string) (bgpRo
 	return adv, nil
 }
 
-// medianLocalPref returns the median local preference of the routes learned
-// from a peer, and how many there were.
+// worstLocalPref returns the lowest local preference on any route learned from
+// a neighbour, the highest, and how many routes there were.
 //
-// The count is not decoration. Returning zero for a peer that sent nothing made
-// "no routes at all" indistinguishable from "local preference zero", which is
-// lower than anything and so counted as correctly deprioritised -- awarding the
-// mark for filtering the neighbour out, which is the one thing this question
-// forbids.
-func medianLocalPref(ctx context.Context, env *Env, peer string) (int, int) {
-	var prefs []int
+// It used to be the median, which is a statement about most routes and about no
+// particular one -- the same loophole that was closed in the Gao-Rexford check
+// and left open here. Setting one prefix learned over the slow provider to a
+// preference above the fast one's moves neither median, so the question about
+// engineering traffic around the slow link passed while traffic for that prefix
+// took it. Comparing the extremes is what makes the claim true of every route.
+func worstLocalPref(ctx context.Context, env *Env, peer string) (lo, hi, n int) {
+	lo, hi = 1<<30, -1
 	for _, r := range env.Routers() {
 		tbl, err := bgpTable(ctx, env, r.Name)
 		if err != nil {
@@ -973,18 +1080,24 @@ func medianLocalPref(ctx context.Context, env *Env, peer string) (int, int) {
 		for _, entries := range tbl.Table() {
 			for _, e := range entries {
 				for _, nh := range e.Nexthops {
-					if nh.IP == peer {
-						prefs = append(prefs, e.LocalPref)
+					if nh.IP != peer {
+						continue
+					}
+					n++
+					if e.LocalPref < lo {
+						lo = e.LocalPref
+					}
+					if e.LocalPref > hi {
+						hi = e.LocalPref
 					}
 				}
 			}
 		}
 	}
-	if len(prefs) == 0 {
-		return 0, 0
+	if n == 0 {
+		return 0, 0, 0
 	}
-	sort.Ints(prefs)
-	return prefs[len(prefs)/2], len(prefs)
+	return lo, hi, n
 }
 
 // checkRPKIInvalidRejected verifies that a route whose origin is RPKI-invalid
@@ -1149,15 +1262,71 @@ func checkRPKIInvalidRejected(ctx context.Context, env *Env) Result {
 				"this lab is not announcing anything RPKI-invalid, so rejecting it "+
 					"cannot be observed and no verdict here would mean anything: %s", why))
 		}
+		// And something did get in.
+		//
+		// "No invalid route is selected" is trivially true of an AS that
+		// selected no external route at all. A deny-everything clause placed
+		// ahead of the RPKI one -- the legitimate clause still present and
+		// still reachable in the configuration -- left this AS with nothing
+		// in its table but its own prefix, and this check awarded full marks
+		// for rejecting an invalid origin it had never been in a position to
+		// accept. A rejection means something only against a background of
+		// acceptance.
+		accepted, aerr := externalRoutesSelected(ctx, env)
+		if aerr != nil {
+			return Errored("rpki.invalid_rejected", aerr)
+		}
+		if accepted == 0 {
+			return Fail("rpki.invalid_rejected", Evidence{
+				Expected: "the invalid origin refused and everything else accepted",
+				Observed: "this AS has selected no externally learned route at all, so " +
+					"refusing the invalid one shows nothing",
+				Hint: "an import policy that denies everything rejects the invalid origin " +
+					"and the rest of the internet with it; deny on the validation state, " +
+					"not on the prefix",
+				Command: "show ip bgp json",
+			})
+		}
 		return Pass("rpki.invalid_rejected", Evidence{
-			Observed: "validation is live and the lab's invalid announcement is not selected",
-			Detail:   liveDetail + "\n" + detail})
+			Observed: fmt.Sprintf("validation is live, %d externally learned route(s) are "+
+				"selected, and the lab's invalid announcement is not among them", accepted),
+			Detail: liveDetail + "\n" + detail})
 	}
 	return Partial("rpki.invalid_rejected", 0.6, Evidence{
 		Expected: "no invalid route selected",
 		Observed: fmt.Sprintf("%d invalid route(s) still chosen", len(selected)),
 		Detail:   strings.Join(truncate(selected, 5), "\n"),
 	})
+}
+
+// externalRoutesSelected counts the destinations this AS learned from outside
+// and chose to use.
+//
+// It is the background any claim about refusing one route has to be read
+// against: an AS that accepted nothing has not shown that it refused anything
+// in particular.
+func externalRoutesSelected(ctx context.Context, env *Env) (int, error) {
+	seen := map[string]bool{}
+	read := 0
+	for _, r := range env.Routers() {
+		tbl, err := bgpTable(ctx, env, r.Name)
+		if err != nil {
+			continue
+		}
+		read++
+		for prefix, entries := range tbl.Table() {
+			for _, e := range entries {
+				if e.IsBest() && strings.TrimSpace(e.Path) != "" {
+					seen[prefix] = true
+				}
+			}
+		}
+	}
+	if read == 0 {
+		return 0, fmt.Errorf("no router's table could be read, so what this AS accepted " +
+			"cannot be established")
+	}
+	return len(seen), nil
 }
 
 // checkRPKINotFoundPreserved guards against over-filtering: a student who
@@ -1255,21 +1424,57 @@ func missingNotFoundRoutes(ctx context.Context, env *Env) ([]string, int, error)
 		return nil, 0, err
 	}
 
-	// One router's table is enough: iBGP carries the AS's view, and a prefix
-	// filtered at the border is absent from all of them.
-	var router string
-	for _, r := range env.Routers() {
-		router = r.Name
-		break
-	}
-	if router == "" {
+	// Every router, and the route each of them has selected.
+	//
+	// One router's table was read, on the reasoning that iBGP carries the AS's
+	// view and a prefix filtered at the border is absent from all of them. The
+	// reasoning holds for a border filter and for nothing else: an inbound
+	// policy on one router's iBGP sessions removes the prefix from that router
+	// alone, and the site behind it cannot reach the network -- 100% packet
+	// loss and "Destination Net Unreachable" were measured while this check
+	// reported all prefixes present and the system scored full marks. A
+	// question about what a system preserves is a question about all of it.
+	routers := env.Routers()
+	if len(routers) == 0 {
 		return nil, 0, fmt.Errorf("AS %d has no router to read", env.AS)
 	}
-	tbl, err := bgpTable(ctx, env, router)
-	if err != nil {
-		return nil, 0, err
+	// Present, per router. A router that cannot be read stops the check: this
+	// concludes from what it does not find, so an unreadable router is one
+	// whose missing routes would also not have been found.
+	haveOn := map[string]map[string]bool{}
+	// Where the selected route came from, per prefix. A route this AS
+	// originated itself is not a route it preserved.
+	forged := map[string][]string{}
+	for _, r := range routers {
+		tbl, err := bgpTable(ctx, env, r.Name)
+		if err != nil {
+			return nil, 0, fmt.Errorf("%s: its table could not be read, so whether it still "+
+				"holds the routes without a ROA cannot be decided: %w", r.Name, err)
+		}
+		seen := map[string]bool{}
+		for prefix, entries := range tbl.Table() {
+			for _, e := range entries {
+				// Selected, not merely present: a route the router holds and
+				// does not use carries no traffic.
+				if !e.IsBest() {
+					continue
+				}
+				seen[prefix] = true
+				// Originated here, not learned from anybody.
+				//
+				// A submission that filtered the real route away and then
+				// announced the same prefix itself -- to Null0, with a forged
+				// AS path -- had the prefix selected on every router and
+				// passed. The AS path can be written to say anything; where
+				// the route entered cannot. FRR gives a locally sourced route
+				// a next hop of 0.0.0.0.
+				if locallySourced(e) {
+					forged[prefix] = append(forged[prefix], r.Name)
+				}
+			}
+		}
+		haveOn[r.Name] = seen
 	}
-	have := tbl.Table()
 
 	var missing []string
 	checked := 0
@@ -1281,11 +1486,67 @@ func missingNotFoundRoutes(ctx context.Context, env *Env) ([]string, int, error)
 			continue
 		}
 		checked++
-		if _, ok := have[as.Block]; !ok {
-			missing = append(missing, fmt.Sprintf("%s (AS %d) is not in the table", as.Block, asn))
+		var without []string
+		for _, r := range routers {
+			if !haveOn[r.Name][as.Block] {
+				without = append(without, r.Name)
+			}
+		}
+		if len(without) > 0 {
+			sort.Strings(without)
+			missing = append(missing, fmt.Sprintf("%s (AS %d) is not selected on %s",
+				as.Block, asn, strings.Join(truncate(without, 4), ", ")))
+			continue
+		}
+		if who := forged[as.Block]; len(who) > 0 {
+			sort.Strings(who)
+			missing = append(missing, fmt.Sprintf(
+				"%s (AS %d) is selected, but %s originates it rather than having learned it: "+
+					"a route you announce yourself is not the route you were asked to preserve",
+				as.Block, asn, strings.Join(truncate(who, 4), ", ")))
+			continue
+		}
+		// And it has to carry traffic.
+		//
+		// The whole point of not over-filtering an unsigned origin is that the
+		// network stays reachable. A route to Null0 is selected on every
+		// router and reaches nobody, and so is a route whose next hop does not
+		// resolve; both used to pass. The probe is the only thing that can
+		// tell a preserved route from a convincing imitation of one.
+		src, dst := hostIn(env.Topology, env.AS), hostIn(env.Topology, asn)
+		if src == nil || dst == nil {
+			continue
+		}
+		addr := siteAddr(dst)
+		if addr == "" {
+			continue
+		}
+		ok, err := env.reaches(ctx, src.ID, addr)
+		if err != nil {
+			return nil, 0, fmt.Errorf("probing %s from %s: %w", addr, src.ID, err)
+		}
+		if !ok {
+			missing = append(missing, fmt.Sprintf(
+				"%s (AS %d) is in every table, but %s cannot reach %s: the route is preserved "+
+					"in name only", as.Block, asn, src.Name, addr))
 		}
 	}
 	return missing, checked, nil
+}
+
+// locallySourced reports whether a route was originated by this AS rather than
+// learned from a neighbour. FRR gives such a route a next hop of 0.0.0.0.
+func locallySourced(e bgpRoute) bool {
+	hops := e.NextHops()
+	if len(hops) == 0 {
+		return false
+	}
+	for _, h := range hops {
+		if h != "0.0.0.0" {
+			return false
+		}
+	}
+	return true
 }
 
 // roaPrefixes is the set of prefixes the validator has a ROA for.
@@ -1516,51 +1777,111 @@ func fieldAfter(line, key string) string {
 // check passes for everybody -- vacuous in exactly the way it was written to
 // stop. `show ip bgp neighbors <rs> routes` is what the router itself
 // considers to have come from that session, after policy.
-func inRegionRoutesViaIXP(ctx context.Context, env *Env, router, ixpPeer string) ([]string, error) {
-	me, ok := env.Topology.ASes[env.AS]
-	if !ok || me.Region == "" {
-		// Without regions in the model there is nothing to be in or out of.
-		return nil, nil
-	}
-	// Every other system in this region counts, staff ASes included: the
-	// controlled announcers the exercise uses to test the filter are exactly
-	// the ones a student's policy must refuse, and excluding them left the
-	// check testing only the systems that had no reason to be there.
-	inRegion := map[int]bool{}
-	for asn, as := range env.Topology.ASes {
-		if asn != env.AS && as.Region == me.Region && as.Role != model.RoleIXP {
-			inRegion[asn] = true
-		}
-	}
-	if len(inRegion) == 0 {
-		return nil, nil
-	}
-
-	var got bgpRouteJSON
-	out, err := env.Vtysh(ctx, router,
-		fmt.Sprintf("show ip bgp neighbors %s routes json", ixpPeer))
+// routeServerOffersOutOfRegion reports how many of the routes the exchange is
+// relaying to this AS are ones it ought to accept.
+//
+// Requiring a member to accept *something* is only fair when something it
+// should accept is on offer. At an exchange whose other members are all in
+// this AS's own region, refusing everything is the correct answer, and an
+// exchange that is relaying nothing at all is the lab's doing rather than the
+// submission's.
+func routeServerOffersOutOfRegion(ctx context.Context, env *Env, rsDevice, ourAddr string,
+	inRegion map[int]bool) (int, error) {
+	res, err := env.Probe(ctx, rsDevice, []string{"vtysh", "-c",
+		fmt.Sprintf("show ip bgp neighbors %s advertised-routes json", ourAddr)})
 	if err != nil {
-		return nil, fmt.Errorf("reading what %s accepted from the exchange: %w", router, err)
+		return 0, fmt.Errorf("asking the route server what it relays to %s: %w", ourAddr, err)
 	}
-	if err := jsonUnmarshalLoose(out, &got); err != nil {
-		return nil, fmt.Errorf("reading what %s accepted from the exchange: %w", router, err)
+	var got bgpRouteJSON
+	if jerr := jsonUnmarshalLoose(res.Stdout, &got); jerr != nil {
+		return 0, fmt.Errorf("reading what the route server relays to %s: %w", ourAddr, jerr)
 	}
-
-	var bad []string
-	for prefix, entries := range got.Table() {
+	n := 0
+	for _, entries := range got.Table() {
 		for _, e := range entries {
+			crosses := false
 			for _, f := range strings.Fields(e.Path) {
-				n, cerr := strconv.Atoi(f)
-				if cerr != nil || !inRegion[n] {
-					continue
+				if asn, cerr := strconv.Atoi(f); cerr == nil && inRegion[asn] {
+					crosses = true
+					break
 				}
-				bad = append(bad, fmt.Sprintf("%s (path %q)", prefix, strings.TrimSpace(e.Path)))
-				break
+			}
+			if !crosses {
+				n++
 			}
 		}
 	}
-	sort.Strings(bad)
-	return uniq(bad), nil
+	return n, nil
+}
+
+// routesViaIXP splits what this AS accepted from the exchange into the routes
+// whose path crosses a system in its own region -- which the exercise says to
+// refuse -- and the rest, which it exists to accept.
+//
+// Both halves matter. Only the first was ever read, so an inbound policy that
+// denied everything from the exchange admitted no in-region route and passed:
+// a member that hears nothing from the exchange and sends nothing to it has not
+// implemented the peering policy, it has switched the exchange off.
+// ixpInRegion is the set the exercise names and the reference answer filters
+// on: the other *student* systems of this AS's region.
+//
+// The staff systems are everybody's transit and are reached through the
+// exchange like any out-of-region member; counting them as in-region made the
+// reference solution fail its own question the moment the exchange began
+// delivering routes at all.
+func ixpInRegion(env *Env) map[int]bool {
+	out := map[int]bool{}
+	me, ok := env.Topology.ASes[env.AS]
+	if !ok || me.Region == "" {
+		return out
+	}
+	for asn, as := range env.Topology.ASes {
+		if asn != env.AS && as.Region == me.Region && as.Role == model.RoleStudent {
+			out[asn] = true
+		}
+	}
+	return out
+}
+
+func routesViaIXP(ctx context.Context, env *Env, router, ixpPeer string) (in, out []string, err error) {
+	if _, ok := env.Topology.ASes[env.AS]; !ok {
+		return nil, nil, fmt.Errorf("AS %d not in the lab", env.AS)
+	}
+	// The same set the exercise names, and the same one the reference answer
+	// filters on: the other *student* systems of this region. The staff
+	// systems are everybody's transit and are reached through the exchange
+	// like any out-of-region member, so counting them as in-region made the
+	// reference solution fail its own question the moment the exchange
+	// started delivering routes at all.
+	inRegion := ixpInRegion(env)
+	var got bgpRouteJSON
+	body, verr := env.Vtysh(ctx, router,
+		fmt.Sprintf("show ip bgp neighbors %s routes json", ixpPeer))
+	if verr != nil {
+		return nil, nil, fmt.Errorf("reading what %s accepted from the exchange: %w", router, verr)
+	}
+	if jerr := jsonUnmarshalLoose(body, &got); jerr != nil {
+		return nil, nil, fmt.Errorf("reading what %s accepted from the exchange: %w", router, jerr)
+	}
+	for prefix, entries := range got.Table() {
+		for _, e := range entries {
+			crosses := false
+			for _, f := range strings.Fields(e.Path) {
+				if n, cerr := strconv.Atoi(f); cerr == nil && inRegion[n] {
+					crosses = true
+					break
+				}
+			}
+			if crosses {
+				in = append(in, fmt.Sprintf("%s (path %q)", prefix, strings.TrimSpace(e.Path)))
+			} else {
+				out = append(out, prefix)
+			}
+		}
+	}
+	sort.Strings(in)
+	sort.Strings(out)
+	return uniq(in), uniq(out), nil
 }
 
 // tunnelEndpointsWrong reports why a tunnel's endpoints are not the two
@@ -1678,6 +1999,26 @@ func selectedRoute(line string) bool {
 	return selectedRouteRE.MatchString(strings.TrimSpace(line))
 }
 
+// forwardsVia reports whether a device would send a packet for an address out
+// of the interface it is supposed to, and names the interface it would use.
+//
+// This is what the tunnel question is about. A counter says traffic crossed the
+// tunnel; it does not say *which* traffic, and a total can be moved by anything
+// the submission cares to send.
+func forwardsVia(ctx context.Context, env *Env, deviceID, addr, want string) (string, bool) {
+	res, err := env.Probe(ctx, deviceID, []string{"ip", "-6", "route", "get", addr})
+	if err != nil || res.ExitCode != 0 {
+		return "", false
+	}
+	f := strings.Fields(res.Stdout)
+	for i := 0; i+1 < len(f); i++ {
+		if f[i] == "dev" {
+			return f[i+1], f[i+1] == want
+		}
+	}
+	return "", false
+}
+
 // crossDatacentreGaps names the host pairs that cannot reach each other across
 // the two datacentres, in both directions.
 //
@@ -1763,4 +2104,80 @@ func sortedInts(m map[int]bool) []int {
 	}
 	sort.Ints(out)
 	return out
+}
+
+// installedVia names the destinations whose selected route leaves through one
+// of the slow addresses, when a path through a fast one is also available.
+//
+// It reads the routing table rather than BGP, because that is where a static
+// route, a policy route or an administrative distance shows up and BGP does
+// not. Every router is asked, and a router that cannot be read stops the check:
+// concluding "nothing goes the slow way" from the routers that answered is the
+// kind of verdict this project keeps having to take back.
+func installedVia(ctx context.Context, env *Env, slow, fast []string) (via []string, unreadable string) {
+	isSlow := map[string]bool{}
+	for _, a := range slow {
+		isSlow[a] = true
+	}
+	isFast := map[string]bool{}
+	for _, a := range fast {
+		isFast[a] = true
+	}
+	// What the system as a whole has an alternative path for, so that a
+	// destination nobody can reach except over the slow link is not counted
+	// against a student who cannot avoid it.
+	//
+	// System-wide, not per router: the fast session is usually on a different
+	// router from the slow one, so a router that holds the slow session sees
+	// the fast path only as an iBGP route with an interior next hop. Computing
+	// this per router found no alternative anywhere and the check passed a
+	// static route straight over the slow link.
+	alt := map[string]bool{}
+	for _, r := range env.Routers() {
+		tbl, err := bgpTable(ctx, env, r.Name)
+		if err != nil {
+			continue
+		}
+		for prefix, entries := range tbl.Table() {
+			for _, e := range entries {
+				for _, nh := range e.Nexthops {
+					if isFast[nh.IP] {
+						alt[prefix] = true
+					}
+				}
+			}
+		}
+	}
+	for _, r := range env.Routers() {
+		var routes map[string][]struct {
+			Protocol string `json:"protocol"`
+			Selected bool   `json:"selected"`
+			Nexthops []struct {
+				IP  string `json:"ip"`
+				FIB bool   `json:"fib"`
+			} `json:"nexthops"`
+		}
+		if err := env.VtyshJSON(ctx, r.Name, "show ip route json", &routes); err != nil {
+			return nil, fmt.Sprintf("%s: its routing table could not be read (%v), so where "+
+				"its traffic actually goes could not be established", r.Name, err)
+		}
+		for prefix, entries := range routes {
+			if !alt[prefix] {
+				continue
+			}
+			for _, e := range entries {
+				if !e.Selected {
+					continue
+				}
+				for _, nh := range e.Nexthops {
+					if !isSlow[nh.IP] {
+						continue
+					}
+					via = append(via, fmt.Sprintf("%s on %s (%s)", prefix, r.Name, e.Protocol))
+					break
+				}
+			}
+		}
+	}
+	return via, ""
 }

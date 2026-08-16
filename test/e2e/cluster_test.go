@@ -1123,7 +1123,10 @@ func TestAnIncidentEvaluatesAndScoresAnAgent(t *testing.T) {
 	// An agent that answers correctly without looking, so this measures the
 	// harness rather than the agent. What it may see is the point: the brief
 	// arrives on standard input and the ground truth does not arrive at all.
-	agent := filepath.Join(out, "agent.sh")
+	// Somewhere the sandbox account can read: t.TempDir() belongs to whoever
+	// ran the test.
+	agent := filepath.Join("/tmp", "twinet-e2e-agent-"+strconv.Itoa(os.Getpid())+".sh")
+	defer func() { _ = os.Remove(agent) }()
 	// The agent runs as an unprivileged account now, so it needs somewhere it
 	// can actually write. t.TempDir() belongs to whoever ran the test.
 	briefPath := filepath.Join("/tmp", "twinet-e2e-brief-"+strconv.Itoa(os.Getpid())+".json")
@@ -1134,10 +1137,36 @@ func TestAnIncidentEvaluatesAndScoresAnAgent(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = os.Remove(briefPath) }()
+	probePath := filepath.Join("/tmp", "twinet-e2e-probe-"+strconv.Itoa(os.Getpid())+".txt")
+	if err := os.WriteFile(probePath, nil, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(probePath, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Remove(probePath) }()
+	// An agent that has to look before it answers.
+	//
+	// It used to print the right answer without reading anything, so the test
+	// measured the harness and not the isolation -- and it went on passing on a
+	// cluster where the agent could not reach a single device, because the
+	// sandbox had no client certificate and every observation came back
+	// "certificate required". A benchmark whose subject is prevented from
+	// looking scores exactly like one whose subject looked and found nothing.
+	//
+	// It cannot name the device in advance any more: the scenario draws its
+	// target when the episode runs, so an agent that answered "as3/NYC"
+	// because the file used to say so would now be wrong most of the time.
+	// This one asks every router in the AS which of its interfaces OSPF is
+	// running on, and reports the one with an internal link OSPF has forgotten
+	// -- which is a diagnosis, arrived at from what the network says.
+	detector := filepath.Join("/tmp", "twinet-e2e-detect-"+strconv.Itoa(os.Getpid())+".py")
+	if err := os.WriteFile(detector, []byte(ospfDetector), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Remove(detector) }()
 	script := "#!/bin/sh\ncat > " + briefPath + "\n" +
-		"printf '%s\\n' '{\"is_anomaly\":true,\"faulty_devices\":[\"as3/NYC\"]," +
-		"\"root_cause_category\":\"misconfiguration\"," +
-		"\"root_cause_name\":[\"ospf_neighbor_missing\"]}'\n"
+		"exec python3 " + detector + " 2>" + probePath + "\n"
 	if err := os.WriteFile(agent, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -1176,6 +1205,22 @@ func TestAnIncidentEvaluatesAndScoresAnAgent(t *testing.T) {
 		t.Errorf("a diagnosis naming exactly the injected device, category and root cause "+
 			"scored %.2f", ep.Score.Total)
 	}
+	// And it earned that by looking. Without this, an agent that cannot reach
+	// any device at all scores the same as one that read the network, which is
+	// how a cluster with mutual TLS went a long time with a benchmark that
+	// could not be run on it.
+	probe, err := os.ReadFile(probePath)
+	if err != nil || !strings.Contains(string(probe), "\"routers\": 8") {
+		t.Errorf("the agent could not observe the lab it was scored on; what its probe "+
+			"returned was:\n%s", probe)
+	}
+	// And the answer it gave was not one it could have known in advance. The
+	// scenario draws its target, so a run that landed on the device the file
+	// used to name proves nothing either way -- but a suite of them that always
+	// landed there would mean the draw is not drawing.
+	if len(ep.Truth) == 0 || len(ep.Truth[0].FaultyDevices) == 0 {
+		t.Fatal("the episode records no faulty device, so there was nothing to diagnose")
+	}
 	if !ep.Resolved {
 		t.Error("the incident was not resolved, so the lab is left broken for whatever runs next")
 	}
@@ -1185,13 +1230,74 @@ func TestAnIncidentEvaluatesAndScoresAnAgent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the agent was given no brief at all: %v", err)
 	}
-	for _, leak := range []string{"ospf_neighbor_missing", "as3/NYC", "ground_truth"} {
+	for _, leak := range []string{"ospf_neighbor_missing", "port_", "ground_truth"} {
 		if strings.Contains(string(brief), leak) {
 			t.Errorf("the agent was told %q in its brief, which is the answer it is being "+
 				"asked for:\n%s", leak, brief)
 		}
 	}
 }
+
+// ospfDetector is the agent the scoring test runs: a real, if small,
+// diagnostician.
+//
+// It asks every router in the AS which interfaces OSPF is running on, compares
+// that with the interfaces that face another router, and reports the router
+// with an internal link OSPF has forgotten. It knows nothing about the scenario
+// beyond the fact that it is looking at an AS, which is the point: the target
+// is drawn when the episode runs, so an agent that has read the scenario file
+// learns nothing from it.
+const ospfDetector = `import json, os, subprocess, sys
+
+m = os.environ.get("TWINET_MANIFEST", ".")
+
+
+def tw(dev, *args):
+    r = subprocess.run(["twinet", "exec", "-m", m, dev, "--"] + list(args),
+                       capture_output=True, text=True)
+    return r.stdout
+
+
+def js(text):
+    i = text.find("{")
+    if i < 0:
+        return {}
+    try:
+        return json.loads(text[i:])
+    except Exception:
+        return {}
+
+
+routers = []
+listing = subprocess.run(["twinet", "inspect", "-m", m], capture_output=True, text=True)
+for line in listing.stdout.splitlines():
+    f = line.split()
+    if len(f) > 2 and f[0].startswith("as3/") and f[1] == "router":
+        routers.append(f[0])
+
+suspects = []
+for r in routers:
+    links = set()
+    for line in tw(r, "ip", "-o", "link").splitlines():
+        if ":" in line:
+            links.add(line.split(":")[1].strip().split("@")[0])
+    ports = {n for n in links if n.startswith("port_")}
+    doc = js(tw(r, "vtysh", "-c", "show ip ospf interface json"))
+    enabled = set(doc.get("interfaces", {}) or {})
+    if not enabled:
+        enabled = {k for k in doc if isinstance(doc.get(k), dict)}
+    missing = sorted(ports - enabled)
+    if missing:
+        suspects.append(r)
+
+print(json.dumps({"routers": len(routers), "suspects": suspects}), file=sys.stderr)
+if suspects:
+    print(json.dumps({"is_anomaly": True, "faulty_devices": suspects,
+                      "root_cause_category": "misconfiguration",
+                      "root_cause_name": ["ospf_neighbor_missing"]}))
+else:
+    print(json.dumps({"is_anomaly": False}))
+`
 
 // A benchmark whose subject can read the answer measures nothing.
 //
@@ -1225,6 +1331,7 @@ func TestAnAgentCannotReachTheAnswer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	repoRoot := filepath.Dir(filepath.Dir(abs))
 	// Every way in that has ever worked, and a few that have not.
 	script := strings.Join([]string{
 		"#!/bin/sh",
@@ -1238,20 +1345,54 @@ func TestAnAgentCannotReachTheAnswer(t *testing.T) {
 		"  echo '--- original roster'; cat " + abs + "/.twinet/roster.json",
 		"  echo '--- listing'; ls -la " + abs + "/.twinet/",
 		"  echo '--- search'; find / -name 'injections.json' -readable 2>/dev/null | head -20",
+		// The scenario itself, which names the fault in plain YAML, and the
+		// repository it lives in, whose tests name it too. Reading the answer
+		// out of a file beside the lab is not less of a leak than reading it
+		// out of the ledger.
+		"  echo '--- scenarios'; cat " + abs + "/incidents/*.yaml",
+		"  echo '--- scenario copy'; cat \"$TWINET_MANIFEST\"/incidents/*.yaml",
+		"  echo '--- repo grep'; grep -rl ospf_neighbor_missing " + repoRoot + " 2>/dev/null | head -5",
+		"  echo '--- repo read'; grep -rh 'ospf_neighbor_missing' " + repoRoot + " 2>/dev/null | head -5",
+		"  echo '--- wander'; find " + repoRoot + " -maxdepth 2 -readable 2>/dev/null | head -5",
 		"  echo '--- episodes'; find / -name '*.json' -path '*episode*' -readable 2>/dev/null | head -5",
 		"  echo '--- docker'; docker ps --format '{{.Names}}' 2>&1 | head -3",
+		// The runner's own command line names the scenario file, and the
+		// scenario names say what the fault is -- that is what makes them
+		// useful to a person and fatal here. An agent whose entire strategy
+		// was `ps -eo args | grep 'twinet incident run'` scored 1.00.
+		"  echo '--- process list'; ps -eo args 2>/dev/null | head -40",
+		"  echo '--- proc'; cat /proc/*/cmdline 2>/dev/null | tr '\\0' ' '",
+		// The answer is not only on this machine. Every scenario Twinet ships
+		// is in a public repository, so an agent with a route to the internet
+		// can fetch its own brief's answer instead of diagnosing it -- by
+		// name, by address, or through anybody's resolver. All three are
+		// tried, and all three have to fail.
+		"  echo '--- fetch the answer by name'; curl -s --max-time 20 " +
+			"https://raw.githubusercontent.com/HongyuHe/Twinet/main/examples/cos461/" +
+			"incidents/ospf_adjacency_lost.yaml",
+		"  echo '--- fetch the answer by address'; curl -s --max-time 20 --resolve " +
+			"raw.githubusercontent.com:443:185.199.109.133 " +
+			"https://raw.githubusercontent.com/HongyuHe/Twinet/main/examples/cos461/" +
+			"incidents/ospf_adjacency_lost.yaml",
+		"  echo '--- resolve anything'; nslookup github.com 8.8.8.8 2>&1 | tail -2",
+		"  echo '--- any other port on the cluster'; nc -z -w 4 10.0.1.2 22 && " +
+			"echo REACHED-SSH || echo blocked",
 		"} >> " + loot + " 2>&1",
 		// And the credential: it must not be able to change anything, or an
 		// agent can repair the fault and report a healthy network.
 		"printf '%s\\n' '{\"is_anomaly\":false}'",
 	}, "\n") + "\n"
-	agentPath := filepath.Join(out, "thief.sh")
+	// Somewhere the sandbox account can read: t.TempDir() belongs to whoever
+	// ran the test and is not world-readable, and an agent that cannot open its
+	// own script proves nothing about what else it could open.
+	agentPath := filepath.Join("/tmp", "twinet-e2e-thief-"+strconv.Itoa(os.Getpid())+".sh")
 	if err := os.WriteFile(agentPath, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chmod(out, 0o755); err != nil {
+	if err := os.Chmod(agentPath, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	defer func() { _ = os.Remove(agentPath) }()
 
 	// The agent answers "nothing is wrong" about a lab with a fault in it, so
 	// it should score badly. If it scores well, it read the answer.
@@ -1264,11 +1405,23 @@ func TestAnAgentCannotReachTheAnswer(t *testing.T) {
 		t.Fatalf("the adversarial agent did not run at all: %v", err)
 	}
 	got := string(stolen)
+	// A test that passes because the agent never started is the defect this
+	// whole file is about. The agent writes its identity first, so its absence
+	// means nothing below was measured.
+	if !strings.Contains(got, "uid=") {
+		t.Fatalf("the agent never ran, so this test proves nothing about what it could "+
+			"reach. The incident said:\n%s\nwhat the agent wrote:\n%s", res, got)
+	}
 	t.Logf("what the agent could reach:\n%s", got)
 	for _, secret := range []string{
 		"ospf_neighbor_missing", // the fault it was asked to diagnose
 		"faulty_devices",        // the shape of the ground truth record
 		"\"undo\"",              // how to reverse it, also in the ledger
+		"kind: Scenario",        // any scenario file at all, here or fetched
+		"ospf_adjacency_lost",   // the scenario's name, in a path or an argv
+		"--scenario",            // the runner's own command line
+		"REACHED-SSH",           // any port on the cluster but the node agents'
+		"internal_link",         // the published scenario, fetched over the network
 	} {
 		if strings.Contains(got, secret) {
 			t.Errorf("the agent read %q out of the filesystem, so the episode measures "+
@@ -1320,4 +1473,232 @@ func labName(t *testing.T, dir string) string {
 	}
 	t.Fatal("the manifest has no name")
 	return ""
+}
+
+// A behaviour is a declaration that has to do something.
+//
+// `behaviours:` -- the manifest's scripted, reversible perturbations, documented
+// since the first version as the replacement for the legacy platform's
+// hijack.sh -- validated, appeared in the schema, and was read by no code at
+// all. The COS-461 RPKI question is built on one: a stub AS starts announcing
+// somebody else's prefix and a student's filters are supposed to stop it.
+// Without it the lab could only carry a permanent invalid announcement, so the
+// question could never be "did your filter stop the hijack when it happened".
+func TestABehaviourStartsAndStopsAHijack(t *testing.T) {
+	dir := labDir(t)
+	out, err := twinet(t, "behaviour", "list", "-m", dir)
+	if err != nil {
+		t.Fatalf("listing behaviours: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "stub_hijack") {
+		t.Skipf("this lab declares no stub_hijack behaviour:\n%s", out)
+	}
+
+	victim := "2.0.0.0/8"
+	originates := func(t *testing.T) bool {
+		t.Helper()
+		got, err := twinet(t, "exec", "-m", dir, "as10/MSP", "--",
+			"vtysh", "-c", "show ip bgp "+victim)
+		if err != nil {
+			return false
+		}
+		// "Local" is how FRR describes a path this router originated.
+		return strings.Contains(got, "Local")
+	}
+
+	if originates(t) {
+		t.Fatal("AS 10 is already announcing the victim's prefix before the behaviour " +
+			"was started, so nothing below would mean anything")
+	}
+
+	if out, err := twinet(t, "behaviour", "start", "stub_hijack", "-m", dir); err != nil {
+		t.Fatalf("starting the behaviour: %v\n%s", err, out)
+	}
+	defer func() {
+		if out, err := twinet(t, "behaviour", "stop", "stub_hijack", "-m", dir); err != nil {
+			t.Fatalf("stopping the behaviour: %v\n%s", err, out)
+		}
+	}()
+	time.Sleep(15 * time.Second)
+
+	if !originates(t) {
+		t.Error("the behaviour reported success and AS 10 is not announcing the prefix, " +
+			"so the exercise's hijack does not happen")
+	}
+	// It is recorded, so an interrupted session leaves nothing live that
+	// nothing on disk mentions.
+	if got, err := twinet(t, "behaviour", "status", "-m", dir); err != nil {
+		t.Errorf("reading the status: %v", err)
+	} else if !strings.Contains(got, "running") {
+		t.Errorf("a started behaviour does not report itself running:\n%s", got)
+	}
+
+	// And the reference solution rejects it: a system whose routers validate
+	// origins must not select a path for the victim's prefix that came from
+	// the hijacker.
+	for _, dev := range []string{"as3/CHI", "as5/SFO"} {
+		got, err := twinet(t, "exec", "-m", dir, dev, "--",
+			"vtysh", "-c", "show ip bgp "+victim)
+		if err != nil {
+			t.Errorf("reading %s: %v", dev, err)
+			continue
+		}
+		if strings.Contains(got, "10 i") || strings.Contains(got, "invalid, best") {
+			t.Errorf("%s selected the hijacked path, so the reference solution does not "+
+				"reject it:\n%s", dev, got)
+		}
+	}
+
+	if out, err := twinet(t, "behaviour", "stop", "stub_hijack", "-m", dir); err != nil {
+		t.Fatalf("stopping the behaviour: %v\n%s", err, out)
+	}
+	time.Sleep(10 * time.Second)
+	if originates(t) {
+		t.Error("the behaviour was stopped and AS 10 is still announcing the prefix, so " +
+			"the lab is left hijacked for whatever runs next")
+	}
+	if got, err := twinet(t, "behaviour", "status", "-m", dir); err != nil {
+		t.Errorf("reading the status: %v", err)
+	} else if strings.Contains(got, "running") {
+		t.Errorf("a stopped behaviour still reports itself running:\n%s", got)
+	}
+}
+
+// One site made passive must cost marks.
+//
+// The multicast checks used a fixed pair of hosts -- first and last in name
+// order -- and one fixed bystander. `ip pim passive` on every transit interface
+// of one router leaves its PIM configuration looking perfect (the interfaces are
+// listed, the rendezvous point is right) and forms no adjacency at all, so that
+// site receives nothing. The pair the checks happened to use went on working and
+// the exercise awarded all four marks with a sixth of it disconnected.
+func TestAPassiveMulticastSiteLosesMarks(t *testing.T) {
+	// The example lab by default.
+	//
+	// This used to skip unless TWINET_MULTICAST_LAB was set, which nothing
+	// sets, so the only test establishing that a passive multicast site loses
+	// marks never ran -- and the suite reported success either way.
+	dir := multicastLab(t)
+	const victim = "as1/RIGHT"
+	ports := []string{"port_TOP", "port_CENTER", "port_BOTTOMR"}
+
+	grade := func(t *testing.T) map[string]float64 {
+		t.Helper()
+		out := t.TempDir()
+		if res, err := twinet(t, "grade", "run", "-m", dir, "--as", "1", "-o", out); err != nil {
+			t.Fatalf("grading: %v\n%s", err, res)
+		}
+		raw, err := os.ReadFile(filepath.Join(out, "group1.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var rep struct {
+			Questions []struct {
+				ID      string  `json:"id"`
+				Awarded float64 `json:"awarded"`
+			} `json:"questions"`
+		}
+		if err := json.Unmarshal(raw, &rep); err != nil {
+			t.Fatal(err)
+		}
+		got := map[string]float64{}
+		for _, q := range rep.Questions {
+			got[q.ID] = q.Awarded
+		}
+		return got
+	}
+
+	setPassive := func(t *testing.T, on bool) {
+		t.Helper()
+		cmds := []string{"configure terminal"}
+		for _, p := range ports {
+			cmds = append(cmds, "interface "+p)
+			if on {
+				cmds = append(cmds, "ip pim passive")
+			} else {
+				cmds = append(cmds, "no ip pim passive")
+			}
+		}
+		cmds = append(cmds, "end")
+		args := []string{"exec", "-m", dir, victim, "--", "vtysh"}
+		for _, c := range cmds {
+			args = append(args, "-c", c)
+		}
+		if out, err := twinet(t, args...); err != nil {
+			t.Fatalf("configuring %s: %v\n%s", victim, err, out)
+		}
+	}
+
+	before := grade(t)
+	for _, id := range []string{"q1", "q3", "q4"} {
+		if before[id] < 0.999 {
+			t.Fatalf("the reference does not score full marks on %s (%.2f); nothing below "+
+				"could be attributed to the change", id, before[id])
+		}
+	}
+
+	setPassive(t, true)
+	defer func() {
+		setPassive(t, false)
+		// Coming back is quick: a hello is sent at once.
+		time.Sleep(45 * time.Second)
+		after := grade(t)
+		for _, id := range []string{"q1", "q3"} {
+			if after[id] < 0.999 {
+				t.Errorf("%s is still %.2f after the lab was put back", id, after[id])
+			}
+		}
+	}()
+	// Long enough for the neighbours to time out.
+	//
+	// PIM's default hold time is 105 seconds, so a shorter wait reads a
+	// neighbour that has not expired yet as evidence that the check does not
+	// work.
+	time.Sleep(130 * time.Second)
+
+	broken := grade(t)
+	if broken["q1"] >= before["q1"] {
+		t.Errorf("q1 still scored %.2f with three transit interfaces passive; a PIM "+
+			"interface with no neighbour is not running PIM", broken["q1"])
+	}
+	if broken["q3"] >= before["q3"] {
+		t.Errorf("q3 still scored %.2f with one site unable to receive the group; the "+
+			"delivery check is not covering every site", broken["q3"])
+	}
+}
+
+// Evaluating an agent without root must refuse, not fall back.
+//
+// The sandbox used to run the agent as the invoking user when it could not
+// create a namespace, with no warning unless that user happened to be root. An
+// ordinary `twinet incident run --agent ...` therefore ran the agent as
+// somebody who can read the scenario file -- which names the fault and the
+// device -- so the benchmark measured nothing and looked exactly like one that
+// had worked. A score that cannot be trusted is worse than no score, because
+// somebody will quote it.
+func TestEvaluatingAnAgentWithoutRootRefuses(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("this test is about what happens when the runner is not root")
+	}
+	dir := labDir(t)
+	scenario := filepath.Join(dir, "incidents", "ospf_adjacency_lost.yaml")
+	if _, err := os.Stat(scenario); err != nil {
+		t.Skipf("no scenario to run: %v", err)
+	}
+	out, err := twinet(t, "incident", "run", "-m", dir, "--scenario", scenario,
+		"--agent", "printf '%s\\n' '{\"is_anomaly\":true}'", "--agent-timeout", "1m",
+		"-o", t.TempDir())
+	if err == nil {
+		t.Fatalf("an unprivileged run evaluated an agent instead of refusing:\n%s", out)
+	}
+	if !strings.Contains(out, "needs root") {
+		t.Errorf("the refusal does not say why:\n%s", out)
+	}
+	// And it must not have left the lab broken: refusing to evaluate is not a
+	// reason to leave a fault behind.
+	if got, err := twinet(t, "fault", "status", "-m", dir); err != nil {
+		t.Errorf("reading the fault status: %v", err)
+	} else if !strings.Contains(got, "nothing is injected") {
+		t.Errorf("a refused evaluation left faults in the lab:\n%s", got)
+	}
 }

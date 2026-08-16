@@ -71,9 +71,27 @@ func (r bgpRoute) NextHops() []string {
 // PathLen returns the number of AS numbers in the path.
 func (r bgpRoute) PathLen() int { return len(strings.Fields(r.Path)) }
 
-// Originated reports whether this AS injected the route itself, which is what
-// an empty AS path on a locally sourced entry means.
-func (r bgpRoute) Originated() bool { return strings.TrimSpace(r.Path) == "" }
+// Originated reports whether this AS injected the route itself.
+//
+// Two independent signs, either of which is decisive. FRR gives a path it
+// injected no peer at all -- `peerId` reads "(unspec)" -- and nothing a
+// route-map can set changes that, because there is no session to name. And an
+// empty AS path anywhere inside the AS means the same thing from the other
+// side: a route learned over eBGP always carries at least the neighbour's ASN,
+// so an empty path on an iBGP-learned copy can only have started here.
+//
+// The empty path alone was the whole test, and it is not enough. Injecting a
+// prefix with `network X route-map M` where M prepends an ASN produces a
+// locally sourced route with a non-empty path, which read as somebody else's
+// route passing through: a reviewer announced 203.0.113.0/24 that way, AS 3
+// advertised it to its customers, and the check that exists to catch exactly
+// that gave full marks.
+func (r bgpRoute) Originated() bool {
+	return r.PeerID == unspecifiedPeer || strings.TrimSpace(r.Path) == ""
+}
+
+// unspecifiedPeer is what FRR prints for a path with no session behind it.
+const unspecifiedPeer = "(unspec)"
 
 // routeSet is a prefix-to-paths map that accepts both an array of paths and a
 // single bare path object for each prefix.

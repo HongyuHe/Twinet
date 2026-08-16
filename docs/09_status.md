@@ -125,6 +125,252 @@ reached students, and each motivated a permanent test.
     so a corrupt capture was silently skipped and the device came back looking
     clean.
 
+11. **The benchmark could be answered from the internet.** Every scenario Twinet
+    ships names its fault, its device and its interface, and the repository is
+    public. The sandbox masked those files on this machine and left the agent
+    the machine's network, so `curl` fetched the answer from GitHub and an agent
+    that never queried a router scored 1.00. The agent now has a network
+    namespace of its own permitting the node agents and nothing else, and the
+    published scenarios no longer contain an answer to fetch: they say what kind
+    of link or device to break and the run draws one, recording the seed.
+
+12. **Withholding the internet from a paying customer was unassessed.** The
+    export half of Gao-Rexford was graded in one direction only — nothing
+    learned from a peer or a provider may go to a peer or a provider — because
+    a customer may receive anything. "May receive anything" is not "need receive
+    nothing": an AS could deny its providers' routes to every customer, leaving
+    them able to reach nobody outside it, and keep full marks for business
+    relationships. `policy.transit_for_customers` now requires every selected
+    route to reach every customer, and the discrimination suite mutates for it.
+
+13. **Reachability inside a VLAN was probed one way.** The same-VLAN half of the
+    layer-2 question looped over `i<j` -- one probe per unordered pair -- while
+    the cross-VLAN half deliberately probed every ordered pair. A host that
+    dropped what it sent to its neighbour, while still answering that
+    neighbour, kept whichever direction the loop happened to take, and full
+    marks with it. Every ordered pair is probed now. Doubling the traffic
+    through links the lab deliberately makes slow then cost a *correct*
+    submission a mark to a dropped packet, so the probes send two per hop and
+    retry three times: a mark that depends on the weather is worse than a
+    missing check, because nobody re-reads a grade that looks plausible.
+
+14. **A route-target leak that only went one way answered no probe.** Isolation
+    between VPN customers was established by pinging every site pair in both
+    directions. A ping needs a route home, and importing another customer's
+    route target on one edge leaves their table alone -- so packets flow into
+    the other bank's network, nothing comes back, every probe times out, and
+    the check reports perfect isolation. One bank able to inject traffic into
+    another's scored full marks. The tables are read as well as probed now.
+    Found by the advanced course's new discrimination suite on its first run,
+    which is what that suite is for.
+
+15. **One multicast site was never tested as a receiver.** Delivery sent from
+    one host and required every other one to receive; the sender was always the
+    same host, so that site was never on the receiving end. One `iptables` rule
+    on its own router -- a thing a student can write, because a student has root
+    in their containers -- blocked the group to it for full marks. The
+    no-flooding half had the mirror hole: the source and the single receiver
+    were never bystanders, so a submission flooding to exactly those two passed.
+    Both now run two rounds with the source moved, and a host covered by
+    neither makes the check say it cannot give a verdict.
+
+16. **The multicast rubric's only discrimination test never ran.** It was
+    guarded on an environment variable nothing sets. There is now a suite that
+    runs by default, and its first execution found the two holes above.
+
+17. **A counterfeit of the unsigned prefix passed for the real one.** Origin
+    validation asks that a prefix nobody has signed is still carried rather
+    than filtered away; it was marked by finding the prefix in every router's
+    table. A submission that filtered the real route away at every border and
+    announced the same prefix itself -- pointed at Null0, with a forged AS path
+    -- had it everywhere and kept full marks while nothing in that AS could
+    reach the network. The route must now have been learned from outside (FRR
+    gives a locally sourced route a next hop of 0.0.0.0, and where a route
+    entered cannot be written the way an AS path can) and must carry traffic.
+
+18. **A blackholed next hop counted as a reachable one.** The check named for
+    "the route is everywhere and the traffic is dropped" asked only whether the
+    router had *a* route to the next hop, and a blackhole is a route. The
+    entry is parsed now: installed, active, with somewhere to send the packet,
+    and not a discard. The same attack exposed a second hole -- the check
+    totalled usable next hops across the AS, so a router that had lost its
+    externally learned routes altogether contributed nothing to either total
+    and vanished into them. Every router must now hold every destination the AS
+    has learned.
+
+19. **The loopback was excluded from the check that said it covered every
+    interface.** "PIM is up on every interface of all 6 routers" was reported
+    by a check whose interface set skipped `lo`. The rendezvous point is
+    addressed by its loopback so that it outlives any one link, and one without
+    PIM cannot register a source: removing it from all six broke delivery while
+    this question kept full marks. The loopback is required now, and exempt
+    only from the rule about having a PIM neighbour, which a loopback cannot.
+
+20. **Equal-cost paths that carried nothing.** The question is decided from the
+    forwarding tables, which is right -- they say exactly which next hops are
+    installed, and sampling traceroutes can miss a live path. What they cannot
+    say is whether anything gets through: a rule dropping that exact traffic
+    left all three prescribed paths installed and every packet discarded, and
+    the report added that the source was balancing over both of them. The
+    tables still decide which paths exist; a probe now decides whether they
+    work.
+
+21. **A subnet redistributed into OSPF passed for one advertised into it.**
+    "Protocol is ospf" is true of a route redistributed from a static
+    blackhole: removing a service subnet's advertisement and redistributing a
+    Null0 route for it elsewhere put the prefix in every table, marked ospf,
+    reaching nowhere, while the check reported all thirty-two subnets carried.
+    OSPF classifies its own routes -- "N" intra-area against "N E1"/"N E2"
+    external -- and that classification is what is read now.
+
+22. **The label stack that carried nothing.** How a customer is carried is read
+    from the forwarding table, which is the only place that can tell a
+    two-label VPN path from a static route. Dropping labelled frames on the
+    interior links left every stack installed, every packet discarded, and the
+    mark intact. The mechanism question now has a precondition: some customer
+    traffic must arrive.
+
+23. **The internet exchange never delivered a route to anybody.** A route server
+    is transparent -- it relays a member's announcement without putting its own
+    AS in front of the path -- and FRR checks by default that the first AS of an
+    eBGP update is the peer's. Every member treated every route from the
+    exchange as a withdrawal, with no notification and an established-looking
+    session, for as long as the lab has existed. The exchange question scored
+    full marks throughout, because the half of it that can be observed is a
+    refusal and an AS that accepts nothing has certainly accepted nothing wrong.
+    Fixing it exposed a second defect hiding behind the first: the in-region
+    filter's `_X_` cannot match a path that *is* AS X, which is what a member
+    announcing its own prefix at an exchange sends. Both are fixed, and the
+    check now requires a member to accept what the exchange is relaying to it
+    from outside its region.
+
+24. **A refusal read without a background of acceptance.** "No invalid route is
+    selected" is trivially true of an AS that selected no external route at
+    all. A deny-everything clause ahead of the RPKI one -- the legitimate
+    clause still present and reachable -- left the AS holding only its own
+    prefix and kept full marks for origin validation. The check now counts
+    what was accepted before reading what was not.
+
+25. **A targeted LDP session accepted as a link adjacency.** LDP will bring up a
+    session between two loopbacks over whatever path the IGP offers: right
+    peer, right address, operational, labels installed. A submission could take
+    LDP off an interior link, replace it with a targeted session, and keep full
+    marks for label distribution across a link that distributes none.
+    `show mpls ldp discovery` names the kind, and every interior interface must
+    now carry a link adjacency with the router on the other side.
+
+26. **Evidence taken from the thing being marked.** Two checks read facts about
+    the world out of the submission's own routers. Whether an external session
+    was established came from its BGP summary: taking the real link down,
+    routing the neighbour's address into the interior and running a
+    four-message BGP speaker on a host produced "Established, remote AS 4" for
+    a system never contacted. And whether a ROA had been published came from
+    `show rpki prefix-table`: withdraw the real authorisation, run an RTR
+    server on a host, point the validator at it, and the table says whatever
+    the student likes. Sessions are now confirmed from the neighbour's side,
+    and publication from the trust anchor's own container.
+
+27. **A counter is a total, and a total can be moved by anything.** Whether
+    IPv6 crossed between the datacentres through the 6in4 tunnel was settled by
+    the tunnel's packet counters rising during the test. Routing every
+    datacentre prefix natively and pinging a link-local address across the
+    tunnel in a loop kept the counters climbing and earned the whole mark while
+    none of the traffic in question was encapsulated. Each gateway is now asked
+    what it would do with a packet for the address being tested, in both
+    directions, and the answer has to be the tunnel.
+
+28. **A route attributed to the next hop it carries rather than the session it
+    arrived on.** An inbound route-map can set the next hop to anything.
+    Pointing a customer's routes at an unrelated on-link address made them
+    invisible to the business-relationship check, so ranking them below a
+    peer's cost nothing. A path's peerId is the session it came in on and no
+    policy can change it; provenance is read from there now.
+
+29. **A reply is not proof the right machine answered.** Internal reachability
+    was established by pinging. A DNAT rule on the source redirects the echo
+    requests for one host to another, and conntrack rewrites the reply so the
+    source sees a perfectly ordinary answer from the address it asked about.
+    Each host's own count of echo requests the kernel delivered to it is now
+    read before and after the matrix, and a host that answered probes it never
+    received fails the question by name.
+
+    What this does *not* establish: a submission controls every host in its own
+    AS, so it can redirect an individual probe and leave the destination's
+    count rising from the other seven sources. The wholesale case is caught;
+    the single-pair case is not, and no evidence gathered inside a network its
+    owner controls could catch it. It is recorded here rather than left to be
+    discovered.
+
+30. **The rendezvous point PIM would use, rather than the one written for the
+    declared range.** The check compared each router's mapping against the
+    declared group range exactly and ignored every other row; PIM takes the
+    most specific prefix covering the group. A second mapping for a /32 inside
+    the range pointed the group the exercise actually sends to at a different
+    router, on all six of them, while the question reported agreement.
+
+31. **A count of adjacencies instead of the adjacencies asked for.** Whether
+    every interior link was adjacent was decided by counting neighbours in
+    state Full against twice the number of links. Making one link passive and
+    tunnelling an adjacency between the same two routers kept the total exactly
+    right while the link had none. Each interface the plan gives a neighbour
+    must now have one, and an adjacency where the plan has no link is reported
+    rather than counted.
+
+32. **The provider answering for the customer it is meant to carry.** Whether a
+    customer's sites reach each other was established by pinging between them,
+    and every packet crosses the provider -- the thing being marked. A rule on
+    each edge answering the far site's address locally, with the real traffic
+    dropped, left all four probes succeeding and the mark untouched. The
+    customer's own hosts now have to have received the probes; unlike the
+    single-AS case, they belong to somebody else, so this evidence is decisive.
+33. **The right prefix, advertised by the wrong router.** Whether a subnet was
+    in OSPF was decided by asking every router whether it held that prefix as an
+    intra-area route. A prefix carries no record of where it came from: taking
+    the measurement network out of OSPF on the router it is attached to and
+    putting the same numbers on a dummy interface on another router left every
+    table holding it, and the check gave full credit for a network OSPF no
+    longer reached. Each subnet is now bound to the interface the plan puts in
+    it, and the check reads what OSPF believes it is running on, per interface.
+34. **A network nothing ever sent a packet to.** The measurement and DNS subnets
+    are part of the assignment, and grading established only that a prefix was
+    carried. The echo counter inside the measurement container read zero after
+    every run this project had ever done -- so when the prefix above was moved
+    and the network went dark, the data-plane check saw nothing, because it
+    probed only hosts. Reachability now also probes from each service container
+    into the AS, pinned to the interface facing it: the platform owns that
+    container, so the traffic is not something a submission can arrange, and the
+    reply has to come back through the subnet being graded.
+35. **An address the plan does not mention, costing nothing.** Whether the
+    addressing matched the plan was decided by looking for the prescribed
+    addresses and nothing else; anything extra was reported and scored neither
+    way. Two reviewers made the same objection, and they were right twice over:
+    the claim is that the addressing matches, which an unplanned address
+    falsifies, and an unplanned address is the raw material for impersonation --
+    claiming a subnet that lives somewhere else is how most of the defects above
+    were built. An address outside every subnet in the lab now costs half the
+    mark for the question, because "and nothing else" is a property of the whole
+    system rather than a fiftieth of a count. An address inside a subnet the
+    plan assigns elsewhere fails the check outright.
+36. **A hijack dressed as transit.** Whether this AS had originated a prefix was
+    decided by the AS path being empty. Injecting one with `network X route-map
+    M`, where M prepends an ASN, produces a locally sourced route with a path,
+    which read as somebody else's route passing through: 203.0.113.0/24
+    announced that way propagated to AS 3's customers while the check that
+    exists to catch a hijack gave full marks. FRR gives a path it injected no
+    peer at all -- `peerId` reads `(unspec)` -- and no route-map can change
+    that, because there is no session to name. Either sign is now decisive.
+37. **Transit promised and not delivered.** Everything the customer-transit
+    check asked about was the routes a customer is *offered*, which is a promise
+    rather than a service. Leaving every session established and every route
+    advertised while dropping the customers' packets in the FORWARD chain cost
+    nothing. A packet now leaves the customer's own router, which the submission
+    does not configure, and the destination in a third AS counts what it
+    received. A multi-homed customer that prefers another provider routes
+    nothing this way, so the traffic is put onto the session with one host route
+    on their router -- with a source address of theirs that the internet can
+    route back to, because the link's own numbering is advertised nowhere and
+    the first reverse-path check on the way drops it.
+
 ## Environment findings
 
 - **Jumbo frames are unavailable.** Raising `eno2` to MTU 9000 dropped the
@@ -146,10 +392,12 @@ someone has checked.
 |---|---|---|
 | The web UI's history: a time slider over past snapshots, per-group VPN status, the Krill proxy | M2 | The matrix, looking glass and overview are served by `twinet web`; the snapshots exist in the state store and nothing renders them |
 | Gateway `save` / SFTP | M2 | `goto`, `status` and `help` are there, and leaving a device shell now returns to the menu rather than dropping the connection. `save` from inside the gateway and SFTP file transfer are not; students collect work with `twinet save` from outside |
+| Outbound access for named devices (`egress:`) | M2 | Declared in the manifest and the schema and read by nothing. A manifest that uses it is now refused rather than deployed with the block ignored. Needs a per-device port into the node's namespace and masquerade on the node |
+| A legacy `save_configs.sh` layout exporter | — | `twinet save` writes Twinet's own archive: a routing configuration and a replayable script per device. The legacy per-device directory layout is a state dump, which cannot be replayed, and is useful only for diffing against the old platform |
 | Krill as a live RPKI publication point | M2 | The lab serves an RTR feed derived from the topology, which is what the exercise needs; a real publication point with per-AS validators is the fuller version |
-| COS-461 Q2.6 stub-AS hijack scenarios | M7 | The RPKI machinery is in place and the check is honest; the scripted hijack scenarios are not written |
+| Real Krill certificate authority | M7 | ROAs are published through an interface of our own on the lab's trust anchor, not a Krill CA hierarchy. The exercise's observable behaviour is the same -- a student publishes a ROA for their own prefix and only their own -- and the lab stays self-contained |
 | Diff-and-converge `apply` | M4 | Deploy is idempotent and now self-healing, but does not compute a minimal change plan |
-| Advanced-course exercises: multicast | M7 | MPLS and VRF are done -- `examples/advnet` is the ETH BGP-free-core and BGP/MPLS L3VPN exercise, verified end to end on the cluster: the two sites of each bank reach each other over a two-label stack, neither bank reaches the other, and the core router has no BGP instance and four operational LDP neighbours. Multicast has no exercise and no checks. It is graded: `examples/advnet/rubric/advnet.yaml` is worth 6 points across the BGP-free core, carrying each customer between its sites, and keeping the customers apart. Verified to discriminate on the cluster, not merely to be satisfiable -- the reference scores 6/6; putting BGP on the core scores 0.8/2 on that question alone; making both tables import both route targets scores 0/2 on isolation while reachability still passes |
+| Advanced-course exercises | M7 | Both are done. MPLS and VRF -- `examples/advnet` is the ETH BGP-free-core and BGP/MPLS L3VPN exercise, verified end to end on the cluster: the two sites of each bank reach each other over a two-label stack, neither bank reaches the other, and the core router has no BGP instance and four operational LDP neighbours. It is graded: `examples/advnet/rubric/advnet.yaml` is worth 6 points across the BGP-free core, carrying each customer between its sites, and keeping the customers apart. Verified to discriminate on the cluster, not merely to be satisfiable -- the reference scores 6/6; putting BGP on the core scores 0.8/2 on that question alone; making both tables import both route targets scores 0/2 on isolation while reachability still passes; shutting LDP on one edge scores 3.95/6 and the label-switching check names the prefix that stopped being carried. Multicast is `examples/multicast`, the course's own six-router topology with PIM sparse mode and IGMP left to the student, graded out of 4 by `examples/multicast/rubric/multicast.yaml`: two marks for configuration that can be read back and two for a packet that a host actually received while a host that did not join heard nothing. Verified to discriminate: the reference scores 4/4, and making one router passive on its three transit interfaces scores 3.30 -- the configuration check naming all six interfaces on both ends of the three links, and the delivery check naming the site that received nothing |
 | The 15 unimplemented NIKA fault types | M8 | Each needs a substrate Twinet does not emulate (6 P4/BMv2, 4 Kubernetes, 3 SDN-southbound, 2 others); adding them means adding that substrate. The DHCP family is now implemented: 45 of NIKA's 60 types are covered, verified by asking real clients for leases rather than by reading configuration back. See [10](10_fault_injection.md) |
 | Load-balancer service, traffic generation | M8 | Prerequisites for two of those |
 

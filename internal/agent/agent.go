@@ -354,6 +354,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	mux.HandleFunc("GET /v1/underlay", s.auth(s.handleUnderlay))
 	mux.HandleFunc("GET /v1/state", s.auth(s.handleStateExport))
 	mux.HandleFunc("POST /v1/state", s.auth(s.handleStateImport))
+	mux.HandleFunc("POST /v1/sweep", s.auth(s.handleSweep))
 
 	srv := &http.Server{
 		Addr:    s.cfg.Listen,
@@ -463,6 +464,14 @@ func (s *Server) auth(h http.HandlerFunc) http.HandlerFunc {
 		got := []byte(r.Header.Get("Authorization"))
 		if subtle.ConstantTimeCompare(got, want) != 1 {
 			http.Error(w, "unauthorised", http.StatusUnauthorized)
+			return
+		}
+		// The certificate issued to an evaluated agent is a limit as well as a
+		// permission: whatever token it presents, it may not reach the routes
+		// that change the cluster.
+		if diagnosticClient(r) {
+			http.Error(w, "a diagnostic session may not use this route",
+				http.StatusForbidden)
 			return
 		}
 		h(w, r)
@@ -1381,4 +1390,73 @@ func describeTLSInputs(c Config) string {
 		}
 	}
 	return strings.Join(have, " and ") + " only"
+}
+
+// SweepRequest asks a node to report, and optionally remove, the overlays it is
+// carrying for nobody.
+type SweepRequest struct {
+	// Remove actually deletes them; without it the node only reports.
+	Remove bool `json:"remove,omitempty"`
+}
+
+// SweepResponse is what the node found.
+type SweepResponse struct {
+	Node    string        `json:"node"`
+	Orphans []netx.Orphan `json:"orphans,omitempty"`
+	Removed []uint32      `json:"removed,omitempty"`
+	InUse   []netx.Orphan `json:"in_use,omitempty"`
+	Errs    []string      `json:"errors,omitempty"`
+}
+
+// handleSweep finds overlays belonging to no lab this node hosts.
+//
+// A destroyed lab whose teardown was interrupted leaves its tunnels and bridges
+// behind. They cost a VNI each out of a finite space, and the deconfliction
+// that stops two labs choosing the same identifier reads the very ownership
+// record they are missing. A hundred were found on one node of this cluster
+// against forty-four in use, left by labs destroyed weeks earlier, and nothing
+// had ever reported them.
+func (s *Server) handleSweep(w http.ResponseWriter, r *http.Request) {
+	var req SweepRequest
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&req)
+	}
+	s.mu.Lock()
+	live := map[string]bool{}
+	for name := range s.current {
+		live[name] = true
+	}
+	busy := len(s.ops) > 0
+	s.mu.Unlock()
+	// A node in the middle of an operation is creating overlays right now, and
+	// one created a moment ago has no container on it yet.
+	if req.Remove && busy {
+		httpError(w, http.StatusConflict,
+			errors.New("this node has an operation in flight; sweeping now could remove an "+
+				"overlay that is being built"))
+		return
+	}
+
+	found, err := netx.FindOrphans(live)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, err)
+		return
+	}
+	resp := SweepResponse{Node: s.cfg.Node}
+	for _, o := range found {
+		if o.Ports > 0 {
+			resp.InUse = append(resp.InUse, o)
+			continue
+		}
+		resp.Orphans = append(resp.Orphans, o)
+		if !req.Remove {
+			continue
+		}
+		if err := netx.RemoveOverlay(o.VNI); err != nil {
+			resp.Errs = append(resp.Errs, fmt.Sprintf("vni %d: %v", o.VNI, err))
+			continue
+		}
+		resp.Removed = append(resp.Removed, o.VNI)
+	}
+	writeJSON(w, resp)
 }

@@ -305,7 +305,15 @@ func (s *DHCPServer) handleOn(pkt []byte, hint string) ([]byte, *DHCPSubnet, err
 		return nil, nil, nil
 	}
 	addr, ok := s.leases[mac]
-	if !ok || !containsAddr(sub, addr) {
+	// The pool, not merely the subnet.
+	//
+	// A remembered lease was reused whenever it fell inside the segment's
+	// prefix, so moving the pool changed nothing for any client that already
+	// had an address: the operator narrows the range, or a fault moves it
+	// somewhere else entirely, and every existing client keeps what it had for
+	// ever. A real server NAKs a request for an address outside the range it
+	// is now configured to hand out, and so does this one.
+	if !ok || !containsAddr(sub, addr) || !inPool(sub, addr) {
 		addr, ok = s.allocate(sub, mac)
 		if !ok {
 			return nil, nil, nil
@@ -371,6 +379,17 @@ func (s *DHCPServer) allocate(sub *DHCPSubnet, mac string) (netip.Addr, bool) {
 		}
 	}
 	return netip.Addr{}, false
+}
+
+// inPool reports whether an address is one this server is currently configured
+// to hand out.
+func inPool(sub *DHCPSubnet, a netip.Addr) bool {
+	first, err1 := netip.ParseAddr(sub.First)
+	last, err2 := netip.ParseAddr(sub.Last)
+	if err1 != nil || err2 != nil || !a.IsValid() {
+		return false
+	}
+	return a.Compare(first) >= 0 && a.Compare(last) <= 0
 }
 
 func containsAddr(sub *DHCPSubnet, a netip.Addr) bool {

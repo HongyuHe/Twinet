@@ -103,15 +103,19 @@ Emitted in NIKA's shape so scoring code is shared, not reimplemented:
 ## 4. Coverage of NIKA's fault taxonomy
 
 NIKA's registry currently defines **60** injectable root causes
-(`/users/hy/nika/docs/failure-types.md`). Twinet registers **42** fault types,
-of which **40 are NIKA types**; the remaining two (`bgp_peer_asn_misconfig`,
+(`/users/hy/nika/docs/failure-types.md`, vendored at
+`internal/fault/nika_types.json`). Twinet registers **47** fault types, of which
+**45 are NIKA types**; the remaining two (`bgp_peer_asn_misconfig`,
 `host_network_down`) are Twinet's own.
 
-The numbers below are produced by diffing `twinet fault list --json` against
-NIKA's table, not by counting entries in this document. An earlier revision
-claimed 47 of 48 by counting types the plan intended to add; the count was wrong
-in both terms and stayed wrong through two reviews, which is a good argument for
-generating it.
+The numbers below are produced by diffing the registry against the vendored
+taxonomy, not by counting entries in this document. An earlier revision claimed
+47 of 48 by counting types the plan intended to add; the count was wrong in both
+terms and stayed wrong through two reviews. A later one said 42 and 40 in this
+paragraph and 47 and 45 in the table below, which is the same failure in a
+smaller way. `TestTheCoverageTableMatchesTheRegistry` now reads the figures out
+of this document and compares them with the registry, so a stale number fails
+the build rather than a review.
 
 | | Count |
 |---|---:|
@@ -132,8 +136,8 @@ comm -23 /tmp/want /tmp/have    # NIKA types Twinet does not implement
 
 ### 4.1 What is not implemented, and why
 
-The 20 gaps are not scattered: they are four substrates Twinet does not emulate,
-plus one family that is a design change rather than a fault.
+The 15 gaps are not scattered: they are four substrates Twinet does not emulate,
+plus two types that are design changes rather than faults.
 
 | Group | Types | What it would take |
 |---|---:|---|
@@ -324,9 +328,7 @@ truth, the symptoms, the diagnosis, the score and the timings.
 
 The agent is a command. It is given the brief, the symptoms, the lab's name and
 how to reach it, on standard input; it is not given the ground truth, the fault
-names or anything else that would answer the question, and the end-to-end suite
-asserts that -- an agent that could read the answer would measure nothing. It
-prints a diagnosis:
+names or anything else that would answer the question. It prints a diagnosis:
 
 ```json
 {"is_anomaly": true,
@@ -335,6 +337,105 @@ prints a diagnosis:
  "root_cause_name": ["ospf_neighbor_missing"],
  "explanation": "free text, recorded and not scored"}
 ```
+
+### What the agent can and cannot see
+
+Not telling the agent the answer is not the same as the agent not being able to
+find it, and every weaker arrangement was tried first and defeated:
+
+| Attempt | How it was defeated |
+|---|---|
+| Keep the ground truth off standard input | `cat $TWINET_MANIFEST/.twinet/injections.json` — the manifest path was in the environment |
+| Copy the lab, minus its private state | The original is world-readable; the agent opened it by absolute path |
+| Drop to an unprivileged account | The scenario file beside the lab names the fault, the device and the interface in plain YAML — and so do the tests that exercise it |
+| Mask every path that holds the answer | The agent had this machine's network, and the scenarios are published: `curl` fetched the answer from GitHub |
+| Mask the paths and cut the network | The answer was still *written in the scenario*, so a model that had read the repository never needed to fetch it |
+
+What holds is a mount namespace. The agent runs as a system account with no
+shell, in a private namespace where the lab directory, the repository containing
+it and any episode directory are each covered by an empty, unreadable
+filesystem. Its working directory is a copy of the lab holding the manifest and
+the placement — how the network was meant to be built, and where the devices
+are, both of which a diagnostician is entitled to — and not the scenarios, the
+ledger, the roster, the credentials or the PKI. Its credential is derived from
+the cluster token by HMAC over the lab name: the node agents accept it for
+status, container listing and exec, refuse every other route, confine it to that
+one lab, and allow only commands that observe, so it cannot take a grading hold,
+enter configuration mode, or bring an interface down. An agent that can repair
+or worsen its own incident is not being scored on anything.
+
+`twinet incident run --agent` therefore needs root, to create the namespaces and
+to drop out of them. Without root, or without `unshare` and `setpriv`, it
+refuses -- before injecting anything -- and says which is missing. It used to
+fall back to running the agent as the invoking user with no isolation at all,
+which produced a number that looked like a measurement and was not.
+
+### The agent's network
+
+The agent gets a network namespace of its own, joined to the machine by a single
+link, with a firewall that permits the node agents' addresses and ports and
+rejects everything else. There is no route to the internet, no resolver, and
+nothing else on the cluster within reach — not another node's SSH, not a
+container, not the machine it is running on. Names the manifest uses are
+resolved before the agent starts and given to it as a hosts file, so blocking
+DNS costs it nothing and gives it no channel.
+
+This is not defence in depth for its own sake. Every scenario Twinet ships is in
+a public repository, and each one used to name its fault, its device and its
+interface. An agent that fetched
+`raw.githubusercontent.com/HongyuHe/Twinet/.../ospf_adjacency_lost.yaml` scored
+1.00 without asking a single router anything.
+
+An operator who needs the agent to reach something else — a model endpoint is
+the usual reason — says so with `--allow-egress host:port`, and the resulting
+set is recorded in the episode. A score earned with a route to the internet is a
+different measurement from one earned without, and that belongs beside the
+number rather than in somebody's memory.
+
+### Where the fault goes is drawn, not written
+
+Cutting the network stops an agent fetching the answer during the run. It does
+nothing about an answer it already knows, and a published scenario that says
+`device: NYC, iface: port_PHY` is an answer anybody can memorise — including a
+model trained on the internet.
+
+So a scenario says what *kind* of place the fault goes, and the run draws one:
+
+```yaml
+faults:
+  - type: ospf_neighbor_missing
+    select:
+      kind: internal_link      # or external_link, router, host
+      as: [3]
+```
+
+Twinet enumerates every target in the deployed topology the selector matches —
+24 internal links inside AS 3 in the COS-461 lab — and draws one with a seed
+taken at run time. The seed is recorded in the episode, so an episode can be
+replayed exactly afterwards (`--seed`) without being predictable beforehand. A
+selector that matches nothing is refused rather than skipped: an episode with
+fewer faults than its ground truth claims is worse than no episode.
+
+`incident run --agent` refuses a scenario whose targets are pinned, and says
+why. `--allow-pinned-target` is for a scenario that is genuinely private.
+
+The agent also needs to reach the node agents, and on a cluster with mutual TLS
+a bearer token is not enough. It is issued a client certificate of its own,
+valid for hours, in its sandbox: transport identity is not authorisation here --
+the node agents decide what a caller may do from its token -- but handing the
+controller's private key to something under evaluation is not a thing to do
+when issuing another costs nothing. Without this the agent could not observe
+anything at all, which scores exactly like an agent that looked and found
+nothing.
+
+The end-to-end suite runs an agent whose entire strategy is to look for the
+answer — the ledger by three paths, the scenarios in the lab and in its own
+copy, a search of the filesystem, a grep of the repository, the Docker socket,
+the scenario fetched from GitHub by name and by address, a query to a public
+resolver, and a port on another node — and requires all of it to come back
+empty. It also requires that agent
+to have actually run, because a test that passes because the subject never
+started is the failure this whole mechanism exists to prevent.
 
 The score has four parts rather than one, because an agent that names the right
 device for the wrong reason and one that names the right reason on the wrong

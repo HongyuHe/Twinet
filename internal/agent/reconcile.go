@@ -197,12 +197,25 @@ func (s *Server) repairLab(ctx context.Context, top *model.Topology, broken []*m
 		// deployed at the reference throws the reference solution away -- a
 		// far worse outcome than the fault being repaired.
 		if why := s.brokenBecause(ctx, top.Name, d); strings.HasPrefix(why, daemonsDown) {
-			if err := s.startDaemons(ctx, top.Name, d); err != nil {
-				slog.Error("routing daemons could not be started", "device", d.ID, "err", err)
+			if err := s.startDaemons(ctx, top.Name, d); err == nil {
+				slog.Info("routing daemons restarted", "device", d.ID)
 				continue
+			} else {
+				// Starting is futile when the reason they are not running is
+				// that the configuration says not to run them.
+				//
+				// A container recreated by an interrupted deployment comes up
+				// with the image's own /etc/frr/daemons, in which bgpd, ospfd
+				// and ldpd are all off. frrinit.sh then honours that file and
+				// starts nothing, the repair reports failure three times, and
+				// the device is abandoned -- a router with no BGP in a lab
+				// nobody is watching, found here as one AS whose customer
+				// session had been down for forty minutes with every ping
+				// between them succeeding. Rewiring re-renders the files,
+				// which is what such a device actually needs.
+				slog.Error("routing daemons could not be started; rebuilding the device so "+
+					"its configuration is written again", "device", d.ID, "err", err)
 			}
-			slog.Info("routing daemons restarted", "device", d.ID)
-			continue
 		}
 		if err := eng.RewireDevice(ctx, top, d); err != nil {
 			s.repairFailed(top.Name, d.ID, "rewiring failed", err)

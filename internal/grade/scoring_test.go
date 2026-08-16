@@ -43,6 +43,34 @@ func TestABrokenCheckIsExcludedRatherThanFailed(t *testing.T) {
 	}
 }
 
+// A property that cannot arise in this AS is neither a pass nor a zero.
+//
+// A stub with no customers cannot withhold transit from one. Marking that a
+// pass awards a mark for something nobody established; marking it a failure
+// charges a student for a topology they were given; and marking it an error
+// summons a human to look at a network that is fine.
+func TestAnInapplicableCheckIsSetAsideNotScored(t *testing.T) {
+	q := QuestionSpec{
+		ID: "q1", Points: 2,
+		Checks: []CheckSpec{{Check: "a", Weight: 1}, {Check: "b", Weight: 1}},
+	}
+	results := []Result{
+		{Check: "a", Status: StatusPass, Score: 1},
+		NotApplicable("b", "this AS has no customers"),
+	}
+	if got := awardFor(q, results); math.Abs(got-2.0) > 1e-9 {
+		t.Errorf("awarded %.3f of 2, want 2.000; a question that could not be asked was "+
+			"charged to the student", got)
+	}
+	// And it must not be mistaken for a pass by anything reading the report.
+	if results[1].Passed() {
+		t.Error("a check that was never run reports itself as passed")
+	}
+	if results[1].Score != 0 {
+		t.Errorf("an inapplicable check carries a score of %.2f", results[1].Score)
+	}
+}
+
 func TestPartialCreditIsCarriedThrough(t *testing.T) {
 	q := QuestionSpec{ID: "q1", Points: 10, Checks: []CheckSpec{{Check: "a", Weight: 1}}}
 	results := []Result{{Check: "a", Status: StatusPartial, Score: 0.5}}

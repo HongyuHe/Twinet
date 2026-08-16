@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"sort"
 	"strings"
 	"syscall"
 
@@ -478,4 +479,72 @@ func overlayOwner(vxName string) (string, bool, error) {
 		return "", false, fmt.Errorf("look up %s: %w", vxName, err)
 	}
 	return ownerFromAlias(l.Attrs().Alias), true, nil
+}
+
+// Orphan is an overlay left behind on this host: a VXLAN device belonging to no
+// lab this node hosts, whose bridge carries nothing.
+type Orphan struct {
+	VNI   uint32 `json:"vni"`
+	Owner string `json:"owner,omitempty"`
+	Ports int    `json:"ports"`
+}
+
+// FindOrphans lists the overlays this host is carrying for nobody.
+//
+// An overlay is kept if a lab named in `live` owns it, or if its bridge still
+// has something attached: a device with a container's veth on it is in use by
+// something, whatever its ownership record says, and removing it would cut a
+// running lab's cable. Only the peerless ones are orphans.
+//
+// They accumulate. A hundred were found on one node of this cluster against
+// forty-four in use, left by labs destroyed weeks earlier, and nothing had ever
+// reported them -- they cost a VNI each out of a finite space, and the
+// deconfliction that stops two labs picking the same identifier reads exactly
+// this ownership record.
+func FindOrphans(live map[string]bool) ([]Orphan, error) {
+	links, err := netlink.LinkList()
+	if err != nil {
+		return nil, fmt.Errorf("list host interfaces: %w", err)
+	}
+	// Which bridges have a port that is not their own tunnel.
+	ports := map[int]int{}
+	for _, l := range links {
+		a := l.Attrs()
+		if a.MasterIndex == 0 {
+			continue
+		}
+		if _, isVx := l.(*netlink.Vxlan); isVx {
+			continue
+		}
+		ports[a.MasterIndex]++
+	}
+	byName := map[string]netlink.Link{}
+	for _, l := range links {
+		byName[l.Attrs().Name] = l
+	}
+
+	var out []Orphan
+	for _, l := range links {
+		vx, ok := l.(*netlink.Vxlan)
+		if !ok || !strings.HasPrefix(vx.Name, "twvx") {
+			continue
+		}
+		vni := uint32(vx.VxlanId)
+		owner := ownerFromAlias(vx.Attrs().Alias)
+		if owner != "" && live[owner] {
+			continue
+		}
+		n := 0
+		if br, ok := byName[BridgeName(vni)]; ok {
+			n = ports[br.Attrs().Index]
+		}
+		if n > 0 {
+			// In use by something. Reported, not removed.
+			out = append(out, Orphan{VNI: vni, Owner: owner, Ports: n})
+			continue
+		}
+		out = append(out, Orphan{VNI: vni, Owner: owner})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].VNI < out[j].VNI })
+	return out, nil
 }

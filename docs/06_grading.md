@@ -129,7 +129,7 @@ Library, mapped to the COS-461 questions:
 |---|---|
 | `l2.vlan_isolation` | admin↔admin and patient↔patient reachable; admin↔patient only via the L3 gateway (assert the traceroute has the gateway hop) |
 | `l2.gateway_configured` | hosts' default gateway is the prescribed router |
-| `l3.addressing_matches_plan` | every interface matches the manifest's `expected` addressing (Q1.2) |
+| `l3.addressing_matches_plan` | every interface matches the manifest's `expected` addressing, and no router carries an address the plan does not mention (Q1.2) |
 | `ospf.full_adjacency` | all OSPF neighbours `Full` |
 | `ospf.subnets_advertised` | every required subnet, incl. DNS/measurement/matrix, in the OSPF LSDB |
 | `ospf.ecmp_paths` | compute the shortest-path DAG from `show ip ospf … json` **and** confirm empirically (repeated traceroutes / marker packets) that exactly the three prescribed `ATL`↔`BOS` paths carry traffic (Q1.3) |
@@ -138,6 +138,8 @@ Library, mapped to the COS-461 questions:
 | `bgp.next_hop_self` | eBGP-learned routes carry a reachable next hop internally |
 | `bgp.own_prefix_only` | the AS originates exactly its /8 |
 | `policy.gao_rexford` | inject from each relationship class via doubles; assert local-pref ordering and that provider/peer routes are not re-exported to provider/peer (Q2.3) |
+| `policy.no_transit_for_peers` | nothing learned from a peer or a provider is advertised to a peer or a provider, and your own and your customers' prefixes are (Q2.3) |
+| `policy.transit_for_customers` | every route the AS selected reaches every customer — the transit half of the export rule, and the opposite error from a leak (Q2.3) |
 | `policy.ixp_communities` | announcements are relayed only to out-of-region members and in-region announcements from the IXP are filtered (Q2.4) |
 | `policy.traffic_engineering` | the slow provider/customer is deprioritised outbound (local-pref) and made less attractive inbound (AS-path prepend), **without** any deny (Q2.5) |
 | `rpki.roa_published` | the AS's ROA exists in the RPKI snapshot and covers its /8 |

@@ -67,7 +67,7 @@ func (s *Server) authDiag(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		r.Header.Del(scopeHeader)
 		got := r.Header.Get("Authorization")
-		if subtle.ConstantTimeCompare([]byte(got), full) == 1 {
+		if subtle.ConstantTimeCompare([]byte(got), full) == 1 && !diagnosticClient(r) {
 			h(w, r)
 			return
 		}
@@ -80,6 +80,26 @@ func (s *Server) authDiag(h http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// diagnosticClient reports whether the transport identity is the certificate
+// issued to an evaluated agent.
+//
+// A leaked cluster token should not be usable from inside the sandbox. The
+// token was found in a world-readable systemd unit and the agent read it, so
+// the certificate it was given is now also a limit rather than only a
+// permission: presented with it, a node refuses the full token and honours only
+// a diagnostic one. Two independent things now have to go wrong.
+func diagnosticClient(r *http.Request) bool {
+	if r.TLS == nil {
+		return false
+	}
+	for _, c := range r.TLS.PeerCertificates {
+		if c.Subject.CommonName == "diagnostic" {
+			return true
+		}
+	}
+	return false
+}
+
 // diagScopeOf reports the lab a diagnostic caller is confined to, and whether
 // the caller is a diagnostic one at all.
 func diagScopeOf(r *http.Request) (string, bool) {
@@ -87,28 +107,280 @@ func diagScopeOf(r *http.Request) (string, bool) {
 	return lab, lab != ""
 }
 
-// readOnlyCommands are the programs a diagnostic caller may run. The rule is
-// not "commands that look harmless" but "commands with no way to change the
-// device": anything that configures, restarts, writes a file, or opens a shell
-// is absent, because a fault an agent introduced itself is indistinguishable
-// from the one it was asked to find.
-var readOnlyCommands = map[string]bool{
-	"ping": true, "ping6": true, "traceroute": true, "traceroute6": true,
-	"tracepath": true, "mtr": true, "dig": true, "host": true, "nslookup": true,
-	"ip": true, "ss": true, "netstat": true, "arp": true, "bridge": true,
-	"cat": true, "ls": true, "head": true, "tail": true, "grep": true, "wc": true,
-	"date": true, "uptime": true, "hostname": true, "ethtool": true,
-	"vtysh": true, "birdc": true, "tcpdump": true, "curl": true, "wget": true,
-	"ip6tables-save": true, "iptables-save": true, "sysctl": true, "nc": true,
-	"ps": true, "free": true, "df": true, "sh": false, "bash": false,
+// What a diagnostic caller may run, program by program, with the arguments each
+// one is allowed.
+//
+// This was a list of programs plus a scan for words that write, and it was
+// walked past twice: once with a newline hiding "configure terminal" inside a
+// vtysh body, once with `ip -family inet link set`, where the argument of an
+// option was mistaken for the object. A denylist has to think of everything; a
+// grammar has to be given permission. Every program here has a validator, the
+// default is refusal, and a program whose read-only subset is not worth
+// spelling out is simply absent.
+//
+// Absent on purpose, having been present: ethtool, whose -K and -s change the
+// device; nc, whose -e runs a command; curl and wget, which write files; birdc,
+// which configures a routing daemon these images do not even run.
+var readOnlyPrograms = map[string]func(cmd []string) error{
+	// Pure observation, whatever the arguments.
+	"ping": nil, "ping6": nil, "traceroute": nil, "traceroute6": nil,
+	"tracepath": nil, "mtr": nil, "dig": nil, "host": nil, "nslookup": nil,
+	"cat": nil, "head": nil, "tail": nil, "grep": nil, "wc": nil, "ls": nil,
+	"date": nil, "uptime": nil, "ps": nil, "free": nil, "df": nil,
+	"netstat": nil,
+
+	// iptables-save -f writes the ruleset to a file, as root, anywhere.
+	"iptables-save":  savesReadOnly,
+	"ip6tables-save": savesReadOnly,
+
+	// Observation with a way to write, spelled out.
+	"ip":       refuseWrites,
+	"bridge":   refuseWrites,
+	"sysctl":   sysctlReadOnly,
+	"ss":       ssReadOnly,
+	"arp":      arpReadOnly,
+	"hostname": hostnameReadOnly,
+	"tcpdump":  tcpdumpReadOnly,
+	"vtysh":    vtyshReadOnly,
 }
 
-// writeSubcommands are the second words that turn an otherwise read-only
-// program into one that changes the device.
-var writeSubcommands = map[string]map[string]bool{
-	"ip":     {"link": true, "addr": true, "address": true, "route": true, "rule": true, "neigh": true, "netns": true, "tunnel": true, "vrf": true, "xfrm": true, "mroute": true, "maddr": true},
-	"bridge": {"link": true, "fdb": true, "vlan": true, "mdb": true},
-	"sysctl": {"-w": true},
+// writeVerbs change something, wherever they appear in an iproute2 command
+// line.
+//
+// Matching by position was the mistake. The parser took the first argument that
+// did not begin with a dash as the object and the next as the verb, so
+// `ip -family inet link set dev lo down` -- where "inet" is the *argument to*
+// -family -- made "inet" the object, "link" the verb, and "set" invisible. A
+// diagnostic session took an interface down on a host it was being scored on.
+var writeVerbs = map[string]bool{
+	"set": true, "add": true, "del": true, "delete": true, "change": true,
+	"replace": true, "append": true, "flush": true, "restore": true,
+	"exec": true, "attach": true, "detach": true, "chain": true,
+}
+
+// writeOptions do something other than print, whatever else is on the line:
+// -batch runs a file of commands, -force presses on past errors, and -netns
+// moves the whole operation into another network namespace.
+var writeOptionNames = map[string]bool{
+	"batch": true, "force": true, "netns": true, "all": true, "write": true,
+}
+
+// refuseWrites rejects an iproute2-style command that changes anything.
+//
+// Abbreviations count. iproute2 accepts any unambiguous prefix of a keyword, so
+// `ip link se dev lo up` is `ip link set dev lo up` -- and a validator matching
+// the exact spellings saw an argument called "se" and let it through. A
+// diagnostic session brought an interface up on a device it was being scored
+// on, and could as easily have brought one down. Anything that could be short
+// for a word that writes is refused; a device really called "se" would be
+// refused too, which is the right way round.
+func refuseWrites(cmd []string) error {
+	for _, a := range cmd[1:] {
+		low := strings.ToLower(a)
+		if strings.HasPrefix(low, "-") {
+			name := strings.TrimLeft(low, "-")
+			if i := strings.IndexByte(name, '='); i > 0 {
+				name = name[:i]
+			}
+			for w := range writeOptionNames {
+				if name != "" && strings.HasPrefix(w, name) {
+					return fmt.Errorf("a diagnostic session may not run %q: %q can be short "+
+						"for -%s, which does more than print",
+						strings.Join(cmd, " "), a, w)
+				}
+			}
+			continue
+		}
+		for w := range writeVerbs {
+			// Two characters is where iproute2 stops being ambiguous; a single
+			// letter it rejects itself.
+			if len(low) >= 2 && strings.HasPrefix(w, low) {
+				return fmt.Errorf("a diagnostic session may not run %q: %q is, or can be "+
+					"short for, %q, which changes the device",
+					strings.Join(cmd, " "), a, w)
+			}
+		}
+	}
+	return nil
+}
+
+// savesReadOnly allows the ruleset dumps to print and nothing else.
+//
+// `iptables-save -f <path>` creates or truncates a file, as root, anywhere on
+// the device -- including a routing configuration. It was allowed because its
+// name says "save" and its validator was nil.
+func savesReadOnly(cmd []string) error {
+	for _, a := range cmd[1:] {
+		switch a {
+		case "-c", "--counters", "-t", "--table", "-M", "--modprobe":
+			continue
+		}
+		if strings.HasPrefix(a, "-") {
+			return fmt.Errorf("a diagnostic session may run %s only to print (%q)", cmd[0], a)
+		}
+	}
+	return nil
+}
+
+func sysctlReadOnly(cmd []string) error {
+	for _, a := range cmd[1:] {
+		if hasShortOption(a, 'w') || hasShortOption(a, 'p') ||
+			a == "--write" || a == "--load" || strings.Contains(a, "=") {
+			return fmt.Errorf("a diagnostic session may not set a kernel parameter (%q)", a)
+		}
+	}
+	return nil
+}
+
+// ssOptionsThatOnlyPrint is the observational subset of ss's short options.
+//
+// An allowlist, because the denylist missed -D, which dumps raw socket
+// information to a file of the caller's choosing -- as root, anywhere on the
+// device, including over a routing configuration. It also missed -K in a
+// cluster. There is no reason to believe the next reader of ss's manual page
+// will find the last of them.
+const ssOptionsThatOnlyPrint = "hVnraletuwxfimsbEZzoNp0469gHOM"
+
+func ssReadOnly(cmd []string) error {
+	for _, a := range cmd[1:] {
+		// ss -K closes sockets, which on a router is a session reset -- an
+		// evaluated agent used `ss -Ktn` to drop a BGP session on a device it
+		// was being scored on. Short options cluster, so matching "-K" exactly
+		// was matching one spelling of several.
+		if hasShortOption(a, 'K') || a == "--kill" {
+			return errors.New("a diagnostic session may not close sockets (ss -K)")
+		}
+		// -D writes a raw dump to a file, as root, wherever it is pointed.
+		if hasShortOption(a, 'D') || a == "--diag" || strings.HasPrefix(a, "--diag=") {
+			return errors.New("a diagnostic session may not write a socket dump to a file " +
+				"(ss -D)")
+		}
+		if !strings.HasPrefix(a, "-") || strings.HasPrefix(a, "--") {
+			continue
+		}
+		// And anything else short that is not in the observational set.
+		body := a[1:]
+		if i := strings.IndexByte(body, '='); i >= 0 {
+			body = body[:i]
+		}
+		for _, c := range body {
+			if !strings.ContainsRune(ssOptionsThatOnlyPrint, c) || c == 'D' {
+				return fmt.Errorf("a diagnostic session may run ss only to print; %q is not "+
+					"an option that does", a)
+			}
+		}
+	}
+	return nil
+}
+
+// hasShortOption reports whether a clustered short-option argument contains a
+// letter: -K, -Ktn and -tnK are the same option three ways.
+//
+// Every validator that matched an option by exact string was matching one
+// spelling of several. A long option (--kill) and anything after "=" are not
+// clusters and are compared whole.
+func hasShortOption(arg string, opt byte) bool {
+	if !strings.HasPrefix(arg, "-") || strings.HasPrefix(arg, "--") {
+		return false
+	}
+	body := arg[1:]
+	if i := strings.IndexByte(body, '='); i >= 0 {
+		body = body[:i]
+	}
+	return strings.IndexByte(body, opt) >= 0
+}
+
+func arpReadOnly(cmd []string) error {
+	for _, a := range cmd[1:] {
+		for _, o := range []byte{'d', 's', 'f'} {
+			if hasShortOption(a, o) {
+				return fmt.Errorf("a diagnostic session may not change the ARP table (%q)", a)
+			}
+		}
+		switch a {
+		case "--delete", "--set", "--file":
+			return fmt.Errorf("a diagnostic session may not change the ARP table (%q)", a)
+		}
+	}
+	return nil
+}
+
+func hostnameReadOnly(cmd []string) error {
+	for _, a := range cmd[1:] {
+		if !strings.HasPrefix(a, "-") {
+			return errors.New("a diagnostic session may not set the hostname")
+		}
+		if hasShortOption(a, 'F') || hasShortOption(a, 'b') ||
+			a == "--file" || a == "--boot" {
+			return fmt.Errorf("a diagnostic session may not set the hostname (%q)", a)
+		}
+	}
+	return nil
+}
+
+func tcpdumpReadOnly(cmd []string) error {
+	for _, a := range cmd[1:] {
+		for _, o := range []byte{'z', 'w', 'W'} {
+			if hasShortOption(a, o) {
+				return fmt.Errorf("a diagnostic session may not run tcpdump %s: it writes to "+
+					"the device or runs a command on it", a)
+			}
+		}
+		if a == "--postrotate-command" {
+			return fmt.Errorf("a diagnostic session may not run tcpdump %s", a)
+		}
+	}
+	return nil
+}
+
+// vtyshReadOnly accepts only show-style commands, in any spelling of the option
+// that carries them.
+//
+// The previous version matched the literal "-c" and nothing else, so
+// `vtysh --command 'configure terminal' --command 'interface lo' ...` went
+// through untouched and a diagnostic session edited a router. Every option is
+// now either one of the two spellings that carry a command, or refused.
+func vtyshReadOnly(cmd []string) error {
+	for i := 1; i < len(cmd); i++ {
+		a := cmd[i]
+		var body string
+		switch {
+		case a == "-c" || a == "--command":
+			if i+1 >= len(cmd) {
+				return errors.New("vtysh -c needs a command")
+			}
+			i++
+			body = cmd[i]
+		case strings.HasPrefix(a, "-c="):
+			body = strings.TrimPrefix(a, "-c=")
+		case strings.HasPrefix(a, "--command="):
+			body = strings.TrimPrefix(a, "--command=")
+		default:
+			return fmt.Errorf("a diagnostic session may run vtysh only as `vtysh -c \"show "+
+				"...\"`; %q is not that", a)
+		}
+		body = strings.TrimSpace(body)
+		if body == "" {
+			return errors.New("vtysh -c needs a command")
+		}
+		// One command, checked as a whole. Validating the first word of a body
+		// that may contain several is validating the wrong thing.
+		if strings.ContainsAny(body, "\n\r;") {
+			return fmt.Errorf("a diagnostic session may send only one vtysh command per "+
+				"argument (%q)", body)
+		}
+		switch strings.Fields(body)[0] {
+		case "show", "ping", "traceroute", "terminal":
+		default:
+			return fmt.Errorf("a diagnostic session may only run vtysh show commands, not %q",
+				body)
+		}
+		// "show ... | ..." is fine, but redirection is not: it writes.
+		if strings.ContainsAny(body, ">`") || strings.Contains(body, "$(") {
+			return fmt.Errorf("a diagnostic session may not redirect (%q)", body)
+		}
+	}
+	return nil
 }
 
 // ReadOnlyCommand reports whether a command can be run by a diagnostic caller.
@@ -125,77 +397,35 @@ func ReadOnlyCommand(cmd []string) error {
 	if i := strings.LastIndex(prog, "/"); i >= 0 {
 		prog = prog[i+1:]
 	}
-	allowed, known := readOnlyCommands[prog]
-	if !known || !allowed {
+	validate, known := readOnlyPrograms[prog]
+	if !known {
 		return fmt.Errorf("a diagnostic session may not run %q: it may only observe. "+
 			"Allowed programs are read-only ones such as ping, traceroute, ip show, ss and "+
 			"vtysh -c 'show ...'", prog)
 	}
 	for _, a := range cmd[1:] {
-		// No shell metacharacters anywhere. Every allowed program takes its
-		// arguments directly, so a semicolon or a backtick is somebody trying
-		// to reach a shell through one of them.
-		if strings.ContainsAny(a, ";|&`$><\n") && prog != "vtysh" && prog != "grep" {
+		// A newline is a command separator everywhere, and vtysh is no
+		// exception: it reads what follows one as the next line of input. The
+		// exemption that used to be here let a diagnostic session send
+		// "show version\nconfigure terminal\ninterface lo\ndescription ..."
+		// as a single body whose first word is "show", and change the router --
+		// while a plain "configure terminal" was refused with 403.
+		if strings.ContainsAny(a, "\n\r\x00") {
+			return fmt.Errorf("a diagnostic session may not send more than one command in "+
+				"an argument (%q contains a line break)", a)
+		}
+		// No shell metacharacters. Every allowed program takes its arguments
+		// directly, so a semicolon or a backtick is somebody trying to reach a
+		// shell through one of them.
+		if strings.ContainsAny(a, ";&`$><") {
+			return fmt.Errorf("a diagnostic session may not use shell syntax (%q)", a)
+		}
+		if strings.Contains(a, "|") && prog != "vtysh" && prog != "grep" {
 			return fmt.Errorf("a diagnostic session may not use shell syntax (%q)", a)
 		}
 	}
-	switch prog {
-	case "vtysh":
-		// Only "show" and "ping"/"traceroute" style commands. A vtysh that can
-		// enter configuration mode can do anything the router can.
-		for i, a := range cmd[1:] {
-			if a != "-c" {
-				continue
-			}
-			if i+2 > len(cmd)-1 {
-				return errors.New("vtysh -c needs a command")
-			}
-			body := strings.TrimSpace(cmd[i+2])
-			first := strings.Fields(body)
-			if len(first) == 0 {
-				return errors.New("vtysh -c needs a command")
-			}
-			switch first[0] {
-			case "show", "ping", "traceroute", "terminal":
-			default:
-				return fmt.Errorf("a diagnostic session may only run vtysh show commands, not %q", body)
-			}
-			// "show ... | ..." is fine, but redirection is not: it writes.
-			if strings.ContainsAny(body, ">`") || strings.Contains(body, "$(") {
-				return fmt.Errorf("a diagnostic session may not redirect (%q)", body)
-			}
-		}
-	case "cat", "head", "tail", "grep", "ls", "wc":
-		// Reading files is allowed, writing through them is not; none of these
-		// write, and redirection was refused above.
-	default:
-		if subs := writeSubcommands[prog]; subs != nil && len(cmd) > 1 {
-			// "ip link show" observes; "ip link set" does not. The object word
-			// is the one after the program, modulo flags.
-			var obj, verb string
-			for _, a := range cmd[1:] {
-				if strings.HasPrefix(a, "-") {
-					if prog == "sysctl" && subs[a] {
-						return fmt.Errorf("a diagnostic session may not run %q", strings.Join(cmd, " "))
-					}
-					continue
-				}
-				if obj == "" {
-					obj = a
-					continue
-				}
-				verb = a
-				break
-			}
-			if subs[obj] {
-				switch verb {
-				case "", "show", "list", "get":
-				default:
-					return fmt.Errorf("a diagnostic session may not run %q: it changes the device",
-						strings.Join(cmd, " "))
-				}
-			}
-		}
+	if validate == nil {
+		return nil
 	}
-	return nil
+	return validate(cmd)
 }

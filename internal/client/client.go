@@ -896,3 +896,18 @@ func (c *Cluster) node(name string) *Node {
 	}
 	return nil
 }
+
+// Sweep asks a node about the overlays it is carrying for no lab it hosts, and
+// optionally removes them.
+func (n *Node) Sweep(ctx context.Context, remove bool) (agent.SweepResponse, error) {
+	var resp agent.SweepResponse
+	err := n.do(ctx, http.MethodPost, "/v1/sweep", agent.SweepRequest{Remove: remove}, &resp)
+	return resp, err
+}
+
+// Sweep asks every node.
+func (c *Cluster) Sweep(ctx context.Context, remove bool) []NodeResult[agent.SweepResponse] {
+	return fanOut(ctx, c.Nodes, func(ctx context.Context, n *Node) (agent.SweepResponse, error) {
+		return n.Sweep(ctx, remove)
+	})
+}

@@ -136,6 +136,29 @@ services:
     kind: builtin.web
     listen: ":9000"
 
+# The scripted perturbations the exercises are built around.
+#
+# A behaviour is announced to the class and started and stopped by an
+# instructor; it is not a fault to be diagnosed. Question 2.6 is built on this
+# one: a stub AS begins announcing a transit provider's prefix, the trust
+# anchor already holds a ROA saying that prefix belongs to somebody else, and a
+# student whose routers validate origins should never select it. Before this
+# existed the lab carried a permanent invalid announcement, so the question
+# could only ever be "is your filter configured", never "did it stop the
+# hijack when it happened".
+behaviours:
+  stub_hijack:
+    kind: bgp-hijack
+    start: manual
+    # AS 10 is a stub at the edge of the tier-3 ring: it has no customers, so
+    # nothing downstream of it can be blamed for what it announces.
+    params: {by: "10"}
+    # AS 2, not AS 1. AS 1 is the system deliberately left without a ROA, so a
+    # hijack of its prefix is not-found rather than invalid and origin
+    # validation cannot catch it -- the exercise would ask students to stop
+    # something no filter of the kind it teaches can stop.
+    victims: {list: [2]}
+
 # The trust anchor's deliberate discrepancies. Declared, so an exercise can say
 # exactly which announcement is meant to be invalid rather than hoping one is.
 rpki:

@@ -3,6 +3,7 @@ package grade
 import (
 	"context"
 	"fmt"
+	"net/netip"
 	"sort"
 	"strings"
 
@@ -74,8 +75,30 @@ func checkBGPFreeCore(ctx context.Context, env *Env) Result {
 		}
 		// FRR says "BGP instance not found" when no process exists at all,
 		// which is the state being asked for.
-		if !strings.Contains(out, "instance not found") && strings.Contains(out, "Neighbor") {
-			bad = append(bad, fmt.Sprintf("%s runs BGP", d.Name))
+		//
+		// Requiring the word "Neighbor" as well was the mistake: FRR prints a
+		// neighbour table only when there are neighbours, so a core router with
+		// `router bgp 1` configured and no peers matched neither string and was
+		// reported as holding no BGP state. It holds a BGP instance, a routing
+		// information base and an identifier, and one line of configuration
+		// away from holding the whole table -- which is the thing the exercise
+		// says a core router must not do.
+		if !strings.Contains(out, "instance not found") {
+			bad = append(bad, fmt.Sprintf("%s has a BGP instance", d.Name))
+			continue
+		}
+		// And the configuration, because an instance that exists but has not
+		// been read by this command would be missed by it.
+		cfg, err := env.Vtysh(ctx, d.Name, "show running-config")
+		if err != nil {
+			return Errored("mpls.bgp_free_core", err)
+		}
+		for _, line := range strings.Split(cfg, "\n") {
+			if strings.HasPrefix(strings.TrimSpace(line), "router bgp") {
+				bad = append(bad, fmt.Sprintf("%s is configured with %s",
+					d.Name, strings.TrimSpace(line)))
+				break
+			}
 		}
 	}
 	// And no edge may name a core router as a neighbour: a session configured
@@ -137,6 +160,22 @@ func checkLDPAdjacencies(ctx context.Context, env *Env) Result {
 		if err != nil {
 			return Errored("mpls.ldp_adjacencies", err)
 		}
+		// Where the adjacency was discovered, not merely that a session
+		// exists.
+		//
+		// LDP will happily bring up a *targeted* session between two
+		// loopbacks, routed over whatever path the IGP offers. That is a
+		// session with the right peer at the right address, and the check
+		// accepted it -- so a submission could take LDP off the interior link
+		// entirely, replace it with a targeted session, and keep full marks
+		// for label distribution across a link that distributes no labels.
+		// A link adjacency is discovered by hellos on the interface itself,
+		// and says so.
+		disc, err := env.Vtysh(ctx, d.Name, "show mpls ldp discovery")
+		if err != nil {
+			return Errored("mpls.ldp_adjacencies", err)
+		}
+		links := ldpLinkAdjacencies(disc)
 		for _, p := range want {
 			if !strings.Contains(out, p.addr) {
 				problems = append(problems, fmt.Sprintf("%s has no LDP session with %s", d.Name, p.name))
@@ -145,6 +184,15 @@ func checkLDPAdjacencies(ctx context.Context, env *Env) Result {
 			if !operationalWith(out, p.addr) {
 				problems = append(problems, fmt.Sprintf("%s's LDP session with %s is not operational",
 					d.Name, p.name))
+			}
+			if id, ok := links[p.iface]; !ok {
+				problems = append(problems, fmt.Sprintf(
+					"%s has no link LDP adjacency on %s, the interface facing %s: a targeted "+
+						"session is not label distribution across that link",
+					d.Name, p.iface, p.name))
+			} else if id != p.addr {
+				problems = append(problems, fmt.Sprintf(
+					"%s's link adjacency on %s is with %s, not %s", d.Name, p.iface, id, p.name))
 			}
 		}
 		// Labels must reach the kernel, not merely be negotiated. A table that
@@ -189,8 +237,24 @@ func checkVPNReachability(ctx context.Context, env *Env) Result {
 	if err != nil {
 		return Errored("vpn.site_reachability", err)
 	}
+	// What each site received, before and after.
+	//
+	// A ping proves that something answered, not that the customer's site did.
+	// The provider is the system being marked and every packet crosses it: a
+	// DNAT rule on each edge, answering the far site's address locally while
+	// the real traffic is dropped, left every probe succeeding and the mark
+	// untouched. The customer's hosts are not the provider's to configure, and
+	// the kernel's count of echo requests delivered to them is not something a
+	// rule on the way can arrange.
+	var allSites []sitePoint
+	for _, sites := range groups {
+		allSites = append(allSites, sites...)
+	}
+	before := receivedEchoesAt(ctx, env, allSites)
+
 	var problems []string
 	tried := 0
+	sentTo := map[string]int{}
 	for name, sites := range groups {
 		if len(sites) < 2 {
 			continue
@@ -202,6 +266,7 @@ func checkVPNReachability(ctx context.Context, env *Env) Result {
 				// report it as working.
 				for _, d := range directed(sites[i], sites[j]) {
 					tried++
+					sentTo[d.to.host]++
 					reached, err := env.reaches(ctx, d.from.host, d.to.addr)
 					if err != nil {
 						return Errored("vpn.site_reachability", err)
@@ -213,6 +278,22 @@ func checkVPNReachability(ctx context.Context, env *Env) Result {
 					}
 				}
 			}
+		}
+	}
+	after := receivedEchoesAt(ctx, env, allSites)
+	for _, site := range allSites {
+		if sentTo[site.host] == 0 {
+			continue
+		}
+		b, okB := before[site.host]
+		a, okA := after[site.host]
+		if !okB || !okA {
+			continue // the counter could not be read; the probe stands alone
+		}
+		if a <= b {
+			problems = append(problems, fmt.Sprintf(
+				"%s answered %d probe(s) it never received, so something on the way is "+
+					"replying for it", site.host, sentTo[site.host]))
 		}
 	}
 	if tried == 0 {
@@ -229,8 +310,30 @@ func checkVPNReachability(ctx context.Context, env *Env) Result {
 	}
 	return Pass("vpn.site_reachability", Evidence{
 		Expected: "each customer's sites reach each other",
-		Observed: fmt.Sprintf("%d site pair(s) reachable", tried),
+		Observed: fmt.Sprintf("%d site pair(s) reachable, and every site received the traffic "+
+			"addressed to it", tried),
 	})
+}
+
+// receivedEchoesAt reads each site host's count of ICMP echo requests the
+// kernel delivered to it.
+func receivedEchoesAt(ctx context.Context, env *Env, sites []sitePoint) map[string]int {
+	out := map[string]int{}
+	seen := map[string]bool{}
+	for _, s := range sites {
+		if seen[s.host] {
+			continue
+		}
+		seen[s.host] = true
+		res, err := env.Probe(ctx, s.host, []string{"cat", "/proc/net/snmp"})
+		if err != nil || res.ExitCode != 0 {
+			continue
+		}
+		if n, ok := icmpInEchos(res.Stdout); ok {
+			out[s.host] = n
+		}
+	}
+	return out
 }
 
 // checkVPNIsolation asks whether the customers are kept apart.
@@ -315,19 +418,164 @@ func checkVPNIsolation(ctx context.Context, env *Env) Result {
 			}
 		}
 	}
+	// And the tables themselves, because a probe that needs a reply cannot see
+	// a leak that only goes one way.
+	//
+	// Importing another customer's route target on one edge puts their
+	// prefixes in this customer's table. Traffic then flows into the other
+	// bank's network, and nothing comes back, because their table has no route
+	// to here -- so every ping is lost and a check built on ping reports
+	// perfect isolation. One bank able to inject packets into another's
+	// network is precisely the failure the mechanism exists to prevent, and it
+	// scored full marks. Found by the advanced course's own discrimination
+	// suite, which is what that suite is for.
+	routeLeaks, err := crossCustomerRoutes(ctx, env, groups, names)
+	if err != nil {
+		return Errored("vpn.isolation", err)
+	}
+	leaks = append(leaks, routeLeaks...)
+
 	if len(leaks) > 0 {
 		sort.Strings(leaks)
 		return Fail("vpn.isolation", Evidence{
-			Expected: "customers cannot reach one another",
-			Observed: strings.Join(leaks, "; "),
-			Command:  "ping",
+			Expected: "customers cannot reach one another, and cannot see one another's routes",
+			Observed: strings.Join(truncate(leaks, 6), "; "),
+			Command:  "ping; show ip route vrf <table> <prefix>",
 		})
 	}
 	return Pass("vpn.isolation", Evidence{
 		Expected: "customers are kept apart, over a VPN that carries their traffic",
-		Observed: fmt.Sprintf("%d directed site pair(s) across %d customer(s) mutually unreachable",
+		Observed: fmt.Sprintf("%d directed site pair(s) across %d customer(s) mutually "+
+			"unreachable, and no customer's table holds another's prefixes",
 			tried, len(names)),
 	})
+}
+
+// anyCustomerTrafficArrives reports whether at least one customer's site can
+// reach another of its own sites.
+//
+// It is deliberately a low bar: this is not the reachability question, which is
+// marked separately and in full. It is the precondition for asking *how*
+// traffic is carried, and a VPN across which nothing at all passes cannot
+// answer it.
+func anyCustomerTrafficArrives(ctx context.Context, env *Env) (bool, error) {
+	groups, err := customerGroups(env)
+	if err != nil {
+		return false, err
+	}
+	tried := 0
+	for _, sites := range groups {
+		for i := 0; i < len(sites); i++ {
+			for j := 0; j < len(sites); j++ {
+				if i == j {
+					continue
+				}
+				tried++
+				ok, err := env.reaches(ctx, sites[i].host, sites[j].addr)
+				if err != nil {
+					return false, err
+				}
+				if ok {
+					return true, nil
+				}
+			}
+		}
+	}
+	if tried == 0 {
+		return false, fmt.Errorf("no customer in this lab has two sites, so there is no " +
+			"traffic between them to carry")
+	}
+	return false, nil
+}
+
+// crossCustomerRoutes reports every place one customer's routing table holds a
+// route to another customer's addresses.
+//
+// This is the control-plane half of isolation, and it is not redundant with the
+// probes above: a leak in one direction delivers packets and receives no reply,
+// which is indistinguishable from isolation to anything that pings.
+//
+// A route counts as a leak when it covers another customer's site and does not
+// cover any of this customer's own. That last clause is what keeps a default
+// route -- which covers everybody, is not customer-specific, and is present in
+// every correct submission here -- from being read as a total leak, without
+// resorting to a list of prefixes to forgive.
+func crossCustomerRoutes(ctx context.Context, env *Env, groups map[string][]sitePoint,
+	names []string) ([]string, error) {
+	holders, err := vrfHolders(env)
+	if err != nil {
+		return nil, err
+	}
+	addrs := map[string][]netip.Addr{}
+	for name, sites := range groups {
+		for _, s := range sites {
+			if a, perr := netip.ParseAddr(s.addr); perr == nil {
+				addrs[name] = append(addrs[name], a)
+			}
+		}
+	}
+	covers := func(p netip.Prefix, who string) bool {
+		for _, a := range addrs[who] {
+			if p.Contains(a) {
+				return true
+			}
+		}
+		return false
+	}
+
+	var leaks []string
+	for _, mine := range names {
+		for _, router := range holders[mine] {
+			var doc map[string]any
+			cmd := fmt.Sprintf("show ip route vrf %s json", mine)
+			if err := env.VtyshJSON(ctx, router, cmd, &doc); err != nil {
+				// Unreadable is not empty. A verdict of "no leaks" drawn from a
+				// table nobody managed to read is the failure this file exists
+				// to avoid.
+				return nil, fmt.Errorf("%s: table %s could not be read (%w), so what is in "+
+					"it cannot be part of a verdict", router, mine, err)
+			}
+			for prefix := range doc {
+				p, perr := netip.ParsePrefix(prefix)
+				if perr != nil || covers(p, mine) {
+					continue
+				}
+				for _, theirs := range names {
+					if theirs == mine || !covers(p, theirs) {
+						continue
+					}
+					leaks = append(leaks, fmt.Sprintf(
+						"%s holds a route to %s in table %s, and those addresses belong to "+
+							"%s: the tables are not separate", router, prefix, mine, theirs))
+				}
+			}
+		}
+	}
+	sort.Strings(leaks)
+	return leaks, nil
+}
+
+// vrfHolders lists, for each routing table, the provider edges that hold it.
+func vrfHolders(env *Env) (map[string][]string, error) {
+	as, ok := env.Topology.ASes[env.AS]
+	if !ok {
+		return nil, fmt.Errorf("AS %d is not in this lab", env.AS)
+	}
+	out := map[string][]string{}
+	for _, d := range as.Routers {
+		seen := map[string]bool{}
+		for _, i := range d.Ifaces {
+			if i.VRF == "" || seen[i.VRF] {
+				continue
+			}
+			seen[i.VRF] = true
+			out[i.VRF] = append(out[i.VRF], d.Name)
+		}
+	}
+	for k := range out {
+		sort.Strings(out[k])
+	}
+	return out, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -393,7 +641,7 @@ func coreRouters(as *model.AS) []*model.Device {
 
 func isCore(as *model.AS, name string) bool { return as.InCore(name) }
 
-type ldpPeer struct{ name, addr string }
+type ldpPeer struct{ name, addr, iface string }
 
 // interiorPeers lists the routers this one shares an interior link with, by the
 // address LDP identifies them with.
@@ -408,11 +656,33 @@ func interiorPeers(as *model.AS, d *model.Device) []ldpPeer {
 			continue
 		}
 		if lo, ok := p.IfaceByName("lo"); ok && lo.Addr4 != "" {
-			out = append(out, ldpPeer{name: p.Name, addr: addrOnly(lo.Addr4)})
+			out = append(out, ldpPeer{name: p.Name, addr: addrOnly(lo.Addr4), iface: i.Name})
 		}
 	}
 	sort.Slice(out, func(a, b int) bool { return out[a].name < out[b].name })
 	return out
+}
+
+// ldpLinkAdjacencies maps each interface with a *link* LDP adjacency to the
+// peer discovered on it.
+//
+// `show mpls ldp discovery` names the kind in its Type column: "Link" for
+// hellos heard on an interface, "Targeted" for a session set up to an address
+// over whatever path the IGP has. Only the first is an adjacency on that link.
+func ldpLinkAdjacencies(out string) map[string]string {
+	res := map[string]string{}
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		// "ipv4 1.152.0.1 Link port_R2 15"
+		if len(f) < 4 || f[0] == "AF" {
+			continue
+		}
+		if !strings.EqualFold(f[2], "Link") {
+			continue
+		}
+		res[f[3]] = f[1]
+	}
+	return res
 }
 
 // operationalWith reports whether the line mentioning an address says the
@@ -638,6 +908,27 @@ func checkVPNLabelSwitched(ctx context.Context, env *Env) Result {
 			}
 		}
 	}
+	// And the labels have to be carrying something.
+	//
+	// Everything above reads the forwarding table, which is the only place
+	// that can distinguish a two-label VPN path from a static route or a leak
+	// into the global table -- and it says nothing about whether a packet gets
+	// through. Dropping EtherType 0x8847 on the interior links leaves every
+	// label stack installed and every labelled packet discarded, and this
+	// awarded full marks for a mechanism that carried nothing. The question is
+	// how the customer's traffic is carried; if none of it is, there is
+	// nothing to answer it about.
+	carried, err := anyCustomerTrafficArrives(ctx, env)
+	if err != nil {
+		return Errored("vpn.label_switched", err)
+	}
+	if !carried {
+		return Errored("vpn.label_switched", fmt.Errorf(
+			"no customer's traffic reaches its other site at all, so how it would have been "+
+				"carried cannot be assessed; the label stacks are installed and nothing "+
+				"crosses them"))
+	}
+
 	sort.Strings(problems)
 	if len(problems) == 0 {
 		return Pass("vpn.label_switched", Evidence{

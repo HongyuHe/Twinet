@@ -43,6 +43,26 @@ WANT=$(md5sum bin/twinetd | cut -d' ' -f1)
 echo "built twinetd ${WANT}"
 
 for n in "${NODES[@]}"; do
+    # An existing unit that carries the token in plain sight is repaired.
+    #
+    # A systemd unit is world-readable, and `Environment=TWINET_TOKEN=...` put
+    # the cluster secret where every account on the node could read it --
+    # including the unprivileged one an evaluated RCA agent runs as, which could
+    # then discard its own read-only credential and act as the controller. The
+    # token is moved into a root-only file and the unit is left pointing at it.
+    # shellcheck disable=SC2016  # runs on the far node, expands there
+    move_secret='u=/etc/systemd/system/twinetd.service
+if grep -q "^Environment=TWINET_TOKEN=" "$u"; then
+  install -d -m 0700 /etc/twinet
+  umask 077
+  sed -n "s#^Environment=\(TWINET_TOKEN=.*\)#\1#p" "$u" > /etc/twinet/agent.env
+  chmod 0600 /etc/twinet/agent.env
+  sed -i "/^Environment=TWINET_TOKEN=/d" "$u"
+  grep -q "^EnvironmentFile=/etc/twinet/agent.env" "$u" || \
+    sed -i "/^Type=simple/a EnvironmentFile=/etc/twinet/agent.env" "$u"
+fi
+chmod 0644 "$u"'
+
     if [ -n "$PKI" ]; then
         cert="${PKI}/${n}_server_cert.pem"
         key="${PKI}/${n}_server_key.pem"
@@ -79,6 +99,26 @@ for n in "${NODES[@]}"; do
     # a mutually authenticated cluster to a bearer token over plain HTTP -- an
     # upgrade that takes the security away, with nothing in its output saying
     # so. Removing TLS has to be asked for.
+    # An existing unit that carries the token in plain sight is repaired.
+    #
+    # A systemd unit is world-readable, and `Environment=TWINET_TOKEN=...` put
+    # the cluster secret where every account on the node could read it --
+    # including the unprivileged one an evaluated RCA agent runs as, which could
+    # then discard its own read-only credential and act as the controller. The
+    # token is moved into a root-only file and the unit is left pointing at it.
+    # shellcheck disable=SC2016  # runs on the far node, expands there
+    move_secret='u=/etc/systemd/system/twinetd.service
+if grep -q "^Environment=TWINET_TOKEN=" "$u"; then
+  install -d -m 0700 /etc/twinet
+  umask 077
+  sed -n "s#^Environment=\(TWINET_TOKEN=.*\)#\1#p" "$u" > /etc/twinet/agent.env
+  chmod 0600 /etc/twinet/agent.env
+  sed -i "/^Environment=TWINET_TOKEN=/d" "$u"
+  grep -q "^EnvironmentFile=/etc/twinet/agent.env" "$u" || \
+    sed -i "/^Type=simple/a EnvironmentFile=/etc/twinet/agent.env" "$u"
+fi
+chmod 0644 "$u"'
+
     if [ -n "$PKI" ]; then
         strip_re='s# -tls-cert [^ ]*##; s# -tls-key [^ ]*##; s# -client-ca [^ ]*##'
         add=' -tls-cert /etc/twinet/pki/server_cert.pem -tls-key /etc/twinet/pki/server_key.pem -client-ca /etc/twinet/pki/ca_cert.pem'
@@ -86,6 +126,7 @@ for n in "${NODES[@]}"; do
     else
         unit_cmd="true"
     fi
+    unit_cmd="$move_secret; $unit_cmd"
 
     # The address the agent already announces as its own is the one it should
     # answer on. Taken from -underlay-ip in the unit rather than from an

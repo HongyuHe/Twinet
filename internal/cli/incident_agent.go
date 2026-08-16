@@ -3,12 +3,12 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"sort"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/HongyuHe/twinet/internal/agent"
@@ -149,6 +149,27 @@ func scoreDiagnosis(d Diagnosis, truth []fault.GroundTruth) Score {
 		s.Total += 0.3
 	}
 
+	// Getting "is anything wrong" wrong means the rest is not an answer.
+	//
+	// The three parts below detection are scored against what was injected, so
+	// on a healthy control -- where nothing was -- naming no devices, no
+	// category and no root cause is exactly right, and an agent that cried
+	// wolf collected 0.80 for it. The control exists to catch the strategy of
+	// always answering "yes"; it was rewarding it. The same gate closes the
+	// other direction: an agent that says a broken network is fine has not
+	// diagnosed it by declining to name anything.
+	if !s.Detected {
+		s.Total = 0
+		if s.Detail == "" {
+			switch {
+			case anomaly:
+				s.Detail = "said nothing was wrong with a network that was broken"
+			default:
+				s.Detail = "reported a fault in a network that was healthy"
+			}
+		}
+	}
+
 	var missing []string
 	for dev := range wantDevices {
 		found := false
@@ -192,7 +213,25 @@ func runAgent(ctx context.Context, command string, ep *Episode, sb *sandbox, tok
 
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	c := exec.CommandContext(runCtx, "sh", "-c", command)
+
+	// Run inside a mount namespace with the answer masked out.
+	//
+	// Dropping to an unprivileged account and handing it a filtered copy was
+	// not enough: the original lab is world-readable, and the scenario file in
+	// it names the fault, the device and the interface in plain YAML. So does
+	// the end-to-end test that exercises it. An agent whose entire strategy was
+	// to grep the repository for the words in its own brief scored a perfect
+	// 1.00 without looking at the network.
+	//
+	// A namespace is the only control that holds, because there is no list of
+	// files that is both short enough to allowlist and complete enough to
+	// trust. Each path is covered with an empty, unreadable filesystem; the
+	// mounts are private, so nothing outside this process sees them, and they
+	// disappear with it.
+	c, err := agentCommand(runCtx, command, sb)
+	if err != nil {
+		return d, "", err
+	}
 	c.Stdin = strings.NewReader(string(input) + "\n")
 	c.Dir = sb.Dir
 	// The agent is handed a credential that can look at this lab and change
@@ -204,13 +243,11 @@ func runAgent(ctx context.Context, command string, ep *Episode, sb *sandbox, tok
 		"TWINET_LAB="+ep.Lab,
 		"TWINET_TOKEN="+agent.DiagnosticToken(token, ep.Lab),
 	)
-	// Dropped to the sandbox account, so the ledger is not merely somewhere
-	// else but unreadable. Without this the agent runs as root and the copy is
-	// decoration.
-	if os.Geteuid() == 0 {
-		c.SysProcAttr = &syscall.SysProcAttr{
-			Credential: &syscall.Credential{Uid: uint32(sb.UID), Gid: uint32(sb.GID)},
-		}
+	if sb.TLSCert != "" {
+		c.Env = append(c.Env,
+			"TWINET_TLS_CERT="+sb.TLSCert,
+			"TWINET_TLS_KEY="+sb.TLSKey,
+			"TWINET_CA="+sb.TLSCA)
 	}
 	var out, errb strings.Builder
 	c.Stdout, c.Stderr = &out, &errb
@@ -241,6 +278,9 @@ func sanitisedEnv() []string {
 		k, _, _ := strings.Cut(kv, "=")
 		switch k {
 		case "TWINET_TOKEN", "TWINET_MANIFEST", "TWINET_LAB", "TWINET_STATE_DIR",
+			// The controller's own transport identity, which is not the
+			// agent's: it gets one of its own, valid for hours.
+			"TWINET_TLS_CERT", "TWINET_TLS_KEY", "TWINET_CA",
 			"TWINET_ALLOW_VERSION_SKEW", "HOME", "TMPDIR", "XDG_STATE_HOME",
 			"XDG_CONFIG_HOME", "XDG_CACHE_HOME", "SUDO_USER", "SUDO_UID", "SUDO_GID":
 			continue
@@ -248,4 +288,83 @@ func sanitisedEnv() []string {
 		out = append(out, kv)
 	}
 	return out
+}
+
+// agentCommand builds the process an evaluated agent runs as.
+//
+// Where the tools exist and this process is root, that is: a private mount
+// namespace, an empty filesystem over every path that holds the answer, and
+// then the agent as an unprivileged account. Where they do not, it is the
+// unprivileged account alone, and the caller is told that the isolation is
+// weaker than it should be rather than left to assume it is not.
+// canEvaluateAgents reports whether this process can put an agent somewhere it
+// cannot read the answer, so `incident run` can refuse before it injects
+// anything rather than after.
+func canEvaluateAgents() error {
+	if os.Geteuid() != 0 {
+		return errors.New("evaluating an agent needs root: the agent has to be put in a " +
+			"namespace where it cannot read the scenario, the lab or the injection ledger, " +
+			"and this process cannot create one. Re-run under sudo")
+	}
+	for _, tool := range []string{"unshare", "setpriv"} {
+		if !haveTool(tool) {
+			return fmt.Errorf("evaluating an agent needs %s, which is not installed: without "+
+				"it the agent shares this machine's filesystem and process table, and can "+
+				"read the fault it is being asked to diagnose", tool)
+		}
+	}
+	return nil
+}
+
+func agentCommand(ctx context.Context, command string, sb *sandbox) (*exec.Cmd, error) {
+	// Refused rather than weakened.
+	//
+	// This used to fall back to running the agent as the invoking user, with no
+	// namespaces and no warning unless it happened to be root. An ordinary
+	// `twinet incident run --agent ...` without sudo therefore ran the agent as
+	// somebody who can read the scenario file, which names the fault and the
+	// device -- so the benchmark silently measured nothing, and looked exactly
+	// like one that had worked. A score that cannot be trusted is worse than no
+	// score, because somebody will quote it.
+	if err := canEvaluateAgents(); err != nil {
+		return nil, err
+	}
+	if sb.Net == nil {
+		// The network is not optional and there is no weaker version of it.
+		// Every published scenario names its own answer, so an agent with a
+		// route to the internet can fetch the answer instead of finding it.
+		return nil, errors.New("the agent has no network of its own, so it would have " +
+			"this machine's; the scenarios are published, and an agent that can reach " +
+			"the internet can read the answer instead of diagnosing it")
+	}
+	var script strings.Builder
+	for _, p := range sb.Hide {
+		// Empty, unreadable, and not a bind of anything: a directory the agent
+		// can see the name of and nothing inside.
+		fmt.Fprintf(&script, "mount -t tmpfs -o size=4k,mode=0000 none %s || exit 90\n",
+			shellQuote(p))
+	}
+	fmt.Fprintf(&script, "exec setpriv --reuid %d --regid %d --clear-groups sh -c %s\n",
+		sb.UID, sb.GID, shellQuote(command))
+	// A process namespace as well as a mount one.
+	//
+	// Masking the files was not enough: the agent shared the host's /proc, and
+	// this runner's own command line contains "--scenario
+	// .../ospf_adjacency_lost.yaml". An agent whose entire strategy was
+	// `ps -eo args | grep 'twinet incident run'` read the scenario's name,
+	// mapped it to the answer, and scored 1.00 without looking at the network.
+	// The scenario names in any suite say what the fault is; that is what makes
+	// them useful to a person and fatal here.
+	//
+	// --fork is required with --pid (the namespace applies to children), and
+	// --mount-proc gives the namespace a procfs of its own, so /proc shows the
+	// agent and nothing else.
+	argv := sb.Net.Wrap([]string{"unshare", "--mount", "--pid", "--fork", "--mount-proc",
+		"--propagation", "private", "--", "sh", "-c", script.String()})
+	return exec.CommandContext(ctx, argv[0], argv[1:]...), nil
+}
+
+func haveTool(name string) bool {
+	_, err := exec.LookPath(name)
+	return err == nil
 }

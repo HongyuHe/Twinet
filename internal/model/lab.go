@@ -108,11 +108,14 @@ func (r Relationship) Inverse() Relationship {
 
 // Meta is the metadata block shared by every top-level document.
 type Meta struct {
-	Name        string            `yaml:"name" json:"name" jsonschema:"required,description=Unique name of the object"`
-	Description string            `yaml:"description,omitempty" json:"description,omitempty"`
-	Course      string            `yaml:"course,omitempty" json:"course,omitempty"`
-	Term        string            `yaml:"term,omitempty" json:"term,omitempty"`
-	Labels      map[string]string `yaml:"labels,omitempty" json:"labels,omitempty"`
+	Name        string `yaml:"name" json:"name" jsonschema:"required,description=Unique name of the object"`
+	Description string `yaml:"description,omitempty" json:"description,omitempty"`
+	// Course and Term are recorded on a report so a mark can be traced to the
+	// class that produced it. Term already appears in a lab's description;
+	// Course is carried through to the grading report.
+	Course string            `yaml:"course,omitempty" json:"course,omitempty"`
+	Term   string            `yaml:"term,omitempty" json:"term,omitempty"`
+	Labels map[string]string `yaml:"labels,omitempty" json:"labels,omitempty"`
 }
 
 // Lab is the top-level manifest: the complete description of one deployment.
@@ -643,8 +646,16 @@ type ServiceAttach struct {
 // Behaviour is a scripted, reversible perturbation of the lab: a BGP hijack, a
 // link failure, and so on. Replaces the legacy platform's hijack.sh scripts.
 type Behaviour struct {
-	Kind    string            `yaml:"kind" json:"kind" jsonschema:"required,enum=bgp-hijack,enum=link-down"`
-	On      string            `yaml:"on,omitempty" json:"on,omitempty" jsonschema:"description=deploy or manual"`
+	Kind string `yaml:"kind" json:"kind" jsonschema:"required,enum=bgp-hijack,enum=link-down"`
+	// Start is when the behaviour begins: "manual" (the default) or "deploy".
+	//
+	// Spelled `start` rather than `on` because YAML 1.1 parsers read a bare
+	// `on:` key as the boolean true. Go's parser is 1.2 and reads it as a
+	// string, so a manifest using `on:` meant one thing to Twinet and another
+	// to every other tool that reads it -- including this project's own schema
+	// check, which is where it was caught. A key that means different things to
+	// two parsers is not a key worth keeping.
+	Start   string            `yaml:"start,omitempty" json:"start,omitempty" jsonschema:"enum=manual,enum=deploy"`
 	Victims *VictimSelector   `yaml:"victims,omitempty" json:"victims,omitempty"`
 	Prefix  string            `yaml:"prefix,omitempty" json:"prefix,omitempty"`
 	Type    string            `yaml:"type,omitempty" json:"type,omitempty"`
