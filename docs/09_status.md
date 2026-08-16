@@ -460,6 +460,15 @@ reached students, and each motivated a permanent test.
     only of the one shelf the check opened. Every scope is read now, with the
     kernel's own -- loopback and link-local -- exempt, because nobody configured
     them.
+47. **An in-region route accepted with its evidence erased.** Which routes
+    crossed a system of this AS's own region was decided from the AS path the
+    member holds after its own import policy has run, and an import policy can
+    rewrite a path: `set as-path exclude 5` turns "5 10" into "10", and a route
+    relayed by an in-region member reads as coming straight from outside it.
+    Exactly what the question says to refuse was accepted, at full marks. The
+    route server belongs to the exchange, and what it advertised is not the
+    submission's to edit; its account of the path is what the routes are now
+    classified by.
 
 ## Environment findings
 
