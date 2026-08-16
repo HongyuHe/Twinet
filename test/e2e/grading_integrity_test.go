@@ -183,6 +183,7 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 	var custTCP string
 	var reorigin struct{ router, routeMap, prefix string }
 	var slowPrepend struct{ router, routeMap, seq, peer, original string }
+	var staticOverride struct{ router, prefix string }
 	var looseROA struct {
 		router, anchor, prefix string
 		length                 int
@@ -801,6 +802,32 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 					" redistribute static",
 					"end")
 				time.Sleep(20 * time.Second)
+			},
+		},
+		{
+			// The ordering agreed with and then ignored.
+			//
+			// BGP's decision is not the kernel's. A static route for an
+			// externally learned prefix sends the traffic wherever it says
+			// while the BGP table still shows the right path selected.
+			name:     "an external prefix forwarded by a static route instead of BGP",
+			question: "q2.3",
+			undo: func(t *testing.T) {
+				if staticOverride.router == "" {
+					return
+				}
+				_, _ = twinet(t, "exec", "-m", dir, staticOverride.router, "--",
+					"ip", "route", "del", staticOverride.prefix)
+			},
+			apply: func(t *testing.T) {
+				router, peer, _, prefix, _ := leakableRoute(t, dir, as)
+				staticOverride = struct{ router, prefix string }{router, prefix}
+				t.Logf("forwarding %s from %s by hand, via %s", prefix, router, peer)
+				out, err := twinet(t, "exec", "-m", dir, router, "--", "ip", "route",
+					"replace", prefix, "via", peer, "proto", "static", "metric", "1")
+				if err != nil {
+					t.Fatalf("installing a static override: %v\n%s", err, out)
+				}
 			},
 		},
 		{

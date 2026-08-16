@@ -557,6 +557,12 @@ reached students, and each motivated a permanent test.
     actually hold the prefix -- that neighbour is somebody else's system, so
     what it holds is not the submission's to arrange, and from this side an
     announcement discarded on arrival looks exactly like one that worked.
+58. **The ordering agreed with and then ignored.** Gao-Rexford was marked from
+    BGP's decision, and the kernel's is what forwards. `ip route replace
+    4.0.0.0/8 via <provider>` sends the traffic to a provider while the BGP
+    table still shows the peer path selected at a higher local preference: the
+    ranking was arranged, agreed with, and overruled, at full marks. An
+    externally learned prefix now has to be forwarded by the route BGP chose.
 
 ## Environment findings
 
