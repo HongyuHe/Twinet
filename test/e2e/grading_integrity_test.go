@@ -174,6 +174,7 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 	var weighted struct{ router, routeMap, prefix string }
 	var ecmpTCP struct{ router, from string }
 	var impostorLink struct{ router, iface, moved string }
+	var ixpRewrite struct{ router, routeMap, match, peer string }
 	var ixpDeny struct{ router, peer, routeMap string }
 	var importMapNames []string
 	var roaWithdrawn struct{ router, anchor, prefix string }
@@ -787,6 +788,39 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 					"router ospf",
 					" redistribute static",
 					"end")
+				time.Sleep(20 * time.Second)
+			},
+		},
+		{
+			// An in-region route accepted with its evidence erased.
+			//
+			// Which routes crossed a system of this region was decided from the
+			// AS path the member holds after its own import policy has run, and
+			// an import policy can rewrite a path.
+			name:     "an in-region announcement accepted with the path rewritten",
+			question: "q2.4",
+			undo: func(t *testing.T) {
+				if ixpRewrite.router == "" {
+					return
+				}
+				vtysh(t, dir, ixpRewrite.router, "configure terminal",
+					"no route-map "+ixpRewrite.routeMap+" permit 4",
+					"no bgp as-path access-list TWGRADE-VIA permit "+ixpRewrite.match,
+					"end")
+			},
+			apply: func(t *testing.T) {
+				router, rmap, peer, hidden, path := ixpInRegionRoute(t, dir, as)
+				ixpRewrite = struct{ router, routeMap, match, peer string }{
+					router, rmap, "^" + path + "$", peer}
+				t.Logf("accepting %s on %s with %s taken out of its path", hidden, router, path)
+				vtysh(t, dir, router, "configure terminal",
+					"bgp as-path access-list TWGRADE-VIA permit ^"+path+"$",
+					"route-map "+rmap+" permit 4",
+					" match as-path TWGRADE-VIA",
+					" set as-path exclude "+strings.Fields(path)[0],
+					" set local-preference 200",
+					"end")
+				vtysh(t, dir, router, "clear ip bgp "+ixpRewrite.peer+" in")
 				time.Sleep(20 * time.Second)
 			},
 		},
@@ -1477,6 +1511,51 @@ func findNotFoundPrefix(t *testing.T, dir string, as int) string {
 		}
 	}
 	return ""
+}
+
+// ixpInRegionRoute finds a route the exchange relays whose path crosses a
+// student system of this AS's own region -- the kind the assignment says to
+// refuse -- together with the router, the policy applied to the exchange
+// session and the exchange's address.
+func ixpInRegionRoute(t *testing.T, dir string, as int) (router, routeMap, peer, prefix, path string) {
+	t.Helper()
+	for _, r := range routersOf(t, dir, as) {
+		cfg, err := twinet(t, "exec", "-m", dir, r, "--", "vtysh", "-c", "show running-config")
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(cfg, "\n") {
+			f := strings.Fields(strings.TrimSpace(line))
+			if len(f) != 5 || f[0] != "neighbor" || f[2] != "route-map" || f[4] != "in" {
+				continue
+			}
+			if !strings.Contains(f[3], "IXP") {
+				continue
+			}
+			out, err := twinet(t, "exec", "-m", dir, r, "--", "vtysh", "-c",
+				"show ip bgp neighbors "+f[1]+" received-routes json")
+			if err != nil {
+				continue
+			}
+			var doc struct {
+				ReceivedRoutes map[string][]struct {
+					Path string `json:"path"`
+				} `json:"receivedRoutes"`
+			}
+			if json.Unmarshal([]byte(out), &doc) != nil {
+				continue
+			}
+			for pfx, ps := range doc.ReceivedRoutes {
+				for _, p := range ps {
+					if len(strings.Fields(p.Path)) >= 2 {
+						return r, f[3], f[1], pfx, strings.TrimSpace(p.Path)
+					}
+				}
+			}
+		}
+	}
+	t.Skip("the exchange relays no multi-hop route to this AS")
+	return "", "", "", "", ""
 }
 
 // interiorLinkEnd picks one end of an interior link and returns the router, the
