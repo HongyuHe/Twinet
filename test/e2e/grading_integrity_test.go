@@ -176,6 +176,7 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 	var impostorLink struct{ router, iface, moved string }
 	var ixpRewrite struct{ router, routeMap, match, peer string }
 	var rpkiNarrow struct{ router, routeMap, seq string }
+	var notFoundBlock struct{ host, prefix string }
 	var ixpDeny struct{ router, peer, routeMap string }
 	var importMapNames []string
 	var roaWithdrawn struct{ router, anchor, prefix string }
@@ -790,6 +791,33 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 					" redistribute static",
 					"end")
 				time.Sleep(20 * time.Second)
+			},
+		},
+		{
+			// One host that cannot reach the preserved network.
+			//
+			// Whether an unsigned origin was still reachable was decided by one
+			// ping from whichever host the manifest happened to list first, so
+			// a blackhole on any other cost nothing.
+			name:     "a preserved route blackholed on one host",
+			question: "q2.6",
+			undo: func(t *testing.T) {
+				if notFoundBlock.host == "" {
+					return
+				}
+				_, _ = twinet(t, "exec", "-m", dir, notFoundBlock.host, "--",
+					"ip", "route", "del", "blackhole", notFoundBlock.prefix)
+			},
+			apply: func(t *testing.T) {
+				prefix := notFoundPrefix(t, dir, as)
+				host := "as" + itoa(as) + "/NYC_host"
+				notFoundBlock = struct{ host, prefix string }{host, prefix}
+				t.Logf("blackholing %s on %s alone", prefix, host)
+				out, err := twinet(t, "exec", "-m", dir, host, "--",
+					"ip", "route", "add", "blackhole", prefix)
+				if err != nil {
+					t.Fatalf("blackholing the preserved route: %v\n%s", err, out)
+				}
 			},
 		},
 		{

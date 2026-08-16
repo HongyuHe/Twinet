@@ -480,6 +480,13 @@ reached students, and each motivated a permanent test.
     does a deny that a permit can be reached before -- route-maps stop at the
     first clause that matches. A preceding permit is allowed only when it
     selects on the validation state itself.
+49. **One host that could not reach the preserved network.** Whether an unsigned
+    origin was still reachable was decided by one ping from whichever host the
+    manifest happened to list first. One probe is a statement about one host: a
+    blackhole for that prefix on any other left the sole probe succeeding and
+    the question at full marks, while the site behind it could not reach the
+    network the question is about. Every host of the AS is asked now, at once,
+    and the ones that cannot reach it are named.
 
 ## Environment findings
 
