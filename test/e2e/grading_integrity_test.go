@@ -180,6 +180,7 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 	var tcpBlock struct{ router, src, dst string }
 	var vlanFlow struct{ switchID string }
 	var forgedLeak struct{ router, routeMap, prefix string }
+	var custTCP string
 	var ixpDeny struct{ router, peer, routeMap string }
 	var importMapNames []string
 	var roaWithdrawn struct{ router, anchor, prefix string }
@@ -1254,6 +1255,33 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 					if err != nil {
 						t.Fatalf("blocking %s: %v\n%s", iface, err, out)
 					}
+				}
+			},
+		},
+		{
+			// Transit that carries pings and nothing else.
+			//
+			// The customer-transit probe was ICMP, so a rule dropping
+			// forwarded TCP from one customer left every probe answered.
+			name:     "a customer whose connections cannot cross while its pings can",
+			question: "q2.3",
+			undo: func(t *testing.T) {
+				if custTCP != "" {
+					_, _ = twinet(t, "exec", "-m", dir, "as3/SFO", "--", "iptables", "-D",
+						"FORWARD", "-i", custTCP, "-p", "tcp", "-j", "DROP")
+				}
+			},
+			apply: func(t *testing.T) {
+				ifaces := customerIfaces(t, dir, as)
+				if len(ifaces) == 0 {
+					t.Skip("AS 3 has no customer-facing interface to block")
+				}
+				custTCP = ifaces[0]
+				t.Logf("discarding forwarded TCP arriving on %s", custTCP)
+				out, err := twinet(t, "exec", "-m", dir, "as3/SFO", "--", "iptables",
+					"-I", "FORWARD", "1", "-i", custTCP, "-p", "tcp", "-j", "DROP")
+				if err != nil {
+					t.Fatalf("discarding a customer's TCP: %v\n%s", err, out)
 				}
 			},
 		},

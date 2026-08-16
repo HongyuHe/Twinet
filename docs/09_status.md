@@ -518,6 +518,12 @@ reached students, and each motivated a permanent test.
     because the traffic-engineering answer prepends our own number and an empty
     path no longer identifies it. A router table that could not be read stops
     the check rather than turning missing knowledge into an accusation.
+53. **Transit that carried pings and nothing else.** The customer-transit probe
+    was ICMP. A rule dropping forwarded TCP arriving from one customer left
+    every probe answered and the question at full marks, while no connection
+    from that customer could cross this AS. A connection is now attempted as
+    well, to a port nothing is listening on in a third AS, with the destination
+    counting the resets it sends.
 
 ## Environment findings
 
