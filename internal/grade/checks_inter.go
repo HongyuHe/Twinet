@@ -1163,16 +1163,50 @@ func transitProbe(ctx context.Context, env *Env, sess externalSession, cand tran
 	ping, err := env.Probe(ctx, sess.PeerDevice, args)
 	arrived := err == nil && ping.ExitCode == 0
 	after, okA := echoesDeliveredTo(ctx, env, cand.Host)
-	if okB && okA && after > before {
-		return "", true
+	switch {
+	case okB && okA && after > before:
+	case arrived && (!okB || !okA):
+		// The counter could not be read; the reply stands on its own.
+	default:
+		return fmt.Sprintf(
+			"the customer at %s is offered %s but its traffic does not cross this AS: "+
+				"a packet from %s to %s in AS %d was not delivered",
+			sess.Addr, cand.Prefix, sess.PeerDevice, cand.Addr, cand.ASN), false
 	}
-	if arrived && (!okB || !okA) {
-		return "", true // the counter could not be read; the reply stands on its own
+
+	// And something other than a ping.
+	//
+	// Transit that carries ICMP and discards the rest is not transit. A rule
+	// dropping forwarded TCP arriving from one customer left every probe
+	// answered and the question at full marks, while no connection from that
+	// customer could cross this AS. The destination counts the resets it sends,
+	// so being refused is the far side speaking and silence is the packets
+	// being swallowed on the way.
+	rstBefore, okR := tcpResetsSent(ctx, env, cand.Host)
+	conn := []string{"nc", "-v", "-w", "3", "-z"}
+	if src != "" {
+		conn = append(conn, "-s", src)
 	}
-	return fmt.Sprintf(
-		"the customer at %s is offered %s but its traffic does not cross this AS: "+
-			"a packet from %s to %s in AS %d was not delivered",
-		sess.Addr, cand.Prefix, sess.PeerDevice, cand.Addr, cand.ASN), false
+	conn = append(conn, cand.Addr, "9")
+	res, cerr := env.Probe(ctx, sess.PeerDevice, conn)
+	rstAfter, okR2 := tcpResetsSent(ctx, env, cand.Host)
+	said := ""
+	if cerr == nil {
+		said = strings.ToLower(res.Stderr + res.Stdout)
+	}
+	switch {
+	case okR && okR2 && rstAfter > rstBefore:
+	case strings.Contains(said, "refused"), strings.Contains(said, "reset"):
+	case cerr == nil && res.ExitCode == 0:
+	case cerr != nil, !okR, !okR2:
+		// Nothing could be established either way, so nothing is concluded.
+	default:
+		return fmt.Sprintf(
+			"the customer at %s can ping across this AS but not connect: a connection from "+
+				"%s to %s in AS %d never arrived, so the transit carries ICMP and nothing else",
+			sess.Addr, sess.PeerDevice, cand.Addr, cand.ASN), false
+	}
+	return "", true
 }
 
 // sessionAddrOf finds our own address on this link, as the customer sees it:
