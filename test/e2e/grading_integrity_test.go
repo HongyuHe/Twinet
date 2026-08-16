@@ -179,6 +179,7 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 	var notFoundBlock struct{ host, prefix string }
 	var tcpBlock struct{ router, src, dst string }
 	var vlanFlow struct{ switchID string }
+	var forgedLeak struct{ router, routeMap, prefix string }
 	var ixpDeny struct{ router, peer, routeMap string }
 	var importMapNames []string
 	var roaWithdrawn struct{ router, anchor, prefix string }
@@ -792,6 +793,37 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 					"router ospf",
 					" redistribute static",
 					"end")
+				time.Sleep(20 * time.Second)
+			},
+		},
+		{
+			// A leak wearing a customer's number.
+			//
+			// Whether an advertisement to a peer or a provider was a leak was
+			// decided from the AS path in that advertisement, and a path on
+			// the way out is the submission's to write.
+			name:     "a peer's route leaked with a customer's ASN prepended",
+			question: "q2.3",
+			undo: func(t *testing.T) {
+				if forgedLeak.router == "" {
+					return
+				}
+				vtysh(t, dir, forgedLeak.router, "configure terminal",
+					"no route-map "+forgedLeak.routeMap+" permit 5",
+					"no ip prefix-list TWGRADE-LEAK-OUT seq 5 permit "+forgedLeak.prefix,
+					"end")
+			},
+			apply: func(t *testing.T) {
+				router, peer, rmap, prefix, cust := leakableRoute(t, dir, as)
+				forgedLeak = struct{ router, routeMap, prefix string }{router, rmap, prefix}
+				t.Logf("leaking %s to %s from %s, wearing AS %s", prefix, peer, router, cust)
+				vtysh(t, dir, router, "configure terminal",
+					"ip prefix-list TWGRADE-LEAK-OUT seq 5 permit "+prefix,
+					"route-map "+rmap+" permit 5",
+					" match ip address prefix-list TWGRADE-LEAK-OUT",
+					" set as-path prepend "+itoa(as)+" "+cust,
+					"end")
+				vtysh(t, dir, router, "clear ip bgp "+peer+" out")
 				time.Sleep(20 * time.Second)
 			},
 		},
@@ -1628,6 +1660,56 @@ func findNotFoundPrefix(t *testing.T, dir string, as int) string {
 		}
 	}
 	return ""
+}
+
+// leakableRoute finds a router with an export policy towards a peer or
+// provider, a prefix that neither this AS nor its customers originate, and a
+// customer's AS number to hide it behind.
+func leakableRoute(t *testing.T, dir string, as int) (router, peer, routeMap, prefix, cust string) {
+	t.Helper()
+	for _, r := range routersOf(t, dir, as) {
+		cfg, err := twinet(t, "exec", "-m", dir, r, "--", "vtysh", "-c", "show running-config")
+		if err != nil {
+			continue
+		}
+		var outMaps [][2]string
+		for _, line := range strings.Split(cfg, "\n") {
+			f := strings.Fields(strings.TrimSpace(line))
+			if len(f) == 5 && f[0] == "neighbor" && f[2] == "route-map" && f[4] == "out" &&
+				!strings.Contains(f[3], "CUSTOMER") && !strings.Contains(f[3], "IXP") {
+				outMaps = append(outMaps, [2]string{f[1], f[3]})
+			}
+		}
+		if len(outMaps) == 0 {
+			continue
+		}
+		out, err := twinet(t, "exec", "-m", dir, r, "--", "vtysh", "-c", "show ip bgp json")
+		if err != nil {
+			continue
+		}
+		var doc struct {
+			Routes map[string][]struct {
+				Path string `json:"path"`
+				Best bool   `json:"bestpath"`
+			} `json:"routes"`
+		}
+		if json.Unmarshal([]byte(out), &doc) != nil {
+			continue
+		}
+		for pfx, ps := range doc.Routes {
+			for _, p := range ps {
+				f := strings.Fields(p.Path)
+				// A single-hop path is a neighbour's own space; using one of
+				// those makes the case unambiguous.
+				if !p.Best || len(f) != 1 || f[0] == itoa(as) {
+					continue
+				}
+				return r, outMaps[0][0], outMaps[0][1], pfx, f[0]
+			}
+		}
+	}
+	t.Skip("no exportable-looking route found")
+	return "", "", "", "", ""
 }
 
 // rpkiDenyClause finds a route-map clause that denies RPKI-invalid routes and
