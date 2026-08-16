@@ -484,8 +484,12 @@ func checkGaoRexford(ctx context.Context, env *Env) Result {
 	// which is most of them, and all of the ones the assignment cares about --
 	// was marked on customer-versus-provider alone.
 	relOf := map[string]model.Relationship{}
+	relOfASN := map[int]model.Relationship{}
 	for _, sess := range externalSessions(ctx, env) {
 		relOf[sess.Addr] = sess.Rel
+		if sess.ASN != 0 {
+			relOfASN[sess.ASN] = sess.Rel
+		}
 	}
 	if len(relOf) == 0 {
 		return Errored("policy.gao_rexford", fmt.Errorf("AS %d has no external neighbours", env.AS))
@@ -528,11 +532,20 @@ func checkGaoRexford(ctx context.Context, env *Env) Result {
 			var chosen, available model.Relationship
 			chosenOK := false
 			for _, e := range entries {
-				rel, via, ok := learnedFromRelationship(e, relOf)
-				if !ok {
+				if rel, via, ok := learnedFromRelationship(e, relOf); ok {
+					seen[rel] = append(seen[rel], observed{e.LocalPref, prefix, via, r.Name})
+				}
+				// Which relationship the route entered this AS through, which
+				// is a different question from which session this router
+				// happened to hear it on. A route another router of the AS
+				// learned from a peer arrives here over iBGP, where the
+				// session says nothing about its origin -- and the whole
+				// comparison is between routes that mostly arrive that way.
+				// The neighbour at the head of the AS path is the answer.
+				rel := sourceRelationship(e, env.AS, relOf, relOfASN)
+				if rel == "" {
 					continue
 				}
-				seen[rel] = append(seen[rel], observed{e.LocalPref, prefix, via, r.Name})
 				if relRank(rel) > relRank(available) {
 					available = rel
 				}
