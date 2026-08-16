@@ -173,6 +173,7 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 	var tunnelTCP struct{ gateway, iface string }
 	var weighted struct{ router, routeMap, prefix string }
 	var ecmpTCP struct{ router, from string }
+	var impostorLink struct{ router, iface, moved string }
 	var ixpDeny struct{ router, peer, routeMap string }
 	var importMapNames []string
 	var roaWithdrawn struct{ router, anchor, prefix string }
@@ -786,6 +787,42 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 					"router ospf",
 					" redistribute static",
 					"end")
+				time.Sleep(20 * time.Second)
+			},
+		},
+		{
+			// An adjacency on something wearing the link's name.
+			//
+			// The interior adjacencies were tied to the plan by the name of
+			// the interface each ran on, and a name is the one part of an
+			// interface anyone with root can change.
+			name:     "an interior link impersonated by a tunnel with its name",
+			question: "q1.2",
+			undo: func(t *testing.T) {
+				if impostorLink.router == "" {
+					return
+				}
+				_, _ = twinet(t, "exec", "-m", dir, impostorLink.router, "--", "sh", "-c",
+					"ip link del "+impostorLink.iface+" 2>/dev/null; "+
+						"ip link set "+impostorLink.moved+" down 2>/dev/null; "+
+						"ip link set "+impostorLink.moved+" name "+impostorLink.iface+
+						" 2>/dev/null; ip link set "+impostorLink.iface+" up")
+			},
+			apply: func(t *testing.T) {
+				router, iface, local, remote := interiorLinkEnd(t, dir, as)
+				impostorLink = struct{ router, iface, moved string }{
+					router, iface, "underlay0"}
+				t.Logf("renaming %s on %s and putting a tunnel in its place", iface, router)
+				out, err := twinet(t, "exec", "-m", dir, router, "--", "sh", "-c",
+					"ip link set "+iface+" down && ip link set "+iface+" name underlay0 && "+
+						"ip link set underlay0 up && ip addr flush dev underlay0 && "+
+						"ip addr add "+local+" dev underlay0 && "+
+						"ip link add "+iface+" type gretap local "+
+						strings.SplitN(local, "/", 2)[0]+" remote "+remote+" && "+
+						"ip link set "+iface+" up")
+				if err != nil {
+					t.Fatalf("substituting a tunnel for the link: %v\n%s", err, out)
+				}
 				time.Sleep(20 * time.Second)
 			},
 		},
@@ -1420,6 +1457,30 @@ func findNotFoundPrefix(t *testing.T, dir string, as int) string {
 		}
 	}
 	return ""
+}
+
+// interiorLinkEnd picks one end of an interior link and returns the router, the
+// interface, its address with prefix, and the address of the router on the
+// other side.
+func interiorLinkEnd(t *testing.T, dir string, as int) (router, iface, local, remote string) {
+	t.Helper()
+	a, b, aIf, _ := interiorLinkEnds(t, dir, as)
+	out, err := twinet(t, "exec", "-m", dir, a, "--", "ip", "-o", "-4", "addr", "show", "dev", aIf)
+	if err != nil {
+		t.Fatalf("reading %s's address on %s: %v\n%s", a, aIf, err, out)
+	}
+	for _, f := range strings.Fields(out) {
+		if strings.Count(f, ".") == 3 && strings.Contains(f, "/") {
+			local = f
+			break
+		}
+	}
+	if local == "" {
+		t.Skip("no address on the interior link")
+	}
+	remote = bumpLastOctet(strings.SplitN(local, "/", 2)[0])
+	_ = b
+	return a, aIf, local, remote
 }
 
 // interiorLinkEnds finds one link between two routers of this AS, and the

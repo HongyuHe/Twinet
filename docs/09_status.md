@@ -443,6 +443,16 @@ reached students, and each motivated a permanent test.
     decides rather than a hash; and a connection is attempted each way between
     the two loopbacks, which is the pair the question names and the pair a rule
     aimed at this traffic would name.
+45. **An adjacency on something wearing the link's name.** The interior
+    adjacencies were bound to the plan by the name of the interface each ran on,
+    and a name is the one part of an interface that anyone with root can change.
+    Renaming the real veths, building a GRE tunnel between the same two routers
+    and giving it the planned name and addresses put an adjacency on a tunnel
+    while the planned link was down, reported as Full "on the link the plan gives
+    it". Twinet stamps a tag derived from the link's identity onto both halves of
+    the veth it creates, and a veth is not an encapsulation: an interface
+    carrying an adjacency now has to be a veth, to carry that link's tag, and to
+    have the address Twinet gave it.
 
 ## Environment findings
 
