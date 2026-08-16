@@ -1780,46 +1780,14 @@ func leakableRoute(t *testing.T, dir string, as int) (router, peer, routeMap, pr
 // may be and still be covered.
 func publishROAWithLength(t *testing.T, dir, router, anchor, prefix string, as, maxLen int) {
 	t.Helper()
-	addr := serviceAddrOn(t, dir, router, anchor)
 	body := fmt.Sprintf(`{"prefix":%q,"max_length":%d,"asn":%d}`, prefix, maxLen, as)
 	out, err := twinet(t, "exec", "-m", dir, router, "--", "sh", "-c",
 		"wget -qO- --post-data="+shellQuoteForTest(body)+
-			" --header='Content-Type: application/json' http://"+addr+":8323/roas")
+			" --header=Content-Type:application/json http://"+anchor+":8323/roas")
 	if err != nil {
-		t.Fatalf("publishing a ROA: %v\n%s", err, out)
+		t.Fatalf("publishing to the anchor at %s: %v\n%s", anchor, err, out)
 	}
 	time.Sleep(10 * time.Second)
-}
-
-// serviceAddrOn finds the address a router reaches a service container at.
-func serviceAddrOn(t *testing.T, dir, router, service string) string {
-	t.Helper()
-	out, err := twinet(t, "exec", "-m", dir, service, "--", "ip", "-o", "-4", "addr", "show",
-		"scope", "global")
-	if err != nil {
-		t.Fatalf("reading %s's addresses: %v\n%s", service, err, out)
-	}
-	// The service has one interface per AS; the one this router can reach is
-	// on the same subnet as one of its own addresses.
-	mine, err := twinet(t, "exec", "-m", dir, router, "--", "ip", "-o", "-4", "addr", "show",
-		"scope", "global")
-	if err != nil {
-		t.Fatalf("reading %s's addresses: %v\n%s", router, err, mine)
-	}
-	for _, line := range strings.Split(out, "\n") {
-		for _, f := range strings.Fields(line) {
-			if strings.Count(f, ".") != 3 || !strings.Contains(f, "/") {
-				continue
-			}
-			addr := strings.SplitN(f, "/", 2)[0]
-			net := addr[:strings.LastIndexByte(addr, '.')+1]
-			if strings.Contains(mine, " "+net) {
-				return addr
-			}
-		}
-	}
-	t.Skipf("no shared subnet between %s and %s", router, service)
-	return ""
 }
 
 // rpkiDenyClause finds a route-map clause that denies RPKI-invalid routes and
