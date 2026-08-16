@@ -400,6 +400,14 @@ reached students, and each motivated a permanent test.
     advertisement are read now -- router, network, summary and external -- so a
     stub link, a transit segment, an inter-area summary and a redistribution are
     all caught, whatever metric they carry.
+41. **A tunnel that only carried pings.** Every probe of the 6in4 question was
+    ICMPv6. A rule on the gateway discarding forwarded TCP left every ping
+    answered, the tunnel counters moving, and the whole point awarded for a
+    tunnel across which no connection could be made. A connection is now
+    attempted each way, to a port nothing is listening on, so no service has to
+    be arranged anywhere: the answer is a reset, and the far side's own count of
+    resets it has sent records that the attempt arrived. A datacentre that can
+    only be pinged is not reachable in any sense the assignment means.
 
 ## Environment findings
 

@@ -170,6 +170,7 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 	var vlanMirror struct{ switchID, from string }
 	var ibgpBlackhole struct{ router, peer string }
 	var leakedRange string
+	var tunnelTCP struct{ gateway, iface string }
 	var ixpDeny struct{ router, peer, routeMap string }
 	var importMapNames []string
 	var roaWithdrawn struct{ router, anchor, prefix string }
@@ -784,6 +785,35 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 					" redistribute static",
 					"end")
 				time.Sleep(20 * time.Second)
+			},
+		},
+		{
+			// A tunnel that only carries pings.
+			//
+			// Every probe of the 6in4 question was ICMPv6, so a rule
+			// discarding forwarded TCP on the gateway left every ping
+			// answered, the tunnel counters moving, and the point awarded for
+			// a tunnel across which no connection could be made.
+			name:     "the tunnel carrying pings and no other traffic",
+			question: "q1.4",
+			undo: func(t *testing.T) {
+				if tunnelTCP.gateway == "" {
+					return
+				}
+				_, _ = twinet(t, "exec", "-m", dir, tunnelTCP.gateway, "--", "sh", "-c",
+					"ip6tables -D FORWARD -i "+tunnelTCP.iface+" -p tcp -j DROP; "+
+						"ip6tables -D FORWARD -o "+tunnelTCP.iface+" -p tcp -j DROP")
+			},
+			apply: func(t *testing.T) {
+				gw, iface := tunnelGateway(t, dir, as)
+				tunnelTCP = struct{ gateway, iface string }{gw, iface}
+				t.Logf("discarding forwarded TCP over %s on %s", iface, gw)
+				out, err := twinet(t, "exec", "-m", dir, gw, "--", "sh", "-c",
+					"ip6tables -I FORWARD 1 -i "+iface+" -p tcp -j DROP && "+
+						"ip6tables -I FORWARD 1 -o "+iface+" -p tcp -j DROP")
+				if err != nil {
+					t.Fatalf("blocking TCP over the tunnel: %v\n%s", err, out)
+				}
 			},
 		},
 		{
@@ -1508,6 +1538,38 @@ func ixpImport(t *testing.T, dir string, as int) (router, peer, routeMap string)
 // serviceSubnet finds a subnet one router advertises into OSPF, another router
 // that does not, and the prefix itself.
 //
+// tunnelGateway finds a datacentre gateway and the tunnel interface it
+// terminates, read from the running lab.
+func tunnelGateway(t *testing.T, dir string, as int) (string, string) {
+	t.Helper()
+	out, err := twinet(t, "inspect", "-m", dir)
+	if err != nil {
+		t.Fatalf("inspecting the lab: %v\n%s", err, out)
+	}
+	prefix := "as" + itoa(as) + "/"
+	var routers []string
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		if len(f) > 1 && strings.HasPrefix(f[0], prefix) && f[1] == "router" {
+			routers = append(routers, f[0])
+		}
+	}
+	sort.Strings(routers)
+	for _, r := range routers {
+		links, err := twinet(t, "exec", "-m", dir, r, "--", "sh", "-c", "ls /sys/class/net")
+		if err != nil {
+			continue
+		}
+		for _, f := range strings.Fields(links) {
+			if strings.HasPrefix(f, "tun") {
+				return r, f
+			}
+		}
+	}
+	t.Skip("no tunnel interface found in this AS")
+	return "", ""
+}
+
 // interASRange finds the subnet of one of this AS's external links, read from
 // the router that terminates it.
 func interASRange(t *testing.T, dir string, as int) string {
