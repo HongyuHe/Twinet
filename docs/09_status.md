@@ -524,6 +524,13 @@ reached students, and each motivated a permanent test.
     from that customer could cross this AS. A connection is now attempted as
     well, to a port nothing is listening on in a third AS, with the destination
     counting the resets it sends.
+54. **A ROA that authorised everything smaller.** Whether a system had published
+    a ROA was decided from the prefix and the origin; the maximum length was
+    printed and not read. A maximum length longer than the prefix authorises
+    every more-specific announcement inside it, so with `maxlen 32` somebody
+    announcing a /16 out of the block with this AS forged as the origin is
+    RPKI-valid to everybody who checks -- and the ROA that was supposed to stop
+    them is what makes it so. Only the block itself counts now.
 
 ## Environment findings
 
