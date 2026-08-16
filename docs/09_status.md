@@ -498,6 +498,16 @@ reached students, and each motivated a permanent test.
     path that carries pings and nothing else caps the check at half, because as
     a fraction of a hundred and forty-four probes the deduction was three
     thousandths, which is the same as not noticing.
+51. **A way across that carried one flow and no broadcast.** The isolation probe
+    sends a broadcast, which is what a shared broadcast domain leaks. It is not
+    what a rule aimed at one flow leaks: an OpenFlow entry copying HTTPS from a
+    VLAN 10 port to a VLAN 20 port carried a connection between two VLANs while
+    every broadcast stayed where it belonged, at full marks. Each switch's flow
+    table is now read, with its port numbering and each port's access VLAN, and
+    any rule that sends a frame from a port in one VLAN out of a port in another
+    -- or out of a port whatever the frame arrived on -- is a way across. That
+    covers every protocol at once and needs no packet, which is what a broadcast
+    probe cannot do.
 
 ## Environment findings
 
