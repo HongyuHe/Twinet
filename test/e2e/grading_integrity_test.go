@@ -1130,6 +1130,26 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 			},
 		},
 		{
+			// The same, in a scope the reader used to filter on.
+			//
+			// A scope the check did not ask about is a place to put an address
+			// it will never see, and a link-scoped address is live: the router
+			// answers for it.
+			name:     "an unplanned address hidden in another scope",
+			question: "q1.2",
+			undo: func(t *testing.T) {
+				_, _ = twinet(t, "exec", "-m", dir, "as3/NYC", "--", "ip", "address", "del",
+					"198.51.100.23/32", "dev", "lo", "scope", "link")
+			},
+			apply: func(t *testing.T) {
+				out, err := twinet(t, "exec", "-m", dir, "as3/NYC", "--", "ip", "address", "add",
+					"198.51.100.23/32", "dev", "lo", "scope", "link")
+				if err != nil {
+					t.Fatalf("adding a link-scoped address: %v\n%s", err, out)
+				}
+			},
+		},
+		{
 			// The right prefix, advertised by the wrong router.
 			//
 			// A prefix carries no record of where it came from. Taking a

@@ -453,6 +453,13 @@ reached students, and each motivated a permanent test.
     the veth it creates, and a veth is not an encapsulation: an interface
     carrying an adjacency now has to be a veth, to carry that link's tag, and to
     have the address Twinet gave it.
+46. **An address hidden in another scope.** The addressing check read `scope
+    global`, so the scope it filtered on was a place to put an address it would
+    never look at: `ip addr add X/32 dev lo scope link` is live, the router
+    answers for X, and the claim that nothing unplanned is configured was true
+    only of the one shelf the check opened. Every scope is read now, with the
+    kernel's own -- loopback and link-local -- exempt, because nobody configured
+    them.
 
 ## Environment findings
 
