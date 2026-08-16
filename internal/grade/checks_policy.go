@@ -86,15 +86,47 @@ func tunnelCarriesTransport(ctx context.Context, env *Env, hosts map[string]*mod
 			}
 			continue
 		}
-		if after > before {
-			continue
+		if after <= before {
+			return fmt.Sprintf(
+				"IPv6 pings cross the tunnel, but a connection from %s to %s at %s never "+
+					"arrived: %s answered no TCP at all, so the tunnel carries ICMP and "+
+					"nothing else", src.Name, dst.Name, addr, dst.Name), false
 		}
-		return fmt.Sprintf(
-			"IPv6 pings cross the tunnel, but a connection from %s to %s at %s never "+
-				"arrived: %s answered no TCP at all, so the tunnel carries ICMP and "+
-				"nothing else", src.Name, dst.Name, addr, dst.Name), false
+		// And a datagram, which is neither of the two things already tried.
+		//
+		// A filter can be written per protocol as easily as per port. The far
+		// side counts the datagrams it received for a port nothing is bound
+		// to, which is a fact about arrival and not about any answer.
+		udpBefore, okU := udpNoPorts(ctx, env, dst.ID)
+		_, _ = env.Probe(ctx, src.ID, []string{"sh", "-c",
+			"echo twinet | nc -6 -u -w 2 " + addr + " " + probePort()})
+		udpAfter, okU2 := udpNoPorts(ctx, env, dst.ID)
+		if okU && okU2 && udpAfter <= udpBefore {
+			return fmt.Sprintf(
+				"IPv6 pings and connections cross the tunnel, but a datagram from %s to %s "+
+					"at %s never arrived: something on the path is filtering by protocol",
+				src.Name, dst.Name, addr), false
+		}
 	}
 	return "", true
+}
+
+// udpNoPorts reads a host's count of datagrams delivered to it for a port
+// nothing is bound to, which the kernel keeps and nothing on the path can
+// raise without the datagram arriving.
+func udpNoPorts(ctx context.Context, env *Env, device string) (int, bool) {
+	res, err := env.Probe(ctx, device, []string{"cat", "/proc/net/snmp6"})
+	if err != nil || res.ExitCode != 0 {
+		return 0, false
+	}
+	for _, line := range strings.Split(res.Stdout, "\n") {
+		f := strings.Fields(line)
+		if len(f) == 2 && f[0] == "Udp6NoPorts" {
+			n, err := strconv.Atoi(f[1])
+			return n, err == nil
+		}
+	}
+	return 0, false
 }
 
 // tcpResetsSent reads a host's count of TCP resets it has sent, which is the
