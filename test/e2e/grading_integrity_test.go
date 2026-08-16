@@ -812,7 +812,7 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 			// reported Established until the hold timer expires, which is
 			// longer than a grading run.
 			name:     "an eBGP session blackholed but still called Established",
-			question: "q2.1",
+			question: "q2.2",
 			undo: func(t *testing.T) {
 				if ebgpBlackhole.router == "" {
 					return
