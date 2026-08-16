@@ -531,6 +531,15 @@ reached students, and each motivated a permanent test.
     announcing a /16 out of the block with this AS forged as the origin is
     RPKI-valid to everybody who checks -- and the ROA that was supposed to stop
     them is what makes it so. Only the block itself counts now.
+55. **Somebody else's prefix, re-originated on the way out.** A relayed route
+    keeps its origin at the end of its path, and this AS's own prepends go on
+    the front. Rewriting the end -- excluding AS 1 and prepending ourselves --
+    makes the neighbour believe this AS originates address space it does not
+    hold, and it never appears as a locally injected route, so the check that
+    exists to catch a hijack saw nothing while the customer's traffic for that
+    network came here. The advertised paths are now read for what they claim:
+    an origin of ours on a prefix that is not ours is a claim on somebody's
+    address space, whatever the local table says.
 
 ## Environment findings
 
