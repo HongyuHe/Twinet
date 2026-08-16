@@ -926,6 +926,30 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 			},
 		},
 		{
+			// One port open and the rest of TCP discarded.
+			//
+			// A fixed probe port is a published answer: a rule resetting that
+			// one port and dropping every other connection read as a network
+			// in perfect health.
+			name:     "one port answering while every other connection is dropped",
+			question: "q1.2",
+			undo: func(t *testing.T) {
+				_, _ = twinet(t, "exec", "-m", dir, "as3/NYC_host", "--", "sh", "-c",
+					"iptables -D INPUT -p tcp --dport 9 -j REJECT --reject-with tcp-reset; "+
+						"iptables -D INPUT -p tcp --tcp-flags RST RST -j ACCEPT; "+
+						"iptables -D INPUT -p tcp -j DROP")
+			},
+			apply: func(t *testing.T) {
+				out, err := twinet(t, "exec", "-m", dir, "as3/NYC_host", "--", "sh", "-c",
+					"iptables -A INPUT -p tcp --dport 9 -j REJECT --reject-with tcp-reset && "+
+						"iptables -I INPUT 2 -p tcp --tcp-flags RST RST -j ACCEPT && "+
+						"iptables -A INPUT -p tcp -j DROP")
+				if err != nil {
+					t.Fatalf("permitting one port and dropping the rest: %v\n%s", err, out)
+				}
+			},
+		},
+		{
 			// A pair that can be pinged and not spoken to.
 			//
 			// Every probe of the internal data plane was ICMP, so a rule

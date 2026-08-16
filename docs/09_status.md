@@ -540,6 +540,13 @@ reached students, and each motivated a permanent test.
     network came here. The advertised paths are now read for what they claim:
     an origin of ours on a prefix that is not ours is a claim on somebody's
     address space, whatever the local table says.
+56. **One port open and the rest of TCP discarded.** The connection probes all
+    used port 9, and a fixed port is a published answer: resetting that one port
+    and dropping every other connection was measured as a network in perfect
+    health, because the one port the grader ever tried was the one port that
+    worked. The port is now drawn when the check runs, above the registered
+    range and below the ephemeral one, so it is unlikely to find a listener and
+    cannot be permitted in advance.
 
 ## Environment findings
 
