@@ -168,6 +168,7 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 	var impostorSubnet struct{ faker, prefix string }
 	var customerDrops []string
 	var vlanMirror struct{ switchID, from string }
+	var ibgpBlackhole struct{ router, peer string }
 	var ixpDeny struct{ router, peer, routeMap string }
 	var importMapNames []string
 	var roaWithdrawn struct{ router, anchor, prefix string }
@@ -782,6 +783,43 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 					" redistribute static",
 					"end")
 				time.Sleep(20 * time.Second)
+			},
+		},
+		{
+			// A session held open by a timer.
+			//
+			// "Established" is a memory. A session whose packets are being
+			// discarded stays Established until the hold timer expires, which
+			// with the default timers is longer than a grading run, so the
+			// mesh scored full marks for a session carrying nothing.
+			name:     "an iBGP session blackholed but still called Established",
+			question: "q2.1",
+			undo: func(t *testing.T) {
+				if ibgpBlackhole.router == "" {
+					return
+				}
+				_, _ = twinet(t, "exec", "-m", dir, ibgpBlackhole.router, "--", "sh", "-c",
+					"iptables -D INPUT -p tcp -s "+ibgpBlackhole.peer+" -j DROP; "+
+						"iptables -D OUTPUT -p tcp -d "+ibgpBlackhole.peer+" -j DROP")
+			},
+			apply: func(t *testing.T) {
+				out, err := twinet(t, "exec", "-m", dir, "as3/NYC", "--",
+					"vtysh", "-c", "show running-config")
+				if err != nil {
+					t.Fatalf("reading the configuration: %v\n%s", err, out)
+				}
+				peer := firstIBGPPeer(out)
+				if peer == "" {
+					t.Skip("no iBGP neighbour found to blackhole")
+				}
+				ibgpBlackhole = struct{ router, peer string }{"as3/NYC", peer}
+				t.Logf("discarding BGP packets between as3/NYC and %s", peer)
+				out, err = twinet(t, "exec", "-m", dir, "as3/NYC", "--", "sh", "-c",
+					"iptables -I INPUT 1 -p tcp -s "+peer+" -j DROP && "+
+						"iptables -I OUTPUT 1 -p tcp -d "+peer+" -j DROP")
+				if err != nil {
+					t.Fatalf("blackholing the session: %v\n%s", err, out)
+				}
 			},
 		},
 		{

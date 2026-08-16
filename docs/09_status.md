@@ -381,6 +381,15 @@ reached students, and each motivated a permanent test.
     then the answer goes back into the VLAN it came from while the other VLAN
     has seen everything. One frame crossing fails the question; isolation is a
     property of the domain, not a proportion of it.
+39. **A session held open by a timer.** "Established" is a memory, not an
+    observation. A session whose packets are being discarded stays Established
+    until the hold timer expires -- three minutes with the default timers, which
+    is longer than a grading run -- so an iBGP session blackholed in both
+    directions scored full marks while carrying nothing. Each router is now
+    asked to send a route refresh, which is a real message that has to cross the
+    connection, and the peer's own received count records its arrival. It also
+    makes the peer answer, so the counts move in both directions, and it
+    disturbs nothing: the peer re-sends routes the receiver already has.
 
 ## Environment findings
 
