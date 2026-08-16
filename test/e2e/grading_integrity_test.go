@@ -167,6 +167,7 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 	var redistributed struct{ faker, prefix string }
 	var impostorSubnet struct{ faker, prefix string }
 	var customerDrops []string
+	var vlanMirror struct{ switchID, from string }
 	var ixpDeny struct{ router, peer, routeMap string }
 	var importMapNames []string
 	var roaWithdrawn struct{ router, anchor, prefix string }
@@ -781,6 +782,36 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 					" redistribute static",
 					"end")
 				time.Sleep(20 * time.Second)
+			},
+		},
+		{
+			// Two VLANs made into one broadcast domain.
+			//
+			// The isolation check asked only about IP: hosts in one VLAN
+			// adjacent, hosts in two separated by the gateway. Mirroring one
+			// access port onto another leaves all of that true, because
+			// off-subnet traffic goes through the gateway by a routing decision
+			// the host makes before any frame exists.
+			name:     "one VLAN's frames mirrored onto another",
+			question: "q1.1",
+			undo: func(t *testing.T) {
+				if vlanMirror.switchID == "" {
+					return
+				}
+				_, _ = twinet(t, "exec", "-m", dir, vlanMirror.switchID, "--",
+					"tc", "qdisc", "del", "dev", vlanMirror.from, "clsact")
+			},
+			apply: func(t *testing.T) {
+				sw, from, to := vlanPortPair(t, dir, as)
+				vlanMirror = struct{ switchID, from string }{sw, from}
+				t.Logf("mirroring %s onto %s on %s", from, to, sw)
+				out, err := twinet(t, "exec", "-m", dir, sw, "--", "sh", "-c",
+					"tc qdisc add dev "+from+" clsact && "+
+						"tc filter add dev "+from+" ingress protocol all pref 10 "+
+						"matchall action mirred egress mirror dev "+to)
+				if err != nil {
+					t.Fatalf("mirroring one access port onto another: %v\n%s", err, out)
+				}
 			},
 		},
 		{
@@ -1404,6 +1435,47 @@ func ixpImport(t *testing.T, dir string, as int) (router, peer, routeMap string)
 // serviceSubnet finds a subnet one router advertises into OSPF, another router
 // that does not, and the prefix itself.
 //
+// vlanPortPair finds a switch with access ports in two different VLANs and
+// returns it with one port from each, read from the lab rather than assumed.
+func vlanPortPair(t *testing.T, dir string, as int) (sw, from, to string) {
+	t.Helper()
+	out, err := twinet(t, "inspect", "-m", dir)
+	if err != nil {
+		t.Fatalf("inspecting the lab: %v\n%s", err, out)
+	}
+	prefix := "as" + itoa(as) + "/"
+	var switches []string
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		if len(f) > 1 && strings.HasPrefix(f[0], prefix) && f[1] == "switch" {
+			switches = append(switches, f[0])
+		}
+	}
+	sort.Strings(switches)
+	for _, s := range switches {
+		ports, err := twinet(t, "exec", "-m", dir, s, "--", "sh", "-c", "ls /sys/class/net")
+		if err != nil {
+			continue
+		}
+		// The access ports of the two VLANs are named after the hosts behind
+		// them, and this topology names them A_* and P_* by VLAN.
+		var a, p string
+		for _, f := range strings.Fields(ports) {
+			switch {
+			case strings.HasPrefix(f, "port_A_") && a == "":
+				a = f
+			case strings.HasPrefix(f, "port_P_") && p == "":
+				p = f
+			}
+		}
+		if a != "" && p != "" {
+			return s, a, p
+		}
+	}
+	t.Skip("no switch with access ports in two VLANs")
+	return "", "", ""
+}
+
 // customerIfaces names the interfaces of as3/SFO that face a customer, read
 // from the running lab so the mutation follows the topology rather than a
 // memory of it.

@@ -370,6 +370,17 @@ reached students, and each motivated a permanent test.
     on their router -- with a source address of theirs that the internet can
     route back to, because the link's own numbering is advertised nowhere and
     the first reverse-path check on the way drops it.
+38. **Two VLANs that were one broadcast domain.** Everything the isolation check
+    asked about was IP: hosts in one VLAN adjacent, hosts in two separated by
+    the gateway. Mirroring one access port onto another with `tc ... mirred`
+    leaves all of that true, because off-subnet traffic goes through the gateway
+    by a routing decision the host makes before any frame exists. A broadcast is
+    now sent and the far side asked whether it saw it: an ARP request names its
+    sender, and a kernel that answers one records who asked. That works where
+    watching for a reply does not, because a copy can be made one way only, and
+    then the answer goes back into the VLAN it came from while the other VLAN
+    has seen everything. One frame crossing fails the question; isolation is a
+    property of the domain, not a proportion of it.
 
 ## Environment findings
 
