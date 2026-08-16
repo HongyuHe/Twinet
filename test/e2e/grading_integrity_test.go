@@ -181,6 +181,10 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 	var vlanFlow struct{ switchID string }
 	var forgedLeak struct{ router, routeMap, prefix string }
 	var custTCP string
+	var looseROA struct {
+		router, anchor, prefix string
+		length                 int
+	}
 	var ixpDeny struct{ router, peer, routeMap string }
 	var importMapNames []string
 	var roaWithdrawn struct{ router, anchor, prefix string }
@@ -795,6 +799,37 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 					" redistribute static",
 					"end")
 				time.Sleep(20 * time.Second)
+			},
+		},
+		{
+			// A ROA that authorises everything smaller.
+			//
+			// The maximum length was printed and not read, so a ROA with
+			// `maxlen 32` -- which makes a hijack of any piece of the block
+			// valid to everybody who checks -- was full credit.
+			name:     "a ROA authorising every more-specific inside the block",
+			question: "q2.6",
+			undo: func(t *testing.T) {
+				if looseROA.anchor == "" {
+					return
+				}
+				publishROAWithLength(t, dir, looseROA.router, looseROA.anchor,
+					looseROA.prefix, as, looseROA.length)
+			},
+			apply: func(t *testing.T) {
+				router, anchor, prefix := roaPublisher(t, dir, as)
+				length := 8
+				if _, l, ok := strings.Cut(prefix, "/"); ok {
+					if n, err := strconv.Atoi(l); err == nil {
+						length = n
+					}
+				}
+				looseROA = struct {
+					router, anchor, prefix string
+					length                 int
+				}{router, anchor, prefix, length}
+				t.Logf("publishing %s with maxlen 32 instead of %d", prefix, length)
+				publishROAWithLength(t, dir, router, anchor, prefix, as, 32)
 			},
 		},
 		{
@@ -1738,6 +1773,53 @@ func leakableRoute(t *testing.T, dir string, as int) (router, peer, routeMap, pr
 	}
 	t.Skip("no exportable-looking route found")
 	return "", "", "", "", ""
+}
+
+// publishROAWithLength publishes a ROA with an explicit maximum length, which
+// is the part of an authorisation that says how much smaller an announcement
+// may be and still be covered.
+func publishROAWithLength(t *testing.T, dir, router, anchor, prefix string, as, maxLen int) {
+	t.Helper()
+	addr := serviceAddrOn(t, dir, router, anchor)
+	body := fmt.Sprintf(`{"prefix":%q,"max_length":%d,"asn":%d}`, prefix, maxLen, as)
+	out, err := twinet(t, "exec", "-m", dir, router, "--", "sh", "-c",
+		"wget -qO- --post-data="+shellQuoteForTest(body)+
+			" --header='Content-Type: application/json' http://"+addr+":8323/roas")
+	if err != nil {
+		t.Fatalf("publishing a ROA: %v\n%s", err, out)
+	}
+	time.Sleep(10 * time.Second)
+}
+
+// serviceAddrOn finds the address a router reaches a service container at.
+func serviceAddrOn(t *testing.T, dir, router, service string) string {
+	t.Helper()
+	out, err := twinet(t, "exec", "-m", dir, service, "--", "ip", "-o", "-4", "addr", "show",
+		"scope", "global")
+	if err != nil {
+		t.Fatalf("reading %s's addresses: %v\n%s", service, err, out)
+	}
+	// The service has one interface per AS; the one this router can reach is
+	// on the same subnet as one of its own addresses.
+	mine, err := twinet(t, "exec", "-m", dir, router, "--", "ip", "-o", "-4", "addr", "show",
+		"scope", "global")
+	if err != nil {
+		t.Fatalf("reading %s's addresses: %v\n%s", router, err, mine)
+	}
+	for _, line := range strings.Split(out, "\n") {
+		for _, f := range strings.Fields(line) {
+			if strings.Count(f, ".") != 3 || !strings.Contains(f, "/") {
+				continue
+			}
+			addr := strings.SplitN(f, "/", 2)[0]
+			net := addr[:strings.LastIndexByte(addr, '.')+1]
+			if strings.Contains(mine, " "+net) {
+				return addr
+			}
+		}
+	}
+	t.Skipf("no shared subnet between %s and %s", router, service)
+	return ""
 }
 
 // rpkiDenyClause finds a route-map clause that denies RPKI-invalid routes and
