@@ -171,6 +171,7 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 	var ibgpBlackhole struct{ router, peer string }
 	var leakedRange string
 	var tunnelTCP struct{ gateway, iface string }
+	var weighted struct{ router, routeMap, prefix string }
 	var ixpDeny struct{ router, peer, routeMap string }
 	var importMapNames []string
 	var roaWithdrawn struct{ router, anchor, prefix string }
@@ -788,6 +789,42 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 			},
 		},
 		{
+			// The ordering arranged by an attribute nobody looked at.
+			//
+			// Local preference is only the second tie-break in the decision
+			// process, so `set weight 65535` on a provider's route puts it
+			// ahead of a peer's while every local preference in the table
+			// still reads correctly.
+			name:     "a provider's route preferred by weight while local preference reads right",
+			question: "q2.3",
+			undo: func(t *testing.T) {
+				if weighted.router == "" {
+					return
+				}
+				vtysh(t, dir, weighted.router, "configure terminal",
+					"no route-map "+weighted.routeMap+" permit 15",
+					"no ip prefix-list TWGRADE-WEIGHT seq 5 permit "+weighted.prefix,
+					"end")
+			},
+			apply: func(t *testing.T) {
+				router, peer, rmap, prefix := providerImport(t, dir, as)
+				weighted = struct{ router, routeMap, prefix string }{router, rmap, prefix}
+				t.Logf("preferring %s from the provider at %s by weight, on %s",
+					prefix, peer, router)
+				// A clause on the policy the provider's session already
+				// applies, so it takes effect the way a student's would.
+				vtysh(t, dir, router, "configure terminal",
+					"ip prefix-list TWGRADE-WEIGHT seq 5 permit "+prefix,
+					"route-map "+rmap+" permit 15",
+					" match ip address prefix-list TWGRADE-WEIGHT",
+					" set local-preference 100",
+					" set weight 65535",
+					"end")
+				vtysh(t, dir, router, "clear ip bgp "+peer+" in")
+				time.Sleep(20 * time.Second)
+			},
+		},
+		{
 			// A route in the table and no packet on the wire.
 			//
 			// A policy rule sending one destination to another table, with a
@@ -1398,6 +1435,47 @@ func interiorLinkEnds(t *testing.T, dir string, as int) (a, b, aIf, bIf string) 
 		}
 	}
 	t.Fatalf("AS %d has no link between two of its routers", as)
+	return "", "", "", ""
+}
+
+// providerImport finds a router with a session to a provider, the policy that
+// session applies on import, and a prefix that a peer also offers -- which is
+// the pair the ordering rule is about.
+func providerImport(t *testing.T, dir string, as int) (router, peer, routeMap, prefix string) {
+	t.Helper()
+	for _, r := range routersOf(t, dir, as) {
+		out, err := twinet(t, "exec", "-m", dir, r, "--", "vtysh", "-c", "show ip bgp json")
+		if err != nil {
+			continue
+		}
+		var doc struct {
+			Routes map[string][]struct {
+				Path   string `json:"path"`
+				PeerID string `json:"peerId"`
+			} `json:"routes"`
+		}
+		if json.Unmarshal([]byte(out), &doc) != nil {
+			continue
+		}
+		maps := importRouteMaps(t, dir, r)
+		for pfx, paths := range doc.Routes {
+			// Two paths for one prefix, one of them heard directly over a
+			// session this router applies a policy to.
+			if len(paths) < 2 {
+				continue
+			}
+			for _, p := range paths {
+				if p.PeerID == "" || maps[p.PeerID] == "" {
+					continue
+				}
+				if len(strings.Fields(p.Path)) < 2 {
+					continue // a route from the neighbour itself, not through it
+				}
+				return r, p.PeerID, maps[p.PeerID], pfx
+			}
+		}
+	}
+	t.Skip("no prefix offered over two relationships was found")
 	return "", "", "", ""
 }
 
