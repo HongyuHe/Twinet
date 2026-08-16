@@ -349,14 +349,25 @@ func checkSixIn4(ctx context.Context, env *Env) Result {
 	// point awarded for a tunnel across which no connection could be made. A
 	// datacentre that can only be pinged is not reachable in any sense the
 	// assignment means.
+	transportBlocked := ""
 	if throughTunnel && len(domains) >= 2 {
 		if why, ok := tunnelCarriesTransport(ctx, env, hosts, domains); !ok {
 			throughTunnel = false
 			reach = why
+			transportBlocked = why
 		}
 	}
 
 	switch {
+	case transportBlocked != "":
+		return Partial("tunnel.sixin4", 0.5, Evidence{
+			Expected: "the datacentres reaching each other over IPv6, not only answering pings",
+			Observed: "the tunnel carries ICMPv6 and nothing else",
+			Detail:   transportBlocked,
+			Hint: "something on the path is permitting ICMP and discarding the rest; " +
+				"a datacentre that can only be pinged is not reachable",
+			Command: "nc -6 -z <the other datacentre's host> 9; /proc/net/snmp",
+		})
 	case len(missing) == 0 && reachable && throughTunnel && len(unreached) > 0:
 		// The tunnel works and the answer does not cover the datacentres.
 		return Partial("tunnel.sixin4", 0.5, Evidence{
