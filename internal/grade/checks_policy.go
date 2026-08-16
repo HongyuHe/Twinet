@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/HongyuHe/twinet/internal/model"
@@ -1603,25 +1604,77 @@ func missingNotFoundRoutes(ctx context.Context, env *Env) ([]string, int, error)
 		// router and reaches nobody, and so is a route whose next hop does not
 		// resolve; both used to pass. The probe is the only thing that can
 		// tell a preserved route from a convincing imitation of one.
-		src, dst := hostIn(env.Topology, env.AS), hostIn(env.Topology, asn)
-		if src == nil || dst == nil {
+		// From every host, not the first one the topology happens to list.
+		//
+		// One probe is a statement about one host: a blackhole for this prefix
+		// on any other left the sole probe succeeding and the question at full
+		// marks, while the site behind it could not reach the network the
+		// question is about. Which host the list starts with is an accident of
+		// the manifest's ordering.
+		dst := hostIn(env.Topology, asn)
+		if dst == nil {
 			continue
 		}
 		addr := siteAddr(dst)
 		if addr == "" {
 			continue
 		}
-		ok, err := env.reaches(ctx, src.ID, addr)
+		unreachable, err := hostsThatCannotReach(ctx, env, addr)
 		if err != nil {
-			return nil, 0, fmt.Errorf("probing %s from %s: %w", addr, src.ID, err)
+			return nil, 0, err
 		}
-		if !ok {
+		if len(unreachable) > 0 {
 			missing = append(missing, fmt.Sprintf(
-				"%s (AS %d) is in every table, but %s cannot reach %s: the route is preserved "+
-					"in name only", as.Block, asn, src.Name, addr))
+				"%s (AS %d) is in every table, but %d host(s) cannot reach %s (%s): the route "+
+					"is preserved in name only", as.Block, asn, len(unreachable), addr,
+				strings.Join(truncate(unreachable, 3), ", ")))
 		}
 	}
 	return missing, checked, nil
+}
+
+// hostsThatCannotReach probes an address from every host of this AS at once and
+// names the ones it does not reach.
+func hostsThatCannotReach(ctx context.Context, env *Env, addr string) ([]string, error) {
+	as, ok := env.Topology.ASes[env.AS]
+	if !ok {
+		return nil, fmt.Errorf("AS %d not in the lab", env.AS)
+	}
+	var (
+		mu   sync.Mutex
+		out  []string
+		wg   sync.WaitGroup
+		perr error
+	)
+	sem := make(chan struct{}, 8)
+	for _, d := range as.Devices {
+		if d.Kind != model.KindHost || d.L2Domain != "" || siteAddr(d) == "" {
+			continue
+		}
+		wg.Add(1)
+		go func(d *model.Device) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			reached, err := env.reaches(ctx, d.ID, addr)
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err != nil:
+				if perr == nil {
+					perr = fmt.Errorf("probing %s from %s: %w", addr, d.ID, err)
+				}
+			case !reached:
+				out = append(out, d.Name)
+			}
+		}(d)
+	}
+	wg.Wait()
+	if perr != nil {
+		return nil, perr
+	}
+	sort.Strings(out)
+	return out, nil
 }
 
 // locallySourced reports whether a route was originated by this AS rather than
