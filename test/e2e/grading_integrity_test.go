@@ -2220,6 +2220,61 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 				time.Sleep(8 * time.Second)
 			},
 		},
+		{
+			// The policy the grader reads and the policy the router runs.
+			//
+			// A session takes its settings from its peer-group unless it
+			// states its own, and a peer-group is a template that nothing
+			// peers with. So a correct-looking policy on the group, overridden
+			// on the session by one that filters nothing, left the clause the
+			// grader was looking for in the configuration while the session
+			// ran something else. The group carried the remote AS, so the
+			// group stood in the list of external sessions in place of its own
+			// member, and nothing ever asked what the member does.
+			//
+			// Everything else about the session is rewritten unchanged, so the
+			// only thing this costs is the question about origin validation.
+			name:     "an import policy on a peer-group, overridden on the session",
+			question: "q2.6",
+			apply: func(t *testing.T) {
+				g := rpkiGuardedSession(t, dir, as)
+				t.Logf("moving the policy of %s onto a peer-group at %s and overriding it "+
+					"on the session", g.peer, g.router)
+				cmds := append([]string{"configure terminal"}, g.decoy...)
+				cmds = append(cmds,
+					"router bgp "+itoa(as),
+					" no neighbor "+g.peer,
+					" neighbor TWGRP peer-group")
+				for _, s := range g.global {
+					cmds = append(cmds, " neighbor TWGRP "+s)
+				}
+				cmds = append(cmds,
+					" neighbor "+g.peer+" peer-group TWGRP",
+					" address-family ipv4 unicast")
+				for _, s := range g.ipv4 {
+					cmds = append(cmds, "  neighbor TWGRP "+s)
+				}
+				cmds = append(cmds,
+					"  neighbor "+g.peer+" route-map TWOPEN in",
+					" exit-address-family", "end")
+				vtysh(t, dir, g.router, cmds...)
+
+				// The session was torn down and rebuilt, so the mark must not
+				// be read until it is carrying routes again: an unestablished
+				// session loses marks for reasons that have nothing to do with
+				// what this case is about.
+				waitForPeer(t, dir, g.router, g.peer)
+
+				// And the router must really be running the override, or this
+				// case proves nothing.
+				out, err := twinet(t, "exec", "-m", dir, g.router, "--", "vtysh",
+					"-c", "show bgp neighbor "+g.peer)
+				if err != nil || !strings.Contains(out, "Inbound path policy configured") {
+					t.Fatalf("%s is not applying an inbound policy to %s, so the override "+
+						"is not in force: %v\n%s", g.router, g.peer, err, out)
+				}
+			},
+		},
 	}
 
 	for _, c := range cases {
@@ -3399,6 +3454,183 @@ func customerSessionsOn(t *testing.T, dir string, as int) (router string, addrs 
 	return router, addrs, prefix
 }
 
+// waitForPeer blocks until a BGP session is established and has routes on it.
+//
+// A case that rebuilds a session has to let it come back before the mark is
+// read, or what it measures is a session that is down -- which costs marks
+// everywhere and says nothing about the thing the case is about.
+func waitForPeer(t *testing.T, dir, router, peer string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Minute)
+	for {
+		out, err := twinet(t, "exec", "-m", dir, router, "--", "vtysh",
+			"-c", "show bgp ipv4 unicast neighbors "+peer+" routes")
+		if err == nil && strings.Contains(out, "Displayed") &&
+			!strings.Contains(out, "Displayed  0 routes") {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the session with %s on %s did not come back with routes: %v\n%s",
+				peer, router, err, out)
+		}
+		time.Sleep(5 * time.Second)
+	}
+}
+
+// guardedSession describes an external session whose inbound policy rejects
+// invalid origins, together with everything needed to rebuild it as a member of
+// a peer-group whose policy the session then overrides.
+type guardedSession struct {
+	router string
+	peer   string
+	// settings holds the neighbour's own lines, in the order and the address
+	// family they were written in, so the rebuilt session is the same session.
+	global []string
+	ipv4   []string
+	// decoy is the vtysh definition of a policy identical to the one the
+	// session runs, minus its validation clauses.
+	decoy []string
+}
+
+// rpkiGuardedSession finds a session the origin-validation question counts as
+// protected, and works out how to move its policy onto a peer-group.
+//
+// The mutation this feeds has to leave the session doing everything else it
+// did -- carrying the same local preferences and communities, exporting the
+// same routes -- or it would cost marks on the questions about those, and the
+// question under test would not be the one that moved.
+func rpkiGuardedSession(t *testing.T, dir string, as int) guardedSession {
+	t.Helper()
+	self := itoa(as)
+	for _, r := range routersOf(t, dir, as) {
+		out, err := twinet(t, "exec", "-m", dir, r, "--", "vtysh", "-c", "show running-config")
+		if err != nil || !strings.Contains(out, "rpki cache ") {
+			continue
+		}
+		for peer, rmap := range importRouteMaps(t, dir, r) {
+			if !isExternalPeer(out, peer, self) {
+				continue
+			}
+			decoy := routeMapWithoutRPKI(out, rmap, "TWOPEN")
+			if decoy == nil {
+				continue // its policy does not turn on validation state
+			}
+			g := guardedSession{router: r, peer: peer, decoy: decoy}
+			g.global, g.ipv4 = neighborSettings(out, peer)
+			return g
+		}
+	}
+	t.Skip("no external session guarded against invalid origins was found")
+	return guardedSession{}
+}
+
+// isExternalPeer reports whether a neighbour's remote AS is somebody else's,
+// comparing the number as a whole field.
+func isExternalPeer(cfg, peer, self string) bool {
+	for _, line := range strings.Split(cfg, "\n") {
+		f := strings.Fields(strings.TrimSpace(line))
+		if len(f) == 4 && f[0] == "neighbor" && f[1] == peer && f[2] == "remote-as" {
+			return f[3] != self && f[3] != "internal"
+		}
+	}
+	return false
+}
+
+// neighborSettings collects the lines written against one neighbour, keeping
+// the address family each belongs to.
+func neighborSettings(cfg, peer string) (global, ipv4 []string) {
+	af := "ipv4 unicast"
+	inBGP := false
+	for _, line := range strings.Split(cfg, "\n") {
+		t := strings.TrimSpace(line)
+		f := strings.Fields(t)
+		switch {
+		case len(f) == 3 && f[0] == "router" && f[1] == "bgp":
+			inBGP, af = true, "ipv4 unicast"
+			continue
+		case len(f) >= 2 && f[0] == "address-family":
+			af = strings.Join(f[1:], " ")
+			continue
+		case t == "exit-address-family":
+			af = "ipv4 unicast"
+			continue
+		case t == "exit":
+			inBGP = false
+			continue
+		}
+		if !inBGP || len(f) < 3 || f[0] != "neighbor" || f[1] != peer {
+			continue
+		}
+		setting := strings.Join(f[2:], " ")
+		// A binding is rewritten onto the group in the family it was written
+		// in; anything outside the IPv4 unicast block belongs with the rest of
+		// the session's global settings.
+		if af == "ipv4 unicast" && strings.HasPrefix(setting, "route-map ") {
+			ipv4 = append(ipv4, setting)
+			continue
+		}
+		if af == "ipv4 unicast" {
+			global = append(global, setting)
+		}
+	}
+	return global, ipv4
+}
+
+// routeMapWithoutRPKI rebuilds a route-map under a new name with its
+// validation clauses left out, which is a policy that looks like the original
+// everywhere except where the question is.
+func routeMapWithoutRPKI(cfg, name, as string) []string {
+	type clause struct {
+		head string
+		body []string
+	}
+	var clauses []clause
+	cur := -1
+	for _, line := range strings.Split(cfg, "\n") {
+		t := strings.TrimSpace(line)
+		f := strings.Fields(t)
+		if len(f) >= 3 && f[0] == "route-map" {
+			if f[1] == name {
+				clauses = append(clauses, clause{head: strings.Join(f[2:], " ")})
+				cur = len(clauses) - 1
+			} else {
+				cur = -1
+			}
+			continue
+		}
+		if t == "exit" || t == "!" || t == "" {
+			cur = -1
+			continue
+		}
+		if cur >= 0 {
+			clauses[cur].body = append(clauses[cur].body, t)
+		}
+	}
+	var cmds []string
+	found := false
+	for _, c := range clauses {
+		rpki := false
+		for _, b := range c.body {
+			if strings.HasPrefix(b, "match rpki") {
+				rpki = true
+			}
+		}
+		if rpki {
+			found = true
+			continue
+		}
+		cmds = append(cmds, "route-map "+as+" "+c.head)
+		for _, b := range c.body {
+			cmds = append(cmds, " "+b)
+		}
+		cmds = append(cmds, "exit")
+	}
+	if !found || len(cmds) == 0 {
+		return nil
+	}
+	return cmds
+}
+
 // importRouteMaps maps each neighbour of a router to the route-map applied on
 // the way in, for the neighbours that have one.
 func importRouteMaps(t *testing.T, dir, router string) map[string]string {
@@ -3644,6 +3876,56 @@ func vtyshQuiet(t *testing.T, dir, device string, cmds ...string) {
 // This is the test that grading refuses to produce marks from it. Refusing is
 // the point: the submission is not marked down, because a grader that cannot
 // trust what it was told does not know what the marks should have been.
+// A correct answer written the way it is written in practice must score what a
+// correct answer scores.
+//
+// Binding an import policy once on a peer-group and pointing the sessions at it
+// is the ordinary way to configure this, and it was marked as having no policy
+// at all: the grader read the lines written against the neighbour's address and
+// a neighbour that inherits its policy has none. The reference lost marks for
+// origin validation it was in fact performing. A grader that fails correct work
+// is worse than one that passes incorrect work, because the student has no way
+// to tell it is wrong.
+func TestAPolicyAppliedThroughAPeerGroupStillScoresFullMarks(t *testing.T) {
+	dir := labDir(t)
+	const as = 3
+
+	solveAS(t, dir, as)
+	defer solveAS(t, dir, as)
+
+	baseline, points, _ := gradeAS(t, dir, as)
+	if len(baseline) == 0 {
+		t.Fatal("no baseline was produced")
+	}
+
+	g := rpkiGuardedSession(t, dir, as)
+	t.Logf("rebinding the policy of %s at %s through a peer-group", g.peer, g.router)
+	cmds := []string{"configure terminal", "router bgp " + itoa(as),
+		" no neighbor " + g.peer, " neighbor TWGRP peer-group"}
+	for _, s := range g.global {
+		cmds = append(cmds, " neighbor TWGRP "+s)
+	}
+	cmds = append(cmds, " neighbor "+g.peer+" peer-group TWGRP",
+		" address-family ipv4 unicast")
+	for _, s := range g.ipv4 {
+		cmds = append(cmds, "  neighbor TWGRP "+s)
+	}
+	cmds = append(cmds, " exit-address-family", "end")
+	vtysh(t, dir, g.router, cmds...)
+	waitForPeer(t, dir, g.router, g.peer)
+
+	// Nothing about the router's behaviour changed, so nothing about its marks
+	// may change either.
+	after, _, report := gradeAS(t, dir, as)
+	for q, want := range baseline {
+		if after[q] < want {
+			t.Errorf("%s fell from %.2f to %.2f of %.2f after the same policy was applied "+
+				"through a peer-group; the configuration is a correct answer\n%s",
+				q, want, after[q], points[q], report)
+		}
+	}
+}
+
 func TestAProgramTheStudentWroteCannotEarnMarks(t *testing.T) {
 	dir := labDir(t)
 	const as = 3
