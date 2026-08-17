@@ -665,6 +665,18 @@ reached students, and each motivated a permanent test.
     takes the rest with it, which was worth nothing. Any mapping inside the
     declared range that points elsewhere is now part of that range going to the
     wrong root, whichever address the exercise happens to test.
+74. **A VPN carrying only pings.** Both L3VPN questions were asked entirely in
+    ICMP. Dropping TCP and UDP on the provider's routers, and leaving ICMP
+    alone, left every probe of `vpn.site_reachability` succeeding and the
+    advanced lab at six out of six, on a network across which no bank could have
+    opened a connection to its own branch. Reachability now tries a connection
+    and a datagram across every pair that answers a ping, reading arrival at the
+    far side — the destination's count of resets it sent, and of datagrams it
+    took delivery of for an unbound port — so an answer forged on the path is
+    told apart from the site replying; a pair carrying ICMP alone is half marks.
+    `vpn.isolation` had the mirror hole, a leak that discards echo requests
+    between two customers and carries their connections reading as perfectly
+    separated tables, and is now asked over all three.
 
 ## Environment findings
 

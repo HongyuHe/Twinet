@@ -249,6 +249,40 @@ func TestABrokenVPNLosesTheRightMarks(t *testing.T) {
 			},
 		},
 		{
+			// A VPN that carries pings and nothing else.
+			//
+			// Both VPN questions were asked entirely in ICMP. Dropping TCP and
+			// UDP on the provider's routers, and leaving ICMP alone, left every
+			// probe succeeding and the lab at six out of six, on a network
+			// across which no bank could have opened a connection to its own
+			// branch.
+			name:     "the provider carrying pings and discarding the rest",
+			question: "q2",
+			undo: func(t *testing.T) {
+				for _, dev := range routersOf(t, dir, provider) {
+					_, _ = twinet(t, "exec", "-m", dir, dev, "--", "sh", "-c",
+						"iptables -D FORWARD -p tcp -j DROP; "+
+							"iptables -D FORWARD -p udp -j DROP; echo ok")
+				}
+			},
+			apply: func(t *testing.T) {
+				devs := routersOf(t, dir, provider)
+				if len(devs) == 0 {
+					t.Fatal("AS has no routers to filter on, so this case would prove nothing")
+				}
+				for _, dev := range devs {
+					if _, err := twinet(t, "exec", "-m", dir, dev, "--", "sh", "-c",
+						"iptables -I FORWARD 1 -p tcp -j DROP; "+
+							"iptables -I FORWARD 1 -p udp -j DROP; echo ok"); err != nil {
+						t.Fatalf("filtering by protocol on %s: %v", dev, err)
+					}
+				}
+				t.Logf("dropped every connection and datagram crossing %d router(s) of AS %d, "+
+					"leaving ICMP alone", len(devs), provider)
+				time.Sleep(3 * time.Second)
+			},
+		},
+		{
 			// A core router that speaks BGP is the thing the exercise forbids.
 			//
 			// The whole point of carrying customer routes in labels is that the
