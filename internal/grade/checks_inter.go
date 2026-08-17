@@ -480,6 +480,7 @@ func checkOwnPrefix(ctx context.Context, env *Env) Result {
 	// question is really about. A prefix originated and withheld is a mistake;
 	// a prefix advertised is a claim on somebody's address space.
 	advertised := map[string]string{}
+	var disowned []string
 	for _, sess := range externalSessions(ctx, env) {
 		adv, err := advertisedRoutes(ctx, env, sess.Router, sess.Addr)
 		if err != nil {
@@ -493,6 +494,23 @@ func checkOwnPrefix(ctx context.Context, env *Env) Result {
 		}
 		for prefix, entries := range adv.Table() {
 			for _, e := range entries {
+				// Our own prefix, sent with somebody else's origin.
+				//
+				// The path this AS sends for its own address space must end
+				// with this AS: that is what originating a prefix means. `set
+				// as-path exclude all` and a prepend of a number that is not
+				// ours produced an announcement every neighbour treated as
+				// AS 65000's, rejected as invalid, and routed around -- while
+				// the table on this side still showed the prefix locally
+				// injected and the question was marked from that.
+				if prefix == as.Block {
+					if p := strings.TrimSpace(e.Path); p != "" && originASN(p) != env.AS {
+						disowned = append(disowned, fmt.Sprintf(
+							"%s tells %s that %s comes from AS %d, not from this AS (path %q)",
+							sess.Router, sess.Addr, prefix, originASN(p), p))
+					}
+					continue
+				}
 				// Claiming to be the origin of somebody else's prefix.
 				//
 				// A route this AS relays keeps the origin at the end of its
@@ -523,6 +541,20 @@ func checkOwnPrefix(ctx context.Context, env *Env) Result {
 				}
 			}
 		}
+	}
+
+	if len(disowned) > 0 {
+		sort.Strings(disowned)
+		return Partial("bgp.own_prefix_only", 0.5, Evidence{
+			Expected: fmt.Sprintf("%s announced as originating in AS %d", as.Block, env.AS),
+			Observed: fmt.Sprintf("%d neighbour(s) are told it comes from somewhere else",
+				len(disowned)),
+			Detail: strings.Join(truncate(disowned, 6), "\n"),
+			Hint: "the path you send for your own address space has to end with your own " +
+				"AS number; anything else is an announcement your neighbours will treat as " +
+				"somebody else's, and route around",
+			Command: "show ip bgp neighbors <addr> advertised-routes json",
+		})
 	}
 
 	hasOwn := originated[as.Block]
