@@ -181,6 +181,7 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 	var ixpRewrite struct{ router, routeMap, match, peer string }
 	var rpkiNarrow struct{ router, routeMap, seq string }
 	var notFoundBlock struct{ host, prefix string }
+	var vlanCut struct{ router, from, to string }
 	var tcpBlock struct{ router, src, dst string }
 	var udpPair struct{ router, src string }
 	var vlanFlow struct{ switchID string }
@@ -1162,6 +1163,35 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 					"-p", "tcp", "-j", "DROP")
 				if err != nil {
 					t.Fatalf("discarding TCP between two hosts: %v\n%s", err, out)
+				}
+			},
+		},
+		{
+			// Two whole sites cut off from the preserved network.
+			//
+			// The probe skipped every host in a layer-2 domain, so rejecting
+			// traffic from both VLANs towards the unsigned prefix cost nothing.
+			name:     "the datacentre sites unable to reach the preserved network",
+			question: "q2.6",
+			undo: func(t *testing.T) {
+				if vlanCut.router == "" {
+					return
+				}
+				_, _ = twinet(t, "exec", "-m", dir, vlanCut.router, "--", "iptables", "-D",
+					"FORWARD", "-s", vlanCut.from, "-d", vlanCut.to, "-j", "REJECT",
+					"--reject-with", "icmp-net-unreachable")
+			},
+			apply: func(t *testing.T) {
+				prefix := notFoundPrefix(t, dir, as)
+				gw, _ := tunnelGateway(t, dir, as)
+				from := vlanSupernet(t, dir, gw)
+				vlanCut = struct{ router, from, to string }{gw, from, prefix}
+				t.Logf("rejecting %s -> %s on %s", from, prefix, gw)
+				out, err := twinet(t, "exec", "-m", dir, gw, "--", "iptables", "-I", "FORWARD",
+					"1", "-s", from, "-d", prefix, "-j", "REJECT",
+					"--reject-with", "icmp-net-unreachable")
+				if err != nil {
+					t.Fatalf("cutting the datacentre off: %v\n%s", err, out)
 				}
 			},
 		},
@@ -2240,6 +2270,42 @@ func slowPrependClause(t *testing.T, dir string, as int) (router, routeMap, seq,
 	}
 	t.Skip("no prepend towards a neighbour was found")
 	return "", "", "", "", "", ""
+}
+
+// vlanSupernet returns a prefix covering the VLAN subnets a gateway serves,
+// read from its own sub-interfaces.
+func vlanSupernet(t *testing.T, dir, gateway string) string {
+	t.Helper()
+	out, err := twinet(t, "exec", "-m", dir, gateway, "--", "ip", "-o", "-4", "addr", "show")
+	if err != nil {
+		t.Fatalf("reading %s's addresses: %v\n%s", gateway, err, out)
+	}
+	var best netip.Prefix
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		if len(f) < 4 || !strings.Contains(f[1], "-L2.") {
+			continue
+		}
+		for i, tok := range f {
+			if tok != "inet" || i+1 >= len(f) {
+				continue
+			}
+			p, err := netip.ParsePrefix(f[i+1])
+			if err != nil {
+				continue
+			}
+			// One bit shorter covers both VLANs of the pair.
+			wide, err := netip.ParsePrefix(p.Masked().Addr().String() + "/" +
+				itoa(p.Bits()-1))
+			if err == nil {
+				best = wide.Masked()
+			}
+		}
+	}
+	if !best.IsValid() {
+		t.Skip("no VLAN sub-interfaces on the gateway")
+	}
+	return best.String()
 }
 
 // ownBlockOf reads the address block this AS originates, from its own table.

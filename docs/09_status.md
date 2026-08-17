@@ -624,6 +624,13 @@ reached students, and each motivated a permanent test.
     around -- while the table on this side still showed the prefix locally
     injected, and the question was marked from that. What leaves the AS is now
     read for what it says about the origin of our own block.
+68. **Two whole sites cut off from the preserved network.** The probe for an
+    unsigned origin's reachability skipped every host in a layer-2 domain,
+    because their reachability to *each other* is a layer-2 question graded
+    elsewhere. Their reachability to the rest of the internet is not: rejecting
+    traffic from both VLANs towards that prefix left every remaining probe
+    succeeding and the question at full marks, with two whole sites unable to
+    reach it.
 
 ## Environment findings
 
