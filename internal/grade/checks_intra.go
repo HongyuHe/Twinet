@@ -1405,6 +1405,20 @@ func crossVLANForwarding(ctx context.Context, env *Env, domain string) []string 
 			// read first.
 			byNum, _ := ovsPortMap(ports.Stdout, "")
 
+			// A bridge under a controller does not forward by its table alone.
+			// The controller is a program of the student's own, free to send
+			// any frame anywhere on any packet-in, and the flow table shows
+			// none of it. The reference switch has no controller, so saying so
+			// costs a correct answer nothing.
+			if c, err := env.Probe(ctx, d.ID,
+				[]string{"ovs-vsctl", "get-controller", br}); err == nil && c.ExitCode == 0 &&
+				strings.TrimSpace(c.Stdout) != "" {
+				out = append(out, fmt.Sprintf(
+					"%s's bridge %s is run by a controller (%s), which decides where frames "+
+						"go, so what it forwards is not in its table", d.Name, br,
+					strings.Join(strings.Fields(c.Stdout), " ")))
+			}
+
 			// The buckets of every group, because a flow's action can be a
 			// group and the flow table then says nothing at all about where
 			// the frame goes. A switch with no group is the normal case, so
@@ -1469,6 +1483,9 @@ func crossVLANForwarding(ctx context.Context, env *Env, domain string) []string 
 				// by changing which port it counts as having arrived on and
 				// then letting the switch forward it by VLAN.
 				at := strings.Index(line, "actions=")
+				for _, u := range ovsUnreadableActions(line[at+8:], byNum, vlanOfPort) {
+					out = append(out, d.Name+" "+u)
+				}
 				rw := ovsWalkActions(line[at+8:], byNum)
 				msg, to, known := normalCrossing(d.Name, line[:at], in, rw, vlanOfPort, bridgeHasNormal)
 				if msg != "" {
@@ -1902,6 +1919,51 @@ func ovsActionPorts(actions string, byNum map[string]string,
 		}
 	}
 	return outs
+}
+
+// ovsUnreadableActions describes the actions of a flow whose effect this
+// cannot work out, which is not the same as a flow that does nothing.
+//
+// `output:NXM_NX_REG0[]` sends the frame wherever a register says, and the
+// register is filled in by earlier flows; a reader looking for a port number
+// finds a token that is not one, and a destination that cannot be named cannot
+// be said to be in the frame's own VLAN. `learn(...)` installs flows that do
+// not exist yet, so the table does not yet say what the switch will do. Both
+// are reported as unread rather than passed over: this is the difference
+// between "it forwards nothing across" and "what it forwards could not be
+// read".
+func ovsUnreadableActions(actions string, byNum map[string]string,
+	vlanOf map[string]int) []string {
+	var out []string
+	for _, raw := range ovsSplitActions(actions) {
+		a := strings.TrimSpace(raw)
+		l := strings.ToLower(a)
+		if strings.HasPrefix(l, "learn(") {
+			out = append(out, "installs flows of its own with `learn`, which are not in the "+
+				"table yet, so what it will forward could not be read")
+			continue
+		}
+		tok, ok := strings.CutPrefix(l, "output:")
+		if !ok {
+			continue
+		}
+		tok = strings.Trim(tok, " \t\"")
+		// Back out of the port it came in on is not a way into another VLAN.
+		if tok == "" || tok == "in_port" {
+			continue
+		}
+		name := ovsPortName(tok, byNum)
+		if _, known := vlanOf[name]; known {
+			continue
+		}
+		if _, known := byNum[tok]; known {
+			continue
+		}
+		out = append(out, fmt.Sprintf(
+			"is told to send frames out of `%s`, which is not a port this could name, so "+
+				"the VLAN they leave in could not be read", strings.TrimSpace(a)))
+	}
+	return out
 }
 
 // ovsRewrite is what an action list does to a frame before the switch decides

@@ -160,3 +160,56 @@ func TestPortsPrintedByNameAreRead(t *testing.T) {
 		t.Fatalf("the quoted name was not resolved: %q", got[0])
 	}
 }
+
+// A destination that is not a port this can name is not a destination this can
+// vouch for. `output:NXM_NX_REG0[]` sends the frame wherever an earlier flow
+// put the register, and a reader looking for a port number finds a token that
+// is not one.
+func TestAnOutputThisCannotNameIsNotReadAsClean(t *testing.T) {
+	env := flowTable(" cookie=0x0, in_port=1 actions=output:NXM_NX_REG0[]\n")
+	got := crossVLANForwarding(context.Background(), env, "DC")
+	if len(got) == 0 {
+		t.Fatal("an output to a register was read as harmless")
+	}
+	if !strings.Contains(got[0], "could not be read") {
+		t.Fatalf("the report does not say it could not be read: %q", got[0])
+	}
+}
+
+// Sending a frame back out of the port it arrived on stays in its VLAN, so it
+// must not be reported.
+func TestOutputBackToTheIngressPortIsNotComplainedAbout(t *testing.T) {
+	env := flowTable(" cookie=0x0, in_port=1 actions=output:in_port\n")
+	if got := crossVLANForwarding(context.Background(), env, "DC"); len(got) != 0 {
+		t.Fatalf("sending a frame back where it came from was complained about: %v", got)
+	}
+}
+
+// A flow that installs other flows means the table does not yet say what the
+// switch will do.
+func TestLearnedFlowsAreNotReadAsClean(t *testing.T) {
+	env := flowTable(" cookie=0x0, priority=10 actions=learn(table=0," +
+		"NXM_OF_VLAN_TCI[0..11],output:NXM_OF_IN_PORT[]),NORMAL\n")
+	if got := crossVLANForwarding(context.Background(), env, "DC"); len(got) == 0 {
+		t.Fatal("a flow that installs flows was read as harmless")
+	}
+}
+
+// A bridge under a controller does not forward by its table alone: the
+// controller is a program of the student's own and the table shows none of it.
+func TestABridgeUnderAControllerIsNotReadAsClean(t *testing.T) {
+	env := switchSaying(map[string]string{
+		"ovs-vsctl --columns=name,tag --format=csv list port": twoVLANPorts,
+		"ovs-vsctl list-br":            "br0\n",
+		"ovs-vsctl get-controller br0": "tcp:10.0.0.9:6653\n",
+		"ovs-ofctl show br0":           " 1(port_A): addr:aa\n 2(port_P): addr:bb\n",
+		"ovs-ofctl dump-flows br0":     " cookie=0x0, priority=0 actions=NORMAL\n",
+	})
+	got := crossVLANForwarding(context.Background(), env, "DC")
+	if len(got) == 0 {
+		t.Fatal("a bridge run by a controller was read as forwarding only what its table says")
+	}
+	if !strings.Contains(got[0], "controller") {
+		t.Fatalf("the report does not name the controller: %q", got[0])
+	}
+}

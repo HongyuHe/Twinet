@@ -863,6 +863,21 @@ reached students, and each motivated a permanent test.
     being matched as a substring, so the letters `all` anywhere in an action
     expanded to every port on the switch -- a way to lose marks for forwarding
     that never happened.
+84. **Three more ways a switch's forwarding is not in its table.** Found while
+    pinning down 83, and closed before anyone had to use them. An
+    `output:NXM_NX_REG0[]` sends the frame wherever an earlier flow put the
+    register, and a reader looking for a port number found a token that was not
+    one and moved on; a destination that cannot be named cannot be said to be
+    in the frame's own VLAN, so it is now reported as unread. A `learn(...)`
+    action installs flows that are not in the table yet, so the table does not
+    yet say what the switch will do; also reported. And a bridge with a
+    controller set does not forward by its table at all -- the controller is a
+    program of the student's own, free to send any frame anywhere on any
+    packet-in -- so a bridge under one is reported as something this cannot
+    vouch for. Every switch in all three labs was read first to confirm the
+    reference answer has one bridge, no controller and the single flow
+    `priority=0 actions=NORMAL`, so none of the three can fire on a correct
+    submission.
 
 ## Environment findings
 
