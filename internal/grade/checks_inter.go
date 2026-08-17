@@ -1723,17 +1723,18 @@ func checkNoForbiddenOSPF(ctx context.Context, env *Env) Result {
 	// peering networks appeared as OSPF routes on every other router of the
 	// system. The configuration is the intent; the routing table is the fact.
 	for _, r := range env.Routers() {
-		var routes map[string][]struct {
+		type routeEntry struct {
 			Protocol string `json:"protocol"`
 			Selected bool   `json:"selected"`
 			Nexthops []struct {
 				InterfaceName string `json:"interfaceName"`
 			} `json:"nexthops"`
 		}
-		if err := env.VtyshJSON(ctx, r.Name, "show ip route ospf json", &routes); err != nil {
+		var byVRF map[string]map[string][]routeEntry
+		if err := env.VtyshJSON(ctx, r.Name, "show ip route vrf all ospf json", &byVRF); err != nil {
 			// An empty table is not an error, and FRR prints nothing at all
 			// for it; anything else is.
-			if s, verr := env.Vtysh(ctx, r.Name, "show ip route ospf json"); verr == nil &&
+			if s, verr := env.Vtysh(ctx, r.Name, "show ip route vrf all ospf json"); verr == nil &&
 				strings.TrimSpace(s) == "" {
 				continue
 			}
@@ -1741,17 +1742,23 @@ func checkNoForbiddenOSPF(ctx context.Context, env *Env) Result {
 				"%s: its OSPF routes could not be read, so whether the inter-AS ranges are "+
 					"in its interior routing cannot be decided: %w", r.Name, err))
 		}
-		for prefix, entries := range routes {
-			if !external.matches(prefix) {
-				continue
-			}
-			for _, e := range entries {
-				if e.Protocol != "ospf" {
+		for vrf, routes := range byVRF {
+			for prefix, entries := range routes {
+				if !external.matches(prefix) {
 					continue
 				}
-				found = append(found, fmt.Sprintf(
-					"%s carries %s as an OSPF route", r.Name, prefix))
-				break
+				for _, e := range entries {
+					if e.Protocol != "ospf" {
+						continue
+					}
+					where := r.Name
+					if vrf != "" && vrf != "default" {
+						where += " (in VRF " + vrf + ")"
+					}
+					found = append(found, fmt.Sprintf(
+						"%s carries %s as an OSPF route", where, prefix))
+					break
+				}
 			}
 		}
 	}
@@ -1814,12 +1821,14 @@ type ospfPrefixLSA struct {
 	Metric            int    `json:"metric"`
 }
 
-// forbiddenInLSDB reports every inter-AS prefix that appears in the area's
-// link-state database, whatever kind of advertisement carried it there and
-// whatever metric it was given.
+// finding is one forbidden prefix and where it was advertised.
+type finding struct{ where, what string }
+
+// forbiddenInLSDB reports every inter-AS prefix that appears in a link-state
+// database, whatever kind of advertisement carried it there, whatever metric it
+// was given, and in whichever VRF the instance runs.
 func forbiddenInLSDB(ctx context.Context, env *Env, external externalRanges) ([]string, error) {
 	kinds := []string{"router", "network", "summary", "external"}
-	type finding struct{ where, what string }
 	var (
 		mu       sync.Mutex
 		out      []string
@@ -1832,9 +1841,13 @@ func forbiddenInLSDB(ctx context.Context, env *Env, external externalRanges) ([]
 			wg.Add(1)
 			go func(router, kind string) {
 				defer wg.Done()
-				var db ospfLSDB
-				cmd := "show ip ospf database " + kind + " json"
-				if err := env.VtyshJSON(ctx, router, cmd, &db); err != nil {
+				// Every VRF, not the default one. An OSPF instance in another
+				// VRF is another routing domain, and reading only the default
+				// meant the report could say no inter-AS range was in OSPF
+				// while an instance beside it held one.
+				var dbs map[string]ospfLSDB
+				cmd := "show ip ospf vrf all database " + kind + " json"
+				if err := env.VtyshJSON(ctx, router, cmd, &dbs); err != nil {
 					// A router with no OSPF prints nothing at all, which is an
 					// empty database and not a failure to read one.
 					if s, verr := env.Vtysh(ctx, router, cmd); verr == nil &&
@@ -1852,37 +1865,9 @@ func forbiddenInLSDB(ctx context.Context, env *Env, external externalRanges) ([]
 					return
 				}
 				var hits []finding
-				for _, lsas := range db.RouterLinkStates.Areas {
-					for _, lsa := range lsas {
-						for _, l := range lsa.RouterLinks {
-							if l.NetworkAddress == "" {
-								continue
-							}
-							p := l.NetworkAddress + "/" + strconv.Itoa(maskBits(l.NetworkMask))
-							if external.matches(p) {
-								hits = append(hits, finding{lsa.AdvertisingRouter,
-									fmt.Sprintf("%s as a %s in its router advertisement", p,
-										strings.ToLower(l.LinkType))})
-							}
-						}
-					}
+				for vrf, db := range dbs {
+					hits = append(hits, lsdbHits(db, external, vrf)...)
 				}
-				add := func(lsas []ospfPrefixLSA, what string) {
-					for _, lsa := range lsas {
-						p := lsa.LinkStateID + "/" + strconv.Itoa(lsa.NetworkMask)
-						if external.matches(p) {
-							hits = append(hits, finding{lsa.AdvertisingRouter,
-								fmt.Sprintf("%s as %s (metric %d)", p, what, lsa.Metric)})
-						}
-					}
-				}
-				for _, lsas := range db.NetworkLinkStates.Areas {
-					add(lsas, "a transit network")
-				}
-				for _, lsas := range db.SummaryLinkStates.Areas {
-					add(lsas, "an inter-area summary")
-				}
-				add(db.ASExternalLinkStates, "an external route redistributed into OSPF")
 				mu.Lock()
 				for _, h := range hits {
 					line := fmt.Sprintf("%s floods %s", h.where, h.what)
@@ -1901,6 +1886,49 @@ func forbiddenInLSDB(ctx context.Context, env *Env, external externalRanges) ([]
 	}
 	sort.Strings(out)
 	return out, nil
+}
+
+// lsdbHits names the forbidden prefixes in one link-state database.
+func lsdbHits(db ospfLSDB, external externalRanges, vrf string) []finding {
+	where := func(router string) string {
+		if vrf != "" && vrf != "default" {
+			return router + " (in VRF " + vrf + ")"
+		}
+		return router
+	}
+	var hits []finding
+	for _, lsas := range db.RouterLinkStates.Areas {
+		for _, lsa := range lsas {
+			for _, l := range lsa.RouterLinks {
+				if l.NetworkAddress == "" {
+					continue
+				}
+				p := l.NetworkAddress + "/" + strconv.Itoa(maskBits(l.NetworkMask))
+				if external.matches(p) {
+					hits = append(hits, finding{where(lsa.AdvertisingRouter),
+						fmt.Sprintf("%s as a %s in its router advertisement", p,
+							strings.ToLower(l.LinkType))})
+				}
+			}
+		}
+	}
+	add := func(lsas []ospfPrefixLSA, what string) {
+		for _, lsa := range lsas {
+			p := lsa.LinkStateID + "/" + strconv.Itoa(lsa.NetworkMask)
+			if external.matches(p) {
+				hits = append(hits, finding{where(lsa.AdvertisingRouter),
+					fmt.Sprintf("%s as %s (metric %d)", p, what, lsa.Metric)})
+			}
+		}
+	}
+	for _, lsas := range db.NetworkLinkStates.Areas {
+		add(lsas, "a transit network")
+	}
+	for _, lsas := range db.SummaryLinkStates.Areas {
+		add(lsas, "an inter-area summary")
+	}
+	add(db.ASExternalLinkStates, "an external route redistributed into OSPF")
+	return hits
 }
 
 // maskBits turns OSPF's dotted network mask into a prefix length.
