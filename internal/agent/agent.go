@@ -127,10 +127,12 @@ type Server struct {
 	started time.Time
 
 	// tools compares a container's programs against its image's, so that a
-	// mark never rests on a program the student under examination wrote.
-	tools     *integrity.Checker
+	// mark never rests on a program the student under examination wrote. It is
+	// a field rather than a call so that a test can put a container in front
+	// of it without an image to build one from.
+	tools     func(context.Context, rt.Container) ([]integrity.Finding, error)
 	toolsMu   sync.Mutex
-	toolsSeen map[string]error
+	toolsSeen map[string]toolsVerdict
 
 	mu sync.Mutex
 	// current is the last topology applied, per lab. One node may host several
@@ -196,8 +198,8 @@ func New(cfg Config) (*Server, error) {
 		ops:     map[string]*lease{},
 		holds:   map[string]*hold{},
 
-		tools:     integrity.NewChecker(engine),
-		toolsSeen: map[string]error{},
+		tools:     integrity.NewChecker(engine).Verify,
+		toolsSeen: map[string]toolsVerdict{},
 
 		repairFails: map[string]int{},
 		exempt:      map[string]*exemptions{},
@@ -1288,23 +1290,24 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, ExecResponse{ExitCode: res.ExitCode, Stdout: res.Stdout, Stderr: res.Stderr})
 }
 
-// verifyTools compares a container's programs against its image's, once per
-// container per run of that container.
+// verifyTools compares a container's programs against its image's, at most once
+// every few seconds per container.
 //
 // A grading run makes hundreds of calls into one container, and reading the
 // programs on every one of them would cost more than the checks do. The answer
-// is kept against the container's process id, which changes whenever the
-// container is restarted -- and a restart is the only way a replaced program
-// could come into use after the first check.
+// is not kept for longer than that, though: it was originally kept for the life
+// of the container, and a program planted after one run was then believed by
+// every run that followed, which is precisely the thing this exists to stop.
 func (s *Server) verifyTools(ctx context.Context, c rt.Container) error {
 	key := fmt.Sprintf("%s/%d", c.ID, c.PID)
+	now := time.Now()
 	s.toolsMu.Lock()
 	cached, ok := s.toolsSeen[key]
 	s.toolsMu.Unlock()
-	if ok {
-		return cached
+	if ok && now.Sub(cached.at) < toolsCheckEvery {
+		return cached.err
 	}
-	findings, err := s.tools.Verify(ctx, c)
+	findings, err := s.tools(ctx, c)
 	if err != nil {
 		// The grader could not read the image. That is the machinery's
 		// failure, and it is not remembered: the next call tries again.
@@ -1316,9 +1319,22 @@ func (s *Server) verifyTools(ctx context.Context, c rt.Container) error {
 		result = &integrity.Error{Container: c.Name, Findings: findings}
 	}
 	s.toolsMu.Lock()
-	s.toolsSeen[key] = result
+	s.toolsSeen[key] = toolsVerdict{err: result, at: now}
 	s.toolsMu.Unlock()
 	return result
+}
+
+// toolsCheckEvery is how stale a container's tool check may be.
+//
+// Short enough that a grading run re-reads the programs several times while it
+// is running, and long enough that a run making hundreds of calls into thirty
+// containers does not spend its time hashing the same files.
+const toolsCheckEvery = 20 * time.Second
+
+// toolsVerdict is what the last check of a container found, and when.
+type toolsVerdict struct {
+	err error
+	at  time.Time
 }
 
 // UnderlayResponse reports what the fabric can carry.
