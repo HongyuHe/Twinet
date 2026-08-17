@@ -247,6 +247,13 @@ func plannedSubnets(env *Env) map[string]string {
 // ownSubnet reports whether an address is inside the prefix this interface is
 // meant to sit in, which is the student's to choose within.
 func ownSubnet(i *model.Iface, addr string) bool {
+	// Where the assignment dictates the address, only that address is the
+	// student's to have. Excusing anything inside the same subnet let a second
+	// address sit on a prescribed loopback unnoticed -- and a spare address in
+	// the right subnet is exactly what an impersonation needs.
+	if i.Prescribed {
+		return false
+	}
 	if i.Subnet != "" && anyInSubnet([]string{addr}, i.Subnet) {
 		return true
 	}
