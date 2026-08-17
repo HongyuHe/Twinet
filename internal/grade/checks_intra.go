@@ -1889,6 +1889,8 @@ func checkInternalReachability(ctx context.Context, env *Env) Result {
 	// arranged: being refused proves the packets made the journey both ways,
 	// where being dropped is silence.
 	pingOnly := unreachableByTCP(ctx, env, hosts, addrOf)
+	pingOnly = append(pingOnly, unreachableByUDP(ctx, env, hosts, addrOf)...)
+	sort.Strings(pingOnly)
 	failed = append(failed, pingOnly...)
 
 	tried := len(pairs) + len(hosts)*(len(hosts)-1)
@@ -2044,6 +2046,78 @@ func unreachableByTCP(ctx context.Context, env *Env, hosts []*model.Device,
 	}
 	wg.Wait()
 	sort.Strings(out)
+	return out
+}
+
+// unreachableByUDP sends a datagram between every ordered pair of hosts and
+// names the ones that do not arrive.
+//
+// Arrival is read at the far side, from its count of datagrams delivered for a
+// port nothing is bound to. The sender cannot be trusted to tell: when the
+// datagram is dropped it hears nothing, and hearing nothing is exactly what
+// `nc` reports as success.
+//
+// The pairs are done in rounds, each round a different offset, so that no two
+// senders aim at the same host at once and the counter says who arrived.
+func unreachableByUDP(ctx context.Context, env *Env, hosts []*model.Device,
+	addrOf map[string]string) []string {
+	n := len(hosts)
+	if n < 2 {
+		return nil
+	}
+	var out []string
+	for k := 1; k < n; k++ {
+		before := udpCounters(ctx, env, hosts)
+		var wg sync.WaitGroup
+		for i, src := range hosts {
+			dst := hosts[(i+k)%n]
+			if addrOf[dst.ID] == "" {
+				continue
+			}
+			wg.Add(1)
+			go func(src, dst *model.Device) {
+				defer wg.Done()
+				_, _ = env.Probe(ctx, src.ID, []string{"sh", "-c",
+					"echo twinet | nc -u -w 2 " + addrOf[dst.ID] + " " + probePort()})
+			}(src, dst)
+		}
+		wg.Wait()
+		after := udpCounters(ctx, env, hosts)
+		for i, src := range hosts {
+			dst := hosts[(i+k)%n]
+			b, okB := before[dst.ID]
+			a, okA := after[dst.ID]
+			if !okB || !okA || a > b {
+				continue
+			}
+			out = append(out, fmt.Sprintf(
+				"a datagram from %s to %s (%s) never arrived, though pings and connections "+
+					"do: something on the path is filtering by protocol",
+				src.Name, dst.Name, addrOf[dst.ID]))
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// udpCounters reads every host's count of datagrams delivered for an unbound
+// port, at once.
+func udpCounters(ctx context.Context, env *Env, hosts []*model.Device) map[string]int {
+	out := map[string]int{}
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for _, h := range hosts {
+		wg.Add(1)
+		go func(h *model.Device) {
+			defer wg.Done()
+			if n, ok := udpNoPortsV4(ctx, env, h.ID); ok {
+				mu.Lock()
+				out[h.ID] = n
+				mu.Unlock()
+			}
+		}(h)
+	}
+	wg.Wait()
 	return out
 }
 
