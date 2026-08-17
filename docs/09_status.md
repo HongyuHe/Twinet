@@ -597,6 +597,14 @@ reached students, and each motivated a permanent test.
     customers, and the check reporting that every selected route had been passed
     on -- nothing had been selected. What the AS as a whole has learned is now
     the measure, minus what that customer taught us itself.
+64. **A pair that exchanged everything but datagrams.** The internal data plane
+    was tried with a ping and a connection, so a rule dropping UDP between two
+    hosts left all one hundred and forty-four probes succeeding. Every ordered
+    pair now also exchanges a datagram, read at the far side from its count of
+    datagrams delivered for an unbound port -- the sender cannot be trusted to
+    tell, because when the datagram is dropped it hears nothing, and hearing
+    nothing is what `nc` reports as success. The pairs go in rounds so that no
+    two senders aim at the same host at once and the counter says who arrived.
 
 ## Environment findings
 

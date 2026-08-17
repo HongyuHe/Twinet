@@ -180,6 +180,7 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 	var rpkiNarrow struct{ router, routeMap, seq string }
 	var notFoundBlock struct{ host, prefix string }
 	var tcpBlock struct{ router, src, dst string }
+	var udpPair struct{ router, src string }
 	var vlanFlow struct{ switchID string }
 	var tcMirror struct{ switchID, from string }
 	var forgedLeak struct{ router, routeMap, prefix string }
@@ -1045,6 +1046,32 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 						"actions=normal,output:"+to)
 				if err != nil {
 					t.Fatalf("mirroring one flow across VLANs: %v\n%s", err, out)
+				}
+			},
+		},
+		{
+			// A pair that exchanges everything but datagrams.
+			//
+			// The matrix was tried with a ping and a connection, so a rule
+			// dropping UDP between two hosts left every probe succeeding.
+			name:     "two hosts that cannot exchange a datagram",
+			question: "q1.2",
+			undo: func(t *testing.T) {
+				if udpPair.router == "" {
+					return
+				}
+				_, _ = twinet(t, "exec", "-m", dir, udpPair.router, "--", "iptables", "-D",
+					"INPUT", "-s", udpPair.src, "-p", "udp", "-j", "DROP")
+			},
+			apply: func(t *testing.T) {
+				dst := "as" + itoa(as) + "/NYC_host"
+				src := hostAddr(t, dir, "as"+itoa(as)+"/MSP_host")
+				udpPair = struct{ router, src string }{dst, src + "/32"}
+				t.Logf("discarding datagrams from %s at %s", src, dst)
+				out, err := twinet(t, "exec", "-m", dir, dst, "--", "iptables", "-I", "INPUT",
+					"1", "-s", udpPair.src, "-p", "udp", "-j", "DROP")
+				if err != nil {
+					t.Fatalf("discarding datagrams: %v\n%s", err, out)
 				}
 			},
 		},
