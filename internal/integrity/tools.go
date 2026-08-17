@@ -205,11 +205,19 @@ func NewChecker(r rt.Runtime) *Checker {
 // grader's own failure, and it comes back as an error so that it is never
 // mistaken for a student's.
 func (c *Checker) Verify(ctx context.Context, con rt.Container) ([]Finding, error) {
-	if con.Image == "" {
+	// The image the container is *running*, not the reference it was created
+	// from. A tag moves whenever the images are rebuilt, and a container made
+	// before it moved is still correct: comparing it against whatever the tag
+	// points at now reports every one of them as tampered with.
+	image := con.ImageID
+	if image == "" {
+		image = con.Image
+	}
+	if image == "" {
 		return nil, fmt.Errorf("container %s reports no image, so there is nothing to "+
 			"compare its programs against", con.Name)
 	}
-	want, err := c.imageTools(ctx, con.Image)
+	want, err := c.imageTools(ctx, image)
 	if err != nil {
 		return nil, err
 	}

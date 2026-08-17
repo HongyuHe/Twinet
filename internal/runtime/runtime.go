@@ -107,14 +107,18 @@ type Health struct {
 
 // Container is an observed container.
 type Container struct {
-	ID     string
-	Name   string
-	Image  string
-	State  State
-	Status string
-	PID    int
-	Labels map[string]string
-	Health string
+	ID    string
+	Name  string
+	Image string
+	// ImageID identifies the image the container is actually running. The
+	// reference above is a tag, and a tag moves; anything that must compare a
+	// container against the software it was built from has to use this.
+	ImageID string
+	State   State
+	Status  string
+	PID     int
+	Labels  map[string]string
+	Health  string
 }
 
 // Label returns a label value.
