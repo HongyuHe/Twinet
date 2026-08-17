@@ -336,7 +336,45 @@ type ospfNeighborJSON struct {
 		NbrState  string `json:"nbrState"`
 		IfaceName string `json:"ifaceName"`
 		Converged string `json:"converged"`
+		// DeadTimerMsec is how long this neighbour has left before it is
+		// declared gone. Every hello resets it, so watching it is how a
+		// stopped conversation is told from a state nobody has revised yet.
+		DeadTimerMsec int64 `json:"routerDeadIntervalTimerDueMsec"`
 	} `json:"neighbors"`
+}
+
+// deadTimers reads every router's remaining dead time per interface.
+func deadTimers(ctx context.Context, env *Env) map[string]map[string]int64 {
+	out := map[string]map[string]int64{}
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for _, r := range env.Routers() {
+		wg.Add(1)
+		go func(r *model.Device) {
+			defer wg.Done()
+			var doc ospfNeighborJSON
+			if err := env.VtyshJSON(ctx, r.Name, "show ip ospf neighbor json", &doc); err != nil {
+				return
+			}
+			byIface := map[string]int64{}
+			for _, ns := range doc.Neighbors {
+				for _, n := range ns {
+					iface := n.IfaceName
+					if i := strings.IndexByte(iface, ':'); i >= 0 {
+						iface = iface[:i]
+					}
+					if v, ok := byIface[iface]; !ok || n.DeadTimerMsec > v {
+						byIface[iface] = n.DeadTimerMsec
+					}
+				}
+			}
+			mu.Lock()
+			out[r.Name] = byIface
+			mu.Unlock()
+		}(r)
+	}
+	wg.Wait()
+	return out
 }
 
 // linkDevice is what an interface says about itself beyond its name.
@@ -472,9 +510,33 @@ func checkOSPFAdjacency(ctx context.Context, env *Env) Result {
 	// in for.
 	links := linkIdentities(ctx, env)
 
+	// And that the conversation is still going on.
+	//
+	// A neighbour stays Full until the dead timer expires, which is forty
+	// seconds: discarding OSPF between two routers and grading immediately
+	// found every adjacency Full and carrying nothing. Every hello resets that
+	// timer, so a second reading a hello interval later says whether one
+	// arrived. A healthy adjacency cannot lose more than one hello interval of
+	// dead time between two readings; a silent one loses the whole wait.
+	before := deadTimers(ctx, env)
+	select {
+	case <-ctx.Done():
+	case <-time.After(12 * time.Second):
+	}
+	after := deadTimers(ctx, env)
+
 	var stuck []string
 	got := 0
 	for _, w := range wanted {
+		if b, ok := before[w.router][w.iface]; ok && b > 0 {
+			if a, ok2 := after[w.router][w.iface]; ok2 && a <= b-11000 {
+				stuck = append(stuck, fmt.Sprintf(
+					"%s -> %s on %s says Full, but no hello arrived while it was watched: "+
+						"the state is held by a timer that has not expired yet",
+					w.router, w.peer, w.iface))
+				continue
+			}
+		}
 		if id, known := links[w.router]; known {
 			dev, present := id[w.iface]
 			switch {
