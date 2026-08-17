@@ -172,6 +172,7 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 	var lengthFilter struct{ router, peer string }
 	var leakedRange string
 	var vrfLeak struct{ router string }
+	var spareAddr struct{ router, addr string }
 	var tunnelTCP struct{ gateway, iface string }
 	var rangeAllow []string
 	var weighted struct{ router, routeMap, prefix string }
@@ -1889,6 +1890,34 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 					"ip", "addr", "add", "192.0.2.123/32", "dev", "lo")
 				if err != nil {
 					t.Fatalf("adding an unplanned address: %v\n%s", err, out)
+				}
+			},
+		},
+		{
+			// A second address on an interface whose address is dictated.
+			//
+			// Anything inside the same subnet was excused everywhere, so a
+			// spare address on a prescribed loopback went unnoticed -- and a
+			// spare address in the right subnet is what an impersonation needs.
+			name:     "a second address on a prescribed loopback",
+			question: "q1.2",
+			undo: func(t *testing.T) {
+				if spareAddr.router == "" {
+					return
+				}
+				_, _ = twinet(t, "exec", "-m", dir, spareAddr.router, "--",
+					"ip", "addr", "del", spareAddr.addr, "dev", "lo")
+			},
+			apply: func(t *testing.T) {
+				router := "as" + itoa(as) + "/NYC"
+				lo := loopbackOf(t, dir, router)
+				addr := lo[:strings.LastIndexByte(lo, '.')] + ".254/24"
+				spareAddr = struct{ router, addr string }{router, addr}
+				t.Logf("adding %s beside the prescribed %s on %s", addr, lo, router)
+				out, err := twinet(t, "exec", "-m", dir, router, "--",
+					"ip", "addr", "add", addr, "dev", "lo")
+				if err != nil {
+					t.Fatalf("adding a spare address: %v\n%s", err, out)
 				}
 			},
 		},

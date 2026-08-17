@@ -644,6 +644,13 @@ reached students, and each motivated a permanent test.
     carried frames from one VLAN into another at full marks. Every action that
     names a port now counts, and the ones that name none but reach every port,
     flood and all, count as reaching all of them.
+71. **A second address on an interface whose address is dictated.** Any address
+    inside an interface's own subnet was excused, on the reasoning that the plan
+    sometimes leaves the choice open. Where the assignment dictates the address
+    it does not: a spare address on a prescribed loopback went unnoticed, and a
+    spare address in the right subnet is exactly what an impersonation needs.
+    Only the exact address counts on a prescribed interface now; where the
+    choice is the student's, anything inside the mandated prefix still does.
 
 ## Environment findings
 
