@@ -638,6 +638,12 @@ reached students, and each motivated a permanent test.
     provider that way for no loss of marks, and the same trick hides anything
     else. A router has three rules when nobody has interfered, plus the one the
     kernel adds for itself once any VRF exists; anything else is now reported.
+70. **A frame emitted by an action the reader did not know.** The flow-table
+    check recognised `output:` and nothing else, so `enqueue:8:0` -- which puts
+    the frame on a queue of port 8 and sends it exactly as `output` would --
+    carried frames from one VLAN into another at full marks. Every action that
+    names a port now counts, and the ones that name none but reach every port,
+    flood and all, count as reaching all of them.
 
 ## Environment findings
 

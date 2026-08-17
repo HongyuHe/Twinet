@@ -186,6 +186,7 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 	var udpPair struct{ router, src string }
 	var vlanFlow struct{ switchID string }
 	var tcMirror struct{ switchID, from string }
+	var enqueueLeak struct{ switchID string }
 	var forgedLeak struct{ router, routeMap, prefix string }
 	var custTCP string
 	var starved struct {
@@ -1060,6 +1061,32 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 					"end")
 				vtysh(t, dir, router, "clear ip bgp "+peer+" out")
 				time.Sleep(20 * time.Second)
+			},
+		},
+		{
+			// A frame emitted by an action the reader did not know.
+			//
+			// `enqueue:<port>:<queue>` puts the frame on a queue of that port
+			// and sends it exactly as `output` would.
+			name:     "frames queued across VLANs instead of output across them",
+			question: "q1.1",
+			undo: func(t *testing.T) {
+				if enqueueLeak.switchID == "" {
+					return
+				}
+				_, _ = twinet(t, "exec", "-m", dir, enqueueLeak.switchID, "--",
+					"ovs-ofctl", "del-flows", "br0", "cookie=0x461/-1")
+			},
+			apply: func(t *testing.T) {
+				sw, from, to := vlanPortPair(t, dir, as)
+				enqueueLeak = struct{ switchID string }{sw}
+				t.Logf("queueing frames from %s onto %s on %s", from, to, sw)
+				out, err := twinet(t, "exec", "-m", dir, sw, "--", "ovs-ofctl", "add-flow", "br0",
+					"cookie=0x461,priority=50000,in_port="+from+",arp,"+
+						"actions=enqueue:"+to+":0")
+				if err != nil {
+					t.Fatalf("queueing frames across VLANs: %v\n%s", err, out)
+				}
 			},
 		},
 		{
