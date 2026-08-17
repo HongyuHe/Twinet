@@ -476,7 +476,27 @@ func (d *Docker) CopyTo(ctx context.Context, name, dst string, mode int64, conte
 
 // CopyFrom reads a single file out of a container.
 func (d *Docker) CopyFrom(ctx context.Context, name, src string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, d.bin, "cp", name+":"+src, "-")
+	return d.copyFrom(ctx, name, src, false)
+}
+
+// CopyFromFollow reads a single file out of a container, following a symbolic
+// link at the end of the path.
+//
+// The unfollowed form returns the link itself, which arrives as an archive
+// entry with no contents; a caller comparing a container against its image has
+// to see the same bytes on both sides, and /bin/sh is a link in every image
+// this project ships.
+func (d *Docker) CopyFromFollow(ctx context.Context, name, src string) ([]byte, error) {
+	return d.copyFrom(ctx, name, src, true)
+}
+
+func (d *Docker) copyFrom(ctx context.Context, name, src string, follow bool) ([]byte, error) {
+	args := []string{"cp"}
+	if follow {
+		args = append(args, "-L")
+	}
+	args = append(args, name+":"+src, "-")
+	cmd := exec.CommandContext(ctx, d.bin, args...)
 	var out, errb bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &errb
