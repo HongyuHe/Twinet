@@ -868,7 +868,7 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 				policyDivert = struct{ router, dst string }{router, dst}
 				t.Logf("diverting %s into another table on %s", dst, router)
 				out, err := twinet(t, "exec", "-m", dir, router, "--", "sh", "-c",
-					"ip route add table 100 "+dst+" via "+peer+" onlink && "+
+					"ip route add table 100 "+dst+" via "+peer+" && "+
 						"ip rule add priority 100 to "+dst+" lookup 100")
 				if err != nil {
 					t.Fatalf("diverting a destination: %v\n%s", err, out)
