@@ -2,7 +2,11 @@ package grade
 
 import (
 	"context"
+	crand "crypto/rand"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"net"
 	"net/netip"
 	"sort"
 	"strings"
@@ -398,7 +402,7 @@ func hostIface(d *model.Device) string {
 // makes it leave. Doing them separately -- join with one tool, listen with
 // another -- leaves the membership behind after the check and changes the next
 // one's result.
-func receiveOn(ctx context.Context, env *Env, host *model.Device, group string,
+func receiveOn(ctx context.Context, env *Env, host *model.Device, group, tag string,
 	seconds int) (string, error) {
 
 	iface := hostIface(host)
@@ -406,15 +410,16 @@ func receiveOn(ctx context.Context, env *Env, host *model.Device, group string,
 		return "", fmt.Errorf("%s has no interface to join on", host.Name)
 	}
 	res, err := env.Probe(ctx, host.ID, []string{"twinet-mcast", "-recv",
-		"-group", group, "-iface", iface, "-seconds", fmt.Sprint(seconds)})
+		"-group", group, "-iface", iface, "-tag", tag, "-seconds", fmt.Sprint(seconds)})
 	if err != nil {
 		return "", err
 	}
 	return res.Stdout + res.Stderr, nil
 }
 
-// sendTo sends a few packets to a group from a host.
-func sendTo(ctx context.Context, env *Env, host *model.Device, group string, n int) error {
+// sendTo sends a few packets to a group from a host, each carrying the tag this
+// run drew.
+func sendTo(ctx context.Context, env *Env, host *model.Device, group, tag string, n int) error {
 	iface := hostIface(host)
 	if iface == "" {
 		return fmt.Errorf("%s has no interface to send from", host.Name)
@@ -423,7 +428,8 @@ func sendTo(ctx context.Context, env *Env, host *model.Device, group string, n i
 	// which is the mistake the exercise warns about; the check must not make
 	// it, or every submission fails for the grader's reason.
 	res, err := env.Probe(ctx, host.ID, []string{"twinet-mcast", "-send",
-		"-group", group, "-iface", iface, "-count", fmt.Sprint(n), "-ttl", "10"})
+		"-group", group, "-iface", iface, "-tag", tag,
+		"-count", fmt.Sprint(n), "-ttl", "10"})
 	if err != nil {
 		return err
 	}
@@ -432,6 +438,35 @@ func sendTo(ctx context.Context, env *Env, host *model.Device, group string, n i
 			firstLine(res.Stderr+res.Stdout))
 	}
 	return nil
+}
+
+// multicastTag is the token stamped on the packets one run sends.
+//
+// Drawn when the check runs, and never published, so that a submission cannot
+// arrange for anything else on the group to be counted as the grader's traffic.
+func multicastTag() string {
+	var b [8]byte
+	if _, err := crand.Read(b[:]); err != nil {
+		// Failing closed here would make grading depend on the kernel's
+		// entropy pool; the clock is unpredictable enough to a configuration
+		// written before the run.
+		return fmt.Sprintf("%016x", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b[:])
+}
+
+// hostAddr4 is the address a host's packets will carry, which is what the
+// routers' forwarding state must name if the tree is the one being measured.
+func hostAddr4(d *model.Device) string {
+	for _, i := range d.Ifaces {
+		if i.Name == "lo" || i.Addr4 == "" {
+			continue
+		}
+		if ip, _, err := net.ParseCIDR(i.Addr4); err == nil {
+			return ip.String()
+		}
+	}
+	return ""
 }
 
 // multicastRun joins a group on several hosts at once, sends from another, and
@@ -450,6 +485,12 @@ func multicastRun(ctx context.Context, env *Env, receivers []*model.Device,
 	bystanders []*model.Device, src *model.Device, group string) (
 	got map[string]string, trees map[string]string, err error) {
 
+	tag := multicastTag()
+	srcAddr := hostAddr4(src)
+	if srcAddr == "" {
+		return nil, nil, fmt.Errorf("%s has no address, so the tree its packets build "+
+			"cannot be told from anyone else's", src.Name)
+	}
 	type result struct {
 		name string
 		out  string
@@ -458,7 +499,7 @@ func multicastRun(ctx context.Context, env *Env, receivers []*model.Device,
 	done := make(chan result, len(receivers)+len(bystanders))
 	for _, h := range receivers {
 		go func(h *model.Device) {
-			out, err := receiveOn(ctx, env, h, group, 25)
+			out, err := receiveOn(ctx, env, h, group, tag, 25)
 			done <- result{h.Name, out, err}
 		}(h)
 	}
@@ -468,7 +509,7 @@ func multicastRun(ctx context.Context, env *Env, receivers []*model.Device,
 		go func(h *model.Device) {
 			iface := hostIface(h)
 			res, err := env.Probe(ctx, h.ID, []string{"twinet-mcast", "-listen",
-				"-group", group, "-iface", iface, "-seconds", "25"})
+				"-group", group, "-iface", iface, "-tag", tag, "-seconds", "25"})
 			if err != nil {
 				done <- result{h.Name, "", err}
 				return
@@ -484,16 +525,19 @@ func multicastRun(ctx context.Context, env *Env, receivers []*model.Device,
 	case <-ctx.Done():
 		return nil, nil, ctx.Err()
 	}
-	if err := sendTo(ctx, env, src, group, 25); err != nil {
+	if err := sendTo(ctx, env, src, group, tag, 25); err != nil {
 		return nil, nil, err
 	}
 	// Read the trees while the traffic is still flowing: multicast forwarding
 	// state expires, so a table read after the sender stops is empty for a
-	// correct submission.
+	// correct submission. Only state naming this source counts: a host sending
+	// to the group on its own segment creates an entry of its own, so "some
+	// router has state for the group" is satisfied by every submission that
+	// leaves a sender running anywhere.
 	trees = map[string]string{}
 	for _, r := range env.Routers() {
-		if out, err := env.Vtysh(ctx, r.Name, "show ip mroute"); err == nil {
-			trees[r.Name] = out
+		if carriesSource(ctx, env, r.Name, group, srcAddr) {
+			trees[r.Name] = group
 		}
 	}
 	got = map[string]string{}
@@ -509,6 +553,22 @@ func multicastRun(ctx context.Context, env *Env, receivers []*model.Device,
 		}
 	}
 	return got, trees, nil
+}
+
+// carriesSource reports whether a router holds multicast forwarding state for
+// the group that names this source.
+//
+// "Some router has state for the group" is satisfied by any submission that
+// leaves a sender running anywhere, and by the shared-tree entry every join
+// creates whether or not a packet ever crosses. Naming the source ties the
+// state to the traffic the question is about.
+func carriesSource(ctx context.Context, env *Env, router, group, src string) bool {
+	var doc map[string]map[string]json.RawMessage
+	if err := env.VtyshJSON(ctx, router, "show ip mroute json", &doc); err != nil {
+		return false
+	}
+	_, ok := doc[group][src]
+	return ok
 }
 
 // cast is one round: who sends, who joins, and who merely listens.

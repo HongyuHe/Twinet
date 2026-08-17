@@ -40,6 +40,7 @@ func main() {
 		seconds = flag.Int("seconds", 10, "how long to listen")
 		count   = flag.Int("count", 5, "how many packets to send")
 		ttl     = flag.Int("ttl", 10, "time to live of sent packets")
+		tag     = flag.String("tag", "", "token stamped on sent packets and required of received ones")
 	)
 	flag.Parse()
 
@@ -57,11 +58,11 @@ func main() {
 
 	switch {
 	case *send:
-		doSend(ip, nic, *port, *count, *ttl)
+		doSend(ip, nic, *port, *count, *ttl, *tag)
 	case *recv:
-		doReceive(ip, nic, *port, *seconds, true)
+		doReceive(ip, nic, *port, *seconds, *tag, true)
 	case *listen:
-		doReceive(ip, nic, *port, *seconds, false)
+		doReceive(ip, nic, *port, *seconds, *tag, false)
 	default:
 		fail("one of -send, -recv or -listen is required")
 	}
@@ -72,7 +73,7 @@ func fail(msg string) {
 	os.Exit(2)
 }
 
-func doSend(group net.IP, nic *net.Interface, port, count, ttl int) {
+func doSend(group net.IP, nic *net.Interface, port, count, ttl int, tag string) {
 	// Bound to the interface's own address so the packets leave the segment the
 	// exercise is about, rather than whichever one the default route picks on a
 	// multi-homed host.
@@ -98,15 +99,30 @@ func doSend(group net.IP, nic *net.Interface, port, count, ttl int) {
 	}
 	dst := &net.UDPAddr{IP: group, Port: port}
 	for i := 0; i < count; i++ {
-		if _, err := p.WriteTo([]byte(fmt.Sprintf("twinet-mcast %d", i)), nil, dst); err != nil {
+		if _, err := p.WriteTo([]byte(stamp(tag, i)), nil, dst); err != nil {
 			fail(fmt.Sprintf("sending: %v", err))
 		}
 		time.Sleep(300 * time.Millisecond)
 	}
-	fmt.Printf("sent %d packet(s) to %s from %s ttl %d\n", count, group, src, ttl)
+	fmt.Printf("sent %d packet(s) to %s from %s ttl %d tag %q\n", count, group, src, ttl, tag)
 }
 
-func doReceive(group net.IP, nic *net.Interface, port, seconds int, join bool) {
+// stamp is the payload of one packet: the tag the grader drew for this run, so
+// that a packet the grader did not send cannot be counted as one it did.
+//
+// Delivery was measured as "something arrived on the group", and a host that
+// sends to the group on its own segment receives its own packets. A sender left
+// running on every host therefore satisfied the question for every host at
+// once, with the traffic the question is about discarded in the network. The
+// tag is drawn when the check runs, so no submission can arrange to carry it.
+func stamp(tag string, i int) string {
+	if tag == "" {
+		return fmt.Sprintf("twinet-mcast %d", i)
+	}
+	return fmt.Sprintf("twinet-mcast %s %d", tag, i)
+}
+
+func doReceive(group net.IP, nic *net.Interface, port, seconds int, tag string, join bool) {
 	var (
 		c   *net.UDPConn
 		err error
@@ -131,14 +147,25 @@ func doReceive(group net.IP, nic *net.Interface, port, seconds int, join bool) {
 		fail(err.Error())
 	}
 	buf := make([]byte, 2048)
-	n := 0
+	n, other := 0, 0
 	var from []string
+	want := ""
+	if tag != "" {
+		want = "twinet-mcast " + tag + " "
+	}
 	for time.Now().Before(deadline) {
 		got, addr, err := c.ReadFromUDP(buf)
 		if err != nil {
 			break
 		}
 		if got == 0 {
+			continue
+		}
+		// Only the packets this run sent count. Anything else on the group is
+		// somebody else's traffic, and answering the question with it would
+		// let a host satisfy the grader by talking to itself.
+		if want != "" && !strings.HasPrefix(string(buf[:got]), want) {
+			other++
 			continue
 		}
 		n++
@@ -150,12 +177,17 @@ func doReceive(group net.IP, nic *net.Interface, port, seconds int, join bool) {
 	if !join {
 		verb = "did not join"
 	}
+	untagged := ""
+	if other > 0 {
+		untagged = fmt.Sprintf("; ignored %d packet(s) on %s that this run did not send",
+			other, group)
+	}
 	if n == 0 {
-		fmt.Printf("nothing arrived for %s in %ds (%s)\n", group, seconds, verb)
+		fmt.Printf("nothing arrived for %s in %ds (%s)%s\n", group, seconds, verb, untagged)
 		return
 	}
-	fmt.Printf("received %d packet(s) for %s from %s (%s)\n",
-		n, group, strings.Join(from, ","), verb)
+	fmt.Printf("received %d packet(s) for %s from %s (%s)%s\n",
+		n, group, strings.Join(from, ","), verb, untagged)
 }
 
 func contains(v []string, s string) bool {
