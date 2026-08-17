@@ -838,6 +838,31 @@ reached students, and each motivated a permanent test.
     describes -- is found. The same name was hardcoded in the snapshot and
     archive paths, so a submission that built its own bridge lost those ports'
     VLANs on the way through its own backup; both now walk every bridge.
+83. **A flow's actions were read, not run.** An action list is a program.
+    Looking through one for output ports found none in
+    `in_port=1,udp,tp_dst=55555 actions=load:4->NXM_OF_IN_PORT[],
+    mod_vlan_vid:20,NORMAL`, which names no port to send anything out of: it
+    retags the frame into the other VLAN, tells it that it arrived on a port
+    that is in that VLAN, and hands it to the switch's own forwarding, which
+    delivers it there. `NORMAL` had been read as harmless because on an
+    untouched frame it is. The actions are now walked in order, keeping the
+    VLAN the frame carries and the port it counts as having arrived on, and a
+    rewritten frame handed to `NORMAL` -- or resubmitted to a table that ends
+    at one -- is read as delivered wherever the rewrite puts it. A flow that
+    rewrites nothing says nothing, so `priority=0 actions=NORMAL`, which is
+    the whole table of a correct switch, costs nothing. Measured: 10.00 ->
+    9.50 with the flow installed, and 10.00 with it removed.
+    Two parsing faults surfaced while pinning this down, each of which had
+    been hiding crossings of the ordinary kind. The match ends at a space
+    before `actions=`, not at a comma, so a flow whose only match was its
+    input port had that port read as `1 actions=output:2`, resolved to
+    nothing, and counted as a flow that had never said where its frames came
+    from -- so the rule that catches a frame leaving its VLAN never fired on
+    it. And a port printed by name arrives in quotes, which matched neither
+    the port-number table nor the VLAN table. Separately, the flood action was
+    being matched as a substring, so the letters `all` anywhere in an action
+    expanded to every port on the switch -- a way to lose marks for forwarding
+    that never happened.
 
 ## Environment findings
 

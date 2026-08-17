@@ -294,6 +294,25 @@ out to be larger cost a mark:
   spin. A group's own `type=all` is not part of a bucket and is deliberately not
   read as flooding; reading it as flooding would fail every switch that has a
   group at all.
+- **A bridge by another name.** `br0` is what the reference answer builds, and
+  it was the only bridge ever asked about; a switch whose bridge is called
+  anything else had nothing read, and `ovs-ofctl show br0` failing was passed
+  over in silence. Every bridge is now listed and read, port numbers are
+  resolved against the bridge that used them, and a switch that cannot be asked
+  is reported as unread rather than clean. The hops are also assembled into a
+  graph, so a way across through a patch port into a second bridge and back out
+  in another VLAN — which no single flow describes — is found.
+- **Actions that are a program, not a list of ports.**
+  `actions=load:4->NXM_OF_IN_PORT[],mod_vlan_vid:20,NORMAL` names no port to
+  send anything out of. It retags the frame into the other VLAN, tells it that
+  it arrived on a port that is in that VLAN, and hands it to `NORMAL`, which
+  delivers it there. `NORMAL` on an untouched frame keeps it in its own VLAN,
+  which is why it had been read as harmless. The actions are therefore walked
+  in order, carrying the frame's VLAN and its input port, and a rewritten frame
+  reaching `NORMAL` — directly, or by a resubmit to a table that ends at one —
+  is read as delivered wherever the rewrite puts it. A flow that rewrites
+  nothing says nothing, so a correct switch's `priority=0 actions=NORMAL` costs
+  it nothing.
 - **Copies made outside the switch's tables.** `tc filter … action mirred egress
   mirror dev <other>` has the kernel copy the frames of an access port into
   another VLAN with the flow table exactly as it should be, and the switch's own

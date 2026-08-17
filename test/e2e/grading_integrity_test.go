@@ -187,6 +187,7 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 	var tcpBlock struct{ router, src, dst string }
 	var udpPair struct{ router, src string }
 	var vlanFlow struct{ switchID string }
+	var vlanRetag struct{ switchID string }
 	var tcMirror struct{ switchID, from string }
 	var enqueueLeak struct{ switchID string }
 	var groupLeak struct{ switchID string }
@@ -1181,6 +1182,35 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 						"actions=normal,output:"+to)
 				if err != nil {
 					t.Fatalf("mirroring one flow across VLANs: %v\n%s", err, out)
+				}
+			},
+		},
+		{
+			// A way across that names no port to send anything out of.
+			//
+			// The actions retag the frame and tell it that it arrived on a
+			// port in the other VLAN, and then hand it to the switch's own
+			// forwarding, which delivers it there. Read as a list of output
+			// ports it has none, so it was read as harmless.
+			name:     "one flow retagged across VLANs before NORMAL",
+			question: "q1.1",
+			undo: func(t *testing.T) {
+				if vlanRetag.switchID == "" {
+					return
+				}
+				_, _ = twinet(t, "exec", "-m", dir, vlanRetag.switchID, "--",
+					"ovs-ofctl", "del-flows", "br0", "cookie=0x461ba2/-1")
+			},
+			apply: func(t *testing.T) {
+				sw, from, to := vlanPortPair(t, dir, as)
+				vlanRetag = struct{ switchID string }{sw}
+				tag := vlanTagOf(t, dir, sw, to)
+				t.Logf("retagging %s into the VLAN of %s (%s) on %s", from, to, tag, sw)
+				out, err := twinet(t, "exec", "-m", dir, sw, "--", "ovs-ofctl", "add-flow", "br0",
+					"cookie=0x461ba2,priority=200,in_port="+from+",udp,tp_dst=55555,"+
+						"actions=mod_vlan_vid:"+tag+",NORMAL")
+				if err != nil {
+					t.Fatalf("retagging one flow across VLANs: %v\n%s", err, out)
 				}
 			},
 		},
@@ -3986,4 +4016,22 @@ func TestAProgramTheStudentWroteCannotEarnMarks(t *testing.T) {
 		t.Errorf("the run was held back but the report does not say why: %s", report)
 	}
 	t.Logf("the run was quarantined: %s", rep.Err)
+}
+
+// vlanTagOf is the VLAN a switch's access port is in.
+func vlanTagOf(t *testing.T, dir, sw, port string) string {
+	t.Helper()
+	out, err := twinet(t, "exec", "-m", dir, sw, "--",
+		"ovs-vsctl", "--columns=name,tag", "--format=csv", "list", "port")
+	if err != nil {
+		t.Fatalf("asking %s which VLAN %s is in: %v\n%s", sw, port, err, out)
+	}
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Split(strings.TrimSpace(line), ",")
+		if len(f) == 2 && f[0] == port && f[1] != "[]" {
+			return f[1]
+		}
+	}
+	t.Fatalf("%s did not say which VLAN %s is in:\n%s", sw, port, out)
+	return ""
 }
