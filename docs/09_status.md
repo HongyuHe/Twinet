@@ -710,6 +710,24 @@ reached students, and each motivated a permanent test.
     lifetime meant a program planted after one run was believed by every run
     after it.
 
+77. **A group is a second table the flow table only points at.** The VLAN
+    isolation check reads what a switch has been told to do, and a flow whose
+    action is `group:461` has been told nothing at all about where the frame
+    goes: the ports are in the group's buckets, which live in a table of their
+    own that `dump-flows` never shows. The reader saw an action naming no port
+    and found nothing to complain about, so a group carrying UDP from a VLAN-10
+    access port straight out of a VLAN-20 one scored 10.00 of 10.00. The reader
+    now dumps the groups too and follows every `group:` into its buckets, and
+    those into any group they name in turn, stopping on one it has already
+    walked so a group pointing at itself cannot spin. The group's own `type=all`
+    is not part of a bucket and is deliberately not read as an instruction to
+    flood — reading it as one would have failed every switch that has a group.
+    The same hole had a second door: the switch's built-in mirror leaves the
+    flow table and the kernel's traffic control exactly as a correct switch
+    would have them and still copies every frame of one port onto another,
+    whatever VLAN either is in. Both are now read; measured at 9.50 and 8.70 of
+    10.00 respectively, against 10.00 before.
+
 ## Environment findings
 
 - **Jumbo frames are unavailable.** Raising `eno2` to MTU 9000 dropped the

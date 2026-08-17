@@ -271,6 +271,39 @@ an untouched program, and a program replaced in the twenty seconds between one
 check and the next. Both are narrower than what it does cover, and neither is
 reachable by editing a configuration file.
 
+### Where a switch has been told to send a frame
+
+`l2.vlan_isolation` does not only send probes. A broadcast finds two VLANs that
+share a broadcast domain, but it does not find a rule aimed at one flow, so the
+check also reads what each switch has actually been told to do and calls any
+instruction that carries a frame from a port in one VLAN out of a port in
+another a way across.
+
+"What it has been told" is larger than the flow table, and each place it turned
+out to be larger cost a mark:
+
+- **Actions that name a port in an unfamiliar way.** `enqueue:8:0` puts the
+  frame on a queue of port 8 and sends it exactly as `output:8` would. Every
+  action naming a port is read, and `flood` and `all`, which name none and reach
+  every port, count as reaching all of them.
+- **Actions that name no port at all.** `actions=group:461` says only that the
+  frame goes wherever group 461 says; the ports are in the group's buckets,
+  which `dump-flows` never shows. The groups are dumped as well and every
+  `group:` is followed into its buckets, and those into any group they name in
+  turn — stopping at one already walked, so a group pointing at itself cannot
+  spin. A group's own `type=all` is not part of a bucket and is deliberately not
+  read as flooding; reading it as flooding would fail every switch that has a
+  group at all.
+- **Copies made outside the switch's tables.** `tc filter … action mirred egress
+  mirror dev <other>` has the kernel copy the frames of an access port into
+  another VLAN with the flow table exactly as it should be, and the switch's own
+  `ovs-vsctl` mirror does the same with neither the flow table nor traffic
+  control touched. Both are read.
+
+The pattern is worth naming, because it is the one that keeps recurring: a check
+that reads one table and concludes from its silence. Silence in a table that
+only points at another table says nothing.
+
 ## Grading a class
 
 Two modes, and the difference is what they cost.

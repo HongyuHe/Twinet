@@ -189,6 +189,7 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 	var vlanFlow struct{ switchID string }
 	var tcMirror struct{ switchID, from string }
 	var enqueueLeak struct{ switchID string }
+	var groupLeak struct{ switchID string }
 	var forgedLeak struct{ router, routeMap, prefix string }
 	var custTCP string
 	var starved struct {
@@ -1088,6 +1089,42 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 						"actions=enqueue:"+to+":0")
 				if err != nil {
 					t.Fatalf("queueing frames across VLANs: %v\n%s", err, out)
+				}
+			},
+		},
+		{
+			// An action that names no port at all.
+			//
+			// A flow whose action is a group says nothing about where the
+			// frame goes: the ports are in the group's buckets, which are in
+			// a table of their own. Reading only the flow table found an
+			// action with no destination in it and nothing to complain about.
+			name:     "frames sent across VLANs by a group the flow only points at",
+			question: "q1.1",
+			undo: func(t *testing.T) {
+				if groupLeak.switchID == "" {
+					return
+				}
+				_, _ = twinet(t, "exec", "-m", dir, groupLeak.switchID, "--",
+					"ovs-ofctl", "-O", "OpenFlow13", "del-flows", "br0", "cookie=0x461f/-1")
+				_, _ = twinet(t, "exec", "-m", dir, groupLeak.switchID, "--",
+					"ovs-ofctl", "-O", "OpenFlow13", "del-groups", "br0", "group_id=4610")
+			},
+			apply: func(t *testing.T) {
+				sw, from, to := vlanPortPair(t, dir, as)
+				groupLeak = struct{ switchID string }{sw}
+				t.Logf("sending frames from %s onto %s through a group on %s", from, to, sw)
+				out, err := twinet(t, "exec", "-m", dir, sw, "--",
+					"ovs-ofctl", "-O", "OpenFlow13", "add-group", "br0",
+					"group_id=4610,type=all,bucket=actions=output:"+to)
+				if err != nil {
+					t.Fatalf("adding a group across VLANs: %v\n%s", err, out)
+				}
+				out, err = twinet(t, "exec", "-m", dir, sw, "--",
+					"ovs-ofctl", "-O", "OpenFlow13", "add-flow", "br0",
+					"cookie=0x461f,priority=50000,in_port="+from+",arp,actions=group:4610")
+				if err != nil {
+					t.Fatalf("pointing a flow at the group: %v\n%s", err, out)
 				}
 			},
 		},
