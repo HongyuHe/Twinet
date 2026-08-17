@@ -631,6 +631,13 @@ reached students, and each motivated a permanent test.
     traffic from both VLANs towards that prefix left every remaining probe
     succeeding and the question at full marks, with two whole sites unable to
     reach it.
+69. **A decision made where the routing protocols have no say.** `ip rule add to
+    X lookup 100`, with a route in table 100, sends that destination wherever it
+    says while zebra's main table -- all a routing daemon reports -- still shows
+    the route BGP chose. A customer's destination was diverted through a
+    provider that way for no loss of marks, and the same trick hides anything
+    else. A router has three rules when nobody has interfered, plus the one the
+    kernel adds for itself once any VRF exists; anything else is now reported.
 
 ## Environment findings
 

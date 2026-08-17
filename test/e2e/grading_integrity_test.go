@@ -196,6 +196,7 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 	var disown struct{ router, routeMap, prefix, peer string }
 	var slowPrepend struct{ router, routeMap, seq, peer, original string }
 	var staticOverride struct{ router, prefix string }
+	var policyDivert struct{ router, dst string }
 	var ebgpBlackhole struct{ router, peer string }
 	var looseROA struct {
 		router, anchor, prefix string
@@ -842,6 +843,35 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 						"iptables -I OUTPUT 1 -p tcp -d "+peer+" -j DROP")
 				if err != nil {
 					t.Fatalf("blackholing an external session: %v\n%s", err, out)
+				}
+			},
+		},
+		{
+			// A decision made where the routing protocols have no say.
+			//
+			// `ip rule add to X lookup 100` with a route in that table sends
+			// the destination wherever it says, while zebra's main table still
+			// shows the route BGP chose.
+			name:     "a destination diverted by a policy rule into another table",
+			question: "q2.3",
+			undo: func(t *testing.T) {
+				if policyDivert.router == "" {
+					return
+				}
+				_, _ = twinet(t, "exec", "-m", dir, policyDivert.router, "--", "sh", "-c",
+					"ip rule del priority 100 to "+policyDivert.dst+" lookup 100; "+
+						"ip route del table 100 "+policyDivert.dst)
+			},
+			apply: func(t *testing.T) {
+				router, peer, _, _, _ := leakableRoute(t, dir, as)
+				dst := loopbackOf(t, dir, "as"+itoa(as)+"/BOS") + "/32"
+				policyDivert = struct{ router, dst string }{router, dst}
+				t.Logf("diverting %s into another table on %s", dst, router)
+				out, err := twinet(t, "exec", "-m", dir, router, "--", "sh", "-c",
+					"ip route add table 100 "+dst+" via "+peer+" onlink && "+
+						"ip rule add priority 100 to "+dst+" lookup 100")
+				if err != nil {
+					t.Fatalf("diverting a destination: %v\n%s", err, out)
 				}
 			},
 		},
