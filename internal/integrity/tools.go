@@ -317,6 +317,16 @@ func (c *Checker) readImage(ctx context.Context, image string) (map[string]resol
 		Command:     []string{"/bin/true"},
 		NetworkMode: "none",
 		Labels:      map[string]string{"twinet.integrity": "true"}}); err != nil {
+		if strings.Contains(err.Error(), "No such image") {
+			// The container is running an image this node no longer has,
+			// which happens when the images are rebuilt under a tag that
+			// already had containers. Nothing about the student is wrong and
+			// nothing about them can be checked either.
+			return nil, fmt.Errorf("this container is running an image (%s) that is no "+
+				"longer on this node, so the programs in it cannot be compared against "+
+				"anything; redeploy the lab so that its containers run the images the "+
+				"node actually has", image)
+		}
 		return nil, fmt.Errorf("a pristine container of %s could not be made to compare "+
 			"against: %w", image, err)
 	}
