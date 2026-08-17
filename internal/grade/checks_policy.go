@@ -74,10 +74,10 @@ func tunnelCarriesTransport(ctx context.Context, env *Env, hosts map[string]*mod
 		if addr == "" {
 			continue
 		}
-		before, okB := tcpResetsSent(ctx, env, dst.ID)
+		before, okB := tcpAnswers(ctx, env, dst.ID)
 		res, err := env.Probe(ctx, src.ID,
 			[]string{"nc", "-6", "-w", "3", "-z", addr, probePort()})
-		after, okA := tcpResetsSent(ctx, env, dst.ID)
+		after, okA := tcpAnswers(ctx, env, dst.ID)
 		if !okB || !okA {
 			// The counter could not be read, so a refusal is the only
 			// evidence there is; a timeout leaves nothing to conclude from.
@@ -127,16 +127,6 @@ func udpNoPorts(ctx context.Context, env *Env, device string) (int, bool) {
 		}
 	}
 	return 0, false
-}
-
-// tcpResetsSent reads a host's count of TCP resets it has sent, which is the
-// kernel's own record of a connection attempt having reached it.
-func tcpResetsSent(ctx context.Context, env *Env, device string) (int, bool) {
-	res, err := env.Probe(ctx, device, []string{"cat", "/proc/net/snmp"})
-	if err != nil || res.ExitCode != 0 {
-		return 0, false
-	}
-	return snmpCounter(res.Stdout, "Tcp:", "OutRsts")
 }
 
 func checkSixIn4(ctx context.Context, env *Env) Result {

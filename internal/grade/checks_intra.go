@@ -1049,9 +1049,9 @@ func carriesTCPBothWays(ctx context.Context, env *Env, from, to string) (string,
 			args = append(args, "-s", addrOnly(slo.Addr4))
 		}
 		args = append(args, addr, probePort())
-		before, okB := tcpResetsSent(ctx, env, dst.ID)
+		before, okB := tcpAnswers(ctx, env, dst.ID)
 		_, _ = env.Probe(ctx, src.ID, args)
-		after, okA := tcpResetsSent(ctx, env, dst.ID)
+		after, okA := tcpAnswers(ctx, env, dst.ID)
 		if okB && okA && after <= before {
 			return fmt.Sprintf(
 				"%s answers pings from %s but no connection to it arrives: the paths carry "+
@@ -2163,8 +2163,9 @@ func checkInternalReachability(ctx context.Context, env *Env) Result {
 	// all eighty-eight of them succeeding and the question at full marks,
 	// while nothing but a ping could cross between the two. A connection is
 	// attempted to a port nothing is listening on, so no service has to be
-	// arranged: being refused proves the packets made the journey both ways,
-	// where being dropped is silence.
+	// arranged, and the destination's own count of what reached it is read --
+	// a refusal proves only that somebody answered, and any router on the way
+	// can send one carrying the destination's address.
 	pingOnly := unreachableByTCP(ctx, env, hosts, addrOf)
 	pingOnly = append(pingOnly, unreachableByUDP(ctx, env, hosts, addrOf)...)
 	sort.Strings(pingOnly)
@@ -2277,51 +2278,55 @@ func serviceAttachments(env *Env) []svcAttachment {
 // unreachableByTCP tries a connection between every ordered pair of hosts and
 // names the ones where the packets do not arrive.
 //
-// The port is one nothing listens on, so the answer is a reset: "refused" is
-// the far side speaking, and silence is something on the path swallowing the
-// attempt. That distinction is the whole test -- both look like a failed
-// connection to the program making it.
+// The port is one nothing listens on, so the answer from a host that receives
+// the attempt is a reset. But a reset is not proof that the host received
+// anything: any router on the way can send one carrying the destination's
+// address, and a student whose network drops forwarded TCP could clear this
+// check with a single `REJECT --reject-with tcp-reset` rule. The destination's
+// own count of the resets it sent is the witness, and silence there is
+// something on the path swallowing the attempt.
 func unreachableByTCP(ctx context.Context, env *Env, hosts []*model.Device,
 	addrOf map[string]string) []string {
-	var (
-		mu  sync.Mutex
-		out []string
-		wg  sync.WaitGroup
-	)
-	sem := make(chan struct{}, 16)
+	type attempt struct{ from, to *model.Device }
+	var pairs []attempt
 	for _, a := range hosts {
 		for _, b := range hosts {
 			if a.ID == b.ID || addrOf[b.ID] == "" {
 				continue
 			}
+			pairs = append(pairs, attempt{a, b})
+		}
+	}
+
+	var (
+		mu  sync.Mutex
+		out []string
+	)
+	// Serialised by destination, so a counter that moved belongs to the
+	// attempt that moved it rather than to somebody else's probe.
+	for _, round := range roundsByDestinationOf(pairs, func(p attempt) string { return p.to.ID }) {
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, 16)
+		for _, p := range round {
 			wg.Add(1)
-			go func(a, b *model.Device) {
+			go func(p attempt) {
 				defer wg.Done()
 				sem <- struct{}{}
 				defer func() { <-sem }()
-				addr := addrOf[b.ID]
-				res, err := env.Probe(ctx, a.ID,
-					[]string{"nc", "-v", "-w", "3", "-z", addr, probePort()})
-				if err != nil {
-					return // the machinery failed, which is not a verdict
-				}
-				answered := res.ExitCode == 0
-				said := strings.ToLower(res.Stderr + res.Stdout)
-				if strings.Contains(said, "refused") || strings.Contains(said, "reset") {
-					answered = true
-				}
-				if answered {
+				addr := addrOf[p.to.ID]
+				w, ok := tryConnection(ctx, env, p.from.ID, p.to.ID, addr, probePort())
+				if !ok || w.reached() {
 					return
 				}
 				mu.Lock()
 				out = append(out, fmt.Sprintf(
 					"%s can ping %s (%s) but no connection to it arrives: something on the "+
-						"path carries ICMP and discards the rest", a.Name, b.Name, addr))
+						"path carries ICMP and discards the rest", p.from.Name, p.to.Name, addr))
 				mu.Unlock()
-			}(a, b)
+			}(p)
 		}
+		wg.Wait()
 	}
-	wg.Wait()
 	sort.Strings(out)
 	return out
 }

@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/HongyuHe/twinet/internal/model"
@@ -391,11 +393,78 @@ func TestAVPNThatCarriesOnlyPingsDoesNotEarnFullReachabilityMarks(t *testing.T) 
 	}
 }
 
+// hostOf finds the device that owns an address.
+func hostOf(sites map[string][]vpnSite, addr string) string {
+	for _, group := range sites {
+		for _, s := range group {
+			if s.addr == addr {
+				return s.host
+			}
+		}
+	}
+	return ""
+}
+
+// snmpWith renders the part of /proc/net/snmp a destination's own record of
+// arriving connections is read from.
+func snmpWith(rsts int) string {
+	return "Tcp: RtoAlgorithm RtoMin PassiveOpens OutRsts\n" +
+		"Tcp: 1 200 0 " + strconv.Itoa(rsts) + "\n"
+}
+
 // Isolation asked only of ICMP is isolation of ICMP.
 //
 // The customers' pings are blocked and their connections are not: the tables
-// are joined, and a check built on ping calls them perfectly separated.
+// are joined, and a check built on ping calls them perfectly separated. The
+// destinations answer for themselves here -- their kernels count the resets
+// they send -- which is what makes this a leak rather than something on the
+// path talking.
 func TestCustomersThatExchangeConnectionsAreNotIsolated(t *testing.T) {
+	top, sites := vpnLab(100, map[string]int{"bankA": 2, "bankB": 2})
+	var mu sync.Mutex
+	resets := map[string]int{}
+	env := &Env{Topology: top, AS: 100,
+		Exec: func(_ context.Context, deviceID string, cmd []string) (rt.ExecResult, error) {
+			if len(cmd) > 0 && cmd[0] == "ping" {
+				addr := cmd[len(cmd)-1]
+				if sameCustomer(sites, deviceID, addr) {
+					return rt.ExecResult{ExitCode: 0, Stdout: "3 packets transmitted, 3 received"}, nil
+				}
+				return rt.ExecResult{ExitCode: 1, Stdout: "3 packets transmitted, 0 received"}, nil
+			}
+			if len(cmd) > 2 && cmd[0] == "nc" {
+				// The attempt arrives, and the host it arrives at resets it.
+				mu.Lock()
+				resets[hostOf(sites, cmd[len(cmd)-2])]++
+				mu.Unlock()
+				return rt.ExecResult{ExitCode: 1, Stderr: "Connection refused"}, nil
+			}
+			if len(cmd) == 2 && cmd[0] == "cat" && cmd[1] == "/proc/net/snmp" {
+				mu.Lock()
+				defer mu.Unlock()
+				return rt.ExecResult{ExitCode: 0, Stdout: snmpWith(resets[deviceID])}, nil
+			}
+			return rt.ExecResult{ExitCode: 0, Stdout: "{}"}, nil
+		}}
+
+	got := checkVPNIsolation(context.Background(), env)
+	if got.Passed() {
+		t.Fatalf("two customers whose hosts answer one another's connections were certified "+
+			"isolated, because only their pings were tried.\nevidence: %s", describe(got))
+	}
+}
+
+// A provider that says no is still saying no.
+//
+// Rejecting cross-customer traffic with a reset rather than dropping it in
+// silence is isolation, implemented more helpfully: nothing crosses, and the
+// sender is told so immediately instead of waiting for a timeout. The reset
+// carries the destination's address because whoever wrote it put that address
+// there, and reading it as the destination speaking marked a correctly
+// separated VPN as leaking -- four of six on the live cluster.
+//
+// The destinations here record nothing, because nothing reached them.
+func TestAProviderThatRejectsCrossCustomerTrafficIsStillIsolating(t *testing.T) {
 	top, sites := vpnLab(100, map[string]int{"bankA": 2, "bankB": 2})
 	env := &Env{Topology: top, AS: 100,
 		Exec: func(_ context.Context, deviceID string, cmd []string) (rt.ExecResult, error) {
@@ -407,15 +476,22 @@ func TestCustomersThatExchangeConnectionsAreNotIsolated(t *testing.T) {
 				return rt.ExecResult{ExitCode: 1, Stdout: "3 packets transmitted, 0 received"}, nil
 			}
 			if len(cmd) > 2 && cmd[0] == "nc" {
+				if sameCustomer(sites, deviceID, cmd[len(cmd)-2]) {
+					return rt.ExecResult{ExitCode: 0}, nil
+				}
+				// The edge forges the refusal; nothing arrives anywhere.
 				return rt.ExecResult{ExitCode: 1, Stderr: "Connection refused"}, nil
+			}
+			if len(cmd) == 2 && cmd[0] == "cat" && cmd[1] == "/proc/net/snmp" {
+				return rt.ExecResult{ExitCode: 0, Stdout: snmpWith(0)}, nil
 			}
 			return rt.ExecResult{ExitCode: 0, Stdout: "{}"}, nil
 		}}
 
 	got := checkVPNIsolation(context.Background(), env)
-	if got.Passed() {
-		t.Fatalf("two customers whose hosts answer one another's connections were certified "+
-			"isolated, because only their pings were tried.\nevidence: %s", describe(got))
+	if !got.Passed() {
+		t.Fatalf("a VPN whose edges reject cross-customer traffic with a reset was marked as "+
+			"leaking, though no packet ever crossed.\nevidence: %s", describe(got))
 	}
 }
 

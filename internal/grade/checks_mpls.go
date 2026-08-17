@@ -603,13 +603,13 @@ func vpnTransportGaps(ctx context.Context, env *Env, pairs []directedPair) ([]st
 // vpnTCPGap attempts one connection across a site pair and reports what did not
 // happen.
 func vpnTCPGap(ctx context.Context, env *Env, d directedPair) string {
-	before, okB := tcpResetsSent(ctx, env, d.to.host)
+	before, okB := tcpAnswers(ctx, env, d.to.host)
 	res, err := env.Probe(ctx, d.from.host,
 		[]string{"nc", "-v", "-w", "3", "-z", d.to.addr, probePort()})
 	if err != nil {
 		return "" // the machinery failed, which is not a verdict
 	}
-	after, okA := tcpResetsSent(ctx, env, d.to.host)
+	after, okA := tcpAnswers(ctx, env, d.to.host)
 	said := strings.ToLower(res.Stderr + res.Stdout)
 	answered := res.ExitCode == 0 ||
 		strings.Contains(said, "refused") || strings.Contains(said, "reset")
@@ -799,8 +799,12 @@ func checkVPNIsolation(ctx context.Context, env *Env) Result {
 // purposes of the customers. Both other transports are tried, and the evidence
 // for each is chosen so that a leak has to be real:
 //
-//   - a connection counts only when the far side answers it, which is a round
-//     trip and cannot happen unless the two sites can reach each other;
+//   - a connection counts only when the destination itself answered it, which
+//     its kernel records and nothing on the path can forge. A reset carries the
+//     destination's address because whoever wrote it put that address on it,
+//     and a provider that rejects cross-customer traffic rather than dropping
+//     it silently -- which is isolation, done more helpfully -- was read as the
+//     two customers talking to each other;
 //   - a datagram counts only when the far side's kernel takes delivery of
 //     several, so that a single unrelated packet arriving in the window is not
 //     read as a breach and does not cost a correct submission its marks.
@@ -808,34 +812,34 @@ func vpnCrossTalk(ctx context.Context, env *Env, pairs []directedPair) []string 
 	var (
 		mu  sync.Mutex
 		out []string
-		wg  sync.WaitGroup
 	)
-	sem := make(chan struct{}, 8)
-	for _, d := range pairs {
-		wg.Add(1)
-		go func(d directedPair) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			res, err := env.Probe(ctx, d.from.host,
-				[]string{"nc", "-v", "-w", "3", "-z", d.to.addr, probePort()})
-			if err != nil {
-				return
-			}
-			said := strings.ToLower(res.Stderr + res.Stdout)
-			if res.ExitCode != 0 &&
-				!strings.Contains(said, "refused") && !strings.Contains(said, "reset") {
-				return
-			}
-			mu.Lock()
-			out = append(out, fmt.Sprintf(
-				"a connection from %s to %s (%s) was answered: the two customers are not "+
-					"separated, whatever happens to their pings",
-				d.from.host, d.to.host, d.to.addr))
-			mu.Unlock()
-		}(d)
+	// Serialised by destination: a counter that moved is only attributable to
+	// this attempt if no other attempt is aimed at the same host at the time.
+	for _, round := range roundsByDestinationOf(pairs, func(d directedPair) string {
+		return d.to.host
+	}) {
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, 8)
+		for _, d := range round {
+			wg.Add(1)
+			go func(d directedPair) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+				w, ok := tryConnection(ctx, env, d.from.host, d.to.host, d.to.addr, probePort())
+				if !ok || !w.proves() {
+					return
+				}
+				mu.Lock()
+				out = append(out, fmt.Sprintf(
+					"a connection from %s to %s (%s) was answered by %s itself: the two "+
+						"customers are not separated, whatever happens to their pings",
+					d.from.host, d.to.host, d.to.addr, d.to.host))
+				mu.Unlock()
+			}(d)
+		}
+		wg.Wait()
 	}
-	wg.Wait()
 	out = append(out, vpnDatagramLeaks(ctx, env, pairs)...)
 	sort.Strings(out)
 	return out
@@ -852,7 +856,9 @@ func vpnDatagramLeaks(ctx context.Context, env *Env, pairs []directedPair) []str
 	const burst = 3 // several, so one stray packet in the window is not a verdict
 
 	var out []string
-	for _, round := range roundsByDestination(pairs) {
+	for _, round := range roundsByDestinationOf(pairs, func(d directedPair) string {
+		return d.to.host
+	}) {
 		before := map[string]int{}
 		for _, d := range round {
 			if n, ok := datagramsDelivered(ctx, env, d.to); ok {
@@ -886,28 +892,6 @@ func vpnDatagramLeaks(ctx context.Context, env *Env, pairs []directedPair) []str
 		}
 	}
 	return out
-}
-
-// roundsByDestination splits pairs into rounds within which every destination
-// appears at most once.
-func roundsByDestination(pairs []directedPair) [][]directedPair {
-	var rounds [][]directedPair
-	left := append([]directedPair(nil), pairs...)
-	for len(left) > 0 {
-		seen := map[string]bool{}
-		var round, rest []directedPair
-		for _, d := range left {
-			if seen[d.to.host] {
-				rest = append(rest, d)
-				continue
-			}
-			seen[d.to.host] = true
-			round = append(round, d)
-		}
-		rounds = append(rounds, round)
-		left = rest
-	}
-	return rounds
 }
 
 // datagramsDelivered reads a site's count of datagrams the kernel took delivery
