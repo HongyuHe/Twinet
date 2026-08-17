@@ -642,6 +642,31 @@ func overriddenByStatic(ctx context.Context, env *Env, routers []*model.Device) 
 			if len(external) == 0 {
 				return
 			}
+			// A rule the routing daemon cannot see.
+			//
+			// `ip rule add to X lookup 100` with a route in table 100 sends
+			// that destination wherever it says, and zebra's main table --
+			// which is all a routing daemon reports -- still shows the route
+			// BGP chose. The kernel consults the rules first. A router has
+			// three of them when nobody has interfered; anything else is a
+			// decision being made somewhere the routing protocol has no say.
+			if res, err := env.Probe(ctx, r.ID, []string{"ip", "rule", "show"}); err == nil &&
+				res.ExitCode == 0 {
+				for _, line := range strings.Split(res.Stdout, "\n") {
+					t := strings.TrimSpace(line)
+					if t == "" || strings.HasSuffix(t, "lookup local") ||
+						strings.HasSuffix(t, "lookup main") ||
+						strings.HasSuffix(t, "lookup default") {
+						continue
+					}
+					mu.Lock()
+					out = append(out, fmt.Sprintf(
+						"%s has a policy rule the routing protocols know nothing about: %s",
+						r.Name, t))
+					mu.Unlock()
+				}
+			}
+
 			var routes ospfRouteJSON
 			if err := env.VtyshJSON(ctx, r.Name, "show ip route json", &routes); err != nil {
 				return
