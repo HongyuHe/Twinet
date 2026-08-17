@@ -1425,10 +1425,23 @@ func crossVLANForwarding(ctx context.Context, env *Env, domain string) []string 
 			for _, n := range byNum {
 				g.link(n, anywhere)
 			}
+			// Read once for the flows and once more for whether any of them
+			// ends at NORMAL, because a flow that rewrites a frame and then
+			// resubmits it is delivered by whichever later flow does.
+			var lines []string
+			bridgeHasNormal := false
 			for _, line := range strings.Split(flows.Stdout, "\n") {
 				if !strings.Contains(line, "actions=") {
 					continue
 				}
+				lines = append(lines, line)
+				for _, a := range ovsSplitActions(line[strings.Index(line, "actions=")+8:]) {
+					if strings.EqualFold(strings.TrimSpace(a), "normal") {
+						bridgeHasNormal = true
+					}
+				}
+			}
+			for _, line := range lines {
 				in, outs := ovsFlowPorts(line, byNum, groups)
 				for _, o := range outs {
 					iv, ok1 := vlanOfPort[in]
@@ -1447,6 +1460,29 @@ func crossVLANForwarding(ctx context.Context, env *Env, domain string) []string 
 						g.link(anywhere, o)
 					} else {
 						g.link(in, o)
+					}
+				}
+
+				// What the actions do to the frame before the switch decides
+				// where it goes. A flow that names no output port at all can
+				// still carry a frame into another VLAN, by retagging it or
+				// by changing which port it counts as having arrived on and
+				// then letting the switch forward it by VLAN.
+				at := strings.Index(line, "actions=")
+				rw := ovsWalkActions(line[at+8:], byNum)
+				msg, to, known := normalCrossing(d.Name, line[:at], in, rw, vlanOfPort, bridgeHasNormal)
+				if msg != "" {
+					out = append(out, msg)
+				}
+				if msg != "" && known {
+					from := anywhere
+					if in != "" {
+						from = in
+					}
+					for _, n := range byNum {
+						if v, ok := vlanOfPort[n]; ok && v == to {
+							g.link(from, n)
+						}
 					}
 				}
 			}
@@ -1738,23 +1774,32 @@ func ovsPortMap(show, tags string) (map[string]string, map[string]int) {
 // ovsFlowPorts pulls the ingress port and every port a flow can send a frame
 // out of, from one line of `ovs-ofctl dump-flows`, resolving numbers to names.
 func ovsFlowPorts(line string, byNum map[string]string, groups map[string]string) (string, []string) {
+	// The match ends where the actions begin, and they are separated by a
+	// space, not a comma. Reading in_port out of the whole line made the port
+	// of `in_port=1 actions=output:2` come out as `1 actions=output:2`, which
+	// resolved to no port at all -- so the flow was read as one that had never
+	// said where its frames came from, and the rule that catches a frame
+	// leaving its VLAN never fired on it.
+	match, actions := line, ""
+	if i := strings.Index(line, "actions="); i >= 0 {
+		match, actions = line[:i], line[i+len("actions="):]
+	}
 	in := ""
-	for _, f := range strings.Split(line, ",") {
+	for _, f := range strings.Split(match, ",") {
 		t := strings.TrimSpace(f)
 		if v, ok := strings.CutPrefix(t, "in_port="); ok {
 			in = ovsPortName(v, byNum)
 		}
-	}
-	actions := line
-	if i := strings.Index(line, "actions="); i >= 0 {
-		actions = line[i+len("actions="):]
 	}
 	return in, ovsActionPorts(actions, byNum, groups, map[string]bool{})
 }
 
 // ovsPortName resolves a port number to the port's name where it can.
 func ovsPortName(tok string, byNum map[string]string) string {
-	tok = strings.Trim(tok, " \t,)")
+	// `ovs-ofctl --names` prints ports by name and in quotes, and a quoted
+	// name matches nothing: not the number table, and not the VLAN table
+	// either, so the port was treated as one this had never heard of.
+	tok = strings.Trim(tok, " \t,)\"")
 	if n, ok := byNum[tok]; ok {
 		return n
 	}
@@ -1843,9 +1888,13 @@ func ovsActionPorts(actions string, byNum map[string]string,
 			}
 		}
 	}
-	// Actions that reach every port at once.
-	for _, all := range []string{"flood", "all"} {
-		if strings.Contains(strings.ToLower(actions), all) {
+	// Actions that reach every port at once. Matched as whole actions: the
+	// letters "all" inside a longer word are not the flood action, and
+	// expanding on those would take marks off a switch that forwards nothing
+	// of the sort.
+	for _, a := range ovsSplitActions(actions) {
+		l := strings.ToLower(strings.TrimSpace(a))
+		if l == "flood" || l == "all" {
 			for _, n := range byNum {
 				outs = append(outs, n)
 			}
@@ -1853,6 +1902,215 @@ func ovsActionPorts(actions string, byNum map[string]string,
 		}
 	}
 	return outs
+}
+
+// ovsRewrite is what an action list does to a frame before the switch decides
+// where it goes: which VLAN it is now in, which port it now counts as having
+// arrived on, and whether it is then handed to NORMAL.
+//
+// This is the difference between reading an action list and running it.
+// `actions=NORMAL` puts a frame out of the ports of its own VLAN and leaks
+// nothing, which is why it was read as harmless. But an action list is a
+// program: `load:4->NXM_OF_IN_PORT[],mod_vlan_vid:20,NORMAL` hands NORMAL a
+// frame that is now tagged 20 and now claims to have come in on port 4, and
+// NORMAL faithfully delivers it into VLAN 20. Nothing in that flow names an
+// output port, so a reader looking for output ports finds none.
+type ovsRewrite struct {
+	vlan      int  // the VLAN the frame carries after the rewrites
+	vlanKnown bool // whether that VLAN could be worked out
+	vlanSet   bool // whether the actions touched the tag at all
+	inPort    string
+	inKnown   bool
+	inSet     bool
+	normal    bool // handed to NORMAL, which forwards by VLAN
+	resubmit  bool // handed back to the tables, which may end at NORMAL
+}
+
+// ovsVLANValue reads the VLAN out of an action's argument. The forms differ:
+// `mod_vlan_vid:20` carries the id on its own, while `set_field:4116->vlan_vid`
+// and the VLAN_TCI register carry the present bit above it.
+func ovsVLANValue(tok string, masked bool) (int, bool) {
+	tok = strings.TrimSpace(tok)
+	if i := strings.IndexByte(tok, '/'); i >= 0 { // value/mask
+		tok = tok[:i]
+	}
+	n, err := strconv.ParseUint(tok, 0, 32)
+	if err != nil {
+		return 0, false
+	}
+	if masked {
+		return int(n & 0xfff), true
+	}
+	return int(n), true
+}
+
+// ovsWalkActions runs an action list far enough to know what the frame looks
+// like by the time the switch decides where to send it.
+func ovsWalkActions(actions string, byNum map[string]string) ovsRewrite {
+	var r ovsRewrite
+	for _, raw := range ovsSplitActions(actions) {
+		a := strings.TrimSpace(raw)
+		l := strings.ToLower(a)
+		switch {
+		case l == "normal":
+			r.normal = true
+		case strings.HasPrefix(l, "resubmit"):
+			r.resubmit = true
+			// resubmit(<port>,<table>) re-runs the tables with the frame
+			// counting as having arrived on that port.
+			if i := strings.IndexByte(a, '('); i >= 0 {
+				arg := a[i+1:]
+				arg = strings.TrimSuffix(strings.TrimSpace(arg), ")")
+				port := arg
+				if j := strings.IndexByte(port, ','); j >= 0 {
+					port = port[:j]
+				}
+				if port = strings.TrimSpace(port); port != "" {
+					r.inSet = true
+					r.inPort = ovsPortName(port, byNum)
+					_, r.inKnown = byNum[strings.TrimSpace(port)]
+				}
+			}
+		case strings.HasPrefix(l, "mod_vlan_vid:"):
+			r.vlanSet = true
+			r.vlan, r.vlanKnown = ovsVLANValue(a[len("mod_vlan_vid:"):], false)
+		case strings.HasPrefix(l, "strip_vlan"), strings.HasPrefix(l, "pop_vlan"):
+			// The frame leaves untagged, so NORMAL gives it the VLAN of
+			// whichever port it counts as having arrived on.
+			r.vlanSet, r.vlanKnown, r.vlan = true, true, 0
+		case strings.HasPrefix(l, "push_vlan"):
+			r.vlanSet, r.vlanKnown = true, false
+		case strings.HasPrefix(l, "set_field:"), strings.HasPrefix(l, "load:"):
+			arrow := strings.Index(a, "->")
+			if arrow < 0 {
+				continue
+			}
+			val := a[strings.IndexByte(a, ':')+1 : arrow]
+			dst := strings.ToLower(a[arrow+2:])
+			switch {
+			case strings.Contains(dst, "vlan_vid"), strings.Contains(dst, "vlan_tci"):
+				r.vlanSet = true
+				r.vlan, r.vlanKnown = ovsVLANValue(val, true)
+			case strings.Contains(dst, "dl_vlan"):
+				r.vlanSet = true
+				r.vlan, r.vlanKnown = ovsVLANValue(val, false)
+			case strings.Contains(dst, "in_port"):
+				r.inSet = true
+				if n, ok := ovsVLANValue(val, false); ok {
+					num := strconv.Itoa(n)
+					r.inPort = ovsPortName(num, byNum)
+					_, r.inKnown = byNum[num]
+				}
+			}
+		case strings.HasPrefix(l, "move:"):
+			if strings.Contains(l, "in_port") {
+				r.inSet = true // copied from somewhere; the value is not readable here
+			}
+			if strings.Contains(l, "vlan_vid") || strings.Contains(l, "vlan_tci") {
+				r.vlanSet = true
+			}
+		}
+	}
+	return r
+}
+
+// ovsMatchVLAN is the VLAN a frame is in when it reaches a flow: the tag the
+// flow matches on if it names one, otherwise the VLAN of the port it came in
+// on, because an access port's frames are in its VLAN by definition.
+func ovsMatchVLAN(line, in string, vlanOf map[string]int) (int, bool) {
+	for _, f := range ovsSplitActions(line) {
+		t := strings.TrimSpace(f)
+		if v, ok := strings.CutPrefix(t, "dl_vlan="); ok {
+			if n, ok := ovsVLANValue(v, false); ok {
+				return n, true
+			}
+		}
+		if v, ok := strings.CutPrefix(t, "vlan_tci="); ok {
+			if n, ok := ovsVLANValue(v, true); ok {
+				return n, true
+			}
+		}
+	}
+	if in != "" {
+		if v, ok := vlanOf[in]; ok {
+			return v, true
+		}
+	}
+	return 0, false
+}
+
+// normalCrossing reports a flow that rewrites a frame and then lets the switch
+// forward it by VLAN, when the VLAN it is forwarded in is not the one it
+// arrived in. It returns the delivered VLAN so the caller can record where
+// such a frame can get to.
+//
+// It says nothing about a flow that rewrites nothing: `priority=0
+// actions=NORMAL` is the whole of a correct switch's table, and NORMAL on an
+// untouched frame keeps it in its own VLAN.
+func normalCrossing(dev, line, in string, r ovsRewrite,
+	vlanOf map[string]int, bridgeHasNormal bool) (string, int, bool) {
+	if !r.vlanSet && !r.inSet {
+		return "", 0, false
+	}
+	if !r.normal && (!r.resubmit || !bridgeHasNormal) {
+		return "", 0, false
+	}
+	from, fromKnown := ovsMatchVLAN(line, in, vlanOf)
+
+	// Where the frame ends up: its own tag if it still has one, otherwise the
+	// VLAN of the port it now counts as having arrived on.
+	to, toKnown := 0, false
+	switch {
+	case r.vlanSet && r.vlanKnown && r.vlan != 0:
+		to, toKnown = r.vlan, true
+	case r.inSet && r.inKnown:
+		to, toKnown = vlanOf[r.inPort]
+	case !r.inSet && in != "":
+		to, toKnown = vlanOf[in]
+	}
+
+	where := "frames"
+	if in != "" {
+		where = "frames from " + in
+	}
+	switch {
+	case fromKnown && toKnown && from == to:
+		return "", 0, false
+	case fromKnown && toKnown:
+		return fmt.Sprintf(
+			"%s is told to put %s (VLAN %d) into VLAN %d and then forward them by VLAN, "+
+				"which delivers them there", dev, where, from, to), to, true
+	default:
+		// One end could not be worked out, and a rewrite was made. Which VLAN
+		// the frame is delivered in is then not something this can vouch for.
+		return fmt.Sprintf(
+			"%s is told to rewrite %s before forwarding them by VLAN, so the VLAN they are "+
+				"delivered in is not the one they arrived in", dev, where), to, toKnown
+	}
+}
+
+// ovsSplitActions splits an action list into its actions, keeping whatever is
+// inside parentheses or brackets together: `resubmit(,10)` and
+// `load:4->NXM_OF_IN_PORT[]` are each one action, commas and all.
+func ovsSplitActions(s string) []string {
+	var out []string
+	depth, start := 0, 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '(', '[':
+			depth++
+		case ')', ']':
+			if depth > 0 {
+				depth--
+			}
+		case ',':
+			if depth == 0 {
+				out = append(out, s[start:i])
+				start = i + 1
+			}
+		}
+	}
+	return append(out, s[start:])
 }
 
 // ovsGroupBuckets reads `ovs-ofctl dump-groups` into the buckets of every
