@@ -654,9 +654,12 @@ func overriddenByStatic(ctx context.Context, env *Env, routers []*model.Device) 
 				res.ExitCode == 0 {
 				for _, line := range strings.Split(res.Stdout, "\n") {
 					t := strings.TrimSpace(line)
+					// The kernel's own: the three it starts with, and the
+					// one it adds for itself the first time any VRF exists.
 					if t == "" || strings.HasSuffix(t, "lookup local") ||
 						strings.HasSuffix(t, "lookup main") ||
-						strings.HasSuffix(t, "lookup default") {
+						strings.HasSuffix(t, "lookup default") ||
+						strings.Contains(t, "l3mdev-table") {
 						continue
 					}
 					mu.Lock()
