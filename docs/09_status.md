@@ -651,6 +651,13 @@ reached students, and each motivated a permanent test.
     spare address in the right subnet is exactly what an impersonation needs.
     Only the exact address counts on a prescribed interface now; where the
     choice is the student's, anything inside the mandated prefix still does.
+72. **An adjacency held up by a timer that had not expired.** An OSPF neighbour
+    stays Full for forty seconds after the hellos stop, so discarding OSPF
+    between two routers and grading straight away found every adjacency Full and
+    carrying nothing. Every hello resets that timer, so a second reading a hello
+    interval later says whether one arrived: a healthy adjacency cannot lose
+    more than one hello interval of dead time between two readings, and a silent
+    one loses the whole wait.
 
 ## Environment findings
 

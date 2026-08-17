@@ -179,6 +179,7 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 	var ecmpTCP struct{ router, from string }
 	var udpBlock struct{ router, src, dst string }
 	var impostorLink struct{ router, iface, moved string }
+	var helloDrop struct{ router, iface string }
 	var ixpRewrite struct{ router, routeMap, match, peer string }
 	var rpkiNarrow struct{ router, routeMap, seq string }
 	var notFoundBlock struct{ host, prefix string }
@@ -1341,6 +1342,34 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 					"end")
 				vtysh(t, dir, router, "clear ip bgp "+ixpRewrite.peer+" in")
 				time.Sleep(20 * time.Second)
+			},
+		},
+		{
+			// An adjacency held up by a timer that has not expired.
+			//
+			// A neighbour stays Full for forty seconds after the hellos stop,
+			// so discarding OSPF on a link and grading straight away found
+			// every adjacency Full and carrying nothing.
+			name:     "an interior link with its hellos discarded",
+			question: "q1.2",
+			undo: func(t *testing.T) {
+				if helloDrop.router == "" {
+					return
+				}
+				_, _ = twinet(t, "exec", "-m", dir, helloDrop.router, "--", "sh", "-c",
+					"iptables -D INPUT -i "+helloDrop.iface+" -p 89 -j DROP; "+
+						"iptables -D OUTPUT -o "+helloDrop.iface+" -p 89 -j DROP")
+			},
+			apply: func(t *testing.T) {
+				a, _, aIf, _ := interiorLinkEnds(t, dir, as)
+				helloDrop = struct{ router, iface string }{a, aIf}
+				t.Logf("discarding OSPF on %s of %s", aIf, a)
+				out, err := twinet(t, "exec", "-m", dir, a, "--", "sh", "-c",
+					"iptables -I INPUT 1 -i "+aIf+" -p 89 -j DROP && "+
+						"iptables -I OUTPUT 1 -o "+aIf+" -p 89 -j DROP")
+				if err != nil {
+					t.Fatalf("discarding OSPF: %v\n%s", err, out)
+				}
 			},
 		},
 		{
