@@ -1402,8 +1402,14 @@ func ovsPortMap(show, csv string) (map[string]string, map[string]int) {
 	return byNum, vlan
 }
 
-// ovsFlowPorts pulls the ingress port and every explicit output port out of one
-// line of `ovs-ofctl dump-flows`, resolving numbers to names.
+// ovsFlowPorts pulls the ingress port and every port a flow can send a frame
+// out of, from one line of `ovs-ofctl dump-flows`, resolving numbers to names.
+//
+// "output:" is not the only way to emit a frame, and reading only that was
+// enough to miss `enqueue:8:0`, which puts the frame on a queue of port 8 and
+// sends it exactly as `output` would. Every action that names a port counts,
+// and the ones that name none but reach every port -- flood, all -- count as
+// reaching all of them.
 func ovsFlowPorts(line string, byNum map[string]string) (string, []string) {
 	name := func(tok string) string {
 		tok = strings.Trim(tok, " \t,)")
@@ -1419,21 +1425,60 @@ func ovsFlowPorts(line string, byNum map[string]string) (string, []string) {
 			in = name(v)
 		}
 	}
+	actions := line
+	if i := strings.Index(line, "actions="); i >= 0 {
+		actions = line[i+len("actions="):]
+	}
 	var outs []string
-	rest := line
-	for {
-		i := strings.Index(rest, "output:")
-		if i < 0 {
+	// Anything of the form "<verb>:<port>[:...]", plus the port-in-parens form.
+	for _, verb := range []string{"output:", "enqueue:", "resubmit:"} {
+		rest := actions
+		for {
+			i := strings.Index(rest, verb)
+			if i < 0 {
+				break
+			}
+			rest = rest[i+len(verb):]
+			end := strings.IndexAny(rest, ", \t")
+			tok := rest
+			if end >= 0 {
+				tok = rest[:end]
+			}
+			// enqueue names the port first and the queue after a colon;
+			// resubmit names a port before a comma inside parentheses.
+			tok = strings.TrimLeft(tok, "(")
+			if j := strings.IndexByte(tok, ':'); j >= 0 {
+				tok = tok[:j]
+			}
+			if tok != "" {
+				outs = append(outs, name(tok))
+			}
+		}
+	}
+	for _, form := range []string{"output(port="} {
+		rest := actions
+		for {
+			i := strings.Index(rest, form)
+			if i < 0 {
+				break
+			}
+			rest = rest[i+len(form):]
+			end := strings.IndexAny(rest, ",) \t")
+			if end < 0 {
+				end = len(rest)
+			}
+			if tok := rest[:end]; tok != "" {
+				outs = append(outs, name(tok))
+			}
+		}
+	}
+	// Actions that reach every port at once.
+	for _, all := range []string{"flood", "all"} {
+		if strings.Contains(strings.ToLower(actions), all) {
+			for _, n := range byNum {
+				outs = append(outs, n)
+			}
 			break
-		}
-		rest = rest[i+len("output:"):]
-		end := strings.IndexAny(rest, ", \t")
-		tok := rest
-		if end >= 0 {
-			tok = rest[:end]
-		}
-		if tok != "" {
-			outs = append(outs, name(tok))
 		}
 	}
 	return in, outs
