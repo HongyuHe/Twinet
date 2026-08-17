@@ -45,7 +45,7 @@ import (
 var Tools = []string{
 	"ping", "ping6", "nc", "ncat", "traceroute", "traceroute6",
 	"ip", "cat", "sh", "vtysh", "ovs-ofctl", "ovs-vsctl", "twinet-mcast",
-	"iptables", "ss", "awk", "grep",
+	"iptables", "ss", "awk", "grep", "ps",
 }
 
 // searchPath is the order a program name is resolved in.

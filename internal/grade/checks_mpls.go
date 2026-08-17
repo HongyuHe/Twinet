@@ -4,7 +4,10 @@ import (
 	"context"
 	"fmt"
 	"net/netip"
+	"path"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -101,6 +104,19 @@ func checkBGPFreeCore(ctx context.Context, env *Env) Result {
 				break
 			}
 		}
+		// And what `vtysh` is not connected to.
+		//
+		// `vtysh` speaks to one set of sockets, and a second BGP daemon does
+		// not have to use them: FRR will run as many instances as you like,
+		// each in its own pathspace with its own socket, and a daemon that is
+		// not FRR at all shares none of its furniture. Either holds sessions,
+		// a table and an identifier while `show bgp summary` answers for an
+		// instance that does not exist.
+		hidden, err := hiddenBGP(ctx, env, d.Name)
+		if err != nil {
+			return Errored("mpls.bgp_free_core", err)
+		}
+		bad = append(bad, hidden...)
 	}
 	// And no edge may name a core router as a neighbour: a session configured
 	// towards a router with no BGP sits idle and is easy to miss.
@@ -138,8 +154,216 @@ func checkBGPFreeCore(ctx context.Context, env *Env) Result {
 	})
 }
 
-// checkLDPAdjacencies confirms label distribution reached the forwarding table.
+// hiddenBGP reports the BGP a router is running somewhere `vtysh` is not
+// looking.
 //
+// `vtysh` connects to one set of sockets under /var/run/frr, and asking it
+// whether a router runs BGP asks only about the daemons that own those
+// sockets. FRR will run as many instances as it is told to, each in a
+// pathspace of its own with its own sockets, and `vtysh -c 'show bgp summary'`
+// answers "BGP instance not found" for a router holding an established session,
+// a table and an identifier in one of them. A daemon that is not FRR at all
+// shares none of FRR's furniture and is just as invisible.
+//
+// So the router is asked what it is running rather than what it will admit to:
+// its processes, its sockets, and every FRR pathspace either of those reveals.
+// None of this fires on a core router as the exercise wants it -- FRR starts
+// bgpd there and leaves it unconfigured, which holds nothing, listens on
+// nothing and is the state being asked for.
+func hiddenBGP(ctx context.Context, env *Env, device string) ([]string, error) {
+	id := model.DeviceID(env.AS, device)
+
+	ps, err := env.Probe(ctx, id, []string{"ps", "-eo", "args"})
+	if err != nil {
+		return nil, err
+	}
+	if ps.ExitCode != 0 {
+		return nil, fmt.Errorf("could not list what %s is running, so whether it runs a "+
+			"second BGP daemon cannot be told: %s", device, firstLine(ps.Stderr))
+	}
+	spaces, out := bgpDaemons(device, ps.Stdout)
+
+	// The sockets of a pathspace, for a daemon whose own name says nothing --
+	// a copy of bgpd under another name is still an FRR daemon and still puts
+	// its socket where FRR does.
+	socks, err := env.Probe(ctx, id, []string{"sh", "-c",
+		`for f in /var/run/frr/*/*.vty; do [ -e "$f" ] && echo "$f"; done`})
+	if err != nil {
+		return nil, err
+	}
+	for _, line := range strings.Split(socks.Stdout, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		ns := path.Base(path.Dir(line))
+		if !slices.Contains(spaces, ns) {
+			spaces = append(spaces, ns)
+			out = append(out, fmt.Sprintf("%s runs a second FRR instance in pathspace %q",
+				device, ns))
+		}
+	}
+
+	// What each of them holds, so the report says something a marker can act
+	// on rather than only that something is there.
+	sort.Strings(spaces)
+	for _, ns := range spaces {
+		res, err := env.Probe(ctx, id, []string{"vtysh", "-N", ns, "-c", "show bgp summary"})
+		if err != nil {
+			return nil, err
+		}
+		if res.ExitCode != 0 || strings.Contains(res.Stdout, "instance not found") {
+			continue
+		}
+		if n := bgpPeerCount(res.Stdout); n > 0 {
+			out = append(out, fmt.Sprintf("%s holds %d BGP neighbour(s) in pathspace %q, "+
+				"where the default vtysh cannot see them", device, n, ns))
+		}
+	}
+
+	// And the wire, because a BGP daemon that has been configured opens the
+	// BGP port whatever it calls itself. A core router as the exercise wants
+	// it has no socket on 179 in any state.
+	ss, err := env.Probe(ctx, id, []string{"ss", "-Htan"})
+	if err != nil {
+		return nil, err
+	}
+	if ss.ExitCode != 0 {
+		return nil, fmt.Errorf("could not read the sockets of %s, so whether it speaks BGP "+
+			"cannot be told: %s", device, firstLine(ss.Stderr))
+	}
+	out = append(out, bgpSockets(device, ss.Stdout)...)
+	return out, nil
+}
+
+// bgpSpeakers names the programs that speak BGP, by the name they run under.
+//
+// FRR's own bgpd is the one the exercise expects to be present and idle, so it
+// is judged by how it was started rather than by being there at all; the rest
+// have no reason to be on a core router in any state.
+var bgpSpeakers = map[string]string{
+	"bird": "BIRD", "bird6": "BIRD", "gobgpd": "GoBGP", "exabgp": "ExaBGP",
+	"openbgpd": "OpenBGPD", "bgpd-openbsd": "OpenBGPD",
+}
+
+// bgpDaemons reads a process listing for BGP daemons the grader is not talking
+// to, and returns the FRR pathspaces among them.
+func bgpDaemons(device, ps string) (spaces, findings []string) {
+	defaults := 0
+	for _, line := range strings.Split(ps, "\n") {
+		args := strings.Fields(line)
+		if len(args) == 0 {
+			continue
+		}
+		prog := path.Base(args[0])
+		if name, ok := bgpSpeakers[prog]; ok {
+			findings = append(findings, fmt.Sprintf("%s runs %s, a BGP daemon of its own",
+				device, name))
+			continue
+		}
+		if prog != "bgpd" {
+			continue
+		}
+		ns := pathspaceOf(args)
+		switch {
+		case ns != "":
+			spaces = append(spaces, ns)
+			findings = append(findings, fmt.Sprintf(
+				"%s runs a second BGP daemon in pathspace %q, which vtysh does not answer for",
+				device, ns))
+		default:
+			// The one FRR starts. A second copy of it, started by hand with
+			// its own socket, is not that one.
+			defaults++
+			if defaults > 1 {
+				findings = append(findings, fmt.Sprintf(
+					"%s runs %d BGP daemons; vtysh answers for one of them", device, defaults))
+			}
+		}
+	}
+	return spaces, findings
+}
+
+// pathspaceOf reads the FRR pathspace a daemon was started in, by whichever of
+// the three spellings started it. A daemon given its own socket directory
+// rather than a pathspace is reported under that directory's name, because it
+// is the same act.
+func pathspaceOf(args []string) string {
+	for i, a := range args {
+		switch {
+		case a == "-N" || a == "--pathspace":
+			if i+1 < len(args) {
+				return args[i+1]
+			}
+		case strings.HasPrefix(a, "--pathspace="):
+			return strings.TrimPrefix(a, "--pathspace=")
+		case a == "--vty_socket":
+			if i+1 < len(args) {
+				return path.Base(strings.TrimSuffix(args[i+1], "/"))
+			}
+		case strings.HasPrefix(a, "--vty_socket="):
+			return path.Base(strings.TrimSuffix(strings.TrimPrefix(a, "--vty_socket="), "/"))
+		}
+	}
+	return ""
+}
+
+// bgpPeerCount reads how many neighbours a summary lists, so the evidence can
+// say what was hidden rather than only that something was.
+func bgpPeerCount(summary string) int {
+	for _, line := range strings.Split(summary, "\n") {
+		f := strings.Fields(strings.TrimSpace(line))
+		if len(f) >= 4 && f[0] == "Total" && f[1] == "number" && f[2] == "of" {
+			n, err := strconv.Atoi(f[len(f)-1])
+			if err == nil {
+				return n
+			}
+		}
+	}
+	return 0
+}
+
+// bgpSockets reports every socket on the BGP port, whoever opened it.
+//
+// This is what catches a BGP speaker that has been renamed: the name it runs
+// under is its to choose, and the port its peers connect to is not.
+func bgpSockets(device, ss string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, line := range strings.Split(ss, "\n") {
+		f := strings.Fields(line)
+		if len(f) < 5 {
+			continue
+		}
+		state, local, peer := f[0], f[3], f[4]
+		var what string
+		switch {
+		case portOf(local) == "179" && state == "LISTEN":
+			what = fmt.Sprintf("%s is listening for BGP connections on %s", device, local)
+		case portOf(local) == "179" || portOf(peer) == "179":
+			what = fmt.Sprintf("%s holds a BGP connection, %s to %s", device, local, peer)
+		default:
+			continue
+		}
+		if !seen[what] {
+			seen[what] = true
+			out = append(out, what)
+		}
+	}
+	return out
+}
+
+// portOf reads the port from an ss address, which is the text after the last
+// colon in both `0.0.0.0:179` and `[::]:179`.
+func portOf(addr string) string {
+	i := strings.LastIndex(addr, ":")
+	if i < 0 {
+		return ""
+	}
+	return addr[i+1:]
+}
+
+// checkLDPAdjacencies confirms label distribution reached the forwarding table.
 // An operational LDP session is not the claim. A router can hold every session
 // and still install nothing, and a router can install labels the kernel then
 // refuses to act on. Both were real failures here. So the session and the
