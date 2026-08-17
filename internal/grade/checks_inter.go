@@ -81,6 +81,48 @@ func bgpSummary(ctx context.Context, env *Env, router string) (bgpSummaryJSON, e
 	return out, err
 }
 
+// bgpUpdatesReceived reads, per router and per neighbour, how many UPDATE
+// messages have arrived on that session.
+//
+// Not the total of all messages. A firewall permitting keepalives and route
+// refreshes by packet length, and discarding everything else, left the totals
+// climbing on a session across which no route could pass: the refresh the
+// grader asked for was itself the traffic it then counted. An UPDATE is what a
+// session exists to carry, and answering a refresh with one is what a live
+// session does.
+func bgpUpdatesReceived(ctx context.Context, env *Env, routers []*model.Device) map[string]map[string]int {
+	out := map[string]map[string]int{}
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for _, r := range routers {
+		wg.Add(1)
+		go func(r *model.Device) {
+			defer wg.Done()
+			res, err := env.Probe(ctx, r.ID, []string{"vtysh", "-c", "show bgp neighbors json"})
+			if err != nil || res.ExitCode != 0 {
+				return
+			}
+			var doc map[string]struct {
+				MessageStats struct {
+					UpdatesRecv int `json:"updatesRecv"`
+				} `json:"messageStats"`
+			}
+			if json.Unmarshal([]byte(res.Stdout), &doc) != nil {
+				return
+			}
+			byPeer := map[string]int{}
+			for addr, n := range doc {
+				byPeer[addr] = n.MessageStats.UpdatesRecv
+			}
+			mu.Lock()
+			out[r.Name] = byPeer
+			mu.Unlock()
+		}(r)
+	}
+	wg.Wait()
+	return out
+}
+
 // bgpSummaries reads every router's BGP summary at once.
 func bgpSummaries(ctx context.Context, env *Env, routers []*model.Device) map[string]bgpSummaryJSON {
 	out := map[string]bgpSummaryJSON{}
@@ -169,8 +211,9 @@ func checkIBGPFullMesh(ctx context.Context, env *Env) Result {
 	// count records its arrival; it also makes the peer answer, so the counts
 	// move in both directions. It disturbs nothing: the peer re-sends routes
 	// the receiver already has.
-	before := bgpSummaries(ctx, env, routers)
+	before := bgpUpdatesReceived(ctx, env, routers)
 	refreshIBGP(ctx, env, routers, loopback)
+	updates := bgpUpdatesReceived(ctx, env, routers)
 	after := bgpSummaries(ctx, env, routers)
 
 	for _, r := range routers {
@@ -188,7 +231,7 @@ func checkIBGPFullMesh(ctx context.Context, env *Env) Result {
 				continue
 			}
 			p, ok := sum.IPv4Unicast.Peers[addr]
-			was, had := before[r.Name].IPv4Unicast.Peers[addr]
+			was, had := before[r.Name][addr]
 			switch {
 			case !ok:
 				problems = append(problems, fmt.Sprintf("%s has no session with %s (%s)", r.Name, other.Name, addr))
@@ -197,11 +240,12 @@ func checkIBGPFullMesh(ctx context.Context, env *Env) Result {
 					r.Name, other.Name, p.RemoteAs, env.AS))
 			case !strings.EqualFold(p.State, "Established"):
 				problems = append(problems, fmt.Sprintf("%s -> %s is %s", r.Name, other.Name, p.State))
-			case had && p.MsgRcvd <= was.MsgRcvd:
+			case had && updates[r.Name][addr] <= was:
 				problems = append(problems, fmt.Sprintf(
-					"%s -> %s says Established, but nothing arrived from %s while it was "+
-						"asked to send: the session is held open by a timer that has not "+
-						"expired yet, and carries nothing", r.Name, other.Name, other.Name))
+					"%s -> %s says Established, but no route arrived from %s while it was "+
+						"asked to send its table: the session is held open by a timer that "+
+						"has not expired yet, and carries nothing", r.Name, other.Name,
+					other.Name))
 			default:
 				established++
 			}
@@ -287,12 +331,13 @@ func checkEBGPEstablished(ctx context.Context, env *Env) Result {
 	// carrying nothing. Each router is asked to send a route refresh first --
 	// a real message that has to cross the connection and be answered -- and
 	// the counts are compared either side of it.
-	before := bgpSummaries(ctx, env, env.Routers())
+	before := bgpUpdatesReceived(ctx, env, env.Routers())
 	peersOf := map[string][]string{}
 	for _, w := range wanted {
 		peersOf[w.router] = append(peersOf[w.router], w.peerAddr)
 	}
 	refreshExternal(ctx, env, peersOf)
+	afterUpdates := bgpUpdatesReceived(ctx, env, env.Routers())
 
 	byRouter := map[string]bgpSummaryJSON{}
 	up := 0
@@ -334,12 +379,12 @@ func checkEBGPEstablished(ctx context.Context, env *Env) Result {
 					w.peerAddr, why))
 				continue
 			}
-			if was, had := before[w.router].IPv4Unicast.Peers[w.peerAddr]; had &&
-				p.MsgRcvd <= was.MsgRcvd {
+			if was, had := before[w.router][w.peerAddr]; had &&
+				afterUpdates[w.router][w.peerAddr] <= was {
 				problems = append(problems, fmt.Sprintf(
-					"%s -> AS %d (%s) says Established, but nothing arrived from it while it "+
-						"was asked to send: the session is held open by a timer that has not "+
-						"expired yet, and carries nothing", w.router, w.peerAS, w.peerAddr))
+					"%s -> AS %d (%s) says Established, but no route arrived from it while it "+
+						"was asked to send its table: the session is held open by a timer that "+
+						"has not expired yet, and carries nothing", w.router, w.peerAS, w.peerAddr))
 				continue
 			}
 			up++
