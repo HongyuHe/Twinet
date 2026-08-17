@@ -157,13 +157,20 @@ func doReceive(group net.IP, nic *net.Interface, port, seconds int, from net.IP,
 		defer func() { _ = c.Close() }()
 	}
 
-	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_DGRAM, int(htons(unix.ETH_P_IP)))
+	// ETH_P_ALL rather than ETH_P_IP on purpose. A socket bound to a single
+	// protocol is only given frames the interface *received*: the copies of
+	// what this host transmits, and the copies its own stack loops back to
+	// itself, never reach it. That would answer this question correctly by
+	// accident, and say nothing in the report about why. Bound to everything,
+	// the host's own traffic arrives too, labelled as such, so a submission
+	// that manufactured its own delivery is told what it did.
+	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_DGRAM, int(htons(unix.ETH_P_ALL)))
 	if err != nil {
 		fail(fmt.Sprintf("opening a packet socket on %s: %v", nic.Name, err))
 	}
 	defer func() { _ = unix.Close(fd) }()
 	if err := unix.Bind(fd, &unix.SockaddrLinklayer{
-		Protocol: htons(unix.ETH_P_IP),
+		Protocol: htons(unix.ETH_P_ALL),
 		Ifindex:  nic.Index,
 	}); err != nil {
 		fail(fmt.Sprintf("binding a packet socket to %s: %v", nic.Name, err))
@@ -188,7 +195,7 @@ func doReceive(group net.IP, nic *net.Interface, port, seconds int, from net.IP,
 			fail(fmt.Sprintf("reading from %s: %v", nic.Name, err))
 		}
 		ll, ok := addr.(*unix.SockaddrLinklayer)
-		if !ok {
+		if !ok || ll.Protocol != htons(unix.ETH_P_IP) {
 			continue
 		}
 		s, dst, payload, ok := parseUDP4(buf[:n], port)
