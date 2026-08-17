@@ -2,6 +2,7 @@ package grade
 
 import (
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"net/netip"
@@ -1366,6 +1367,17 @@ func crossVLANForwarding(ctx context.Context, env *Env, domain string) []string 
 		// single OpenFlow rule, and reading only the flow table missed it
 		// entirely.
 		out = append(out, mirroredPorts(ctx, env, d, vlanOfPort)...)
+		out = append(out, ovsMirrors(ctx, env, d, vlanOfPort)...)
+
+		// The buckets of every group, because a flow's action can be a group
+		// and the flow table then says nothing at all about where the frame
+		// goes. A switch with no group is the normal case, so an error here
+		// is not one.
+		groups := map[string]string{}
+		if g, err := env.Probe(ctx, d.ID,
+			[]string{"ovs-ofctl", "dump-groups", "br0"}); err == nil && g.ExitCode == 0 {
+			groups = ovsGroupBuckets(g.Stdout)
+		}
 
 		flows, err := env.Probe(ctx, d.ID, []string{"ovs-ofctl", "dump-flows", "br0"})
 		if err != nil || flows.ExitCode != 0 {
@@ -1375,7 +1387,7 @@ func crossVLANForwarding(ctx context.Context, env *Env, domain string) []string 
 			if !strings.Contains(line, "actions=") {
 				continue
 			}
-			in, outs := ovsFlowPorts(line, byNum)
+			in, outs := ovsFlowPorts(line, byNum, groups)
 			for _, o := range outs {
 				iv, ok1 := vlanOfPort[in]
 				ov, ok2 := vlanOfPort[o]
@@ -1441,8 +1453,95 @@ func mirroredPorts(ctx context.Context, env *Env, d *model.Device,
 	return out
 }
 
+// ovsMirrors names the switch's own port mirrors that copy frames from a port
+// in one VLAN into a port in another.
+//
+// A mirror is the switch's built-in copier. It leaves the flow table and the
+// kernel's traffic control exactly as a correct switch would have them, and
+// still duplicates every frame of one port onto another whatever VLAN either
+// is in.
+func ovsMirrors(ctx context.Context, env *Env, d *model.Device,
+	vlanOf map[string]int) []string {
+	res, err := env.Probe(ctx, d.ID,
+		[]string{"ovs-vsctl", "--columns=_uuid,name", "--format=csv", "list", "port"})
+	if err != nil || res.ExitCode != 0 {
+		return nil
+	}
+	byUUID := map[string]string{}
+	for _, rec := range ovsCSV(res.Stdout) {
+		if len(rec) >= 2 {
+			byUUID[strings.TrimSpace(rec[0])] = strings.TrimSpace(rec[1])
+		}
+	}
+	mirrors, err := env.Probe(ctx, d.ID, []string{"ovs-vsctl",
+		"--columns=select_src_port,select_dst_port,select_all,output_port",
+		"--format=csv", "list", "mirror"})
+	if err != nil || mirrors.ExitCode != 0 {
+		return nil
+	}
+	var out []string
+	for _, rec := range ovsCSV(mirrors.Stdout) {
+		if len(rec) < 4 {
+			continue
+		}
+		from := append(ovsPortNames(rec[0], byUUID), ovsPortNames(rec[1], byUUID)...)
+		if strings.Contains(rec[2], "true") {
+			for _, p := range byUUID {
+				from = append(from, p)
+			}
+		}
+		for _, to := range ovsPortNames(rec[3], byUUID) {
+			ov, ok := vlanOf[to]
+			if !ok {
+				continue
+			}
+			for _, src := range from {
+				iv, ok := vlanOf[src]
+				if !ok || iv == ov {
+					continue
+				}
+				out = append(out, fmt.Sprintf(
+					"%s is told to copy every frame of %s (VLAN %d) onto %s (VLAN %d)",
+					d.Name, src, iv, to, ov))
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// ovsCSV parses what `ovs-vsctl --format=csv` prints, keeping whatever it
+// managed to read when a line will not parse.
+func ovsCSV(s string) [][]string {
+	r := csv.NewReader(strings.NewReader(s))
+	r.FieldsPerRecord = -1
+	r.LazyQuotes = true
+	var out [][]string
+	for {
+		rec, err := r.Read()
+		if err != nil {
+			return out
+		}
+		out = append(out, rec)
+	}
+}
+
+// ovsPortNames turns a database field holding one port row, or a set of them,
+// into the names of those ports.
+func ovsPortNames(field string, byUUID map[string]string) []string {
+	var out []string
+	for _, t := range strings.FieldsFunc(field, func(r rune) bool {
+		return r == '[' || r == ']' || r == ',' || r == ' ' || r == '"'
+	}) {
+		if n, ok := byUUID[t]; ok {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
 // ovsPortMap reads the switch's port numbering and each port's access VLAN.
-func ovsPortMap(show, csv string) (map[string]string, map[string]int) {
+func ovsPortMap(show, tags string) (map[string]string, map[string]int) {
 	byNum := map[string]string{}
 	for _, line := range strings.Split(show, "\n") {
 		t := strings.TrimSpace(line)
@@ -1457,7 +1556,7 @@ func ovsPortMap(show, csv string) (map[string]string, map[string]int) {
 		byNum[t[:i]] = t[i+1 : j]
 	}
 	vlan := map[string]int{}
-	for _, line := range strings.Split(csv, "\n") {
+	for _, line := range strings.Split(tags, "\n") {
 		f := strings.Split(strings.TrimSpace(line), ",")
 		if len(f) < 2 {
 			continue
@@ -1473,31 +1572,46 @@ func ovsPortMap(show, csv string) (map[string]string, map[string]int) {
 
 // ovsFlowPorts pulls the ingress port and every port a flow can send a frame
 // out of, from one line of `ovs-ofctl dump-flows`, resolving numbers to names.
-//
-// "output:" is not the only way to emit a frame, and reading only that was
-// enough to miss `enqueue:8:0`, which puts the frame on a queue of port 8 and
-// sends it exactly as `output` would. Every action that names a port counts,
-// and the ones that name none but reach every port -- flood, all -- count as
-// reaching all of them.
-func ovsFlowPorts(line string, byNum map[string]string) (string, []string) {
-	name := func(tok string) string {
-		tok = strings.Trim(tok, " \t,)")
-		if n, ok := byNum[tok]; ok {
-			return n
-		}
-		return tok
-	}
+func ovsFlowPorts(line string, byNum map[string]string, groups map[string]string) (string, []string) {
 	in := ""
 	for _, f := range strings.Split(line, ",") {
 		t := strings.TrimSpace(f)
 		if v, ok := strings.CutPrefix(t, "in_port="); ok {
-			in = name(v)
+			in = ovsPortName(v, byNum)
 		}
 	}
 	actions := line
 	if i := strings.Index(line, "actions="); i >= 0 {
 		actions = line[i+len("actions="):]
 	}
+	return in, ovsActionPorts(actions, byNum, groups, map[string]bool{})
+}
+
+// ovsPortName resolves a port number to the port's name where it can.
+func ovsPortName(tok string, byNum map[string]string) string {
+	tok = strings.Trim(tok, " \t,)")
+	if n, ok := byNum[tok]; ok {
+		return n
+	}
+	return tok
+}
+
+// ovsActionPorts expands one action string into every port it can put a frame
+// on, following each group it names into that group's buckets.
+//
+// "output:" is not the only way to emit a frame, and reading only that was
+// enough to miss `enqueue:8:0`, which puts the frame on a queue of port 8 and
+// sends it exactly as `output` would. Every action that names a port counts,
+// and the ones that name none but reach every port -- flood, all -- count as
+// reaching all of them.
+//
+// A group is a second table the flow table only points at: `actions=group:461`
+// names no port whatsoever, and the frame leaves by whichever port the group's
+// buckets say. Reading only the flow table saw an action with no destination
+// and found nothing to complain about, so a group carrying a frame from one
+// VLAN straight into another scored full marks.
+func ovsActionPorts(actions string, byNum map[string]string,
+	groups map[string]string, seen map[string]bool) []string {
 	var outs []string
 	// Anything of the form "<verb>:<port>[:...]", plus the port-in-parens form.
 	for _, verb := range []string{"output:", "enqueue:", "resubmit:"} {
@@ -1520,7 +1634,7 @@ func ovsFlowPorts(line string, byNum map[string]string) (string, []string) {
 				tok = tok[:j]
 			}
 			if tok != "" {
-				outs = append(outs, name(tok))
+				outs = append(outs, ovsPortName(tok, byNum))
 			}
 		}
 	}
@@ -1537,7 +1651,30 @@ func ovsFlowPorts(line string, byNum map[string]string) (string, []string) {
 				end = len(rest)
 			}
 			if tok := rest[:end]; tok != "" {
-				outs = append(outs, name(tok))
+				outs = append(outs, ovsPortName(tok, byNum))
+			}
+		}
+	}
+	// Every group the actions name, and every group those name in turn. The
+	// visited set is what stops a group that points at itself from spinning.
+	for _, verb := range []string{"group:", "group_id="} {
+		rest := actions
+		for {
+			i := strings.Index(rest, verb)
+			if i < 0 {
+				break
+			}
+			rest = rest[i+len(verb):]
+			id := rest
+			if end := strings.IndexAny(id, ",) \t"); end >= 0 {
+				id = id[:end]
+			}
+			if id == "" || seen[id] {
+				continue
+			}
+			seen[id] = true
+			if b, ok := groups[id]; ok {
+				outs = append(outs, ovsActionPorts(b, byNum, groups, seen)...)
 			}
 		}
 	}
@@ -1550,7 +1687,33 @@ func ovsFlowPorts(line string, byNum map[string]string) (string, []string) {
 			break
 		}
 	}
-	return in, outs
+	return outs
+}
+
+// ovsGroupBuckets reads `ovs-ofctl dump-groups` into the buckets of every
+// group, keyed by group id.
+func ovsGroupBuckets(dump string) map[string]string {
+	out := map[string]string{}
+	for _, line := range strings.Split(dump, "\n") {
+		t := strings.TrimSpace(line)
+		i := strings.Index(t, "group_id=")
+		if i < 0 {
+			continue
+		}
+		id := t[i+len("group_id="):]
+		if j := strings.IndexAny(id, ", \t"); j >= 0 {
+			id = id[:j]
+		}
+		// From the first bucket onwards, and no earlier: what comes before it
+		// names the group's type, and `type=all` is not an instruction to
+		// flood -- reading it as one would fail every switch that has a group.
+		j := strings.Index(t, "bucket=")
+		if id == "" || j < 0 {
+			continue
+		}
+		out[id] += "," + t[j:]
+	}
+	return out
 }
 
 // crossVLANFrames sends a broadcast in one VLAN and asks the other whether it
