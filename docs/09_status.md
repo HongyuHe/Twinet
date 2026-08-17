@@ -728,6 +728,27 @@ reached students, and each motivated a permanent test.
     whatever VLAN either is in. Both are now read; measured at 9.50 and 8.70 of
     10.00 respectively, against 10.00 before.
 
+78. **`vtysh` answers for one BGP daemon, not for the router.** The BGP-free
+    core is the point of the MPLS exercise, and the check asked each core router
+    `show bgp summary` and believed "% BGP instance not found". `vtysh` speaks
+    to the daemons owning one set of sockets under /var/run/frr, and FRR will
+    run as many instances as it is told to: `bgpd -N x` puts a second one in a
+    pathspace with sockets of its own. A core router holding a BGP instance, a
+    configured neighbour and a listener on port 179 in a pathspace answered
+    "instance not found" to the grader and scored 6.00 of 6.00 for a BGP-free
+    core. A daemon that is not FRR at all -- BIRD, GoBGP, ExaBGP -- shares none
+    of FRR's furniture and was equally invisible. Core routers are now asked
+    what they are running rather than what they will admit to: their process
+    list, every FRR pathspace that either the process list or a stray vty socket
+    reveals, and their sockets. Each pathspace is then asked what it holds, so
+    the report names the hidden neighbours rather than only their existence.
+    None of it fires on a correct answer, and that is the delicate part: FRR
+    starts bgpd on core routers and leaves it unconfigured, so "a bgpd is
+    running" is the state the exercise *wants* -- an unconfigured daemon holds
+    no instance, opens no port and is not a finding. Measured at 4.80 of 6.00
+    with the hidden daemon, 6.00 without. `ps` joined the programs a mark
+    depends on and is hashed against the image with the rest.
+
 ## Environment findings
 
 - **Jumbo frames are unavailable.** Raising `eno2` to MTU 9000 dropped the

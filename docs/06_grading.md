@@ -304,6 +304,37 @@ The pattern is worth naming, because it is the one that keeps recurring: a check
 that reads one table and concludes from its silence. Silence in a table that
 only points at another table says nothing.
 
+### Asking a router what it runs, not what it will admit to
+
+The same shape, one layer down. `vtysh` is not the router; it is a client that
+connects to whichever daemons own the sockets in `/var/run/frr`. Asking it
+whether a core router runs BGP asks only about those, and FRR will happily run a
+second `bgpd` in a pathspace of its own — `bgpd -N x` — holding an instance, a
+neighbour and the BGP port while `vtysh -c 'show bgp summary'` reports `% BGP
+instance not found`. A daemon that is not FRR at all shares none of FRR's
+furniture and is invisible in the same way.
+
+`mpls.bgp_free_core` therefore reads three things about each core router, none
+of which the router gets to narrate:
+
+- **its processes**, for a second `bgpd` — started with `-N`, `--pathspace` or
+  its own `--vty_socket`, or simply a second copy — and for BIRD, GoBGP, ExaBGP
+  or OpenBGPD under their own names;
+- **its FRR pathspaces**, from the process list and from any `.vty` socket in a
+  subdirectory of `/var/run/frr`, each then asked what it holds so the evidence
+  names the hidden neighbours;
+- **its sockets**, for the BGP port in any state — which is what catches a BGP
+  speaker that has been renamed, since the name it runs under is its to choose
+  and the port its peers connect to is not.
+
+The delicate half is the false positive. FRR *does* start `bgpd` on a correct
+core router and leaves it unconfigured, and that is the state the exercise asks
+for: no instance, no table, no listener. "A bgpd is running" is therefore not a
+finding, and a check that made it one would fail every correct answer — the more
+expensive of the two mistakes. What remains uncovered is a BGP speaker that has
+been renamed *and* moved off port 179, which is stated here rather than papered
+over.
+
 ## Grading a class
 
 Two modes, and the difference is what they cost.
