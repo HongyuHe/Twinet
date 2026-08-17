@@ -227,6 +227,31 @@ func checkPIMEnabled(ctx context.Context, env *Env) Result {
 	}
 }
 
+// rangeSplit reports a mapping that carves part of the declared group range
+// off to a different rendezvous point, or "" if none does.
+func rangeSplit(out, groups, want string) string {
+	declared, err := netip.ParsePrefix(groups)
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		if len(f) < 2 || !strings.Contains(f[1], "/") {
+			continue
+		}
+		pfx, err := netip.ParsePrefix(f[1])
+		if err != nil || f[0] == want {
+			continue
+		}
+		// Inside the declared range and pointing somewhere else.
+		if declared.Overlaps(pfx) && pfx.Bits() >= declared.Bits() {
+			return fmt.Sprintf("%s of the declared range %s is sent to %s, not %s",
+				pfx, groups, f[0], want)
+		}
+	}
+	return ""
+}
+
 func checkRendezvousPoint(ctx context.Context, env *Env) Result {
 	as, ok := env.Topology.ASes[env.AS]
 	if !ok || !as.Multicast.Enabled {
@@ -279,6 +304,18 @@ func checkRendezvousPoint(ctx context.Context, env *Env) Result {
 				continue
 			}
 			found, foundBits = f[0], pfx.Bits()
+		}
+		// And the rest of the range, not only the address under test.
+		//
+		// The tested group is one address of the declared range, and PIM takes
+		// the most specific mapping for each group separately: `ip pim rp
+		// <somewhere unreachable> 237.0.0.128/25` leaves the tested address
+		// alone and takes half the range with it, which was worth nothing.
+		// Anything more specific than the declared range, pointing somewhere
+		// else, is part of that range going to the wrong root.
+		if split := rangeSplit(out, as.Multicast.Groups, want); split != "" {
+			wrong = append(wrong, fmt.Sprintf("%s: %s", r.Name, split))
+			continue
 		}
 		switch found {
 		case want:
