@@ -1749,7 +1749,14 @@ func hostsThatCannotReach(ctx context.Context, env *Env, addr string) ([]string,
 	)
 	sem := make(chan struct{}, 8)
 	for _, d := range as.Devices {
-		if d.Kind != model.KindHost || d.L2Domain != "" || siteAddr(d) == "" {
+		// The datacentre hosts as well.
+		//
+		// They were skipped because their reachability to *each other* is a
+		// layer-2 question graded elsewhere. Their reachability to the rest of
+		// the internet is not: rejecting traffic from both VLANs towards the
+		// unsigned prefix left every remaining probe succeeding and the
+		// question at full marks, with two whole sites unable to reach it.
+		if d.Kind != model.KindHost || siteAddr(d) == "" {
 			continue
 		}
 		wg.Add(1)
