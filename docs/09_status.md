@@ -612,6 +612,11 @@ reached students, and each motivated a permanent test.
     route could pass -- the refresh the grader asked for was itself the traffic
     it then counted. An UPDATE is what a session exists to carry, and both the
     internal mesh and the external sessions now require that count to move.
+66. **An OSPF instance the reader never opened.** Whether an inter-AS range was
+    in OSPF was decided from the default VRF's database and routing table, so an
+    instance in another VRF holding one was invisible and the report said there
+    was none. FRR keys both answers by VRF when asked for all of them, and a
+    finding now names the instance it is in.
 
 ## Environment findings
 

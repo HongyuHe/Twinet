@@ -171,6 +171,7 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 	var ibgpBlackhole struct{ router, peer string }
 	var lengthFilter struct{ router, peer string }
 	var leakedRange string
+	var vrfLeak struct{ router string }
 	var tunnelTCP struct{ gateway, iface string }
 	var rangeAllow []string
 	var weighted struct{ router, routeMap, prefix string }
@@ -1427,6 +1428,40 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 				if err != nil {
 					t.Fatalf("blocking TCP over the tunnel: %v\n%s", err, out)
 				}
+			},
+		},
+		{
+			// An OSPF instance the reader never opened.
+			//
+			// Reading only the default VRF meant the report could say no
+			// inter-AS range was in OSPF while an instance beside it held one.
+			name:     "an inter-AS range in an OSPF instance in another VRF",
+			question: "q1.2",
+			undo: func(t *testing.T) {
+				if vrfLeak.router == "" {
+					return
+				}
+				_, _ = twinet(t, "exec", "-m", dir, vrfLeak.router, "--", "sh", "-c",
+					"vtysh -c 'configure terminal' -c 'no router ospf vrf TWBAD' -c 'end'; "+
+						"ip link del twdum0 2>/dev/null; ip link del TWBAD 2>/dev/null")
+			},
+			apply: func(t *testing.T) {
+				router := "as" + itoa(as) + "/NYC"
+				rng := interASRange(t, dir, as)
+				vrfLeak = struct{ router string }{router}
+				t.Logf("putting %s into an OSPF instance in another VRF on %s", rng, router)
+				addr := strings.SplitN(rng, "/", 2)[0]
+				addr = addr[:strings.LastIndexByte(addr, '.')] + ".9/24"
+				out, err := twinet(t, "exec", "-m", dir, router, "--", "sh", "-c",
+					"ip link add TWBAD type vrf table 1001 && ip link set TWBAD up && "+
+						"ip link add twdum0 type dummy && ip link set twdum0 master TWBAD && "+
+						"ip addr add "+addr+" dev twdum0 && ip link set twdum0 up && "+
+						"vtysh -c 'configure terminal' -c 'router ospf vrf TWBAD' "+
+						"-c ' ospf router-id 9.9.9.9' -c ' network "+rng+" area 0' -c 'end'")
+				if err != nil {
+					t.Fatalf("building an OSPF instance in a VRF: %v\n%s", err, out)
+				}
+				time.Sleep(10 * time.Second)
 			},
 		},
 		{
