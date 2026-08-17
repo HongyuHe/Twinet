@@ -169,6 +169,7 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 	var customerDrops []string
 	var vlanMirror struct{ switchID, from string }
 	var ibgpBlackhole struct{ router, peer string }
+	var lengthFilter struct{ router, peer string }
 	var leakedRange string
 	var tunnelTCP struct{ gateway, iface string }
 	var rangeAllow []string
@@ -1460,6 +1461,50 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 					" redistribute connected route-map TWGRADE-LEAK",
 					"end")
 				time.Sleep(15 * time.Second)
+			},
+		},
+		{
+			// A session that carries keepalives and no routes.
+			//
+			// Permitting small BGP packets by length and discarding the rest
+			// leaves the message totals climbing on a session across which no
+			// route can pass -- including the refresh the grader asks for.
+			name:     "an iBGP session that answers refreshes but carries no routes",
+			question: "q2.1",
+			undo: func(t *testing.T) {
+				if lengthFilter.router == "" {
+					return
+				}
+				_, _ = twinet(t, "exec", "-m", dir, lengthFilter.router, "--", "sh", "-c",
+					"iptables -D OUTPUT -p tcp -d "+lengthFilter.peer+
+						" --dport 179 -m length --length 0:120 -j ACCEPT; "+
+						"iptables -D OUTPUT -p tcp -d "+lengthFilter.peer+" --dport 179 -j DROP; "+
+						"iptables -D OUTPUT -p tcp -d "+lengthFilter.peer+
+						" --sport 179 -m length --length 0:120 -j ACCEPT; "+
+						"iptables -D OUTPUT -p tcp -d "+lengthFilter.peer+" --sport 179 -j DROP")
+			},
+			apply: func(t *testing.T) {
+				out, err := twinet(t, "exec", "-m", dir, "as3/PHY", "--",
+					"vtysh", "-c", "show running-config")
+				if err != nil {
+					t.Fatalf("reading the configuration: %v\n%s", err, out)
+				}
+				peer := firstIBGPPeer(out)
+				if peer == "" {
+					t.Skip("no iBGP neighbour found")
+				}
+				lengthFilter = struct{ router, peer string }{"as3/PHY", peer}
+				t.Logf("permitting only small BGP packets towards %s", peer)
+				out, err = twinet(t, "exec", "-m", dir, "as3/PHY", "--", "sh", "-c",
+					"iptables -I OUTPUT 1 -p tcp -d "+peer+
+						" --sport 179 -m length --length 0:120 -j ACCEPT && "+
+						"iptables -I OUTPUT 2 -p tcp -d "+peer+" --sport 179 -j DROP && "+
+						"iptables -I OUTPUT 1 -p tcp -d "+peer+
+						" --dport 179 -m length --length 0:120 -j ACCEPT && "+
+						"iptables -I OUTPUT 2 -p tcp -d "+peer+" --dport 179 -j DROP")
+				if err != nil {
+					t.Fatalf("filtering by length: %v\n%s", err, out)
+				}
 			},
 		},
 		{

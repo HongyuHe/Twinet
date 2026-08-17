@@ -605,6 +605,13 @@ reached students, and each motivated a permanent test.
     tell, because when the datagram is dropped it hears nothing, and hearing
     nothing is what `nc` reports as success. The pairs go in rounds so that no
     two senders aim at the same host at once and the counter says who arrived.
+65. **A session that carried keepalives and no routes.** The liveness probe
+    compared the total of all messages received on a session. A firewall
+    permitting keepalives and route refreshes by packet length, and discarding
+    everything else, left those totals climbing on a session across which no
+    route could pass -- the refresh the grader asked for was itself the traffic
+    it then counted. An UPDATE is what a session exists to carry, and both the
+    internal mesh and the external sessions now require that count to move.
 
 ## Environment findings
 
