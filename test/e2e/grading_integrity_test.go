@@ -3594,3 +3594,77 @@ func vtyshQuiet(t *testing.T, dir, device string, cmds ...string) {
 	}
 	_, _ = twinet(t, args...)
 }
+
+// A student's own container cannot be allowed to answer for itself.
+//
+// Every data-plane question is settled by running a program inside a student's
+// container and reading what it printed, and a student has root there. A shell
+// script called `ping` that prints "3 packets transmitted, 3 received" earns
+// the reachability marks on a network that forwards nothing -- and it does not
+// even have to replace the image's copy, because a file earlier on the search
+// path is the one that runs.
+//
+// This is the test that grading refuses to produce marks from it. Refusing is
+// the point: the submission is not marked down, because a grader that cannot
+// trust what it was told does not know what the marks should have been.
+func TestAProgramTheStudentWroteCannotEarnMarks(t *testing.T) {
+	dir := labDir(t)
+	const as = 3
+
+	solveAS(t, dir, as)
+	baseline, points, _ := gradeAS(t, dir, as)
+	total := func(m map[string]float64) float64 {
+		var sum float64
+		for _, v := range m {
+			sum += v
+		}
+		return sum
+	}
+	if total(baseline) < total(points) {
+		t.Skipf("the reference is not at full marks (%.2f of %.2f); nothing below could "+
+			"be attributed to the planted program", total(baseline), total(points))
+	}
+	t.Logf("the reference scores %.2f of %.2f", total(baseline), total(points))
+
+	hosts := hostsOfAS(t, dir, as)
+	if len(hosts) == 0 {
+		t.Fatalf("AS %d has no hosts to plant a program in", as)
+	}
+	victim := hosts[0]
+	plant := "printf '#!/bin/sh\\necho \"3 packets transmitted, 3 received, 0%% packet " +
+		"loss\"\\nexit 0\\n' > /usr/local/bin/ping; chmod +x /usr/local/bin/ping; echo ok"
+	if _, err := twinet(t, "exec", "-m", dir, victim, "--", "sh", "-c", plant); err != nil {
+		t.Fatalf("planting a ping in %s: %v", victim, err)
+	}
+	defer func() {
+		_, _ = twinet(t, "exec", "-m", dir, victim, "--", "rm", "-f", "/usr/local/bin/ping")
+		// The agent re-reads a container's programs every twenty seconds; the
+		// next test in this package must not meet a stale refusal.
+		time.Sleep(25 * time.Second)
+	}()
+	t.Logf("planted a ping that always succeeds in %s", victim)
+	time.Sleep(25 * time.Second)
+
+	_, _, report := gradeASBroken(t, dir, as)
+
+	// Quarantine, not a lower mark. The submission has not been shown to be
+	// wrong; it has been shown to be unmarkable, and the difference is the
+	// whole point -- a student whose container answers for itself must not be
+	// given a number that anybody could mistake for a grade.
+	var rep struct {
+		NeedsReview bool   `json:"needs_review"`
+		Err         string `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(report), &rep); err != nil {
+		t.Fatalf("the report does not parse: %v", err)
+	}
+	if !rep.NeedsReview {
+		t.Fatalf("a container whose ping is a shell script written by the student was "+
+			"graded as if nothing were wrong; every data-plane mark in this lab can be "+
+			"had without a working network\n%s", report)
+	}
+	if !strings.Contains(report, "not the ones its image ships") {
+		t.Errorf("the run was held back but the report does not say why: %s", report)
+	}
+	t.Logf("the run was quarantined: %s", rep.Err)
+}

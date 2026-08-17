@@ -233,6 +233,44 @@ still keeps hidden checks for the graded run.
 - The event log records whether the graded AS's config matches what was live in
   the class network at the deadline.
 
+### The programs a mark rests on
+
+A student has root in their own containers — that is the exercise. It also means
+every program the grader runs there is theirs to replace. A shell script called
+`ping` that prints `3 packets transmitted, 3 received` earns the reachability
+marks on a network that forwards nothing, and one called `vtysh` earns the
+configuration marks for configuration that was never written. Neither has to
+overwrite the image's copy: a file earlier on the search path is the one that
+runs.
+
+So before a grading command executes in a container, its programs are compared
+against the image it is running. Both sides are read by the grader, never by
+asking the container: the container's through `/proc` on its node, the image's
+out of a container of that image created and never started. Resolution follows
+the search path, so a `ping` planted in `/usr/local/bin` is found while the
+image's copy sits untouched below it, and a program the image does not ship at
+all is a plant. A program the student *removed* is not a finding — it cannot
+answer anything either.
+
+A container that fails this is **not marked down**. The run is quarantined and
+says which container and which program, because a grader that cannot trust what
+it was told does not know what the marks should have been.
+
+Two consequences worth knowing:
+
+- Rebuilding the images under a tag that already has containers leaves those
+  containers running bytes the node may no longer have. Grading then stops with
+  "this container is running an image that is no longer on this node"; redeploy
+  the lab.
+- `twinet grade batch` is unaffected either way: it rebuilds every container
+  from the image and loads only the submitted configuration, so nothing a
+  student did to their container's filesystem is present at all.
+
+What this does not cover is stated plainly: a shared library replaced underneath
+an untouched program, and a program replaced in the twenty seconds between one
+check and the next. Both are narrower than what it does cover, and neither is
+reachable by editing a configuration file.
+
 ## Grading a class
 
 Two modes, and the difference is what they cost.

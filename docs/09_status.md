@@ -688,6 +688,27 @@ reached students, and each motivated a permanent test.
     group* is not enough, because a join creates a shared-tree entry whether or
     not a packet ever crosses and a local sender creates one of its own, so the
     routers must hold state naming the source this run sent from.
+76. **A program the student wrote answering for them.** Every data-plane
+    question is settled by running a program inside a student's container and
+    reading what it printed, and a student has root there. A shell script called
+    `ping` that prints "3 packets transmitted, 3 received" earns the
+    reachability marks on a network that forwards nothing, and one called
+    `vtysh` earns the configuration marks for configuration that was never
+    written — and neither has to replace the image's copy, because a file
+    earlier on the search path is the one that runs. Measured at 10.00 of 10.00
+    with a two-line `/usr/local/bin/ping`. Before a grading command runs, the
+    container's programs are now compared against the image it is running, both
+    sides read by the grader rather than by asking the container: through
+    `/proc` on the node, with symbolic links followed by hand because an
+    absolute link met under `/proc/<pid>/root` resolves against the node's own
+    root and would have hashed the node's shell. A container that fails is not
+    marked down — it is quarantined, because a grader that cannot trust what it
+    was told does not know what the marks should have been. Two further holes
+    were found while building it: comparing against the image *tag* rather than
+    the image the container runs made every container look tampered with the
+    moment the images were rebuilt, and keeping a container's verdict for its
+    lifetime meant a program planted after one run was believed by every run
+    after it.
 
 ## Environment findings
 
