@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/HongyuHe/twinet/internal/mcast"
 	"github.com/HongyuHe/twinet/internal/model"
 )
 
@@ -395,14 +396,66 @@ func hostIface(d *model.Device) string {
 	return ""
 }
 
+// seen is what one host observed on the group during a run.
+//
+// The counts are kept apart because they answer different questions. Delivery
+// is `arrived`, and only that: a packet the host's own stack looped back to it
+// is this host talking to itself, which is what `looped` counts, and a host
+// whose site receives nothing can produce as many of those as it likes.
+type seen struct {
+	joined  bool
+	arrived int // packets of this run's, off the wire
+	looped  int // packets of this run's, generated on this host
+	foreign int // packets on the group this run did not send
+	sources []string
+	raw     string
+}
+
+// mcastReport turns what a host reported into what it means for this run.
+//
+// The host is not asked to decide. It says what it saw -- a digest, a source
+// and where the kernel says each packet came from -- and the matching against
+// what was sent happens here, because only here is it known what was sent.
+func mcastReport(out string, want map[string]bool) seen {
+	s := seen{raw: strings.TrimSpace(out)}
+	srcs := map[string]bool{}
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		switch {
+		case len(f) >= 2 && f[0] == "twinet-mcast":
+			for _, kv := range f[1:] {
+				if k, v, ok := strings.Cut(kv, "="); ok && k == "joined" {
+					s.joined = v == "true"
+				}
+			}
+		case len(f) == 4 && f[0] == "packet":
+			if !want[f[1]] {
+				s.foreign++
+				continue
+			}
+			if f[3] == "outgoing" || f[3] == "loopback" {
+				s.looped++
+				continue
+			}
+			s.arrived++
+			srcs[f[2]] = true
+		}
+	}
+	for k := range srcs {
+		s.sources = append(s.sources, k)
+	}
+	sort.Strings(s.sources)
+	return s
+}
+
 // receiveOn joins a group on a host and reports what arrived.
 //
-// The join and the listen are the same operation: a socket that has joined the
-// group is what makes the host send an IGMP report, and closing it is what
-// makes it leave. Doing them separately -- join with one tool, listen with
-// another -- leaves the membership behind after the check and changes the next
-// one's result.
-func receiveOn(ctx context.Context, env *Env, host *model.Device, group, tag string,
+// The join and the observation happen in one process on purpose: a socket that
+// has joined the group is what makes the host send an IGMP report, and closing
+// it is what makes it leave. Doing them separately -- join with one tool,
+// listen with another -- leaves the membership behind after the check and
+// changes the next one's result.
+func receiveOn(ctx context.Context, env *Env, host *model.Device, group, from string,
 	seconds int) (string, error) {
 
 	iface := hostIface(host)
@@ -410,11 +463,98 @@ func receiveOn(ctx context.Context, env *Env, host *model.Device, group, tag str
 		return "", fmt.Errorf("%s has no interface to join on", host.Name)
 	}
 	res, err := env.Probe(ctx, host.ID, []string{"twinet-mcast", "-recv",
-		"-group", group, "-iface", iface, "-tag", tag, "-seconds", fmt.Sprint(seconds)})
+		"-group", group, "-iface", iface, "-from", from,
+		"-seconds", fmt.Sprint(seconds)})
 	if err != nil {
 		return "", err
 	}
 	return res.Stdout + res.Stderr, nil
+}
+
+// lastHop is the router a host's packets reach first, and the name of the
+// interface on that router facing it.
+//
+// That interface is what has to appear in the router's outgoing interface list
+// for the group: it is the one thing about delivery that is the network's doing
+// and not the host's, so it is what tells a tree that reaches the site from a
+// host that arranged to see packets some other way.
+func lastHop(h *model.Device) (*model.Device, string) {
+	for _, i := range h.Ifaces {
+		if i.Link == nil {
+			continue
+		}
+		other := i.Link.A
+		if other == i {
+			other = i.Link.B
+		}
+		if other == nil || other.Device == nil {
+			continue
+		}
+		switch other.Device.Kind {
+		case model.KindRouter:
+			return other.Device, other.Name
+		case model.KindSwitch:
+			// A host behind a switch still has a router on the segment; the
+			// interface that matters is the router's, not the switch's.
+			if r, name := routerOnSegment(other.Device, h); r != nil {
+				return r, name
+			}
+		}
+	}
+	return nil, ""
+}
+
+// routerOnSegment finds the router attached to a switch, skipping the host that
+// asked.
+func routerOnSegment(sw *model.Device, skip *model.Device) (*model.Device, string) {
+	for _, i := range sw.Ifaces {
+		if i.Link == nil {
+			continue
+		}
+		other := i.Link.A
+		if other == i {
+			other = i.Link.B
+		}
+		if other == nil || other.Device == nil || other.Device == skip {
+			continue
+		}
+		if other.Device.Kind == model.KindRouter {
+			return other.Device, other.Name
+		}
+	}
+	return nil, ""
+}
+
+// tree is what one router holds for the group while the traffic is flowing.
+type tree struct {
+	carriesSource bool
+	oil           map[string]bool
+}
+
+// treeOn reads a router's multicast forwarding state for the group.
+//
+// Both entries are read. Whether the last-hop router forwards on the shared
+// tree or has switched to the source's own is a matter of timing that the
+// exercise does not ask about, and the outgoing interface list means the same
+// thing either way: this router has been told, by IGMP, to put the group on
+// that segment.
+func treeOn(ctx context.Context, env *Env, router, group, src string) tree {
+	var doc map[string]map[string]struct {
+		OIL map[string]json.RawMessage `json:"oil"`
+	}
+	t := tree{oil: map[string]bool{}}
+	if err := env.VtyshJSON(ctx, router, "show ip mroute json", &doc); err != nil {
+		return t
+	}
+	for source, e := range doc[group] {
+		if source == src {
+			t.carriesSource = true
+		}
+		for name := range e.OIL {
+			t.oil[name] = true
+		}
+	}
+	return t
 }
 
 // sendTo sends a few packets to a group from a host, each carrying the tag this
@@ -483,9 +623,10 @@ func hostAddr4(d *model.Device) string {
 // not the tree built for six.
 func multicastRun(ctx context.Context, env *Env, receivers []*model.Device,
 	bystanders []*model.Device, src *model.Device, group string) (
-	got map[string]string, trees map[string]string, err error) {
+	got map[string]seen, trees map[string]tree, err error) {
 
 	tag := multicastTag()
+	want := mcast.Digests(tag, multicastPackets)
 	srcAddr := hostAddr4(src)
 	if srcAddr == "" {
 		return nil, nil, fmt.Errorf("%s has no address, so the tree its packets build "+
@@ -499,17 +640,17 @@ func multicastRun(ctx context.Context, env *Env, receivers []*model.Device,
 	done := make(chan result, len(receivers)+len(bystanders))
 	for _, h := range receivers {
 		go func(h *model.Device) {
-			out, err := receiveOn(ctx, env, h, group, tag, 25)
+			out, err := receiveOn(ctx, env, h, group, srcAddr, 25)
 			done <- result{h.Name, out, err}
 		}(h)
 	}
-	// A host that does not join, listening on the same port. Anything it
-	// receives is traffic nobody asked it to receive.
+	// A host that does not join, watching the same segment. Anything it sees is
+	// traffic nobody asked it to receive.
 	for _, h := range bystanders {
 		go func(h *model.Device) {
 			iface := hostIface(h)
 			res, err := env.Probe(ctx, h.ID, []string{"twinet-mcast", "-listen",
-				"-group", group, "-iface", iface, "-tag", tag, "-seconds", "25"})
+				"-group", group, "-iface", iface, "-from", srcAddr, "-seconds", "25"})
 			if err != nil {
 				done <- result{h.Name, "", err}
 				return
@@ -525,7 +666,7 @@ func multicastRun(ctx context.Context, env *Env, receivers []*model.Device,
 	case <-ctx.Done():
 		return nil, nil, ctx.Err()
 	}
-	if err := sendTo(ctx, env, src, group, tag, 25); err != nil {
+	if err := sendTo(ctx, env, src, group, tag, multicastPackets); err != nil {
 		return nil, nil, err
 	}
 	// Read the trees while the traffic is still flowing: multicast forwarding
@@ -534,20 +675,18 @@ func multicastRun(ctx context.Context, env *Env, receivers []*model.Device,
 	// to the group on its own segment creates an entry of its own, so "some
 	// router has state for the group" is satisfied by every submission that
 	// leaves a sender running anywhere.
-	trees = map[string]string{}
+	trees = map[string]tree{}
 	for _, r := range env.Routers() {
-		if carriesSource(ctx, env, r.Name, group, srcAddr) {
-			trees[r.Name] = group
-		}
+		trees[r.Name] = treeOn(ctx, env, r.Name, group, srcAddr)
 	}
-	got = map[string]string{}
+	got = map[string]seen{}
 	for i := 0; i < len(receivers)+len(bystanders); i++ {
 		select {
 		case res := <-done:
 			if res.err != nil {
 				return got, trees, res.err
 			}
-			got[res.name] = res.out
+			got[res.name] = mcastReport(res.out, want)
 		case <-ctx.Done():
 			return got, trees, ctx.Err()
 		}
@@ -555,21 +694,10 @@ func multicastRun(ctx context.Context, env *Env, receivers []*model.Device,
 	return got, trees, nil
 }
 
-// carriesSource reports whether a router holds multicast forwarding state for
-// the group that names this source.
-//
-// "Some router has state for the group" is satisfied by any submission that
-// leaves a sender running anywhere, and by the shared-tree entry every join
-// creates whether or not a packet ever crosses. Naming the source ties the
-// state to the traffic the question is about.
-func carriesSource(ctx context.Context, env *Env, router, group, src string) bool {
-	var doc map[string]map[string]json.RawMessage
-	if err := env.VtyshJSON(ctx, router, "show ip mroute json", &doc); err != nil {
-		return false
-	}
-	_, ok := doc[group][src]
-	return ok
-}
+// multicastPackets is how many packets one run sends. Enough that a single lost
+// one does not decide a mark, few enough that the run stays inside the window
+// the listeners are open for.
+const multicastPackets = 25
 
 // cast is one round: who sends, who joins, and who merely listens.
 type cast struct {
@@ -666,15 +794,15 @@ func checkMulticastDelivery(ctx context.Context, env *Env) Result {
 		for _, h := range c.recv {
 			wanted++
 			covered[h.Name] = true
-			if strings.Contains(got[h.Name], "received") {
+			why, ok := deliveredTo(h, got[h.Name], trees, group, c.src)
+			if ok {
 				delivered++
 				continue
 			}
-			missed = append(missed, fmt.Sprintf("%s never received %s sent by %s",
-				h.Name, group, c.src.Name))
+			missed = append(missed, why)
 		}
-		for name, out := range trees {
-			if strings.Contains(out, group) {
+		for name, t := range trees {
+			if t.carriesSource {
 				forwarding[name] = true
 			}
 		}
@@ -732,6 +860,42 @@ func checkMulticastDelivery(ctx context.Context, env *Env) Result {
 	}
 }
 
+// deliveredTo says whether the network carried the source's packets to this
+// host, and if not, what was seen instead.
+//
+// Two things have to hold, and neither is redundant. The packets have to have
+// arrived on the wire, which is the host's own kernel reporting where each
+// frame came from and is the only part a host cannot arrange for itself. And
+// the router on the host's segment has to have been told, by IGMP, to put the
+// group there -- which is the network's doing and not the host's, and is what
+// separates a tree that reaches a site from a site that found some other way to
+// see the traffic.
+func deliveredTo(h *model.Device, s seen, trees map[string]tree, group string,
+	src *model.Device) (string, bool) {
+
+	switch {
+	case s.arrived == 0 && s.looped > 0:
+		return fmt.Sprintf("%s saw %d packet(s) of %s's on %s, but every one of them was "+
+			"generated on the host itself rather than arriving on the wire",
+			h.Name, s.looped, src.Name, group), false
+	case s.arrived == 0:
+		return fmt.Sprintf("%s never received %s sent by %s", h.Name, group, src.Name), false
+	}
+	r, iface := lastHop(h)
+	if r == nil {
+		// Nothing in the shipped labs reaches this, and a host with no router
+		// on its segment cannot be graded on whether a tree reached it.
+		return fmt.Sprintf("%s has no router on its segment, so what reached it "+
+			"cannot be attributed to a tree", h.Name), false
+	}
+	if !trees[r.Name].oil[iface] {
+		return fmt.Sprintf("%s saw %s's packets, but %s is not putting %s on %s: "+
+			"the traffic reached the host without the tree being asked to deliver it",
+			h.Name, src.Name, r.Name, group, iface), false
+	}
+	return "", true
+}
+
 func checkMulticastNoFlooding(ctx context.Context, env *Env) Result {
 	as, ok := env.Topology.ASes[env.AS]
 	if !ok || !as.Multicast.Enabled {
@@ -758,7 +922,7 @@ func checkMulticastNoFlooding(ctx context.Context, env *Env) Result {
 		if err != nil {
 			return Errored("multicast.no_flooding", err)
 		}
-		if !strings.Contains(got[c.recv[0].Name], "received") {
+		if got[c.recv[0].Name].arrived == 0 {
 			// Nothing was delivered at all, so there is nothing to have
 			// leaked. That is the delivery question's failure, not this one,
 			// and marking it twice would punish one mistake in two places.
@@ -770,9 +934,9 @@ func checkMulticastNoFlooding(ctx context.Context, env *Env) Result {
 		for _, h := range c.bystanders {
 			listened++
 			overheard[h.Name] = true
-			if strings.Contains(got[h.Name], "received") {
-				leaked = append(leaked, fmt.Sprintf("%s received %s (sent by %s) without "+
-					"joining it", h.Name, group, c.src.Name))
+			if s := got[h.Name]; s.arrived > 0 {
+				leaked = append(leaked, fmt.Sprintf("%s saw %d packet(s) of %s (sent by %s) "+
+					"on its segment without joining it", h.Name, s.arrived, group, c.src.Name))
 			}
 		}
 	}
