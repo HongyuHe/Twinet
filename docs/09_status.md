@@ -617,6 +617,13 @@ reached students, and each motivated a permanent test.
     instance in another VRF holding one was invisible and the report said there
     was none. FRR keys both answers by VRF when asked for all of them, and a
     finding now names the instance it is in.
+67. **Our own prefix, sent with somebody else's origin.** Originating a prefix
+    means the path you send for it ends with your own AS number. `set as-path
+    exclude all` and a prepend of a foreign number produced an announcement
+    every neighbour treated as somebody else's, rejected as invalid and routed
+    around -- while the table on this side still showed the prefix locally
+    injected, and the question was marked from that. What leaves the AS is now
+    read for what it says about the origin of our own block.
 
 ## Environment findings
 

@@ -192,6 +192,7 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 		peers  []string
 	}
 	var reorigin struct{ router, routeMap, prefix string }
+	var disown struct{ router, routeMap, prefix, peer string }
 	var slowPrepend struct{ router, routeMap, seq, peer, original string }
 	var staticOverride struct{ router, prefix string }
 	var ebgpBlackhole struct{ router, peer string }
@@ -895,6 +896,41 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 				vtysh(t, dir, router, "configure terminal",
 					"route-map "+rmap+" permit "+seq,
 					" set as-path prepend "+asn+" "+asn+" "+asn,
+					"end")
+				vtysh(t, dir, router, "clear ip bgp "+peer+" out")
+				time.Sleep(20 * time.Second)
+			},
+		},
+		{
+			// Our own prefix, sent with somebody else's origin.
+			//
+			// The path an AS sends for its own address space must end with its
+			// own number. Replacing it makes every neighbour treat the
+			// announcement as somebody else's and route around it, while the
+			// table on this side still shows the prefix locally injected.
+			name:     "the AS's own prefix announced as coming from elsewhere",
+			question: "q2.2",
+			undo: func(t *testing.T) {
+				if disown.router == "" {
+					return
+				}
+				vtysh(t, dir, disown.router, "configure terminal",
+					"no route-map "+disown.routeMap+" permit 2",
+					"no ip prefix-list TWGRADE-DISOWN seq 5 permit "+disown.prefix,
+					"end")
+				vtysh(t, dir, disown.router, "clear ip bgp "+disown.peer+" out")
+			},
+			apply: func(t *testing.T) {
+				router, peer, rmap, _, _ := leakableRoute(t, dir, as)
+				own := ownBlockOf(t, dir, as)
+				disown = struct{ router, routeMap, prefix, peer string }{router, rmap, own, peer}
+				t.Logf("telling %s that %s comes from AS 65000", peer, own)
+				vtysh(t, dir, router, "configure terminal",
+					"ip prefix-list TWGRADE-DISOWN seq 5 permit "+own,
+					"route-map "+rmap+" permit 2",
+					" match ip address prefix-list TWGRADE-DISOWN",
+					" set as-path exclude all",
+					" set as-path prepend 65000",
 					"end")
 				vtysh(t, dir, router, "clear ip bgp "+peer+" out")
 				time.Sleep(20 * time.Second)
@@ -2204,6 +2240,35 @@ func slowPrependClause(t *testing.T, dir string, as int) (router, routeMap, seq,
 	}
 	t.Skip("no prepend towards a neighbour was found")
 	return "", "", "", "", "", ""
+}
+
+// ownBlockOf reads the address block this AS originates, from its own table.
+func ownBlockOf(t *testing.T, dir string, as int) string {
+	t.Helper()
+	for _, r := range routersOf(t, dir, as) {
+		out, err := twinet(t, "exec", "-m", dir, r, "--", "vtysh", "-c", "show ip bgp json")
+		if err != nil {
+			continue
+		}
+		var doc struct {
+			Routes map[string][]struct {
+				Path   string `json:"path"`
+				PeerID string `json:"peerId"`
+			} `json:"routes"`
+		}
+		if json.Unmarshal([]byte(out), &doc) != nil {
+			continue
+		}
+		for pfx, ps := range doc.Routes {
+			for _, p := range ps {
+				if p.PeerID == "(unspec)" && strings.TrimSpace(p.Path) == "" {
+					return pfx
+				}
+			}
+		}
+	}
+	t.Skip("this AS originates nothing")
+	return ""
 }
 
 // leakableRoute finds a router with an export policy towards a peer or
