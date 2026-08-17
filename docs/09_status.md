@@ -677,6 +677,17 @@ reached students, and each motivated a permanent test.
     `vpn.isolation` had the mirror hole, a leak that discards echo requests
     between two customers and carries their connections reading as perfectly
     separated tables, and is now asked over all three.
+75. **Receivers answering the question by talking to themselves.** Delivery was
+    measured as "something arrived on the group", and a host that sends to a
+    group on its own segment receives its own packets. Blocking the graded
+    traffic outright on every router and leaving a sender running on every host
+    therefore satisfied the question for every host at once, with nothing
+    delivered anywhere, and kept all four marks. Every packet the grader sends
+    now carries a token drawn when the check runs, and only packets carrying it
+    are counted. The tree behind them is read the same way: state *for the
+    group* is not enough, because a join creates a shared-tree entry whether or
+    not a packet ever crosses and a local sender creates one of its own, so the
+    routers must hold state naming the source this run sent from.
 
 ## Environment findings
 

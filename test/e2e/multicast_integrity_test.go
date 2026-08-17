@@ -194,6 +194,57 @@ func TestABrokenMulticastTreeLosesTheRightMarks(t *testing.T) {
 				time.Sleep(25 * time.Second)
 			},
 		},
+		{
+			// The receivers answering the question by talking to themselves.
+			//
+			// Delivery was measured as "something arrived on the group", and a
+			// host that sends to a group on its own segment receives its own
+			// packets. Blocking the graded traffic outright on every router and
+			// leaving a sender running on every host therefore satisfied the
+			// question for every host at once, with nothing delivered anywhere.
+			name:     "every host sending to the group on its own segment",
+			question: "q3",
+			undo: func(t *testing.T) {
+				group := testGroup(t, dir, as)
+				for _, dev := range routersOf(t, dir, as) {
+					_, _ = twinet(t, "exec", "-m", dir, dev, "--", "sh", "-c",
+						"iptables -D FORWARD -d "+group+" -p udp -j DROP; "+
+							"iptables -D INPUT -d "+group+" -p udp -j DROP; echo ok")
+				}
+				for _, h := range hostsOfAS(t, dir, as) {
+					_, _ = twinet(t, "exec", "-m", dir, h, "--", "sh", "-c",
+						"for p in $(ps -ef | awk '/[t]winet-mcast/ {print $1}'); do "+
+							"kill $p 2>/dev/null || true; done; echo ok")
+				}
+			},
+			apply: func(t *testing.T) {
+				group := testGroup(t, dir, as)
+				for _, dev := range routersOf(t, dir, as) {
+					if _, err := twinet(t, "exec", "-m", dir, dev, "--", "sh", "-c",
+						"iptables -I FORWARD 1 -d "+group+" -p udp -j DROP; "+
+							"iptables -I INPUT 1 -d "+group+" -p udp -j DROP; echo ok"); err != nil {
+						t.Fatalf("blocking %s on %s: %v", group, dev, err)
+					}
+				}
+				hosts := hostsOfAS(t, dir, as)
+				if len(hosts) < 2 {
+					t.Skip("this lab has too few hosts for the decoy to prove anything")
+				}
+				for _, h := range hosts {
+					// Time to live one, so the decoys never leave the segment
+					// and cannot be mistaken for traffic that crossed anything.
+					if _, err := twinet(t, "exec", "-m", dir, h, "--", "sh", "-c",
+						"i=$(ip -o -4 addr show | awk '$2!=\"lo\"{print $2; exit}'); "+
+							"nohup sh -c \"while true; do twinet-mcast -send -group "+group+
+							" -iface $i -count 200 -ttl 1; done\" >/dev/null 2>&1 & echo ok"); err != nil {
+						t.Fatalf("starting the decoy sender on %s: %v", h, err)
+					}
+				}
+				t.Logf("blocked %s in the network and left a sender running on each of %d host(s)",
+					group, len(hosts))
+				time.Sleep(5 * time.Second)
+			},
+		},
 	}
 
 	for _, c := range cases {
