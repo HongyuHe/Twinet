@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/HongyuHe/twinet/internal/model"
 )
@@ -228,10 +229,13 @@ func checkLDPAdjacencies(ctx context.Context, env *Env) Result {
 
 // checkVPNReachability asks whether each customer's sites can reach each other.
 //
-// It pings between hosts of the same customer, from one site to another. That
+// It sends between hosts of the same customer, from one site to another. That
 // is the only claim the exercise makes that a student can be sure of: the
 // branches run ordinary eBGP and know nothing about MPLS, so if two sites of a
 // bank can reach each other it is because the provider carried them.
+//
+// Ping, connection and datagram, because a bank's branches exchange none of
+// their business over ICMP.
 func checkVPNReachability(ctx context.Context, env *Env) Result {
 	groups, err := customerGroups(env)
 	if err != nil {
@@ -255,6 +259,7 @@ func checkVPNReachability(ctx context.Context, env *Env) Result {
 	var problems []string
 	tried := 0
 	sentTo := map[string]int{}
+	var carried []directedPair
 	for name, sites := range groups {
 		if len(sites) < 2 {
 			continue
@@ -275,11 +280,15 @@ func checkVPNReachability(ctx context.Context, env *Env) Result {
 						problems = append(problems, fmt.Sprintf(
 							"%s cannot reach %s (%s), both sites of %s",
 							d.from.host, d.to.host, d.to.addr, name))
+						continue
 					}
+					carried = append(carried, d)
 				}
 			}
 		}
 	}
+	// The pairs that answer a ping are asked to carry ordinary traffic too.
+	pingOnly := vpnTransportGaps(ctx, env, carried)
 	after := receivedEchoesAt(ctx, env, allSites)
 	for _, site := range allSites {
 		if sentTo[site.host] == 0 {
@@ -308,11 +317,104 @@ func checkVPNReachability(ctx context.Context, env *Env) Result {
 			Command:  "ping",
 		})
 	}
+	if len(pingOnly) > 0 {
+		// Half: the tables are joined and the pings cross, so the VPN exists,
+		// but a link that carries nothing a customer would send is not one they
+		// could use.
+		return Partial("vpn.site_reachability", 0.5, Evidence{
+			Expected: "each customer's sites exchange ordinary traffic, not only pings",
+			Observed: fmt.Sprintf("%d of %d site pair(s) carry ICMP and nothing else",
+				len(pingOnly), tried),
+			Detail: strings.Join(truncate(pingOnly, 6), "\n"),
+			Hint: "a VPN that answers a ping but drops connections and datagrams is not " +
+				"carrying the customer; check for filtering by protocol on the edge",
+			Command: "nc; /proc/net/snmp",
+		})
+	}
 	return Pass("vpn.site_reachability", Evidence{
 		Expected: "each customer's sites reach each other",
-		Observed: fmt.Sprintf("%d site pair(s) reachable, and every site received the traffic "+
-			"addressed to it", tried),
+		Observed: fmt.Sprintf("%d site pair(s) reachable by ping, connection and datagram, and "+
+			"every site received the traffic addressed to it", tried),
 	})
+}
+
+// vpnTransportGaps names the site pairs that answer a ping but do not carry
+// ordinary traffic.
+//
+// A VPN carrying ICMP and nothing else is not one a customer could use, and
+// ICMP is the easy thing to leave working: dropping TCP and UDP on the
+// provider's edges left every probe of this question succeeding and the mark
+// untouched, on a network where no bank could have opened a connection to its
+// own branch.
+//
+// Both transports are tried, in the direction the pair names, and arrival is
+// read at the destination. The sender's view is not evidence on its own: a
+// rule on the path can answer a connection with a reset of its own making, and
+// a dropped datagram is indistinguishable from a delivered one to whoever sent
+// it. The destination's kernel counts the resets it sent and the datagrams it
+// took delivery of for an unbound port, and neither is a number anything on the
+// way can raise.
+//
+// One pair at a time, so that a counter that moves belongs to the probe that
+// just ran.
+func vpnTransportGaps(ctx context.Context, env *Env, pairs []directedPair) []string {
+	var out []string
+	for _, d := range pairs {
+		if p := vpnTCPGap(ctx, env, d); p != "" {
+			out = append(out, p)
+		}
+		if p := vpnUDPGap(ctx, env, d); p != "" {
+			out = append(out, p)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// vpnTCPGap attempts one connection across a site pair and reports what did not
+// happen.
+func vpnTCPGap(ctx context.Context, env *Env, d directedPair) string {
+	before, okB := tcpResetsSent(ctx, env, d.to.host)
+	res, err := env.Probe(ctx, d.from.host,
+		[]string{"nc", "-v", "-w", "3", "-z", d.to.addr, probePort()})
+	if err != nil {
+		return "" // the machinery failed, which is not a verdict
+	}
+	after, okA := tcpResetsSent(ctx, env, d.to.host)
+	said := strings.ToLower(res.Stderr + res.Stdout)
+	answered := res.ExitCode == 0 ||
+		strings.Contains(said, "refused") || strings.Contains(said, "reset")
+	arrived := okB && okA && after > before
+
+	switch {
+	case answered && okB && okA && !arrived:
+		return fmt.Sprintf("%s got an answer from %s (%s) to a connection %s never saw: "+
+			"something on the path is answering for it", d.from.host, d.to.host, d.to.addr,
+			d.to.host)
+	case !answered && arrived:
+		return fmt.Sprintf("a connection from %s reaches %s (%s) but the answer does not come "+
+			"back, though pings do", d.from.host, d.to.host, d.to.addr)
+	case !answered:
+		return fmt.Sprintf("%s can ping %s (%s) but no connection to it arrives: the VPN is "+
+			"carrying ICMP and discarding the rest", d.from.host, d.to.host, d.to.addr)
+	}
+	return ""
+}
+
+// vpnUDPGap sends one datagram across a site pair and reads, at the far side,
+// whether it arrived.
+func vpnUDPGap(ctx context.Context, env *Env, d directedPair) string {
+	before, okB := datagramsDelivered(ctx, env, d.to)
+	if _, err := env.Probe(ctx, d.from.host, []string{"sh", "-c",
+		"echo twinet | nc -u -w 2 " + d.to.addr + " " + probePort()}); err != nil {
+		return ""
+	}
+	after, okA := datagramsDelivered(ctx, env, d.to)
+	if !okB || !okA || after > before {
+		return ""
+	}
+	return fmt.Sprintf("a datagram from %s to %s (%s) never arrived, though pings do: the VPN "+
+		"is filtering by protocol", d.from.host, d.to.host, d.to.addr)
 }
 
 // receivedEchoesAt reads each site host's count of ICMP echo requests the
@@ -398,12 +500,14 @@ func checkVPNIsolation(ctx context.Context, env *Env) Result {
 	// this replaced walked straight past it.
 	var leaks []string
 	tried := 0
+	var crossPairs []directedPair
 	for x := 0; x < len(names); x++ {
 		for y := x + 1; y < len(names); y++ {
 			for _, a := range groups[names[x]] {
 				for _, b := range groups[names[y]] {
 					for _, d := range directed(a, b) {
 						tried++
+						crossPairs = append(crossPairs, d)
 						reached, err := env.reaches(ctx, d.from.host, d.to.addr)
 						if err != nil {
 							return Errored("vpn.isolation", err)
@@ -418,6 +522,13 @@ func checkVPNIsolation(ctx context.Context, env *Env) Result {
 			}
 		}
 	}
+	// The same pairs over the transports a ping does not exercise. Isolation
+	// asked only of ICMP is isolation of ICMP: a path that discards echo
+	// requests between the customers and carries their connections and
+	// datagrams reads as perfectly separated tables, while the two banks are
+	// exchanging traffic.
+	leaks = append(leaks, vpnCrossTalk(ctx, env, crossPairs)...)
+
 	// And the tables themselves, because a probe that needs a reply cannot see
 	// a leak that only goes one way.
 	//
@@ -446,9 +557,137 @@ func checkVPNIsolation(ctx context.Context, env *Env) Result {
 	return Pass("vpn.isolation", Evidence{
 		Expected: "customers are kept apart, over a VPN that carries their traffic",
 		Observed: fmt.Sprintf("%d directed site pair(s) across %d customer(s) mutually "+
-			"unreachable, and no customer's table holds another's prefixes",
-			tried, len(names)),
+			"unreachable by ping, connection and datagram, and no customer's table holds "+
+			"another's prefixes", tried, len(names)),
 	})
+}
+
+// vpnCrossTalk names the cross-customer pairs that exchange anything at all.
+//
+// The ping between them is one protocol of three, and the one a leak is most
+// likely to be missing: a path that discards echo requests and carries the rest
+// is separated for the purposes of a check built on ping and joined for the
+// purposes of the customers. Both other transports are tried, and the evidence
+// for each is chosen so that a leak has to be real:
+//
+//   - a connection counts only when the far side answers it, which is a round
+//     trip and cannot happen unless the two sites can reach each other;
+//   - a datagram counts only when the far side's kernel takes delivery of
+//     several, so that a single unrelated packet arriving in the window is not
+//     read as a breach and does not cost a correct submission its marks.
+func vpnCrossTalk(ctx context.Context, env *Env, pairs []directedPair) []string {
+	var (
+		mu  sync.Mutex
+		out []string
+		wg  sync.WaitGroup
+	)
+	sem := make(chan struct{}, 8)
+	for _, d := range pairs {
+		wg.Add(1)
+		go func(d directedPair) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			res, err := env.Probe(ctx, d.from.host,
+				[]string{"nc", "-v", "-w", "3", "-z", d.to.addr, probePort()})
+			if err != nil {
+				return
+			}
+			said := strings.ToLower(res.Stderr + res.Stdout)
+			if res.ExitCode != 0 &&
+				!strings.Contains(said, "refused") && !strings.Contains(said, "reset") {
+				return
+			}
+			mu.Lock()
+			out = append(out, fmt.Sprintf(
+				"a connection from %s to %s (%s) was answered: the two customers are not "+
+					"separated, whatever happens to their pings",
+				d.from.host, d.to.host, d.to.addr))
+			mu.Unlock()
+		}(d)
+	}
+	wg.Wait()
+	out = append(out, vpnDatagramLeaks(ctx, env, pairs)...)
+	sort.Strings(out)
+	return out
+}
+
+// vpnDatagramLeaks sends datagrams across every cross-customer pair and reads,
+// at each destination, whether they arrived.
+//
+// A datagram is one way, so the sender learns nothing; the destination's count
+// of datagrams delivered for an unbound port is the only witness. The pairs are
+// scheduled so that no destination is aimed at twice at once, which is what
+// makes a counter that moved attributable to the sender that moved it.
+func vpnDatagramLeaks(ctx context.Context, env *Env, pairs []directedPair) []string {
+	const burst = 3 // several, so one stray packet in the window is not a verdict
+
+	var out []string
+	for _, round := range roundsByDestination(pairs) {
+		before := map[string]int{}
+		for _, d := range round {
+			if n, ok := datagramsDelivered(ctx, env, d.to); ok {
+				before[d.to.host] = n
+			}
+		}
+		var wg sync.WaitGroup
+		for _, d := range round {
+			wg.Add(1)
+			go func(d directedPair) {
+				defer wg.Done()
+				for i := 0; i < burst; i++ {
+					_, _ = env.Probe(ctx, d.from.host, []string{"sh", "-c",
+						"echo twinet | nc -u -w 1 " + d.to.addr + " " + probePort()})
+				}
+			}(d)
+		}
+		wg.Wait()
+		for _, d := range round {
+			b, ok := before[d.to.host]
+			if !ok {
+				continue
+			}
+			a, ok := datagramsDelivered(ctx, env, d.to)
+			if !ok || a-b < burst {
+				continue
+			}
+			out = append(out, fmt.Sprintf(
+				"datagrams from %s arrived at %s (%s): the two customers are not separated, "+
+					"whatever happens to their pings", d.from.host, d.to.host, d.to.addr))
+		}
+	}
+	return out
+}
+
+// roundsByDestination splits pairs into rounds within which every destination
+// appears at most once.
+func roundsByDestination(pairs []directedPair) [][]directedPair {
+	var rounds [][]directedPair
+	left := append([]directedPair(nil), pairs...)
+	for len(left) > 0 {
+		seen := map[string]bool{}
+		var round, rest []directedPair
+		for _, d := range left {
+			if seen[d.to.host] {
+				rest = append(rest, d)
+				continue
+			}
+			seen[d.to.host] = true
+			round = append(round, d)
+		}
+		rounds = append(rounds, round)
+		left = rest
+	}
+	return rounds
+}
+
+// datagramsDelivered reads a site's count of datagrams the kernel took delivery
+// of for a port nothing is bound to, in the family the site is addressed in.
+func datagramsDelivered(ctx context.Context, env *Env, s sitePoint) (int, bool) {
+	if strings.Contains(s.addr, ":") {
+		return udpNoPorts(ctx, env, s.host)
+	}
+	return udpNoPortsV4(ctx, env, s.host)
 }
 
 // anyCustomerTrafficArrives reports whether at least one customer's site can
