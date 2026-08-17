@@ -821,6 +821,23 @@ reached students, and each motivated a permanent test.
     placed than any student -- reading every host's process table from outside
     the lab and distributing the stolen tag instantly -- still 2.00, where it
     had been 4.00. Restored, 4.00.
+82. **The switch was asked about one bridge by name.** Every reading of Open
+    vSwitch named `br0`, because that is what the reference answer builds, and
+    `ovs-ofctl show br0` failing made the grader skip that switch without a
+    word. A submission that did its switching on a bridge called anything else
+    therefore had nothing read at all -- and since the isolation probe sends a
+    broadcast, which a rule aimed at one flow does not leak, a targeted
+    cross-VLAN forwarding entry on such a bridge cost nothing. Three things
+    were wrong at once: the name, the silence when it was not found, and the
+    assumption that one bridge is the whole switch. Now every bridge the switch
+    has is listed and read, port numbers are resolved against the bridge that
+    used them rather than whichever was read first, a switch that cannot be
+    asked is reported as unread instead of clean, and the hops are assembled
+    into a graph so that a way across through a second bridge -- out of a patch
+    port, in on its peer, back out in another VLAN, which no single flow
+    describes -- is found. The same name was hardcoded in the snapshot and
+    archive paths, so a submission that built its own bridge lost those ports'
+    VLANs on the way through its own backup; both now walk every bridge.
 
 ## Environment findings
 

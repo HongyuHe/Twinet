@@ -1351,16 +1351,15 @@ func crossVLANForwarding(ctx context.Context, env *Env, domain string) []string 
 		if domain != "" && d.L2Domain != "" && d.L2Domain != domain {
 			continue
 		}
-		ports, err := env.Probe(ctx, d.ID, []string{"ovs-ofctl", "show", "br0"})
-		if err != nil || ports.ExitCode != 0 {
-			continue
-		}
 		tags, err := env.Probe(ctx, d.ID,
 			[]string{"ovs-vsctl", "--columns=name,tag", "--format=csv", "list", "port"})
 		if err != nil || tags.ExitCode != 0 {
+			out = append(out, fmt.Sprintf(
+				"%s could not be asked which VLAN its ports are in, so nothing it forwards "+
+					"was read", d.Name))
 			continue
 		}
-		byNum, vlanOfPort := ovsPortMap(ports.Stdout, tags.Stdout)
+		_, vlanOfPort := ovsPortMap("", tags.Stdout)
 		// Anything the kernel has been told to copy, before the switch's own
 		// tables. `tc filter ... action mirred egress mirror dev <other>` on
 		// an access port copies frames into another VLAN without touching a
@@ -1369,43 +1368,209 @@ func crossVLANForwarding(ctx context.Context, env *Env, domain string) []string 
 		out = append(out, mirroredPorts(ctx, env, d, vlanOfPort)...)
 		out = append(out, ovsMirrors(ctx, env, d, vlanOfPort)...)
 
-		// The buckets of every group, because a flow's action can be a group
-		// and the flow table then says nothing at all about where the frame
-		// goes. A switch with no group is the normal case, so an error here
-		// is not one.
-		groups := map[string]string{}
-		if g, err := env.Probe(ctx, d.ID,
-			[]string{"ovs-ofctl", "dump-groups", "br0"}); err == nil && g.ExitCode == 0 {
-			groups = ovsGroupBuckets(g.Stdout)
-		}
-
-		flows, err := env.Probe(ctx, d.ID, []string{"ovs-ofctl", "dump-flows", "br0"})
-		if err != nil || flows.ExitCode != 0 {
+		// Every bridge the switch has, not the one the reference answer
+		// happens to build. `br0` was the only name ever asked for, and
+		// `ovs-ofctl show br0` failing meant this switch was passed over in
+		// silence -- so a submission that did its forwarding on a bridge by
+		// any other name was never read at all.
+		list, err := env.Probe(ctx, d.ID, []string{"ovs-vsctl", "list-br"})
+		if err != nil || list.ExitCode != 0 {
+			out = append(out, fmt.Sprintf(
+				"%s could not be asked which bridges it has, so nothing it forwards was read",
+				d.Name))
 			continue
 		}
-		for _, line := range strings.Split(flows.Stdout, "\n") {
-			if !strings.Contains(line, "actions=") {
+		var bridges []string
+		for _, b := range strings.Split(list.Stdout, "\n") {
+			if b = strings.TrimSpace(b); b != "" {
+				bridges = append(bridges, b)
+			}
+		}
+		if len(bridges) == 0 {
+			out = append(out, fmt.Sprintf("%s has no bridge, so it switches nothing", d.Name))
+			continue
+		}
+
+		g := &ovsGraph{vlanOf: vlanOfPort, edges: map[string]map[string]bool{}}
+		for _, br := range bridges {
+			ports, err := env.Probe(ctx, d.ID, []string{"ovs-ofctl", "show", br})
+			if err != nil || ports.ExitCode != 0 {
+				out = append(out, fmt.Sprintf(
+					"%s's bridge %s could not be read, so what it forwards is unknown",
+					d.Name, br))
 				continue
 			}
-			in, outs := ovsFlowPorts(line, byNum, groups)
-			for _, o := range outs {
-				iv, ok1 := vlanOfPort[in]
-				ov, ok2 := vlanOfPort[o]
-				switch {
-				case in != "" && ok1 && ok2 && iv != ov:
-					out = append(out, fmt.Sprintf(
-						"%s is told to send frames from %s (VLAN %d) out of %s (VLAN %d)",
-						d.Name, in, iv, o, ov))
-				case in == "" && ok2:
-					out = append(out, fmt.Sprintf(
-						"%s is told to send frames out of %s (VLAN %d) whatever port they "+
-							"arrived on", d.Name, o, ov))
+			// Port numbers are the bridge's own, so they are resolved against
+			// the bridge that used them and not against whichever bridge was
+			// read first.
+			byNum, _ := ovsPortMap(ports.Stdout, "")
+
+			// The buckets of every group, because a flow's action can be a
+			// group and the flow table then says nothing at all about where
+			// the frame goes. A switch with no group is the normal case, so
+			// an error here is not one.
+			groups := map[string]string{}
+			if gr, err := env.Probe(ctx, d.ID,
+				[]string{"ovs-ofctl", "dump-groups", br}); err == nil && gr.ExitCode == 0 {
+				groups = ovsGroupBuckets(gr.Stdout)
+			}
+
+			flows, err := env.Probe(ctx, d.ID, []string{"ovs-ofctl", "dump-flows", br})
+			if err != nil || flows.ExitCode != 0 {
+				out = append(out, fmt.Sprintf(
+					"%s's bridge %s would not say what it forwards", d.Name, br))
+				continue
+			}
+			anywhere := "*" + br
+			for _, n := range byNum {
+				g.link(n, anywhere)
+			}
+			for _, line := range strings.Split(flows.Stdout, "\n") {
+				if !strings.Contains(line, "actions=") {
+					continue
+				}
+				in, outs := ovsFlowPorts(line, byNum, groups)
+				for _, o := range outs {
+					iv, ok1 := vlanOfPort[in]
+					ov, ok2 := vlanOfPort[o]
+					switch {
+					case in != "" && ok1 && ok2 && iv != ov:
+						out = append(out, fmt.Sprintf(
+							"%s is told to send frames from %s (VLAN %d) out of %s (VLAN %d)",
+							d.Name, in, iv, o, ov))
+					case in == "" && ok2:
+						out = append(out, fmt.Sprintf(
+							"%s is told to send frames out of %s (VLAN %d) whatever port they "+
+								"arrived on", d.Name, o, ov))
+					}
+					if in == "" {
+						g.link(anywhere, o)
+					} else {
+						g.link(in, o)
+					}
 				}
 			}
 		}
+		// A frame put out of a patch port comes in on its peer, which is how
+		// two bridges are joined. Following that is what makes a second
+		// bridge worth reading: on its own it holds no VLAN, and the way
+		// across is the pair of hops through it.
+		for a, b := range ovsPatchPeers(ctx, env, d) {
+			g.patch(a, b)
+		}
+		out = append(out, g.crossings(d.Name)...)
 	}
 	sort.Strings(out)
 	return out
+}
+
+// ovsGraph is where a frame can get to inside one switch: the ports, and every
+// hop the switch has been told to make between them.
+//
+// One bridge's flow table is not the whole switch. Bridges are joined by patch
+// ports -- what goes out of one arrives on its peer -- so a frame can leave a
+// VLAN 10 port, cross into a second bridge, and come back out somewhere in
+// VLAN 20 without any single flow naming ports in two VLANs. Reading the hops
+// as a graph is what makes that visible.
+type ovsGraph struct {
+	vlanOf map[string]int
+	// from -> to -> whether the hop crosses between bridges.
+	edges map[string]map[string]bool
+}
+
+func (g *ovsGraph) add(from, to string, isPatch bool) {
+	if from == "" || to == "" {
+		return
+	}
+	if g.edges[from] == nil {
+		g.edges[from] = map[string]bool{}
+	}
+	g.edges[from][to] = g.edges[from][to] || isPatch
+}
+
+// link records a hop the switch makes within one bridge.
+func (g *ovsGraph) link(from, to string) { g.add(from, to, false) }
+
+// patch records the hop from a patch port to the peer it arrives on.
+func (g *ovsGraph) patch(from, to string) { g.add(from, to, true) }
+
+// crossings names the ways a frame can get from a port in one VLAN to a port
+// in another by way of a second bridge.
+//
+// Hops within a single bridge are reported where they are read, port by port,
+// so only paths that leave the bridge are named here -- otherwise one flow
+// would be complained about twice.
+func (g *ovsGraph) crossings(dev string) []string {
+	srcs := make([]string, 0, len(g.vlanOf))
+	for p := range g.vlanOf {
+		srcs = append(srcs, p)
+	}
+	sort.Strings(srcs)
+
+	var out []string
+	for _, src := range srcs {
+		v := g.vlanOf[src]
+		type step struct {
+			port    string
+			crossed bool
+		}
+		seen := map[step]bool{{src, false}: true}
+		queue := []step{{src, false}}
+		for len(queue) > 0 {
+			cur := queue[0]
+			queue = queue[1:]
+			nexts := make([]string, 0, len(g.edges[cur.port]))
+			for n := range g.edges[cur.port] {
+				nexts = append(nexts, n)
+			}
+			sort.Strings(nexts)
+			for _, n := range nexts {
+				st := step{n, cur.crossed || g.edges[cur.port][n]}
+				if seen[st] {
+					continue
+				}
+				if u, ok := g.vlanOf[n]; ok && u != v && st.crossed {
+					out = append(out, fmt.Sprintf(
+						"%s is told to carry frames from %s (VLAN %d) across to %s (VLAN %d) "+
+							"by way of another bridge", dev, src, v, n, u))
+					queue = nil
+					break
+				}
+				seen[st] = true
+				queue = append(queue, st)
+			}
+		}
+	}
+	return out
+}
+
+// ovsPatchPeers reads which of a switch's ports are patch ports, and the port
+// each one delivers to.
+func ovsPatchPeers(ctx context.Context, env *Env, d *model.Device) map[string]string {
+	peers := map[string]string{}
+	r, err := env.Probe(ctx, d.ID, []string{"ovs-vsctl", "--columns=name,type,options",
+		"--format=csv", "list", "interface"})
+	if err != nil || r.ExitCode != 0 {
+		return peers
+	}
+	for _, line := range strings.Split(r.Stdout, "\n") {
+		i := strings.Index(line, "peer=")
+		if i < 0 {
+			continue
+		}
+		// The name is the first field; options hold commas of their own, so
+		// the peer is read from where it is written rather than by counting
+		// fields.
+		name := strings.Trim(strings.TrimSpace(strings.SplitN(line, ",", 2)[0]), `"`)
+		peer := line[i+len("peer="):]
+		if j := strings.IndexAny(peer, `,}" `); j >= 0 {
+			peer = peer[:j]
+		}
+		if name != "" && peer != "" && name != "name" {
+			peers[name] = peer
+		}
+	}
+	return peers
 }
 
 // mirroredPorts names the traffic-control rules on a switch that copy frames
@@ -2008,7 +2173,7 @@ func checkVLANIsolation(ctx context.Context, env *Env) Result {
 				"probed pairs", crossed, len(rules), len(probed), tested),
 			Detail:  strings.Join(truncate(leaks, 8), "\n"),
 			Hint:    "an access port belongs to one VLAN; check for anything bridging, mirroring or forwarding between them",
-			Command: "arping; ip neigh show; ovs-ofctl dump-flows br0",
+			Command: "arping; ip neigh show; ovs-vsctl list-br; ovs-ofctl dump-flows <bridge>",
 		})
 	}
 
