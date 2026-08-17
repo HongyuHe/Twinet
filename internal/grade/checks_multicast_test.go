@@ -217,3 +217,27 @@ func hostBehindRouter(host, router, iface string) (*model.Device, *model.Device)
 	r.Ifaces = []*model.Iface{ri}
 	return h, r
 }
+
+// A site that sees packets for the group from some other sender is told so.
+//
+// The commonest way a submission produces traffic on the group is a sender of
+// its own, and after the source filter those packets never become sightings at
+// all. Reporting only "never received" would hide the one fact that explains
+// what the student is looking at.
+func TestASiteToldWhatItSawInsteadOfTheSource(t *testing.T) {
+	s := mcastReport("twinet-mcast joined=true group=237.0.0.10 iface=host seconds=25 "+
+		"wire=0 loopback=0 elsewhere=12 sources=none\n", map[string]bool{"aa": true})
+	if s.elsewhere != 12 {
+		t.Fatalf("elsewhere = %d, want 12", s.elsewhere)
+	}
+	h, r := hostBehindRouter("LEFT_host", "LEFT", "host")
+	why, ok := deliveredTo(h, s, map[string]tree{
+		r.Name: {carriesSource: true, oil: map[string]bool{"host": true}},
+	}, "237.0.0.10", &model.Device{Name: "TOP_host"})
+	if ok {
+		t.Fatal("a site that received nothing of the source's was credited with delivery")
+	}
+	if !strings.Contains(why, "somebody else's source address") {
+		t.Fatalf("the report does not say what reached the host: %q", why)
+	}
+}

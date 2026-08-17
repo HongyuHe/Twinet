@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/netip"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -403,12 +404,13 @@ func hostIface(d *model.Device) string {
 // is this host talking to itself, which is what `looped` counts, and a host
 // whose site receives nothing can produce as many of those as it likes.
 type seen struct {
-	joined  bool
-	arrived int // packets of this run's, off the wire
-	looped  int // packets of this run's, generated on this host
-	foreign int // packets on the group this run did not send
-	sources []string
-	raw     string
+	joined    bool
+	arrived   int // packets of this run's, off the wire
+	looped    int // packets of this run's, generated on this host
+	foreign   int // packets on the group this run did not send
+	elsewhere int // packets on the group carrying some other source address
+	sources   []string
+	raw       string
 }
 
 // mcastReport turns what a host reported into what it means for this run.
@@ -424,8 +426,23 @@ func mcastReport(out string, want map[string]bool) seen {
 		switch {
 		case len(f) >= 2 && f[0] == "twinet-mcast":
 			for _, kv := range f[1:] {
-				if k, v, ok := strings.Cut(kv, "="); ok && k == "joined" {
+				k, v, ok := strings.Cut(kv, "=")
+				if !ok {
+					continue
+				}
+				switch k {
+				case "joined":
 					s.joined = v == "true"
+				case "elsewhere":
+					// Packets on the group carrying a source other than the
+					// one this run sent from. The host is told about them
+					// because a submission generating its own traffic on the
+					// group is the commonest reason a site sees something and
+					// still has no tree.
+					n, err := strconv.Atoi(v)
+					if err == nil {
+						s.elsewhere = n
+					}
 				}
 			}
 		case len(f) == 4 && f[0] == "packet":
@@ -878,6 +895,10 @@ func deliveredTo(h *model.Device, s seen, trees map[string]tree, group string,
 		return fmt.Sprintf("%s saw %d packet(s) of %s's on %s, but every one of them was "+
 			"generated on the host itself rather than arriving on the wire",
 			h.Name, s.looped, src.Name, group), false
+	case s.arrived == 0 && s.elsewhere > 0:
+		return fmt.Sprintf("%s never received %s sent by %s; %d packet(s) for the group did "+
+			"reach it, but carrying somebody else's source address",
+			h.Name, group, src.Name, s.elsewhere), false
 	case s.arrived == 0:
 		return fmt.Sprintf("%s never received %s sent by %s", h.Name, group, src.Name), false
 	}

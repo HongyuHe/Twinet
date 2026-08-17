@@ -406,6 +406,33 @@ accusation does not, because it carries the burden of proof, and isolation has
 two further witnesses — the routing tables and the datagram counters — so
 nothing rests on this one alone.
 
+### Who sent a packet a host received
+
+The same question one layer down. A datagram socket reports what the kernel
+handed it; it cannot report where that came from. Multicast makes the gap
+concrete: a host that sends to a group on its own segment receives its own
+packets, because loopback is on by default. So "the group arrived here" is
+something any site can arrange for itself, with no tree anywhere.
+
+A tag on the payload does not fix it. The student owns the sending host in
+these exercises, so anything the probe puts on the wire can be read off it —
+and while the tag was passed on the probe's command line it did not even need
+that, since the probe's argv sits in the student's own process table.
+
+What settles it is the kernel. A packet socket is told, for every frame,
+whether it was received, transmitted, or looped back by this host, and that is
+not something a program in the namespace can rewrite. The probe therefore binds
+one — to every protocol, not just IP, so that the host's own traffic arrives
+too and can be *named* rather than merely missed — and only frames that came in
+off the wire count as delivery.
+
+Two smaller things follow. The probe no longer holds the tag: it reports what it
+saw as digests, and the matching happens in the grader, which is the only place
+that knows what was sent. And delivery also requires the router on the
+receiver's own segment to be putting the group there, which is the network's
+doing and not the host's — it is what separates a tree that reached a site from
+a site that found some other way to see the traffic.
+
 ## Grading a class
 
 Two modes, and the difference is what they cost.

@@ -799,6 +799,28 @@ reached students, and each motivated a permanent test.
     burden of proof. Measured: the forged refusal 4.00 → 6.00, the forged reset
     10.00 → 9.90, and on a connection that genuinely lands the destination's
     `OutRsts` moves 18 → 19.
+81. **A host cannot be its own delivery.** The multicast question asks whether
+    the tree carried the source's packets to a site, and it was answered by a
+    datagram socket -- which reports what the kernel handed it and cannot say
+    where it came from. A host that sends to a group on its own segment
+    receives its own packets, so any site could produce the traffic the network
+    was failing to deliver. The tag was meant to close that, and it was handed
+    to the probe on its command line, in the student's own process table: a
+    fifteen-line watcher polling `/proc/*/cmdline` read it and forged the rest.
+    Dropping every genuine delivery cost half the mark; adding the watchers put
+    it back, on a network across which nothing was carried. Three things are
+    different now. The probe reads with a packet socket bound to every
+    protocol, so the kernel tells it whether each frame was received,
+    transmitted or looped back, and only what came in off the wire counts --
+    the host's own traffic is not merely excluded but named in the report. The
+    probe no longer holds the tag at all: it reports digests of what it saw and
+    the matching happens in the grader, which is the only place that knows what
+    was sent. And delivery now also requires the router on the receiver's own
+    segment to be putting the group there, which is the network's doing rather
+    than the host's. Measured: the drop 4.00 → 2.00, and with a thief better
+    placed than any student -- reading every host's process table from outside
+    the lab and distributing the stolen tag instantly -- still 2.00, where it
+    had been 4.00. Restored, 4.00.
 
 ## Environment findings
 
