@@ -748,6 +748,30 @@ reached students, and each motivated a permanent test.
     no instance, opens no port and is not a finding. Measured at 4.80 of 6.00
     with the hidden daemon, 6.00 without. `ps` joined the programs a mark
     depends on and is hashed against the image with the rest.
+79. **The policy written near a session is not the policy it runs.** A
+    neighbour's route-map was looked up by the address on the line, which is not
+    how FRR decides what governs a session. A session takes its settings from
+    its peer-group unless it states its own, and a peer-group is a template that
+    nothing peers with. Reading only the lines written against the address got
+    this wrong in both directions at once. Binding a correct policy once on a
+    peer-group and pointing the sessions at it -- the ordinary way to write this
+    -- was marked as no policy at all: the cos461 reference scored 9.80 for
+    accepting invalid origins it was in fact rejecting, which is the worse
+    failure of the two, because a student who is right has no way to tell the
+    grader is wrong. And the same blindness gave full marks to a submission that
+    put the correct policy on the group while overriding it on the session with
+    one that filters nothing. The group carried the remote AS, so the group
+    stood among the external sessions in place of its own member, and the check
+    read the decoy; on the cluster the session ran the override -- the local
+    preference the routes carried was the override's -- and the AS scored 10.00
+    with no origin validation on its only external session. A binding also
+    governs only the address family it was written in; FRR prints IPv6 after
+    IPv4 and the last one parsed was kept, so a policy bound inbound under
+    `address-family ipv6 unicast` stood for the IPv4 session, measured at 10.00
+    before and 9.80 after. Neighbour lookups now resolve group inheritance per
+    setting and per direction, keep the family a binding was written in, and
+    never grade a peer-group as a session. Measured: the decoy 10.00 → 9.80, the
+    correct peer-group answer 9.80 → 10.00.
 
 ## Environment findings
 

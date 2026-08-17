@@ -335,6 +335,44 @@ expensive of the two mistakes. What remains uncovered is a BGP speaker that has
 been renamed *and* moved off port 179, which is stated here rather than papered
 over.
 
+### Which policy governs a session
+
+A route-map is judged by what it does to the session it is on, so the grader has
+to work out which route-map that is — and the answer is not "the one written on
+a line with this address in it".
+
+FRR resolves it in two steps the reader has to follow. A session takes each
+setting from its peer-group unless it states that setting itself, per setting
+and per direction; and a binding governs only the address family it was written
+in. A peer-group is a template: nothing peers with it, and it has no marks of
+its own.
+
+Skipping either step is wrong in both directions at once, which is what makes it
+worth spelling out:
+
+- **The correct answer loses marks.** Binding an import policy once on a
+  peer-group and pointing every session at it is how this is written in
+  practice. Read literally, each of those sessions has no policy — so the
+  reference lost the origin-validation mark for filtering it was performing.
+  This is the more serious of the two failures. A student who is right has no
+  way to discover that the grader is wrong, and no evidence to argue with.
+- **The wrong answer keeps them.** Put the correct policy on the group, then
+  override it on the session with one that filters nothing. The clause the
+  grader searches for is still in the configuration, and the router never runs
+  it. If the group also carries the `remote-as` — which it usually will, since
+  that is half the point of a group — then the group itself appears in the list
+  of external sessions in place of its own members, and the sessions are never
+  examined at all.
+
+The same applies across families: FRR prints `address-family ipv6 unicast` after
+`ipv4`, so a reader that keeps the last binding it saw will report an IPv6
+policy as the policy on an IPv4 session.
+
+The rule this comes down to is that a configuration is a program with scoping
+rules, and grepping it is not reading it. Wherever a check asks what a
+configuration says about one object, it has to resolve the same inheritance the
+daemon does, or it is reading a different program from the one that runs.
+
 ## Grading a class
 
 Two modes, and the difference is what they cost.
