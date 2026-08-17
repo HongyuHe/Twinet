@@ -288,7 +288,7 @@ func checkVPNReachability(ctx context.Context, env *Env) Result {
 		}
 	}
 	// The pairs that answer a ping are asked to carry ordinary traffic too.
-	pingOnly := vpnTransportGaps(ctx, env, carried)
+	pingOnly, pingOnlyPairs := vpnTransportGaps(ctx, env, carried)
 	after := receivedEchoesAt(ctx, env, allSites)
 	for _, site := range allSites {
 		if sentTo[site.host] == 0 {
@@ -324,7 +324,7 @@ func checkVPNReachability(ctx context.Context, env *Env) Result {
 		return Partial("vpn.site_reachability", 0.5, Evidence{
 			Expected: "each customer's sites exchange ordinary traffic, not only pings",
 			Observed: fmt.Sprintf("%d of %d site pair(s) carry ICMP and nothing else",
-				len(pingOnly), tried),
+				pingOnlyPairs, tried),
 			Detail: strings.Join(truncate(pingOnly, 6), "\n"),
 			Hint: "a VPN that answers a ping but drops connections and datagrams is not " +
 				"carrying the customer; check for filtering by protocol on the edge",
@@ -356,19 +356,24 @@ func checkVPNReachability(ctx context.Context, env *Env) Result {
 // way can raise.
 //
 // One pair at a time, so that a counter that moves belongs to the probe that
-// just ran.
-func vpnTransportGaps(ctx context.Context, env *Env, pairs []directedPair) []string {
+// just ran. Returns the gaps found and how many pairs they fall across.
+func vpnTransportGaps(ctx context.Context, env *Env, pairs []directedPair) ([]string, int) {
 	var out []string
+	affected := 0
 	for _, d := range pairs {
+		n := len(out)
 		if p := vpnTCPGap(ctx, env, d); p != "" {
 			out = append(out, p)
 		}
 		if p := vpnUDPGap(ctx, env, d); p != "" {
 			out = append(out, p)
 		}
+		if len(out) > n {
+			affected++
+		}
 	}
 	sort.Strings(out)
-	return out
+	return out, affected
 }
 
 // vpnTCPGap attempts one connection across a site pair and reports what did not
