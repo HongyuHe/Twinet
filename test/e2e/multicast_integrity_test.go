@@ -110,6 +110,33 @@ func TestABrokenMulticastTreeLosesTheRightMarks(t *testing.T) {
 			},
 		},
 		{
+			// Half the range sent somewhere else.
+			//
+			// PIM takes the most specific mapping for each group separately, so
+			// a mapping covering the half of the declared range that the tested
+			// address is not in leaves the test alone and takes the rest.
+			name:     "half the declared group range rooted elsewhere",
+			question: "q2",
+			apply: func(t *testing.T) {
+				group := testGroup(t, dir, as)
+				// The half the tested address is not in.
+				half := group[:strings.LastIndexByte(group, '.')] + ".128/25"
+				for _, dev := range routersOf(t, dir, as) {
+					vtysh(t, dir, dev, "configure terminal",
+						"ip pim rp 10.255.255.1 "+half, "end")
+				}
+				time.Sleep(15 * time.Second)
+			},
+			undo: func(t *testing.T) {
+				group := testGroup(t, dir, as)
+				half := group[:strings.LastIndexByte(group, '.')] + ".128/25"
+				for _, dev := range routersOf(t, dir, as) {
+					vtysh(t, dir, dev, "configure terminal",
+						"no ip pim rp 10.255.255.1 "+half, "end")
+				}
+			},
+		},
+		{
 			// PIM off one link of the core.
 			//
 			// The interface stays up and unicast keeps working over it, so

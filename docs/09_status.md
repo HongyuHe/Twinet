@@ -658,6 +658,13 @@ reached students, and each motivated a permanent test.
     interval later says whether one arrived: a healthy adjacency cannot lose
     more than one hello interval of dead time between two readings, and a silent
     one loses the whole wait.
+73. **Half a group range rooted somewhere else.** The rendezvous point was
+    checked for the one group the rest of the exercise uses, and PIM takes the
+    most specific mapping for each group separately. A mapping covering the half
+    of the declared range the tested address is not in leaves the test alone and
+    takes the rest with it, which was worth nothing. Any mapping inside the
+    declared range that points elsewhere is now part of that range going to the
+    wrong root, whichever address the exercise happens to test.
 
 ## Environment findings
 
