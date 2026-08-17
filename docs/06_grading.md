@@ -373,6 +373,39 @@ rules, and grepping it is not reading it. Wherever a check asks what a
 configuration says about one object, it has to resolve the same inheritance the
 daemon does, or it is reading a different program from the one that runs.
 
+### Who answered a connection
+
+A program making a TCP connection learns whether it got an answer. It does not
+learn who sent it, and it cannot. A reset carries the destination's address
+because whoever wrote it put that address there: `iptables -j REJECT
+--reject-with tcp-reset` on any router along the way forges one, an ICMP
+unreachable from a router reaches the caller in the same words, and a host
+firewall on the sender produces it without a packet ever leaving.
+
+Three checks read "refused" as the far side speaking, and the premise is wrong
+in both directions at once:
+
+- **Isolation.** A refusal was counted as two customers exchanging traffic. A
+  network that rejects cross-customer connections rather than dropping them in
+  silence is isolating — more helpfully than one that leaves the sender waiting
+  for a timeout — and it was marked as leaking.
+- **Reachability.** A refusal was counted as proof that packets arrive. One
+  `REJECT` rule on a router restored full marks for a network across which no
+  connection could pass.
+
+What settles it is the destination's own record: the resets it sent plus the
+connections it accepted, read before and after the attempt. Neither counter
+moves unless the packets got there, and nothing on the path can raise either.
+Probes are scheduled so that no destination is aimed at twice at once — a
+counter that moved while two attempts were in flight is nobody's in particular.
+
+The two directions part company where the destination cannot be asked, and the
+asymmetry is deliberate. Reachability falls back to the prober's view: failing a
+correct path because a file could not be read is the more expensive mistake. An
+accusation does not, because it carries the burden of proof, and isolation has
+two further witnesses — the routing tables and the datagram counters — so
+nothing rests on this one alone.
+
 ## Grading a class
 
 Two modes, and the difference is what they cost.

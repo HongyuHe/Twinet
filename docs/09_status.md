@@ -772,6 +772,33 @@ reached students, and each motivated a permanent test.
     setting and per direction, keep the family a binding was written in, and
     never grade a peer-group as a session. Measured: the decoy 10.00 → 9.80, the
     correct peer-group answer 9.80 → 10.00.
+80. **A refusal is not the far side speaking.** A program making a TCP
+    connection learns whether it got an answer, never who sent it. A reset
+    carries the destination's address because whoever wrote it put that address
+    there, and any router on the way can write one — `iptables -j REJECT
+    --reject-with tcp-reset` forges exactly the answer three checks were reading
+    as proof of who answered, and an ICMP unreachable reaches the caller in the
+    same words. The premise was wrong in both directions at once. `vpn.isolation`
+    counted a refusal as two customers exchanging traffic, so a network that
+    rejects cross-customer connections rather than dropping them in silence —
+    which is isolation, implemented more helpfully — was reported as leaking:
+    a host firewall on a customer site, whose packets never left the host, cost
+    the provider 2.00 of 6.00. In the other direction `dataplane.internal_
+    reachability` and the transit check read a refusal as proof that packets
+    arrive, so one `REJECT --reject-with tcp-reset` on a router restored the
+    mark for a network across which no connection could pass; the transit check
+    had even read the destination's counter already and then cleared itself on
+    the refusal regardless. Every one of them now reads the destination's own
+    record — the resets it sent plus the connections it accepted, neither of
+    which moves unless the packets got there — and probes are scheduled so no
+    destination is aimed at twice at once, since a counter that moved is
+    otherwise nobody's in particular. Where the destination cannot be asked the
+    two directions part company deliberately: reachability falls back to the
+    prober's view, because failing a correct path over an unreadable file is the
+    more expensive mistake, while an accusation does not, because it carries the
+    burden of proof. Measured: the forged refusal 4.00 → 6.00, the forged reset
+    10.00 → 9.90, and on a connection that genuinely lands the destination's
+    `OutRsts` moves 18 → 19.
 
 ## Environment findings
 
