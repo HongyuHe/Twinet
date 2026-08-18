@@ -930,6 +930,105 @@ reached students, and each motivated a permanent test.
     *not* done: excusing rules whose packet counter is zero, which was the
     obvious fix and would have passed a submission with its VLANs wide open so
     long as nobody sent anything while the grader watched.
+89. **Silence from a listener read as an empty wire.** Found in our own audit
+    of the multicast checks, which have had less attention than cos461. Both
+    multicast questions ran `twinet-mcast` on a host and parsed its output;
+    neither looked at its exit status, and a host that printed nothing parsed
+    to "saw nothing". A student has root in their containers, so a bystander
+    whose listener is made to fail reported no packets, and `no_flooding`
+    passed a submission that was flooding -- nothing was reported, so nothing
+    had leaked. The same silence in the other direction failed a receiver whose
+    listener did not run, for a network fault that was not theirs. A run now
+    requires every host to have printed its summary line, and requires the
+    receivers to have joined and the bystanders not to have; anything else
+    holds the question for review rather than grading it. The exit status is
+    checked too.
+90. **The same silence, in the VLAN broadcast probe.** Found by sweeping every
+    probe in the grading package whose exit status is never read. A pair was
+    counted as tested the moment the sending host's `arping` returned, and the
+    destination's neighbour table was read afterwards. If that read failed, the
+    pair had already been counted, and a pair with no recorded neighbour scores
+    as a pair the frame did not reach -- so a destination that could not be
+    asked was marked as one the broadcast never got to. A pair now counts as
+    tested only once its destination has actually been read; pairs that could
+    not be read are reported, and if none could be read the question is held
+    rather than passed.
+91. **And again in the L3VPN transport probe.** The question that catches a VPN
+    carrying pings and nothing else reads, at the destination, the resets it
+    sent and the datagrams it took delivery of. Neither counter is one the
+    sender can see, which is the point. But when a counter could not be read
+    the helper returned "no gap", the pair was scored as carrying ordinary
+    traffic, and the pass said in as many words that "every site received the
+    traffic addressed to it" -- a sentence about an observation nobody made.
+    A pair whose far side cannot be read is now named as untested and the
+    question is held, rather than passed on the strength of the sender's own
+    view of a datagram, which is no view at all.
+92. **A rendezvous point written the other way was invisible.** (Round 103.)
+    FRR takes a rendezvous point's groups either inline -- `ip pim rp <addr>
+    237.0.0.0/24` -- or by prefix-list: `ip pim rp <addr> prefix-list NAME`.
+    The second column of `show ip pim rp-info` then holds the list's *name*,
+    and the parser skipped any row whose second column had no slash in it. Both
+    directions were wrong. A student whose prefix-list plainly covers the test
+    group was told "CENTER has no rendezvous point covering 237.0.0.10", which
+    is false, and lost a sixth of the question -- while `multicast.delivery`
+    gave them full marks for the tree that mapping built. And a *wrong*
+    rendezvous point installed the same way, more specific than the declared
+    range, was invisible to the check that exists to find exactly that. Lists
+    are now resolved on the router that names them, in sequence order, with
+    permits an earlier deny covers dropped. Confirmed live in both directions:
+    the prefix-list answer now scores 4.00 where it scored 3.83, and a shadowing
+    `prefix-list` mapping to another router is now named -- and it really does
+    break delivery, which is what settles that FRR reads these mappings the way
+    the check now does.
+
+93. **Nothing to conclude from, concluded from.** The 6in4 question checks that
+    the tunnel carries more than pings by reading, at the far side, the resets
+    and datagrams it took delivery of. When neither counter could be read the
+    loop moved on -- the code said so, "the machinery failed, which is not a
+    verdict" -- and the function then returned "it carries transport" to a
+    caller that awarded the point. A non-verdict spent as a verdict. The
+    question is now held when no direction could be observed. Two smaller
+    versions of the same thing in the same file: a tunnel's packet counter that
+    could not be read was reported as a tunnel that carried nothing, in both
+    the forward and the return direction.
+
+94. **Traffic engineering over a link the check could not name.** (Round 104.)
+    The forwarding half of `policy.traffic_engineering` exists to notice the one
+    thing the BGP half cannot: `ip route 2.0.0.0/8 <the slow link>`, which
+    overrides every local preference the rest of the question reads. It compared
+    the routing table's next-hop *address* against the slow neighbours' -- but a
+    static route may name an interface instead, and then the table carries no
+    address at all. `ip route 2.0.0.0/8 ext_1_ALL` on `as3/MSP` sent the fast
+    provider's own prefix out the 25 ms link, and the check reported "slow
+    neighbours: AS1 via MSP (25ms)" and awarded 1.00/1.00 for forwarding that
+    was going exactly where the question forbids. The offered fix -- deduct for
+    any non-BGP protocol -- was rejected: a static route pointed at the *fast*
+    neighbour would then be reported as "installed over the slow provider",
+    which is not true, and this grader's recurring defect is precisely claims
+    that outrun their evidence. Instead the link is now recognised by the local
+    interface it leaves by as well as by the neighbour's address. Because FRR
+    reports the *resolved* next hop's interface, a static route pointed at some
+    far address that recurses over the slow link is caught by the same test.
+
+95. **A routing table that could not be read, read as a router with no
+    addresses.** `l3.addressing_matches_plan` runs `ip -o -4 addr show` on every
+    router. `Probe` reports a non-zero exit in its result, not as an error, so a
+    failed listing arrived as empty output -- and empty output means every
+    planned address is missing and no counterfeit address exists. Both verdicts
+    at once, from nothing: a correct submission would be failed for addresses it
+    does have, and one impersonating another AS's subnet would pass. The exit
+    status is now read, and an unreadable table is an infrastructure error.
+
+96. **A traceroute that never ran, read as a host that never answered.** Being
+    unable to reach the far side exits *zero* -- traceroute prints `!N` or `*`
+    and returns success -- so a non-zero exit means the measurement was never
+    made. `traceHops` and `traceFirstHop` ignored it and returned zero hops,
+    which `l2.vlan_isolation` reported as "X cannot reach Y". Same shape in two
+    more places: `ip -d tunnel show` failing was reported as "has no configured
+    6in4 tunnel", and a `nc` that failed to send was reported as a datagram that
+    did not arrive, accusing the VPN of filtering by protocol. All four now
+    distinguish a failed measurement from a measurement that failed.
+
 
 ## Environment findings
 

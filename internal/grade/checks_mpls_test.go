@@ -657,3 +657,27 @@ func TestTheShippedRubricMakesIsolationDependOnReachability(t *testing.T) {
 			"reachable would still be graded for isolation. q3.depends_on = %v", q3.DependsOn)
 	}
 }
+
+// A datagram is invisible to whoever sent it, so the far side's count is the
+// whole of the evidence. Without it there is no verdict, and "no gap found"
+// was read as "the VPN carries datagrams".
+func TestAnUnreadableFarSideIsNotAWorkingVPN(t *testing.T) {
+	env := &Env{
+		Topology: &model.Topology{ASes: map[int]*model.AS{1: {ASN: 1}}},
+		AS:       1,
+		Exec: func(_ context.Context, _ string, cmd []string) (rt.ExecResult, error) {
+			if len(cmd) > 0 && cmd[0] == "cat" {
+				return rt.ExecResult{ExitCode: 1, Stderr: "no such file"}, nil
+			}
+			return rt.ExecResult{}, nil
+		},
+	}
+	d := directedPair{from: sitePoint{host: "as1/A"}, to: sitePoint{host: "as1/B", addr: "10.0.0.2"}}
+	gap, ok := vpnUDPGap(context.Background(), env, d)
+	if ok {
+		t.Fatal("a pair whose far side was never read was reported as tested")
+	}
+	if gap != "" {
+		t.Fatalf("a gap was reported from an unread counter: %q", gap)
+	}
+}

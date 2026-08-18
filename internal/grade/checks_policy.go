@@ -64,7 +64,8 @@ func init() {
 // while permitting ICMP -- which is what makes a ping-only test worthless --
 // stops it moving at all.
 func tunnelCarriesTransport(ctx context.Context, env *Env, hosts map[string]*model.Device,
-	domains []string) (string, bool) {
+	domains []string) (why string, carries, observed bool) {
+
 	for i := 0; i < 2; i++ {
 		src, dst := hosts[domains[i]], hosts[domains[1-i]]
 		if src == nil || dst == nil {
@@ -75,22 +76,22 @@ func tunnelCarriesTransport(ctx context.Context, env *Env, hosts map[string]*mod
 			continue
 		}
 		before, okB := tcpAnswers(ctx, env, dst.ID)
-		res, err := env.Probe(ctx, src.ID,
+		_, _ = env.Probe(ctx, src.ID,
 			[]string{"nc", "-6", "-w", "3", "-z", addr, probePort()})
 		after, okA := tcpAnswers(ctx, env, dst.ID)
 		if !okB || !okA {
-			// The counter could not be read, so a refusal is the only
-			// evidence there is; a timeout leaves nothing to conclude from.
-			if err == nil && res.ExitCode == 0 {
-				continue
-			}
+			// The far side's own count of the resets it sent is the whole of
+			// the evidence: a reply forged on the path does not move it, and
+			// the sender cannot tell the difference. Without it this direction
+			// was passed over in silence, and the point was awarded for a
+			// tunnel across which nothing was shown to travel.
 			continue
 		}
 		if after <= before {
 			return fmt.Sprintf(
 				"IPv6 pings cross the tunnel, but a connection from %s to %s at %s never "+
 					"arrived: %s answered no TCP at all, so the tunnel carries ICMP and "+
-					"nothing else", src.Name, dst.Name, addr, dst.Name), false
+					"nothing else", src.Name, dst.Name, addr, dst.Name), false, true
 		}
 		// And a datagram, which is neither of the two things already tried.
 		//
@@ -101,14 +102,18 @@ func tunnelCarriesTransport(ctx context.Context, env *Env, hosts map[string]*mod
 		_, _ = env.Probe(ctx, src.ID, []string{"sh", "-c",
 			"echo twinet | nc -6 -u -w 2 " + addr + " " + probePort()})
 		udpAfter, okU2 := udpNoPorts(ctx, env, dst.ID)
-		if okU && okU2 && udpAfter <= udpBefore {
+		if !okU || !okU2 {
+			continue
+		}
+		if udpAfter <= udpBefore {
 			return fmt.Sprintf(
 				"IPv6 pings and connections cross the tunnel, but a datagram from %s to %s "+
 					"at %s never arrived: something on the path is filtering by protocol",
-				src.Name, dst.Name, addr), false
+				src.Name, dst.Name, addr), false, true
 		}
+		observed = true
 	}
-	return "", true
+	return "", true, observed
 }
 
 // udpNoPorts reads a host's count of datagrams delivered to it for a port
@@ -183,6 +188,14 @@ func checkSixIn4(ctx context.Context, env *Env) Result {
 		out, err := env.Probe(ctx, gw.ID, []string{"sh", "-c", "ip -d tunnel show 2>/dev/null"})
 		if err != nil {
 			return Errored("tunnel.sixin4", err)
+		}
+		// A listing that could not be produced is not a gateway with no
+		// tunnels: empty output would otherwise be reported as the student
+		// having configured none.
+		if out.ExitCode != 0 {
+			return Errored("tunnel.sixin4", fmt.Errorf(
+				"the tunnels on %s could not be listed (exit %d: %s)",
+				gw.Name, out.ExitCode, firstLine(out.Stderr)))
 		}
 		names := configuredTunnels(out.Stdout)
 		if len(names) == 0 {
@@ -331,6 +344,13 @@ func checkSixIn4(ctx context.Context, env *Env) Result {
 				throughTunnel = true
 			} else if nativeFwd != "" {
 				reach = nativeFwd
+			} else if reachable && tunnels[domains[0]] != "" && (before < 0 || after < 0) {
+				// A counter that could not be read is not a counter that did
+				// not move. Reporting it as one deducted for native routing
+				// nobody saw.
+				reach = fmt.Sprintf("IPv6 reaches %s, but %s's packet count could not be read "+
+					"on %s, so whether the traffic was encapsulated is unknown",
+					dst.Name, tunnels[domains[0]], gw.Name)
 			} else if reachable && tunnels[domains[0]] != "" {
 				reach = fmt.Sprintf("IPv6 reaches %s, but %s carried no packets during the test, "+
 					"so the traffic is being routed natively rather than encapsulated",
@@ -371,6 +391,12 @@ func checkSixIn4(ctx context.Context, env *Env) Result {
 							throughTunnel = false
 							reach = fmt.Sprintf("%s cannot reach %s at %s over IPv6, so the "+
 								"tunnel carries traffic one way only", bs.Name, bd.Name, addr)
+						case before < 0 || after < 0:
+							throughTunnel = false
+							reach = fmt.Sprintf("IPv6 reaches %s from %s, but %s's packet "+
+								"count could not be read on %s, so whether the return path "+
+								"is encapsulated is unknown",
+								bd.Name, bs.Name, tunnels[domains[1]], back.Name)
 						case after <= before:
 							throughTunnel = false
 							reach = fmt.Sprintf("IPv6 reaches %s from %s, but %s carried no "+
@@ -393,10 +419,20 @@ func checkSixIn4(ctx context.Context, env *Env) Result {
 	// assignment means.
 	transportBlocked := ""
 	if throughTunnel && len(domains) >= 2 {
-		if why, ok := tunnelCarriesTransport(ctx, env, hosts, domains); !ok {
+		why, ok, observed := tunnelCarriesTransport(ctx, env, hosts, domains)
+		switch {
+		case !ok:
 			throughTunnel = false
 			reach = why
 			transportBlocked = why
+		case !observed:
+			// Every probe that says the tunnel carries more than pings reads a
+			// counter at the far side. If none could be read, the tunnel was
+			// never shown to carry anything but pings, and passing it said it
+			// had been.
+			return Errored("tunnel.sixin4", fmt.Errorf(
+				"no host on either side could be asked what arrived, so whether the tunnel "+
+					"carries anything but pings is unknown"))
 		}
 	}
 
@@ -886,11 +922,16 @@ func checkTrafficEngineering(ctx context.Context, env *Env) Result {
 	// The model knows which links are slow: the delay is in the topology.
 	type nb struct {
 		router string
-		addr   string
-		asn    int
-		rel    model.Relationship
-		delay  string
-		slow   bool
+		// iface is the local interface the link leaves by. A static route can
+		// name an interface instead of an address, and then the routing table
+		// carries no next-hop address at all -- so the address alone cannot
+		// say which link a destination leaves by.
+		iface string
+		addr  string
+		asn   int
+		rel   model.Relationship
+		delay string
+		slow  bool
 	}
 	var neighbours []nb
 	var maxDelay float64
@@ -908,7 +949,7 @@ func checkTrafficEngineering(ctx context.Context, env *Env) Result {
 			if d > maxDelay {
 				maxDelay = d
 			}
-			neighbours = append(neighbours, nb{r.Name, env.PeerAddr(ctx, i), i.Peer.Device.ASN, rel, i.Link.Props.Delay, false})
+			neighbours = append(neighbours, nb{r.Name, i.Name, env.PeerAddr(ctx, i), i.Peer.Device.ASN, rel, i.Link.Props.Delay, false})
 		}
 	}
 	if len(neighbours) < 2 {
@@ -1004,12 +1045,17 @@ func checkTrafficEngineering(ctx context.Context, env *Env) Result {
 	// *selected* is.
 	for _, rel := range []model.Relationship{model.RelProvider, model.RelCustomer} {
 		var slowAddrs, fastAddrs []string
+		slowIfaces := map[string]map[string]bool{}
 		for _, n := range neighbours {
 			if n.rel != rel {
 				continue
 			}
 			if n.slow {
 				slowAddrs = append(slowAddrs, n.addr)
+				if slowIfaces[n.router] == nil {
+					slowIfaces[n.router] = map[string]bool{}
+				}
+				slowIfaces[n.router][n.iface] = true
 			} else {
 				fastAddrs = append(fastAddrs, n.addr)
 			}
@@ -1018,7 +1064,7 @@ func checkTrafficEngineering(ctx context.Context, env *Env) Result {
 			continue
 		}
 		checks++
-		viaSlow, unreadable := installedVia(ctx, env, slowAddrs, fastAddrs)
+		viaSlow, unreadable := installedVia(ctx, env, slowAddrs, slowIfaces, fastAddrs)
 		switch {
 		case unreadable != "":
 			fmt.Fprintf(&detail, "forwarding: %s\n", unreadable)
@@ -2424,15 +2470,18 @@ func sortedInts(m map[int]bool) []int {
 	return out
 }
 
-// installedVia names the destinations whose selected route leaves through one
-// of the slow addresses, when a path through a fast one is also available.
+// installedVia names the destinations whose selected route leaves by one of the
+// slow links, when a path through a fast one is also available. A link is
+// recognised by the neighbour's address or by the local interface it leaves by,
+// because a static route may name either and one that names the interface has
+// no next-hop address in the table at all.
 //
 // It reads the routing table rather than BGP, because that is where a static
 // route, a policy route or an administrative distance shows up and BGP does
 // not. Every router is asked, and a router that cannot be read stops the check:
 // concluding "nothing goes the slow way" from the routers that answered is the
 // kind of verdict this project keeps having to take back.
-func installedVia(ctx context.Context, env *Env, slow, fast []string) (via []string, unreadable string) {
+func installedVia(ctx context.Context, env *Env, slow []string, slowIf map[string]map[string]bool, fast []string) (via []string, unreadable string) {
 	isSlow := map[string]bool{}
 	for _, a := range slow {
 		isSlow[a] = true
@@ -2471,8 +2520,9 @@ func installedVia(ctx context.Context, env *Env, slow, fast []string) (via []str
 			Protocol string `json:"protocol"`
 			Selected bool   `json:"selected"`
 			Nexthops []struct {
-				IP  string `json:"ip"`
-				FIB bool   `json:"fib"`
+				IP    string `json:"ip"`
+				FIB   bool   `json:"fib"`
+				Iface string `json:"interfaceName"`
 			} `json:"nexthops"`
 		}
 		if err := env.VtyshJSON(ctx, r.Name, "show ip route json", &routes); err != nil {
@@ -2488,7 +2538,18 @@ func installedVia(ctx context.Context, env *Env, slow, fast []string) (via []str
 					continue
 				}
 				for _, nh := range e.Nexthops {
-					if !isSlow[nh.IP] {
+					// Either way of naming the slow link counts. `ip route
+					// 2.0.0.0/8 <slow neighbour>` puts the neighbour's address
+					// in "ip"; `ip route 2.0.0.0/8 <slow interface>` puts
+					// nothing there at all and only names the interface, and
+					// reading the address alone let that second form send the
+					// traffic over exactly the link the question asks it to
+					// avoid while the check reported the forwarding correct.
+					//
+					// The interface is read from the resolved next hop, so a
+					// static route pointed at some far address that recurses
+					// over the slow link is caught by the same test.
+					if !isSlow[nh.IP] && !slowIf[r.Name][nh.Iface] {
 						continue
 					}
 					via = append(via, fmt.Sprintf("%s on %s (%s)", prefix, r.Name, e.Protocol))

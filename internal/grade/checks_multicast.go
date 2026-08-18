@@ -233,26 +233,127 @@ func checkPIMEnabled(ctx context.Context, env *Env) Result {
 	}
 }
 
+// rpMapping is one row of `show ip pim rp-info`: a rendezvous point and one of
+// the group ranges sent to it.
+type rpMapping struct {
+	rp  string
+	pfx netip.Prefix
+}
+
+// plistEntry is one line of a prefix-list, in sequence order.
+type plistEntry struct {
+	permit bool
+	pfx    netip.Prefix
+}
+
+// rpMappings reads `show ip pim rp-info` into the ranges each rendezvous point
+// is given.
+//
+// The second column is a group prefix when the mapping was written inline and
+// the *name of a prefix-list* when it was written `ip pim rp <addr>
+// prefix-list <name>`. A name is not a prefix, so every mapping written that
+// way was skipped in silence: a router whose prefix-list plainly covers the
+// group was reported as having no rendezvous point for it, and a wrong
+// rendezvous point installed the same way was invisible. The list is resolved
+// on the router that names it.
+func rpMappings(ctx context.Context, env *Env, router, out string) []rpMapping {
+	lists := map[string][]plistEntry{}
+	var maps []rpMapping
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		if len(f) < 2 {
+			continue
+		}
+		if _, err := netip.ParseAddr(f[0]); err != nil {
+			continue // the header, and anything else that is not a mapping
+		}
+		if strings.Contains(f[1], "/") {
+			if pfx, err := netip.ParsePrefix(f[1]); err == nil {
+				maps = append(maps, rpMapping{f[0], pfx})
+			}
+			continue
+		}
+		name := f[1]
+		if _, done := lists[name]; !done {
+			lists[name] = prefixListOn(ctx, env, router, name)
+		}
+		for _, e := range applicable(lists[name]) {
+			maps = append(maps, rpMapping{f[0], e.pfx})
+		}
+	}
+	return maps
+}
+
+// applicable drops the permit entries that an earlier line denies outright, so
+// a list is expanded into the ranges it really lets through.
+func applicable(entries []plistEntry) []plistEntry {
+	var out []plistEntry
+	for i, e := range entries {
+		if !e.permit {
+			continue
+		}
+		denied := false
+		for _, d := range entries[:i] {
+			if !d.permit && d.pfx.Contains(e.pfx.Addr()) && d.pfx.Bits() <= e.pfx.Bits() {
+				denied = true
+				break
+			}
+		}
+		if !denied {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// prefixListOn reads one prefix-list from a router. FRR prints the list once
+// per daemon that holds it, so the same sequence number appears several times
+// and is taken once.
+func prefixListOn(ctx context.Context, env *Env, router, name string) []plistEntry {
+	out, err := env.Vtysh(ctx, router, "show ip prefix-list "+name)
+	if err != nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	var entries []plistEntry
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		if len(f) < 4 || f[0] != "seq" {
+			continue
+		}
+		permit := f[2] == "permit"
+		if !permit && f[2] != "deny" {
+			continue
+		}
+		pfx, err := netip.ParsePrefix(f[3])
+		if err != nil {
+			continue
+		}
+		key := f[1] + " " + f[2] + " " + f[3]
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		entries = append(entries, plistEntry{permit, pfx})
+	}
+	return entries
+}
+
 // rangeSplit reports a mapping that carves part of the declared group range
 // off to a different rendezvous point, or "" if none does.
-func rangeSplit(out, groups, want string) string {
+func rangeSplit(maps []rpMapping, groups, want string) string {
 	declared, err := netip.ParsePrefix(groups)
 	if err != nil {
 		return ""
 	}
-	for _, line := range strings.Split(out, "\n") {
-		f := strings.Fields(line)
-		if len(f) < 2 || !strings.Contains(f[1], "/") {
-			continue
-		}
-		pfx, err := netip.ParsePrefix(f[1])
-		if err != nil || f[0] == want {
+	for _, m := range maps {
+		if m.rp == want {
 			continue
 		}
 		// Inside the declared range and pointing somewhere else.
-		if declared.Overlaps(pfx) && pfx.Bits() >= declared.Bits() {
+		if declared.Overlaps(m.pfx) && m.pfx.Bits() >= declared.Bits() {
 			return fmt.Sprintf("%s of the declared range %s is sent to %s, not %s",
-				pfx, groups, f[0], want)
+				m.pfx, groups, m.rp, want)
 		}
 	}
 	return ""
@@ -296,20 +397,13 @@ func checkRendezvousPoint(ctx context.Context, env *Env) Result {
 		// at a different router on every one of the six, and the check went on
 		// reporting that they all agreed. The rule PIM uses is the rule read
 		// here.
+		maps := rpMappings(ctx, env, r.Name, out)
 		found, foundBits := "", -1
-		for _, line := range strings.Split(out, "\n") {
-			f := strings.Fields(line)
-			if len(f) < 2 || !strings.Contains(f[1], "/") {
+		for _, m := range maps {
+			if !m.pfx.Contains(testAddr) || m.pfx.Bits() <= foundBits {
 				continue
 			}
-			pfx, err := netip.ParsePrefix(f[1])
-			if err != nil {
-				continue
-			}
-			if !pfx.Contains(testAddr) || pfx.Bits() <= foundBits {
-				continue
-			}
-			found, foundBits = f[0], pfx.Bits()
+			found, foundBits = m.rp, m.pfx.Bits()
 		}
 		// And the rest of the range, not only the address under test.
 		//
@@ -319,7 +413,7 @@ func checkRendezvousPoint(ctx context.Context, env *Env) Result {
 		// alone and takes half the range with it, which was worth nothing.
 		// Anything more specific than the declared range, pointing somewhere
 		// else, is part of that range going to the wrong root.
-		if split := rangeSplit(out, as.Multicast.Groups, want); split != "" {
+		if split := rangeSplit(maps, as.Multicast.Groups, want); split != "" {
 			wrong = append(wrong, fmt.Sprintf("%s: %s", r.Name, split))
 			continue
 		}
@@ -405,10 +499,11 @@ func hostIface(d *model.Device) string {
 // whose site receives nothing can produce as many of those as it likes.
 type seen struct {
 	joined    bool
-	arrived   int // packets of this run's, off the wire
-	looped    int // packets of this run's, generated on this host
-	foreign   int // packets on the group this run did not send
-	elsewhere int // packets on the group carrying some other source address
+	reported  bool // the host said what it saw, rather than never saying
+	arrived   int  // packets of this run's, off the wire
+	looped    int  // packets of this run's, generated on this host
+	foreign   int  // packets on the group this run did not send
+	elsewhere int  // packets on the group carrying some other source address
 	sources   []string
 	raw       string
 }
@@ -433,6 +528,10 @@ func mcastReport(out string, want map[string]bool) seen {
 				switch k {
 				case "joined":
 					s.joined = v == "true"
+					// The summary line is printed once the run finishes, so
+					// its presence is what separates a host that watched the
+					// wire and saw nothing from one that never watched.
+					s.reported = true
 				case "elsewhere":
 					// Packets on the group carrying a source other than the
 					// one this run sent from. The host is told about them
@@ -484,6 +583,10 @@ func receiveOn(ctx context.Context, env *Env, host *model.Device, group, from st
 		"-seconds", fmt.Sprint(seconds)})
 	if err != nil {
 		return "", err
+	}
+	if res.ExitCode != 0 {
+		return "", fmt.Errorf("%s could not listen on %s: %s", host.Name, group,
+			firstLine(res.Stderr+res.Stdout))
 	}
 	return res.Stdout + res.Stderr, nil
 }
@@ -655,6 +758,10 @@ func multicastRun(ctx context.Context, env *Env, receivers []*model.Device,
 		err  error
 	}
 	done := make(chan result, len(receivers)+len(bystanders))
+	wantJoin := map[string]bool{}
+	for _, h := range receivers {
+		wantJoin[h.Name] = true
+	}
 	for _, h := range receivers {
 		go func(h *model.Device) {
 			out, err := receiveOn(ctx, env, h, group, srcAddr, 25)
@@ -670,6 +777,11 @@ func multicastRun(ctx context.Context, env *Env, receivers []*model.Device,
 				"-group", group, "-iface", iface, "-from", srcAddr, "-seconds", "25"})
 			if err != nil {
 				done <- result{h.Name, "", err}
+				return
+			}
+			if res.ExitCode != 0 {
+				done <- result{h.Name, "", fmt.Errorf("%s could not watch %s: %s", h.Name,
+					group, firstLine(res.Stderr+res.Stdout))}
 				return
 			}
 			done <- result{h.Name, res.Stdout + res.Stderr, nil}
@@ -706,6 +818,27 @@ func multicastRun(ctx context.Context, env *Env, receivers []*model.Device,
 			got[res.name] = mcastReport(res.out, want)
 		case <-ctx.Done():
 			return got, trees, ctx.Err()
+		}
+	}
+	// A host that never said what it saw is not a host that saw nothing.
+	// Reading silence as an empty wire passed a submission whose bystander
+	// listener did not run -- nothing was reported, so nothing had leaked --
+	// and failed one whose receiver's did not. Neither is an observation, so
+	// neither is graded: the question is held for review instead.
+	for _, h := range append(append([]*model.Device{}, receivers...), bystanders...) {
+		st := got[h.Name]
+		switch {
+		case !st.reported:
+			return got, trees, fmt.Errorf(
+				"%s never reported what reached it on %s, so what did is unknown",
+				h.Name, group)
+		case wantJoin[h.Name] && !st.joined:
+			return got, trees, fmt.Errorf(
+				"%s did not join %s, so its receiving nothing says nothing about the tree",
+				h.Name, group)
+		case !wantJoin[h.Name] && st.joined:
+			return got, trees, fmt.Errorf(
+				"%s joined %s, so its receiving something is not a leak", h.Name, group)
 		}
 	}
 	return got, trees, nil

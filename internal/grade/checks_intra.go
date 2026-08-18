@@ -99,6 +99,16 @@ func checkAddressing(ctx context.Context, env *Env) Result {
 		if err != nil {
 			return Errored("l3.addressing_matches_plan", err)
 		}
+		// A table that could not be read is not a router with no addresses.
+		// Probe reports a non-zero exit in the result, not as an error, so a
+		// failed `ip addr show` arrived here as empty output: every planned
+		// address was then reported missing -- a correct submission failed for
+		// addresses it does have -- and every counterfeit one was invisible.
+		if out.ExitCode != 0 {
+			return Errored("l3.addressing_matches_plan", fmt.Errorf(
+				"the addresses of %s could not be read (ip exited %d: %s), so whether they "+
+					"match the plan could not be established", r.Name, out.ExitCode, firstLine(out.Stderr)))
+		}
 		have := parseIPAddrOutput(out.Stdout)
 		known := map[string]bool{}
 		for _, i := range r.Ifaces {
@@ -2404,7 +2414,7 @@ func ovsGroupBuckets(dump string) map[string]string {
 // the answer goes back into the VLAN it came from and the sender hears nothing
 // while the other VLAN has seen everything.
 func crossVLANFrames(ctx context.Context, env *Env, vlans []int,
-	hosts map[int][]*model.Device, sem chan struct{}) ([]string, int) {
+	hosts map[int][]*model.Device, sem chan struct{}) (leaked []string, tested, unread int) {
 	type pair struct{ src, dst *model.Device }
 	var pairs []pair
 	for a := range vlans {
@@ -2420,10 +2430,9 @@ func crossVLANFrames(ctx context.Context, env *Env, vlans []int,
 		}
 	}
 	var (
-		mu     sync.Mutex
-		leaks  []string
-		tested int
-		wg     sync.WaitGroup
+		mu    sync.Mutex
+		leaks []string
+		wg    sync.WaitGroup
 	)
 	for _, p := range pairs {
 		wg.Add(1)
@@ -2447,12 +2456,22 @@ func crossVLANFrames(ctx context.Context, env *Env, vlans []int,
 			if err != nil || res.ExitCode > 1 {
 				return
 			}
+			// A pair counts as tested once its destination has been read.
+			// Counting it before meant a neighbour table that could not be
+			// read -- the probe never ran, so it recorded nothing -- was
+			// scored as a pair the frame did not reach.
+			seen, err := env.Probe(ctx, p.dst.ID,
+				[]string{"ip", "neigh", "show", srcAddr, "dev", dstIf})
+			if err != nil || seen.ExitCode != 0 {
+				mu.Lock()
+				unread++
+				mu.Unlock()
+				return
+			}
 			mu.Lock()
 			tested++
 			mu.Unlock()
-			seen, err := env.Probe(ctx, p.dst.ID,
-				[]string{"ip", "neigh", "show", srcAddr, "dev", dstIf})
-			if err != nil || !strings.Contains(seen.Stdout, "lladdr") {
+			if !strings.Contains(seen.Stdout, "lladdr") {
 				return
 			}
 			mu.Lock()
@@ -2465,7 +2484,7 @@ func crossVLANFrames(ctx context.Context, env *Env, vlans []int,
 	}
 	wg.Wait()
 	sort.Strings(leaks)
-	return leaks, tested
+	return leaks, tested, unread
 }
 
 // accessPort names the interface a host sits on in its layer-2 domain, and the
@@ -2583,7 +2602,8 @@ func checkVLANIsolation(ctx context.Context, env *Env) Result {
 					hops, err := adjacentHopsRetrying(ctx, env, src, dst)
 					switch {
 					case err != nil:
-						record(false, "VLAN %d: %s cannot reach %s (%v)", v, src.Name, dst.Name, err)
+						record(false, "VLAN %d: the distance from %s to %s could not be "+
+							"measured (%v)", v, src.Name, dst.Name, err)
 					case hops == 1:
 						record(true, "")
 					default:
@@ -2612,8 +2632,8 @@ func checkVLANIsolation(ctx context.Context, env *Env) Result {
 						hops, first, err := traceFirstHopRetrying(ctx, env, src, dst)
 						switch {
 						case err != nil:
-							record(false, "%s cannot reach %s across VLANs (%v)",
-								src.Name, dst.Name, err)
+							record(false, "the path from %s to %s across VLANs could not be "+
+								"measured (%v)", src.Name, dst.Name, err)
 						case hops < 2:
 							record(false, "%s %s; different VLANs must be separated at layer 2",
 								src.Name, describeReach(dst.Name, hops))
@@ -2666,7 +2686,18 @@ func checkVLANIsolation(ctx context.Context, env *Env) Result {
 	// another is not keeping them apart, whatever the frame is.
 	rules, notes := crossVLANForwarding(ctx, env, domain,
 		labDestinations(ctx, env, hosts, gateway))
-	probed, tested := crossVLANFrames(ctx, env, vlans, hosts, sem)
+	probed, tested, unread := crossVLANFrames(ctx, env, vlans, hosts, sem)
+	if tested == 0 && unread > 0 {
+		return Errored("l2.vlan_isolation", fmt.Errorf(
+			"no host could be asked whether a frame from the other VLAN reached it "+
+				"(%d pair(s) unreadable), so whether the VLANs are separate is unknown",
+			unread))
+	}
+	if unread > 0 {
+		notes = append(notes, fmt.Sprintf(
+			"%d pair(s) could not be read, so the verdict covers the other %d",
+			unread, tested))
+	}
 	leaks := append(rules, probed...)
 	for i := 0; i < tested-len(probed); i++ {
 		record(true, "")
@@ -3155,6 +3186,14 @@ func traceHops(ctx context.Context, env *Env, src, dst *model.Device) (int, erro
 	if err != nil {
 		return 0, err
 	}
+	// A traceroute that did not run is not a destination that did not answer.
+	// Being unable to reach the far side exits zero and prints "!N" or "*",
+	// so a non-zero exit means the measurement was never made -- and reading
+	// it as zero hops reported a host as unreachable on no evidence at all.
+	if res.ExitCode != 0 {
+		return 0, fmt.Errorf("traceroute on %s exited %d: %s",
+			src.Name, res.ExitCode, firstLine(res.Stderr))
+	}
 	return countTracerouteHops(res.Stdout, addr), nil
 }
 
@@ -3168,6 +3207,10 @@ func traceFirstHop(ctx context.Context, env *Env, src, dst *model.Device) (int, 
 	res, err := env.Probe(ctx, src.ID, []string{"traceroute", "-n", "-q", "2", "-w", "2", "-m", "8", addr})
 	if err != nil {
 		return 0, "", err
+	}
+	if res.ExitCode != 0 {
+		return 0, "", fmt.Errorf("traceroute on %s exited %d: %s",
+			src.Name, res.ExitCode, firstLine(res.Stderr))
 	}
 	return countTracerouteHops(res.Stdout, addr), firstTracerouteHop(res.Stdout), nil
 }
