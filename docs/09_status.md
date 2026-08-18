@@ -1179,6 +1179,25 @@ reached students, and each motivated a permanent test.
      willing to wait is reported as one whose liveness could not be
      established, rather than as silence.
 
+105. **A host vouching for itself.** Reachability is not established by a
+     reply, because a DNAT rule can divert the echo requests for one host to
+     another and conntrack makes the answer look ordinary, so the check also
+     reads the destination's own count of echo requests the kernel delivered to
+     it. The comment on that read claimed nothing a submission configures could
+     raise the counter without the packets arriving. A host pinging its own
+     loopback address raises it one for one -- measured, five self-pings moved
+     it from 1471 to 1476. With the echo requests for one host diverted away
+     and a background `ping 127.0.0.1` left running on it, the DNAT rule
+     counted 56 packets taken from the host during the graded run while the
+     report said "every host received the traffic addressed to it", at full
+     marks. The witness is now what arrived from off the machine: loopback
+     packets are counted a second time on the loopback device, and a probe the
+     grader sends never touches it, so the difference between the two counts
+     cannot be raised by a host talking to itself. The second half of the same
+     defect: the test was that the counter had moved at all, so one packet from
+     anywhere stood as the witness for all eighteen probes sent to a host. It
+     is now counted against the number of probes.
+
 
 
 

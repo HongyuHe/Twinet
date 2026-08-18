@@ -3075,8 +3075,12 @@ func checkInternalReachability(ctx context.Context, env *Env) Result {
 	// perfectly ordinary answer from the address it asked about -- left every
 	// probe succeeding while the host in question received nothing at all.
 	// The kernel's own count of echo requests delivered to it is not something
-	// a route or a NAT rule can arrange: if it did not go up, the packets did
-	// not arrive there.
+	// a route or a NAT rule can arrange. It is something the host itself can
+	// arrange, though: the counter takes no interest in where a packet came
+	// from, and a host pinging its own loopback address raises it one for one,
+	// so the DNAT above plus a background `ping 127.0.0.1` put it back to
+	// passing while the host still received nothing. What is counted is
+	// therefore the arrivals that cannot have come from the host itself.
 	//
 	// Read once per host rather than once per pair, so 56 probes cost 16 extra
 	// reads and not 112.
@@ -3147,9 +3151,16 @@ func checkInternalReachability(ctx context.Context, env *Env) Result {
 		if !okB || !okA {
 			continue // the counter could not be read; the ping stands on its own
 		}
-		if after <= before {
-			unseen = append(unseen, fmt.Sprintf("%s answered %d probe(s) it never received: "+
-				"something else is replying for it", h.Name, want))
+		// Every probe sends two echo requests, so asking for one apiece still
+		// leaves room for a lost packet. Asking for a count at all is the
+		// point: the test was that the counter had moved by anything at all,
+		// which let a single packet from anywhere stand as the witness for
+		// every probe sent to that host.
+		arrived := arrivedFromOffBox(before, after)
+		if arrived < want {
+			unseen = append(unseen, fmt.Sprintf("%s answered %d probe(s), but only %d echo "+
+				"request(s) reached it from off the machine: something else is replying for it",
+				h.Name, want, arrived))
 		}
 	}
 	if len(unseen) > 0 {
@@ -3361,11 +3372,45 @@ func udpCounters(ctx context.Context, env *Env, hosts []*model.Device) map[strin
 	return out
 }
 
-// receivedEchoes reads each host's count of ICMP echo requests delivered to it.//
-// The kernel keeps it; nothing a submission configures can raise it without the
-// packets actually arriving.
-func receivedEchoes(ctx context.Context, env *Env, hosts []*model.Device) map[string]int {
-	out := map[string]int{}
+// arrivedFromOffBox is how many ICMP echo requests reached a host from
+// somewhere other than itself, between two readings of its counters.
+//
+// Loopback packets are counted both as echo requests and on the loopback
+// device, so subtracting the one from the other leaves arrivals the host
+// cannot have generated. Traffic the host sends to other machines does not
+// enter either count, which matters because the hosts are probe sources as
+// well as probe destinations.
+func arrivedFromOffBox(before, after hostTraffic) int {
+	n := (after.echoes - before.echoes) - (after.loopRx - before.loopRx)
+	if n < 0 {
+		return 0
+	}
+	return n
+}
+
+// hostTraffic is what a host's own kernel says was delivered to it.
+type hostTraffic struct {
+	echoes int // ICMP echo requests delivered, wherever they came from
+	loopRx int // packets delivered over the loopback device
+}
+
+// receivedEchoes reads, per host, the kernel's count of ICMP echo requests
+// delivered to it and of packets delivered over its loopback device.
+//
+// The echo counter on its own is not a witness that anything arrived from the
+// network. It counts every echo request the kernel took delivery of, and a
+// ping to 127.0.0.1 raises it exactly as much as a ping from another machine,
+// so answering for a host elsewhere and leaving `ping 127.0.0.1` running on it
+// made the counter climb while nothing addressed to it ever got there.
+//
+// A loopback packet is counted a second time, on the loopback device, and a
+// probe sent by the grader never touches that device. The difference between
+// the two counts is therefore a number of echo requests that cannot have come
+// from the host itself. Other loopback traffic subtracts from it as well, so
+// it is a lower bound rather than an exact count -- which is the direction to
+// err in, since it can fail to credit an arrival but never invent one.
+func receivedEchoes(ctx context.Context, env *Env, hosts []*model.Device) map[string]hostTraffic {
+	out := map[string]hostTraffic{}
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, 16)
@@ -3375,19 +3420,40 @@ func receivedEchoes(ctx context.Context, env *Env, hosts []*model.Device) map[st
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			res, err := env.Probe(ctx, h.ID, []string{"cat", "/proc/net/snmp"})
+			res, err := env.Probe(ctx, h.ID, []string{"cat", "/proc/net/snmp", "/proc/net/dev"})
 			if err != nil || res.ExitCode != 0 {
 				return
 			}
 			if n, ok := icmpInEchos(res.Stdout); ok {
 				mu.Lock()
-				out[h.ID] = n
+				out[h.ID] = hostTraffic{echoes: n, loopRx: loopbackRx(res.Stdout)}
 				mu.Unlock()
 			}
 		}(h)
 	}
 	wg.Wait()
 	return out
+}
+
+// loopbackRx pulls the loopback device's received packet count out of
+// /proc/net/dev, whose columns are bytes first and packets second.
+func loopbackRx(body string) int {
+	for _, line := range strings.Split(body, "\n") {
+		name, rest, ok := strings.Cut(line, ":")
+		if !ok || strings.TrimSpace(name) != "lo" {
+			continue
+		}
+		f := strings.Fields(rest)
+		if len(f) < 2 {
+			return 0
+		}
+		n, err := strconv.Atoi(f[1])
+		if err != nil {
+			return 0
+		}
+		return n
+	}
+	return 0
 }
 
 // icmpInEchos pulls InEchos out of /proc/net/snmp, by name rather than by
