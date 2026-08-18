@@ -241,3 +241,23 @@ func TestASiteToldWhatItSawInsteadOfTheSource(t *testing.T) {
 		t.Fatalf("the report does not say what reached the host: %q", why)
 	}
 }
+
+// A host that never said what it saw is not a host that saw nothing. The
+// summary line is what separates the two, and a listener that did not run
+// prints none.
+func TestSilenceFromAListenerIsNotAnEmptyWire(t *testing.T) {
+	if s := mcastReport("", map[string]bool{}); s.reported {
+		t.Fatal("a host that printed nothing was read as having reported")
+	}
+	if s := mcastReport("twinet-mcast: no such interface\n", map[string]bool{}); s.reported {
+		t.Fatal("a host whose listener failed was read as having reported")
+	}
+	s := mcastReport("twinet-mcast joined=false group=237.0.0.10 iface=host seconds=25 "+
+		"wire=0 loopback=0 elsewhere=0 sources=none\n", map[string]bool{})
+	if !s.reported {
+		t.Fatal("a host that watched the wire and saw nothing was read as silent")
+	}
+	if s.arrived != 0 {
+		t.Fatalf("packets were invented: %d", s.arrived)
+	}
+}

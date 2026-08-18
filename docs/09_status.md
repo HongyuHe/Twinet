@@ -930,6 +930,19 @@ reached students, and each motivated a permanent test.
     *not* done: excusing rules whose packet counter is zero, which was the
     obvious fix and would have passed a submission with its VLANs wide open so
     long as nobody sent anything while the grader watched.
+89. **Silence from a listener read as an empty wire.** Found in our own audit
+    of the multicast checks, which have had less attention than cos461. Both
+    multicast questions ran `twinet-mcast` on a host and parsed its output;
+    neither looked at its exit status, and a host that printed nothing parsed
+    to "saw nothing". A student has root in their containers, so a bystander
+    whose listener is made to fail reported no packets, and `no_flooding`
+    passed a submission that was flooding -- nothing was reported, so nothing
+    had leaked. The same silence in the other direction failed a receiver whose
+    listener did not run, for a network fault that was not theirs. A run now
+    requires every host to have printed its summary line, and requires the
+    receivers to have joined and the bystanders not to have; anything else
+    holds the question for review rather than grading it. The exit status is
+    checked too.
 
 ## Environment findings
 

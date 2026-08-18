@@ -405,10 +405,11 @@ func hostIface(d *model.Device) string {
 // whose site receives nothing can produce as many of those as it likes.
 type seen struct {
 	joined    bool
-	arrived   int // packets of this run's, off the wire
-	looped    int // packets of this run's, generated on this host
-	foreign   int // packets on the group this run did not send
-	elsewhere int // packets on the group carrying some other source address
+	reported  bool // the host said what it saw, rather than never saying
+	arrived   int  // packets of this run's, off the wire
+	looped    int  // packets of this run's, generated on this host
+	foreign   int  // packets on the group this run did not send
+	elsewhere int  // packets on the group carrying some other source address
 	sources   []string
 	raw       string
 }
@@ -433,6 +434,10 @@ func mcastReport(out string, want map[string]bool) seen {
 				switch k {
 				case "joined":
 					s.joined = v == "true"
+					// The summary line is printed once the run finishes, so
+					// its presence is what separates a host that watched the
+					// wire and saw nothing from one that never watched.
+					s.reported = true
 				case "elsewhere":
 					// Packets on the group carrying a source other than the
 					// one this run sent from. The host is told about them
@@ -484,6 +489,10 @@ func receiveOn(ctx context.Context, env *Env, host *model.Device, group, from st
 		"-seconds", fmt.Sprint(seconds)})
 	if err != nil {
 		return "", err
+	}
+	if res.ExitCode != 0 {
+		return "", fmt.Errorf("%s could not listen on %s: %s", host.Name, group,
+			firstLine(res.Stderr+res.Stdout))
 	}
 	return res.Stdout + res.Stderr, nil
 }
@@ -655,6 +664,10 @@ func multicastRun(ctx context.Context, env *Env, receivers []*model.Device,
 		err  error
 	}
 	done := make(chan result, len(receivers)+len(bystanders))
+	wantJoin := map[string]bool{}
+	for _, h := range receivers {
+		wantJoin[h.Name] = true
+	}
 	for _, h := range receivers {
 		go func(h *model.Device) {
 			out, err := receiveOn(ctx, env, h, group, srcAddr, 25)
@@ -670,6 +683,11 @@ func multicastRun(ctx context.Context, env *Env, receivers []*model.Device,
 				"-group", group, "-iface", iface, "-from", srcAddr, "-seconds", "25"})
 			if err != nil {
 				done <- result{h.Name, "", err}
+				return
+			}
+			if res.ExitCode != 0 {
+				done <- result{h.Name, "", fmt.Errorf("%s could not watch %s: %s", h.Name,
+					group, firstLine(res.Stderr+res.Stdout))}
 				return
 			}
 			done <- result{h.Name, res.Stdout + res.Stderr, nil}
@@ -706,6 +724,27 @@ func multicastRun(ctx context.Context, env *Env, receivers []*model.Device,
 			got[res.name] = mcastReport(res.out, want)
 		case <-ctx.Done():
 			return got, trees, ctx.Err()
+		}
+	}
+	// A host that never said what it saw is not a host that saw nothing.
+	// Reading silence as an empty wire passed a submission whose bystander
+	// listener did not run -- nothing was reported, so nothing had leaked --
+	// and failed one whose receiver's did not. Neither is an observation, so
+	// neither is graded: the question is held for review instead.
+	for _, h := range append(append([]*model.Device{}, receivers...), bystanders...) {
+		st := got[h.Name]
+		switch {
+		case !st.reported:
+			return got, trees, fmt.Errorf(
+				"%s never reported what reached it on %s, so what did is unknown",
+				h.Name, group)
+		case wantJoin[h.Name] && !st.joined:
+			return got, trees, fmt.Errorf(
+				"%s did not join %s, so its receiving nothing says nothing about the tree",
+				h.Name, group)
+		case !wantJoin[h.Name] && st.joined:
+			return got, trees, fmt.Errorf(
+				"%s joined %s, so its receiving something is not a leak", h.Name, group)
 		}
 	}
 	return got, trees, nil
