@@ -1115,21 +1115,38 @@ func checkTrafficEngineering(ctx context.Context, env *Env) Result {
 			fmt.Fprintf(&detail, "inbound: %s is not advertised to AS%d\n", own, f.asn)
 			continue
 		}
+		// Whether the announcement survived is measured, not deduced from the
+		// shape of the path. A foreign AS number is *usually* fatal -- the
+		// network it belongs to discards a path through itself as a loop --
+		// but "usually" is not an observation, and the check used to report
+		// the announcement as discarded without ever asking the neighbour. A
+		// number nobody in the lab answers to is prepended, the route arrives
+		// intact and is chosen as best, and the report still said the slow
+		// link had stopped being a backup.
+		held, readable := neighbourHoldsOurs(ctx, env, s.asn, own)
 		switch {
-		case len(sForeign) > 0:
+		case readable && !held && len(sForeign) > 0:
 			fmt.Fprintf(&detail,
 				"inbound: the path advertised to the slow AS%d contains %s, which is not this "+
-					"AS: a path through a neighbour's own number is a loop to it and the "+
-					"announcement is discarded, so the slow link stops being a backup at all\n",
-				s.asn, strings.Join(truncate(sForeign, 3), ", "))
+					"AS, and AS%d holds no route for %s learnt from us: the announcement did "+
+					"not survive, so the slow link is not the backup the question asks for\n",
+				s.asn, strings.Join(truncate(sForeign, 3), ", "), s.asn, own)
+		case readable && !held:
+			fmt.Fprintf(&detail,
+				"inbound: AS%d holds no route for %s learnt from us, so the slow link is not "+
+					"the backup the question asks for\n", s.asn, own)
 		case sLen <= fLen:
 			fmt.Fprintf(&detail,
 				"inbound: the path advertised to the slow AS%d is %d long, no longer than the %d sent to AS%d; prepend to make it less attractive\n",
 				s.asn, sLen, fLen, f.asn)
-		case !neighbourHolds(ctx, env, s.asn, own):
+		case len(sForeign) > 0:
 			fmt.Fprintf(&detail,
-				"inbound: AS%d does not hold %s at all, so the slow link is not the backup "+
-					"the question asks for\n", s.asn, own)
+				"inbound: the path advertised to the slow AS%d is lengthened with %s, which is "+
+					"not this AS; AS%d did accept it, but padding with somebody else's number "+
+					"is not what the question asks for: every network that number belongs to "+
+					"discards a path through itself, and a number left at the end of the path "+
+					"makes the prefix look like theirs. Prepend your own AS number (%d)\n",
+				s.asn, strings.Join(truncate(sForeign, 3), ", "), s.asn, env.AS)
 		default:
 			passed++
 		}
@@ -1232,16 +1249,28 @@ func advertisedOwnPath(ctx context.Context, env *Env, router, peer, own string) 
 	return longest, uniq(foreign), true
 }
 
-// neighbourHolds asks a neighbour whether it actually has our prefix.
+// neighbourHoldsOurs asks a neighbour whether the announcement *we* sent it
+// survived the journey.
 //
 // The neighbour is somebody else's system, so its table is not the
 // submission's to arrange: what it holds is the only account of whether an
-// announcement survived the journey. An announcement that is sent and
-// discarded on arrival looks identical, from this side, to one that worked.
-func neighbourHolds(ctx context.Context, env *Env, asn int, prefix string) bool {
+// announcement lived or died. An announcement that is sent and discarded on
+// arrival looks identical, from this side, to one that worked.
+//
+// "Does the neighbour have our prefix" is a different and weaker question. It
+// may hold the prefix through somebody else entirely while discarding
+// everything we send, and then the link the question calls a backup carries
+// nothing -- which is exactly what prepending the neighbour's own number does.
+// A route learnt straight from us begins with our AS number, so the leftmost
+// element separates the two.
+//
+// The second return says whether any router of that AS could be read. A
+// neighbour nobody can read yields no evidence either way, and the caller
+// gives the submission the benefit of the doubt rather than inventing one.
+func neighbourHoldsOurs(ctx context.Context, env *Env, asn int, prefix string) (held, readable bool) {
 	as, ok := env.Topology.ASes[asn]
 	if !ok {
-		return true // not in the lab, so nothing can be concluded
+		return false, false // not in the lab, so nothing can be concluded
 	}
 	for _, r := range as.Routers {
 		res, err := env.Probe(ctx, r.ID, []string{"vtysh", "-c",
@@ -1259,13 +1288,29 @@ func neighbourHolds(ctx context.Context, env *Env, asn int, prefix string) bool 
 		if json.Unmarshal([]byte(res.Stdout), &doc) != nil {
 			continue
 		}
+		readable = true
 		for _, p := range doc.Paths {
-			if pathContainsASN(p.ASPath.String, env.AS) {
-				return true
+			if firstASN(p.ASPath.String) == env.AS {
+				return true, true
 			}
 		}
 	}
-	return false
+	return false, readable
+}
+
+// firstASN is the AS at the front of a path, which is the one the route was
+// received from. Prepends go on the front too, so a route received directly
+// from an AS begins with that AS's number however many times it padded.
+func firstASN(path string) int {
+	f := strings.Fields(strings.TrimSpace(path))
+	if len(f) == 0 {
+		return 0
+	}
+	n, err := strconv.Atoi(f[0])
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 // advertisedPrefixes returns the set of prefixes advertised to a neighbour.

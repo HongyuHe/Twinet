@@ -1029,6 +1029,24 @@ reached students, and each motivated a permanent test.
     did not arrive, accusing the VPN of filtering by protocol. All four now
     distinguish a failed measurement from a measurement that failed.
 
+97. **"The announcement is discarded" -- said without asking the neighbour.**
+    The inbound half of `policy.traffic_engineering` read any foreign AS number
+    in the path advertised to the slow neighbour as proof the announcement had
+    died: "a path through a neighbour's own number is a loop to it and the
+    announcement is discarded, so the slow link stops being a backup at all".
+    That is true of the neighbour's *own* number and of nothing else. Padding
+    with 99 -- a number nobody in the lab answers to -- left AS 1 holding the
+    route and choosing it as best, and the report still said the link had
+    stopped being a backup. Survival is now measured at the neighbour instead
+    of deduced from the shape of the path. The measurement is also the right
+    one: `neighbourHolds` asked whether the neighbour had the prefix *at all*,
+    which a prepend of its own number answers yes to whenever the neighbour
+    also learns it the long way round -- excusing the one thing the question
+    forbids. `neighbourHoldsOurs` requires the path to begin with our number,
+    which is what a route received from us looks like. Padding with somebody
+    else's number is still deducted, now for the reason that is true.
+
+
 
 ## Environment findings
 
