@@ -943,6 +943,16 @@ reached students, and each motivated a permanent test.
     receivers to have joined and the bystanders not to have; anything else
     holds the question for review rather than grading it. The exit status is
     checked too.
+90. **The same silence, in the VLAN broadcast probe.** Found by sweeping every
+    probe in the grading package whose exit status is never read. A pair was
+    counted as tested the moment the sending host's `arping` returned, and the
+    destination's neighbour table was read afterwards. If that read failed, the
+    pair had already been counted, and a pair with no recorded neighbour scores
+    as a pair the frame did not reach -- so a destination that could not be
+    asked was marked as one the broadcast never got to. A pair now counts as
+    tested only once its destination has actually been read; pairs that could
+    not be read are reported, and if none could be read the question is held
+    rather than passed.
 
 ## Environment findings
 
