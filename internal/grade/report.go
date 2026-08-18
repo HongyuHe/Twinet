@@ -445,9 +445,31 @@ func csvField(s string) string {
 // Text renders the class summary.
 func (s *Summary) Text() string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "graded %d submission(s) against %s in %s\n", s.Count, s.Rubric, s.Duration)
-	fmt.Fprintf(&b, "  mean %.2f  median %.2f  min %.2f  max %.2f  (out of %.2f)\n\n",
-		s.Mean, s.Median, s.Min, s.Max, s.MaxTotal)
+	// The distribution is over the submissions that were actually graded, so
+	// the count beside it has to be that one. Printing the number of
+	// submissions *attempted* described a wider set than the statistics did,
+	// and when every one of them was held for review the line read
+	// "mean 0.00 median 0.00 min 0.00 max 0.00" -- which is what a class that
+	// scored nothing looks like, and was in fact a class nobody had marked.
+	held := s.Count - s.Graded
+	switch {
+	case s.Graded == 0:
+		fmt.Fprintf(&b, "graded 0 of %d submission(s) against %s in %s\n",
+			s.Count, s.Rubric, s.Duration)
+		fmt.Fprintf(&b, "  no marks: every submission needs review, so there is no "+
+			"distribution to report (out of %.2f)\n\n", s.MaxTotal)
+	case held > 0:
+		fmt.Fprintf(&b, "graded %d of %d submission(s) against %s in %s\n",
+			s.Graded, s.Count, s.Rubric, s.Duration)
+		fmt.Fprintf(&b, "  mean %.2f  median %.2f  min %.2f  max %.2f  (out of %.2f, "+
+			"over the %d graded; %d need review)\n\n",
+			s.Mean, s.Median, s.Min, s.Max, s.MaxTotal, s.Graded, held)
+	default:
+		fmt.Fprintf(&b, "graded %d submission(s) against %s in %s\n",
+			s.Count, s.Rubric, s.Duration)
+		fmt.Fprintf(&b, "  mean %.2f  median %.2f  min %.2f  max %.2f  (out of %.2f)\n\n",
+			s.Mean, s.Median, s.Min, s.Max, s.MaxTotal)
+	}
 	if len(s.FailCount) > 0 {
 		type kv struct {
 			k string

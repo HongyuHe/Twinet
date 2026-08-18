@@ -2,6 +2,7 @@ package grade
 
 import (
 	"math"
+	"strings"
 	"testing"
 	"time"
 )
@@ -146,5 +147,41 @@ func TestAClassWhereNothingCouldBeGradedReportsNoDistribution(t *testing.T) {
 	}
 	if len(s.Quarantined()) != 1 {
 		t.Error("the failed submission is not quarantined")
+	}
+}
+
+// The distribution is computed over the submissions that were graded, so the
+// line above it must not claim a wider set. When everything was held for
+// review the summary read "mean 0.00 median 0.00 min 0.00 max 0.00", which is
+// what a class that scored nothing looks like and was in fact a class nobody
+// had marked.
+func TestASummaryDoesNotReportMarksNobodyWasGiven(t *testing.T) {
+	held := &Report{Submission: "group1", Total: 3, MaxTotal: 4, NeedsReview: true}
+	s := Summarise("multicast-pim", []*Report{held}, time.Second)
+	txt := s.Text()
+	if strings.Contains(txt, "mean 0.00") {
+		t.Fatalf("a quarantined submission was reported as a class mean of zero:\n%s", txt)
+	}
+	if !strings.Contains(txt, "graded 0 of 1") {
+		t.Fatalf("the summary does not say how many were graded:\n%s", txt)
+	}
+}
+
+// And when only some were held, the count beside the distribution must be the
+// number the distribution covers, not the number attempted.
+func TestASummaryCountsOnlyWhatItAveraged(t *testing.T) {
+	s := Summarise("multicast-pim", []*Report{
+		{Submission: "group1", Total: 4, MaxTotal: 4},
+		{Submission: "group2", Total: 0, MaxTotal: 4, NeedsReview: true},
+	}, time.Second)
+	txt := s.Text()
+	if !strings.Contains(txt, "graded 1 of 2") {
+		t.Fatalf("the summary does not separate graded from attempted:\n%s", txt)
+	}
+	if !strings.Contains(txt, "1 need review") {
+		t.Fatalf("the summary does not say how many are held:\n%s", txt)
+	}
+	if s.Mean != 4 {
+		t.Fatalf("the held submission dragged the mean to %v", s.Mean)
 	}
 }

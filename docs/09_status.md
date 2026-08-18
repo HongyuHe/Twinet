@@ -878,6 +878,31 @@ reached students, and each motivated a permanent test.
     reference answer has one bridge, no controller and the single flow
     `priority=0 actions=NORMAL`, so none of the three can fire on a correct
     submission.
+85. **A forgotten experiment failed a correct answer.** `tunnel.sixin4` took
+    the first 6in4 tunnel `ip -d tunnel show` listed and judged the submission
+    on its endpoints. A device may carry several, and a student debugging their
+    answer routinely leaves one behind; the kernel lists them in its own order.
+    A correct `tun6` sitting behind an abandoned `bad_tun` was therefore
+    reported as "sourced from 3.0.10.1, not its loopback" and lost half a mark
+    for a tunnel that was not the one carrying the traffic. Every tunnel is now
+    judged on its own endpoints and the first sound one is taken, which cannot
+    award an unearned mark because whether the traffic goes through *that*
+    tunnel is settled afterwards by what the gateway does with a packet for the
+    far host and by the tunnel's counters in both directions. Measured: with a
+    leftover tunnel listed first and the reference tunnel otherwise untouched,
+    9.50 before and 10.00 after; with only the wrong-endpoint tunnel present,
+    9.00, so the mark still cannot be had without the right tunnel.
+86. **A class nobody had marked was reported as a class that scored zero.** The
+    run summary printed `graded 1 submission(s)` and `mean 0.00 median 0.00
+    min 0.00 max 0.00` for a submission that had been held for review and never
+    marked at all. The statistics were right to exclude it -- a quarantined
+    zero measures the platform, not the student -- but the line above them
+    counted the submissions attempted rather than the submissions the
+    distribution covers, so the two disagreed, and the shape they disagreed
+    into was indistinguishable from a cohort that had failed everything. The
+    line now says `graded 0 of 1` and states plainly that there is no
+    distribution; when only some are held it says `graded 88 of 100` and names
+    how many are waiting.
 
 ## Environment findings
 
