@@ -1121,6 +1121,26 @@ reached students, and each motivated a permanent test.
      said "on AS path" whichever way the verdict went; they now report how many
      in-region routes were offered and whether they arrived.
 
+102. **A router accused of impersonating itself.** An address inside a subnet
+     the plan assigns elsewhere fails the addressing check outright, which is
+     right: that is how a submission stands in for a part of the network it is
+     not. But "elsewhere" was read as "any interface other than this one", so a
+     second address on a router's own prescribed loopback -- inside the router's
+     own /24, advertised by the router itself, answering for nobody else -- was
+     reported as "1 address(es) claim a subnet the plan puts on another
+     interface", under a hint reading "an address from somebody else's subnet",
+     with the detail naming as3/ATL:lo as both the offender and the victim. The
+     check contradicted itself in its own evidence and took the whole mark for
+     it. Standing in for something is a claim about a router, so the router now
+     decides it: an address inside a subnet the plan gives to this router
+     counterfeits nothing. It still costs, because the plan does not mention it
+     and "and nothing else" is what that falsifies -- finding 71's spare address
+     on a prescribed loopback is still caught, just no longer as an
+     impersonation. The one case this must not swallow is the far end of a
+     shared link, whose subnet really is partly ours: an address the plan hands
+     to another router is a counterfeit wherever it is worn, whatever mask it is
+     written with, and is now named as one.
+
 
 
 

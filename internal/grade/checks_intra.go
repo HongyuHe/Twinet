@@ -87,6 +87,8 @@ func checkAddressing(ctx context.Context, env *Env) Result {
 	// student's own choice, which the plan leaves to them.
 	var extra, counterfeit []string
 	planned := plannedSubnets(env)
+	owners := subnetOwners(env)
+	planCarries := plannedAddrs(env)
 
 	for _, r := range env.Routers() {
 		// Every scope, not only the global one.
@@ -125,6 +127,34 @@ func checkAddressing(ctx context.Context, env *Env) Result {
 					continue // the student's own choice inside the mandated prefix
 				}
 				if where := impersonates(planned, a); where != "" {
+					// Standing in for a part of the network you are not is a
+					// claim about a router, so it is the router that decides
+					// this. An address inside a subnet the plan gives to this
+					// very router counterfeits nothing -- there is no one else
+					// it could be answering for -- and reporting it as
+					// "a subnet the plan puts on another interface" while
+					// naming this router's own interface as the owner said
+					// something that was not true and took the whole mark for
+					// it. It is still an address the plan does not mention, so
+					// it still costs: "and nothing else" is what it falsifies.
+					//
+					// Taking another router's planned address is the exception
+					// that has to survive this, because a shared link's subnet
+					// belongs to both ends: the far end's address sitting on
+					// this one is an impersonation inside a subnet that really
+					// is partly ours.
+					if owner, taken := planCarries[bareAddr(a)]; taken && owner.device != r.ID {
+						counterfeit = append(counterfeit, fmt.Sprintf(
+							"%s:%s carries %s, the address the plan puts on %s",
+							r.Name, iface, a, owner.where))
+						continue
+					}
+					if owners[where][r.ID] {
+						extra = append(extra, fmt.Sprintf("%s:%s carries %s, which the plan "+
+							"does not mention -- %s is this router's own subnet",
+							r.Name, iface, a, where))
+						continue
+					}
 					counterfeit = append(counterfeit, fmt.Sprintf(
 						"%s:%s carries %s, which is inside %s -- a subnet the plan puts on %s",
 						r.Name, iface, a, where, planned[where]))
@@ -173,11 +203,11 @@ func checkAddressing(ctx context.Context, env *Env) Result {
 	sort.Strings(counterfeit)
 	if len(counterfeit) > 0 {
 		return Fail("l3.addressing_matches_plan", Evidence{
-			Expected: "no router carrying an address out of a subnet that belongs elsewhere",
-			Observed: fmt.Sprintf("%d address(es) claim a subnet the plan puts on another "+
-				"interface", len(counterfeit)),
+			Expected: "no router carrying an address out of a subnet that belongs to another router",
+			Observed: fmt.Sprintf("%d address(es) claim space the plan puts on another "+
+				"router", len(counterfeit)),
 			Detail:  strings.Join(truncate(counterfeit, 6), "\n"),
-			Hint:    "an address from somebody else's subnet makes this router answer for a part of the network it is not",
+			Hint:    "an address from another router's subnet makes this one answer for a part of the network it is not",
 			Command: "ip -o -4 addr show scope global",
 		})
 	}
@@ -281,6 +311,85 @@ func ownSubnet(i *model.Iface, addr string) bool {
 		}
 	}
 	return false
+}
+
+// subnetOwners maps every subnet in the lab to the routers the plan gives it
+// to. A link's subnet belongs to both of its ends, so this is a set rather than
+// a name: an address inside a subnet one of whose owners is the router carrying
+// it is not standing in for anybody.
+func subnetOwners(env *Env) map[string]map[string]bool {
+	out := map[string]map[string]bool{}
+	add := func(subnet, device string) {
+		if subnet == "" || device == "" {
+			return
+		}
+		if out[subnet] == nil {
+			out[subnet] = map[string]bool{}
+		}
+		out[subnet][device] = true
+	}
+	for _, l := range env.Topology.Links {
+		for _, e := range []*model.Iface{l.A, l.B} {
+			if e != nil && e.Device != nil {
+				add(l.Subnet, e.Device.ID)
+			}
+		}
+	}
+	for _, d := range env.Topology.Devices {
+		for _, i := range d.Ifaces {
+			add(i.Subnet, d.ID)
+			if i.Link != nil {
+				add(i.Link.Subnet, d.ID)
+			}
+			if i.Addr4 != "" {
+				if p, err := netip.ParsePrefix(i.Addr4); err == nil {
+					add(p.Masked().String(), d.ID)
+				}
+			}
+		}
+	}
+	return out
+}
+
+// plannedAddr is an address the plan puts somewhere, and where.
+type plannedAddr struct {
+	device string
+	where  string
+}
+
+// plannedAddrs maps every address the plan hands out to the interface it
+// belongs on. Wearing one of these is an impersonation wherever it happens,
+// including inside a subnet the wearer part-owns: on a shared link, the far
+// end's address is in a subnet that is legitimately ours too.
+func plannedAddrs(env *Env) map[string]plannedAddr {
+	out := map[string]plannedAddr{}
+	for _, d := range env.Topology.Devices {
+		for _, i := range d.Ifaces {
+			if i.Addr4 == "" {
+				continue
+			}
+			a := bareAddr(i.Addr4)
+			if a == "" {
+				continue
+			}
+			if _, seen := out[a]; !seen {
+				out[a] = plannedAddr{device: d.ID, where: d.ID + ":" + i.Name}
+			}
+		}
+	}
+	return out
+}
+
+// bareAddr strips the prefix length from an address, so that the same address
+// written with two different masks is recognised as the one address it is.
+func bareAddr(addr string) string {
+	if p, err := netip.ParsePrefix(addr); err == nil {
+		return p.Addr().String()
+	}
+	if a, err := netip.ParseAddr(addr); err == nil {
+		return a.String()
+	}
+	return ""
 }
 
 // impersonates names the planned subnet an address has been taken from, if any.
