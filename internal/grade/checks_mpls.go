@@ -512,7 +512,7 @@ func checkVPNReachability(ctx context.Context, env *Env) Result {
 		}
 	}
 	// The pairs that answer a ping are asked to carry ordinary traffic too.
-	pingOnly, pingOnlyPairs := vpnTransportGaps(ctx, env, carried)
+	pingOnly, pingOnlyPairs, untestedPairs := vpnTransportGaps(ctx, env, carried)
 	after := receivedEchoesAt(ctx, env, allSites)
 	for _, site := range allSites {
 		if sentTo[site.host] == 0 {
@@ -555,6 +555,15 @@ func checkVPNReachability(ctx context.Context, env *Env) Result {
 			Command: "nc; /proc/net/snmp",
 		})
 	}
+	// The pass says every pair carried a connection and a datagram, and that
+	// each was seen arriving at the far side. A pair whose far side could not
+	// be read was never shown to do either, and passing it said so anyway.
+	if len(untestedPairs) > 0 {
+		return Errored("vpn.site_reachability", fmt.Errorf(
+			"%d site pair(s) could not be read at the far side (%s), so whether the VPN "+
+				"carries anything but pings between them is unknown",
+			len(untestedPairs), strings.Join(truncate(untestedPairs, 4), "; ")))
+	}
 	return Pass("vpn.site_reachability", Evidence{
 		Expected: "each customer's sites reach each other",
 		Observed: fmt.Sprintf("%d site pair(s) reachable by ping, connection and datagram, and "+
@@ -581,33 +590,43 @@ func checkVPNReachability(ctx context.Context, env *Env) Result {
 //
 // One pair at a time, so that a counter that moves belongs to the probe that
 // just ran. Returns the gaps found and how many pairs they fall across.
-func vpnTransportGaps(ctx context.Context, env *Env, pairs []directedPair) ([]string, int) {
+func vpnTransportGaps(ctx context.Context, env *Env, pairs []directedPair) (
+	gaps []string, affected int, untested []string) {
+
 	var out []string
-	affected := 0
 	for _, d := range pairs {
 		n := len(out)
-		if p := vpnTCPGap(ctx, env, d); p != "" {
+		p, okTCP := vpnTCPGap(ctx, env, d)
+		if p != "" {
 			out = append(out, p)
 		}
-		if p := vpnUDPGap(ctx, env, d); p != "" {
-			out = append(out, p)
+		q, okUDP := vpnUDPGap(ctx, env, d)
+		if q != "" {
+			out = append(out, q)
 		}
 		if len(out) > n {
 			affected++
 		}
+		// A pair whose far side could not be read is not a pair that carries
+		// ordinary traffic. Saying nothing about it passed it.
+		if !okTCP || !okUDP {
+			untested = append(untested, fmt.Sprintf("%s to %s (%s)",
+				d.from.host, d.to.host, d.to.addr))
+		}
 	}
 	sort.Strings(out)
-	return out, affected
+	sort.Strings(untested)
+	return out, affected, untested
 }
 
 // vpnTCPGap attempts one connection across a site pair and reports what did not
 // happen.
-func vpnTCPGap(ctx context.Context, env *Env, d directedPair) string {
+func vpnTCPGap(ctx context.Context, env *Env, d directedPair) (string, bool) {
 	before, okB := tcpAnswers(ctx, env, d.to.host)
 	res, err := env.Probe(ctx, d.from.host,
 		[]string{"nc", "-v", "-w", "3", "-z", d.to.addr, probePort()})
 	if err != nil {
-		return "" // the machinery failed, which is not a verdict
+		return "", false // the machinery failed, which is not a verdict
 	}
 	after, okA := tcpAnswers(ctx, env, d.to.host)
 	said := strings.ToLower(res.Stderr + res.Stdout)
@@ -619,31 +638,38 @@ func vpnTCPGap(ctx context.Context, env *Env, d directedPair) string {
 	case answered && okB && okA && !arrived:
 		return fmt.Sprintf("%s got an answer from %s (%s) to a connection %s never saw: "+
 			"something on the path is answering for it", d.from.host, d.to.host, d.to.addr,
-			d.to.host)
+			d.to.host), true
 	case !answered && arrived:
 		return fmt.Sprintf("a connection from %s reaches %s (%s) but the answer does not come "+
-			"back, though pings do", d.from.host, d.to.host, d.to.addr)
+			"back, though pings do", d.from.host, d.to.host, d.to.addr), true
 	case !answered:
 		return fmt.Sprintf("%s can ping %s (%s) but no connection to it arrives: the VPN is "+
-			"carrying ICMP and discarding the rest", d.from.host, d.to.host, d.to.addr)
+			"carrying ICMP and discarding the rest", d.from.host, d.to.host, d.to.addr), true
 	}
-	return ""
+	// It answered, so the only way to know the answer came from the far side
+	// is the far side's own count of what it sent.
+	return "", okB && okA
 }
 
 // vpnUDPGap sends one datagram across a site pair and reads, at the far side,
 // whether it arrived.
-func vpnUDPGap(ctx context.Context, env *Env, d directedPair) string {
+func vpnUDPGap(ctx context.Context, env *Env, d directedPair) (string, bool) {
 	before, okB := datagramsDelivered(ctx, env, d.to)
 	if _, err := env.Probe(ctx, d.from.host, []string{"sh", "-c",
 		"echo twinet | nc -u -w 2 " + d.to.addr + " " + probePort()}); err != nil {
-		return ""
+		return "", false
 	}
 	after, okA := datagramsDelivered(ctx, env, d.to)
-	if !okB || !okA || after > before {
-		return ""
+	// A datagram is invisible to whoever sent it, so the far side's count is
+	// the whole of the evidence. Without it there is no verdict either way.
+	if !okB || !okA {
+		return "", false
+	}
+	if after > before {
+		return "", true
 	}
 	return fmt.Sprintf("a datagram from %s to %s (%s) never arrived, though pings do: the VPN "+
-		"is filtering by protocol", d.from.host, d.to.host, d.to.addr)
+		"is filtering by protocol", d.from.host, d.to.host, d.to.addr), true
 }
 
 // receivedEchoesAt reads each site host's count of ICMP echo requests the

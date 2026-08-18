@@ -953,6 +953,16 @@ reached students, and each motivated a permanent test.
     tested only once its destination has actually been read; pairs that could
     not be read are reported, and if none could be read the question is held
     rather than passed.
+91. **And again in the L3VPN transport probe.** The question that catches a VPN
+    carrying pings and nothing else reads, at the destination, the resets it
+    sent and the datagrams it took delivery of. Neither counter is one the
+    sender can see, which is the point. But when a counter could not be read
+    the helper returned "no gap", the pair was scored as carrying ordinary
+    traffic, and the pass said in as many words that "every site received the
+    traffic addressed to it" -- a sentence about an observation nobody made.
+    A pair whose far side cannot be read is now named as untested and the
+    question is held, rather than passed on the strength of the sender's own
+    view of a datagram, which is no view at all.
 
 ## Environment findings
 
