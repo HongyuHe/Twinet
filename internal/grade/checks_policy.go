@@ -635,12 +635,30 @@ func checkIXPCommunities(ctx context.Context, env *Env) Result {
 	if rerr != nil {
 		return Errored("policy.ixp_communities", rerr)
 	}
+	inRegion := ixpInRegion(env)
 	admitted, accepted, aerr := routesViaIXP(ctx, env, ixpRouter.Name, ixpPeer, offeredPaths)
 	if aerr != nil {
 		return Errored("policy.ixp_communities", aerr)
 	}
 	if len(admitted) > 0 {
 		filters = false
+	}
+	// The table decides it, where the table can decide it.
+	//
+	// The configuration half looked for `match as-path` and nothing else, so a
+	// member that refused every in-region route with a prefix-list -- the same
+	// routes gone from the same table, by a mechanism the exercise never
+	// forbids -- was told "nothing filters arrivals" and lost half the mark
+	// while its table was indistinguishable from the reference answer's. The
+	// comment above already says the table is what the question is about.
+	//
+	// This only speaks when the table has something to say. If the exchange is
+	// relaying no in-region route at all, an empty `admitted` is the lab's
+	// doing rather than the submission's, and the configuration remains the
+	// only evidence that a filter exists.
+	inRegionOffered := countInRegionOffers(offeredPaths, inRegion)
+	if len(admitted) == 0 && inRegionOffered > 0 {
+		filters = true
 	}
 	// What the exchange is for.
 	//
@@ -729,16 +747,25 @@ func checkIXPCommunities(ctx context.Context, env *Env) Result {
 	case len(tagged) > 0 && filters:
 		return Pass("policy.ixp_communities", Evidence{
 			Observed: fmt.Sprintf("the exchange holds %s from this AS tagged %s and relayed it "+
-				"to %d member(s); arrivals are filtered on AS path",
-				own, strings.Join(tagged, " "), len(seen.advertisedTo)),
+				"to %d member(s); %s",
+				own, strings.Join(tagged, " "), len(seen.advertisedTo),
+				map[bool]string{
+					true:  fmt.Sprintf("all %d in-region route(s) the exchange offered are refused on the way in", inRegionOffered),
+					false: "arrivals are filtered on AS path",
+				}[inRegionOffered > 0]),
 			Detail:  "relayed to " + strings.Join(relayed, " "),
 			Command: fmt.Sprintf("show bgp ipv4 unicast %s json (on the route server)", own),
 		})
 	case len(tagged) > 0:
 		return Partial("policy.ixp_communities", 0.5, Evidence{
 			Expected: "communities set for out-of-region members, and in-region announcements refused",
-			Observed: fmt.Sprintf("the exchange sees %s but nothing filters arrivals from %s on AS path",
-				strings.Join(tagged, " "), ixpPeer),
+			Observed: fmt.Sprintf("the exchange sees %s, but %s",
+				strings.Join(tagged, " "),
+				map[bool]string{
+					true: fmt.Sprintf("in-region routes still arrive from %s", ixpPeer),
+					false: fmt.Sprintf("the exchange is relaying no in-region route to us, and no inbound "+
+						"filter on %s would refuse one", ixpPeer),
+				}[inRegionOffered > 0]),
 			Hint:    "part (ii) asks you to deny announcements whose path contains an in-region AS",
 			Detail:  unapplied,
 			Command: "show running-config",
@@ -2298,6 +2325,23 @@ func routeServerOffersOutOfRegion(ctx context.Context, env *Env, rsDevice, ourAd
 // exchange like any out-of-region member; counting them as in-region made the
 // reference solution fail its own question the moment the exchange began
 // delivering routes at all.
+// countInRegionOffers reports how many of the routes the exchange is relaying
+// to this AS cross a system in its own region -- the ones the exercise says to
+// refuse, and so the ones whose absence from the member's table is evidence
+// that something refused them.
+func countInRegionOffers(offeredPaths map[string]string, inRegion map[int]bool) int {
+	n := 0
+	for _, path := range offeredPaths {
+		for _, f := range strings.Fields(path) {
+			if asn, err := strconv.Atoi(f); err == nil && inRegion[asn] {
+				n++
+				break
+			}
+		}
+	}
+	return n
+}
+
 func ixpInRegion(env *Env) map[int]bool {
 	out := map[int]bool{}
 	me, ok := env.Topology.ASes[env.AS]
