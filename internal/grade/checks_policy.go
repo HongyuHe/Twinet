@@ -184,8 +184,8 @@ func checkSixIn4(ctx context.Context, env *Env) Result {
 		if err != nil {
 			return Errored("tunnel.sixin4", err)
 		}
-		name := configuredTunnel(out.Stdout)
-		if name == "" {
+		names := configuredTunnels(out.Stdout)
+		if len(names) == 0 {
 			missing = append(missing, fmt.Sprintf("%s has no configured 6in4 tunnel "+
 				"(the kernel's own sit0 does not count: it has no endpoints)", gw.Name))
 			continue
@@ -197,7 +197,26 @@ func checkSixIn4(ctx context.Context, env *Env) Result {
 		// addresses -- which breaks the moment either link does, and is not
 		// what the question asks for -- scored the same as the answer. The
 		// loopback is the point: it is reachable by any interior path.
-		if why := tunnelEndpointsWrong(out.Stdout, name, gw, gateways, domains, d); why != "" {
+		//
+		// Each tunnel is judged on its own endpoints and the first sound one
+		// is taken. Judging only the first the kernel happened to list meant a
+		// forgotten experiment left beside a correct tunnel failed the answer.
+		// Taking a sound one cannot award an unearned mark: whether the
+		// traffic goes through *that* tunnel is settled below, by what the
+		// gateway does with a packet for the far host and by the tunnel's own
+		// counters.
+		name, why := "", ""
+		for _, n := range names {
+			w := tunnelEndpointsWrong(out.Stdout, n, gw, gateways, domains, d)
+			if w == "" {
+				name = n
+				break
+			}
+			if why == "" {
+				why = w
+			}
+		}
+		if name == "" {
 			missing = append(missing, fmt.Sprintf("%s: %s", gw.Name, why))
 			continue
 		}
@@ -1954,7 +1973,15 @@ func countROAs(out string) int {
 // "ipv6/ip". A GRE tunnel between the same two addresses also carries the
 // traffic and also moves the counters, so accepting any tunnel with two
 // endpoints gave the mark for a different answer to a different question.
-func configuredTunnel(out string) string {
+//
+// Every such tunnel is returned, not the first one. A device is free to have
+// more than one, and a student debugging their answer routinely leaves an
+// experiment behind; the kernel lists them in its own order, so taking the
+// first one meant a correct tunnel could be judged by an abandoned tunnel's
+// endpoints and a right answer marked wrong. Which of them the traffic
+// actually uses is settled afterwards, by the route and the counters.
+func configuredTunnels(out string) []string {
+	var names []string
 	for _, line := range strings.Split(out, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || !strings.Contains(line, "remote ") || !strings.Contains(line, "local ") {
@@ -1971,9 +1998,9 @@ func configuredTunnel(out string) string {
 		if fieldAfter(line, "remote") == "any" || fieldAfter(line, "local") == "any" {
 			continue
 		}
-		return name
+		names = append(names, name)
 	}
-	return ""
+	return names
 }
 
 // tunnelTx reads a tunnel's transmitted packet count.
