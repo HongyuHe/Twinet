@@ -1083,6 +1083,25 @@ reached students, and each motivated a permanent test.
     in the stack the kernel reports, and the lab's directly-connected edge pair
     keeps its mark.
 
+100. **rpki.notfound_preserved asked the submission which prefixes it should be
+     judged against.** `roaPrefixes` read `show rpki prefix-table` from the
+     first router that answered and returned it, empty or not. A router with no
+     validator session prints an empty table and exits zero, and the reference
+     cos461 submission carries no `rpki cache` on three of its eight routers,
+     so the baseline was decided by which router the manifest happens to list
+     first. Removing the one `rpki cache` line from MSP -- which the lab
+     plainly permits, three of its peers having none -- moved the examined
+     population from 1 prefix to 9, and the report then stated "all 9
+     prefix(es) without a ROA are still in this AS's table" when eight of the
+     nine were marked `V` for valid in the very BGP table the check had just
+     read. `hijackIsAnnounced` already spells out the doctrine this broke:
+     asking the student's own routers is circular, because a submission cannot
+     be the reference it is judged against. The population now comes from the
+     lab's own `lab.rpki.not_found` declaration, which staff control; failing
+     that, from every router's table pooled rather than the first one's; and
+     when no baseline can be established while candidates exist, the check says
+     so instead of reading silence as "nobody has published a ROA".
+
 
 
 

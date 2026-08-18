@@ -1704,14 +1704,16 @@ func checkRPKINotFoundPreserved(ctx context.Context, env *Env) Result {
 				"there was no not-found route to lose"})
 	}
 	return Pass("rpki.notfound_preserved", Evidence{
-		Observed: fmt.Sprintf("all %d prefix(es) without a ROA are still in this AS's table", checked),
-		Command:  "show bgp ipv4 unicast rpki notfound"})
+		Observed: fmt.Sprintf("all %d prefix(es) whose owner has published no ROA are "+
+			"selected on every router of this AS, learned rather than originated here, "+
+			"and reachable from every host", checked),
+		Command: "show bgp ipv4 unicast rpki notfound"})
 }
 
 // missingNotFoundRoutes names the prefixes this AS should hold and does not,
 // among those whose origin has published no ROA.
 func missingNotFoundRoutes(ctx context.Context, env *Env) ([]string, int, error) {
-	covered, err := roaPrefixes(ctx, env)
+	want, err := notFoundPopulation(ctx, env)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -1770,32 +1772,26 @@ func missingNotFoundRoutes(ctx context.Context, env *Env) ([]string, int, error)
 
 	var missing []string
 	checked := 0
-	for asn, as := range env.Topology.ASes {
-		if asn == env.AS || as.Block == "" || as.Role == model.RoleIXP {
-			continue
-		}
-		if covered[as.Block] {
-			continue
-		}
+	for block, asn := range want {
 		checked++
 		var without []string
 		for _, r := range routers {
-			if !haveOn[r.Name][as.Block] {
+			if !haveOn[r.Name][block] {
 				without = append(without, r.Name)
 			}
 		}
 		if len(without) > 0 {
 			sort.Strings(without)
 			missing = append(missing, fmt.Sprintf("%s (AS %d) is not selected on %s",
-				as.Block, asn, strings.Join(truncate(without, 4), ", ")))
+				block, asn, strings.Join(truncate(without, 4), ", ")))
 			continue
 		}
-		if who := forged[as.Block]; len(who) > 0 {
+		if who := forged[block]; len(who) > 0 {
 			sort.Strings(who)
 			missing = append(missing, fmt.Sprintf(
 				"%s (AS %d) is selected, but %s originates it rather than having learned it: "+
 					"a route you announce yourself is not the route you were asked to preserve",
-				as.Block, asn, strings.Join(truncate(who, 4), ", ")))
+				block, asn, strings.Join(truncate(who, 4), ", ")))
 			continue
 		}
 		// And it has to carry traffic.
@@ -1827,7 +1823,7 @@ func missingNotFoundRoutes(ctx context.Context, env *Env) ([]string, int, error)
 		if len(unreachable) > 0 {
 			missing = append(missing, fmt.Sprintf(
 				"%s (AS %d) is in every table, but %d host(s) cannot reach %s (%s): the route "+
-					"is preserved in name only", as.Block, asn, len(unreachable), addr,
+					"is preserved in name only", block, asn, len(unreachable), addr,
 				strings.Join(truncate(unreachable, 3), ", ")))
 		}
 	}
@@ -1900,14 +1896,24 @@ func locallySourced(e bgpRoute) bool {
 	return true
 }
 
-// roaPrefixes is the set of prefixes the validator has a ROA for.
-func roaPrefixes(ctx context.Context, env *Env) (map[string]bool, error) {
+// roaPrefixes is the set of prefixes some router has been served a ROA for,
+// and whether any router's table could be read at all.
+//
+// Every router is asked and the answers are pooled. Asking only the first one
+// that replied made the answer depend on which router that happened to be: a
+// router with no validator session prints an empty table and reports no error,
+// and three of the eight routers in the reference cos461 submission carry no
+// `rpki cache` line at all, so the pool is empty or full according to an
+// accident of ordering.
+func roaPrefixes(ctx context.Context, env *Env) (map[string]bool, bool) {
 	out := map[string]bool{}
+	readable := false
 	for _, r := range env.Routers() {
 		text, err := env.Vtysh(ctx, r.Name, "show rpki prefix-table")
 		if err != nil {
 			continue
 		}
+		readable = true
 		// The table prints the address and the prefix length in separate
 		// columns -- "6.0.0.0   8 -   8   6" -- and never as "6.0.0.0/8".
 		// Looking for a slash therefore matched nothing at all, so every
@@ -1916,9 +1922,82 @@ func roaPrefixes(ctx context.Context, env *Env) (map[string]bool, error) {
 		for k := range parseROATable(text) {
 			out[k] = true
 		}
+	}
+	return out, readable
+}
+
+// notFoundPopulation names the address blocks whose owners have published no
+// ROA, keyed by block, with the ASN that owns each.
+//
+// The lab declares this in lab.rpki.not_found and staff control the
+// declaration. That is the point. The alternative -- asking the student's own
+// routers which prefixes the validator has served -- is circular in the same
+// way that asking them whether a hijack was announced would be: a submission
+// cannot be the reference it is judged against. A router whose validator
+// session is down prints an empty prefix table and exits zero, and an empty
+// table read as "nobody has published a ROA" silently turns this check into a
+// different and far stricter one -- that this AS holds a route to every other
+// AS in the lab -- while the evidence carries on calling those prefixes
+// not-found.
+//
+// Measured: dropping the single `rpki cache` line from MSP, which this lab
+// plainly permits since three of its eight routers carry none, moved the
+// examined population from 1 prefix to 9 and had the report state "all 9
+// prefix(es) without a ROA are still in this AS's table" -- of which eight were
+// marked V for valid in the very BGP table the check had just read.
+func notFoundPopulation(ctx context.Context, env *Env) (map[string]int, error) {
+	if env.Topology != nil && env.Topology.Lab != nil &&
+		len(env.Topology.Lab.RPKI.NotFound) > 0 {
+		out := map[string]int{}
+		for _, asn := range env.Topology.Lab.RPKI.NotFound {
+			as, ok := env.Topology.ASes[asn]
+			if !ok || as.Block == "" || asn == env.AS || as.Role == model.RoleIXP {
+				continue
+			}
+			out[as.Block] = asn
+		}
 		return out, nil
 	}
-	return out, nil
+
+	// No declaration, so fall back to what the validator has served.
+	//
+	// Every other system that owns a block is a candidate; the served table
+	// only decides which of them to drop. When there are no candidates the
+	// answer is the empty set however the table reads, and refusing there
+	// would withhold a mark over a baseline that changes nothing.
+	cand := map[string]int{}
+	for asn, as := range env.Topology.ASes {
+		if asn == env.AS || as.Block == "" || as.Role == model.RoleIXP {
+			continue
+		}
+		cand[as.Block] = asn
+	}
+	if len(cand) == 0 {
+		return nil, nil
+	}
+
+	// With candidates to decide between, the baseline has to be real.
+	// Concluding "no ROAs anywhere" from tables that could not be read, or
+	// from sessions that are down, grades against a population nobody
+	// observed -- and errs strict, since every candidate then counts as one
+	// the submission must hold.
+	covered, readable := roaPrefixes(ctx, env)
+	if !readable {
+		return nil, fmt.Errorf("no router's RPKI prefix table could be read, so which of " +
+			"the other systems have published a ROA cannot be established")
+	}
+	if len(covered) == 0 {
+		return nil, fmt.Errorf("no router has been served a single ROA, so whether the " +
+			"other systems have published one cannot be established: either the validator " +
+			"sessions are down or this lab publishes no ROAs, and the two cannot be told " +
+			"apart from here -- declare lab.rpki.not_found to settle it")
+	}
+	for block := range cand {
+		if covered[block] {
+			delete(cand, block)
+		}
+	}
+	return cand, nil
 }
 
 // rpkiConfigured reports whether any router has an RPKI cache configured.
