@@ -510,6 +510,90 @@ func deadTimers(ctx context.Context, env *Env) map[string]map[string]int64 {
 	return out
 }
 
+const (
+	// OSPF's own default, used when a router will not say what it uses. It is
+	// the shortest common interval, so assuming it can only make the liveness
+	// window tighter than it needs to be, never looser.
+	defaultHelloMsec = 10000
+	// The longest this check will stand and watch. Forty-five seconds covers
+	// both intervals RFC 2328 gives, ten and thirty. Beyond that the check
+	// says it cannot tell rather than waiting arbitrarily long on a number the
+	// student chose.
+	maxWatchMsec = 45000
+)
+
+// watchFor is how long to watch a dead timer when hellos come every hello ms:
+// long enough that a live adjacency must reset the timer at least once, and
+// never so long that a student's choice of interval decides how long grading
+// takes.
+func watchFor(hello int64) int64 {
+	w := int64(12000)
+	if hello+2000 > w {
+		w = hello + 2000
+	}
+	if w > maxWatchMsec {
+		w = maxWatchMsec
+	}
+	return w
+}
+
+// missedHello says whether a dead timer that went from before to after over
+// elapsed ms was reset in between.
+//
+// A hello sets the timer back to the dead interval, so over a window of
+// elapsed ms the timer falls by elapsed less one interval for every hello that
+// arrived: at most elapsed-hello if the adjacency is live, and the whole of
+// elapsed if it is silent. Half an interval below elapsed lies between the two
+// whatever the interval is.
+func missedHello(before, after, elapsed, hello int64) bool {
+	return before-after >= elapsed-hello/2
+}
+
+// ospfIfaceJSON is what a router says about its own OSPF timers.
+type ospfIfaceJSON struct {
+	Interfaces map[string]struct {
+		HelloMsec int64 `json:"timerMsecs"`
+		DeadSec   int64 `json:"timerDeadSecs"`
+	} `json:"interfaces"`
+}
+
+// helloIntervals reads how often each interface actually sends a hello.
+//
+// The liveness test below watches the dead timer for a hello to reset it, so
+// it has to watch for longer than the gap between hellos. Ten seconds is only
+// OSPF's default: RFC 2328 specifies thirty for non-broadcast networks, and
+// any interval is permitted. Reading the interval rather than assuming it is
+// what keeps the test from calling a slow-hello adjacency dead.
+//
+// An interval that cannot be read is taken to be the default, which makes the
+// window shorter and the test stricter -- never the other way round.
+func helloIntervals(ctx context.Context, env *Env) map[string]map[string]int64 {
+	out := map[string]map[string]int64{}
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for _, r := range env.Routers() {
+		wg.Add(1)
+		go func(r *model.Device) {
+			defer wg.Done()
+			var doc ospfIfaceJSON
+			if err := env.VtyshJSON(ctx, r.Name, "show ip ospf interface json", &doc); err != nil {
+				return
+			}
+			byIface := map[string]int64{}
+			for name, i := range doc.Interfaces {
+				if i.HelloMsec > 0 {
+					byIface[name] = i.HelloMsec
+				}
+			}
+			mu.Lock()
+			out[r.Name] = byIface
+			mu.Unlock()
+		}(r)
+	}
+	wg.Wait()
+	return out
+}
+
 // linkDevice is what an interface says about itself beyond its name.
 type linkDevice struct {
 	Kind     string
@@ -651,23 +735,65 @@ func checkOSPFAdjacency(ctx context.Context, env *Env) Result {
 	// timer, so a second reading a hello interval later says whether one
 	// arrived. A healthy adjacency cannot lose more than one hello interval of
 	// dead time between two readings; a silent one loses the whole wait.
+	// How long to watch is not a constant. It was twelve seconds, which
+	// contains a hello only while the interval is the ten-second default;
+	// RFC 2328 specifies thirty for non-broadcast networks. At a thirty-second
+	// interval two windows in three contained no hello, and an adjacency that
+	// had been up for hours with nothing retransmitted was reported as held up
+	// by a timer -- differently on each run, so the same submission was worth
+	// different marks depending on when it was graded.
+	hellos := helloIntervals(ctx, env)
+	helloOf := func(router, iface string) int64 {
+		if h, ok := hellos[router][iface]; ok && h > 0 {
+			return h
+		}
+		return int64(defaultHelloMsec)
+	}
+	watch := int64(12000)
+	for _, w := range wanted {
+		if got := watchFor(helloOf(w.router, w.iface)); got > watch {
+			watch = got
+		}
+	}
+
+	start := time.Now()
 	before := deadTimers(ctx, env)
 	select {
 	case <-ctx.Done():
-	case <-time.After(12 * time.Second):
+	case <-time.After(time.Duration(watch) * time.Millisecond):
 	}
 	after := deadTimers(ctx, env)
+	elapsed := time.Since(start).Milliseconds()
 
 	var stuck []string
 	got := 0
 	for _, w := range wanted {
-		if b, ok := before[w.router][w.iface]; ok && b > 0 {
-			if a, ok2 := after[w.router][w.iface]; ok2 && a <= b-11000 {
-				stuck = append(stuck, fmt.Sprintf(
-					"%s -> %s on %s says Full, but no hello arrived while it was watched: "+
-						"the state is held by a timer that has not expired yet",
-					w.router, w.peer, w.iface))
-				continue
+		hello := helloOf(w.router, w.iface)
+		switch {
+		case elapsed < hello+2000:
+			// Watching for less than one interval proves nothing either way,
+			// and saying the adjacency is dead would be inventing a reading
+			// that was never taken.
+			stuck = append(stuck, fmt.Sprintf(
+				"%s -> %s on %s says Full, but sends a hello only every %ds, which is "+
+					"longer than this check watches for, so nothing here shows the "+
+					"adjacency is still alive",
+				w.router, w.peer, w.iface, hello/1000))
+			continue
+		default:
+			if b, ok := before[w.router][w.iface]; ok && b > 0 {
+				// Over a window of E with hellos every H, a live adjacency's
+				// dead time falls by E minus one interval for each hello that
+				// reset it, so by at most E-H. A silent one loses the whole E.
+				// Half an interval below E separates the two.
+				if a, ok2 := after[w.router][w.iface]; ok2 && missedHello(b, a, elapsed, hello) {
+					stuck = append(stuck, fmt.Sprintf(
+						"%s -> %s on %s says Full, but no hello arrived in the %ds it was "+
+							"watched, though one is due every %ds: the state is held by a "+
+							"timer that has not expired yet",
+						w.router, w.peer, w.iface, elapsed/1000, hello/1000))
+					continue
+				}
 			}
 		}
 		if id, known := links[w.router]; known {

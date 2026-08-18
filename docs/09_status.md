@@ -1162,6 +1162,23 @@ reached students, and each motivated a permanent test.
      check already noticed the blackhole this particular mutation caused, but
      it is the ranking's own claim that was false.
 
+104. **A hello that was watched for less time than it takes to arrive.** The
+     liveness test added for finding 72 watches an OSPF dead timer for twelve
+     seconds and calls the adjacency dead if nothing reset it, which is right
+     while hellos come every ten seconds. Ten is only the default: RFC 2328
+     specifies thirty for non-broadcast networks and any interval is permitted.
+     At thirty, two windows in three contained no hello at all, and an
+     adjacency up for two and a half hours with nothing retransmitted was
+     reported as "held by a timer that has not expired yet" -- on some runs and
+     not others, so the same submission was worth 1.00 or 0.92 depending on
+     when it was graded. The window is now taken from the interval each
+     interface actually uses, and the threshold with it: over a window a live
+     adjacency loses at most one interval less than the whole of it, a silent
+     one loses all of it, and half an interval below the window separates the
+     two whatever the interval is. An interval longer than the grader is
+     willing to wait is reported as one whose liveness could not be
+     established, rather than as silence.
+
 
 
 
