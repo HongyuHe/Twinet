@@ -1432,11 +1432,16 @@ func checkVPNLabelSwitched(ctx context.Context, env *Env) Result {
 			case len(shallow) == 0:
 				labelled++
 			case len(shallow) < installed:
+				carry := "carry"
+				if len(shallow) == 1 {
+					carry = "carries"
+				}
 				problems = append(problems, fmt.Sprintf(
-					"%s reaches %s in %s over %d equal-cost paths and %d of them (%s) carry the "+
+					"%s reaches %s in %s over %d equal-cost paths and %d of them (%s) %s the "+
 						"VPN label alone; a flow hashed onto one of those arrives at the next "+
 						"router carrying a label that router never handed out",
-					e.router, prefix, e.vrf, installed, len(shallow), strings.Join(shallow, ", ")))
+					e.router, prefix, e.vrf, installed, len(shallow),
+					strings.Join(shallow, ", "), carry))
 			case installed > 1:
 				problems = append(problems, fmt.Sprintf(
 					"%s reaches %s in %s over %d equal-cost paths and not one of them carries "+
