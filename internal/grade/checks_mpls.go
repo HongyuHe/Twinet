@@ -622,23 +622,31 @@ func vpnTransportGaps(ctx context.Context, env *Env, pairs []directedPair) (
 // vpnTCPGap attempts one connection across a site pair and reports what did not
 // happen.
 func vpnTCPGap(ctx context.Context, env *Env, d directedPair) (string, bool) {
+	port := probePort()
+	tap := startArrivalTap(ctx, env, d.to.host, port)
 	before, okB := tcpAnswers(ctx, env, d.to.host)
 	res, err := env.Probe(ctx, d.from.host,
-		[]string{"nc", "-v", "-w", "3", "-z", d.to.addr, probePort()})
+		[]string{"nc", "-v", "-w", "3", "-z", d.to.addr, port})
 	if err != nil {
-		return "", false // the machinery failed, which is not a verdict
+		_, _ = tap.seen(ctx, env) // clear the capture off the machine
+		return "", false          // the machinery failed, which is not a verdict
 	}
 	after, okA := tcpAnswers(ctx, env, d.to.host)
+	frames, live := tap.seen(ctx, env)
+	got := arrival{
+		tapped: frames.tcp, tapLive: live,
+		counted: offBoxDelta(before, after), counterOK: okB && okA,
+	}
 	said := strings.ToLower(res.Stderr + res.Stdout)
 	answered := res.ExitCode == 0 ||
 		strings.Contains(said, "refused") || strings.Contains(said, "reset")
-	arrived := okB && okA && after > before
+	arrived := got.attributable() && got.arrived()
 
 	switch {
-	case answered && okB && okA && !arrived:
-		return fmt.Sprintf("%s got an answer from %s (%s) to a connection %s never saw: "+
+	case answered && got.attributable() && !arrived:
+		return fmt.Sprintf("%s got an answer from %s (%s) to a connection %s never saw -- %s: "+
 			"something on the path is answering for it", d.from.host, d.to.host, d.to.addr,
-			d.to.host), true
+			d.to.host, got.why()), true
 	case !answered && arrived:
 		return fmt.Sprintf("a connection from %s reaches %s (%s) but the answer does not come "+
 			"back, though pings do", d.from.host, d.to.host, d.to.addr), true
@@ -647,13 +655,15 @@ func vpnTCPGap(ctx context.Context, env *Env, d directedPair) (string, bool) {
 			"carrying ICMP and discarding the rest", d.from.host, d.to.host, d.to.addr), true
 	}
 	// It answered, so the only way to know the answer came from the far side
-	// is the far side's own count of what it sent.
-	return "", okB && okA
+	// is the far side's own record of what reached it.
+	return "", got.attributable()
 }
 
 // vpnUDPGap sends one datagram across a site pair and reads, at the far side,
 // whether it arrived.
 func vpnUDPGap(ctx context.Context, env *Env, d directedPair) (string, bool) {
+	port := probePort()
+	tap := startArrivalTap(ctx, env, d.to.host, port)
 	before, okB := datagramsDelivered(ctx, env, d.to)
 	// A datagram that was never sent cannot have been filtered. Reaching a
 	// closed port exits zero here and a blocked one times out and also exits
@@ -661,21 +671,28 @@ func vpnUDPGap(ctx context.Context, env *Env, d directedPair) (string, bool) {
 	// that as a datagram that did not arrive accused the VPN of filtering by
 	// protocol on no evidence.
 	sent, err := env.Probe(ctx, d.from.host, []string{"sh", "-c",
-		"echo twinet | nc -u -w 2 " + d.to.addr + " " + probePort()})
+		"echo twinet | nc -u -w 2 " + d.to.addr + " " + port})
 	if err != nil || sent.ExitCode != 0 {
+		_, _ = tap.seen(ctx, env) // clear the capture off the machine
 		return "", false
 	}
 	after, okA := datagramsDelivered(ctx, env, d.to)
-	// A datagram is invisible to whoever sent it, so the far side's count is
-	// the whole of the evidence. Without it there is no verdict either way.
-	if !okB || !okA {
+	frames, live := tap.seen(ctx, env)
+	got := arrival{
+		tapped: frames.udp, tapLive: live,
+		counted: offBoxDelta(before, after), counterOK: okB && okA,
+	}
+	// A datagram is invisible to whoever sent it, so the far side's own record
+	// is the whole of the evidence. Without it there is no verdict either way.
+	if !got.attributable() {
 		return "", false
 	}
-	if after > before {
+	if got.arrived() {
 		return "", true
 	}
-	return fmt.Sprintf("a datagram from %s to %s (%s) never arrived, though pings do: the VPN "+
-		"is filtering by protocol", d.from.host, d.to.host, d.to.addr), true
+	return fmt.Sprintf("a datagram from %s to %s (%s) never arrived -- %s -- though pings do: "+
+		"the VPN is filtering by protocol",
+		d.from.host, d.to.host, d.to.addr, got.why()), true
 }
 
 // receivedEchoesAt reads each site host's count of ICMP echo requests the
@@ -819,7 +836,7 @@ func checkVPNIsolation(ctx context.Context, env *Env) Result {
 		Expected: "customers are kept apart, over a VPN that carries their traffic",
 		Observed: fmt.Sprintf("%d directed site pair(s) across %d customer(s) mutually "+
 			"unreachable by ping, connection and datagram, and no customer's table holds "+
-			"another's prefixes", tried, len(names)),
+			"a route aimed at another's prefixes alone", tried, len(names)),
 	})
 }
 
@@ -880,10 +897,15 @@ func vpnCrossTalk(ctx context.Context, env *Env, pairs []directedPair) []string 
 // vpnDatagramLeaks sends datagrams across every cross-customer pair and reads,
 // at each destination, whether they arrived.
 //
-// A datagram is one way, so the sender learns nothing; the destination's count
-// of datagrams delivered for an unbound port is the only witness. The pairs are
-// scheduled so that no destination is aimed at twice at once, which is what
-// makes a counter that moved attributable to the sender that moved it.
+// A datagram is one way, so the sender learns nothing; what the destination
+// recorded is the only witness. The pairs are scheduled so that no destination
+// is aimed at twice at once, which is what makes a counter that moved
+// attributable to the sender that moved it.
+//
+// This one accuses, so the direction to err in is the other one: a count the
+// destination raised by itself, on its own loopback, would name two properly
+// separated customers as leaking into each other. Both the loopback subtraction
+// and the capture of the exact flow are here for that reason.
 func vpnDatagramLeaks(ctx context.Context, env *Env, pairs []directedPair) []string {
 	const burst = 3 // several, so one stray packet in the window is not a verdict
 
@@ -891,7 +913,12 @@ func vpnDatagramLeaks(ctx context.Context, env *Env, pairs []directedPair) []str
 	for _, round := range roundsByDestinationOf(pairs, func(d directedPair) string {
 		return d.to.host
 	}) {
-		before := map[string]int{}
+		ports := map[string]string{}
+		for _, d := range round {
+			ports[d.to.host] = probePort()
+		}
+		taps := startTaps(ctx, env, ports)
+		before := map[string]counterWitness{}
 		for _, d := range round {
 			if n, ok := datagramsDelivered(ctx, env, d.to); ok {
 				before[d.to.host] = n
@@ -904,18 +931,20 @@ func vpnDatagramLeaks(ctx context.Context, env *Env, pairs []directedPair) []str
 				defer wg.Done()
 				for i := 0; i < burst; i++ {
 					_, _ = env.Probe(ctx, d.from.host, []string{"sh", "-c",
-						"echo twinet | nc -u -w 1 " + d.to.addr + " " + probePort()})
+						"echo twinet | nc -u -w 1 " + d.to.addr + " " + ports[d.to.host]})
 				}
 			}(d)
 		}
 		wg.Wait()
+		seen := readTaps(ctx, env, taps)
 		for _, d := range round {
-			b, ok := before[d.to.host]
-			if !ok {
-				continue
+			b, okB := before[d.to.host]
+			a, okA := datagramsDelivered(ctx, env, d.to)
+			got := arrival{
+				tapped: seen[d.to.host].counts.udp, tapLive: seen[d.to.host].live,
+				counted: offBoxDelta(b, a), counterOK: okB && okA,
 			}
-			a, ok := datagramsDelivered(ctx, env, d.to)
-			if !ok || a-b < burst {
+			if !got.arrivedAtLeast(burst) {
 				continue
 			}
 			out = append(out, fmt.Sprintf(
@@ -928,7 +957,7 @@ func vpnDatagramLeaks(ctx context.Context, env *Env, pairs []directedPair) []str
 
 // datagramsDelivered reads a site's count of datagrams the kernel took delivery
 // of for a port nothing is bound to, in the family the site is addressed in.
-func datagramsDelivered(ctx context.Context, env *Env, s sitePoint) (int, bool) {
+func datagramsDelivered(ctx context.Context, env *Env, s sitePoint) (counterWitness, bool) {
 	if strings.Contains(s.addr, ":") {
 		return udpNoPorts(ctx, env, s.host)
 	}
@@ -980,10 +1009,22 @@ func anyCustomerTrafficArrives(ctx context.Context, env *Env) (bool, error) {
 // which is indistinguishable from isolation to anything that pings.
 //
 // A route counts as a leak when it covers another customer's site and does not
-// cover any of this customer's own. That last clause is what keeps a default
-// route -- which covers everybody, is not customer-specific, and is present in
-// every correct submission here -- from being read as a total leak, without
-// resorting to a list of prefixes to forgive.
+// cover any of this customer's own. That last clause keeps a route that covers
+// everybody -- a default route, or an aggregate wide enough to span both
+// customers -- from being read as a total leak, without resorting to a list of
+// prefixes to forgive: such a route says nothing about where its traffic ends
+// up, and reading it as a leak would cost a correct submission its marks.
+//
+// The price of that exemption is that a route wide enough to cover this
+// customer's own sites is not examined here at all, so a leak arranged behind
+// one is invisible to this half. That is not a hole, because it is the probes
+// above that decide reachability and they do not care how the route was
+// spelled: a 16.0.0.0/4 in one table resolving into the other customer's
+// network, advertised to the customer, was measured delivering every packet it
+// was sent, and was caught -- by the connection and the datagram, the ping
+// having been dropped for want of a return path. What this function
+// establishes is therefore narrower than "the tables are separate", and the
+// evidence says so.
 func crossCustomerRoutes(ctx context.Context, env *Env, groups map[string][]sitePoint,
 	names []string) ([]string, error) {
 	holders, err := vrfHolders(env)
@@ -1264,6 +1305,64 @@ func (e *Env) reaches(ctx context.Context, deviceID, addr string) (bool, error) 
 // edge which customer it belongs to. A static route has no labels; a route in
 // the global table is not in the VRF; and a single label is a backbone path
 // with no VPN on it.
+// vpnNexthop is one path the kernel holds for a VPN prefix, with the label
+// stack it would push on a packet taking that path.
+type vpnNexthop struct {
+	IP            string `json:"ip"`
+	FIB           bool   `json:"fib"`
+	InterfaceName string `json:"interfaceName"`
+	Labels        []int  `json:"labels"`
+}
+
+// labelDepth reports how many of a prefix's paths the kernel has installed,
+// which of them carry fewer than the two labels a VPN route needs, and the
+// thinnest stack among them.
+//
+// It looks at every installed path rather than the best one. A prefix with
+// several equal-cost paths gets a nexthop per path, each with its own transport
+// label, and the kernel hashes flows across all of them; the deepest stack
+// among them describes the best path, not the route. With LDP missing on one
+// interior link the two good paths hid the third, which carried the VPN label
+// alone -- and flows hashed onto it arrived at the core router bearing a label
+// it had never handed out and were dropped, five of nine source addresses
+// losing everything, while this reported the prefix as resolving through a
+// transport label and a VPN label. A route is label-switched only if all of it
+// is.
+//
+// Two labels is the right floor even where the two edges are neighbours. LDP
+// signals implicit-null for a prefix one hop away, so the ingress pushes only
+// the VPN label onto the wire -- but the stack the kernel reports still has the
+// implicit-null in it, so the depth is two either way and a correct submission
+// is not caught by this.
+func labelDepth(nhs []vpnNexthop) (installed int, shallow []string, thinnest int) {
+	thinnest = -1
+	for _, nh := range nhs {
+		if !nh.FIB {
+			continue
+		}
+		installed++
+		if thinnest < 0 || len(nh.Labels) < thinnest {
+			thinnest = len(nh.Labels)
+		}
+		if len(nh.Labels) >= 2 {
+			continue
+		}
+		via := nh.IP
+		if nh.InterfaceName != "" {
+			via = nh.InterfaceName
+		}
+		if via == "" {
+			via = "unnamed path"
+		}
+		shallow = append(shallow, via)
+	}
+	if thinnest < 0 {
+		thinnest = 0
+	}
+	sort.Strings(shallow)
+	return installed, shallow, thinnest
+}
+
 func checkVPNLabelSwitched(ctx context.Context, env *Env) Result {
 	as, ok := env.Topology.ASes[env.AS]
 	if !ok || len(as.VRFs) == 0 {
@@ -1330,18 +1429,14 @@ func checkVPNLabelSwitched(ctx context.Context, env *Env) Result {
 	}
 
 	var problems []string
-	checked, labelled := 0, 0
+	checked, labelled, paths := 0, 0, 0
 	for _, e := range edges {
 		for _, prefix := range e.remote {
 			checked++
 			var doc map[string][]struct {
-				Protocol string `json:"protocol"`
-				Selected bool   `json:"selected"`
-				Nexthops []struct {
-					IP     string `json:"ip"`
-					FIB    bool   `json:"fib"`
-					Labels []int  `json:"labels"`
-				} `json:"nexthops"`
+				Protocol string       `json:"protocol"`
+				Selected bool         `json:"selected"`
+				Nexthops []vpnNexthop `json:"nexthops"`
 			}
 			cmd := fmt.Sprintf("show ip route vrf %s %s json", e.vrf, prefix)
 			if err := env.VtyshJSON(ctx, e.router, cmd, &doc); err != nil {
@@ -1367,20 +1462,34 @@ func checkVPNLabelSwitched(ctx context.Context, env *Env) Result {
 					e.router, prefix, e.vrf, best.Protocol))
 				continue
 			}
-			// The stack, in the entry the kernel is actually using.
-			stack := 0
-			for _, nh := range best.Nexthops {
-				if !nh.FIB {
-					continue
-				}
-				if len(nh.Labels) > stack {
-					stack = len(nh.Labels)
-				}
-			}
+			// Every path the kernel would use, not the best-labelled one.
+			installed, shallow, thinnest := labelDepth(best.Nexthops)
+			paths += installed
 			switch {
-			case stack >= 2:
+			case installed == 0:
+				problems = append(problems, fmt.Sprintf(
+					"%s has %s in %s but no path installed for it, so nothing is carrying it",
+					e.router, prefix, e.vrf))
+			case len(shallow) == 0:
 				labelled++
-			case stack == 1:
+			case len(shallow) < installed:
+				carry := "carry"
+				if len(shallow) == 1 {
+					carry = "carries"
+				}
+				problems = append(problems, fmt.Sprintf(
+					"%s reaches %s in %s over %d equal-cost paths and %d of them (%s) %s the "+
+						"VPN label alone; a flow hashed onto one of those arrives at the next "+
+						"router carrying a label that router never handed out",
+					e.router, prefix, e.vrf, installed, len(shallow),
+					strings.Join(shallow, ", "), carry))
+			case installed > 1:
+				problems = append(problems, fmt.Sprintf(
+					"%s reaches %s in %s over %d equal-cost paths and not one of them carries "+
+						"a transport label; a VPN route needs two -- a transport label across "+
+						"the interior and a VPN label the far edge reads",
+					e.router, prefix, e.vrf, installed))
+			case thinnest == 1:
 				problems = append(problems, fmt.Sprintf(
 					"%s reaches %s in %s with one label; a VPN route needs two -- a transport "+
 						"label across the interior and a VPN label the far edge reads",
@@ -1418,7 +1527,8 @@ func checkVPNLabelSwitched(ctx context.Context, env *Env) Result {
 		return Pass("vpn.label_switched", Evidence{
 			Expected: "each customer's remote sites reached over a two-label path",
 			Observed: fmt.Sprintf("%d remote prefix(es) across %d edge/table pair(s) resolve "+
-				"through a transport label and a VPN label", labelled, len(edges)),
+				"through a transport label and a VPN label, on every one of the %d path(s) "+
+				"installed for them", labelled, len(edges), paths),
 			Command: "show ip route vrf <table> <prefix> json",
 		})
 	}

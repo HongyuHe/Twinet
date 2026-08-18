@@ -87,6 +87,8 @@ func checkAddressing(ctx context.Context, env *Env) Result {
 	// student's own choice, which the plan leaves to them.
 	var extra, counterfeit []string
 	planned := plannedSubnets(env)
+	owners := subnetOwners(env)
+	planCarries := plannedAddrs(env)
 
 	for _, r := range env.Routers() {
 		// Every scope, not only the global one.
@@ -125,6 +127,34 @@ func checkAddressing(ctx context.Context, env *Env) Result {
 					continue // the student's own choice inside the mandated prefix
 				}
 				if where := impersonates(planned, a); where != "" {
+					// Standing in for a part of the network you are not is a
+					// claim about a router, so it is the router that decides
+					// this. An address inside a subnet the plan gives to this
+					// very router counterfeits nothing -- there is no one else
+					// it could be answering for -- and reporting it as
+					// "a subnet the plan puts on another interface" while
+					// naming this router's own interface as the owner said
+					// something that was not true and took the whole mark for
+					// it. It is still an address the plan does not mention, so
+					// it still costs: "and nothing else" is what it falsifies.
+					//
+					// Taking another router's planned address is the exception
+					// that has to survive this, because a shared link's subnet
+					// belongs to both ends: the far end's address sitting on
+					// this one is an impersonation inside a subnet that really
+					// is partly ours.
+					if owner, taken := planCarries[bareAddr(a)]; taken && owner.device != r.ID {
+						counterfeit = append(counterfeit, fmt.Sprintf(
+							"%s:%s carries %s, the address the plan puts on %s",
+							r.Name, iface, a, owner.where))
+						continue
+					}
+					if owners[where][r.ID] {
+						extra = append(extra, fmt.Sprintf("%s:%s carries %s, which the plan "+
+							"does not mention -- %s is this router's own subnet",
+							r.Name, iface, a, where))
+						continue
+					}
 					counterfeit = append(counterfeit, fmt.Sprintf(
 						"%s:%s carries %s, which is inside %s -- a subnet the plan puts on %s",
 						r.Name, iface, a, where, planned[where]))
@@ -173,11 +203,11 @@ func checkAddressing(ctx context.Context, env *Env) Result {
 	sort.Strings(counterfeit)
 	if len(counterfeit) > 0 {
 		return Fail("l3.addressing_matches_plan", Evidence{
-			Expected: "no router carrying an address out of a subnet that belongs elsewhere",
-			Observed: fmt.Sprintf("%d address(es) claim a subnet the plan puts on another "+
-				"interface", len(counterfeit)),
+			Expected: "no router carrying an address out of a subnet that belongs to another router",
+			Observed: fmt.Sprintf("%d address(es) claim space the plan puts on another "+
+				"router", len(counterfeit)),
 			Detail:  strings.Join(truncate(counterfeit, 6), "\n"),
-			Hint:    "an address from somebody else's subnet makes this router answer for a part of the network it is not",
+			Hint:    "an address from another router's subnet makes this one answer for a part of the network it is not",
 			Command: "ip -o -4 addr show scope global",
 		})
 	}
@@ -283,6 +313,97 @@ func ownSubnet(i *model.Iface, addr string) bool {
 	return false
 }
 
+// subnetOwners maps every subnet in the lab to the routers the plan gives it
+// to. A link's subnet belongs to both of its ends, so this is a set rather than
+// a name: an address inside a subnet one of whose owners is the router carrying
+// it is not standing in for anybody.
+func subnetOwners(env *Env) map[string]map[string]bool {
+	out := map[string]map[string]bool{}
+	add := func(subnet, device string) {
+		subnet = normalPrefix(subnet)
+		if subnet == "" || device == "" {
+			return
+		}
+		if out[subnet] == nil {
+			out[subnet] = map[string]bool{}
+		}
+		out[subnet][device] = true
+	}
+	for _, l := range env.Topology.Links {
+		for _, e := range []*model.Iface{l.A, l.B} {
+			if e != nil && e.Device != nil {
+				add(l.Subnet, e.Device.ID)
+			}
+		}
+	}
+	for _, d := range env.Topology.Devices {
+		for _, i := range d.Ifaces {
+			add(i.Subnet, d.ID)
+			if i.Link != nil {
+				add(i.Link.Subnet, d.ID)
+			}
+			if i.Addr4 != "" {
+				if p, err := netip.ParsePrefix(i.Addr4); err == nil {
+					add(p.Masked().String(), d.ID)
+				}
+			}
+		}
+	}
+	return out
+}
+
+// normalPrefix puts a subnet in the one form it can be compared in, so that
+// 179.1.20.0/24 and 179.1.20.2/24 are recognised as the same subnet however
+// they were written down.
+func normalPrefix(subnet string) string {
+	p, err := netip.ParsePrefix(strings.TrimSpace(subnet))
+	if err != nil {
+		return strings.TrimSpace(subnet)
+	}
+	return p.Masked().String()
+}
+
+// plannedAddr is an address the plan puts somewhere, and where.
+type plannedAddr struct {
+	device string
+	where  string
+}
+
+// plannedAddrs maps every address the plan hands out to the interface it
+// belongs on. Wearing one of these is an impersonation wherever it happens,
+// including inside a subnet the wearer part-owns: on a shared link, the far
+// end's address is in a subnet that is legitimately ours too.
+func plannedAddrs(env *Env) map[string]plannedAddr {
+	out := map[string]plannedAddr{}
+	for _, d := range env.Topology.Devices {
+		for _, i := range d.Ifaces {
+			if i.Addr4 == "" {
+				continue
+			}
+			a := bareAddr(i.Addr4)
+			if a == "" {
+				continue
+			}
+			if _, seen := out[a]; !seen {
+				out[a] = plannedAddr{device: d.ID, where: d.ID + ":" + i.Name}
+			}
+		}
+	}
+	return out
+}
+
+// bareAddr strips the prefix length from an address, so that the same address
+// written with two different masks is recognised as the one address it is.
+func bareAddr(addr string) string {
+	if p, err := netip.ParsePrefix(addr); err == nil {
+		return p.Addr().String()
+	}
+	if a, err := netip.ParseAddr(addr); err == nil {
+		return a.String()
+	}
+	return ""
+}
+
 // impersonates names the planned subnet an address has been taken from, if any.
 func impersonates(planned map[string]string, addr string) string {
 	ip, err := netip.ParsePrefix(addr)
@@ -378,6 +499,90 @@ func deadTimers(ctx context.Context, env *Env) map[string]map[string]int64 {
 					if v, ok := byIface[iface]; !ok || n.DeadTimerMsec > v {
 						byIface[iface] = n.DeadTimerMsec
 					}
+				}
+			}
+			mu.Lock()
+			out[r.Name] = byIface
+			mu.Unlock()
+		}(r)
+	}
+	wg.Wait()
+	return out
+}
+
+const (
+	// OSPF's own default, used when a router will not say what it uses. It is
+	// the shortest common interval, so assuming it can only make the liveness
+	// window tighter than it needs to be, never looser.
+	defaultHelloMsec = 10000
+	// The longest this check will stand and watch. Forty-five seconds covers
+	// both intervals RFC 2328 gives, ten and thirty. Beyond that the check
+	// says it cannot tell rather than waiting arbitrarily long on a number the
+	// student chose.
+	maxWatchMsec = 45000
+)
+
+// watchFor is how long to watch a dead timer when hellos come every hello ms:
+// long enough that a live adjacency must reset the timer at least once, and
+// never so long that a student's choice of interval decides how long grading
+// takes.
+func watchFor(hello int64) int64 {
+	w := int64(12000)
+	if hello+2000 > w {
+		w = hello + 2000
+	}
+	if w > maxWatchMsec {
+		w = maxWatchMsec
+	}
+	return w
+}
+
+// missedHello says whether a dead timer that went from before to after over
+// elapsed ms was reset in between.
+//
+// A hello sets the timer back to the dead interval, so over a window of
+// elapsed ms the timer falls by elapsed less one interval for every hello that
+// arrived: at most elapsed-hello if the adjacency is live, and the whole of
+// elapsed if it is silent. Half an interval below elapsed lies between the two
+// whatever the interval is.
+func missedHello(before, after, elapsed, hello int64) bool {
+	return before-after >= elapsed-hello/2
+}
+
+// ospfIfaceJSON is what a router says about its own OSPF timers.
+type ospfIfaceJSON struct {
+	Interfaces map[string]struct {
+		HelloMsec int64 `json:"timerMsecs"`
+		DeadSec   int64 `json:"timerDeadSecs"`
+	} `json:"interfaces"`
+}
+
+// helloIntervals reads how often each interface actually sends a hello.
+//
+// The liveness test below watches the dead timer for a hello to reset it, so
+// it has to watch for longer than the gap between hellos. Ten seconds is only
+// OSPF's default: RFC 2328 specifies thirty for non-broadcast networks, and
+// any interval is permitted. Reading the interval rather than assuming it is
+// what keeps the test from calling a slow-hello adjacency dead.
+//
+// An interval that cannot be read is taken to be the default, which makes the
+// window shorter and the test stricter -- never the other way round.
+func helloIntervals(ctx context.Context, env *Env) map[string]map[string]int64 {
+	out := map[string]map[string]int64{}
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for _, r := range env.Routers() {
+		wg.Add(1)
+		go func(r *model.Device) {
+			defer wg.Done()
+			var doc ospfIfaceJSON
+			if err := env.VtyshJSON(ctx, r.Name, "show ip ospf interface json", &doc); err != nil {
+				return
+			}
+			byIface := map[string]int64{}
+			for name, i := range doc.Interfaces {
+				if i.HelloMsec > 0 {
+					byIface[name] = i.HelloMsec
 				}
 			}
 			mu.Lock()
@@ -530,23 +735,65 @@ func checkOSPFAdjacency(ctx context.Context, env *Env) Result {
 	// timer, so a second reading a hello interval later says whether one
 	// arrived. A healthy adjacency cannot lose more than one hello interval of
 	// dead time between two readings; a silent one loses the whole wait.
+	// How long to watch is not a constant. It was twelve seconds, which
+	// contains a hello only while the interval is the ten-second default;
+	// RFC 2328 specifies thirty for non-broadcast networks. At a thirty-second
+	// interval two windows in three contained no hello, and an adjacency that
+	// had been up for hours with nothing retransmitted was reported as held up
+	// by a timer -- differently on each run, so the same submission was worth
+	// different marks depending on when it was graded.
+	hellos := helloIntervals(ctx, env)
+	helloOf := func(router, iface string) int64 {
+		if h, ok := hellos[router][iface]; ok && h > 0 {
+			return h
+		}
+		return int64(defaultHelloMsec)
+	}
+	watch := int64(12000)
+	for _, w := range wanted {
+		if got := watchFor(helloOf(w.router, w.iface)); got > watch {
+			watch = got
+		}
+	}
+
+	start := time.Now()
 	before := deadTimers(ctx, env)
 	select {
 	case <-ctx.Done():
-	case <-time.After(12 * time.Second):
+	case <-time.After(time.Duration(watch) * time.Millisecond):
 	}
 	after := deadTimers(ctx, env)
+	elapsed := time.Since(start).Milliseconds()
 
 	var stuck []string
 	got := 0
 	for _, w := range wanted {
-		if b, ok := before[w.router][w.iface]; ok && b > 0 {
-			if a, ok2 := after[w.router][w.iface]; ok2 && a <= b-11000 {
-				stuck = append(stuck, fmt.Sprintf(
-					"%s -> %s on %s says Full, but no hello arrived while it was watched: "+
-						"the state is held by a timer that has not expired yet",
-					w.router, w.peer, w.iface))
-				continue
+		hello := helloOf(w.router, w.iface)
+		switch {
+		case elapsed < hello+2000:
+			// Watching for less than one interval proves nothing either way,
+			// and saying the adjacency is dead would be inventing a reading
+			// that was never taken.
+			stuck = append(stuck, fmt.Sprintf(
+				"%s -> %s on %s says Full, but sends a hello only every %ds, which is "+
+					"longer than this check watches for, so nothing here shows the "+
+					"adjacency is still alive",
+				w.router, w.peer, w.iface, hello/1000))
+			continue
+		default:
+			if b, ok := before[w.router][w.iface]; ok && b > 0 {
+				// Over a window of E with hellos every H, a live adjacency's
+				// dead time falls by E minus one interval for each hello that
+				// reset it, so by at most E-H. A silent one loses the whole E.
+				// Half an interval below E separates the two.
+				if a, ok2 := after[w.router][w.iface]; ok2 && missedHello(b, a, elapsed, hello) {
+					stuck = append(stuck, fmt.Sprintf(
+						"%s -> %s on %s says Full, but no hello arrived in the %ds it was "+
+							"watched, though one is due every %ds: the state is held by a "+
+							"timer that has not expired yet",
+						w.router, w.peer, w.iface, elapsed/1000, hello/1000))
+					continue
+				}
 			}
 		}
 		if id, known := links[w.router]; known {
@@ -1034,7 +1281,9 @@ func deadHops(ctx context.Context, env *Env, paths [][]string) []string {
 
 // carriesTCPBothWays opens a connection each way between two routers, to a
 // port nothing is listening on, and reads the far side's own count of the
-// resets it sent.
+// resets it sent -- together with a capture on the far side of the flow the
+// probe creates, which is what makes the count attributable to this probe
+// rather than to any traffic the submission cares to generate.
 func carriesTCPBothWays(ctx context.Context, env *Env, from, to string) (string, bool) {
 	ends := [][2]string{{from, to}, {to, from}}
 	for _, e := range ends {
@@ -1051,55 +1300,68 @@ func carriesTCPBothWays(ctx context.Context, env *Env, from, to string) (string,
 			return "", true
 		}
 		addr := addrOnly(lo.Addr4)
+		// One port for both protocols, drawn for this pair alone, so that a
+		// single capture on the far side covers the connection and the
+		// datagram and neither can be confused with anything else in flight.
+		port := probePort()
+		tap := startArrivalTap(ctx, env, dst.ID, port)
 		// Between the loopbacks, which is the pair the question is about and
 		// the pair a rule aimed at this traffic would name. Sourced from an
 		// interface address instead, a probe misses a drop written against the
 		// routers themselves and reads as a healthy path.
 		args := []string{"nc", "-w", "3", "-z"}
+		src4 := ""
 		if slo, ok := src.IfaceByName("lo"); ok && slo.Addr4 != "" {
-			args = append(args, "-s", addrOnly(slo.Addr4))
+			src4 = addrOnly(slo.Addr4)
+			args = append(args, "-s", src4)
 		}
-		args = append(args, addr, probePort())
+		args = append(args, addr, port)
 		before, okB := tcpAnswers(ctx, env, dst.ID)
 		_, _ = env.Probe(ctx, src.ID, args)
 		after, okA := tcpAnswers(ctx, env, dst.ID)
-		if okB && okA && after <= before {
-			return fmt.Sprintf(
-				"%s answers pings from %s but no connection to it arrives: the paths carry "+
-					"ICMP and nothing else", e[1], e[0]), false
-		}
 		// And a datagram. A filter is written per protocol as easily as per
 		// port: dropping UDP between the two loopbacks left the pings and the
 		// connections working and the paths carrying two thirds of what they
 		// should.
-		src4 := ""
-		if slo, ok := src.IfaceByName("lo"); ok && slo.Addr4 != "" {
-			src4 = addrOnly(slo.Addr4)
-		}
 		udpBefore, okU := udpNoPortsV4(ctx, env, dst.ID)
 		cmd := "echo twinet | nc -u -w 2"
 		if src4 != "" {
 			cmd += " -s " + src4
 		}
-		_, _ = env.Probe(ctx, src.ID, []string{"sh", "-c", cmd + " " + addr + " " + probePort()})
+		_, _ = env.Probe(ctx, src.ID, []string{"sh", "-c", cmd + " " + addr + " " + port})
 		udpAfter, okU2 := udpNoPortsV4(ctx, env, dst.ID)
-		if okU && okU2 && udpAfter <= udpBefore {
+		frames, live := tap.seen(ctx, env)
+
+		gotTCP := arrival{
+			tapped: frames.tcp, tapLive: live,
+			counted: offBoxDelta(before, after), counterOK: okB && okA,
+		}
+		if gotTCP.attributable() && !gotTCP.arrived() {
 			return fmt.Sprintf(
-				"%s answers pings and connections from %s but no datagram from it arrives: "+
-					"something on the paths is filtering by protocol", e[1], e[0]), false
+				"%s answers pings from %s but no connection to it arrives -- %s: the paths "+
+					"carry ICMP and nothing else", e[1], e[0], gotTCP.why()), false
+		}
+		gotUDP := arrival{
+			tapped: frames.udp, tapLive: live,
+			counted: offBoxDelta(udpBefore, udpAfter), counterOK: okU && okU2,
+		}
+		if gotUDP.attributable() && !gotUDP.arrived() {
+			return fmt.Sprintf(
+				"%s answers pings and connections from %s but no datagram from it arrives "+
+					"-- %s: something on the paths is filtering by protocol",
+				e[1], e[0], gotUDP.why()), false
 		}
 	}
 	return "", true
 }
 
 // udpNoPortsV4 reads a host's count of datagrams delivered to it for a port
-// nothing is bound to.
-func udpNoPortsV4(ctx context.Context, env *Env, device string) (int, bool) {
-	res, err := env.Probe(ctx, device, []string{"cat", "/proc/net/snmp"})
-	if err != nil || res.ExitCode != 0 {
-		return 0, false
-	}
-	return snmpCounter(res.Stdout, "Udp:", "NoPorts")
+// nothing is bound to, together with the loopback traffic that could have
+// produced it.
+func udpNoPortsV4(ctx context.Context, env *Env, device string) (counterWitness, bool) {
+	return readCounter(ctx, env, device, "/proc/net/snmp", func(body string) (int, bool) {
+		return snmpCounter(body, "Udp:", "NoPorts")
+	})
 }
 
 func checkECMP(ctx context.Context, env *Env) Result {
@@ -2828,8 +3090,12 @@ func checkInternalReachability(ctx context.Context, env *Env) Result {
 	// perfectly ordinary answer from the address it asked about -- left every
 	// probe succeeding while the host in question received nothing at all.
 	// The kernel's own count of echo requests delivered to it is not something
-	// a route or a NAT rule can arrange: if it did not go up, the packets did
-	// not arrive there.
+	// a route or a NAT rule can arrange. It is something the host itself can
+	// arrange, though: the counter takes no interest in where a packet came
+	// from, and a host pinging its own loopback address raises it one for one,
+	// so the DNAT above plus a background `ping 127.0.0.1` put it back to
+	// passing while the host still received nothing. What is counted is
+	// therefore the arrivals that cannot have come from the host itself.
 	//
 	// Read once per host rather than once per pair, so 56 probes cost 16 extra
 	// reads and not 112.
@@ -2900,9 +3166,16 @@ func checkInternalReachability(ctx context.Context, env *Env) Result {
 		if !okB || !okA {
 			continue // the counter could not be read; the ping stands on its own
 		}
-		if after <= before {
-			unseen = append(unseen, fmt.Sprintf("%s answered %d probe(s) it never received: "+
-				"something else is replying for it", h.Name, want))
+		// Every probe sends two echo requests, so asking for one apiece still
+		// leaves room for a lost packet. Asking for a count at all is the
+		// point: the test was that the counter had moved by anything at all,
+		// which let a single packet from anywhere stand as the witness for
+		// every probe sent to that host.
+		arrived := arrivedFromOffBox(before, after)
+		if arrived < want {
+			unseen = append(unseen, fmt.Sprintf("%s answered %d probe(s), but only %d echo "+
+				"request(s) reached it from off the machine: something else is replying for it",
+				h.Name, want, arrived))
 		}
 	}
 	if len(unseen) > 0 {
@@ -3045,10 +3318,12 @@ func unreachableByTCP(ctx context.Context, env *Env, hosts []*model.Device,
 // unreachableByUDP sends a datagram between every ordered pair of hosts and
 // names the ones that do not arrive.
 //
-// Arrival is read at the far side, from its count of datagrams delivered for a
-// port nothing is bound to. The sender cannot be trusted to tell: when the
-// datagram is dropped it hears nothing, and hearing nothing is exactly what
-// `nc` reports as success.
+// Arrival is read at the far side, from a capture of the flow on its own
+// interfaces together with its count of datagrams delivered for a port nothing
+// is bound to. The sender cannot be trusted to tell: when the datagram is
+// dropped it hears nothing, and hearing nothing is exactly what `nc` reports as
+// success. Nor can the count on its own, which the receiving host raises for
+// itself by sending a datagram to one of its own closed ports.
 //
 // The pairs are done in rounds, each round a different offset, so that no two
 // senders aim at the same host at once and the counter says who arrived.
@@ -3060,6 +3335,16 @@ func unreachableByUDP(ctx context.Context, env *Env, hosts []*model.Device,
 	}
 	var out []string
 	for k := 1; k < n; k++ {
+		// One port per destination for this round, so that each capture
+		// watches for exactly the datagram aimed at that host.
+		ports := map[string]string{}
+		for i := range hosts {
+			dst := hosts[(i+k)%n]
+			if addrOf[dst.ID] != "" {
+				ports[dst.ID] = probePort()
+			}
+		}
+		taps := startTaps(ctx, env, ports)
 		before := udpCounters(ctx, env, hosts)
 		var wg sync.WaitGroup
 		for i, src := range hosts {
@@ -3071,22 +3356,28 @@ func unreachableByUDP(ctx context.Context, env *Env, hosts []*model.Device,
 			go func(src, dst *model.Device) {
 				defer wg.Done()
 				_, _ = env.Probe(ctx, src.ID, []string{"sh", "-c",
-					"echo twinet | nc -u -w 2 " + addrOf[dst.ID] + " " + probePort()})
+					"echo twinet | nc -u -w 2 " + addrOf[dst.ID] + " " + ports[dst.ID]})
 			}(src, dst)
 		}
 		wg.Wait()
 		after := udpCounters(ctx, env, hosts)
+		seen := readTaps(ctx, env, taps)
 		for i, src := range hosts {
 			dst := hosts[(i+k)%n]
 			b, okB := before[dst.ID]
 			a, okA := after[dst.ID]
-			if !okB || !okA || a > b {
+			frames, live := seen[dst.ID].counts, seen[dst.ID].live
+			got := arrival{
+				tapped: frames.udp, tapLive: live,
+				counted: offBoxDelta(b, a), counterOK: okB && okA,
+			}
+			if !got.attributable() || got.arrived() {
 				continue
 			}
 			out = append(out, fmt.Sprintf(
-				"a datagram from %s to %s (%s) never arrived, though pings and connections "+
-					"do: something on the path is filtering by protocol",
-				src.Name, dst.Name, addrOf[dst.ID]))
+				"a datagram from %s to %s (%s) never arrived -- %s -- though pings and "+
+					"connections do: something on the path is filtering by protocol",
+				src.Name, dst.Name, addrOf[dst.ID], got.why()))
 		}
 	}
 	sort.Strings(out)
@@ -3095,8 +3386,8 @@ func unreachableByUDP(ctx context.Context, env *Env, hosts []*model.Device,
 
 // udpCounters reads every host's count of datagrams delivered for an unbound
 // port, at once.
-func udpCounters(ctx context.Context, env *Env, hosts []*model.Device) map[string]int {
-	out := map[string]int{}
+func udpCounters(ctx context.Context, env *Env, hosts []*model.Device) map[string]counterWitness {
+	out := map[string]counterWitness{}
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	for _, h := range hosts {
@@ -3114,11 +3405,45 @@ func udpCounters(ctx context.Context, env *Env, hosts []*model.Device) map[strin
 	return out
 }
 
-// receivedEchoes reads each host's count of ICMP echo requests delivered to it.//
-// The kernel keeps it; nothing a submission configures can raise it without the
-// packets actually arriving.
-func receivedEchoes(ctx context.Context, env *Env, hosts []*model.Device) map[string]int {
-	out := map[string]int{}
+// arrivedFromOffBox is how many ICMP echo requests reached a host from
+// somewhere other than itself, between two readings of its counters.
+//
+// Loopback packets are counted both as echo requests and on the loopback
+// device, so subtracting the one from the other leaves arrivals the host
+// cannot have generated. Traffic the host sends to other machines does not
+// enter either count, which matters because the hosts are probe sources as
+// well as probe destinations.
+func arrivedFromOffBox(before, after hostTraffic) int {
+	n := (after.echoes - before.echoes) - (after.loopRx - before.loopRx)
+	if n < 0 {
+		return 0
+	}
+	return n
+}
+
+// hostTraffic is what a host's own kernel says was delivered to it.
+type hostTraffic struct {
+	echoes int // ICMP echo requests delivered, wherever they came from
+	loopRx int // packets delivered over the loopback device
+}
+
+// receivedEchoes reads, per host, the kernel's count of ICMP echo requests
+// delivered to it and of packets delivered over its loopback device.
+//
+// The echo counter on its own is not a witness that anything arrived from the
+// network. It counts every echo request the kernel took delivery of, and a
+// ping to 127.0.0.1 raises it exactly as much as a ping from another machine,
+// so answering for a host elsewhere and leaving `ping 127.0.0.1` running on it
+// made the counter climb while nothing addressed to it ever got there.
+//
+// A loopback packet is counted a second time, on the loopback device, and a
+// probe sent by the grader never touches that device. The difference between
+// the two counts is therefore a number of echo requests that cannot have come
+// from the host itself. Other loopback traffic subtracts from it as well, so
+// it is a lower bound rather than an exact count -- which is the direction to
+// err in, since it can fail to credit an arrival but never invent one.
+func receivedEchoes(ctx context.Context, env *Env, hosts []*model.Device) map[string]hostTraffic {
+	out := map[string]hostTraffic{}
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, 16)
@@ -3128,19 +3453,40 @@ func receivedEchoes(ctx context.Context, env *Env, hosts []*model.Device) map[st
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			res, err := env.Probe(ctx, h.ID, []string{"cat", "/proc/net/snmp"})
+			res, err := env.Probe(ctx, h.ID, []string{"cat", "/proc/net/snmp", "/proc/net/dev"})
 			if err != nil || res.ExitCode != 0 {
 				return
 			}
 			if n, ok := icmpInEchos(res.Stdout); ok {
 				mu.Lock()
-				out[h.ID] = n
+				out[h.ID] = hostTraffic{echoes: n, loopRx: loopbackRx(res.Stdout)}
 				mu.Unlock()
 			}
 		}(h)
 	}
 	wg.Wait()
 	return out
+}
+
+// loopbackRx pulls the loopback device's received packet count out of
+// /proc/net/dev, whose columns are bytes first and packets second.
+func loopbackRx(body string) int {
+	for _, line := range strings.Split(body, "\n") {
+		name, rest, ok := strings.Cut(line, ":")
+		if !ok || strings.TrimSpace(name) != "lo" {
+			continue
+		}
+		f := strings.Fields(rest)
+		if len(f) < 2 {
+			return 0
+		}
+		n, err := strconv.Atoi(f[1])
+		if err != nil {
+			return 0
+		}
+		return n
+	}
+	return 0
 }
 
 // icmpInEchos pulls InEchos out of /proc/net/snmp, by name rather than by

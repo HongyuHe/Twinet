@@ -43,7 +43,7 @@ func TestAPeerThatSeesNoSuchSessionIsNotASession(t *testing.T) {
 		env := &Env{AS: 3, Exec: func(_ context.Context, _ string, _ []string) (rt.ExecResult, error) {
 			return rt.ExecResult{ExitCode: 0, Stdout: c.summary}, nil
 		}}
-		got := peerAgrees(context.Background(), env, "as4/BOS", "10.0.0.1", 3)
+		got, _, _ := peerAgrees(context.Background(), env, "as4/BOS", "10.0.0.1", 3)
 		if got == "" {
 			t.Errorf("%s: the neighbour was taken to agree, so an impersonated session "+
 				"would score full marks", c.name)
@@ -59,7 +59,7 @@ func TestAPeerThatSeesNoSuchSessionIsNotASession(t *testing.T) {
 		return rt.ExecResult{ExitCode: 0,
 			Stdout: `{"ipv4Unicast":{"peers":{"10.0.0.1":{"remoteAs":3,"state":"Established"}}}}`}, nil
 	}}
-	if got := peerAgrees(context.Background(), env, "as4/BOS", "10.0.0.1", 3); got != "" {
+	if got, _, _ := peerAgrees(context.Background(), env, "as4/BOS", "10.0.0.1", 3); got != "" {
 		t.Errorf("a genuine session was reported as a problem: %s", got)
 	}
 }
@@ -70,7 +70,7 @@ func TestANeighbourThatCannotBeAskedHasNotAgreed(t *testing.T) {
 	env := &Env{AS: 3, Exec: func(_ context.Context, _ string, _ []string) (rt.ExecResult, error) {
 		return rt.ExecResult{}, fmt.Errorf("container is not running")
 	}}
-	if got := peerAgrees(context.Background(), env, "as4/BOS", "10.0.0.1", 3); got == "" {
+	if got, _, _ := peerAgrees(context.Background(), env, "as4/BOS", "10.0.0.1", 3); got == "" {
 		t.Error("an unreachable neighbour was taken to confirm the session")
 	}
 }

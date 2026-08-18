@@ -75,24 +75,15 @@ func tunnelCarriesTransport(ctx context.Context, env *Env, hosts map[string]*mod
 		if addr == "" {
 			continue
 		}
+		// One port for both protocols, drawn for this direction alone, so that
+		// a single capture on the far side covers the connection and the
+		// datagram and neither can be confused with anything else.
+		port := probePort()
+		tap := startArrivalTap(ctx, env, dst.ID, port)
 		before, okB := tcpAnswers(ctx, env, dst.ID)
 		_, _ = env.Probe(ctx, src.ID,
-			[]string{"nc", "-6", "-w", "3", "-z", addr, probePort()})
+			[]string{"nc", "-6", "-w", "3", "-z", addr, port})
 		after, okA := tcpAnswers(ctx, env, dst.ID)
-		if !okB || !okA {
-			// The far side's own count of the resets it sent is the whole of
-			// the evidence: a reply forged on the path does not move it, and
-			// the sender cannot tell the difference. Without it this direction
-			// was passed over in silence, and the point was awarded for a
-			// tunnel across which nothing was shown to travel.
-			continue
-		}
-		if after <= before {
-			return fmt.Sprintf(
-				"IPv6 pings cross the tunnel, but a connection from %s to %s at %s never "+
-					"arrived: %s answered no TCP at all, so the tunnel carries ICMP and "+
-					"nothing else", src.Name, dst.Name, addr, dst.Name), false, true
-		}
 		// And a datagram, which is neither of the two things already tried.
 		//
 		// A filter can be written per protocol as easily as per port. The far
@@ -100,16 +91,40 @@ func tunnelCarriesTransport(ctx context.Context, env *Env, hosts map[string]*mod
 		// to, which is a fact about arrival and not about any answer.
 		udpBefore, okU := udpNoPorts(ctx, env, dst.ID)
 		_, _ = env.Probe(ctx, src.ID, []string{"sh", "-c",
-			"echo twinet | nc -6 -u -w 2 " + addr + " " + probePort()})
+			"echo twinet | nc -6 -u -w 2 " + addr + " " + port})
 		udpAfter, okU2 := udpNoPorts(ctx, env, dst.ID)
-		if !okU || !okU2 {
+		frames, live := tap.seen(ctx, env)
+
+		gotTCP := arrival{
+			tapped: frames.tcp, tapLive: live,
+			counted: offBoxDelta(before, after), counterOK: okB && okA,
+		}
+		if !gotTCP.attributable() {
+			// The far side's own record is the whole of the evidence: a reply
+			// forged on the path does not move it, and the sender cannot tell
+			// the difference. Without it this direction was passed over in
+			// silence, and the point was awarded for a tunnel across which
+			// nothing was shown to travel.
 			continue
 		}
-		if udpAfter <= udpBefore {
+		if !gotTCP.arrived() {
+			return fmt.Sprintf(
+				"IPv6 pings cross the tunnel, but a connection from %s to %s at %s never "+
+					"arrived -- %s -- so the tunnel carries ICMP and nothing else",
+				src.Name, dst.Name, addr, gotTCP.why()), false, true
+		}
+		gotUDP := arrival{
+			tapped: frames.udp, tapLive: live,
+			counted: offBoxDelta(udpBefore, udpAfter), counterOK: okU && okU2,
+		}
+		if !gotUDP.attributable() {
+			continue
+		}
+		if !gotUDP.arrived() {
 			return fmt.Sprintf(
 				"IPv6 pings and connections cross the tunnel, but a datagram from %s to %s "+
-					"at %s never arrived: something on the path is filtering by protocol",
-				src.Name, dst.Name, addr), false, true
+					"at %s never arrived -- %s: something on the path is filtering by "+
+					"protocol", src.Name, dst.Name, addr, gotUDP.why()), false, true
 		}
 		observed = true
 	}
@@ -118,20 +133,19 @@ func tunnelCarriesTransport(ctx context.Context, env *Env, hosts map[string]*mod
 
 // udpNoPorts reads a host's count of datagrams delivered to it for a port
 // nothing is bound to, which the kernel keeps and nothing on the path can
-// raise without the datagram arriving.
-func udpNoPorts(ctx context.Context, env *Env, device string) (int, bool) {
-	res, err := env.Probe(ctx, device, []string{"cat", "/proc/net/snmp6"})
-	if err != nil || res.ExitCode != 0 {
-		return 0, false
-	}
-	for _, line := range strings.Split(res.Stdout, "\n") {
-		f := strings.Fields(line)
-		if len(f) == 2 && f[0] == "Udp6NoPorts" {
-			n, err := strconv.Atoi(f[1])
-			return n, err == nil
+// raise without the datagram arriving, together with the loopback traffic the
+// host could have produced it with itself.
+func udpNoPorts(ctx context.Context, env *Env, device string) (counterWitness, bool) {
+	return readCounter(ctx, env, device, "/proc/net/snmp6", func(body string) (int, bool) {
+		for _, line := range strings.Split(body, "\n") {
+			f := strings.Fields(line)
+			if len(f) == 2 && f[0] == "Udp6NoPorts" {
+				n, err := strconv.Atoi(f[1])
+				return n, err == nil
+			}
 		}
-	}
-	return 0, false
+		return 0, false
+	})
 }
 
 func checkSixIn4(ctx context.Context, env *Env) Result {
@@ -635,12 +649,30 @@ func checkIXPCommunities(ctx context.Context, env *Env) Result {
 	if rerr != nil {
 		return Errored("policy.ixp_communities", rerr)
 	}
+	inRegion := ixpInRegion(env)
 	admitted, accepted, aerr := routesViaIXP(ctx, env, ixpRouter.Name, ixpPeer, offeredPaths)
 	if aerr != nil {
 		return Errored("policy.ixp_communities", aerr)
 	}
 	if len(admitted) > 0 {
 		filters = false
+	}
+	// The table decides it, where the table can decide it.
+	//
+	// The configuration half looked for `match as-path` and nothing else, so a
+	// member that refused every in-region route with a prefix-list -- the same
+	// routes gone from the same table, by a mechanism the exercise never
+	// forbids -- was told "nothing filters arrivals" and lost half the mark
+	// while its table was indistinguishable from the reference answer's. The
+	// comment above already says the table is what the question is about.
+	//
+	// This only speaks when the table has something to say. If the exchange is
+	// relaying no in-region route at all, an empty `admitted` is the lab's
+	// doing rather than the submission's, and the configuration remains the
+	// only evidence that a filter exists.
+	inRegionOffered := countInRegionOffers(offeredPaths, inRegion)
+	if len(admitted) == 0 && inRegionOffered > 0 {
+		filters = true
 	}
 	// What the exchange is for.
 	//
@@ -729,16 +761,25 @@ func checkIXPCommunities(ctx context.Context, env *Env) Result {
 	case len(tagged) > 0 && filters:
 		return Pass("policy.ixp_communities", Evidence{
 			Observed: fmt.Sprintf("the exchange holds %s from this AS tagged %s and relayed it "+
-				"to %d member(s); arrivals are filtered on AS path",
-				own, strings.Join(tagged, " "), len(seen.advertisedTo)),
+				"to %d member(s); %s",
+				own, strings.Join(tagged, " "), len(seen.advertisedTo),
+				map[bool]string{
+					true:  fmt.Sprintf("all %d in-region route(s) the exchange offered are refused on the way in", inRegionOffered),
+					false: "arrivals are filtered on AS path",
+				}[inRegionOffered > 0]),
 			Detail:  "relayed to " + strings.Join(relayed, " "),
 			Command: fmt.Sprintf("show bgp ipv4 unicast %s json (on the route server)", own),
 		})
 	case len(tagged) > 0:
 		return Partial("policy.ixp_communities", 0.5, Evidence{
 			Expected: "communities set for out-of-region members, and in-region announcements refused",
-			Observed: fmt.Sprintf("the exchange sees %s but nothing filters arrivals from %s on AS path",
-				strings.Join(tagged, " "), ixpPeer),
+			Observed: fmt.Sprintf("the exchange sees %s, but %s",
+				strings.Join(tagged, " "),
+				map[bool]string{
+					true: fmt.Sprintf("in-region routes still arrive from %s", ixpPeer),
+					false: fmt.Sprintf("the exchange is relaying no in-region route to us, and no inbound "+
+						"filter on %s would refuse one", ixpPeer),
+				}[inRegionOffered > 0]),
 			Hint:    "part (ii) asks you to deny announcements whose path contains an in-region AS",
 			Detail:  unapplied,
 			Command: "show running-config",
@@ -1115,21 +1156,38 @@ func checkTrafficEngineering(ctx context.Context, env *Env) Result {
 			fmt.Fprintf(&detail, "inbound: %s is not advertised to AS%d\n", own, f.asn)
 			continue
 		}
+		// Whether the announcement survived is measured, not deduced from the
+		// shape of the path. A foreign AS number is *usually* fatal -- the
+		// network it belongs to discards a path through itself as a loop --
+		// but "usually" is not an observation, and the check used to report
+		// the announcement as discarded without ever asking the neighbour. A
+		// number nobody in the lab answers to is prepended, the route arrives
+		// intact and is chosen as best, and the report still said the slow
+		// link had stopped being a backup.
+		held, readable := neighbourHoldsOurs(ctx, env, s.asn, own)
 		switch {
-		case len(sForeign) > 0:
+		case readable && !held && len(sForeign) > 0:
 			fmt.Fprintf(&detail,
 				"inbound: the path advertised to the slow AS%d contains %s, which is not this "+
-					"AS: a path through a neighbour's own number is a loop to it and the "+
-					"announcement is discarded, so the slow link stops being a backup at all\n",
-				s.asn, strings.Join(truncate(sForeign, 3), ", "))
+					"AS, and AS%d holds no route for %s learnt from us: the announcement did "+
+					"not survive, so the slow link is not the backup the question asks for\n",
+				s.asn, strings.Join(truncate(sForeign, 3), ", "), s.asn, own)
+		case readable && !held:
+			fmt.Fprintf(&detail,
+				"inbound: AS%d holds no route for %s learnt from us, so the slow link is not "+
+					"the backup the question asks for\n", s.asn, own)
 		case sLen <= fLen:
 			fmt.Fprintf(&detail,
 				"inbound: the path advertised to the slow AS%d is %d long, no longer than the %d sent to AS%d; prepend to make it less attractive\n",
 				s.asn, sLen, fLen, f.asn)
-		case !neighbourHolds(ctx, env, s.asn, own):
+		case len(sForeign) > 0:
 			fmt.Fprintf(&detail,
-				"inbound: AS%d does not hold %s at all, so the slow link is not the backup "+
-					"the question asks for\n", s.asn, own)
+				"inbound: the path advertised to the slow AS%d is lengthened with %s, which is "+
+					"not this AS; AS%d did accept it, but padding with somebody else's number "+
+					"is not what the question asks for: every network that number belongs to "+
+					"discards a path through itself, and a number left at the end of the path "+
+					"makes the prefix look like theirs. Prepend your own AS number (%d)\n",
+				s.asn, strings.Join(truncate(sForeign, 3), ", "), s.asn, env.AS)
 		default:
 			passed++
 		}
@@ -1232,16 +1290,28 @@ func advertisedOwnPath(ctx context.Context, env *Env, router, peer, own string) 
 	return longest, uniq(foreign), true
 }
 
-// neighbourHolds asks a neighbour whether it actually has our prefix.
+// neighbourHoldsOurs asks a neighbour whether the announcement *we* sent it
+// survived the journey.
 //
 // The neighbour is somebody else's system, so its table is not the
 // submission's to arrange: what it holds is the only account of whether an
-// announcement survived the journey. An announcement that is sent and
-// discarded on arrival looks identical, from this side, to one that worked.
-func neighbourHolds(ctx context.Context, env *Env, asn int, prefix string) bool {
+// announcement lived or died. An announcement that is sent and discarded on
+// arrival looks identical, from this side, to one that worked.
+//
+// "Does the neighbour have our prefix" is a different and weaker question. It
+// may hold the prefix through somebody else entirely while discarding
+// everything we send, and then the link the question calls a backup carries
+// nothing -- which is exactly what prepending the neighbour's own number does.
+// A route learnt straight from us begins with our AS number, so the leftmost
+// element separates the two.
+//
+// The second return says whether any router of that AS could be read. A
+// neighbour nobody can read yields no evidence either way, and the caller
+// gives the submission the benefit of the doubt rather than inventing one.
+func neighbourHoldsOurs(ctx context.Context, env *Env, asn int, prefix string) (held, readable bool) {
 	as, ok := env.Topology.ASes[asn]
 	if !ok {
-		return true // not in the lab, so nothing can be concluded
+		return false, false // not in the lab, so nothing can be concluded
 	}
 	for _, r := range as.Routers {
 		res, err := env.Probe(ctx, r.ID, []string{"vtysh", "-c",
@@ -1259,13 +1329,29 @@ func neighbourHolds(ctx context.Context, env *Env, asn int, prefix string) bool 
 		if json.Unmarshal([]byte(res.Stdout), &doc) != nil {
 			continue
 		}
+		readable = true
 		for _, p := range doc.Paths {
-			if pathContainsASN(p.ASPath.String, env.AS) {
-				return true
+			if firstASN(p.ASPath.String) == env.AS {
+				return true, true
 			}
 		}
 	}
-	return false
+	return false, readable
+}
+
+// firstASN is the AS at the front of a path, which is the one the route was
+// received from. Prepends go on the front too, so a route received directly
+// from an AS begins with that AS's number however many times it padded.
+func firstASN(path string) int {
+	f := strings.Fields(strings.TrimSpace(path))
+	if len(f) == 0 {
+		return 0
+	}
+	n, err := strconv.Atoi(f[0])
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 // advertisedPrefixes returns the set of prefixes advertised to a neighbour.
@@ -1659,14 +1745,16 @@ func checkRPKINotFoundPreserved(ctx context.Context, env *Env) Result {
 				"there was no not-found route to lose"})
 	}
 	return Pass("rpki.notfound_preserved", Evidence{
-		Observed: fmt.Sprintf("all %d prefix(es) without a ROA are still in this AS's table", checked),
-		Command:  "show bgp ipv4 unicast rpki notfound"})
+		Observed: fmt.Sprintf("all %d prefix(es) whose owner has published no ROA are "+
+			"selected on every router of this AS, learned rather than originated here, "+
+			"and reachable from every host", checked),
+		Command: "show bgp ipv4 unicast rpki notfound"})
 }
 
 // missingNotFoundRoutes names the prefixes this AS should hold and does not,
 // among those whose origin has published no ROA.
 func missingNotFoundRoutes(ctx context.Context, env *Env) ([]string, int, error) {
-	covered, err := roaPrefixes(ctx, env)
+	want, err := notFoundPopulation(ctx, env)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -1725,32 +1813,26 @@ func missingNotFoundRoutes(ctx context.Context, env *Env) ([]string, int, error)
 
 	var missing []string
 	checked := 0
-	for asn, as := range env.Topology.ASes {
-		if asn == env.AS || as.Block == "" || as.Role == model.RoleIXP {
-			continue
-		}
-		if covered[as.Block] {
-			continue
-		}
+	for block, asn := range want {
 		checked++
 		var without []string
 		for _, r := range routers {
-			if !haveOn[r.Name][as.Block] {
+			if !haveOn[r.Name][block] {
 				without = append(without, r.Name)
 			}
 		}
 		if len(without) > 0 {
 			sort.Strings(without)
 			missing = append(missing, fmt.Sprintf("%s (AS %d) is not selected on %s",
-				as.Block, asn, strings.Join(truncate(without, 4), ", ")))
+				block, asn, strings.Join(truncate(without, 4), ", ")))
 			continue
 		}
-		if who := forged[as.Block]; len(who) > 0 {
+		if who := forged[block]; len(who) > 0 {
 			sort.Strings(who)
 			missing = append(missing, fmt.Sprintf(
 				"%s (AS %d) is selected, but %s originates it rather than having learned it: "+
 					"a route you announce yourself is not the route you were asked to preserve",
-				as.Block, asn, strings.Join(truncate(who, 4), ", ")))
+				block, asn, strings.Join(truncate(who, 4), ", ")))
 			continue
 		}
 		// And it has to carry traffic.
@@ -1782,7 +1864,7 @@ func missingNotFoundRoutes(ctx context.Context, env *Env) ([]string, int, error)
 		if len(unreachable) > 0 {
 			missing = append(missing, fmt.Sprintf(
 				"%s (AS %d) is in every table, but %d host(s) cannot reach %s (%s): the route "+
-					"is preserved in name only", as.Block, asn, len(unreachable), addr,
+					"is preserved in name only", block, asn, len(unreachable), addr,
 				strings.Join(truncate(unreachable, 3), ", ")))
 		}
 	}
@@ -1855,14 +1937,24 @@ func locallySourced(e bgpRoute) bool {
 	return true
 }
 
-// roaPrefixes is the set of prefixes the validator has a ROA for.
-func roaPrefixes(ctx context.Context, env *Env) (map[string]bool, error) {
+// roaPrefixes is the set of prefixes some router has been served a ROA for,
+// and whether any router's table could be read at all.
+//
+// Every router is asked and the answers are pooled. Asking only the first one
+// that replied made the answer depend on which router that happened to be: a
+// router with no validator session prints an empty table and reports no error,
+// and three of the eight routers in the reference cos461 submission carry no
+// `rpki cache` line at all, so the pool is empty or full according to an
+// accident of ordering.
+func roaPrefixes(ctx context.Context, env *Env) (map[string]bool, bool) {
 	out := map[string]bool{}
+	readable := false
 	for _, r := range env.Routers() {
 		text, err := env.Vtysh(ctx, r.Name, "show rpki prefix-table")
 		if err != nil {
 			continue
 		}
+		readable = true
 		// The table prints the address and the prefix length in separate
 		// columns -- "6.0.0.0   8 -   8   6" -- and never as "6.0.0.0/8".
 		// Looking for a slash therefore matched nothing at all, so every
@@ -1871,9 +1963,82 @@ func roaPrefixes(ctx context.Context, env *Env) (map[string]bool, error) {
 		for k := range parseROATable(text) {
 			out[k] = true
 		}
+	}
+	return out, readable
+}
+
+// notFoundPopulation names the address blocks whose owners have published no
+// ROA, keyed by block, with the ASN that owns each.
+//
+// The lab declares this in lab.rpki.not_found and staff control the
+// declaration. That is the point. The alternative -- asking the student's own
+// routers which prefixes the validator has served -- is circular in the same
+// way that asking them whether a hijack was announced would be: a submission
+// cannot be the reference it is judged against. A router whose validator
+// session is down prints an empty prefix table and exits zero, and an empty
+// table read as "nobody has published a ROA" silently turns this check into a
+// different and far stricter one -- that this AS holds a route to every other
+// AS in the lab -- while the evidence carries on calling those prefixes
+// not-found.
+//
+// Measured: dropping the single `rpki cache` line from MSP, which this lab
+// plainly permits since three of its eight routers carry none, moved the
+// examined population from 1 prefix to 9 and had the report state "all 9
+// prefix(es) without a ROA are still in this AS's table" -- of which eight were
+// marked V for valid in the very BGP table the check had just read.
+func notFoundPopulation(ctx context.Context, env *Env) (map[string]int, error) {
+	if env.Topology != nil && env.Topology.Lab != nil &&
+		len(env.Topology.Lab.RPKI.NotFound) > 0 {
+		out := map[string]int{}
+		for _, asn := range env.Topology.Lab.RPKI.NotFound {
+			as, ok := env.Topology.ASes[asn]
+			if !ok || as.Block == "" || asn == env.AS || as.Role == model.RoleIXP {
+				continue
+			}
+			out[as.Block] = asn
+		}
 		return out, nil
 	}
-	return out, nil
+
+	// No declaration, so fall back to what the validator has served.
+	//
+	// Every other system that owns a block is a candidate; the served table
+	// only decides which of them to drop. When there are no candidates the
+	// answer is the empty set however the table reads, and refusing there
+	// would withhold a mark over a baseline that changes nothing.
+	cand := map[string]int{}
+	for asn, as := range env.Topology.ASes {
+		if asn == env.AS || as.Block == "" || as.Role == model.RoleIXP {
+			continue
+		}
+		cand[as.Block] = asn
+	}
+	if len(cand) == 0 {
+		return nil, nil
+	}
+
+	// With candidates to decide between, the baseline has to be real.
+	// Concluding "no ROAs anywhere" from tables that could not be read, or
+	// from sessions that are down, grades against a population nobody
+	// observed -- and errs strict, since every candidate then counts as one
+	// the submission must hold.
+	covered, readable := roaPrefixes(ctx, env)
+	if !readable {
+		return nil, fmt.Errorf("no router's RPKI prefix table could be read, so which of " +
+			"the other systems have published a ROA cannot be established")
+	}
+	if len(covered) == 0 {
+		return nil, fmt.Errorf("no router has been served a single ROA, so whether the " +
+			"other systems have published one cannot be established: either the validator " +
+			"sessions are down or this lab publishes no ROAs, and the two cannot be told " +
+			"apart from here -- declare lab.rpki.not_found to settle it")
+	}
+	for block := range cand {
+		if covered[block] {
+			delete(cand, block)
+		}
+	}
+	return cand, nil
 }
 
 // rpkiConfigured reports whether any router has an RPKI cache configured.
@@ -2174,6 +2339,23 @@ func routeServerOffersOutOfRegion(ctx context.Context, env *Env, rsDevice, ourAd
 // exchange like any out-of-region member; counting them as in-region made the
 // reference solution fail its own question the moment the exchange began
 // delivering routes at all.
+// countInRegionOffers reports how many of the routes the exchange is relaying
+// to this AS cross a system in its own region -- the ones the exercise says to
+// refuse, and so the ones whose absence from the member's table is evidence
+// that something refused them.
+func countInRegionOffers(offeredPaths map[string]string, inRegion map[int]bool) int {
+	n := 0
+	for _, path := range offeredPaths {
+		for _, f := range strings.Fields(path) {
+			if asn, err := strconv.Atoi(f); err == nil && inRegion[asn] {
+				n++
+				break
+			}
+		}
+	}
+	return n
+}
+
 func ixpInRegion(env *Env) map[int]bool {
 	out := map[int]bool{}
 	me, ok := env.Topology.ASes[env.AS]

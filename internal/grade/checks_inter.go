@@ -74,6 +74,28 @@ type bgpSummaryJSON struct {
 	} `json:"ipv4Unicast"`
 }
 
+// advertisedTo reports how many prefixes a router says it has advertised to
+// the neighbour at an address, and whether that could be established at all.
+//
+// It is the peer's own count, which is what makes it worth reading: whether a
+// session had anything to carry is not a question the receiving end can
+// answer, and a receiver that assumes the answer is yes reports silence as a
+// dead session.
+func advertisedTo(sums map[string]bgpSummaryJSON, from, addr string) (int, bool) {
+	if addr == "" {
+		return 0, false
+	}
+	sum, ok := sums[from]
+	if !ok {
+		return 0, false
+	}
+	p, ok := sum.IPv4Unicast.Peers[addr]
+	if !ok {
+		return 0, false
+	}
+	return p.PfxSnt, true
+}
+
 // summary fetches a router's BGP summary, tolerating a router with no BGP.
 func bgpSummary(ctx context.Context, env *Env, router string) (bgpSummaryJSON, error) {
 	var out bgpSummaryJSON
@@ -196,6 +218,7 @@ func checkIBGPFullMesh(ctx context.Context, env *Env) Result {
 
 	want := len(routers) * (len(routers) - 1)
 	established := 0
+	untested := 0
 	var problems []string
 
 	// "Established" is a memory, not an observation.
@@ -241,11 +264,28 @@ func checkIBGPFullMesh(ctx context.Context, env *Env) Result {
 			case !strings.EqualFold(p.State, "Established"):
 				problems = append(problems, fmt.Sprintf("%s -> %s is %s", r.Name, other.Name, p.State))
 			case had && updates[r.Name][addr] <= was:
+				// Silence is only evidence when the peer had something to say.
+				//
+				// A router that originates no prefix of its own has nothing to
+				// advertise over iBGP: split horizon stops it re-advertising
+				// what it learnt from another iBGP peer, so it answers a route
+				// refresh with nothing at all. Announcing the AS prefix from a
+				// subset of the routers is an ordinary design, and it used to
+				// cost a mark for seven sessions reported as "held open by a
+				// timer" -- every one of them Established for a quarter of an
+				// hour and carrying routes in the other direction the whole
+				// time. What the peer had to send is now read from the peer.
+				sent, known := advertisedTo(after, other.Name, loopback[r.Name])
+				if !known || sent == 0 {
+					untested++
+					established++
+					continue
+				}
 				problems = append(problems, fmt.Sprintf(
-					"%s -> %s says Established, but no route arrived from %s while it was "+
-						"asked to send its table: the session is held open by a timer that "+
-						"has not expired yet, and carries nothing", r.Name, other.Name,
-					other.Name))
+					"%s -> %s says Established and %s has %d prefix(es) to send on it, but "+
+						"none arrived while it was asked to send its table: the session is "+
+						"held open by a timer that has not expired yet, and carries nothing",
+					r.Name, other.Name, other.Name, sent))
 			default:
 				established++
 			}
@@ -253,8 +293,12 @@ func checkIBGPFullMesh(ctx context.Context, env *Env) Result {
 	}
 
 	if established == want && len(problems) == 0 {
-		return Pass("bgp.ibgp_full_mesh", Evidence{
-			Observed: fmt.Sprintf("%d of %d iBGP sessions established", established, want)})
+		observed := fmt.Sprintf("%d of %d iBGP sessions established", established, want)
+		if untested > 0 {
+			observed += fmt.Sprintf("; on %d of them the peer has no route to send, "+
+				"so only the session state could be read", untested)
+		}
+		return Pass("bgp.ibgp_full_mesh", Evidence{Observed: observed})
 	}
 	sort.Strings(problems)
 	return Partial("bgp.ibgp_full_mesh", ratio(established, want), Evidence{
@@ -373,18 +417,25 @@ func checkEBGPEstablished(ctx context.Context, env *Env) Result {
 			// system that was never contacted. The neighbour belongs to
 			// somebody else, and asking it is the one thing a submission
 			// cannot arrange.
-			if why := peerAgrees(ctx, env, w.peerDevice, w.ourAddr, env.AS); why != "" {
+			why, sent, known := peerAgrees(ctx, env, w.peerDevice, w.ourAddr, env.AS)
+			if why != "" {
 				problems = append(problems, fmt.Sprintf(
 					"%s reports a session with AS %d at %s, but %s", w.router, w.peerAS,
 					w.peerAddr, why))
 				continue
 			}
+			// Same reservation as the mesh: a neighbour with nothing to
+			// advertise -- a customer that only receives, an exchange whose
+			// members announce nothing to us -- answers a route refresh with
+			// silence over a session that is perfectly alive. The neighbour's
+			// own count of what it sends us says which case this is.
 			if was, had := before[w.router][w.peerAddr]; had &&
-				afterUpdates[w.router][w.peerAddr] <= was {
+				afterUpdates[w.router][w.peerAddr] <= was && known && sent > 0 {
 				problems = append(problems, fmt.Sprintf(
-					"%s -> AS %d (%s) says Established, but no route arrived from it while it "+
-						"was asked to send its table: the session is held open by a timer that "+
-						"has not expired yet, and carries nothing", w.router, w.peerAS, w.peerAddr))
+					"%s -> AS %d (%s) says Established and the neighbour has %d prefix(es) to "+
+						"send on it, but none arrived while it was asked to send its table: "+
+						"the session is held open by a timer that has not expired yet, and "+
+						"carries nothing", w.router, w.peerAS, w.peerAddr, sent))
 				continue
 			}
 			up++
@@ -412,29 +463,29 @@ func checkEBGPEstablished(ctx context.Context, env *Env) Result {
 // An empty answer means agreement. A neighbour that cannot be read is reported
 // as such rather than assumed to agree: the whole point is that this is the
 // half of the evidence the submission does not control.
-func peerAgrees(ctx context.Context, env *Env, peerDevice, ourAddr string, ourAS int) string {
+func peerAgrees(ctx context.Context, env *Env, peerDevice, ourAddr string, ourAS int) (why string, sentToUs int, known bool) {
 	if peerDevice == "" || ourAddr == "" {
-		return ""
+		return "", 0, false
 	}
 	res, err := env.Probe(ctx, peerDevice, []string{"vtysh", "-c", "show ip bgp summary json"})
 	if err != nil {
-		return fmt.Sprintf("%s could not be asked whether it sees one (%v)", peerDevice, err)
+		return fmt.Sprintf("%s could not be asked whether it sees one (%v)", peerDevice, err), 0, false
 	}
 	var sum bgpSummaryJSON
 	if jerr := jsonUnmarshalLoose(res.Stdout, &sum); jerr != nil {
-		return fmt.Sprintf("%s's own view could not be read (%v)", peerDevice, jerr)
+		return fmt.Sprintf("%s's own view could not be read (%v)", peerDevice, jerr), 0, false
 	}
 	p, ok := sum.IPv4Unicast.Peers[ourAddr]
 	switch {
 	case !ok:
 		return fmt.Sprintf("%s has no session with %s at all, so the session is with "+
-			"something else answering at that address", peerDevice, ourAddr)
+			"something else answering at that address", peerDevice, ourAddr), 0, false
 	case p.RemoteAs != ourAS:
-		return fmt.Sprintf("%s sees %s as AS %d, not AS %d", peerDevice, ourAddr, p.RemoteAs, ourAS)
+		return fmt.Sprintf("%s sees %s as AS %d, not AS %d", peerDevice, ourAddr, p.RemoteAs, ourAS), 0, false
 	case !strings.EqualFold(p.State, "Established"):
-		return fmt.Sprintf("%s sees that session as %s", peerDevice, p.State)
+		return fmt.Sprintf("%s sees that session as %s", peerDevice, p.State), 0, false
 	}
-	return ""
+	return "", p.PfxSnt, true
 }
 
 func bgpTable(ctx context.Context, env *Env, router string) (bgpRouteJSON, error) {
@@ -623,6 +674,12 @@ func overriddenByStatic(ctx context.Context, env *Env, routers []*model.Device) 
 		out []string
 		wg  sync.WaitGroup
 	)
+	// Which subnets the plan actually attaches each router to. Being directly
+	// attached to a prefix BGP also carries is ordinary and right: an eBGP
+	// link subnet the far end redistributes comes back as a BGP route, and the
+	// connected route beats it, as it should. What is not ordinary is being
+	// attached to a subnet the plan never put on this router.
+	attached := subnetOwners(env)
 	for _, r := range routers {
 		wg.Add(1)
 		go func(r *model.Device) {
@@ -683,7 +740,27 @@ func overriddenByStatic(ctx context.Context, env *Env, routers []*model.Device) 
 						continue
 					}
 					switch e.Protocol {
-					case "bgp", "connected", "":
+					case "bgp", "":
+					case "connected":
+						// A connected route sits at distance 0, below every protocol,
+						// so it takes the traffic whatever BGP decided. That is right
+						// for a subnet the router is really on, and a way to make the
+						// ranking irrelevant for one it is not: put an address out of
+						// somebody else's space on an interface of your own and their
+						// prefix becomes yours to answer for.
+						//
+						// Which it is has to be decided by the plan. The running
+						// configuration is the thing being marked, so it cannot also
+						// be the thing that says whether the router belongs there.
+						if attached[normalPrefix(prefix)][r.ID] {
+							continue
+						}
+						mu.Lock()
+						out = append(out, fmt.Sprintf(
+							"%s forwards %s by a directly attached route rather than the one BGP "+
+								"chose, and the plan does not put that subnet on it",
+							r.Name, prefix))
+						mu.Unlock()
 					default:
 						mu.Lock()
 						out = append(out, fmt.Sprintf(
@@ -1495,14 +1572,21 @@ func transitProbe(ctx context.Context, env *Env, sess externalSession, cand tran
 	// forges exactly the answer this check was reading, so the destination's
 	// own count of what reached it is what settles the matter; the prober's
 	// view stands only where that count could not be read.
+	port := probePort()
+	tap := startArrivalTap(ctx, env, cand.Host, port)
 	rstBefore, okR := tcpAnswers(ctx, env, cand.Host)
 	conn := []string{"nc", "-v", "-w", "3", "-z"}
 	if src != "" {
 		conn = append(conn, "-s", src)
 	}
-	conn = append(conn, cand.Addr, probePort())
+	conn = append(conn, cand.Addr, port)
 	res, cerr := env.Probe(ctx, sess.PeerDevice, conn)
 	rstAfter, okR2 := tcpAnswers(ctx, env, cand.Host)
+	frames, live := tap.seen(ctx, env)
+	got := arrival{
+		tapped: frames.tcp, tapLive: live,
+		counted: offBoxDelta(rstBefore, rstAfter), counterOK: okR && okR2,
+	}
 	said := ""
 	if cerr == nil {
 		said = strings.ToLower(res.Stderr + res.Stdout)
@@ -1510,8 +1594,8 @@ func transitProbe(ctx context.Context, env *Env, sess externalSession, cand tran
 	answered := cerr == nil && (res.ExitCode == 0 ||
 		strings.Contains(said, "refused") || strings.Contains(said, "reset"))
 	switch {
-	case okR && okR2 && rstAfter > rstBefore:
-	case cerr != nil, !okR, !okR2:
+	case cerr == nil && got.attributable() && got.arrived():
+	case cerr != nil, !got.attributable():
 		// The destination could not be asked. Nothing is concluded from an
 		// answer whose source is unknown, in either direction.
 		if !answered && cerr == nil {
@@ -1524,8 +1608,9 @@ func transitProbe(ctx context.Context, env *Env, sess externalSession, cand tran
 	default:
 		return fmt.Sprintf(
 			"the customer at %s can ping across this AS but not connect: a connection from "+
-				"%s to %s in AS %d never arrived, so the transit carries ICMP and nothing else",
-			sess.Addr, sess.PeerDevice, cand.Addr, cand.ASN), false
+				"%s to %s in AS %d never arrived -- %s -- so the transit carries ICMP and "+
+				"nothing else",
+			sess.Addr, sess.PeerDevice, cand.Addr, cand.ASN, got.why()), false
 	}
 	return "", true
 }

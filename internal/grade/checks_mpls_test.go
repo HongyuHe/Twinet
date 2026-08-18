@@ -406,11 +406,18 @@ func hostOf(sites map[string][]vpnSite, addr string) string {
 }
 
 // snmpWith renders the part of /proc/net/snmp a destination's own record of
-// arriving connections is read from.
+// arriving connections is read from, together with the loopback packet count
+// read alongside it -- quiet here, since these hosts generate no traffic of
+// their own.
 func snmpWith(rsts int) string {
 	return "Tcp: RtoAlgorithm RtoMin PassiveOpens OutRsts\n" +
-		"Tcp: 1 200 0 " + strconv.Itoa(rsts) + "\n"
+		"Tcp: 1 200 0 " + strconv.Itoa(rsts) + "\n" + procNetDevQuiet
 }
+
+// procNetDevQuiet is a /proc/net/dev with nothing on the loopback device.
+const procNetDevQuiet = "Inter-|   Receive                              |  Transmit\n" +
+	" face |bytes packets errs drop fifo frame compressed multicast|bytes packets\n" +
+	"    lo:       0       0    0    0    0     0          0         0     0     0\n"
 
 // Isolation asked only of ICMP is isolation of ICMP.
 //
@@ -439,7 +446,7 @@ func TestCustomersThatExchangeConnectionsAreNotIsolated(t *testing.T) {
 				mu.Unlock()
 				return rt.ExecResult{ExitCode: 1, Stderr: "Connection refused"}, nil
 			}
-			if len(cmd) == 2 && cmd[0] == "cat" && cmd[1] == "/proc/net/snmp" {
+			if len(cmd) >= 2 && cmd[0] == "cat" && cmd[1] == "/proc/net/snmp" {
 				mu.Lock()
 				defer mu.Unlock()
 				return rt.ExecResult{ExitCode: 0, Stdout: snmpWith(resets[deviceID])}, nil
@@ -482,7 +489,7 @@ func TestAProviderThatRejectsCrossCustomerTrafficIsStillIsolating(t *testing.T) 
 				// The edge forges the refusal; nothing arrives anywhere.
 				return rt.ExecResult{ExitCode: 1, Stderr: "Connection refused"}, nil
 			}
-			if len(cmd) == 2 && cmd[0] == "cat" && cmd[1] == "/proc/net/snmp" {
+			if len(cmd) >= 2 && cmd[0] == "cat" && cmd[1] == "/proc/net/snmp" {
 				return rt.ExecResult{ExitCode: 0, Stdout: snmpWith(0)}, nil
 			}
 			return rt.ExecResult{ExitCode: 0, Stdout: "{}"}, nil

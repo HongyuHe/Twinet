@@ -62,17 +62,19 @@ func (w tcpWitness) proves() bool {
 // tcpAnswers reads a host's own record of connection attempts that reached it:
 // the resets it sent, plus the connections it accepted. Nothing on the path can
 // raise either without the packets arriving.
-func tcpAnswers(ctx context.Context, env *Env, device string) (int, bool) {
-	res, err := env.Probe(ctx, device, []string{"cat", "/proc/net/snmp"})
-	if err != nil || res.ExitCode != 0 {
-		return 0, false
-	}
-	rsts, okR := snmpCounter(res.Stdout, "Tcp:", "OutRsts")
-	opens, okO := snmpCounter(res.Stdout, "Tcp:", "PassiveOpens")
-	if !okR || !okO {
-		return 0, false
-	}
-	return rsts + opens, true
+//
+// The host itself can, though, by connecting to its own closed ports, so the
+// loopback packet count is read alongside and subtracted -- see arrival_tap.go
+// for what each witness does and does not establish.
+func tcpAnswers(ctx context.Context, env *Env, device string) (counterWitness, bool) {
+	return readCounter(ctx, env, device, "/proc/net/snmp", func(body string) (int, bool) {
+		rsts, okR := snmpCounter(body, "Tcp:", "OutRsts")
+		opens, okO := snmpCounter(body, "Tcp:", "PassiveOpens")
+		if !okR || !okO {
+			return 0, false
+		}
+		return rsts + opens, true
+	})
 }
 
 // tryConnection makes one connection from src to addr and reports both what the
@@ -84,19 +86,28 @@ func tcpAnswers(ctx context.Context, env *Env, device string) (int, bool) {
 // schedule them so that no destination appears twice in a round.
 func tryConnection(ctx context.Context, env *Env, src, dstDevice, addr, port string) (
 	tcpWitness, bool) {
+	tap := startArrivalTap(ctx, env, dstDevice, port)
 	before, okB := tcpAnswers(ctx, env, dstDevice)
 	res, err := env.Probe(ctx, src, []string{"nc", "-v", "-w", "3", "-z", addr, port})
 	if err != nil {
+		_, _ = tap.seen(ctx, env)  // clear the capture off the machine
 		return tcpWitness{}, false // the machinery failed, which is not a verdict
 	}
 	after, okA := tcpAnswers(ctx, env, dstDevice)
+	frames, live := tap.seen(ctx, env)
+	got := arrival{
+		tapped:    frames.tcp,
+		tapLive:   live,
+		counted:   offBoxDelta(before, after),
+		counterOK: okB && okA,
+	}
 
 	said := strings.ToLower(res.Stderr + res.Stdout)
 	return tcpWitness{
 		answered: res.ExitCode == 0 ||
 			strings.Contains(said, "refused") || strings.Contains(said, "reset"),
-		arrived:      okB && okA && after > before,
-		attributable: okB && okA,
+		arrived:      got.arrived(),
+		attributable: got.attributable(),
 	}, true
 }
 

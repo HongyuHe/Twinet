@@ -1029,6 +1029,203 @@ reached students, and each motivated a permanent test.
     did not arrive, accusing the VPN of filtering by protocol. All four now
     distinguish a failed measurement from a measurement that failed.
 
+97. **"The announcement is discarded" -- said without asking the neighbour.**
+    The inbound half of `policy.traffic_engineering` read any foreign AS number
+    in the path advertised to the slow neighbour as proof the announcement had
+    died: "a path through a neighbour's own number is a loop to it and the
+    announcement is discarded, so the slow link stops being a backup at all".
+    That is true of the neighbour's *own* number and of nothing else. Padding
+    with 99 -- a number nobody in the lab answers to -- left AS 1 holding the
+    route and choosing it as best, and the report still said the link had
+    stopped being a backup. Survival is now measured at the neighbour instead
+    of deduced from the shape of the path. The measurement is also the right
+    one: `neighbourHolds` asked whether the neighbour had the prefix *at all*,
+    which a prepend of its own number answers yes to whenever the neighbour
+    also learns it the long way round -- excusing the one thing the question
+    forbids. `neighbourHoldsOurs` requires the path to begin with our number,
+    which is what a route received from us looks like. Padding with somebody
+    else's number is still deducted, now for the reason that is true.
+98. **Silence from a peer with nothing to say, read as a dead session.** Both
+    `bgp.ibgp_full_mesh` and `bgp.ebgp_established` prove a session is alive by
+    asking the far end to re-send its table and watching the UPDATE counter --
+    the right test, since an Established session whose packets are discarded
+    stays Established until the hold timer expires. But a peer that has nothing
+    to advertise answers a route refresh with nothing at all, and the checks
+    read that as "the session is held open by a timer that has not expired yet,
+    and carries nothing". A router that originates no prefix of its own has
+    nothing to send over iBGP -- split horizon stops it passing on what it
+    learnt from another iBGP peer -- and announcing the AS prefix from a subset
+    of the routers is an ordinary design. On the live lab it cost a mark for
+    seven sessions that were Established for a quarter of an hour and receiving
+    one to five prefixes each; every other check in the rubric passed, so the
+    submission was correct in every respect and marked down anyway. Whether the
+    peer had anything to carry is not a question the receiving end can answer,
+    so it is now read from the peer's own advertised count. The dead-session
+    test is untouched where that count is non-zero, which is every case findings
+    39, 59 and 65 were about: a blackholed session's sender still believes it is
+    advertising its routes.
+
+99. **The best of several equal-cost paths, reported as the route.** A VPN
+    prefix with several equal-cost paths gets one nexthop per path, each with
+    its own transport label, and the kernel hashes flows across all of them.
+    `vpn.label_switched` took the deepest label stack among those paths and
+    called it the route, so two well-labelled paths hid a third that carried
+    the VPN label alone. Removing LDP from one interior link left the route to
+    the far site with three paths, one of them unlabelled, and the check passed
+    it with full marks and the words "resolve through a transport label and a
+    VPN label". Measured, not inferred: the core router's label table had no
+    entry for the VPN label such a packet arrives carrying, and five of nine
+    source addresses lost every packet. It now looks at every installed path,
+    names the ones carrying the VPN label alone, and passes only when all of
+    them are label-switched. Two labels stays the right floor even where the
+    two edges are neighbours: LDP signals implicit-null one hop away, so
+    nothing but the VPN label goes on the wire, but the implicit-null is still
+    in the stack the kernel reports, and the lab's directly-connected edge pair
+    keeps its mark.
+
+100. **rpki.notfound_preserved asked the submission which prefixes it should be
+     judged against.** `roaPrefixes` read `show rpki prefix-table` from the
+     first router that answered and returned it, empty or not. A router with no
+     validator session prints an empty table and exits zero, and the reference
+     cos461 submission carries no `rpki cache` on three of its eight routers,
+     so the baseline was decided by which router the manifest happens to list
+     first. Removing the one `rpki cache` line from MSP -- which the lab
+     plainly permits, three of its peers having none -- moved the examined
+     population from 1 prefix to 9, and the report then stated "all 9
+     prefix(es) without a ROA are still in this AS's table" when eight of the
+     nine were marked `V` for valid in the very BGP table the check had just
+     read. `hijackIsAnnounced` already spells out the doctrine this broke:
+     asking the student's own routers is circular, because a submission cannot
+     be the reference it is judged against. The population now comes from the
+     lab's own `lab.rpki.not_found` declaration, which staff control; failing
+     that, from every router's table pooled rather than the first one's; and
+     when no baseline can be established while candidates exist, the check says
+     so instead of reading silence as "nobody has published a ROA".
+
+101. **A working filter marked down for the mechanism it used.** The IXP
+     question asks a member to refuse the routes whose path crosses its own
+     region, and says nothing about how. `checkIXPCommunities` looked for
+     `match as-path` in the inbound route-map and nothing else, so a member
+     that refused exactly the same routes with a prefix-list scored 0.5 and was
+     told "nothing filters arrivals from 180.140.0.140 on AS path" -- while its
+     table held the same two out-of-region routes as the reference answer's and
+     none of the six in-region ones the exchange had offered. The comment
+     directly above that code already said "the table is what the question is
+     about"; the code was not reading the table. Now it does: where the
+     exchange offered in-region routes and none arrived, something refused
+     them, whatever it was written with. That reads the table only where the
+     table can speak -- at an exchange relaying no in-region route at all, an
+     empty set of wrongly-admitted routes is the lab's doing rather than the
+     submission's, so the configuration stays the only evidence and a member
+     with no filter still does not get the mark for free. Both evidence lines
+     said "on AS path" whichever way the verdict went; they now report how many
+     in-region routes were offered and whether they arrived.
+
+102. **A router accused of impersonating itself.** An address inside a subnet
+     the plan assigns elsewhere fails the addressing check outright, which is
+     right: that is how a submission stands in for a part of the network it is
+     not. But "elsewhere" was read as "any interface other than this one", so a
+     second address on a router's own prescribed loopback -- inside the router's
+     own /24, advertised by the router itself, answering for nobody else -- was
+     reported as "1 address(es) claim a subnet the plan puts on another
+     interface", under a hint reading "an address from somebody else's subnet",
+     with the detail naming as3/ATL:lo as both the offender and the victim. The
+     check contradicted itself in its own evidence and took the whole mark for
+     it. Standing in for something is a claim about a router, so the router now
+     decides it: an address inside a subnet the plan gives to this router
+     counterfeits nothing. It still costs, because the plan does not mention it
+     and "and nothing else" is what that falsifies -- finding 71's spare address
+     on a prescribed loopback is still caught, just no longer as an
+     impersonation. The one case this must not swallow is the far end of a
+     shared link, whose subnet really is partly ours: an address the plan hands
+     to another router is a counterfeit wherever it is worn, whatever mask it is
+     written with, and is now named as one.
+
+103. **A prefix taken by attaching yourself to it.** The local-preference
+     ordering is only worth marking if it decides where packets go, so the
+     check looks for anything installed above BGP. Static routes, kernel routes
+     and policy rules were all counted; connected routes were exempted
+     outright. A connected route sits at distance 0, below every protocol, so
+     `ip addr add 9.0.0.1/8 dev dummy0` made a customer's whole prefix directly
+     attached and took its traffic, while the check still awarded the point for
+     the ranking deciding where traffic goes -- a point for a property it had
+     not established. The obvious repair, flagging any connected route for an
+     externally learned prefix, was measured against the shipped labs first and
+     is wrong: four correct border routers in the advanced-networks lab are
+     directly attached to an eBGP link subnet that the far end redistributes,
+     so the prefix is externally learned and the connected route rightly beats
+     it. Worse, whether that happens depends on what the *neighbouring* AS
+     advertises, which in a class is another student's submission. The plan
+     decides instead: a router directly attached to a subnet the plan puts on
+     it is where it belongs; one attached to a subnet the plan does not is
+     answering for a part of the network it was never given. The data-plane
+     check already noticed the blackhole this particular mutation caused, but
+     it is the ranking's own claim that was false.
+
+104. **A hello that was watched for less time than it takes to arrive.** The
+     liveness test added for finding 72 watches an OSPF dead timer for twelve
+     seconds and calls the adjacency dead if nothing reset it, which is right
+     while hellos come every ten seconds. Ten is only the default: RFC 2328
+     specifies thirty for non-broadcast networks and any interval is permitted.
+     At thirty, two windows in three contained no hello at all, and an
+     adjacency up for two and a half hours with nothing retransmitted was
+     reported as "held by a timer that has not expired yet" -- on some runs and
+     not others, so the same submission was worth 1.00 or 0.92 depending on
+     when it was graded. The window is now taken from the interval each
+     interface actually uses, and the threshold with it: over a window a live
+     adjacency loses at most one interval less than the whole of it, a silent
+     one loses all of it, and half an interval below the window separates the
+     two whatever the interval is. An interval longer than the grader is
+     willing to wait is reported as one whose liveness could not be
+     established, rather than as silence.
+
+105. **A host vouching for itself.** Reachability is not established by a
+     reply, because a DNAT rule can divert the echo requests for one host to
+     another and conntrack makes the answer look ordinary, so the check also
+     reads the destination's own count of echo requests the kernel delivered to
+     it. The comment on that read claimed nothing a submission configures could
+     raise the counter without the packets arriving. A host pinging its own
+     loopback address raises it one for one -- measured, five self-pings moved
+     it from 1471 to 1476. With the echo requests for one host diverted away
+     and a background `ping 127.0.0.1` left running on it, the DNAT rule
+     counted 56 packets taken from the host during the graded run while the
+     report said "every host received the traffic addressed to it", at full
+     marks. The witness is now what arrived from off the machine: loopback
+     packets are counted a second time on the loopback device, and a probe the
+     grader sends never touches it, so the difference between the two counts
+     cannot be raised by a host talking to itself. The second half of the same
+     defect: the test was that the counter had moved at all, so one packet from
+     anywhere stood as the witness for all eighteen probes sent to a host. It
+     is now counted against the number of probes.
+
+106. **The same counter, for connections and datagrams.** Reachability, transit,
+     the VPN questions and the load-balancing question all ask whether something
+     other than a ping gets through, and all of them read the destination's own
+     kernel counters to find out: the resets it sent, the connections it
+     accepted, the datagrams it took delivery of for a closed port. Those are
+     global counters, and the destination is the submission's own machine. A
+     loop connecting to 127.0.0.1 moved `OutRsts` thirty times in three seconds
+     and `NoPorts` twenty-one times in two -- measured -- so with TCP and UDP
+     dropped between two routers in both directions, no connection able to pass
+     either way, `ospf.ecmp_paths` still reported "all 3 prescribed paths
+     installed" at full marks. The loopback subtraction of finding 105 closes
+     the self-inflation, and is applied to every one of these counters now; but
+     a submission has more than one machine, and a connection to a closed port
+     from any of them raises the counter without touching the loopback, so a
+     counter alone cannot be the witness. Each probe now goes to a port drawn at
+     random for it alone, and the destination watches its own interfaces for
+     that flow while the probe is in flight: tcpdump names the interface each
+     frame arrived on, and traffic a machine sends to itself names itself --
+     even a connection to the machine's own routable address is delivered over
+     `lo` and is reported as such. Both witnesses are required where both can be
+     had, so a frame has to reach an interface from off the machine *and* the
+     kernel has to take delivery of it; where the capture cannot run, the
+     subtracted counter still decides, which is never weaker than what was there
+     before. Measured: the attack 1.00 -> 0.00 on the load-balancing question,
+     and the three shipped labs unchanged at 10.00, 6.00 and 4.00.
+
+
+
 
 ## Environment findings
 
