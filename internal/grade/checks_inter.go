@@ -1572,14 +1572,21 @@ func transitProbe(ctx context.Context, env *Env, sess externalSession, cand tran
 	// forges exactly the answer this check was reading, so the destination's
 	// own count of what reached it is what settles the matter; the prober's
 	// view stands only where that count could not be read.
+	port := probePort()
+	tap := startArrivalTap(ctx, env, cand.Host, port)
 	rstBefore, okR := tcpAnswers(ctx, env, cand.Host)
 	conn := []string{"nc", "-v", "-w", "3", "-z"}
 	if src != "" {
 		conn = append(conn, "-s", src)
 	}
-	conn = append(conn, cand.Addr, probePort())
+	conn = append(conn, cand.Addr, port)
 	res, cerr := env.Probe(ctx, sess.PeerDevice, conn)
 	rstAfter, okR2 := tcpAnswers(ctx, env, cand.Host)
+	frames, live := tap.seen(ctx, env)
+	got := arrival{
+		tapped: frames.tcp, tapLive: live,
+		counted: offBoxDelta(rstBefore, rstAfter), counterOK: okR && okR2,
+	}
 	said := ""
 	if cerr == nil {
 		said = strings.ToLower(res.Stderr + res.Stdout)
@@ -1587,8 +1594,8 @@ func transitProbe(ctx context.Context, env *Env, sess externalSession, cand tran
 	answered := cerr == nil && (res.ExitCode == 0 ||
 		strings.Contains(said, "refused") || strings.Contains(said, "reset"))
 	switch {
-	case okR && okR2 && rstAfter > rstBefore:
-	case cerr != nil, !okR, !okR2:
+	case cerr == nil && got.attributable() && got.arrived():
+	case cerr != nil, !got.attributable():
 		// The destination could not be asked. Nothing is concluded from an
 		// answer whose source is unknown, in either direction.
 		if !answered && cerr == nil {
@@ -1601,8 +1608,9 @@ func transitProbe(ctx context.Context, env *Env, sess externalSession, cand tran
 	default:
 		return fmt.Sprintf(
 			"the customer at %s can ping across this AS but not connect: a connection from "+
-				"%s to %s in AS %d never arrived, so the transit carries ICMP and nothing else",
-			sess.Addr, sess.PeerDevice, cand.Addr, cand.ASN), false
+				"%s to %s in AS %d never arrived -- %s -- so the transit carries ICMP and "+
+				"nothing else",
+			sess.Addr, sess.PeerDevice, cand.Addr, cand.ASN, got.why()), false
 	}
 	return "", true
 }

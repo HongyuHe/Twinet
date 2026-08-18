@@ -1198,6 +1198,32 @@ reached students, and each motivated a permanent test.
      anywhere stood as the witness for all eighteen probes sent to a host. It
      is now counted against the number of probes.
 
+106. **The same counter, for connections and datagrams.** Reachability, transit,
+     the VPN questions and the load-balancing question all ask whether something
+     other than a ping gets through, and all of them read the destination's own
+     kernel counters to find out: the resets it sent, the connections it
+     accepted, the datagrams it took delivery of for a closed port. Those are
+     global counters, and the destination is the submission's own machine. A
+     loop connecting to 127.0.0.1 moved `OutRsts` thirty times in three seconds
+     and `NoPorts` twenty-one times in two -- measured -- so with TCP and UDP
+     dropped between two routers in both directions, no connection able to pass
+     either way, `ospf.ecmp_paths` still reported "all 3 prescribed paths
+     installed" at full marks. The loopback subtraction of finding 105 closes
+     the self-inflation, and is applied to every one of these counters now; but
+     a submission has more than one machine, and a connection to a closed port
+     from any of them raises the counter without touching the loopback, so a
+     counter alone cannot be the witness. Each probe now goes to a port drawn at
+     random for it alone, and the destination watches its own interfaces for
+     that flow while the probe is in flight: tcpdump names the interface each
+     frame arrived on, and traffic a machine sends to itself names itself --
+     even a connection to the machine's own routable address is delivered over
+     `lo` and is reported as such. Both witnesses are required where both can be
+     had, so a frame has to reach an interface from off the machine *and* the
+     kernel has to take delivery of it; where the capture cannot run, the
+     subtracted counter still decides, which is never weaker than what was there
+     before. Measured: the attack 1.00 -> 0.00 on the load-balancing question,
+     and the three shipped labs unchanged at 10.00, 6.00 and 4.00.
+
 
 
 

@@ -622,23 +622,31 @@ func vpnTransportGaps(ctx context.Context, env *Env, pairs []directedPair) (
 // vpnTCPGap attempts one connection across a site pair and reports what did not
 // happen.
 func vpnTCPGap(ctx context.Context, env *Env, d directedPair) (string, bool) {
+	port := probePort()
+	tap := startArrivalTap(ctx, env, d.to.host, port)
 	before, okB := tcpAnswers(ctx, env, d.to.host)
 	res, err := env.Probe(ctx, d.from.host,
-		[]string{"nc", "-v", "-w", "3", "-z", d.to.addr, probePort()})
+		[]string{"nc", "-v", "-w", "3", "-z", d.to.addr, port})
 	if err != nil {
-		return "", false // the machinery failed, which is not a verdict
+		_, _ = tap.seen(ctx, env) // clear the capture off the machine
+		return "", false          // the machinery failed, which is not a verdict
 	}
 	after, okA := tcpAnswers(ctx, env, d.to.host)
+	frames, live := tap.seen(ctx, env)
+	got := arrival{
+		tapped: frames.tcp, tapLive: live,
+		counted: offBoxDelta(before, after), counterOK: okB && okA,
+	}
 	said := strings.ToLower(res.Stderr + res.Stdout)
 	answered := res.ExitCode == 0 ||
 		strings.Contains(said, "refused") || strings.Contains(said, "reset")
-	arrived := okB && okA && after > before
+	arrived := got.attributable() && got.arrived()
 
 	switch {
-	case answered && okB && okA && !arrived:
-		return fmt.Sprintf("%s got an answer from %s (%s) to a connection %s never saw: "+
+	case answered && got.attributable() && !arrived:
+		return fmt.Sprintf("%s got an answer from %s (%s) to a connection %s never saw -- %s: "+
 			"something on the path is answering for it", d.from.host, d.to.host, d.to.addr,
-			d.to.host), true
+			d.to.host, got.why()), true
 	case !answered && arrived:
 		return fmt.Sprintf("a connection from %s reaches %s (%s) but the answer does not come "+
 			"back, though pings do", d.from.host, d.to.host, d.to.addr), true
@@ -647,13 +655,15 @@ func vpnTCPGap(ctx context.Context, env *Env, d directedPair) (string, bool) {
 			"carrying ICMP and discarding the rest", d.from.host, d.to.host, d.to.addr), true
 	}
 	// It answered, so the only way to know the answer came from the far side
-	// is the far side's own count of what it sent.
-	return "", okB && okA
+	// is the far side's own record of what reached it.
+	return "", got.attributable()
 }
 
 // vpnUDPGap sends one datagram across a site pair and reads, at the far side,
 // whether it arrived.
 func vpnUDPGap(ctx context.Context, env *Env, d directedPair) (string, bool) {
+	port := probePort()
+	tap := startArrivalTap(ctx, env, d.to.host, port)
 	before, okB := datagramsDelivered(ctx, env, d.to)
 	// A datagram that was never sent cannot have been filtered. Reaching a
 	// closed port exits zero here and a blocked one times out and also exits
@@ -661,21 +671,28 @@ func vpnUDPGap(ctx context.Context, env *Env, d directedPair) (string, bool) {
 	// that as a datagram that did not arrive accused the VPN of filtering by
 	// protocol on no evidence.
 	sent, err := env.Probe(ctx, d.from.host, []string{"sh", "-c",
-		"echo twinet | nc -u -w 2 " + d.to.addr + " " + probePort()})
+		"echo twinet | nc -u -w 2 " + d.to.addr + " " + port})
 	if err != nil || sent.ExitCode != 0 {
+		_, _ = tap.seen(ctx, env) // clear the capture off the machine
 		return "", false
 	}
 	after, okA := datagramsDelivered(ctx, env, d.to)
-	// A datagram is invisible to whoever sent it, so the far side's count is
-	// the whole of the evidence. Without it there is no verdict either way.
-	if !okB || !okA {
+	frames, live := tap.seen(ctx, env)
+	got := arrival{
+		tapped: frames.udp, tapLive: live,
+		counted: offBoxDelta(before, after), counterOK: okB && okA,
+	}
+	// A datagram is invisible to whoever sent it, so the far side's own record
+	// is the whole of the evidence. Without it there is no verdict either way.
+	if !got.attributable() {
 		return "", false
 	}
-	if after > before {
+	if got.arrived() {
 		return "", true
 	}
-	return fmt.Sprintf("a datagram from %s to %s (%s) never arrived, though pings do: the VPN "+
-		"is filtering by protocol", d.from.host, d.to.host, d.to.addr), true
+	return fmt.Sprintf("a datagram from %s to %s (%s) never arrived -- %s -- though pings do: "+
+		"the VPN is filtering by protocol",
+		d.from.host, d.to.host, d.to.addr, got.why()), true
 }
 
 // receivedEchoesAt reads each site host's count of ICMP echo requests the
@@ -880,10 +897,15 @@ func vpnCrossTalk(ctx context.Context, env *Env, pairs []directedPair) []string 
 // vpnDatagramLeaks sends datagrams across every cross-customer pair and reads,
 // at each destination, whether they arrived.
 //
-// A datagram is one way, so the sender learns nothing; the destination's count
-// of datagrams delivered for an unbound port is the only witness. The pairs are
-// scheduled so that no destination is aimed at twice at once, which is what
-// makes a counter that moved attributable to the sender that moved it.
+// A datagram is one way, so the sender learns nothing; what the destination
+// recorded is the only witness. The pairs are scheduled so that no destination
+// is aimed at twice at once, which is what makes a counter that moved
+// attributable to the sender that moved it.
+//
+// This one accuses, so the direction to err in is the other one: a count the
+// destination raised by itself, on its own loopback, would name two properly
+// separated customers as leaking into each other. Both the loopback subtraction
+// and the capture of the exact flow are here for that reason.
 func vpnDatagramLeaks(ctx context.Context, env *Env, pairs []directedPair) []string {
 	const burst = 3 // several, so one stray packet in the window is not a verdict
 
@@ -891,7 +913,12 @@ func vpnDatagramLeaks(ctx context.Context, env *Env, pairs []directedPair) []str
 	for _, round := range roundsByDestinationOf(pairs, func(d directedPair) string {
 		return d.to.host
 	}) {
-		before := map[string]int{}
+		ports := map[string]string{}
+		for _, d := range round {
+			ports[d.to.host] = probePort()
+		}
+		taps := startTaps(ctx, env, ports)
+		before := map[string]counterWitness{}
 		for _, d := range round {
 			if n, ok := datagramsDelivered(ctx, env, d.to); ok {
 				before[d.to.host] = n
@@ -904,18 +931,20 @@ func vpnDatagramLeaks(ctx context.Context, env *Env, pairs []directedPair) []str
 				defer wg.Done()
 				for i := 0; i < burst; i++ {
 					_, _ = env.Probe(ctx, d.from.host, []string{"sh", "-c",
-						"echo twinet | nc -u -w 1 " + d.to.addr + " " + probePort()})
+						"echo twinet | nc -u -w 1 " + d.to.addr + " " + ports[d.to.host]})
 				}
 			}(d)
 		}
 		wg.Wait()
+		seen := readTaps(ctx, env, taps)
 		for _, d := range round {
-			b, ok := before[d.to.host]
-			if !ok {
-				continue
+			b, okB := before[d.to.host]
+			a, okA := datagramsDelivered(ctx, env, d.to)
+			got := arrival{
+				tapped: seen[d.to.host].counts.udp, tapLive: seen[d.to.host].live,
+				counted: offBoxDelta(b, a), counterOK: okB && okA,
 			}
-			a, ok := datagramsDelivered(ctx, env, d.to)
-			if !ok || a-b < burst {
+			if !got.arrivedAtLeast(burst) {
 				continue
 			}
 			out = append(out, fmt.Sprintf(
@@ -928,7 +957,7 @@ func vpnDatagramLeaks(ctx context.Context, env *Env, pairs []directedPair) []str
 
 // datagramsDelivered reads a site's count of datagrams the kernel took delivery
 // of for a port nothing is bound to, in the family the site is addressed in.
-func datagramsDelivered(ctx context.Context, env *Env, s sitePoint) (int, bool) {
+func datagramsDelivered(ctx context.Context, env *Env, s sitePoint) (counterWitness, bool) {
 	if strings.Contains(s.addr, ":") {
 		return udpNoPorts(ctx, env, s.host)
 	}

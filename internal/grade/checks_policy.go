@@ -75,24 +75,15 @@ func tunnelCarriesTransport(ctx context.Context, env *Env, hosts map[string]*mod
 		if addr == "" {
 			continue
 		}
+		// One port for both protocols, drawn for this direction alone, so that
+		// a single capture on the far side covers the connection and the
+		// datagram and neither can be confused with anything else.
+		port := probePort()
+		tap := startArrivalTap(ctx, env, dst.ID, port)
 		before, okB := tcpAnswers(ctx, env, dst.ID)
 		_, _ = env.Probe(ctx, src.ID,
-			[]string{"nc", "-6", "-w", "3", "-z", addr, probePort()})
+			[]string{"nc", "-6", "-w", "3", "-z", addr, port})
 		after, okA := tcpAnswers(ctx, env, dst.ID)
-		if !okB || !okA {
-			// The far side's own count of the resets it sent is the whole of
-			// the evidence: a reply forged on the path does not move it, and
-			// the sender cannot tell the difference. Without it this direction
-			// was passed over in silence, and the point was awarded for a
-			// tunnel across which nothing was shown to travel.
-			continue
-		}
-		if after <= before {
-			return fmt.Sprintf(
-				"IPv6 pings cross the tunnel, but a connection from %s to %s at %s never "+
-					"arrived: %s answered no TCP at all, so the tunnel carries ICMP and "+
-					"nothing else", src.Name, dst.Name, addr, dst.Name), false, true
-		}
 		// And a datagram, which is neither of the two things already tried.
 		//
 		// A filter can be written per protocol as easily as per port. The far
@@ -100,16 +91,40 @@ func tunnelCarriesTransport(ctx context.Context, env *Env, hosts map[string]*mod
 		// to, which is a fact about arrival and not about any answer.
 		udpBefore, okU := udpNoPorts(ctx, env, dst.ID)
 		_, _ = env.Probe(ctx, src.ID, []string{"sh", "-c",
-			"echo twinet | nc -6 -u -w 2 " + addr + " " + probePort()})
+			"echo twinet | nc -6 -u -w 2 " + addr + " " + port})
 		udpAfter, okU2 := udpNoPorts(ctx, env, dst.ID)
-		if !okU || !okU2 {
+		frames, live := tap.seen(ctx, env)
+
+		gotTCP := arrival{
+			tapped: frames.tcp, tapLive: live,
+			counted: offBoxDelta(before, after), counterOK: okB && okA,
+		}
+		if !gotTCP.attributable() {
+			// The far side's own record is the whole of the evidence: a reply
+			// forged on the path does not move it, and the sender cannot tell
+			// the difference. Without it this direction was passed over in
+			// silence, and the point was awarded for a tunnel across which
+			// nothing was shown to travel.
 			continue
 		}
-		if udpAfter <= udpBefore {
+		if !gotTCP.arrived() {
+			return fmt.Sprintf(
+				"IPv6 pings cross the tunnel, but a connection from %s to %s at %s never "+
+					"arrived -- %s -- so the tunnel carries ICMP and nothing else",
+				src.Name, dst.Name, addr, gotTCP.why()), false, true
+		}
+		gotUDP := arrival{
+			tapped: frames.udp, tapLive: live,
+			counted: offBoxDelta(udpBefore, udpAfter), counterOK: okU && okU2,
+		}
+		if !gotUDP.attributable() {
+			continue
+		}
+		if !gotUDP.arrived() {
 			return fmt.Sprintf(
 				"IPv6 pings and connections cross the tunnel, but a datagram from %s to %s "+
-					"at %s never arrived: something on the path is filtering by protocol",
-				src.Name, dst.Name, addr), false, true
+					"at %s never arrived -- %s: something on the path is filtering by "+
+					"protocol", src.Name, dst.Name, addr, gotUDP.why()), false, true
 		}
 		observed = true
 	}
@@ -118,20 +133,19 @@ func tunnelCarriesTransport(ctx context.Context, env *Env, hosts map[string]*mod
 
 // udpNoPorts reads a host's count of datagrams delivered to it for a port
 // nothing is bound to, which the kernel keeps and nothing on the path can
-// raise without the datagram arriving.
-func udpNoPorts(ctx context.Context, env *Env, device string) (int, bool) {
-	res, err := env.Probe(ctx, device, []string{"cat", "/proc/net/snmp6"})
-	if err != nil || res.ExitCode != 0 {
-		return 0, false
-	}
-	for _, line := range strings.Split(res.Stdout, "\n") {
-		f := strings.Fields(line)
-		if len(f) == 2 && f[0] == "Udp6NoPorts" {
-			n, err := strconv.Atoi(f[1])
-			return n, err == nil
+// raise without the datagram arriving, together with the loopback traffic the
+// host could have produced it with itself.
+func udpNoPorts(ctx context.Context, env *Env, device string) (counterWitness, bool) {
+	return readCounter(ctx, env, device, "/proc/net/snmp6", func(body string) (int, bool) {
+		for _, line := range strings.Split(body, "\n") {
+			f := strings.Fields(line)
+			if len(f) == 2 && f[0] == "Udp6NoPorts" {
+				n, err := strconv.Atoi(f[1])
+				return n, err == nil
+			}
 		}
-	}
-	return 0, false
+		return 0, false
+	})
 }
 
 func checkSixIn4(ctx context.Context, env *Env) Result {

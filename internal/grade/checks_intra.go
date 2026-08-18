@@ -1281,7 +1281,9 @@ func deadHops(ctx context.Context, env *Env, paths [][]string) []string {
 
 // carriesTCPBothWays opens a connection each way between two routers, to a
 // port nothing is listening on, and reads the far side's own count of the
-// resets it sent.
+// resets it sent -- together with a capture on the far side of the flow the
+// probe creates, which is what makes the count attributable to this probe
+// rather than to any traffic the submission cares to generate.
 func carriesTCPBothWays(ctx context.Context, env *Env, from, to string) (string, bool) {
 	ends := [][2]string{{from, to}, {to, from}}
 	for _, e := range ends {
@@ -1298,55 +1300,68 @@ func carriesTCPBothWays(ctx context.Context, env *Env, from, to string) (string,
 			return "", true
 		}
 		addr := addrOnly(lo.Addr4)
+		// One port for both protocols, drawn for this pair alone, so that a
+		// single capture on the far side covers the connection and the
+		// datagram and neither can be confused with anything else in flight.
+		port := probePort()
+		tap := startArrivalTap(ctx, env, dst.ID, port)
 		// Between the loopbacks, which is the pair the question is about and
 		// the pair a rule aimed at this traffic would name. Sourced from an
 		// interface address instead, a probe misses a drop written against the
 		// routers themselves and reads as a healthy path.
 		args := []string{"nc", "-w", "3", "-z"}
+		src4 := ""
 		if slo, ok := src.IfaceByName("lo"); ok && slo.Addr4 != "" {
-			args = append(args, "-s", addrOnly(slo.Addr4))
+			src4 = addrOnly(slo.Addr4)
+			args = append(args, "-s", src4)
 		}
-		args = append(args, addr, probePort())
+		args = append(args, addr, port)
 		before, okB := tcpAnswers(ctx, env, dst.ID)
 		_, _ = env.Probe(ctx, src.ID, args)
 		after, okA := tcpAnswers(ctx, env, dst.ID)
-		if okB && okA && after <= before {
-			return fmt.Sprintf(
-				"%s answers pings from %s but no connection to it arrives: the paths carry "+
-					"ICMP and nothing else", e[1], e[0]), false
-		}
 		// And a datagram. A filter is written per protocol as easily as per
 		// port: dropping UDP between the two loopbacks left the pings and the
 		// connections working and the paths carrying two thirds of what they
 		// should.
-		src4 := ""
-		if slo, ok := src.IfaceByName("lo"); ok && slo.Addr4 != "" {
-			src4 = addrOnly(slo.Addr4)
-		}
 		udpBefore, okU := udpNoPortsV4(ctx, env, dst.ID)
 		cmd := "echo twinet | nc -u -w 2"
 		if src4 != "" {
 			cmd += " -s " + src4
 		}
-		_, _ = env.Probe(ctx, src.ID, []string{"sh", "-c", cmd + " " + addr + " " + probePort()})
+		_, _ = env.Probe(ctx, src.ID, []string{"sh", "-c", cmd + " " + addr + " " + port})
 		udpAfter, okU2 := udpNoPortsV4(ctx, env, dst.ID)
-		if okU && okU2 && udpAfter <= udpBefore {
+		frames, live := tap.seen(ctx, env)
+
+		gotTCP := arrival{
+			tapped: frames.tcp, tapLive: live,
+			counted: offBoxDelta(before, after), counterOK: okB && okA,
+		}
+		if gotTCP.attributable() && !gotTCP.arrived() {
 			return fmt.Sprintf(
-				"%s answers pings and connections from %s but no datagram from it arrives: "+
-					"something on the paths is filtering by protocol", e[1], e[0]), false
+				"%s answers pings from %s but no connection to it arrives -- %s: the paths "+
+					"carry ICMP and nothing else", e[1], e[0], gotTCP.why()), false
+		}
+		gotUDP := arrival{
+			tapped: frames.udp, tapLive: live,
+			counted: offBoxDelta(udpBefore, udpAfter), counterOK: okU && okU2,
+		}
+		if gotUDP.attributable() && !gotUDP.arrived() {
+			return fmt.Sprintf(
+				"%s answers pings and connections from %s but no datagram from it arrives "+
+					"-- %s: something on the paths is filtering by protocol",
+				e[1], e[0], gotUDP.why()), false
 		}
 	}
 	return "", true
 }
 
 // udpNoPortsV4 reads a host's count of datagrams delivered to it for a port
-// nothing is bound to.
-func udpNoPortsV4(ctx context.Context, env *Env, device string) (int, bool) {
-	res, err := env.Probe(ctx, device, []string{"cat", "/proc/net/snmp"})
-	if err != nil || res.ExitCode != 0 {
-		return 0, false
-	}
-	return snmpCounter(res.Stdout, "Udp:", "NoPorts")
+// nothing is bound to, together with the loopback traffic that could have
+// produced it.
+func udpNoPortsV4(ctx context.Context, env *Env, device string) (counterWitness, bool) {
+	return readCounter(ctx, env, device, "/proc/net/snmp", func(body string) (int, bool) {
+		return snmpCounter(body, "Udp:", "NoPorts")
+	})
 }
 
 func checkECMP(ctx context.Context, env *Env) Result {
@@ -3303,10 +3318,12 @@ func unreachableByTCP(ctx context.Context, env *Env, hosts []*model.Device,
 // unreachableByUDP sends a datagram between every ordered pair of hosts and
 // names the ones that do not arrive.
 //
-// Arrival is read at the far side, from its count of datagrams delivered for a
-// port nothing is bound to. The sender cannot be trusted to tell: when the
-// datagram is dropped it hears nothing, and hearing nothing is exactly what
-// `nc` reports as success.
+// Arrival is read at the far side, from a capture of the flow on its own
+// interfaces together with its count of datagrams delivered for a port nothing
+// is bound to. The sender cannot be trusted to tell: when the datagram is
+// dropped it hears nothing, and hearing nothing is exactly what `nc` reports as
+// success. Nor can the count on its own, which the receiving host raises for
+// itself by sending a datagram to one of its own closed ports.
 //
 // The pairs are done in rounds, each round a different offset, so that no two
 // senders aim at the same host at once and the counter says who arrived.
@@ -3318,6 +3335,16 @@ func unreachableByUDP(ctx context.Context, env *Env, hosts []*model.Device,
 	}
 	var out []string
 	for k := 1; k < n; k++ {
+		// One port per destination for this round, so that each capture
+		// watches for exactly the datagram aimed at that host.
+		ports := map[string]string{}
+		for i := range hosts {
+			dst := hosts[(i+k)%n]
+			if addrOf[dst.ID] != "" {
+				ports[dst.ID] = probePort()
+			}
+		}
+		taps := startTaps(ctx, env, ports)
 		before := udpCounters(ctx, env, hosts)
 		var wg sync.WaitGroup
 		for i, src := range hosts {
@@ -3329,22 +3356,28 @@ func unreachableByUDP(ctx context.Context, env *Env, hosts []*model.Device,
 			go func(src, dst *model.Device) {
 				defer wg.Done()
 				_, _ = env.Probe(ctx, src.ID, []string{"sh", "-c",
-					"echo twinet | nc -u -w 2 " + addrOf[dst.ID] + " " + probePort()})
+					"echo twinet | nc -u -w 2 " + addrOf[dst.ID] + " " + ports[dst.ID]})
 			}(src, dst)
 		}
 		wg.Wait()
 		after := udpCounters(ctx, env, hosts)
+		seen := readTaps(ctx, env, taps)
 		for i, src := range hosts {
 			dst := hosts[(i+k)%n]
 			b, okB := before[dst.ID]
 			a, okA := after[dst.ID]
-			if !okB || !okA || a > b {
+			frames, live := seen[dst.ID].counts, seen[dst.ID].live
+			got := arrival{
+				tapped: frames.udp, tapLive: live,
+				counted: offBoxDelta(b, a), counterOK: okB && okA,
+			}
+			if !got.attributable() || got.arrived() {
 				continue
 			}
 			out = append(out, fmt.Sprintf(
-				"a datagram from %s to %s (%s) never arrived, though pings and connections "+
-					"do: something on the path is filtering by protocol",
-				src.Name, dst.Name, addrOf[dst.ID]))
+				"a datagram from %s to %s (%s) never arrived -- %s -- though pings and "+
+					"connections do: something on the path is filtering by protocol",
+				src.Name, dst.Name, addrOf[dst.ID], got.why()))
 		}
 	}
 	sort.Strings(out)
@@ -3353,8 +3386,8 @@ func unreachableByUDP(ctx context.Context, env *Env, hosts []*model.Device,
 
 // udpCounters reads every host's count of datagrams delivered for an unbound
 // port, at once.
-func udpCounters(ctx context.Context, env *Env, hosts []*model.Device) map[string]int {
-	out := map[string]int{}
+func udpCounters(ctx context.Context, env *Env, hosts []*model.Device) map[string]counterWitness {
+	out := map[string]counterWitness{}
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	for _, h := range hosts {
