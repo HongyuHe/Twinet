@@ -674,6 +674,12 @@ func overriddenByStatic(ctx context.Context, env *Env, routers []*model.Device) 
 		out []string
 		wg  sync.WaitGroup
 	)
+	// Which subnets the plan actually attaches each router to. Being directly
+	// attached to a prefix BGP also carries is ordinary and right: an eBGP
+	// link subnet the far end redistributes comes back as a BGP route, and the
+	// connected route beats it, as it should. What is not ordinary is being
+	// attached to a subnet the plan never put on this router.
+	attached := subnetOwners(env)
 	for _, r := range routers {
 		wg.Add(1)
 		go func(r *model.Device) {
@@ -734,7 +740,27 @@ func overriddenByStatic(ctx context.Context, env *Env, routers []*model.Device) 
 						continue
 					}
 					switch e.Protocol {
-					case "bgp", "connected", "":
+					case "bgp", "":
+					case "connected":
+						// A connected route sits at distance 0, below every protocol,
+						// so it takes the traffic whatever BGP decided. That is right
+						// for a subnet the router is really on, and a way to make the
+						// ranking irrelevant for one it is not: put an address out of
+						// somebody else's space on an interface of your own and their
+						// prefix becomes yours to answer for.
+						//
+						// Which it is has to be decided by the plan. The running
+						// configuration is the thing being marked, so it cannot also
+						// be the thing that says whether the router belongs there.
+						if attached[normalPrefix(prefix)][r.ID] {
+							continue
+						}
+						mu.Lock()
+						out = append(out, fmt.Sprintf(
+							"%s forwards %s by a directly attached route rather than the one BGP "+
+								"chose, and the plan does not put that subnet on it",
+							r.Name, prefix))
+						mu.Unlock()
 					default:
 						mu.Lock()
 						out = append(out, fmt.Sprintf(

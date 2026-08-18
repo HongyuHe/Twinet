@@ -1141,6 +1141,27 @@ reached students, and each motivated a permanent test.
      to another router is a counterfeit wherever it is worn, whatever mask it is
      written with, and is now named as one.
 
+103. **A prefix taken by attaching yourself to it.** The local-preference
+     ordering is only worth marking if it decides where packets go, so the
+     check looks for anything installed above BGP. Static routes, kernel routes
+     and policy rules were all counted; connected routes were exempted
+     outright. A connected route sits at distance 0, below every protocol, so
+     `ip addr add 9.0.0.1/8 dev dummy0` made a customer's whole prefix directly
+     attached and took its traffic, while the check still awarded the point for
+     the ranking deciding where traffic goes -- a point for a property it had
+     not established. The obvious repair, flagging any connected route for an
+     externally learned prefix, was measured against the shipped labs first and
+     is wrong: four correct border routers in the advanced-networks lab are
+     directly attached to an eBGP link subnet that the far end redistributes,
+     so the prefix is externally learned and the connected route rightly beats
+     it. Worse, whether that happens depends on what the *neighbouring* AS
+     advertises, which in a class is another student's submission. The plan
+     decides instead: a router directly attached to a subnet the plan puts on
+     it is where it belongs; one attached to a subnet the plan does not is
+     answering for a part of the network it was never given. The data-plane
+     check already noticed the blackhole this particular mutation caused, but
+     it is the ranking's own claim that was false.
+
 
 
 

@@ -320,6 +320,7 @@ func ownSubnet(i *model.Iface, addr string) bool {
 func subnetOwners(env *Env) map[string]map[string]bool {
 	out := map[string]map[string]bool{}
 	add := func(subnet, device string) {
+		subnet = normalPrefix(subnet)
 		if subnet == "" || device == "" {
 			return
 		}
@@ -349,6 +350,17 @@ func subnetOwners(env *Env) map[string]map[string]bool {
 		}
 	}
 	return out
+}
+
+// normalPrefix puts a subnet in the one form it can be compared in, so that
+// 179.1.20.0/24 and 179.1.20.2/24 are recognised as the same subnet however
+// they were written down.
+func normalPrefix(subnet string) string {
+	p, err := netip.ParsePrefix(strings.TrimSpace(subnet))
+	if err != nil {
+		return strings.TrimSpace(subnet)
+	}
+	return p.Masked().String()
 }
 
 // plannedAddr is an address the plan puts somewhere, and where.
