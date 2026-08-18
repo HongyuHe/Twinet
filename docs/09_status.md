@@ -913,6 +913,23 @@ reached students, and each motivated a permanent test.
     same function, a name that matched no line at all returned "nothing wrong
     with these endpoints", which awarded the mark for output nobody could read;
     it now says so.
+88. **Deducting for a crossing that cannot happen.** A student debugging a
+    switch adds `ovs-ofctl add-flow br0 "ip,nw_dst=192.168.99.99,in_port=1,
+    actions=output:2"` to watch whether traffic moves between two ports, and
+    forgets to remove it. Nothing in the lab has that address, so no frame ever
+    matches; the grader's own probes found 0 of 8 pairs leaking. The VLAN
+    isolation check failed the domain anyway, because it read the *existence*
+    of a rule that names ports in two VLANs and never asked whether any frame
+    the lab can produce satisfies its match. Half a point for a rule that
+    carries nothing. A rule is now excused only when its destination match
+    covers no address the plan assigns anywhere in the topology and none
+    configured on the domain's hosts or their gateway right now, and only on a
+    bridge whose every action merely chooses a port -- one that rewrites
+    addresses, resubmits or learns can manufacture a frame addressed to
+    anything. The excused rule is still reported to the student. Note what was
+    *not* done: excusing rules whose packet counter is zero, which was the
+    obvious fix and would have passed a submission with its VLANs wide open so
+    long as nobody sent anything while the grader watched.
 
 ## Environment findings
 

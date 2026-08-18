@@ -50,7 +50,7 @@ func TestASwitchIsReadWhateverItsBridgeIsCalled(t *testing.T) {
 		"ovs-ofctl dump-flows dcfabric": " cookie=0x0, priority=200,in_port=1,tcp," +
 			"tp_dst=443, actions=output:2\n cookie=0x0, priority=0, actions=NORMAL\n",
 	})
-	got := crossVLANForwarding(context.Background(), env, "DC")
+	got := crossVLANLeaks(context.Background(), env, "DC")
 	if len(got) == 0 {
 		t.Fatal("a rule carrying frames from VLAN 10 to VLAN 20 was not read, because it " +
 			"was not on a bridge called br0")
@@ -75,7 +75,7 @@ func TestPortNumbersAreResolvedAgainstTheirOwnBridge(t *testing.T) {
 		"ovs-ofctl dump-flows br1": " cookie=0x0, in_port=1, actions=output:2\n",
 		"ovs-vsctl --columns=name,type,options --format=csv list interface": "name,type,options\n",
 	})
-	got := crossVLANForwarding(context.Background(), env, "DC")
+	got := crossVLANLeaks(context.Background(), env, "DC")
 	if len(got) != 1 {
 		t.Fatalf("want one crossing read from br1, got %d: %v", len(got), got)
 	}
@@ -102,7 +102,7 @@ func TestAWayAcrossThroughASecondBridgeIsFound(t *testing.T) {
 		"ovs-vsctl --columns=name,type,options --format=csv list interface": "name,type,options\n" +
 			`p0,patch,"{peer=p1}"` + "\n" + `p1,patch,"{peer=p0}"` + "\n",
 	})
-	got := crossVLANForwarding(context.Background(), env, "DC")
+	got := crossVLANLeaks(context.Background(), env, "DC")
 	if len(got) == 0 {
 		t.Fatal("frames can go from VLAN 10 out through a second bridge and back into " +
 			"VLAN 20, and nothing said so")
@@ -127,7 +127,7 @@ func TestASwitchThatKeepsItsVLANsApartIsNotComplainedAbout(t *testing.T) {
 			"priority=0 actions=NORMAL\n",
 		"ovs-vsctl --columns=name,type,options --format=csv list interface": "name,type,options\n",
 	})
-	if got := crossVLANForwarding(context.Background(), env, "DC"); len(got) != 0 {
+	if got := crossVLANLeaks(context.Background(), env, "DC"); len(got) != 0 {
 		t.Fatalf("a correct switch was reported as forwarding across VLANs: %v", got)
 	}
 }
@@ -141,7 +141,7 @@ func TestASwitchThatCannotBeReadIsNotReadAsClean(t *testing.T) {
 	env := switchSaying(map[string]string{
 		"ovs-vsctl --columns=name,tag --format=csv list port": twoVLANPorts,
 	})
-	got := crossVLANForwarding(context.Background(), env, "DC")
+	got := crossVLANLeaks(context.Background(), env, "DC")
 	if len(got) == 0 {
 		t.Fatal("a switch whose bridges could not be listed was passed as keeping its " +
 			"VLANs apart")

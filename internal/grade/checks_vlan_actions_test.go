@@ -2,6 +2,7 @@ package grade
 
 import (
 	"context"
+	"net/netip"
 	"strings"
 	"testing"
 )
@@ -28,7 +29,7 @@ func TestRetaggingBeforeNormalIsRead(t *testing.T) {
 	env := flowTable(" cookie=0x0, priority=100,udp,in_port=1,tp_dst=55555 " +
 		"actions=load:4->NXM_OF_IN_PORT[],mod_vlan_vid:20,NORMAL\n" +
 		" cookie=0x0, priority=0 actions=NORMAL\n")
-	got := crossVLANForwarding(context.Background(), env, "DC")
+	got := crossVLANLeaks(context.Background(), env, "DC")
 	if len(got) == 0 {
 		t.Fatal("a frame retagged into VLAN 20 and handed to NORMAL was read as harmless")
 	}
@@ -40,7 +41,7 @@ func TestRetaggingBeforeNormalIsRead(t *testing.T) {
 // Retagging alone is enough; the input port need not be touched.
 func TestRetaggingAloneIsRead(t *testing.T) {
 	env := flowTable(" cookie=0x0, priority=100,in_port=1 actions=mod_vlan_vid:20,NORMAL\n")
-	if got := crossVLANForwarding(context.Background(), env, "DC"); len(got) == 0 {
+	if got := crossVLANLeaks(context.Background(), env, "DC"); len(got) == 0 {
 		t.Fatal("mod_vlan_vid before NORMAL was read as harmless")
 	}
 }
@@ -49,7 +50,7 @@ func TestRetaggingAloneIsRead(t *testing.T) {
 func TestPretendingToArriveElsewhereIsRead(t *testing.T) {
 	env := flowTable(" cookie=0x0, priority=100,in_port=1 " +
 		"actions=set_field:2->in_port,NORMAL\n")
-	if got := crossVLANForwarding(context.Background(), env, "DC"); len(got) == 0 {
+	if got := crossVLANLeaks(context.Background(), env, "DC"); len(got) == 0 {
 		t.Fatal("rewriting in_port before NORMAL was read as harmless")
 	}
 }
@@ -59,7 +60,7 @@ func TestPretendingToArriveElsewhereIsRead(t *testing.T) {
 func TestRewritingThenResubmittingIsRead(t *testing.T) {
 	env := flowTable(" cookie=0x0, priority=100,in_port=1 " +
 		"actions=mod_vlan_vid:20,resubmit(,0)\n cookie=0x0, priority=0 actions=NORMAL\n")
-	if got := crossVLANForwarding(context.Background(), env, "DC"); len(got) == 0 {
+	if got := crossVLANLeaks(context.Background(), env, "DC"); len(got) == 0 {
 		t.Fatal("a rewrite handed back to the tables was read as harmless")
 	}
 }
@@ -68,7 +69,7 @@ func TestRewritingThenResubmittingIsRead(t *testing.T) {
 func TestTheRegisterFormOfARetagIsRead(t *testing.T) {
 	env := flowTable(" cookie=0x0, priority=100,in_port=1 " +
 		"actions=set_field:4116->vlan_vid,NORMAL\n")
-	got := crossVLANForwarding(context.Background(), env, "DC")
+	got := crossVLANLeaks(context.Background(), env, "DC")
 	if len(got) == 0 {
 		t.Fatal("set_field on vlan_vid before NORMAL was read as harmless")
 	}
@@ -82,7 +83,7 @@ func TestTheRegisterFormOfARetagIsRead(t *testing.T) {
 func TestPlainNormalForwardingIsNotComplainedAbout(t *testing.T) {
 	env := flowTable(" cookie=0x0, duration=931.2s, table=0, n_packets=4423, " +
 		"n_bytes=418, priority=0 actions=NORMAL\n")
-	if got := crossVLANForwarding(context.Background(), env, "DC"); len(got) != 0 {
+	if got := crossVLANLeaks(context.Background(), env, "DC"); len(got) != 0 {
 		t.Fatalf("a correct switch was complained about: %v", got)
 	}
 }
@@ -92,7 +93,7 @@ func TestPlainNormalForwardingIsNotComplainedAbout(t *testing.T) {
 func TestARetagToTheSameVLANIsNotComplainedAbout(t *testing.T) {
 	env := flowTable(" cookie=0x0, priority=100,in_port=1 actions=mod_vlan_vid:10,NORMAL\n" +
 		" cookie=0x0, priority=100,dl_vlan=20 actions=mod_vlan_vid:20,NORMAL\n")
-	if got := crossVLANForwarding(context.Background(), env, "DC"); len(got) != 0 {
+	if got := crossVLANLeaks(context.Background(), env, "DC"); len(got) != 0 {
 		t.Fatalf("a rewrite that changes nothing was complained about: %v", got)
 	}
 }
@@ -102,7 +103,7 @@ func TestARetagToTheSameVLANIsNotComplainedAbout(t *testing.T) {
 // vouch for.
 func TestAnUnreadableRewriteIsNotReadAsClean(t *testing.T) {
 	env := flowTable(" cookie=0x0, priority=100 actions=push_vlan:0x8100,NORMAL\n")
-	if got := crossVLANForwarding(context.Background(), env, "DC"); len(got) == 0 {
+	if got := crossVLANLeaks(context.Background(), env, "DC"); len(got) == 0 {
 		t.Fatal("a rewrite whose result is unknown was read as harmless")
 	}
 }
@@ -139,7 +140,7 @@ func TestActionsAreSplitAtTheirOwnCommas(t *testing.T) {
 func TestAFlowMatchingOnlyItsInputPortIsRead(t *testing.T) {
 	env := flowTable(" cookie=0x0, duration=5.0s, table=0, n_packets=0, n_bytes=0, " +
 		"in_port=1 actions=output:2\n")
-	got := crossVLANForwarding(context.Background(), env, "DC")
+	got := crossVLANLeaks(context.Background(), env, "DC")
 	if len(got) == 0 {
 		t.Fatal("a flow whose only match was its input port was read as harmless")
 	}
@@ -152,7 +153,7 @@ func TestAFlowMatchingOnlyItsInputPortIsRead(t *testing.T) {
 // matches neither the number table nor the VLAN table.
 func TestPortsPrintedByNameAreRead(t *testing.T) {
 	env := flowTable(" cookie=0x0, table=0, in_port=\"port_A\" actions=output:\"port_P\"\n")
-	got := crossVLANForwarding(context.Background(), env, "DC")
+	got := crossVLANLeaks(context.Background(), env, "DC")
 	if len(got) == 0 {
 		t.Fatal("a flow printed with port names was read as harmless")
 	}
@@ -167,7 +168,7 @@ func TestPortsPrintedByNameAreRead(t *testing.T) {
 // is not one.
 func TestAnOutputThisCannotNameIsNotReadAsClean(t *testing.T) {
 	env := flowTable(" cookie=0x0, in_port=1 actions=output:NXM_NX_REG0[]\n")
-	got := crossVLANForwarding(context.Background(), env, "DC")
+	got := crossVLANLeaks(context.Background(), env, "DC")
 	if len(got) == 0 {
 		t.Fatal("an output to a register was read as harmless")
 	}
@@ -180,7 +181,7 @@ func TestAnOutputThisCannotNameIsNotReadAsClean(t *testing.T) {
 // must not be reported.
 func TestOutputBackToTheIngressPortIsNotComplainedAbout(t *testing.T) {
 	env := flowTable(" cookie=0x0, in_port=1 actions=output:in_port\n")
-	if got := crossVLANForwarding(context.Background(), env, "DC"); len(got) != 0 {
+	if got := crossVLANLeaks(context.Background(), env, "DC"); len(got) != 0 {
 		t.Fatalf("sending a frame back where it came from was complained about: %v", got)
 	}
 }
@@ -190,7 +191,7 @@ func TestOutputBackToTheIngressPortIsNotComplainedAbout(t *testing.T) {
 func TestLearnedFlowsAreNotReadAsClean(t *testing.T) {
 	env := flowTable(" cookie=0x0, priority=10 actions=learn(table=0," +
 		"NXM_OF_VLAN_TCI[0..11],output:NXM_OF_IN_PORT[]),NORMAL\n")
-	if got := crossVLANForwarding(context.Background(), env, "DC"); len(got) == 0 {
+	if got := crossVLANLeaks(context.Background(), env, "DC"); len(got) == 0 {
 		t.Fatal("a flow that installs flows was read as harmless")
 	}
 }
@@ -205,11 +206,19 @@ func TestABridgeUnderAControllerIsNotReadAsClean(t *testing.T) {
 		"ovs-ofctl show br0":           " 1(port_A): addr:aa\n 2(port_P): addr:bb\n",
 		"ovs-ofctl dump-flows br0":     " cookie=0x0, priority=0 actions=NORMAL\n",
 	})
-	got := crossVLANForwarding(context.Background(), env, "DC")
+	got := crossVLANLeaks(context.Background(), env, "DC")
 	if len(got) == 0 {
 		t.Fatal("a bridge run by a controller was read as forwarding only what its table says")
 	}
 	if !strings.Contains(got[0], "controller") {
 		t.Fatalf("the report does not name the controller: %q", got[0])
 	}
+}
+
+// crossVLANLeaks is crossVLANForwarding with an inventory covering every
+// address, so no rule is excused for carrying nothing this lab addresses.
+func crossVLANLeaks(ctx context.Context, env *Env, domain string) []string {
+	leaks, _ := crossVLANForwarding(ctx, env, domain, []netip.Prefix{
+		netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0")})
+	return leaks
 }

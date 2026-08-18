@@ -5,6 +5,7 @@ import (
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
+	"math/bits"
 	"net/netip"
 	"regexp"
 	"sort"
@@ -1332,16 +1333,194 @@ func checkECMP(ctx context.Context, env *Env) Result {
 
 // checkVLANIsolation verifies that hosts in the same VLAN reach each other
 // directly while hosts in different VLANs are forced through the gateway.
+// labDestinations is every address a frame in this lab could be addressed to:
+// what the plan assigns anywhere in the topology, and what the hosts of this
+// layer-2 domain and their gateway actually have configured. The live half
+// matters because a student may address a host by hand, and a rule aimed at
+// that address is a real way across.
+func labDestinations(ctx context.Context, env *Env, hosts map[int][]*model.Device,
+	gateway *model.Device) []netip.Prefix {
+
+	var out []netip.Prefix
+	add := func(s string) {
+		if s = strings.TrimSpace(s); s == "" {
+			return
+		}
+		if p, err := netip.ParsePrefix(s); err == nil {
+			out = append(out, p.Masked())
+			return
+		}
+		if a, err := netip.ParseAddr(s); err == nil {
+			out = append(out, netip.PrefixFrom(a, a.BitLen()))
+		}
+	}
+	for _, as := range env.Topology.ASes {
+		for _, d := range as.Devices {
+			for _, i := range d.Ifaces {
+				add(i.Addr4)
+				add(i.Addr6)
+			}
+		}
+	}
+	var live []*model.Device
+	for _, hs := range hosts {
+		live = append(live, hs...)
+	}
+	if gateway != nil {
+		live = append(live, gateway)
+	}
+	for _, d := range live {
+		r, err := env.Probe(ctx, d.ID, []string{"ip", "-o", "addr", "show"})
+		if err != nil || r.ExitCode != 0 {
+			continue
+		}
+		for _, l := range strings.Split(r.Stdout, "\n") {
+			f := strings.Fields(l)
+			for i := 0; i+1 < len(f); i++ {
+				if f[i] == "inet" || f[i] == "inet6" {
+					add(f[i+1])
+				}
+			}
+		}
+	}
+	return out
+}
+
+// flowDeliversNothing reports why a flow rule cannot carry a frame between two
+// of this lab's hosts, or "" if it can.
+//
+// A rule restricted to a destination address that nothing in the lab has --
+// left behind by a student testing whether traffic moves between two ports --
+// never carries a frame, and failing the domain for it deducts for a crossing
+// that does not exist. The counter is not what decides this: a rule that has
+// matched nothing yet may match everything a minute later, so excusing rules
+// whose n_packets is zero would pass a submission with its VLANs wide open.
+// What decides it is whether any frame the lab can produce satisfies the match.
+func flowDeliversNothing(match string, inv []netip.Prefix) string {
+	var (
+		field, val string
+		got        bool
+	)
+	for _, tok := range strings.Split(strings.ReplaceAll(match, " ", ","), ",") {
+		k, v, ok := strings.Cut(strings.TrimSpace(tok), "=")
+		if !ok {
+			continue
+		}
+		switch k {
+		case "nw_dst", "ip_dst", "ipv4_dst", "ipv6_dst", "arp_tpa", "nd_target":
+			// The narrowest constraint wins: several are a conjunction, and a
+			// frame has to satisfy every one of them.
+			field, val, got = k, v, true
+		}
+	}
+	if !got {
+		return ""
+	}
+	p, err := parseFlowPrefix(val)
+	if err != nil {
+		return "" // not understood, so not ruled out
+	}
+	// Multicast and broadcast are addressed to nobody in particular, so no
+	// inventory can rule them out.
+	if p.Addr().Is4() {
+		mc := netip.MustParsePrefix("224.0.0.0/4")
+		bc := netip.MustParsePrefix("255.255.255.255/32")
+		if prefixesOverlap(p, mc) || prefixesOverlap(p, bc) {
+			return ""
+		}
+	} else if prefixesOverlap(p, netip.MustParsePrefix("ff00::/8")) {
+		return ""
+	}
+	for _, q := range inv {
+		if prefixesOverlap(p, q) {
+			return ""
+		}
+	}
+	return fmt.Sprintf("only to %s=%s, which nothing in this lab has", field, val)
+}
+
+// parseFlowPrefix reads an address as a flow match writes it: bare, with a
+// prefix length, or with a dotted mask.
+func parseFlowPrefix(v string) (netip.Prefix, error) {
+	if a, m, ok := strings.Cut(v, "/"); ok {
+		if !strings.Contains(m, ".") && !strings.Contains(m, ":") {
+			p, err := netip.ParsePrefix(v)
+			if err != nil {
+				return netip.Prefix{}, err
+			}
+			return p.Masked(), nil
+		}
+		mask, err := netip.ParseAddr(m)
+		if err != nil {
+			return netip.Prefix{}, err
+		}
+		ones := 0
+		for _, b := range mask.AsSlice() {
+			ones += bits.OnesCount8(b)
+		}
+		addr, err := netip.ParseAddr(a)
+		if err != nil {
+			return netip.Prefix{}, err
+		}
+		return netip.PrefixFrom(addr, ones).Masked(), nil
+	}
+	a, err := netip.ParseAddr(v)
+	if err != nil {
+		return netip.Prefix{}, err
+	}
+	return netip.PrefixFrom(a, a.BitLen()), nil
+}
+
+func prefixesOverlap(a, b netip.Prefix) bool {
+	return a.Overlaps(b)
+}
+
+// bridgeOnlyForwards reports whether every action on a bridge merely chooses
+// where a frame goes. A bridge that rewrites addresses, resubmits, or learns
+// can manufacture a frame addressed to anything, so on such a bridge no rule
+// can be ruled out by what the lab addresses.
+func bridgeOnlyForwards(lines []string) bool {
+	inert := map[string]bool{
+		"output": true, "normal": true, "drop": true, "flood": true, "all": true,
+		"local": true, "in_port": true, "controller": true, "strip_vlan": true,
+		"mod_vlan_vid": true, "mod_vlan_pcp": true, "push_vlan": true, "pop_vlan": true,
+	}
+	for _, line := range lines {
+		at := strings.Index(line, "actions=")
+		if at < 0 {
+			continue
+		}
+		for _, a := range ovsSplitActions(line[at+8:]) {
+			a = strings.TrimSpace(a)
+			if a == "" {
+				continue
+			}
+			head, _, _ := strings.Cut(a, ":")
+			head, _, _ = strings.Cut(head, "(")
+			head = strings.ToLower(strings.TrimSpace(head))
+			if _, err := strconv.Atoi(head); err == nil {
+				continue // a bare port number
+			}
+			if !inert[head] {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // crossVLANForwarding names any rule a switch of this domain has been given
 // that forwards a frame from a port in one VLAN out of a port in another.
 //
 // A broadcast probe finds a shared broadcast domain; it does not find a rule
 // aimed at one flow. This reads what the switch has actually been told to do,
 // which covers every protocol at once and needs no packet.
-func crossVLANForwarding(ctx context.Context, env *Env, domain string) []string {
+func crossVLANForwarding(ctx context.Context, env *Env, domain string,
+	inv []netip.Prefix) (leaks, notes []string) {
+
 	as, ok := env.Topology.ASes[env.AS]
 	if !ok {
-		return nil
+		return nil, nil
 	}
 	var out []string
 	for _, d := range as.Devices {
@@ -1455,7 +1634,21 @@ func crossVLANForwarding(ctx context.Context, env *Env, domain string) []string 
 					}
 				}
 			}
+			inertBridge := bridgeOnlyForwards(lines)
 			for _, line := range lines {
+				at := strings.Index(line, "actions=")
+				// A rule no frame of this lab can satisfy carries nothing
+				// across, whatever ports it names. Only on a bridge that
+				// merely chooses where frames go: one that rewrites or
+				// resubmits can manufacture a frame addressed to anything.
+				if inertBridge {
+					if why := flowDeliversNothing(line[:at], inv); why != "" {
+						notes = append(notes, fmt.Sprintf(
+							"%s has a rule that forwards %s, so it carries nothing between "+
+								"VLANs; it is not counted against you, but remove it", d.Name, why))
+						continue
+					}
+				}
 				in, outs := ovsFlowPorts(line, byNum, groups)
 				for _, o := range outs {
 					iv, ok1 := vlanOfPort[in]
@@ -1482,7 +1675,6 @@ func crossVLANForwarding(ctx context.Context, env *Env, domain string) []string 
 				// still carry a frame into another VLAN, by retagging it or
 				// by changing which port it counts as having arrived on and
 				// then letting the switch forward it by VLAN.
-				at := strings.Index(line, "actions=")
 				for _, u := range ovsUnreadableActions(line[at+8:], byNum, vlanOfPort) {
 					out = append(out, d.Name+" "+u)
 				}
@@ -1514,7 +1706,8 @@ func crossVLANForwarding(ctx context.Context, env *Env, domain string) []string 
 		out = append(out, g.crossings(d.Name)...)
 	}
 	sort.Strings(out)
-	return out
+	sort.Strings(notes)
+	return out, notes
 }
 
 // ovsGraph is where a frame can get to inside one switch: the ports, and every
@@ -2471,7 +2664,8 @@ func checkVLANIsolation(ctx context.Context, env *Env) Result {
 	// where it belonged, and the question kept its mark. A switch that has
 	// been told to send a frame from a port in one VLAN out of a port in
 	// another is not keeping them apart, whatever the frame is.
-	rules := crossVLANForwarding(ctx, env, domain)
+	rules, notes := crossVLANForwarding(ctx, env, domain,
+		labDestinations(ctx, env, hosts, gateway))
 	probed, tested := crossVLANFrames(ctx, env, vlans, hosts, sem)
 	leaks := append(rules, probed...)
 	for i := 0; i < tested-len(probed); i++ {
@@ -2508,11 +2702,12 @@ func checkVLANIsolation(ctx context.Context, env *Env) Result {
 	}
 	sort.Strings(problems)
 	var detail strings.Builder
-	detail.WriteString(strings.Join(truncate(problems, 8), "\n"))
+	detail.WriteString(strings.Join(truncate(append(problems, notes...), 8), "\n"))
 
 	if total > 0 && passed == total {
 		return Pass("l2.vlan_isolation", Evidence{
-			Observed: fmt.Sprintf("%d VLANs isolated correctly, routed via %s", len(vlans), gateway.Name)})
+			Observed: fmt.Sprintf("%d VLANs isolated correctly, routed via %s", len(vlans), gateway.Name),
+			Detail:   strings.Join(truncate(notes, 8), "\n")})
 	}
 	return Partial("l2.vlan_isolation", ratio(passed, total), Evidence{
 		Expected: "same VLAN adjacent, different VLANs via the gateway",
