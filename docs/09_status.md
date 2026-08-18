@@ -1045,6 +1045,26 @@ reached students, and each motivated a permanent test.
     forbids. `neighbourHoldsOurs` requires the path to begin with our number,
     which is what a route received from us looks like. Padding with somebody
     else's number is still deducted, now for the reason that is true.
+98. **Silence from a peer with nothing to say, read as a dead session.** Both
+    `bgp.ibgp_full_mesh` and `bgp.ebgp_established` prove a session is alive by
+    asking the far end to re-send its table and watching the UPDATE counter --
+    the right test, since an Established session whose packets are discarded
+    stays Established until the hold timer expires. But a peer that has nothing
+    to advertise answers a route refresh with nothing at all, and the checks
+    read that as "the session is held open by a timer that has not expired yet,
+    and carries nothing". A router that originates no prefix of its own has
+    nothing to send over iBGP -- split horizon stops it passing on what it
+    learnt from another iBGP peer -- and announcing the AS prefix from a subset
+    of the routers is an ordinary design. On the live lab it cost a mark for
+    seven sessions that were Established for a quarter of an hour and receiving
+    one to five prefixes each; every other check in the rubric passed, so the
+    submission was correct in every respect and marked down anyway. Whether the
+    peer had anything to carry is not a question the receiving end can answer,
+    so it is now read from the peer's own advertised count. The dead-session
+    test is untouched where that count is non-zero, which is every case findings
+    39, 59 and 65 were about: a blackholed session's sender still believes it is
+    advertising its routes.
+
 
 
 
