@@ -2196,9 +2196,17 @@ func routesViaIXP(ctx context.Context, env *Env, router, ixpPeer string,
 func tunnelEndpointsWrong(out, name string, gw *model.Device,
 	gateways map[string]*model.Device, domains []string, self string) string {
 
-	line := lineContaining(out, name+":")
+	// The device's own line, matched on the whole name.
+	//
+	// A substring search for "tun6:" also matches "xtun6:", so a tunnel left
+	// over from an experiment and listed first supplied the endpoints of the
+	// tunnel actually being judged. And a line that cannot be found is not a
+	// tunnel whose endpoints are right: saying nothing here awarded the mark
+	// for output nobody could read.
+	line := tunnelLine(out, name)
 	if line == "" {
-		return ""
+		return fmt.Sprintf("its tunnel %s is not described by `ip -d tunnel show`, so its "+
+			"endpoints could not be read", name)
 	}
 	local := fieldAfter(line, "local")
 	remote := fieldAfter(line, "remote")
@@ -2232,11 +2240,14 @@ func tunnelEndpointsWrong(out, name string, gw *model.Device,
 	return ""
 }
 
-// lineContaining returns the first line of output that mentions a string.
-func lineContaining(out, want string) string {
+// tunnelLine returns the line of `ip -d tunnel show` that describes one
+// device, matched on the whole name rather than on a substring of it.
+func tunnelLine(out, name string) string {
 	for _, l := range strings.Split(out, "\n") {
-		if strings.Contains(l, want) {
-			return strings.TrimSpace(l)
+		l = strings.TrimSpace(l)
+		f := strings.Fields(l)
+		if len(f) > 0 && f[0] == name+":" {
+			return l
 		}
 	}
 	return ""

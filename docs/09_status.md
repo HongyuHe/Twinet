@@ -903,6 +903,16 @@ reached students, and each motivated a permanent test.
     line now says `graded 0 of 1` and states plainly that there is no
     distribution; when only some are held it says `graded 88 of 100` and names
     how many are waiting.
+87. **The same forgotten experiment, one layer down.** Found while fixing 85.
+    Having picked which tunnel to judge, the check found that tunnel's line in
+    `ip -d tunnel show` with a substring search for `tun6:` -- which also
+    matches `xtun6:`. A leftover tunnel whose name merely ends in the real
+    one's, listed first, therefore supplied the endpoints of the tunnel being
+    judged, and the fix for 85 did not help because the wrong line was read for
+    the right name. The line is now matched on the whole device name. In the
+    same function, a name that matched no line at all returned "nothing wrong
+    with these endpoints", which awarded the mark for output nobody could read;
+    it now says so.
 
 ## Environment findings
 

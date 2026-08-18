@@ -1,6 +1,9 @@
 package grade
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // A route-map that is written but never attached to a neighbour changes
 // nothing the network can observe. Awarding a mark for it credits a student
@@ -149,5 +152,28 @@ func TestOnlyA6in4TunnelCounts(t *testing.T) {
 		"tun6: ipv6/ip remote 3.153.0.1 local 3.156.0.1 ttl 64 6rd-prefix 2002::/16\n"
 	if got := configuredTunnels(sit); len(got) != 1 || got[0] != "tun6" {
 		t.Errorf("a correct 6in4 tunnel was not recognised (got %q)", got)
+	}
+}
+
+// A tunnel's line is found by its whole name. A substring search for "tun6:"
+// also matches "xtun6:", so an experiment left behind and listed first
+// supplied the endpoints of the tunnel actually being judged.
+func TestATunnelIsJudgedOnItsOwnLine(t *testing.T) {
+	const out = "sit0: ipv6/ip remote any local any ttl 64\n" +
+		"xtun6: ipv6/ip remote 3.0.10.2 local 3.0.10.1 ttl 64\n" +
+		"tun6: ipv6/ip remote 3.156.0.1 local 3.153.0.1 ttl 64\n"
+	got := tunnelLine(out, "tun6")
+	if !strings.HasPrefix(got, "tun6:") {
+		t.Fatalf("the wrong tunnel's line was returned: %q", got)
+	}
+	if strings.Contains(got, "3.0.10.1") {
+		t.Fatalf("the leftover tunnel's endpoints were read as tun6's: %q", got)
+	}
+}
+
+// And a name that describes no line is not a tunnel whose endpoints are right.
+func TestATunnelWithNoLineIsNotAccepted(t *testing.T) {
+	if got := tunnelLine("sit0: ipv6/ip remote any local any\n", "tun6"); got != "" {
+		t.Fatalf("a line was invented for a tunnel that is not there: %q", got)
 	}
 }
