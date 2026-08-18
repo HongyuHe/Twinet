@@ -99,6 +99,16 @@ func checkAddressing(ctx context.Context, env *Env) Result {
 		if err != nil {
 			return Errored("l3.addressing_matches_plan", err)
 		}
+		// A table that could not be read is not a router with no addresses.
+		// Probe reports a non-zero exit in the result, not as an error, so a
+		// failed `ip addr show` arrived here as empty output: every planned
+		// address was then reported missing -- a correct submission failed for
+		// addresses it does have -- and every counterfeit one was invisible.
+		if out.ExitCode != 0 {
+			return Errored("l3.addressing_matches_plan", fmt.Errorf(
+				"the addresses of %s could not be read (ip exited %d: %s), so whether they "+
+					"match the plan could not be established", r.Name, out.ExitCode, firstLine(out.Stderr)))
+		}
 		have := parseIPAddrOutput(out.Stdout)
 		known := map[string]bool{}
 		for _, i := range r.Ifaces {
@@ -2592,7 +2602,8 @@ func checkVLANIsolation(ctx context.Context, env *Env) Result {
 					hops, err := adjacentHopsRetrying(ctx, env, src, dst)
 					switch {
 					case err != nil:
-						record(false, "VLAN %d: %s cannot reach %s (%v)", v, src.Name, dst.Name, err)
+						record(false, "VLAN %d: the distance from %s to %s could not be "+
+							"measured (%v)", v, src.Name, dst.Name, err)
 					case hops == 1:
 						record(true, "")
 					default:
@@ -2621,8 +2632,8 @@ func checkVLANIsolation(ctx context.Context, env *Env) Result {
 						hops, first, err := traceFirstHopRetrying(ctx, env, src, dst)
 						switch {
 						case err != nil:
-							record(false, "%s cannot reach %s across VLANs (%v)",
-								src.Name, dst.Name, err)
+							record(false, "the path from %s to %s across VLANs could not be "+
+								"measured (%v)", src.Name, dst.Name, err)
 						case hops < 2:
 							record(false, "%s %s; different VLANs must be separated at layer 2",
 								src.Name, describeReach(dst.Name, hops))
@@ -3175,6 +3186,14 @@ func traceHops(ctx context.Context, env *Env, src, dst *model.Device) (int, erro
 	if err != nil {
 		return 0, err
 	}
+	// A traceroute that did not run is not a destination that did not answer.
+	// Being unable to reach the far side exits zero and prints "!N" or "*",
+	// so a non-zero exit means the measurement was never made -- and reading
+	// it as zero hops reported a host as unreachable on no evidence at all.
+	if res.ExitCode != 0 {
+		return 0, fmt.Errorf("traceroute on %s exited %d: %s",
+			src.Name, res.ExitCode, firstLine(res.Stderr))
+	}
 	return countTracerouteHops(res.Stdout, addr), nil
 }
 
@@ -3188,6 +3207,10 @@ func traceFirstHop(ctx context.Context, env *Env, src, dst *model.Device) (int, 
 	res, err := env.Probe(ctx, src.ID, []string{"traceroute", "-n", "-q", "2", "-w", "2", "-m", "8", addr})
 	if err != nil {
 		return 0, "", err
+	}
+	if res.ExitCode != 0 {
+		return 0, "", fmt.Errorf("traceroute on %s exited %d: %s",
+			src.Name, res.ExitCode, firstLine(res.Stderr))
 	}
 	return countTracerouteHops(res.Stdout, addr), firstTracerouteHop(res.Stdout), nil
 }

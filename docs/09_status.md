@@ -992,6 +992,44 @@ reached students, and each motivated a permanent test.
     could not be read was reported as a tunnel that carried nothing, in both
     the forward and the return direction.
 
+94. **Traffic engineering over a link the check could not name.** (Round 104.)
+    The forwarding half of `policy.traffic_engineering` exists to notice the one
+    thing the BGP half cannot: `ip route 2.0.0.0/8 <the slow link>`, which
+    overrides every local preference the rest of the question reads. It compared
+    the routing table's next-hop *address* against the slow neighbours' -- but a
+    static route may name an interface instead, and then the table carries no
+    address at all. `ip route 2.0.0.0/8 ext_1_ALL` on `as3/MSP` sent the fast
+    provider's own prefix out the 25 ms link, and the check reported "slow
+    neighbours: AS1 via MSP (25ms)" and awarded 1.00/1.00 for forwarding that
+    was going exactly where the question forbids. The offered fix -- deduct for
+    any non-BGP protocol -- was rejected: a static route pointed at the *fast*
+    neighbour would then be reported as "installed over the slow provider",
+    which is not true, and this grader's recurring defect is precisely claims
+    that outrun their evidence. Instead the link is now recognised by the local
+    interface it leaves by as well as by the neighbour's address. Because FRR
+    reports the *resolved* next hop's interface, a static route pointed at some
+    far address that recurses over the slow link is caught by the same test.
+
+95. **A routing table that could not be read, read as a router with no
+    addresses.** `l3.addressing_matches_plan` runs `ip -o -4 addr show` on every
+    router. `Probe` reports a non-zero exit in its result, not as an error, so a
+    failed listing arrived as empty output -- and empty output means every
+    planned address is missing and no counterfeit address exists. Both verdicts
+    at once, from nothing: a correct submission would be failed for addresses it
+    does have, and one impersonating another AS's subnet would pass. The exit
+    status is now read, and an unreadable table is an infrastructure error.
+
+96. **A traceroute that never ran, read as a host that never answered.** Being
+    unable to reach the far side exits *zero* -- traceroute prints `!N` or `*`
+    and returns success -- so a non-zero exit means the measurement was never
+    made. `traceHops` and `traceFirstHop` ignored it and returned zero hops,
+    which `l2.vlan_isolation` reported as "X cannot reach Y". Same shape in two
+    more places: `ip -d tunnel show` failing was reported as "has no configured
+    6in4 tunnel", and a `nc` that failed to send was reported as a datagram that
+    did not arrive, accusing the VPN of filtering by protocol. All four now
+    distinguish a failed measurement from a measurement that failed.
+
+
 ## Environment findings
 
 - **Jumbo frames are unavailable.** Raising `eno2` to MTU 9000 dropped the

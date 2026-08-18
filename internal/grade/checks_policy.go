@@ -189,6 +189,14 @@ func checkSixIn4(ctx context.Context, env *Env) Result {
 		if err != nil {
 			return Errored("tunnel.sixin4", err)
 		}
+		// A listing that could not be produced is not a gateway with no
+		// tunnels: empty output would otherwise be reported as the student
+		// having configured none.
+		if out.ExitCode != 0 {
+			return Errored("tunnel.sixin4", fmt.Errorf(
+				"the tunnels on %s could not be listed (exit %d: %s)",
+				gw.Name, out.ExitCode, firstLine(out.Stderr)))
+		}
 		names := configuredTunnels(out.Stdout)
 		if len(names) == 0 {
 			missing = append(missing, fmt.Sprintf("%s has no configured 6in4 tunnel "+
@@ -914,11 +922,16 @@ func checkTrafficEngineering(ctx context.Context, env *Env) Result {
 	// The model knows which links are slow: the delay is in the topology.
 	type nb struct {
 		router string
-		addr   string
-		asn    int
-		rel    model.Relationship
-		delay  string
-		slow   bool
+		// iface is the local interface the link leaves by. A static route can
+		// name an interface instead of an address, and then the routing table
+		// carries no next-hop address at all -- so the address alone cannot
+		// say which link a destination leaves by.
+		iface string
+		addr  string
+		asn   int
+		rel   model.Relationship
+		delay string
+		slow  bool
 	}
 	var neighbours []nb
 	var maxDelay float64
@@ -936,7 +949,7 @@ func checkTrafficEngineering(ctx context.Context, env *Env) Result {
 			if d > maxDelay {
 				maxDelay = d
 			}
-			neighbours = append(neighbours, nb{r.Name, env.PeerAddr(ctx, i), i.Peer.Device.ASN, rel, i.Link.Props.Delay, false})
+			neighbours = append(neighbours, nb{r.Name, i.Name, env.PeerAddr(ctx, i), i.Peer.Device.ASN, rel, i.Link.Props.Delay, false})
 		}
 	}
 	if len(neighbours) < 2 {
@@ -1032,12 +1045,17 @@ func checkTrafficEngineering(ctx context.Context, env *Env) Result {
 	// *selected* is.
 	for _, rel := range []model.Relationship{model.RelProvider, model.RelCustomer} {
 		var slowAddrs, fastAddrs []string
+		slowIfaces := map[string]map[string]bool{}
 		for _, n := range neighbours {
 			if n.rel != rel {
 				continue
 			}
 			if n.slow {
 				slowAddrs = append(slowAddrs, n.addr)
+				if slowIfaces[n.router] == nil {
+					slowIfaces[n.router] = map[string]bool{}
+				}
+				slowIfaces[n.router][n.iface] = true
 			} else {
 				fastAddrs = append(fastAddrs, n.addr)
 			}
@@ -1046,7 +1064,7 @@ func checkTrafficEngineering(ctx context.Context, env *Env) Result {
 			continue
 		}
 		checks++
-		viaSlow, unreadable := installedVia(ctx, env, slowAddrs, fastAddrs)
+		viaSlow, unreadable := installedVia(ctx, env, slowAddrs, slowIfaces, fastAddrs)
 		switch {
 		case unreadable != "":
 			fmt.Fprintf(&detail, "forwarding: %s\n", unreadable)
@@ -2452,15 +2470,18 @@ func sortedInts(m map[int]bool) []int {
 	return out
 }
 
-// installedVia names the destinations whose selected route leaves through one
-// of the slow addresses, when a path through a fast one is also available.
+// installedVia names the destinations whose selected route leaves by one of the
+// slow links, when a path through a fast one is also available. A link is
+// recognised by the neighbour's address or by the local interface it leaves by,
+// because a static route may name either and one that names the interface has
+// no next-hop address in the table at all.
 //
 // It reads the routing table rather than BGP, because that is where a static
 // route, a policy route or an administrative distance shows up and BGP does
 // not. Every router is asked, and a router that cannot be read stops the check:
 // concluding "nothing goes the slow way" from the routers that answered is the
 // kind of verdict this project keeps having to take back.
-func installedVia(ctx context.Context, env *Env, slow, fast []string) (via []string, unreadable string) {
+func installedVia(ctx context.Context, env *Env, slow []string, slowIf map[string]map[string]bool, fast []string) (via []string, unreadable string) {
 	isSlow := map[string]bool{}
 	for _, a := range slow {
 		isSlow[a] = true
@@ -2499,8 +2520,9 @@ func installedVia(ctx context.Context, env *Env, slow, fast []string) (via []str
 			Protocol string `json:"protocol"`
 			Selected bool   `json:"selected"`
 			Nexthops []struct {
-				IP  string `json:"ip"`
-				FIB bool   `json:"fib"`
+				IP    string `json:"ip"`
+				FIB   bool   `json:"fib"`
+				Iface string `json:"interfaceName"`
 			} `json:"nexthops"`
 		}
 		if err := env.VtyshJSON(ctx, r.Name, "show ip route json", &routes); err != nil {
@@ -2516,7 +2538,18 @@ func installedVia(ctx context.Context, env *Env, slow, fast []string) (via []str
 					continue
 				}
 				for _, nh := range e.Nexthops {
-					if !isSlow[nh.IP] {
+					// Either way of naming the slow link counts. `ip route
+					// 2.0.0.0/8 <slow neighbour>` puts the neighbour's address
+					// in "ip"; `ip route 2.0.0.0/8 <slow interface>` puts
+					// nothing there at all and only names the interface, and
+					// reading the address alone let that second form send the
+					// traffic over exactly the link the question asks it to
+					// avoid while the check reported the forwarding correct.
+					//
+					// The interface is read from the resolved next hop, so a
+					// static route pointed at some far address that recurses
+					// over the slow link is caught by the same test.
+					if !isSlow[nh.IP] && !slowIf[r.Name][nh.Iface] {
 						continue
 					}
 					via = append(via, fmt.Sprintf("%s on %s (%s)", prefix, r.Name, e.Protocol))

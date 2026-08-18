@@ -655,8 +655,14 @@ func vpnTCPGap(ctx context.Context, env *Env, d directedPair) (string, bool) {
 // whether it arrived.
 func vpnUDPGap(ctx context.Context, env *Env, d directedPair) (string, bool) {
 	before, okB := datagramsDelivered(ctx, env, d.to)
-	if _, err := env.Probe(ctx, d.from.host, []string{"sh", "-c",
-		"echo twinet | nc -u -w 2 " + d.to.addr + " " + probePort()}); err != nil {
+	// A datagram that was never sent cannot have been filtered. Reaching a
+	// closed port exits zero here and a blocked one times out and also exits
+	// zero, so a non-zero exit means the sender itself failed -- and reading
+	// that as a datagram that did not arrive accused the VPN of filtering by
+	// protocol on no evidence.
+	sent, err := env.Probe(ctx, d.from.host, []string{"sh", "-c",
+		"echo twinet | nc -u -w 2 " + d.to.addr + " " + probePort()})
+	if err != nil || sent.ExitCode != 0 {
 		return "", false
 	}
 	after, okA := datagramsDelivered(ctx, env, d.to)
