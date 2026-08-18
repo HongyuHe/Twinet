@@ -819,7 +819,7 @@ func checkVPNIsolation(ctx context.Context, env *Env) Result {
 		Expected: "customers are kept apart, over a VPN that carries their traffic",
 		Observed: fmt.Sprintf("%d directed site pair(s) across %d customer(s) mutually "+
 			"unreachable by ping, connection and datagram, and no customer's table holds "+
-			"another's prefixes", tried, len(names)),
+			"a route aimed at another's prefixes alone", tried, len(names)),
 	})
 }
 
@@ -980,10 +980,22 @@ func anyCustomerTrafficArrives(ctx context.Context, env *Env) (bool, error) {
 // which is indistinguishable from isolation to anything that pings.
 //
 // A route counts as a leak when it covers another customer's site and does not
-// cover any of this customer's own. That last clause is what keeps a default
-// route -- which covers everybody, is not customer-specific, and is present in
-// every correct submission here -- from being read as a total leak, without
-// resorting to a list of prefixes to forgive.
+// cover any of this customer's own. That last clause keeps a route that covers
+// everybody -- a default route, or an aggregate wide enough to span both
+// customers -- from being read as a total leak, without resorting to a list of
+// prefixes to forgive: such a route says nothing about where its traffic ends
+// up, and reading it as a leak would cost a correct submission its marks.
+//
+// The price of that exemption is that a route wide enough to cover this
+// customer's own sites is not examined here at all, so a leak arranged behind
+// one is invisible to this half. That is not a hole, because it is the probes
+// above that decide reachability and they do not care how the route was
+// spelled: a 16.0.0.0/4 in one table resolving into the other customer's
+// network, advertised to the customer, was measured delivering every packet it
+// was sent, and was caught -- by the connection and the datagram, the ping
+// having been dropped for want of a return path. What this function
+// establishes is therefore narrower than "the tables are separate", and the
+// evidence says so.
 func crossCustomerRoutes(ctx context.Context, env *Env, groups map[string][]sitePoint,
 	names []string) ([]string, error) {
 	holders, err := vrfHolders(env)
