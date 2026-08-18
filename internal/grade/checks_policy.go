@@ -64,7 +64,8 @@ func init() {
 // while permitting ICMP -- which is what makes a ping-only test worthless --
 // stops it moving at all.
 func tunnelCarriesTransport(ctx context.Context, env *Env, hosts map[string]*model.Device,
-	domains []string) (string, bool) {
+	domains []string) (why string, carries, observed bool) {
+
 	for i := 0; i < 2; i++ {
 		src, dst := hosts[domains[i]], hosts[domains[1-i]]
 		if src == nil || dst == nil {
@@ -75,22 +76,22 @@ func tunnelCarriesTransport(ctx context.Context, env *Env, hosts map[string]*mod
 			continue
 		}
 		before, okB := tcpAnswers(ctx, env, dst.ID)
-		res, err := env.Probe(ctx, src.ID,
+		_, _ = env.Probe(ctx, src.ID,
 			[]string{"nc", "-6", "-w", "3", "-z", addr, probePort()})
 		after, okA := tcpAnswers(ctx, env, dst.ID)
 		if !okB || !okA {
-			// The counter could not be read, so a refusal is the only
-			// evidence there is; a timeout leaves nothing to conclude from.
-			if err == nil && res.ExitCode == 0 {
-				continue
-			}
+			// The far side's own count of the resets it sent is the whole of
+			// the evidence: a reply forged on the path does not move it, and
+			// the sender cannot tell the difference. Without it this direction
+			// was passed over in silence, and the point was awarded for a
+			// tunnel across which nothing was shown to travel.
 			continue
 		}
 		if after <= before {
 			return fmt.Sprintf(
 				"IPv6 pings cross the tunnel, but a connection from %s to %s at %s never "+
 					"arrived: %s answered no TCP at all, so the tunnel carries ICMP and "+
-					"nothing else", src.Name, dst.Name, addr, dst.Name), false
+					"nothing else", src.Name, dst.Name, addr, dst.Name), false, true
 		}
 		// And a datagram, which is neither of the two things already tried.
 		//
@@ -101,14 +102,18 @@ func tunnelCarriesTransport(ctx context.Context, env *Env, hosts map[string]*mod
 		_, _ = env.Probe(ctx, src.ID, []string{"sh", "-c",
 			"echo twinet | nc -6 -u -w 2 " + addr + " " + probePort()})
 		udpAfter, okU2 := udpNoPorts(ctx, env, dst.ID)
-		if okU && okU2 && udpAfter <= udpBefore {
+		if !okU || !okU2 {
+			continue
+		}
+		if udpAfter <= udpBefore {
 			return fmt.Sprintf(
 				"IPv6 pings and connections cross the tunnel, but a datagram from %s to %s "+
 					"at %s never arrived: something on the path is filtering by protocol",
-				src.Name, dst.Name, addr), false
+				src.Name, dst.Name, addr), false, true
 		}
+		observed = true
 	}
-	return "", true
+	return "", true, observed
 }
 
 // udpNoPorts reads a host's count of datagrams delivered to it for a port
@@ -331,6 +336,13 @@ func checkSixIn4(ctx context.Context, env *Env) Result {
 				throughTunnel = true
 			} else if nativeFwd != "" {
 				reach = nativeFwd
+			} else if reachable && tunnels[domains[0]] != "" && (before < 0 || after < 0) {
+				// A counter that could not be read is not a counter that did
+				// not move. Reporting it as one deducted for native routing
+				// nobody saw.
+				reach = fmt.Sprintf("IPv6 reaches %s, but %s's packet count could not be read "+
+					"on %s, so whether the traffic was encapsulated is unknown",
+					dst.Name, tunnels[domains[0]], gw.Name)
 			} else if reachable && tunnels[domains[0]] != "" {
 				reach = fmt.Sprintf("IPv6 reaches %s, but %s carried no packets during the test, "+
 					"so the traffic is being routed natively rather than encapsulated",
@@ -371,6 +383,12 @@ func checkSixIn4(ctx context.Context, env *Env) Result {
 							throughTunnel = false
 							reach = fmt.Sprintf("%s cannot reach %s at %s over IPv6, so the "+
 								"tunnel carries traffic one way only", bs.Name, bd.Name, addr)
+						case before < 0 || after < 0:
+							throughTunnel = false
+							reach = fmt.Sprintf("IPv6 reaches %s from %s, but %s's packet "+
+								"count could not be read on %s, so whether the return path "+
+								"is encapsulated is unknown",
+								bd.Name, bs.Name, tunnels[domains[1]], back.Name)
 						case after <= before:
 							throughTunnel = false
 							reach = fmt.Sprintf("IPv6 reaches %s from %s, but %s carried no "+
@@ -393,10 +411,20 @@ func checkSixIn4(ctx context.Context, env *Env) Result {
 	// assignment means.
 	transportBlocked := ""
 	if throughTunnel && len(domains) >= 2 {
-		if why, ok := tunnelCarriesTransport(ctx, env, hosts, domains); !ok {
+		why, ok, observed := tunnelCarriesTransport(ctx, env, hosts, domains)
+		switch {
+		case !ok:
 			throughTunnel = false
 			reach = why
 			transportBlocked = why
+		case !observed:
+			// Every probe that says the tunnel carries more than pings reads a
+			// counter at the far side. If none could be read, the tunnel was
+			// never shown to carry anything but pings, and passing it said it
+			// had been.
+			return Errored("tunnel.sixin4", fmt.Errorf(
+				"no host on either side could be asked what arrived, so whether the tunnel "+
+					"carries anything but pings is unknown"))
 		}
 	}
 

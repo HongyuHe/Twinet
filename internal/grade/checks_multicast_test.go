@@ -1,11 +1,14 @@
 package grade
 
 import (
+	"context"
+	"net/netip"
 	"strings"
 	"testing"
 
 	"github.com/HongyuHe/twinet/internal/mcast"
 	"github.com/HongyuHe/twinet/internal/model"
+	rt "github.com/HongyuHe/twinet/internal/runtime"
 )
 
 // Every host has to be tested as a receiver, and as somebody who did not ask.
@@ -259,5 +262,57 @@ func TestSilenceFromAListenerIsNotAnEmptyWire(t *testing.T) {
 	}
 	if s.arrived != 0 {
 		t.Fatalf("packets were invented: %d", s.arrived)
+	}
+}
+
+// A rendezvous point may be given its groups by prefix-list rather than
+// inline. The second column of `show ip pim rp-info` then holds the list's
+// name, which is not a prefix, and every such mapping was skipped: a router
+// whose list plainly covers the group was reported as having none.
+func TestARendezvousPointGivenByPrefixListIsRead(t *testing.T) {
+	const rpInfo = "RP address  group/prefix-list  OIF  I am RP  Source\n" +
+		" 1.156.0.1   MCAST_GROUPS       lo   yes      Static\n"
+	replies := map[string]string{
+		"show ip pim rp-info": rpInfo,
+		"show ip prefix-list MCAST_GROUPS": "ZEBRA: ip prefix-list MCAST_GROUPS: 1 entries\n" +
+			"   seq 5 permit 237.0.0.0/24\n" +
+			"PIM: ip prefix-list MCAST_GROUPS: 1 entries\n" +
+			"   seq 5 permit 237.0.0.0/24\n",
+	}
+	env := &Env{
+		Topology: &model.Topology{ASes: map[int]*model.AS{1: {ASN: 1}}},
+		AS:       1,
+		Exec: func(_ context.Context, _ string, cmd []string) (rt.ExecResult, error) {
+			if len(cmd) == 3 && cmd[0] == "vtysh" {
+				if out, ok := replies[cmd[2]]; ok {
+					return rt.ExecResult{Stdout: out}, nil
+				}
+			}
+			return rt.ExecResult{ExitCode: 1, Stderr: "no such command"}, nil
+		},
+	}
+	maps := rpMappings(context.Background(), env, "CENTER", rpInfo)
+	if len(maps) != 1 {
+		t.Fatalf("a prefix-list mapping was not read: %+v", maps)
+	}
+	if maps[0].rp != "1.156.0.1" || maps[0].pfx.String() != "237.0.0.0/24" {
+		t.Fatalf("the list resolved to the wrong range: %+v", maps[0])
+	}
+	// And a wrong rendezvous point installed the same way is now visible.
+	if got := rangeSplit([]rpMapping{{"1.153.0.1", netip.MustParsePrefix("237.0.0.0/25")}},
+		"237.0.0.0/24", "1.156.0.1"); got == "" {
+		t.Fatal("a more specific mapping to another rendezvous point was not reported")
+	}
+}
+
+// A permit an earlier line denies outright lets nothing through.
+func TestADeniedRangeIsNotARendezvousPointsGroups(t *testing.T) {
+	got := applicable([]plistEntry{
+		{false, netip.MustParsePrefix("237.0.0.0/24")},
+		{true, netip.MustParsePrefix("237.0.0.0/25")},
+		{true, netip.MustParsePrefix("238.0.0.0/24")},
+	})
+	if len(got) != 1 || got[0].pfx.String() != "238.0.0.0/24" {
+		t.Fatalf("the denied range was kept: %+v", got)
 	}
 }

@@ -963,6 +963,34 @@ reached students, and each motivated a permanent test.
     A pair whose far side cannot be read is now named as untested and the
     question is held, rather than passed on the strength of the sender's own
     view of a datagram, which is no view at all.
+92. **A rendezvous point written the other way was invisible.** (Round 103.)
+    FRR takes a rendezvous point's groups either inline -- `ip pim rp <addr>
+    237.0.0.0/24` -- or by prefix-list: `ip pim rp <addr> prefix-list NAME`.
+    The second column of `show ip pim rp-info` then holds the list's *name*,
+    and the parser skipped any row whose second column had no slash in it. Both
+    directions were wrong. A student whose prefix-list plainly covers the test
+    group was told "CENTER has no rendezvous point covering 237.0.0.10", which
+    is false, and lost a sixth of the question -- while `multicast.delivery`
+    gave them full marks for the tree that mapping built. And a *wrong*
+    rendezvous point installed the same way, more specific than the declared
+    range, was invisible to the check that exists to find exactly that. Lists
+    are now resolved on the router that names them, in sequence order, with
+    permits an earlier deny covers dropped. Confirmed live in both directions:
+    the prefix-list answer now scores 4.00 where it scored 3.83, and a shadowing
+    `prefix-list` mapping to another router is now named -- and it really does
+    break delivery, which is what settles that FRR reads these mappings the way
+    the check now does.
+
+93. **Nothing to conclude from, concluded from.** The 6in4 question checks that
+    the tunnel carries more than pings by reading, at the far side, the resets
+    and datagrams it took delivery of. When neither counter could be read the
+    loop moved on -- the code said so, "the machinery failed, which is not a
+    verdict" -- and the function then returned "it carries transport" to a
+    caller that awarded the point. A non-verdict spent as a verdict. The
+    question is now held when no direction could be observed. Two smaller
+    versions of the same thing in the same file: a tunnel's packet counter that
+    could not be read was reported as a tunnel that carried nothing, in both
+    the forward and the return direction.
 
 ## Environment findings
 
