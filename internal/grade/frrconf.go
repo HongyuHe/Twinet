@@ -21,24 +21,52 @@ import (
 type frrConfig struct {
 	raw       string
 	routeMaps map[string][]string // name -> body lines across all sequences
-	// neighborMaps records, per neighbour address, the route-maps bound to it
-	// in each direction.
-	neighborMaps map[string]map[string]string // addr -> direction -> map name
+	// neighborMaps records, per neighbour and address family, the route-maps
+	// bound in each direction.
+	//
+	// The address family is part of the key because a binding governs only the
+	// family it was written in. Flattening them let the last one parsed stand
+	// for all of them, and FRR prints IPv6 after IPv4: a policy bound inbound
+	// under `address-family ipv6 unicast` was read as the policy on the IPv4
+	// session, which is a route-map the router never runs on the routes being
+	// asked about.
+	neighborMaps map[nbrKey]map[string]string // (addr, af) -> direction -> map name
 	// neighborAttrs records other per-neighbour settings, e.g. "route-reflector-client".
 	neighborAttrs map[string][]string
+	// peerGroups names the peer-groups the configuration declares. A group is
+	// a template, not a session: nothing peers with it, so it must never be
+	// graded as though something did.
+	peerGroups map[string]bool
+	// groupOf maps a neighbour to the peer-group it belongs to, which is where
+	// its settings come from when it does not state them itself.
+	groupOf map[string]string
 	// localAS is the AS number the BGP process runs as, which is what tells an
 	// internal session from an external one.
 	localAS int
 }
 
+// nbrKey identifies a neighbour's settings within one address family.
+type nbrKey struct {
+	addr string
+	af   string
+}
+
+// ipv4Unicast is the family a `neighbor` line belongs to when it appears
+// outside any `address-family` block, which is where FRR prints the IPv4
+// unicast bindings by default.
+const ipv4Unicast = "ipv4 unicast"
+
 func parseFRR(cfg string) *frrConfig {
 	f := &frrConfig{
 		raw:           cfg,
 		routeMaps:     map[string][]string{},
-		neighborMaps:  map[string]map[string]string{},
+		neighborMaps:  map[nbrKey]map[string]string{},
 		neighborAttrs: map[string][]string{},
+		peerGroups:    map[string]bool{},
+		groupOf:       map[string]string{},
 	}
 	var currentMap string
+	af := ipv4Unicast
 	for _, line := range strings.Split(cfg, "\n") {
 		t := strings.TrimSpace(line)
 		fields := strings.Fields(t)
@@ -46,6 +74,15 @@ func parseFRR(cfg string) *frrConfig {
 			if n, err := strconv.Atoi(fields[2]); err == nil {
 				f.localAS = n
 			}
+			af = ipv4Unicast
+		}
+		if len(fields) >= 2 && fields[0] == "address-family" {
+			af = strings.Join(fields[1:], " ")
+			continue
+		}
+		if t == "exit-address-family" {
+			af = ipv4Unicast
+			continue
 		}
 		switch {
 		case len(fields) >= 3 && fields[0] == "route-map":
@@ -64,15 +101,28 @@ func parseFRR(cfg string) *frrConfig {
 			continue
 		case len(fields) >= 2 && fields[0] == "neighbor":
 			addr := fields[1]
+			// "neighbor NAME peer-group" declares a template; "neighbor ADDR
+			// peer-group NAME" makes a session use one.
+			if len(fields) == 3 && fields[2] == "peer-group" {
+				f.peerGroups[addr] = true
+			}
+			if len(fields) == 4 && fields[2] == "peer-group" {
+				f.groupOf[addr] = fields[3]
+				// A configuration may name a group before declaring it, and a
+				// name used as a group is a group whether or not the
+				// declaration was seen.
+				f.peerGroups[fields[3]] = true
+			}
 			// "neighbor X route-map NAME in|out"
 			if len(fields) >= 5 && fields[2] == "route-map" {
 				dir := fields[4]
-				if f.neighborMaps[addr] == nil {
-					f.neighborMaps[addr] = map[string]string{}
+				k := nbrKey{addr: addr, af: af}
+				if f.neighborMaps[k] == nil {
+					f.neighborMaps[k] = map[string]string{}
 				}
 				// FRR keeps only the last binding per direction, so a later
 				// line replaces an earlier one exactly as the router does.
-				f.neighborMaps[addr][dir] = fields[3]
+				f.neighborMaps[k][dir] = fields[3]
 			}
 			f.neighborAttrs[addr] = append(f.neighborAttrs[addr], strings.Join(fields[2:], " "))
 			currentMap = ""
@@ -85,10 +135,31 @@ func parseFRR(cfg string) *frrConfig {
 	return f
 }
 
-// mapFor returns the route-map bound to a neighbour in one direction.
+// mapFor returns the route-map bound to a neighbour in one direction, in the
+// IPv4 unicast family.
 func (f *frrConfig) mapFor(addr, dir string) string {
-	if m, ok := f.neighborMaps[addr]; ok {
+	return f.mapForAF(addr, ipv4Unicast, dir)
+}
+
+// mapForAF returns the route-map that governs a session in one direction of one
+// address family, resolving peer-group inheritance the way the router does.
+//
+// A neighbour that states nothing takes its group's binding, and a neighbour
+// that states its own overrides the group's. Reading only the lines written
+// against the address got this wrong in both directions at once. A student who
+// wrote a correct policy once on a peer-group and pointed every session at it
+// -- which is how this is done in practice -- was marked as having no policy at
+// all. And a student who put a correct-looking policy on the group and then
+// overrode it on the session with one that filters nothing was marked as having
+// the group's: the grader read a route-map the router does not run.
+func (f *frrConfig) mapForAF(addr, af, dir string) string {
+	if m, ok := f.neighborMaps[nbrKey{addr: addr, af: af}]; ok && m[dir] != "" {
 		return m[dir]
+	}
+	if g := f.groupOf[addr]; g != "" {
+		if m, ok := f.neighborMaps[nbrKey{addr: g, af: af}]; ok {
+			return m[dir]
+		}
 	}
 	return ""
 }
@@ -118,9 +189,61 @@ func (f *frrConfig) appliedBody(addr, dir string) string {
 }
 
 // hasNeighbor reports whether the configuration mentions a neighbour at all.
+//
+// A peer-group is not a neighbour. Nothing peers with a template, so counting
+// one as a session would let a group named after the address the check is
+// looking for stand in for a session that was never configured.
 func (f *frrConfig) hasNeighbor(addr string) bool {
+	if f.peerGroups[addr] {
+		return false
+	}
 	_, ok := f.neighborAttrs[addr]
 	return ok
+}
+
+// effectiveAttrs merges a neighbour's own settings with those it inherits from
+// its peer-group.
+//
+// FRR inherits per setting and a setting written on the member replaces the
+// group's, so the merge is keyed on the setting name. Without it a session that
+// takes its `remote-as` from its group looked like a session with no remote AS
+// at all, and was left out of the set of external sessions that must be
+// guarded -- while the group, which is not a session, was put into it.
+func (f *frrConfig) effectiveAttrs(addr string) string {
+	own := f.neighborAttrs[addr]
+	g := f.groupOf[addr]
+	if g == "" {
+		return strings.Join(own, "\n")
+	}
+	defined := map[string]bool{}
+	for _, a := range own {
+		if k := settingKey(a); k != "" {
+			defined[k] = true
+		}
+	}
+	merged := append([]string{}, own...)
+	for _, a := range f.neighborAttrs[g] {
+		if k := settingKey(a); k == "" || defined[k] {
+			continue
+		}
+		merged = append(merged, a)
+	}
+	return strings.Join(merged, "\n")
+}
+
+// settingKey names the setting a neighbour line configures, so that a member's
+// line can be told to override the same setting on its group and no other.
+func settingKey(attr string) string {
+	f := strings.Fields(attr)
+	if len(f) == 0 {
+		return ""
+	}
+	// A route-map binding overrides only the direction it names: a member that
+	// sets its own inbound policy still inherits the group's outbound one.
+	if f[0] == "route-map" && len(f) >= 3 {
+		return "route-map " + f[2]
+	}
+	return f[0]
 }
 
 // ipOnly drops the prefix length from an address written as "3.101.0.1/24".
@@ -230,8 +353,15 @@ func (c *frrConfig) asPathListLen(name string) int {
 // internal session, does not run on anything that could be invalid.
 func (f *frrConfig) externalNeighbours() []string {
 	var out []string
-	for addr, attrs := range f.neighborAttrs {
-		body := strings.Join(attrs, "\n")
+	for addr := range f.neighborAttrs {
+		// A peer-group is a template, not a session. It was being graded as
+		// one: a group carrying `remote-as` appeared here in place of its
+		// members, so the check read the group's policy and never looked at
+		// the sessions, which are free to override it.
+		if f.peerGroups[addr] {
+			continue
+		}
+		body := f.effectiveAttrs(addr)
 		if !strings.Contains(body, "remote-as") {
 			continue
 		}

@@ -110,6 +110,33 @@ func TestABrokenMulticastTreeLosesTheRightMarks(t *testing.T) {
 			},
 		},
 		{
+			// Half the range sent somewhere else.
+			//
+			// PIM takes the most specific mapping for each group separately, so
+			// a mapping covering the half of the declared range that the tested
+			// address is not in leaves the test alone and takes the rest.
+			name:     "half the declared group range rooted elsewhere",
+			question: "q2",
+			apply: func(t *testing.T) {
+				group := testGroup(t, dir, as)
+				// The half the tested address is not in.
+				half := group[:strings.LastIndexByte(group, '.')] + ".128/25"
+				for _, dev := range routersOf(t, dir, as) {
+					vtysh(t, dir, dev, "configure terminal",
+						"ip pim rp 10.255.255.1 "+half, "end")
+				}
+				time.Sleep(15 * time.Second)
+			},
+			undo: func(t *testing.T) {
+				group := testGroup(t, dir, as)
+				half := group[:strings.LastIndexByte(group, '.')] + ".128/25"
+				for _, dev := range routersOf(t, dir, as) {
+					vtysh(t, dir, dev, "configure terminal",
+						"no ip pim rp 10.255.255.1 "+half, "end")
+				}
+			},
+		},
+		{
 			// PIM off one link of the core.
 			//
 			// The interface stays up and unicast keeps working over it, so
@@ -165,6 +192,57 @@ func TestABrokenMulticastTreeLosesTheRightMarks(t *testing.T) {
 					" no ip igmp",
 					"end")
 				time.Sleep(25 * time.Second)
+			},
+		},
+		{
+			// The receivers answering the question by talking to themselves.
+			//
+			// Delivery was measured as "something arrived on the group", and a
+			// host that sends to a group on its own segment receives its own
+			// packets. Blocking the graded traffic outright on every router and
+			// leaving a sender running on every host therefore satisfied the
+			// question for every host at once, with nothing delivered anywhere.
+			name:     "every host sending to the group on its own segment",
+			question: "q3",
+			undo: func(t *testing.T) {
+				group := testGroup(t, dir, as)
+				for _, dev := range routersOf(t, dir, as) {
+					_, _ = twinet(t, "exec", "-m", dir, dev, "--", "sh", "-c",
+						"iptables -D FORWARD -d "+group+" -p udp -j DROP; "+
+							"iptables -D INPUT -d "+group+" -p udp -j DROP; echo ok")
+				}
+				for _, h := range hostsOfAS(t, dir, as) {
+					_, _ = twinet(t, "exec", "-m", dir, h, "--", "sh", "-c",
+						"for p in $(ps -ef | awk '/[t]winet-mcast/ {print $1}'); do "+
+							"kill $p 2>/dev/null || true; done; echo ok")
+				}
+			},
+			apply: func(t *testing.T) {
+				group := testGroup(t, dir, as)
+				for _, dev := range routersOf(t, dir, as) {
+					if _, err := twinet(t, "exec", "-m", dir, dev, "--", "sh", "-c",
+						"iptables -I FORWARD 1 -d "+group+" -p udp -j DROP; "+
+							"iptables -I INPUT 1 -d "+group+" -p udp -j DROP; echo ok"); err != nil {
+						t.Fatalf("blocking %s on %s: %v", group, dev, err)
+					}
+				}
+				hosts := hostsOfAS(t, dir, as)
+				if len(hosts) < 2 {
+					t.Skip("this lab has too few hosts for the decoy to prove anything")
+				}
+				for _, h := range hosts {
+					// Time to live one, so the decoys never leave the segment
+					// and cannot be mistaken for traffic that crossed anything.
+					if _, err := twinet(t, "exec", "-m", dir, h, "--", "sh", "-c",
+						"i=$(ip -o -4 addr show | awk '$2!=\"lo\"{print $2; exit}'); "+
+							"nohup sh -c \"while true; do twinet-mcast -send -group "+group+
+							" -iface $i -count 200 -ttl 1; done\" >/dev/null 2>&1 & echo ok"); err != nil {
+						t.Fatalf("starting the decoy sender on %s: %v", h, err)
+					}
+				}
+				t.Logf("blocked %s in the network and left a sender running on each of %d host(s)",
+					group, len(hosts))
+				time.Sleep(5 * time.Second)
 			},
 		},
 	}
@@ -283,4 +361,103 @@ func igmpIface(t *testing.T, dir string, as int) (router, iface string) {
 	}
 	t.Fatalf("no router in AS %d listens for group memberships", as)
 	return "", ""
+}
+
+// A host cannot be its own delivery.
+//
+// A datagram socket reports what the kernel handed it and cannot say where it
+// came from, and a host that sends to a group on its own segment gets its own
+// packets back. That was the whole exploit: drop every genuine delivery, read
+// the tag out of the grader's own command line -- it was sitting in the
+// student's process table -- and produce the traffic the network was failing to
+// carry. Every site then reported the group arriving, and the exercise awarded
+// full marks to a network that delivered nothing.
+//
+// So the probe is asked directly, on a real kernel in a real container, whether
+// it can tell the two apart. The unit tests pin what the check does with the
+// answer; this pins that the answer is true.
+func TestTheProbeTellsItsOwnTrafficFromTheNetworksOwn(t *testing.T) {
+	dir := multicastLab(t)
+	const as = 1
+	group := testGroup(t, dir, as)
+	hosts := hostsOfAS(t, dir, as)
+	if len(hosts) < 2 {
+		t.Skip("this needs two hosts")
+	}
+	listener, sender := hosts[0], hosts[1]
+
+	iface := func(h string) string {
+		out, err := twinet(t, "exec", "-m", dir, h, "--", "sh", "-c",
+			`ip -o -4 addr show | awk '$2!="lo"{print $2; exit}'`)
+		if err != nil {
+			t.Fatalf("finding %s's interface: %v", h, err)
+		}
+		return strings.TrimSpace(lastLine(out))
+	}
+	addr := func(h string) string {
+		out, err := twinet(t, "exec", "-m", dir, h, "--", "sh", "-c",
+			`ip -o -4 addr show | awk '$2!="lo"{split($4,a,"/"); print a[1]; exit}'`)
+		if err != nil {
+			t.Fatalf("finding %s's address: %v", h, err)
+		}
+		return strings.TrimSpace(lastLine(out))
+	}
+
+	watch := func(from string) string {
+		out := make(chan string, 1)
+		go func() {
+			o, _ := twinet(t, "exec", "-m", dir, listener, "--", "twinet-mcast", "-recv",
+				"-group", group, "-iface", iface(listener), "-from", from, "-seconds", "14")
+			out <- o
+		}()
+		time.Sleep(5 * time.Second)
+		return <-out
+	}
+
+	// What the host makes for itself, with this run's tag and everything else
+	// right, still has to be reported as the host's own.
+	forged := make(chan string, 1)
+	go func() { forged <- watch(addr(listener)) }()
+	time.Sleep(6 * time.Second)
+	if _, err := twinet(t, "exec", "-m", dir, listener, "--", "twinet-mcast", "-send",
+		"-group", group, "-iface", iface(listener), "-tag", "e2e", "-count", "6",
+		"-ttl", "10"); err != nil {
+		t.Fatalf("forging traffic on %s: %v", listener, err)
+	}
+	got := <-forged
+	if !strings.Contains(got, "wire=0") {
+		t.Errorf("%s counted traffic it generated itself as having arrived on the wire, "+
+			"which is how a network that delivers nothing scored full marks:\n%s",
+			listener, got)
+	}
+	if strings.Contains(got, "loopback=0") {
+		t.Errorf("%s did not notice its own traffic at all; the report has nothing to "+
+			"tell a student who did this by accident:\n%s", listener, got)
+	}
+
+	// And the network's own traffic still has to read as having arrived, or the
+	// check fails every correct submission for the grader's reason.
+	real := make(chan string, 1)
+	go func() { real <- watch(addr(sender)) }()
+	time.Sleep(6 * time.Second)
+	if _, err := twinet(t, "exec", "-m", dir, sender, "--", "twinet-mcast", "-send",
+		"-group", group, "-iface", iface(sender), "-tag", "e2e", "-count", "6",
+		"-ttl", "10"); err != nil {
+		t.Fatalf("sending from %s: %v", sender, err)
+	}
+	if got := <-real; strings.Contains(got, "wire=0") {
+		t.Errorf("%s did not see the traffic %s really sent it:\n%s", listener, sender, got)
+	}
+}
+
+// lastLine is the last non-empty line of a command's output, which is where a
+// shell one-liner's answer is once the runner has had its say.
+func lastLine(s string) string {
+	var out string
+	for _, l := range strings.Split(s, "\n") {
+		if strings.TrimSpace(l) != "" {
+			out = l
+		}
+	}
+	return out
 }

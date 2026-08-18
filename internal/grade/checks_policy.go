@@ -74,10 +74,10 @@ func tunnelCarriesTransport(ctx context.Context, env *Env, hosts map[string]*mod
 		if addr == "" {
 			continue
 		}
-		before, okB := tcpResetsSent(ctx, env, dst.ID)
+		before, okB := tcpAnswers(ctx, env, dst.ID)
 		res, err := env.Probe(ctx, src.ID,
 			[]string{"nc", "-6", "-w", "3", "-z", addr, probePort()})
-		after, okA := tcpResetsSent(ctx, env, dst.ID)
+		after, okA := tcpAnswers(ctx, env, dst.ID)
 		if !okB || !okA {
 			// The counter could not be read, so a refusal is the only
 			// evidence there is; a timeout leaves nothing to conclude from.
@@ -127,16 +127,6 @@ func udpNoPorts(ctx context.Context, env *Env, device string) (int, bool) {
 		}
 	}
 	return 0, false
-}
-
-// tcpResetsSent reads a host's count of TCP resets it has sent, which is the
-// kernel's own record of a connection attempt having reached it.
-func tcpResetsSent(ctx context.Context, env *Env, device string) (int, bool) {
-	res, err := env.Probe(ctx, device, []string{"cat", "/proc/net/snmp"})
-	if err != nil || res.ExitCode != 0 {
-		return 0, false
-	}
-	return snmpCounter(res.Stdout, "Tcp:", "OutRsts")
 }
 
 func checkSixIn4(ctx context.Context, env *Env) Result {
@@ -194,8 +184,8 @@ func checkSixIn4(ctx context.Context, env *Env) Result {
 		if err != nil {
 			return Errored("tunnel.sixin4", err)
 		}
-		name := configuredTunnel(out.Stdout)
-		if name == "" {
+		names := configuredTunnels(out.Stdout)
+		if len(names) == 0 {
 			missing = append(missing, fmt.Sprintf("%s has no configured 6in4 tunnel "+
 				"(the kernel's own sit0 does not count: it has no endpoints)", gw.Name))
 			continue
@@ -207,7 +197,26 @@ func checkSixIn4(ctx context.Context, env *Env) Result {
 		// addresses -- which breaks the moment either link does, and is not
 		// what the question asks for -- scored the same as the answer. The
 		// loopback is the point: it is reachable by any interior path.
-		if why := tunnelEndpointsWrong(out.Stdout, name, gw, gateways, domains, d); why != "" {
+		//
+		// Each tunnel is judged on its own endpoints and the first sound one
+		// is taken. Judging only the first the kernel happened to list meant a
+		// forgotten experiment left beside a correct tunnel failed the answer.
+		// Taking a sound one cannot award an unearned mark: whether the
+		// traffic goes through *that* tunnel is settled below, by what the
+		// gateway does with a packet for the far host and by the tunnel's own
+		// counters.
+		name, why := "", ""
+		for _, n := range names {
+			w := tunnelEndpointsWrong(out.Stdout, n, gw, gateways, domains, d)
+			if w == "" {
+				name = n
+				break
+			}
+			if why == "" {
+				why = w
+			}
+		}
+		if name == "" {
 			missing = append(missing, fmt.Sprintf("%s: %s", gw.Name, why))
 			continue
 		}
@@ -1749,7 +1758,14 @@ func hostsThatCannotReach(ctx context.Context, env *Env, addr string) ([]string,
 	)
 	sem := make(chan struct{}, 8)
 	for _, d := range as.Devices {
-		if d.Kind != model.KindHost || d.L2Domain != "" || siteAddr(d) == "" {
+		// The datacentre hosts as well.
+		//
+		// They were skipped because their reachability to *each other* is a
+		// layer-2 question graded elsewhere. Their reachability to the rest of
+		// the internet is not: rejecting traffic from both VLANs towards the
+		// unsigned prefix left every remaining probe succeeding and the
+		// question at full marks, with two whole sites unable to reach it.
+		if d.Kind != model.KindHost || siteAddr(d) == "" {
 			continue
 		}
 		wg.Add(1)
@@ -1957,7 +1973,15 @@ func countROAs(out string) int {
 // "ipv6/ip". A GRE tunnel between the same two addresses also carries the
 // traffic and also moves the counters, so accepting any tunnel with two
 // endpoints gave the mark for a different answer to a different question.
-func configuredTunnel(out string) string {
+//
+// Every such tunnel is returned, not the first one. A device is free to have
+// more than one, and a student debugging their answer routinely leaves an
+// experiment behind; the kernel lists them in its own order, so taking the
+// first one meant a correct tunnel could be judged by an abandoned tunnel's
+// endpoints and a right answer marked wrong. Which of them the traffic
+// actually uses is settled afterwards, by the route and the counters.
+func configuredTunnels(out string) []string {
+	var names []string
 	for _, line := range strings.Split(out, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || !strings.Contains(line, "remote ") || !strings.Contains(line, "local ") {
@@ -1974,9 +1998,9 @@ func configuredTunnel(out string) string {
 		if fieldAfter(line, "remote") == "any" || fieldAfter(line, "local") == "any" {
 			continue
 		}
-		return name
+		names = append(names, name)
 	}
-	return ""
+	return names
 }
 
 // tunnelTx reads a tunnel's transmitted packet count.
@@ -2172,9 +2196,17 @@ func routesViaIXP(ctx context.Context, env *Env, router, ixpPeer string,
 func tunnelEndpointsWrong(out, name string, gw *model.Device,
 	gateways map[string]*model.Device, domains []string, self string) string {
 
-	line := lineContaining(out, name+":")
+	// The device's own line, matched on the whole name.
+	//
+	// A substring search for "tun6:" also matches "xtun6:", so a tunnel left
+	// over from an experiment and listed first supplied the endpoints of the
+	// tunnel actually being judged. And a line that cannot be found is not a
+	// tunnel whose endpoints are right: saying nothing here awarded the mark
+	// for output nobody could read.
+	line := tunnelLine(out, name)
 	if line == "" {
-		return ""
+		return fmt.Sprintf("its tunnel %s is not described by `ip -d tunnel show`, so its "+
+			"endpoints could not be read", name)
 	}
 	local := fieldAfter(line, "local")
 	remote := fieldAfter(line, "remote")
@@ -2208,11 +2240,14 @@ func tunnelEndpointsWrong(out, name string, gw *model.Device,
 	return ""
 }
 
-// lineContaining returns the first line of output that mentions a string.
-func lineContaining(out, want string) string {
+// tunnelLine returns the line of `ip -d tunnel show` that describes one
+// device, matched on the whole name rather than on a substring of it.
+func tunnelLine(out, name string) string {
 	for _, l := range strings.Split(out, "\n") {
-		if strings.Contains(l, want) {
-			return strings.TrimSpace(l)
+		l = strings.TrimSpace(l)
+		f := strings.Fields(l)
+		if len(f) > 0 && f[0] == name+":" {
+			return l
 		}
 	}
 	return ""

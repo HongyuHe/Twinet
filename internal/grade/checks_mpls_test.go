@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/HongyuHe/twinet/internal/model"
@@ -89,6 +91,9 @@ const (
 // the defect these tests exist to prevent.
 func pingExec(matrix func(fromID, toAddr string) reachOutcome) func(context.Context, string, []string) (rt.ExecResult, error) {
 	return func(_ context.Context, deviceID string, cmd []string) (rt.ExecResult, error) {
+		if res, ok := transportProbe(deviceID, cmd, matrix); ok {
+			return res, nil
+		}
 		if len(cmd) == 0 || cmd[0] != "ping" {
 			// Isolation reads the tables as well as probing, because a leak
 			// that only goes one way answers no probe. An empty table is the
@@ -105,6 +110,31 @@ func pingExec(matrix func(fromID, toAddr string) reachOutcome) func(context.Cont
 			return rt.ExecResult{ExitCode: 1, Stdout: "3 packets transmitted, 0 received"}, nil
 		}
 	}
+}
+
+// transportProbe answers the connection and datagram probes the VPN checks make
+// alongside their pings, from the same reachability matrix.
+//
+// A lab where the paths carry pings and nothing else is a broken lab, so the
+// fake answers all three the same way. It deliberately does not model the
+// kernel counters: `/proc/net/snmp` is left unreadable here, which is the case
+// the checks must survive by standing on the probe alone.
+func transportProbe(deviceID string, cmd []string,
+	matrix func(fromID, toAddr string) reachOutcome) (rt.ExecResult, bool) {
+	var addr string
+	switch {
+	case len(cmd) > 2 && cmd[0] == "nc":
+		addr = cmd[len(cmd)-2] // nc -v -w 3 -z <addr> <port>
+	case len(cmd) == 3 && cmd[0] == "sh" && strings.Contains(cmd[2], "nc -u"):
+		// A datagram tells its sender nothing, whatever became of it.
+		return rt.ExecResult{ExitCode: 0}, true
+	default:
+		return rt.ExecResult{}, false
+	}
+	if matrix(deviceID, addr) == reachable {
+		return rt.ExecResult{ExitCode: 1, Stderr: "Connection refused"}, true
+	}
+	return rt.ExecResult{ExitCode: 1, Stderr: "Connection timed out"}, true
 }
 
 // sameCustomer reports whether a source host and a target address belong to one
@@ -244,6 +274,14 @@ func TestAOneWayRouteLeakIsCaughtEvenThoughNoProbeSucceeds(t *testing.T) {
 
 	env := &Env{Topology: top, AS: 100,
 		Exec: func(_ context.Context, deviceID string, cmd []string) (rt.ExecResult, error) {
+			if res, ok := transportProbe(deviceID, cmd, func(from, to string) reachOutcome {
+				if sameCustomer(sites, from, to) {
+					return reachable
+				}
+				return blocked
+			}); ok {
+				return res, nil
+			}
 			if len(cmd) > 0 && cmd[0] == "ping" {
 				addr := cmd[len(cmd)-1]
 				// A working VPN for each customer, and not one cross-customer
@@ -283,6 +321,14 @@ func TestADefaultRouteIsNotACrossCustomerLeak(t *testing.T) {
 	top, sites := vpnLab(100, map[string]int{"bankA": 2, "bankB": 2})
 	env := &Env{Topology: top, AS: 100,
 		Exec: func(_ context.Context, deviceID string, cmd []string) (rt.ExecResult, error) {
+			if res, ok := transportProbe(deviceID, cmd, func(from, to string) reachOutcome {
+				if sameCustomer(sites, from, to) {
+					return reachable
+				}
+				return blocked
+			}); ok {
+				return res, nil
+			}
 			if len(cmd) > 0 && cmd[0] == "ping" {
 				addr := cmd[len(cmd)-1]
 				if sameCustomer(sites, deviceID, addr) {
@@ -319,6 +365,133 @@ func TestReachabilityIsTestedInBothDirections(t *testing.T) {
 	if got.Passed() {
 		t.Fatalf("a VPN that carries a customer only one way earned full reachability marks: the "+
 			"return path was never probed.\nevidence: %s", describe(got))
+	}
+}
+
+// A bank's branches do not exchange their business over ICMP.
+//
+// Dropping TCP and UDP at the provider's edges, and leaving ICMP alone, left
+// every probe of this question succeeding and the mark at six out of six, on a
+// network across which no customer could have opened a single connection.
+func TestAVPNThatCarriesOnlyPingsDoesNotEarnFullReachabilityMarks(t *testing.T) {
+	top, _ := vpnLab(100, map[string]int{"bankA": 2})
+	env := &Env{Topology: top, AS: 100,
+		Exec: func(_ context.Context, deviceID string, cmd []string) (rt.ExecResult, error) {
+			if len(cmd) > 0 && cmd[0] == "ping" {
+				return rt.ExecResult{ExitCode: 0, Stdout: "3 packets transmitted, 3 received"}, nil
+			}
+			if len(cmd) > 2 && cmd[0] == "nc" {
+				return rt.ExecResult{ExitCode: 1, Stderr: "Connection timed out"}, nil
+			}
+			return rt.ExecResult{ExitCode: 0, Stdout: "{}"}, nil
+		}}
+
+	got := checkVPNReachability(context.Background(), env)
+	if got.Score >= 1 {
+		t.Fatalf("a VPN carrying ICMP and discarding every connection earned full reachability "+
+			"marks.\nevidence: %s", describe(got))
+	}
+}
+
+// hostOf finds the device that owns an address.
+func hostOf(sites map[string][]vpnSite, addr string) string {
+	for _, group := range sites {
+		for _, s := range group {
+			if s.addr == addr {
+				return s.host
+			}
+		}
+	}
+	return ""
+}
+
+// snmpWith renders the part of /proc/net/snmp a destination's own record of
+// arriving connections is read from.
+func snmpWith(rsts int) string {
+	return "Tcp: RtoAlgorithm RtoMin PassiveOpens OutRsts\n" +
+		"Tcp: 1 200 0 " + strconv.Itoa(rsts) + "\n"
+}
+
+// Isolation asked only of ICMP is isolation of ICMP.
+//
+// The customers' pings are blocked and their connections are not: the tables
+// are joined, and a check built on ping calls them perfectly separated. The
+// destinations answer for themselves here -- their kernels count the resets
+// they send -- which is what makes this a leak rather than something on the
+// path talking.
+func TestCustomersThatExchangeConnectionsAreNotIsolated(t *testing.T) {
+	top, sites := vpnLab(100, map[string]int{"bankA": 2, "bankB": 2})
+	var mu sync.Mutex
+	resets := map[string]int{}
+	env := &Env{Topology: top, AS: 100,
+		Exec: func(_ context.Context, deviceID string, cmd []string) (rt.ExecResult, error) {
+			if len(cmd) > 0 && cmd[0] == "ping" {
+				addr := cmd[len(cmd)-1]
+				if sameCustomer(sites, deviceID, addr) {
+					return rt.ExecResult{ExitCode: 0, Stdout: "3 packets transmitted, 3 received"}, nil
+				}
+				return rt.ExecResult{ExitCode: 1, Stdout: "3 packets transmitted, 0 received"}, nil
+			}
+			if len(cmd) > 2 && cmd[0] == "nc" {
+				// The attempt arrives, and the host it arrives at resets it.
+				mu.Lock()
+				resets[hostOf(sites, cmd[len(cmd)-2])]++
+				mu.Unlock()
+				return rt.ExecResult{ExitCode: 1, Stderr: "Connection refused"}, nil
+			}
+			if len(cmd) == 2 && cmd[0] == "cat" && cmd[1] == "/proc/net/snmp" {
+				mu.Lock()
+				defer mu.Unlock()
+				return rt.ExecResult{ExitCode: 0, Stdout: snmpWith(resets[deviceID])}, nil
+			}
+			return rt.ExecResult{ExitCode: 0, Stdout: "{}"}, nil
+		}}
+
+	got := checkVPNIsolation(context.Background(), env)
+	if got.Passed() {
+		t.Fatalf("two customers whose hosts answer one another's connections were certified "+
+			"isolated, because only their pings were tried.\nevidence: %s", describe(got))
+	}
+}
+
+// A provider that says no is still saying no.
+//
+// Rejecting cross-customer traffic with a reset rather than dropping it in
+// silence is isolation, implemented more helpfully: nothing crosses, and the
+// sender is told so immediately instead of waiting for a timeout. The reset
+// carries the destination's address because whoever wrote it put that address
+// there, and reading it as the destination speaking marked a correctly
+// separated VPN as leaking -- four of six on the live cluster.
+//
+// The destinations here record nothing, because nothing reached them.
+func TestAProviderThatRejectsCrossCustomerTrafficIsStillIsolating(t *testing.T) {
+	top, sites := vpnLab(100, map[string]int{"bankA": 2, "bankB": 2})
+	env := &Env{Topology: top, AS: 100,
+		Exec: func(_ context.Context, deviceID string, cmd []string) (rt.ExecResult, error) {
+			if len(cmd) > 0 && cmd[0] == "ping" {
+				addr := cmd[len(cmd)-1]
+				if sameCustomer(sites, deviceID, addr) {
+					return rt.ExecResult{ExitCode: 0, Stdout: "3 packets transmitted, 3 received"}, nil
+				}
+				return rt.ExecResult{ExitCode: 1, Stdout: "3 packets transmitted, 0 received"}, nil
+			}
+			if len(cmd) > 2 && cmd[0] == "nc" {
+				if sameCustomer(sites, deviceID, cmd[len(cmd)-2]) {
+					return rt.ExecResult{ExitCode: 0}, nil
+				}
+				// The edge forges the refusal; nothing arrives anywhere.
+				return rt.ExecResult{ExitCode: 1, Stderr: "Connection refused"}, nil
+			}
+			if len(cmd) == 2 && cmd[0] == "cat" && cmd[1] == "/proc/net/snmp" {
+				return rt.ExecResult{ExitCode: 0, Stdout: snmpWith(0)}, nil
+			}
+			return rt.ExecResult{ExitCode: 0, Stdout: "{}"}, nil
+		}}
+
+	got := checkVPNIsolation(context.Background(), env)
+	if !got.Passed() {
+		t.Fatalf("a VPN whose edges reject cross-customer traffic with a reset was marked as "+
+			"leaking, though no packet ever crossed.\nevidence: %s", describe(got))
 	}
 }
 

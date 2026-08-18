@@ -1,6 +1,9 @@
 package grade
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // A route-map that is written but never attached to a neighbour changes
 // nothing the network can observe. Awarding a mark for it credits a student
@@ -65,12 +68,26 @@ exit
 // as a 6in4 tunnel awards the mark before the student begins the exercise.
 func TestTheKernelsOwnSitDeviceIsNotATunnel(t *testing.T) {
 	const bare = "sit0: ipv6/ip remote any local any ttl 64 nopmtudisc 6rd-prefix 2002::/16\n"
-	if got := configuredTunnel(bare); got != "" {
+	if got := configuredTunnels(bare); len(got) != 0 {
 		t.Errorf("sit0 was accepted as the student's tunnel: %q", got)
 	}
 	const built = bare + "tun6: ipv6/ip remote 3.153.0.1 local 3.156.0.1 ttl 64 6rd-prefix 2002::/16\n"
-	if got := configuredTunnel(built); got != "tun6" {
+	if got := configuredTunnels(built); len(got) != 1 || got[0] != "tun6" {
 		t.Errorf("a configured tunnel was not recognised: %q", got)
+	}
+}
+
+// A device may carry more than one tunnel, and a student debugging their
+// answer routinely leaves an experiment behind. The kernel lists them in its
+// own order, so judging only the first meant a correct tunnel could be marked
+// wrong on an abandoned tunnel's endpoints.
+func TestALeftoverTunnelDoesNotHideTheRealOne(t *testing.T) {
+	const both = "sit0: ipv6/ip remote any local any ttl 64\n" +
+		"bad_tun: ipv6/ip remote 3.0.10.2 local 3.0.10.1 ttl 64\n" +
+		"tun6: ipv6/ip remote 3.153.0.1 local 3.156.0.1 ttl 64\n"
+	got := configuredTunnels(both)
+	if len(got) != 2 || got[0] != "bad_tun" || got[1] != "tun6" {
+		t.Fatalf("both tunnels should be offered for judging, got %q", got)
 	}
 }
 
@@ -127,13 +144,36 @@ exit
 func TestOnlyA6in4TunnelCounts(t *testing.T) {
 	const gre = "sit0: ipv6/ip remote any local any ttl 64\n" +
 		"tun6: gre/ip remote 3.153.0.1 local 3.156.0.1 ttl 64\n"
-	if got := configuredTunnel(gre); got != "" {
+	if got := configuredTunnels(gre); len(got) != 0 {
 		t.Errorf("a GRE tunnel was accepted as the answer to the 6in4 question (got %q)", got)
 	}
 
 	const sit = "sit0: ipv6/ip remote any local any ttl 64\n" +
 		"tun6: ipv6/ip remote 3.153.0.1 local 3.156.0.1 ttl 64 6rd-prefix 2002::/16\n"
-	if got := configuredTunnel(sit); got != "tun6" {
+	if got := configuredTunnels(sit); len(got) != 1 || got[0] != "tun6" {
 		t.Errorf("a correct 6in4 tunnel was not recognised (got %q)", got)
+	}
+}
+
+// A tunnel's line is found by its whole name. A substring search for "tun6:"
+// also matches "xtun6:", so an experiment left behind and listed first
+// supplied the endpoints of the tunnel actually being judged.
+func TestATunnelIsJudgedOnItsOwnLine(t *testing.T) {
+	const out = "sit0: ipv6/ip remote any local any ttl 64\n" +
+		"xtun6: ipv6/ip remote 3.0.10.2 local 3.0.10.1 ttl 64\n" +
+		"tun6: ipv6/ip remote 3.156.0.1 local 3.153.0.1 ttl 64\n"
+	got := tunnelLine(out, "tun6")
+	if !strings.HasPrefix(got, "tun6:") {
+		t.Fatalf("the wrong tunnel's line was returned: %q", got)
+	}
+	if strings.Contains(got, "3.0.10.1") {
+		t.Fatalf("the leftover tunnel's endpoints were read as tun6's: %q", got)
+	}
+}
+
+// And a name that describes no line is not a tunnel whose endpoints are right.
+func TestATunnelWithNoLineIsNotAccepted(t *testing.T) {
+	if got := tunnelLine("sit0: ipv6/ip remote any local any\n", "tun6"); got != "" {
+		t.Fatalf("a line was invented for a tunnel that is not there: %q", got)
 	}
 }

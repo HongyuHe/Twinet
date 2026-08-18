@@ -33,6 +33,7 @@ import (
 	"time"
 
 	"github.com/HongyuHe/twinet/internal/deploy"
+	"github.com/HongyuHe/twinet/internal/integrity"
 	"github.com/HongyuHe/twinet/internal/model"
 	"github.com/HongyuHe/twinet/internal/netx"
 	"github.com/HongyuHe/twinet/internal/plan"
@@ -125,6 +126,14 @@ type Server struct {
 	store   *state.Store
 	started time.Time
 
+	// tools compares a container's programs against its image's, so that a
+	// mark never rests on a program the student under examination wrote. It is
+	// a field rather than a call so that a test can put a container in front
+	// of it without an image to build one from.
+	tools     func(context.Context, rt.Container) ([]integrity.Finding, error)
+	toolsMu   sync.Mutex
+	toolsSeen map[string]toolsVerdict
+
 	mu sync.Mutex
 	// current is the last topology applied, per lab. One node may host several
 	// labs at once -- a class lab beside a harness per submission being graded
@@ -188,6 +197,9 @@ func New(cfg Config) (*Server, error) {
 		current: map[string]*model.Topology{},
 		ops:     map[string]*lease{},
 		holds:   map[string]*hold{},
+
+		tools:     integrity.NewChecker(engine).Verify,
+		toolsSeen: map[string]toolsVerdict{},
 
 		repairFails: map[string]int{},
 		exempt:      map[string]*exemptions{},
@@ -1038,6 +1050,14 @@ type ExecRequest struct {
 	// how a student session is confined to their own AS: authorisation is
 	// enforced here, beside the container, not by network segmentation.
 	Owner string `json:"owner,omitempty"`
+	// Grading marks a command whose output will become a mark.
+	//
+	// A student has root in their own containers, so the programs the grader
+	// runs there are the student's to replace. Before one of these runs, the
+	// container's programs are compared against the image it was built from,
+	// and a command that would have been answered by a program that is not the
+	// image's comes back as a failure of the machinery rather than as evidence.
+	Grading bool `json:"grading,omitempty"`
 }
 
 // ExecResponse carries the result.
@@ -1254,12 +1274,67 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 				diagLab, req.Container, c.Labels[deploy.LabelLab]))
 		return
 	}
+	// Nothing a container says can be believed until the programs saying it
+	// are the ones its image ships.
+	if req.Grading {
+		if err := s.verifyTools(r.Context(), c); err != nil {
+			httpError(w, http.StatusInternalServerError, err)
+			return
+		}
+	}
 	res, err := s.rt.Exec(r.Context(), req.Container, rt.ExecCmd{Cmd: req.Cmd})
 	if err != nil {
 		httpError(w, http.StatusInternalServerError, err)
 		return
 	}
 	writeJSON(w, ExecResponse{ExitCode: res.ExitCode, Stdout: res.Stdout, Stderr: res.Stderr})
+}
+
+// verifyTools compares a container's programs against its image's, at most once
+// every few seconds per container.
+//
+// A grading run makes hundreds of calls into one container, and reading the
+// programs on every one of them would cost more than the checks do. The answer
+// is not kept for longer than that, though: it was originally kept for the life
+// of the container, and a program planted after one run was then believed by
+// every run that followed, which is precisely the thing this exists to stop.
+func (s *Server) verifyTools(ctx context.Context, c rt.Container) error {
+	key := fmt.Sprintf("%s/%d", c.ID, c.PID)
+	now := time.Now()
+	s.toolsMu.Lock()
+	cached, ok := s.toolsSeen[key]
+	s.toolsMu.Unlock()
+	if ok && now.Sub(cached.at) < toolsCheckEvery {
+		return cached.err
+	}
+	findings, err := s.tools(ctx, c)
+	if err != nil {
+		// The grader could not read the image. That is the machinery's
+		// failure, and it is not remembered: the next call tries again.
+		return fmt.Errorf("the programs in %s could not be checked against %s, so the "+
+			"evidence they produce cannot be relied on: %w", c.Name, c.Image, err)
+	}
+	var result error
+	if len(findings) > 0 {
+		result = &integrity.Error{Container: c.Name, Findings: findings}
+	}
+	s.toolsMu.Lock()
+	s.toolsSeen[key] = toolsVerdict{err: result, at: now}
+	s.toolsMu.Unlock()
+	return result
+}
+
+// toolsCheckEvery is how stale a container's tool check may be.
+//
+// Short enough that a grading run re-reads the programs several times while it
+// is running, and long enough that a run making hundreds of calls into thirty
+// containers does not spend its time hashing the same files.
+const toolsCheckEvery = 20 * time.Second
+
+// toolsVerdict is what the last check of a container found, and when.
+type toolsVerdict struct {
+	err error
+	at  time.Time
 }
 
 // UnderlayResponse reports what the fabric can carry.

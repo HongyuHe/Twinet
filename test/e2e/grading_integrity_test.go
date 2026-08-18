@@ -169,23 +169,39 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 	var customerDrops []string
 	var vlanMirror struct{ switchID, from string }
 	var ibgpBlackhole struct{ router, peer string }
+	var lengthFilter struct{ router, peer string }
 	var leakedRange string
+	var vrfLeak struct{ router string }
+	var spareAddr struct{ router, addr string }
 	var tunnelTCP struct{ gateway, iface string }
 	var rangeAllow []string
 	var weighted struct{ router, routeMap, prefix string }
 	var ecmpTCP struct{ router, from string }
 	var udpBlock struct{ router, src, dst string }
 	var impostorLink struct{ router, iface, moved string }
+	var helloDrop struct{ router, iface string }
 	var ixpRewrite struct{ router, routeMap, match, peer string }
 	var rpkiNarrow struct{ router, routeMap, seq string }
 	var notFoundBlock struct{ host, prefix string }
+	var vlanCut struct{ router, from, to string }
 	var tcpBlock struct{ router, src, dst string }
+	var udpPair struct{ router, src string }
 	var vlanFlow struct{ switchID string }
+	var vlanRetag struct{ switchID string }
+	var tcMirror struct{ switchID, from string }
+	var enqueueLeak struct{ switchID string }
+	var groupLeak struct{ switchID string }
 	var forgedLeak struct{ router, routeMap, prefix string }
 	var custTCP string
+	var starved struct {
+		router string
+		peers  []string
+	}
 	var reorigin struct{ router, routeMap, prefix string }
+	var disown struct{ router, routeMap, prefix, peer string }
 	var slowPrepend struct{ router, routeMap, seq, peer, original string }
 	var staticOverride struct{ router, prefix string }
+	var policyDivert struct{ router, dst string }
 	var ebgpBlackhole struct{ router, peer string }
 	var looseROA struct {
 		router, anchor, prefix string
@@ -836,6 +852,35 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 			},
 		},
 		{
+			// A decision made where the routing protocols have no say.
+			//
+			// `ip rule add to X lookup 100` with a route in that table sends
+			// the destination wherever it says, while zebra's main table still
+			// shows the route BGP chose.
+			name:     "a destination diverted by a policy rule into another table",
+			question: "q2.3",
+			undo: func(t *testing.T) {
+				if policyDivert.router == "" {
+					return
+				}
+				_, _ = twinet(t, "exec", "-m", dir, policyDivert.router, "--", "sh", "-c",
+					"ip rule del priority 100 to "+policyDivert.dst+" lookup 100; "+
+						"ip route del table 100 "+policyDivert.dst)
+			},
+			apply: func(t *testing.T) {
+				router, peer, _, _, _ := leakableRoute(t, dir, as)
+				dst := loopbackOf(t, dir, "as"+itoa(as)+"/BOS") + "/32"
+				policyDivert = struct{ router, dst string }{router, dst}
+				t.Logf("diverting %s into another table on %s", dst, router)
+				out, err := twinet(t, "exec", "-m", dir, router, "--", "sh", "-c",
+					"ip route add table 100 "+dst+" via "+peer+" && "+
+						"ip rule add priority 100 to "+dst+" lookup 100")
+				if err != nil {
+					t.Fatalf("diverting a destination: %v\n%s", err, out)
+				}
+			},
+		},
+		{
 			// The ordering agreed with and then ignored.
 			//
 			// BGP's decision is not the kernel's. A static route for an
@@ -887,6 +932,41 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 				vtysh(t, dir, router, "configure terminal",
 					"route-map "+rmap+" permit "+seq,
 					" set as-path prepend "+asn+" "+asn+" "+asn,
+					"end")
+				vtysh(t, dir, router, "clear ip bgp "+peer+" out")
+				time.Sleep(20 * time.Second)
+			},
+		},
+		{
+			// Our own prefix, sent with somebody else's origin.
+			//
+			// The path an AS sends for its own address space must end with its
+			// own number. Replacing it makes every neighbour treat the
+			// announcement as somebody else's and route around it, while the
+			// table on this side still shows the prefix locally injected.
+			name:     "the AS's own prefix announced as coming from elsewhere",
+			question: "q2.2",
+			undo: func(t *testing.T) {
+				if disown.router == "" {
+					return
+				}
+				vtysh(t, dir, disown.router, "configure terminal",
+					"no route-map "+disown.routeMap+" permit 2",
+					"no ip prefix-list TWGRADE-DISOWN seq 5 permit "+disown.prefix,
+					"end")
+				vtysh(t, dir, disown.router, "clear ip bgp "+disown.peer+" out")
+			},
+			apply: func(t *testing.T) {
+				router, peer, rmap, _, _ := leakableRoute(t, dir, as)
+				own := ownBlockOf(t, dir, as)
+				disown = struct{ router, routeMap, prefix, peer string }{router, rmap, own, peer}
+				t.Logf("telling %s that %s comes from AS 65000", peer, own)
+				vtysh(t, dir, router, "configure terminal",
+					"ip prefix-list TWGRADE-DISOWN seq 5 permit "+own,
+					"route-map "+rmap+" permit 2",
+					" match ip address prefix-list TWGRADE-DISOWN",
+					" set as-path exclude all",
+					" set as-path prepend 65000",
 					"end")
 				vtysh(t, dir, router, "clear ip bgp "+peer+" out")
 				time.Sleep(20 * time.Second)
@@ -988,6 +1068,96 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 			},
 		},
 		{
+			// A frame emitted by an action the reader did not know.
+			//
+			// `enqueue:<port>:<queue>` puts the frame on a queue of that port
+			// and sends it exactly as `output` would.
+			name:     "frames queued across VLANs instead of output across them",
+			question: "q1.1",
+			undo: func(t *testing.T) {
+				if enqueueLeak.switchID == "" {
+					return
+				}
+				_, _ = twinet(t, "exec", "-m", dir, enqueueLeak.switchID, "--",
+					"ovs-ofctl", "del-flows", "br0", "cookie=0x461/-1")
+			},
+			apply: func(t *testing.T) {
+				sw, from, to := vlanPortPair(t, dir, as)
+				enqueueLeak = struct{ switchID string }{sw}
+				t.Logf("queueing frames from %s onto %s on %s", from, to, sw)
+				out, err := twinet(t, "exec", "-m", dir, sw, "--", "ovs-ofctl", "add-flow", "br0",
+					"cookie=0x461,priority=50000,in_port="+from+",arp,"+
+						"actions=enqueue:"+to+":0")
+				if err != nil {
+					t.Fatalf("queueing frames across VLANs: %v\n%s", err, out)
+				}
+			},
+		},
+		{
+			// An action that names no port at all.
+			//
+			// A flow whose action is a group says nothing about where the
+			// frame goes: the ports are in the group's buckets, which are in
+			// a table of their own. Reading only the flow table found an
+			// action with no destination in it and nothing to complain about.
+			name:     "frames sent across VLANs by a group the flow only points at",
+			question: "q1.1",
+			undo: func(t *testing.T) {
+				if groupLeak.switchID == "" {
+					return
+				}
+				_, _ = twinet(t, "exec", "-m", dir, groupLeak.switchID, "--",
+					"ovs-ofctl", "-O", "OpenFlow13", "del-flows", "br0", "cookie=0x461f/-1")
+				_, _ = twinet(t, "exec", "-m", dir, groupLeak.switchID, "--",
+					"ovs-ofctl", "-O", "OpenFlow13", "del-groups", "br0", "group_id=4610")
+			},
+			apply: func(t *testing.T) {
+				sw, from, to := vlanPortPair(t, dir, as)
+				groupLeak = struct{ switchID string }{sw}
+				t.Logf("sending frames from %s onto %s through a group on %s", from, to, sw)
+				out, err := twinet(t, "exec", "-m", dir, sw, "--",
+					"ovs-ofctl", "-O", "OpenFlow13", "add-group", "br0",
+					"group_id=4610,type=all,bucket=actions=output:"+to)
+				if err != nil {
+					t.Fatalf("adding a group across VLANs: %v\n%s", err, out)
+				}
+				out, err = twinet(t, "exec", "-m", dir, sw, "--",
+					"ovs-ofctl", "-O", "OpenFlow13", "add-flow", "br0",
+					"cookie=0x461f,priority=50000,in_port="+from+",arp,actions=group:4610")
+				if err != nil {
+					t.Fatalf("pointing a flow at the group: %v\n%s", err, out)
+				}
+			},
+		},
+		{
+			// A copy the switch's own tables know nothing about.
+			//
+			// The kernel will copy a frame for anybody who asks, and a `tc`
+			// mirror on an access port carries one VLAN's traffic into another
+			// with the flow table exactly as it should be.
+			name:     "one protocol mirrored across VLANs by a traffic-control rule",
+			question: "q1.1",
+			undo: func(t *testing.T) {
+				if tcMirror.switchID == "" {
+					return
+				}
+				_, _ = twinet(t, "exec", "-m", dir, tcMirror.switchID, "--",
+					"tc", "qdisc", "del", "dev", tcMirror.from, "clsact")
+			},
+			apply: func(t *testing.T) {
+				sw, from, to := vlanPortPair(t, dir, as)
+				tcMirror = struct{ switchID, from string }{sw, from}
+				t.Logf("mirroring ICMP from %s to %s on %s", from, to, sw)
+				out, err := twinet(t, "exec", "-m", dir, sw, "--", "sh", "-c",
+					"tc qdisc add dev "+from+" clsact && "+
+						"tc filter add dev "+from+" ingress protocol ip pref 49152 flower "+
+						"ip_proto icmp action mirred egress mirror dev "+to)
+				if err != nil {
+					t.Fatalf("mirroring across VLANs with tc: %v\n%s", err, out)
+				}
+			},
+		},
+		{
 			// A way across that carries one flow and no broadcast.
 			//
 			// The isolation probe sends a broadcast, which is what a shared
@@ -1012,6 +1182,61 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 						"actions=normal,output:"+to)
 				if err != nil {
 					t.Fatalf("mirroring one flow across VLANs: %v\n%s", err, out)
+				}
+			},
+		},
+		{
+			// A way across that names no port to send anything out of.
+			//
+			// The actions retag the frame and tell it that it arrived on a
+			// port in the other VLAN, and then hand it to the switch's own
+			// forwarding, which delivers it there. Read as a list of output
+			// ports it has none, so it was read as harmless.
+			name:     "one flow retagged across VLANs before NORMAL",
+			question: "q1.1",
+			undo: func(t *testing.T) {
+				if vlanRetag.switchID == "" {
+					return
+				}
+				_, _ = twinet(t, "exec", "-m", dir, vlanRetag.switchID, "--",
+					"ovs-ofctl", "del-flows", "br0", "cookie=0x461ba2/-1")
+			},
+			apply: func(t *testing.T) {
+				sw, from, to := vlanPortPair(t, dir, as)
+				vlanRetag = struct{ switchID string }{sw}
+				tag := vlanTagOf(t, dir, sw, to)
+				t.Logf("retagging %s into the VLAN of %s (%s) on %s", from, to, tag, sw)
+				out, err := twinet(t, "exec", "-m", dir, sw, "--", "ovs-ofctl", "add-flow", "br0",
+					"cookie=0x461ba2,priority=200,in_port="+from+",udp,tp_dst=55555,"+
+						"actions=mod_vlan_vid:"+tag+",NORMAL")
+				if err != nil {
+					t.Fatalf("retagging one flow across VLANs: %v\n%s", err, out)
+				}
+			},
+		},
+		{
+			// A pair that exchanges everything but datagrams.
+			//
+			// The matrix was tried with a ping and a connection, so a rule
+			// dropping UDP between two hosts left every probe succeeding.
+			name:     "two hosts that cannot exchange a datagram",
+			question: "q1.2",
+			undo: func(t *testing.T) {
+				if udpPair.router == "" {
+					return
+				}
+				_, _ = twinet(t, "exec", "-m", dir, udpPair.router, "--", "iptables", "-D",
+					"INPUT", "-s", udpPair.src, "-p", "udp", "-j", "DROP")
+			},
+			apply: func(t *testing.T) {
+				dst := "as" + itoa(as) + "/NYC_host"
+				src := hostAddr(t, dir, "as"+itoa(as)+"/MSP_host")
+				udpPair = struct{ router, src string }{dst, src + "/32"}
+				t.Logf("discarding datagrams from %s at %s", src, dst)
+				out, err := twinet(t, "exec", "-m", dir, dst, "--", "iptables", "-I", "INPUT",
+					"1", "-s", udpPair.src, "-p", "udp", "-j", "DROP")
+				if err != nil {
+					t.Fatalf("discarding datagrams: %v\n%s", err, out)
 				}
 			},
 		},
@@ -1064,6 +1289,35 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 					"-p", "tcp", "-j", "DROP")
 				if err != nil {
 					t.Fatalf("discarding TCP between two hosts: %v\n%s", err, out)
+				}
+			},
+		},
+		{
+			// Two whole sites cut off from the preserved network.
+			//
+			// The probe skipped every host in a layer-2 domain, so rejecting
+			// traffic from both VLANs towards the unsigned prefix cost nothing.
+			name:     "the datacentre sites unable to reach the preserved network",
+			question: "q2.6",
+			undo: func(t *testing.T) {
+				if vlanCut.router == "" {
+					return
+				}
+				_, _ = twinet(t, "exec", "-m", dir, vlanCut.router, "--", "iptables", "-D",
+					"FORWARD", "-s", vlanCut.from, "-d", vlanCut.to, "-j", "REJECT",
+					"--reject-with", "icmp-net-unreachable")
+			},
+			apply: func(t *testing.T) {
+				prefix := notFoundPrefix(t, dir, as)
+				gw, _ := tunnelGateway(t, dir, as)
+				from := vlanSupernet(t, dir, gw)
+				vlanCut = struct{ router, from, to string }{gw, from, prefix}
+				t.Logf("rejecting %s -> %s on %s", from, prefix, gw)
+				out, err := twinet(t, "exec", "-m", dir, gw, "--", "iptables", "-I", "FORWARD",
+					"1", "-s", from, "-d", prefix, "-j", "REJECT",
+					"--reject-with", "icmp-net-unreachable")
+				if err != nil {
+					t.Fatalf("cutting the datacentre off: %v\n%s", err, out)
 				}
 			},
 		},
@@ -1155,6 +1409,34 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 					"end")
 				vtysh(t, dir, router, "clear ip bgp "+ixpRewrite.peer+" in")
 				time.Sleep(20 * time.Second)
+			},
+		},
+		{
+			// An adjacency held up by a timer that has not expired.
+			//
+			// A neighbour stays Full for forty seconds after the hellos stop,
+			// so discarding OSPF on a link and grading straight away found
+			// every adjacency Full and carrying nothing.
+			name:     "an interior link with its hellos discarded",
+			question: "q1.2",
+			undo: func(t *testing.T) {
+				if helloDrop.router == "" {
+					return
+				}
+				_, _ = twinet(t, "exec", "-m", dir, helloDrop.router, "--", "sh", "-c",
+					"iptables -D INPUT -i "+helloDrop.iface+" -p 89 -j DROP; "+
+						"iptables -D OUTPUT -o "+helloDrop.iface+" -p 89 -j DROP")
+			},
+			apply: func(t *testing.T) {
+				a, _, aIf, _ := interiorLinkEnds(t, dir, as)
+				helloDrop = struct{ router, iface string }{a, aIf}
+				t.Logf("discarding OSPF on %s of %s", aIf, a)
+				out, err := twinet(t, "exec", "-m", dir, a, "--", "sh", "-c",
+					"iptables -I INPUT 1 -i "+aIf+" -p 89 -j DROP && "+
+						"iptables -I OUTPUT 1 -o "+aIf+" -p 89 -j DROP")
+				if err != nil {
+					t.Fatalf("discarding OSPF: %v\n%s", err, out)
+				}
 			},
 		},
 		{
@@ -1369,6 +1651,40 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 			},
 		},
 		{
+			// An OSPF instance the reader never opened.
+			//
+			// Reading only the default VRF meant the report could say no
+			// inter-AS range was in OSPF while an instance beside it held one.
+			name:     "an inter-AS range in an OSPF instance in another VRF",
+			question: "q1.2",
+			undo: func(t *testing.T) {
+				if vrfLeak.router == "" {
+					return
+				}
+				_, _ = twinet(t, "exec", "-m", dir, vrfLeak.router, "--", "sh", "-c",
+					"vtysh -c 'configure terminal' -c 'no router ospf vrf TWBAD' -c 'end'; "+
+						"ip link del twdum0 2>/dev/null; ip link del TWBAD 2>/dev/null")
+			},
+			apply: func(t *testing.T) {
+				router := "as" + itoa(as) + "/NYC"
+				rng := interASRange(t, dir, as)
+				vrfLeak = struct{ router string }{router}
+				t.Logf("putting %s into an OSPF instance in another VRF on %s", rng, router)
+				addr := strings.SplitN(rng, "/", 2)[0]
+				addr = addr[:strings.LastIndexByte(addr, '.')] + ".9/24"
+				out, err := twinet(t, "exec", "-m", dir, router, "--", "sh", "-c",
+					"ip link add TWBAD type vrf table 1001 && ip link set TWBAD up && "+
+						"ip link add twdum0 type dummy && ip link set twdum0 master TWBAD && "+
+						"ip addr add "+addr+" dev twdum0 && ip link set twdum0 up && "+
+						"vtysh -c 'configure terminal' -c 'router ospf vrf TWBAD' "+
+						"-c ' ospf router-id 9.9.9.9' -c ' network "+rng+" area 0' -c 'end'")
+				if err != nil {
+					t.Fatalf("building an OSPF instance in a VRF: %v\n%s", err, out)
+				}
+				time.Sleep(10 * time.Second)
+			},
+		},
+		{
 			// A prefix in OSPF that no routing table holds.
 			//
 			// Redistributed with the maximum metric, an inter-AS range is
@@ -1400,6 +1716,50 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 					" redistribute connected route-map TWGRADE-LEAK",
 					"end")
 				time.Sleep(15 * time.Second)
+			},
+		},
+		{
+			// A session that carries keepalives and no routes.
+			//
+			// Permitting small BGP packets by length and discarding the rest
+			// leaves the message totals climbing on a session across which no
+			// route can pass -- including the refresh the grader asks for.
+			name:     "an iBGP session that answers refreshes but carries no routes",
+			question: "q2.1",
+			undo: func(t *testing.T) {
+				if lengthFilter.router == "" {
+					return
+				}
+				_, _ = twinet(t, "exec", "-m", dir, lengthFilter.router, "--", "sh", "-c",
+					"iptables -D OUTPUT -p tcp -d "+lengthFilter.peer+
+						" --dport 179 -m length --length 0:120 -j ACCEPT; "+
+						"iptables -D OUTPUT -p tcp -d "+lengthFilter.peer+" --dport 179 -j DROP; "+
+						"iptables -D OUTPUT -p tcp -d "+lengthFilter.peer+
+						" --sport 179 -m length --length 0:120 -j ACCEPT; "+
+						"iptables -D OUTPUT -p tcp -d "+lengthFilter.peer+" --sport 179 -j DROP")
+			},
+			apply: func(t *testing.T) {
+				out, err := twinet(t, "exec", "-m", dir, "as3/PHY", "--",
+					"vtysh", "-c", "show running-config")
+				if err != nil {
+					t.Fatalf("reading the configuration: %v\n%s", err, out)
+				}
+				peer := firstIBGPPeer(out)
+				if peer == "" {
+					t.Skip("no iBGP neighbour found")
+				}
+				lengthFilter = struct{ router, peer string }{"as3/PHY", peer}
+				t.Logf("permitting only small BGP packets towards %s", peer)
+				out, err = twinet(t, "exec", "-m", dir, "as3/PHY", "--", "sh", "-c",
+					"iptables -I OUTPUT 1 -p tcp -d "+peer+
+						" --sport 179 -m length --length 0:120 -j ACCEPT && "+
+						"iptables -I OUTPUT 2 -p tcp -d "+peer+" --sport 179 -j DROP && "+
+						"iptables -I OUTPUT 1 -p tcp -d "+peer+
+						" --dport 179 -m length --length 0:120 -j ACCEPT && "+
+						"iptables -I OUTPUT 2 -p tcp -d "+peer+" --dport 179 -j DROP")
+				if err != nil {
+					t.Fatalf("filtering by length: %v\n%s", err, out)
+				}
 			},
 		},
 		{
@@ -1500,6 +1860,54 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 			},
 		},
 		{
+			// A table emptied so that nothing is owed.
+			//
+			// What a customer was owed came from the table of the router
+			// holding its session, and that table is the submission's to
+			// empty: denying everything inbound left the router with only its
+			// own prefix and the check reporting that everything selected had
+			// been passed on.
+			name:        "a border router that selects nothing to give its customers",
+			question:    "q2.3",
+			alsoAffects: []string{"q2.2", "q2.5", "q2.6"},
+			undo: func(t *testing.T) {
+				if starved.router == "" {
+					return
+				}
+				for _, p := range starved.peers {
+					vtysh(t, dir, starved.router, "configure terminal",
+						"router bgp "+itoa(as),
+						" address-family ipv4 unicast",
+						"  no neighbor "+p+" route-map TWGRADE-DENY in",
+						"end")
+				}
+				vtysh(t, dir, starved.router, "configure terminal",
+					"no route-map TWGRADE-DENY deny 10", "end")
+			},
+			apply: func(t *testing.T) {
+				router := "as" + itoa(as) + "/SFO"
+				peers := bgpPeersOf(t, dir, router)
+				if len(peers) == 0 {
+					t.Skip("no BGP peers found")
+				}
+				starved = struct {
+					router string
+					peers  []string
+				}{router, peers}
+				t.Logf("denying every inbound announcement on %s", router)
+				vtysh(t, dir, router, "configure terminal", "route-map TWGRADE-DENY deny 10", "end")
+				for _, p := range peers {
+					vtysh(t, dir, router, "configure terminal",
+						"router bgp "+itoa(as),
+						" address-family ipv4 unicast",
+						"  neighbor "+p+" route-map TWGRADE-DENY in",
+						"end")
+				}
+				vtysh(t, dir, router, "clear ip bgp * soft in")
+				time.Sleep(25 * time.Second)
+			},
+		},
+		{
 			// Transit that carries pings and nothing else.
 			//
 			// The customer-transit probe was ICMP, so a rule dropping
@@ -1578,6 +1986,34 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 					"ip", "addr", "add", "192.0.2.123/32", "dev", "lo")
 				if err != nil {
 					t.Fatalf("adding an unplanned address: %v\n%s", err, out)
+				}
+			},
+		},
+		{
+			// A second address on an interface whose address is dictated.
+			//
+			// Anything inside the same subnet was excused everywhere, so a
+			// spare address on a prescribed loopback went unnoticed -- and a
+			// spare address in the right subnet is what an impersonation needs.
+			name:     "a second address on a prescribed loopback",
+			question: "q1.2",
+			undo: func(t *testing.T) {
+				if spareAddr.router == "" {
+					return
+				}
+				_, _ = twinet(t, "exec", "-m", dir, spareAddr.router, "--",
+					"ip", "addr", "del", spareAddr.addr, "dev", "lo")
+			},
+			apply: func(t *testing.T) {
+				router := "as" + itoa(as) + "/NYC"
+				lo := loopbackOf(t, dir, router)
+				addr := lo[:strings.LastIndexByte(lo, '.')] + ".254/24"
+				spareAddr = struct{ router, addr string }{router, addr}
+				t.Logf("adding %s beside the prescribed %s on %s", addr, lo, router)
+				out, err := twinet(t, "exec", "-m", dir, router, "--",
+					"ip", "addr", "add", addr, "dev", "lo")
+				if err != nil {
+					t.Fatalf("adding a spare address: %v\n%s", err, out)
 				}
 			},
 		},
@@ -1814,6 +2250,61 @@ func TestABrokenSubmissionLosesTheRightMarks(t *testing.T) {
 				time.Sleep(8 * time.Second)
 			},
 		},
+		{
+			// The policy the grader reads and the policy the router runs.
+			//
+			// A session takes its settings from its peer-group unless it
+			// states its own, and a peer-group is a template that nothing
+			// peers with. So a correct-looking policy on the group, overridden
+			// on the session by one that filters nothing, left the clause the
+			// grader was looking for in the configuration while the session
+			// ran something else. The group carried the remote AS, so the
+			// group stood in the list of external sessions in place of its own
+			// member, and nothing ever asked what the member does.
+			//
+			// Everything else about the session is rewritten unchanged, so the
+			// only thing this costs is the question about origin validation.
+			name:     "an import policy on a peer-group, overridden on the session",
+			question: "q2.6",
+			apply: func(t *testing.T) {
+				g := rpkiGuardedSession(t, dir, as)
+				t.Logf("moving the policy of %s onto a peer-group at %s and overriding it "+
+					"on the session", g.peer, g.router)
+				cmds := append([]string{"configure terminal"}, g.decoy...)
+				cmds = append(cmds,
+					"router bgp "+itoa(as),
+					" no neighbor "+g.peer,
+					" neighbor TWGRP peer-group")
+				for _, s := range g.global {
+					cmds = append(cmds, " neighbor TWGRP "+s)
+				}
+				cmds = append(cmds,
+					" neighbor "+g.peer+" peer-group TWGRP",
+					" address-family ipv4 unicast")
+				for _, s := range g.ipv4 {
+					cmds = append(cmds, "  neighbor TWGRP "+s)
+				}
+				cmds = append(cmds,
+					"  neighbor "+g.peer+" route-map TWOPEN in",
+					" exit-address-family", "end")
+				vtysh(t, dir, g.router, cmds...)
+
+				// The session was torn down and rebuilt, so the mark must not
+				// be read until it is carrying routes again: an unestablished
+				// session loses marks for reasons that have nothing to do with
+				// what this case is about.
+				waitForPeer(t, dir, g.router, g.peer)
+
+				// And the router must really be running the override, or this
+				// case proves nothing.
+				out, err := twinet(t, "exec", "-m", dir, g.router, "--", "vtysh",
+					"-c", "show bgp neighbor "+g.peer)
+				if err != nil || !strings.Contains(out, "Inbound path policy configured") {
+					t.Fatalf("%s is not applying an inbound policy to %s, so the override "+
+						"is not in force: %v\n%s", g.router, g.peer, err, out)
+				}
+			},
+		},
 	}
 
 	for _, c := range cases {
@@ -1931,6 +2422,30 @@ func findNotFoundPrefix(t *testing.T, dir string, as int) string {
 	return ""
 }
 
+// bgpPeersOf lists the BGP neighbour addresses a router holds sessions with.
+func bgpPeersOf(t *testing.T, dir, router string) []string {
+	t.Helper()
+	out, err := twinet(t, "exec", "-m", dir, router, "--", "vtysh", "-c",
+		"show ip bgp summary json")
+	if err != nil {
+		t.Fatalf("reading %s's sessions: %v\n%s", router, err, out)
+	}
+	var doc struct {
+		IPv4Unicast struct {
+			Peers map[string]struct{} `json:"peers"`
+		} `json:"ipv4Unicast"`
+	}
+	if json.Unmarshal([]byte(out), &doc) != nil {
+		return nil
+	}
+	var peers []string
+	for addr := range doc.IPv4Unicast.Peers {
+		peers = append(peers, addr)
+	}
+	sort.Strings(peers)
+	return peers
+}
+
 // externalSessionOf finds one router of this AS and an external neighbour it
 // holds a session with.
 func externalSessionOf(t *testing.T, dir string, as int) (string, string) {
@@ -1992,6 +2507,71 @@ func slowPrependClause(t *testing.T, dir string, as int) (router, routeMap, seq,
 	}
 	t.Skip("no prepend towards a neighbour was found")
 	return "", "", "", "", "", ""
+}
+
+// vlanSupernet returns a prefix covering the VLAN subnets a gateway serves,
+// read from its own sub-interfaces.
+func vlanSupernet(t *testing.T, dir, gateway string) string {
+	t.Helper()
+	out, err := twinet(t, "exec", "-m", dir, gateway, "--", "ip", "-o", "-4", "addr", "show")
+	if err != nil {
+		t.Fatalf("reading %s's addresses: %v\n%s", gateway, err, out)
+	}
+	var best netip.Prefix
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		if len(f) < 4 || !strings.Contains(f[1], "-L2.") {
+			continue
+		}
+		for i, tok := range f {
+			if tok != "inet" || i+1 >= len(f) {
+				continue
+			}
+			p, err := netip.ParsePrefix(f[i+1])
+			if err != nil {
+				continue
+			}
+			// One bit shorter covers both VLANs of the pair.
+			wide, err := netip.ParsePrefix(p.Masked().Addr().String() + "/" +
+				itoa(p.Bits()-1))
+			if err == nil {
+				best = wide.Masked()
+			}
+		}
+	}
+	if !best.IsValid() {
+		t.Skip("no VLAN sub-interfaces on the gateway")
+	}
+	return best.String()
+}
+
+// ownBlockOf reads the address block this AS originates, from its own table.
+func ownBlockOf(t *testing.T, dir string, as int) string {
+	t.Helper()
+	for _, r := range routersOf(t, dir, as) {
+		out, err := twinet(t, "exec", "-m", dir, r, "--", "vtysh", "-c", "show ip bgp json")
+		if err != nil {
+			continue
+		}
+		var doc struct {
+			Routes map[string][]struct {
+				Path   string `json:"path"`
+				PeerID string `json:"peerId"`
+			} `json:"routes"`
+		}
+		if json.Unmarshal([]byte(out), &doc) != nil {
+			continue
+		}
+		for pfx, ps := range doc.Routes {
+			for _, p := range ps {
+				if p.PeerID == "(unspec)" && strings.TrimSpace(p.Path) == "" {
+					return pfx
+				}
+			}
+		}
+	}
+	t.Skip("this AS originates nothing")
+	return ""
 }
 
 // leakableRoute finds a router with an export policy towards a peer or
@@ -2904,6 +3484,183 @@ func customerSessionsOn(t *testing.T, dir string, as int) (router string, addrs 
 	return router, addrs, prefix
 }
 
+// waitForPeer blocks until a BGP session is established and has routes on it.
+//
+// A case that rebuilds a session has to let it come back before the mark is
+// read, or what it measures is a session that is down -- which costs marks
+// everywhere and says nothing about the thing the case is about.
+func waitForPeer(t *testing.T, dir, router, peer string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Minute)
+	for {
+		out, err := twinet(t, "exec", "-m", dir, router, "--", "vtysh",
+			"-c", "show bgp ipv4 unicast neighbors "+peer+" routes")
+		if err == nil && strings.Contains(out, "Displayed") &&
+			!strings.Contains(out, "Displayed  0 routes") {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the session with %s on %s did not come back with routes: %v\n%s",
+				peer, router, err, out)
+		}
+		time.Sleep(5 * time.Second)
+	}
+}
+
+// guardedSession describes an external session whose inbound policy rejects
+// invalid origins, together with everything needed to rebuild it as a member of
+// a peer-group whose policy the session then overrides.
+type guardedSession struct {
+	router string
+	peer   string
+	// settings holds the neighbour's own lines, in the order and the address
+	// family they were written in, so the rebuilt session is the same session.
+	global []string
+	ipv4   []string
+	// decoy is the vtysh definition of a policy identical to the one the
+	// session runs, minus its validation clauses.
+	decoy []string
+}
+
+// rpkiGuardedSession finds a session the origin-validation question counts as
+// protected, and works out how to move its policy onto a peer-group.
+//
+// The mutation this feeds has to leave the session doing everything else it
+// did -- carrying the same local preferences and communities, exporting the
+// same routes -- or it would cost marks on the questions about those, and the
+// question under test would not be the one that moved.
+func rpkiGuardedSession(t *testing.T, dir string, as int) guardedSession {
+	t.Helper()
+	self := itoa(as)
+	for _, r := range routersOf(t, dir, as) {
+		out, err := twinet(t, "exec", "-m", dir, r, "--", "vtysh", "-c", "show running-config")
+		if err != nil || !strings.Contains(out, "rpki cache ") {
+			continue
+		}
+		for peer, rmap := range importRouteMaps(t, dir, r) {
+			if !isExternalPeer(out, peer, self) {
+				continue
+			}
+			decoy := routeMapWithoutRPKI(out, rmap, "TWOPEN")
+			if decoy == nil {
+				continue // its policy does not turn on validation state
+			}
+			g := guardedSession{router: r, peer: peer, decoy: decoy}
+			g.global, g.ipv4 = neighborSettings(out, peer)
+			return g
+		}
+	}
+	t.Skip("no external session guarded against invalid origins was found")
+	return guardedSession{}
+}
+
+// isExternalPeer reports whether a neighbour's remote AS is somebody else's,
+// comparing the number as a whole field.
+func isExternalPeer(cfg, peer, self string) bool {
+	for _, line := range strings.Split(cfg, "\n") {
+		f := strings.Fields(strings.TrimSpace(line))
+		if len(f) == 4 && f[0] == "neighbor" && f[1] == peer && f[2] == "remote-as" {
+			return f[3] != self && f[3] != "internal"
+		}
+	}
+	return false
+}
+
+// neighborSettings collects the lines written against one neighbour, keeping
+// the address family each belongs to.
+func neighborSettings(cfg, peer string) (global, ipv4 []string) {
+	af := "ipv4 unicast"
+	inBGP := false
+	for _, line := range strings.Split(cfg, "\n") {
+		t := strings.TrimSpace(line)
+		f := strings.Fields(t)
+		switch {
+		case len(f) == 3 && f[0] == "router" && f[1] == "bgp":
+			inBGP, af = true, "ipv4 unicast"
+			continue
+		case len(f) >= 2 && f[0] == "address-family":
+			af = strings.Join(f[1:], " ")
+			continue
+		case t == "exit-address-family":
+			af = "ipv4 unicast"
+			continue
+		case t == "exit":
+			inBGP = false
+			continue
+		}
+		if !inBGP || len(f) < 3 || f[0] != "neighbor" || f[1] != peer {
+			continue
+		}
+		setting := strings.Join(f[2:], " ")
+		// A binding is rewritten onto the group in the family it was written
+		// in; anything outside the IPv4 unicast block belongs with the rest of
+		// the session's global settings.
+		if af == "ipv4 unicast" && strings.HasPrefix(setting, "route-map ") {
+			ipv4 = append(ipv4, setting)
+			continue
+		}
+		if af == "ipv4 unicast" {
+			global = append(global, setting)
+		}
+	}
+	return global, ipv4
+}
+
+// routeMapWithoutRPKI rebuilds a route-map under a new name with its
+// validation clauses left out, which is a policy that looks like the original
+// everywhere except where the question is.
+func routeMapWithoutRPKI(cfg, name, as string) []string {
+	type clause struct {
+		head string
+		body []string
+	}
+	var clauses []clause
+	cur := -1
+	for _, line := range strings.Split(cfg, "\n") {
+		t := strings.TrimSpace(line)
+		f := strings.Fields(t)
+		if len(f) >= 3 && f[0] == "route-map" {
+			if f[1] == name {
+				clauses = append(clauses, clause{head: strings.Join(f[2:], " ")})
+				cur = len(clauses) - 1
+			} else {
+				cur = -1
+			}
+			continue
+		}
+		if t == "exit" || t == "!" || t == "" {
+			cur = -1
+			continue
+		}
+		if cur >= 0 {
+			clauses[cur].body = append(clauses[cur].body, t)
+		}
+	}
+	var cmds []string
+	found := false
+	for _, c := range clauses {
+		rpki := false
+		for _, b := range c.body {
+			if strings.HasPrefix(b, "match rpki") {
+				rpki = true
+			}
+		}
+		if rpki {
+			found = true
+			continue
+		}
+		cmds = append(cmds, "route-map "+as+" "+c.head)
+		for _, b := range c.body {
+			cmds = append(cmds, " "+b)
+		}
+		cmds = append(cmds, "exit")
+	}
+	if !found || len(cmds) == 0 {
+		return nil
+	}
+	return cmds
+}
+
 // importRouteMaps maps each neighbour of a router to the route-map applied on
 // the way in, for the neighbours that have one.
 func importRouteMaps(t *testing.T, dir, router string) map[string]string {
@@ -3135,4 +3892,146 @@ func vtyshQuiet(t *testing.T, dir, device string, cmds ...string) {
 		args = append(args, "-c", c)
 	}
 	_, _ = twinet(t, args...)
+}
+
+// A student's own container cannot be allowed to answer for itself.
+//
+// Every data-plane question is settled by running a program inside a student's
+// container and reading what it printed, and a student has root there. A shell
+// script called `ping` that prints "3 packets transmitted, 3 received" earns
+// the reachability marks on a network that forwards nothing -- and it does not
+// even have to replace the image's copy, because a file earlier on the search
+// path is the one that runs.
+//
+// This is the test that grading refuses to produce marks from it. Refusing is
+// the point: the submission is not marked down, because a grader that cannot
+// trust what it was told does not know what the marks should have been.
+// A correct answer written the way it is written in practice must score what a
+// correct answer scores.
+//
+// Binding an import policy once on a peer-group and pointing the sessions at it
+// is the ordinary way to configure this, and it was marked as having no policy
+// at all: the grader read the lines written against the neighbour's address and
+// a neighbour that inherits its policy has none. The reference lost marks for
+// origin validation it was in fact performing. A grader that fails correct work
+// is worse than one that passes incorrect work, because the student has no way
+// to tell it is wrong.
+func TestAPolicyAppliedThroughAPeerGroupStillScoresFullMarks(t *testing.T) {
+	dir := labDir(t)
+	const as = 3
+
+	solveAS(t, dir, as)
+	defer solveAS(t, dir, as)
+
+	baseline, points, _ := gradeAS(t, dir, as)
+	if len(baseline) == 0 {
+		t.Fatal("no baseline was produced")
+	}
+
+	g := rpkiGuardedSession(t, dir, as)
+	t.Logf("rebinding the policy of %s at %s through a peer-group", g.peer, g.router)
+	cmds := []string{"configure terminal", "router bgp " + itoa(as),
+		" no neighbor " + g.peer, " neighbor TWGRP peer-group"}
+	for _, s := range g.global {
+		cmds = append(cmds, " neighbor TWGRP "+s)
+	}
+	cmds = append(cmds, " neighbor "+g.peer+" peer-group TWGRP",
+		" address-family ipv4 unicast")
+	for _, s := range g.ipv4 {
+		cmds = append(cmds, "  neighbor TWGRP "+s)
+	}
+	cmds = append(cmds, " exit-address-family", "end")
+	vtysh(t, dir, g.router, cmds...)
+	waitForPeer(t, dir, g.router, g.peer)
+
+	// Nothing about the router's behaviour changed, so nothing about its marks
+	// may change either.
+	after, _, report := gradeAS(t, dir, as)
+	for q, want := range baseline {
+		if after[q] < want {
+			t.Errorf("%s fell from %.2f to %.2f of %.2f after the same policy was applied "+
+				"through a peer-group; the configuration is a correct answer\n%s",
+				q, want, after[q], points[q], report)
+		}
+	}
+}
+
+func TestAProgramTheStudentWroteCannotEarnMarks(t *testing.T) {
+	dir := labDir(t)
+	const as = 3
+
+	solveAS(t, dir, as)
+	baseline, points, _ := gradeAS(t, dir, as)
+	total := func(m map[string]float64) float64 {
+		var sum float64
+		for _, v := range m {
+			sum += v
+		}
+		return sum
+	}
+	if total(baseline) < total(points) {
+		t.Skipf("the reference is not at full marks (%.2f of %.2f); nothing below could "+
+			"be attributed to the planted program", total(baseline), total(points))
+	}
+	t.Logf("the reference scores %.2f of %.2f", total(baseline), total(points))
+
+	hosts := hostsOfAS(t, dir, as)
+	if len(hosts) == 0 {
+		t.Fatalf("AS %d has no hosts to plant a program in", as)
+	}
+	victim := hosts[0]
+	plant := "printf '#!/bin/sh\\necho \"3 packets transmitted, 3 received, 0%% packet " +
+		"loss\"\\nexit 0\\n' > /usr/local/bin/ping; chmod +x /usr/local/bin/ping; echo ok"
+	if _, err := twinet(t, "exec", "-m", dir, victim, "--", "sh", "-c", plant); err != nil {
+		t.Fatalf("planting a ping in %s: %v", victim, err)
+	}
+	defer func() {
+		_, _ = twinet(t, "exec", "-m", dir, victim, "--", "rm", "-f", "/usr/local/bin/ping")
+		// The agent re-reads a container's programs every twenty seconds; the
+		// next test in this package must not meet a stale refusal.
+		time.Sleep(25 * time.Second)
+	}()
+	t.Logf("planted a ping that always succeeds in %s", victim)
+	time.Sleep(25 * time.Second)
+
+	_, _, report := gradeASBroken(t, dir, as)
+
+	// Quarantine, not a lower mark. The submission has not been shown to be
+	// wrong; it has been shown to be unmarkable, and the difference is the
+	// whole point -- a student whose container answers for itself must not be
+	// given a number that anybody could mistake for a grade.
+	var rep struct {
+		NeedsReview bool   `json:"needs_review"`
+		Err         string `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(report), &rep); err != nil {
+		t.Fatalf("the report does not parse: %v", err)
+	}
+	if !rep.NeedsReview {
+		t.Fatalf("a container whose ping is a shell script written by the student was "+
+			"graded as if nothing were wrong; every data-plane mark in this lab can be "+
+			"had without a working network\n%s", report)
+	}
+	if !strings.Contains(report, "not the ones its image ships") {
+		t.Errorf("the run was held back but the report does not say why: %s", report)
+	}
+	t.Logf("the run was quarantined: %s", rep.Err)
+}
+
+// vlanTagOf is the VLAN a switch's access port is in.
+func vlanTagOf(t *testing.T, dir, sw, port string) string {
+	t.Helper()
+	out, err := twinet(t, "exec", "-m", dir, sw, "--",
+		"ovs-vsctl", "--columns=name,tag", "--format=csv", "list", "port")
+	if err != nil {
+		t.Fatalf("asking %s which VLAN %s is in: %v\n%s", sw, port, err, out)
+	}
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Split(strings.TrimSpace(line), ",")
+		if len(f) == 2 && f[0] == port && f[1] != "[]" {
+			return f[1]
+		}
+	}
+	t.Fatalf("%s did not say which VLAN %s is in:\n%s", sw, port, out)
+	return ""
 }

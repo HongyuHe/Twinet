@@ -401,7 +401,11 @@ func captureSwitch(ctx context.Context, exec func(context.Context, string, []str
 	// unreachable across the trunk, which presents as hosts that cannot see
 	// each other for no visible reason. Removing the spaces is the whole fix,
 	// and it cost an afternoon to find from the far end.
-	script := `for p in $(ovs-vsctl list-ports br0 2>/dev/null); do
+	// Every bridge, not br0. The reference answer builds one bridge and this
+	// asked for it by name, so a submission that made another had those ports
+	// read as absent and lost their VLANs on the way through the archive.
+	script := `for b in $(ovs-vsctl list-br 2>/dev/null); do
+for p in $(ovs-vsctl list-ports "$b" 2>/dev/null); do
   tag=$(ovs-vsctl get port "$p" tag 2>/dev/null | tr -d '[] ')
   trunks=$(ovs-vsctl get port "$p" trunks 2>/dev/null | tr -d '[] ')
   mode=$(ovs-vsctl get port "$p" vlan_mode 2>/dev/null | tr -d '"')
@@ -413,6 +417,7 @@ func captureSwitch(ctx context.Context, exec func(context.Context, string, []str
   # that used it came back from its own archive carrying nothing.
   [ -n "$mode" ] && [ "$mode" != "[]" ] && echo "ovs-vsctl set port $p vlan_mode=$mode"
   [ -n "$trunks" ] && echo "ovs-vsctl set port $p trunks=$trunks"
+done
 done`
 	res, err := exec(ctx, d.ID, []string{"sh", "-c", script})
 	if err != nil {

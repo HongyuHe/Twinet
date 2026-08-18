@@ -81,6 +81,48 @@ func bgpSummary(ctx context.Context, env *Env, router string) (bgpSummaryJSON, e
 	return out, err
 }
 
+// bgpUpdatesReceived reads, per router and per neighbour, how many UPDATE
+// messages have arrived on that session.
+//
+// Not the total of all messages. A firewall permitting keepalives and route
+// refreshes by packet length, and discarding everything else, left the totals
+// climbing on a session across which no route could pass: the refresh the
+// grader asked for was itself the traffic it then counted. An UPDATE is what a
+// session exists to carry, and answering a refresh with one is what a live
+// session does.
+func bgpUpdatesReceived(ctx context.Context, env *Env, routers []*model.Device) map[string]map[string]int {
+	out := map[string]map[string]int{}
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for _, r := range routers {
+		wg.Add(1)
+		go func(r *model.Device) {
+			defer wg.Done()
+			res, err := env.Probe(ctx, r.ID, []string{"vtysh", "-c", "show bgp neighbors json"})
+			if err != nil || res.ExitCode != 0 {
+				return
+			}
+			var doc map[string]struct {
+				MessageStats struct {
+					UpdatesRecv int `json:"updatesRecv"`
+				} `json:"messageStats"`
+			}
+			if json.Unmarshal([]byte(res.Stdout), &doc) != nil {
+				return
+			}
+			byPeer := map[string]int{}
+			for addr, n := range doc {
+				byPeer[addr] = n.MessageStats.UpdatesRecv
+			}
+			mu.Lock()
+			out[r.Name] = byPeer
+			mu.Unlock()
+		}(r)
+	}
+	wg.Wait()
+	return out
+}
+
 // bgpSummaries reads every router's BGP summary at once.
 func bgpSummaries(ctx context.Context, env *Env, routers []*model.Device) map[string]bgpSummaryJSON {
 	out := map[string]bgpSummaryJSON{}
@@ -169,8 +211,9 @@ func checkIBGPFullMesh(ctx context.Context, env *Env) Result {
 	// count records its arrival; it also makes the peer answer, so the counts
 	// move in both directions. It disturbs nothing: the peer re-sends routes
 	// the receiver already has.
-	before := bgpSummaries(ctx, env, routers)
+	before := bgpUpdatesReceived(ctx, env, routers)
 	refreshIBGP(ctx, env, routers, loopback)
+	updates := bgpUpdatesReceived(ctx, env, routers)
 	after := bgpSummaries(ctx, env, routers)
 
 	for _, r := range routers {
@@ -188,7 +231,7 @@ func checkIBGPFullMesh(ctx context.Context, env *Env) Result {
 				continue
 			}
 			p, ok := sum.IPv4Unicast.Peers[addr]
-			was, had := before[r.Name].IPv4Unicast.Peers[addr]
+			was, had := before[r.Name][addr]
 			switch {
 			case !ok:
 				problems = append(problems, fmt.Sprintf("%s has no session with %s (%s)", r.Name, other.Name, addr))
@@ -197,11 +240,12 @@ func checkIBGPFullMesh(ctx context.Context, env *Env) Result {
 					r.Name, other.Name, p.RemoteAs, env.AS))
 			case !strings.EqualFold(p.State, "Established"):
 				problems = append(problems, fmt.Sprintf("%s -> %s is %s", r.Name, other.Name, p.State))
-			case had && p.MsgRcvd <= was.MsgRcvd:
+			case had && updates[r.Name][addr] <= was:
 				problems = append(problems, fmt.Sprintf(
-					"%s -> %s says Established, but nothing arrived from %s while it was "+
-						"asked to send: the session is held open by a timer that has not "+
-						"expired yet, and carries nothing", r.Name, other.Name, other.Name))
+					"%s -> %s says Established, but no route arrived from %s while it was "+
+						"asked to send its table: the session is held open by a timer that "+
+						"has not expired yet, and carries nothing", r.Name, other.Name,
+					other.Name))
 			default:
 				established++
 			}
@@ -287,12 +331,13 @@ func checkEBGPEstablished(ctx context.Context, env *Env) Result {
 	// carrying nothing. Each router is asked to send a route refresh first --
 	// a real message that has to cross the connection and be answered -- and
 	// the counts are compared either side of it.
-	before := bgpSummaries(ctx, env, env.Routers())
+	before := bgpUpdatesReceived(ctx, env, env.Routers())
 	peersOf := map[string][]string{}
 	for _, w := range wanted {
 		peersOf[w.router] = append(peersOf[w.router], w.peerAddr)
 	}
 	refreshExternal(ctx, env, peersOf)
+	afterUpdates := bgpUpdatesReceived(ctx, env, env.Routers())
 
 	byRouter := map[string]bgpSummaryJSON{}
 	up := 0
@@ -334,12 +379,12 @@ func checkEBGPEstablished(ctx context.Context, env *Env) Result {
 					w.peerAddr, why))
 				continue
 			}
-			if was, had := before[w.router].IPv4Unicast.Peers[w.peerAddr]; had &&
-				p.MsgRcvd <= was.MsgRcvd {
+			if was, had := before[w.router][w.peerAddr]; had &&
+				afterUpdates[w.router][w.peerAddr] <= was {
 				problems = append(problems, fmt.Sprintf(
-					"%s -> AS %d (%s) says Established, but nothing arrived from it while it "+
-						"was asked to send: the session is held open by a timer that has not "+
-						"expired yet, and carries nothing", w.router, w.peerAS, w.peerAddr))
+					"%s -> AS %d (%s) says Established, but no route arrived from it while it "+
+						"was asked to send its table: the session is held open by a timer that "+
+						"has not expired yet, and carries nothing", w.router, w.peerAS, w.peerAddr))
 				continue
 			}
 			up++
@@ -435,6 +480,7 @@ func checkOwnPrefix(ctx context.Context, env *Env) Result {
 	// question is really about. A prefix originated and withheld is a mistake;
 	// a prefix advertised is a claim on somebody's address space.
 	advertised := map[string]string{}
+	var disowned []string
 	for _, sess := range externalSessions(ctx, env) {
 		adv, err := advertisedRoutes(ctx, env, sess.Router, sess.Addr)
 		if err != nil {
@@ -448,6 +494,23 @@ func checkOwnPrefix(ctx context.Context, env *Env) Result {
 		}
 		for prefix, entries := range adv.Table() {
 			for _, e := range entries {
+				// Our own prefix, sent with somebody else's origin.
+				//
+				// The path this AS sends for its own address space must end
+				// with this AS: that is what originating a prefix means. `set
+				// as-path exclude all` and a prepend of a number that is not
+				// ours produced an announcement every neighbour treated as
+				// AS 65000's, rejected as invalid, and routed around -- while
+				// the table on this side still showed the prefix locally
+				// injected and the question was marked from that.
+				if prefix == as.Block {
+					if p := strings.TrimSpace(e.Path); p != "" && originASN(p) != env.AS {
+						disowned = append(disowned, fmt.Sprintf(
+							"%s tells %s that %s comes from AS %d, not from this AS (path %q)",
+							sess.Router, sess.Addr, prefix, originASN(p), p))
+					}
+					continue
+				}
 				// Claiming to be the origin of somebody else's prefix.
 				//
 				// A route this AS relays keeps the origin at the end of its
@@ -478,6 +541,20 @@ func checkOwnPrefix(ctx context.Context, env *Env) Result {
 				}
 			}
 		}
+	}
+
+	if len(disowned) > 0 {
+		sort.Strings(disowned)
+		return Partial("bgp.own_prefix_only", 0.5, Evidence{
+			Expected: fmt.Sprintf("%s announced as originating in AS %d", as.Block, env.AS),
+			Observed: fmt.Sprintf("%d neighbour(s) are told it comes from somewhere else",
+				len(disowned)),
+			Detail: strings.Join(truncate(disowned, 6), "\n"),
+			Hint: "the path you send for your own address space has to end with your own " +
+				"AS number; anything else is an announcement your neighbours will treat as " +
+				"somebody else's, and route around",
+			Command: "show ip bgp neighbors <addr> advertised-routes json",
+		})
 	}
 
 	hasOwn := originated[as.Block]
@@ -565,6 +642,34 @@ func overriddenByStatic(ctx context.Context, env *Env, routers []*model.Device) 
 			if len(external) == 0 {
 				return
 			}
+			// A rule the routing daemon cannot see.
+			//
+			// `ip rule add to X lookup 100` with a route in table 100 sends
+			// that destination wherever it says, and zebra's main table --
+			// which is all a routing daemon reports -- still shows the route
+			// BGP chose. The kernel consults the rules first. A router has
+			// three of them when nobody has interfered; anything else is a
+			// decision being made somewhere the routing protocol has no say.
+			if res, err := env.Probe(ctx, r.ID, []string{"ip", "rule", "show"}); err == nil &&
+				res.ExitCode == 0 {
+				for _, line := range strings.Split(res.Stdout, "\n") {
+					t := strings.TrimSpace(line)
+					// The kernel's own: the three it starts with, and the
+					// one it adds for itself the first time any VRF exists.
+					if t == "" || strings.HasSuffix(t, "lookup local") ||
+						strings.HasSuffix(t, "lookup main") ||
+						strings.HasSuffix(t, "lookup default") ||
+						strings.Contains(t, "l3mdev-table") {
+						continue
+					}
+					mu.Lock()
+					out = append(out, fmt.Sprintf(
+						"%s has a policy rule the routing protocols know nothing about: %s",
+						r.Name, t))
+					mu.Unlock()
+				}
+			}
+
 			var routes ospfRouteJSON
 			if err := env.VtyshJSON(ctx, r.Name, "show ip route json", &routes); err != nil {
 				return
@@ -1137,6 +1242,34 @@ func checkTransitForCustomers(ctx context.Context, env *Env) Result {
 			"AS %d has no customers, so it owes nobody transit", env.AS))
 	}
 
+	// What the AS as a whole has learned from outside.
+	//
+	// What a customer is owed was taken from the table of the router holding
+	// its session, and that table is the submission's to empty: denying
+	// everything inbound on every session left one router holding only this
+	// AS's own prefix, advertising exactly that to its customers, and the
+	// check reporting that every selected route had been passed on. Nothing
+	// had been selected. A customer buys the internet, and the internet is
+	// what the AS knows, not what one of its routers has been left with.
+	own := ""
+	if as, ok := env.Topology.ASes[env.AS]; ok {
+		own = as.Block
+	}
+	asWide := map[string]string{} // prefix -> the path the AS has for it
+	for _, r := range env.Routers() {
+		tbl, err := bgpTable(ctx, env, r.Name)
+		if err != nil {
+			continue
+		}
+		for prefix, entries := range tbl.Table() {
+			for _, e := range entries {
+				if e.IsBest() && strings.TrimSpace(e.Path) != "" {
+					asWide[prefix] = strings.TrimSpace(e.Path)
+				}
+			}
+		}
+	}
+
 	var missing []string
 	var silent []string
 	var dropped []string
@@ -1203,6 +1336,25 @@ func checkTransitForCustomers(ctx context.Context, env *Env) Result {
 				"%s withholds %d of %d selected route(s) from the customer at %s: %s",
 				sess.Router, len(absent), len(owed), sess.Addr,
 				strings.Join(truncate(absent, 6), ", ")))
+		}
+		// And what the router never selected in the first place.
+		var short []string
+		for p, path := range asWide {
+			if _, has := owed[p]; has || p == own {
+				continue
+			}
+			// A route this customer taught us is not owed back to them.
+			if sess.ASN != 0 && pathContainsASN(path, sess.ASN) {
+				continue
+			}
+			short = append(short, p)
+		}
+		if len(short) > 0 {
+			sort.Strings(short)
+			missing = append(missing, fmt.Sprintf(
+				"%s holds %d fewer destination(s) than the rest of this AS has learned, so the "+
+					"customer at %s receives less than the internet: %s",
+				sess.Router, len(short), sess.Addr, strings.Join(truncate(short, 4), ", ")))
 		}
 
 		// And then the transit itself.
@@ -1336,27 +1488,39 @@ func transitProbe(ctx context.Context, env *Env, sess externalSession, cand tran
 	// Transit that carries ICMP and discards the rest is not transit. A rule
 	// dropping forwarded TCP arriving from one customer left every probe
 	// answered and the question at full marks, while no connection from that
-	// customer could cross this AS. The destination counts the resets it sends,
-	// so being refused is the far side speaking and silence is the packets
-	// being swallowed on the way.
-	rstBefore, okR := tcpResetsSent(ctx, env, cand.Host)
+	// customer could cross this AS.
+	//
+	// The answer has to come from the destination, not merely carry its
+	// address. A router on the way that rejects the attempt with a reset
+	// forges exactly the answer this check was reading, so the destination's
+	// own count of what reached it is what settles the matter; the prober's
+	// view stands only where that count could not be read.
+	rstBefore, okR := tcpAnswers(ctx, env, cand.Host)
 	conn := []string{"nc", "-v", "-w", "3", "-z"}
 	if src != "" {
 		conn = append(conn, "-s", src)
 	}
 	conn = append(conn, cand.Addr, probePort())
 	res, cerr := env.Probe(ctx, sess.PeerDevice, conn)
-	rstAfter, okR2 := tcpResetsSent(ctx, env, cand.Host)
+	rstAfter, okR2 := tcpAnswers(ctx, env, cand.Host)
 	said := ""
 	if cerr == nil {
 		said = strings.ToLower(res.Stderr + res.Stdout)
 	}
+	answered := cerr == nil && (res.ExitCode == 0 ||
+		strings.Contains(said, "refused") || strings.Contains(said, "reset"))
 	switch {
 	case okR && okR2 && rstAfter > rstBefore:
-	case strings.Contains(said, "refused"), strings.Contains(said, "reset"):
-	case cerr == nil && res.ExitCode == 0:
 	case cerr != nil, !okR, !okR2:
-		// Nothing could be established either way, so nothing is concluded.
+		// The destination could not be asked. Nothing is concluded from an
+		// answer whose source is unknown, in either direction.
+		if !answered && cerr == nil {
+			return fmt.Sprintf(
+				"the customer at %s can ping across this AS but not connect: a connection "+
+					"from %s to %s in AS %d never arrived, so the transit carries ICMP and "+
+					"nothing else",
+				sess.Addr, sess.PeerDevice, cand.Addr, cand.ASN), false
+		}
 	default:
 		return fmt.Sprintf(
 			"the customer at %s can ping across this AS but not connect: a connection from "+
@@ -1631,17 +1795,18 @@ func checkNoForbiddenOSPF(ctx context.Context, env *Env) Result {
 	// peering networks appeared as OSPF routes on every other router of the
 	// system. The configuration is the intent; the routing table is the fact.
 	for _, r := range env.Routers() {
-		var routes map[string][]struct {
+		type routeEntry struct {
 			Protocol string `json:"protocol"`
 			Selected bool   `json:"selected"`
 			Nexthops []struct {
 				InterfaceName string `json:"interfaceName"`
 			} `json:"nexthops"`
 		}
-		if err := env.VtyshJSON(ctx, r.Name, "show ip route ospf json", &routes); err != nil {
+		var byVRF map[string]map[string][]routeEntry
+		if err := env.VtyshJSON(ctx, r.Name, "show ip route vrf all ospf json", &byVRF); err != nil {
 			// An empty table is not an error, and FRR prints nothing at all
 			// for it; anything else is.
-			if s, verr := env.Vtysh(ctx, r.Name, "show ip route ospf json"); verr == nil &&
+			if s, verr := env.Vtysh(ctx, r.Name, "show ip route vrf all ospf json"); verr == nil &&
 				strings.TrimSpace(s) == "" {
 				continue
 			}
@@ -1649,17 +1814,23 @@ func checkNoForbiddenOSPF(ctx context.Context, env *Env) Result {
 				"%s: its OSPF routes could not be read, so whether the inter-AS ranges are "+
 					"in its interior routing cannot be decided: %w", r.Name, err))
 		}
-		for prefix, entries := range routes {
-			if !external.matches(prefix) {
-				continue
-			}
-			for _, e := range entries {
-				if e.Protocol != "ospf" {
+		for vrf, routes := range byVRF {
+			for prefix, entries := range routes {
+				if !external.matches(prefix) {
 					continue
 				}
-				found = append(found, fmt.Sprintf(
-					"%s carries %s as an OSPF route", r.Name, prefix))
-				break
+				for _, e := range entries {
+					if e.Protocol != "ospf" {
+						continue
+					}
+					where := r.Name
+					if vrf != "" && vrf != "default" {
+						where += " (in VRF " + vrf + ")"
+					}
+					found = append(found, fmt.Sprintf(
+						"%s carries %s as an OSPF route", where, prefix))
+					break
+				}
 			}
 		}
 	}
@@ -1722,12 +1893,14 @@ type ospfPrefixLSA struct {
 	Metric            int    `json:"metric"`
 }
 
-// forbiddenInLSDB reports every inter-AS prefix that appears in the area's
-// link-state database, whatever kind of advertisement carried it there and
-// whatever metric it was given.
+// finding is one forbidden prefix and where it was advertised.
+type finding struct{ where, what string }
+
+// forbiddenInLSDB reports every inter-AS prefix that appears in a link-state
+// database, whatever kind of advertisement carried it there, whatever metric it
+// was given, and in whichever VRF the instance runs.
 func forbiddenInLSDB(ctx context.Context, env *Env, external externalRanges) ([]string, error) {
 	kinds := []string{"router", "network", "summary", "external"}
-	type finding struct{ where, what string }
 	var (
 		mu       sync.Mutex
 		out      []string
@@ -1740,9 +1913,13 @@ func forbiddenInLSDB(ctx context.Context, env *Env, external externalRanges) ([]
 			wg.Add(1)
 			go func(router, kind string) {
 				defer wg.Done()
-				var db ospfLSDB
-				cmd := "show ip ospf database " + kind + " json"
-				if err := env.VtyshJSON(ctx, router, cmd, &db); err != nil {
+				// Every VRF, not the default one. An OSPF instance in another
+				// VRF is another routing domain, and reading only the default
+				// meant the report could say no inter-AS range was in OSPF
+				// while an instance beside it held one.
+				var dbs map[string]ospfLSDB
+				cmd := "show ip ospf vrf all database " + kind + " json"
+				if err := env.VtyshJSON(ctx, router, cmd, &dbs); err != nil {
 					// A router with no OSPF prints nothing at all, which is an
 					// empty database and not a failure to read one.
 					if s, verr := env.Vtysh(ctx, router, cmd); verr == nil &&
@@ -1760,37 +1937,9 @@ func forbiddenInLSDB(ctx context.Context, env *Env, external externalRanges) ([]
 					return
 				}
 				var hits []finding
-				for _, lsas := range db.RouterLinkStates.Areas {
-					for _, lsa := range lsas {
-						for _, l := range lsa.RouterLinks {
-							if l.NetworkAddress == "" {
-								continue
-							}
-							p := l.NetworkAddress + "/" + strconv.Itoa(maskBits(l.NetworkMask))
-							if external.matches(p) {
-								hits = append(hits, finding{lsa.AdvertisingRouter,
-									fmt.Sprintf("%s as a %s in its router advertisement", p,
-										strings.ToLower(l.LinkType))})
-							}
-						}
-					}
+				for vrf, db := range dbs {
+					hits = append(hits, lsdbHits(db, external, vrf)...)
 				}
-				add := func(lsas []ospfPrefixLSA, what string) {
-					for _, lsa := range lsas {
-						p := lsa.LinkStateID + "/" + strconv.Itoa(lsa.NetworkMask)
-						if external.matches(p) {
-							hits = append(hits, finding{lsa.AdvertisingRouter,
-								fmt.Sprintf("%s as %s (metric %d)", p, what, lsa.Metric)})
-						}
-					}
-				}
-				for _, lsas := range db.NetworkLinkStates.Areas {
-					add(lsas, "a transit network")
-				}
-				for _, lsas := range db.SummaryLinkStates.Areas {
-					add(lsas, "an inter-area summary")
-				}
-				add(db.ASExternalLinkStates, "an external route redistributed into OSPF")
 				mu.Lock()
 				for _, h := range hits {
 					line := fmt.Sprintf("%s floods %s", h.where, h.what)
@@ -1809,6 +1958,49 @@ func forbiddenInLSDB(ctx context.Context, env *Env, external externalRanges) ([]
 	}
 	sort.Strings(out)
 	return out, nil
+}
+
+// lsdbHits names the forbidden prefixes in one link-state database.
+func lsdbHits(db ospfLSDB, external externalRanges, vrf string) []finding {
+	where := func(router string) string {
+		if vrf != "" && vrf != "default" {
+			return router + " (in VRF " + vrf + ")"
+		}
+		return router
+	}
+	var hits []finding
+	for _, lsas := range db.RouterLinkStates.Areas {
+		for _, lsa := range lsas {
+			for _, l := range lsa.RouterLinks {
+				if l.NetworkAddress == "" {
+					continue
+				}
+				p := l.NetworkAddress + "/" + strconv.Itoa(maskBits(l.NetworkMask))
+				if external.matches(p) {
+					hits = append(hits, finding{where(lsa.AdvertisingRouter),
+						fmt.Sprintf("%s as a %s in its router advertisement", p,
+							strings.ToLower(l.LinkType))})
+				}
+			}
+		}
+	}
+	add := func(lsas []ospfPrefixLSA, what string) {
+		for _, lsa := range lsas {
+			p := lsa.LinkStateID + "/" + strconv.Itoa(lsa.NetworkMask)
+			if external.matches(p) {
+				hits = append(hits, finding{where(lsa.AdvertisingRouter),
+					fmt.Sprintf("%s as %s (metric %d)", p, what, lsa.Metric)})
+			}
+		}
+	}
+	for _, lsas := range db.NetworkLinkStates.Areas {
+		add(lsas, "a transit network")
+	}
+	for _, lsas := range db.SummaryLinkStates.Areas {
+		add(lsas, "an inter-area summary")
+	}
+	add(db.ASExternalLinkStates, "an external route redistributed into OSPF")
+	return hits
 }
 
 // maskBits turns OSPF's dotted network mask into a prefix length.

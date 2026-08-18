@@ -57,10 +57,12 @@ func execFunc(reply map[string]string) func(context.Context, string, []string) (
 		switch {
 		case strings.Contains(body, "bgp json"), strings.Contains(body, "bgp ipv4 unicast json"):
 			return rt.ExecResult{Stdout: `{"routes":{}}`}, nil
+		case strings.Contains(body, "show ip route vrf all"):
+			return rt.ExecResult{Stdout: `{"default":{}}`}, nil
 		case strings.Contains(body, "show ip route"):
 			return rt.ExecResult{Stdout: "{}"}, nil
-		case strings.Contains(body, "ospf database"):
-			return rt.ExecResult{Stdout: `{"routerId":"3.0.0.1"}`}, nil
+		case strings.Contains(body, "ospf") && strings.Contains(body, "database"):
+			return rt.ExecResult{Stdout: `{"default":{"routerId":"3.0.0.1"}}`}, nil
 		case strings.Contains(body, "rpki prefix-table"):
 			return rt.ExecResult{Stdout: "RPKI/RTR prefix table\n"}, nil
 		}

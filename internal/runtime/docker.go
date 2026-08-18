@@ -273,9 +273,13 @@ func (d *Docker) Remove(ctx context.Context, name string, force bool) error {
 
 // dockerInspect is the subset of `docker inspect` output we consume.
 type dockerInspect struct {
-	ID    string `json:"Id"`
-	Name  string `json:"Name"`
-	State struct {
+	ID string `json:"Id"`
+	// ImageID is the image the container is actually running, which is not
+	// the same thing as the reference it was created from: a tag moves, and a
+	// container created before it moved still runs the older bytes.
+	ImageID string `json:"Image"`
+	Name    string `json:"Name"`
+	State   struct {
 		Status string `json:"Status"`
 		Pid    int    `json:"Pid"`
 		Health *struct {
@@ -309,13 +313,14 @@ func (d *Docker) Inspect(ctx context.Context, name string) (Container, error) {
 
 func fromInspect(r dockerInspect) Container {
 	c := Container{
-		ID:     r.ID,
-		Name:   strings.TrimPrefix(r.Name, "/"),
-		Image:  r.Config.Image,
-		State:  normaliseState(r.State.Status),
-		Status: r.State.Status,
-		PID:    r.State.Pid,
-		Labels: r.Config.Labels,
+		ID:      r.ID,
+		Name:    strings.TrimPrefix(r.Name, "/"),
+		Image:   r.Config.Image,
+		ImageID: r.ImageID,
+		State:   normaliseState(r.State.Status),
+		Status:  r.State.Status,
+		PID:     r.State.Pid,
+		Labels:  r.Config.Labels,
 	}
 	if r.State.Health != nil {
 		c.Health = r.State.Health.Status
@@ -476,7 +481,27 @@ func (d *Docker) CopyTo(ctx context.Context, name, dst string, mode int64, conte
 
 // CopyFrom reads a single file out of a container.
 func (d *Docker) CopyFrom(ctx context.Context, name, src string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, d.bin, "cp", name+":"+src, "-")
+	return d.copyFrom(ctx, name, src, false)
+}
+
+// CopyFromFollow reads a single file out of a container, following a symbolic
+// link at the end of the path.
+//
+// The unfollowed form returns the link itself, which arrives as an archive
+// entry with no contents; a caller comparing a container against its image has
+// to see the same bytes on both sides, and /bin/sh is a link in every image
+// this project ships.
+func (d *Docker) CopyFromFollow(ctx context.Context, name, src string) ([]byte, error) {
+	return d.copyFrom(ctx, name, src, true)
+}
+
+func (d *Docker) copyFrom(ctx context.Context, name, src string, follow bool) ([]byte, error) {
+	args := []string{"cp"}
+	if follow {
+		args = append(args, "-L")
+	}
+	args = append(args, name+":"+src, "-")
+	cmd := exec.CommandContext(ctx, d.bin, args...)
 	var out, errb bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &errb

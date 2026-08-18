@@ -31,11 +31,18 @@ import (
 // form. ovs-vsctl prints lists as "[10, 20]"; the space is stripped along with
 // the brackets, because a trunk written as "trunks=10, 20" is split by the
 // shell and silently loses every VLAN after the first.
-const switchCapture = `for p in $(ovs-vsctl list-ports br0 2>/dev/null); do
+//
+// Every bridge, not br0. The reference answer builds one bridge and this asked
+// for it by name, so a submission that made another -- which is a perfectly
+// good way to build a switch -- had those ports read as absent, and came back
+// from its own snapshot with their VLANs gone.
+const switchCapture = `for b in $(ovs-vsctl list-br 2>/dev/null); do
+for p in $(ovs-vsctl list-ports "$b" 2>/dev/null); do
   tag=$(ovs-vsctl get port "$p" tag 2>/dev/null | tr -d '[] ')
   trunks=$(ovs-vsctl get port "$p" trunks 2>/dev/null | tr -d '[] ')
   mode=$(ovs-vsctl get port "$p" vlan_mode 2>/dev/null | tr -d '"')
   echo "port $p tag=${tag} trunks=${trunks} mode=${mode}"
+done
 done`
 
 // ErrNotRunning reports that a device's container exists but is not running, so

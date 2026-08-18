@@ -2,8 +2,10 @@ package grade
 
 import (
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
+	"math/bits"
 	"net/netip"
 	"regexp"
 	"sort"
@@ -247,6 +249,13 @@ func plannedSubnets(env *Env) map[string]string {
 // ownSubnet reports whether an address is inside the prefix this interface is
 // meant to sit in, which is the student's to choose within.
 func ownSubnet(i *model.Iface, addr string) bool {
+	// Where the assignment dictates the address, only that address is the
+	// student's to have. Excusing anything inside the same subnet let a second
+	// address sit on a prescribed loopback unnoticed -- and a spare address in
+	// the right subnet is exactly what an impersonation needs.
+	if i.Prescribed {
+		return false
+	}
 	if i.Subnet != "" && anyInSubnet([]string{addr}, i.Subnet) {
 		return true
 	}
@@ -329,7 +338,45 @@ type ospfNeighborJSON struct {
 		NbrState  string `json:"nbrState"`
 		IfaceName string `json:"ifaceName"`
 		Converged string `json:"converged"`
+		// DeadTimerMsec is how long this neighbour has left before it is
+		// declared gone. Every hello resets it, so watching it is how a
+		// stopped conversation is told from a state nobody has revised yet.
+		DeadTimerMsec int64 `json:"routerDeadIntervalTimerDueMsec"`
 	} `json:"neighbors"`
+}
+
+// deadTimers reads every router's remaining dead time per interface.
+func deadTimers(ctx context.Context, env *Env) map[string]map[string]int64 {
+	out := map[string]map[string]int64{}
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for _, r := range env.Routers() {
+		wg.Add(1)
+		go func(r *model.Device) {
+			defer wg.Done()
+			var doc ospfNeighborJSON
+			if err := env.VtyshJSON(ctx, r.Name, "show ip ospf neighbor json", &doc); err != nil {
+				return
+			}
+			byIface := map[string]int64{}
+			for _, ns := range doc.Neighbors {
+				for _, n := range ns {
+					iface := n.IfaceName
+					if i := strings.IndexByte(iface, ':'); i >= 0 {
+						iface = iface[:i]
+					}
+					if v, ok := byIface[iface]; !ok || n.DeadTimerMsec > v {
+						byIface[iface] = n.DeadTimerMsec
+					}
+				}
+			}
+			mu.Lock()
+			out[r.Name] = byIface
+			mu.Unlock()
+		}(r)
+	}
+	wg.Wait()
+	return out
 }
 
 // linkDevice is what an interface says about itself beyond its name.
@@ -465,9 +512,33 @@ func checkOSPFAdjacency(ctx context.Context, env *Env) Result {
 	// in for.
 	links := linkIdentities(ctx, env)
 
+	// And that the conversation is still going on.
+	//
+	// A neighbour stays Full until the dead timer expires, which is forty
+	// seconds: discarding OSPF between two routers and grading immediately
+	// found every adjacency Full and carrying nothing. Every hello resets that
+	// timer, so a second reading a hello interval later says whether one
+	// arrived. A healthy adjacency cannot lose more than one hello interval of
+	// dead time between two readings; a silent one loses the whole wait.
+	before := deadTimers(ctx, env)
+	select {
+	case <-ctx.Done():
+	case <-time.After(12 * time.Second):
+	}
+	after := deadTimers(ctx, env)
+
 	var stuck []string
 	got := 0
 	for _, w := range wanted {
+		if b, ok := before[w.router][w.iface]; ok && b > 0 {
+			if a, ok2 := after[w.router][w.iface]; ok2 && a <= b-11000 {
+				stuck = append(stuck, fmt.Sprintf(
+					"%s -> %s on %s says Full, but no hello arrived while it was watched: "+
+						"the state is held by a timer that has not expired yet",
+					w.router, w.peer, w.iface))
+				continue
+			}
+		}
 		if id, known := links[w.router]; known {
 			dev, present := id[w.iface]
 			switch {
@@ -979,9 +1050,9 @@ func carriesTCPBothWays(ctx context.Context, env *Env, from, to string) (string,
 			args = append(args, "-s", addrOnly(slo.Addr4))
 		}
 		args = append(args, addr, probePort())
-		before, okB := tcpResetsSent(ctx, env, dst.ID)
+		before, okB := tcpAnswers(ctx, env, dst.ID)
 		_, _ = env.Probe(ctx, src.ID, args)
-		after, okA := tcpResetsSent(ctx, env, dst.ID)
+		after, okA := tcpAnswers(ctx, env, dst.ID)
 		if okB && okA && after <= before {
 			return fmt.Sprintf(
 				"%s answers pings from %s but no connection to it arrives: the paths carry "+
@@ -1262,16 +1333,194 @@ func checkECMP(ctx context.Context, env *Env) Result {
 
 // checkVLANIsolation verifies that hosts in the same VLAN reach each other
 // directly while hosts in different VLANs are forced through the gateway.
+// labDestinations is every address a frame in this lab could be addressed to:
+// what the plan assigns anywhere in the topology, and what the hosts of this
+// layer-2 domain and their gateway actually have configured. The live half
+// matters because a student may address a host by hand, and a rule aimed at
+// that address is a real way across.
+func labDestinations(ctx context.Context, env *Env, hosts map[int][]*model.Device,
+	gateway *model.Device) []netip.Prefix {
+
+	var out []netip.Prefix
+	add := func(s string) {
+		if s = strings.TrimSpace(s); s == "" {
+			return
+		}
+		if p, err := netip.ParsePrefix(s); err == nil {
+			out = append(out, p.Masked())
+			return
+		}
+		if a, err := netip.ParseAddr(s); err == nil {
+			out = append(out, netip.PrefixFrom(a, a.BitLen()))
+		}
+	}
+	for _, as := range env.Topology.ASes {
+		for _, d := range as.Devices {
+			for _, i := range d.Ifaces {
+				add(i.Addr4)
+				add(i.Addr6)
+			}
+		}
+	}
+	var live []*model.Device
+	for _, hs := range hosts {
+		live = append(live, hs...)
+	}
+	if gateway != nil {
+		live = append(live, gateway)
+	}
+	for _, d := range live {
+		r, err := env.Probe(ctx, d.ID, []string{"ip", "-o", "addr", "show"})
+		if err != nil || r.ExitCode != 0 {
+			continue
+		}
+		for _, l := range strings.Split(r.Stdout, "\n") {
+			f := strings.Fields(l)
+			for i := 0; i+1 < len(f); i++ {
+				if f[i] == "inet" || f[i] == "inet6" {
+					add(f[i+1])
+				}
+			}
+		}
+	}
+	return out
+}
+
+// flowDeliversNothing reports why a flow rule cannot carry a frame between two
+// of this lab's hosts, or "" if it can.
+//
+// A rule restricted to a destination address that nothing in the lab has --
+// left behind by a student testing whether traffic moves between two ports --
+// never carries a frame, and failing the domain for it deducts for a crossing
+// that does not exist. The counter is not what decides this: a rule that has
+// matched nothing yet may match everything a minute later, so excusing rules
+// whose n_packets is zero would pass a submission with its VLANs wide open.
+// What decides it is whether any frame the lab can produce satisfies the match.
+func flowDeliversNothing(match string, inv []netip.Prefix) string {
+	var (
+		field, val string
+		got        bool
+	)
+	for _, tok := range strings.Split(strings.ReplaceAll(match, " ", ","), ",") {
+		k, v, ok := strings.Cut(strings.TrimSpace(tok), "=")
+		if !ok {
+			continue
+		}
+		switch k {
+		case "nw_dst", "ip_dst", "ipv4_dst", "ipv6_dst", "arp_tpa", "nd_target":
+			// The narrowest constraint wins: several are a conjunction, and a
+			// frame has to satisfy every one of them.
+			field, val, got = k, v, true
+		}
+	}
+	if !got {
+		return ""
+	}
+	p, err := parseFlowPrefix(val)
+	if err != nil {
+		return "" // not understood, so not ruled out
+	}
+	// Multicast and broadcast are addressed to nobody in particular, so no
+	// inventory can rule them out.
+	if p.Addr().Is4() {
+		mc := netip.MustParsePrefix("224.0.0.0/4")
+		bc := netip.MustParsePrefix("255.255.255.255/32")
+		if prefixesOverlap(p, mc) || prefixesOverlap(p, bc) {
+			return ""
+		}
+	} else if prefixesOverlap(p, netip.MustParsePrefix("ff00::/8")) {
+		return ""
+	}
+	for _, q := range inv {
+		if prefixesOverlap(p, q) {
+			return ""
+		}
+	}
+	return fmt.Sprintf("only to %s=%s, which nothing in this lab has", field, val)
+}
+
+// parseFlowPrefix reads an address as a flow match writes it: bare, with a
+// prefix length, or with a dotted mask.
+func parseFlowPrefix(v string) (netip.Prefix, error) {
+	if a, m, ok := strings.Cut(v, "/"); ok {
+		if !strings.Contains(m, ".") && !strings.Contains(m, ":") {
+			p, err := netip.ParsePrefix(v)
+			if err != nil {
+				return netip.Prefix{}, err
+			}
+			return p.Masked(), nil
+		}
+		mask, err := netip.ParseAddr(m)
+		if err != nil {
+			return netip.Prefix{}, err
+		}
+		ones := 0
+		for _, b := range mask.AsSlice() {
+			ones += bits.OnesCount8(b)
+		}
+		addr, err := netip.ParseAddr(a)
+		if err != nil {
+			return netip.Prefix{}, err
+		}
+		return netip.PrefixFrom(addr, ones).Masked(), nil
+	}
+	a, err := netip.ParseAddr(v)
+	if err != nil {
+		return netip.Prefix{}, err
+	}
+	return netip.PrefixFrom(a, a.BitLen()), nil
+}
+
+func prefixesOverlap(a, b netip.Prefix) bool {
+	return a.Overlaps(b)
+}
+
+// bridgeOnlyForwards reports whether every action on a bridge merely chooses
+// where a frame goes. A bridge that rewrites addresses, resubmits, or learns
+// can manufacture a frame addressed to anything, so on such a bridge no rule
+// can be ruled out by what the lab addresses.
+func bridgeOnlyForwards(lines []string) bool {
+	inert := map[string]bool{
+		"output": true, "normal": true, "drop": true, "flood": true, "all": true,
+		"local": true, "in_port": true, "controller": true, "strip_vlan": true,
+		"mod_vlan_vid": true, "mod_vlan_pcp": true, "push_vlan": true, "pop_vlan": true,
+	}
+	for _, line := range lines {
+		at := strings.Index(line, "actions=")
+		if at < 0 {
+			continue
+		}
+		for _, a := range ovsSplitActions(line[at+8:]) {
+			a = strings.TrimSpace(a)
+			if a == "" {
+				continue
+			}
+			head, _, _ := strings.Cut(a, ":")
+			head, _, _ = strings.Cut(head, "(")
+			head = strings.ToLower(strings.TrimSpace(head))
+			if _, err := strconv.Atoi(head); err == nil {
+				continue // a bare port number
+			}
+			if !inert[head] {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // crossVLANForwarding names any rule a switch of this domain has been given
 // that forwards a frame from a port in one VLAN out of a port in another.
 //
 // A broadcast probe finds a shared broadcast domain; it does not find a rule
 // aimed at one flow. This reads what the switch has actually been told to do,
 // which covers every protocol at once and needs no packet.
-func crossVLANForwarding(ctx context.Context, env *Env, domain string) []string {
+func crossVLANForwarding(ctx context.Context, env *Env, domain string,
+	inv []netip.Prefix) (leaks, notes []string) {
+
 	as, ok := env.Topology.ASes[env.AS]
 	if !ok {
-		return nil
+		return nil, nil
 	}
 	var out []string
 	for _, d := range as.Devices {
@@ -1281,38 +1530,333 @@ func crossVLANForwarding(ctx context.Context, env *Env, domain string) []string 
 		if domain != "" && d.L2Domain != "" && d.L2Domain != domain {
 			continue
 		}
-		ports, err := env.Probe(ctx, d.ID, []string{"ovs-ofctl", "show", "br0"})
-		if err != nil || ports.ExitCode != 0 {
-			continue
-		}
 		tags, err := env.Probe(ctx, d.ID,
 			[]string{"ovs-vsctl", "--columns=name,tag", "--format=csv", "list", "port"})
 		if err != nil || tags.ExitCode != 0 {
+			out = append(out, fmt.Sprintf(
+				"%s could not be asked which VLAN its ports are in, so nothing it forwards "+
+					"was read", d.Name))
 			continue
 		}
-		byNum, vlanOfPort := ovsPortMap(ports.Stdout, tags.Stdout)
-		flows, err := env.Probe(ctx, d.ID, []string{"ovs-ofctl", "dump-flows", "br0"})
-		if err != nil || flows.ExitCode != 0 {
+		_, vlanOfPort := ovsPortMap("", tags.Stdout)
+		// Anything the kernel has been told to copy, before the switch's own
+		// tables. `tc filter ... action mirred egress mirror dev <other>` on
+		// an access port copies frames into another VLAN without touching a
+		// single OpenFlow rule, and reading only the flow table missed it
+		// entirely.
+		out = append(out, mirroredPorts(ctx, env, d, vlanOfPort)...)
+		out = append(out, ovsMirrors(ctx, env, d, vlanOfPort)...)
+
+		// Every bridge the switch has, not the one the reference answer
+		// happens to build. `br0` was the only name ever asked for, and
+		// `ovs-ofctl show br0` failing meant this switch was passed over in
+		// silence -- so a submission that did its forwarding on a bridge by
+		// any other name was never read at all.
+		list, err := env.Probe(ctx, d.ID, []string{"ovs-vsctl", "list-br"})
+		if err != nil || list.ExitCode != 0 {
+			out = append(out, fmt.Sprintf(
+				"%s could not be asked which bridges it has, so nothing it forwards was read",
+				d.Name))
 			continue
 		}
-		for _, line := range strings.Split(flows.Stdout, "\n") {
-			if !strings.Contains(line, "actions=") {
+		var bridges []string
+		for _, b := range strings.Split(list.Stdout, "\n") {
+			if b = strings.TrimSpace(b); b != "" {
+				bridges = append(bridges, b)
+			}
+		}
+		if len(bridges) == 0 {
+			out = append(out, fmt.Sprintf("%s has no bridge, so it switches nothing", d.Name))
+			continue
+		}
+
+		g := &ovsGraph{vlanOf: vlanOfPort, edges: map[string]map[string]bool{}}
+		for _, br := range bridges {
+			ports, err := env.Probe(ctx, d.ID, []string{"ovs-ofctl", "show", br})
+			if err != nil || ports.ExitCode != 0 {
+				out = append(out, fmt.Sprintf(
+					"%s's bridge %s could not be read, so what it forwards is unknown",
+					d.Name, br))
 				continue
 			}
-			in, outs := ovsFlowPorts(line, byNum)
-			for _, o := range outs {
-				iv, ok1 := vlanOfPort[in]
-				ov, ok2 := vlanOfPort[o]
-				switch {
-				case in != "" && ok1 && ok2 && iv != ov:
-					out = append(out, fmt.Sprintf(
-						"%s is told to send frames from %s (VLAN %d) out of %s (VLAN %d)",
-						d.Name, in, iv, o, ov))
-				case in == "" && ok2:
-					out = append(out, fmt.Sprintf(
-						"%s is told to send frames out of %s (VLAN %d) whatever port they "+
-							"arrived on", d.Name, o, ov))
+			// Port numbers are the bridge's own, so they are resolved against
+			// the bridge that used them and not against whichever bridge was
+			// read first.
+			byNum, _ := ovsPortMap(ports.Stdout, "")
+
+			// A bridge under a controller does not forward by its table alone.
+			// The controller is a program of the student's own, free to send
+			// any frame anywhere on any packet-in, and the flow table shows
+			// none of it. The reference switch has no controller, so saying so
+			// costs a correct answer nothing.
+			if c, err := env.Probe(ctx, d.ID,
+				[]string{"ovs-vsctl", "get-controller", br}); err == nil && c.ExitCode == 0 &&
+				strings.TrimSpace(c.Stdout) != "" {
+				out = append(out, fmt.Sprintf(
+					"%s's bridge %s is run by a controller (%s), which decides where frames "+
+						"go, so what it forwards is not in its table", d.Name, br,
+					strings.Join(strings.Fields(c.Stdout), " ")))
+			}
+
+			// The buckets of every group, because a flow's action can be a
+			// group and the flow table then says nothing at all about where
+			// the frame goes. A switch with no group is the normal case, so
+			// an error here is not one.
+			groups := map[string]string{}
+			if gr, err := env.Probe(ctx, d.ID,
+				[]string{"ovs-ofctl", "dump-groups", br}); err == nil && gr.ExitCode == 0 {
+				groups = ovsGroupBuckets(gr.Stdout)
+			}
+
+			flows, err := env.Probe(ctx, d.ID, []string{"ovs-ofctl", "dump-flows", br})
+			if err != nil || flows.ExitCode != 0 {
+				out = append(out, fmt.Sprintf(
+					"%s's bridge %s would not say what it forwards", d.Name, br))
+				continue
+			}
+			anywhere := "*" + br
+			for _, n := range byNum {
+				g.link(n, anywhere)
+			}
+			// Read once for the flows and once more for whether any of them
+			// ends at NORMAL, because a flow that rewrites a frame and then
+			// resubmits it is delivered by whichever later flow does.
+			var lines []string
+			bridgeHasNormal := false
+			for _, line := range strings.Split(flows.Stdout, "\n") {
+				if !strings.Contains(line, "actions=") {
+					continue
 				}
+				lines = append(lines, line)
+				for _, a := range ovsSplitActions(line[strings.Index(line, "actions=")+8:]) {
+					if strings.EqualFold(strings.TrimSpace(a), "normal") {
+						bridgeHasNormal = true
+					}
+				}
+			}
+			inertBridge := bridgeOnlyForwards(lines)
+			for _, line := range lines {
+				at := strings.Index(line, "actions=")
+				// A rule no frame of this lab can satisfy carries nothing
+				// across, whatever ports it names. Only on a bridge that
+				// merely chooses where frames go: one that rewrites or
+				// resubmits can manufacture a frame addressed to anything.
+				if inertBridge {
+					if why := flowDeliversNothing(line[:at], inv); why != "" {
+						notes = append(notes, fmt.Sprintf(
+							"%s has a rule that forwards %s, so it carries nothing between "+
+								"VLANs; it is not counted against you, but remove it", d.Name, why))
+						continue
+					}
+				}
+				in, outs := ovsFlowPorts(line, byNum, groups)
+				for _, o := range outs {
+					iv, ok1 := vlanOfPort[in]
+					ov, ok2 := vlanOfPort[o]
+					switch {
+					case in != "" && ok1 && ok2 && iv != ov:
+						out = append(out, fmt.Sprintf(
+							"%s is told to send frames from %s (VLAN %d) out of %s (VLAN %d)",
+							d.Name, in, iv, o, ov))
+					case in == "" && ok2:
+						out = append(out, fmt.Sprintf(
+							"%s is told to send frames out of %s (VLAN %d) whatever port they "+
+								"arrived on", d.Name, o, ov))
+					}
+					if in == "" {
+						g.link(anywhere, o)
+					} else {
+						g.link(in, o)
+					}
+				}
+
+				// What the actions do to the frame before the switch decides
+				// where it goes. A flow that names no output port at all can
+				// still carry a frame into another VLAN, by retagging it or
+				// by changing which port it counts as having arrived on and
+				// then letting the switch forward it by VLAN.
+				for _, u := range ovsUnreadableActions(line[at+8:], byNum, vlanOfPort) {
+					out = append(out, d.Name+" "+u)
+				}
+				rw := ovsWalkActions(line[at+8:], byNum)
+				msg, to, known := normalCrossing(d.Name, line[:at], in, rw, vlanOfPort, bridgeHasNormal)
+				if msg != "" {
+					out = append(out, msg)
+				}
+				if msg != "" && known {
+					from := anywhere
+					if in != "" {
+						from = in
+					}
+					for _, n := range byNum {
+						if v, ok := vlanOfPort[n]; ok && v == to {
+							g.link(from, n)
+						}
+					}
+				}
+			}
+		}
+		// A frame put out of a patch port comes in on its peer, which is how
+		// two bridges are joined. Following that is what makes a second
+		// bridge worth reading: on its own it holds no VLAN, and the way
+		// across is the pair of hops through it.
+		for a, b := range ovsPatchPeers(ctx, env, d) {
+			g.patch(a, b)
+		}
+		out = append(out, g.crossings(d.Name)...)
+	}
+	sort.Strings(out)
+	sort.Strings(notes)
+	return out, notes
+}
+
+// ovsGraph is where a frame can get to inside one switch: the ports, and every
+// hop the switch has been told to make between them.
+//
+// One bridge's flow table is not the whole switch. Bridges are joined by patch
+// ports -- what goes out of one arrives on its peer -- so a frame can leave a
+// VLAN 10 port, cross into a second bridge, and come back out somewhere in
+// VLAN 20 without any single flow naming ports in two VLANs. Reading the hops
+// as a graph is what makes that visible.
+type ovsGraph struct {
+	vlanOf map[string]int
+	// from -> to -> whether the hop crosses between bridges.
+	edges map[string]map[string]bool
+}
+
+func (g *ovsGraph) add(from, to string, isPatch bool) {
+	if from == "" || to == "" {
+		return
+	}
+	if g.edges[from] == nil {
+		g.edges[from] = map[string]bool{}
+	}
+	g.edges[from][to] = g.edges[from][to] || isPatch
+}
+
+// link records a hop the switch makes within one bridge.
+func (g *ovsGraph) link(from, to string) { g.add(from, to, false) }
+
+// patch records the hop from a patch port to the peer it arrives on.
+func (g *ovsGraph) patch(from, to string) { g.add(from, to, true) }
+
+// crossings names the ways a frame can get from a port in one VLAN to a port
+// in another by way of a second bridge.
+//
+// Hops within a single bridge are reported where they are read, port by port,
+// so only paths that leave the bridge are named here -- otherwise one flow
+// would be complained about twice.
+func (g *ovsGraph) crossings(dev string) []string {
+	srcs := make([]string, 0, len(g.vlanOf))
+	for p := range g.vlanOf {
+		srcs = append(srcs, p)
+	}
+	sort.Strings(srcs)
+
+	var out []string
+	for _, src := range srcs {
+		v := g.vlanOf[src]
+		type step struct {
+			port    string
+			crossed bool
+		}
+		seen := map[step]bool{{src, false}: true}
+		queue := []step{{src, false}}
+		for len(queue) > 0 {
+			cur := queue[0]
+			queue = queue[1:]
+			nexts := make([]string, 0, len(g.edges[cur.port]))
+			for n := range g.edges[cur.port] {
+				nexts = append(nexts, n)
+			}
+			sort.Strings(nexts)
+			for _, n := range nexts {
+				st := step{n, cur.crossed || g.edges[cur.port][n]}
+				if seen[st] {
+					continue
+				}
+				if u, ok := g.vlanOf[n]; ok && u != v && st.crossed {
+					out = append(out, fmt.Sprintf(
+						"%s is told to carry frames from %s (VLAN %d) across to %s (VLAN %d) "+
+							"by way of another bridge", dev, src, v, n, u))
+					queue = nil
+					break
+				}
+				seen[st] = true
+				queue = append(queue, st)
+			}
+		}
+	}
+	return out
+}
+
+// ovsPatchPeers reads which of a switch's ports are patch ports, and the port
+// each one delivers to.
+func ovsPatchPeers(ctx context.Context, env *Env, d *model.Device) map[string]string {
+	peers := map[string]string{}
+	r, err := env.Probe(ctx, d.ID, []string{"ovs-vsctl", "--columns=name,type,options",
+		"--format=csv", "list", "interface"})
+	if err != nil || r.ExitCode != 0 {
+		return peers
+	}
+	for _, line := range strings.Split(r.Stdout, "\n") {
+		i := strings.Index(line, "peer=")
+		if i < 0 {
+			continue
+		}
+		// The name is the first field; options hold commas of their own, so
+		// the peer is read from where it is written rather than by counting
+		// fields.
+		name := strings.Trim(strings.TrimSpace(strings.SplitN(line, ",", 2)[0]), `"`)
+		peer := line[i+len("peer="):]
+		if j := strings.IndexAny(peer, `,}" `); j >= 0 {
+			peer = peer[:j]
+		}
+		if name != "" && peer != "" && name != "name" {
+			peers[name] = peer
+		}
+	}
+	return peers
+}
+
+// mirroredPorts names the traffic-control rules on a switch that copy frames
+// from a port in one VLAN to a port in another.
+//
+// The switch's own flow table is not the only place a frame can be told to go
+// somewhere: the kernel will copy one for anybody who asks, and a rule doing
+// that leaves the flow table exactly as it should be.
+func mirroredPorts(ctx context.Context, env *Env, d *model.Device,
+	vlanOf map[string]int) []string {
+	var out []string
+	for port, iv := range vlanOf {
+		for _, dir := range []string{"ingress", "egress"} {
+			res, err := env.Probe(ctx, d.ID,
+				[]string{"tc", "filter", "show", "dev", port, dir})
+			if err != nil || res.ExitCode != 0 {
+				continue
+			}
+			for _, line := range strings.Split(res.Stdout, "\n") {
+				t := strings.TrimSpace(line)
+				if !strings.Contains(t, "mirred") {
+					continue
+				}
+				// "... (Egress Mirror to device port_P_EUH) pipe"
+				i := strings.LastIndex(t, "device ")
+				if i < 0 {
+					continue
+				}
+				target := strings.Fields(t[i+len("device "):])
+				if len(target) == 0 {
+					continue
+				}
+				to := strings.Trim(target[0], "()")
+				ov, ok := vlanOf[to]
+				if !ok || ov == iv {
+					continue
+				}
+				out = append(out, fmt.Sprintf(
+					"%s is told to copy frames %s on %s (VLAN %d) to %s (VLAN %d)",
+					d.Name, dir, port, iv, to, ov))
 			}
 		}
 	}
@@ -1320,8 +1864,95 @@ func crossVLANForwarding(ctx context.Context, env *Env, domain string) []string 
 	return out
 }
 
+// ovsMirrors names the switch's own port mirrors that copy frames from a port
+// in one VLAN into a port in another.
+//
+// A mirror is the switch's built-in copier. It leaves the flow table and the
+// kernel's traffic control exactly as a correct switch would have them, and
+// still duplicates every frame of one port onto another whatever VLAN either
+// is in.
+func ovsMirrors(ctx context.Context, env *Env, d *model.Device,
+	vlanOf map[string]int) []string {
+	res, err := env.Probe(ctx, d.ID,
+		[]string{"ovs-vsctl", "--columns=_uuid,name", "--format=csv", "list", "port"})
+	if err != nil || res.ExitCode != 0 {
+		return nil
+	}
+	byUUID := map[string]string{}
+	for _, rec := range ovsCSV(res.Stdout) {
+		if len(rec) >= 2 {
+			byUUID[strings.TrimSpace(rec[0])] = strings.TrimSpace(rec[1])
+		}
+	}
+	mirrors, err := env.Probe(ctx, d.ID, []string{"ovs-vsctl",
+		"--columns=select_src_port,select_dst_port,select_all,output_port",
+		"--format=csv", "list", "mirror"})
+	if err != nil || mirrors.ExitCode != 0 {
+		return nil
+	}
+	var out []string
+	for _, rec := range ovsCSV(mirrors.Stdout) {
+		if len(rec) < 4 {
+			continue
+		}
+		from := append(ovsPortNames(rec[0], byUUID), ovsPortNames(rec[1], byUUID)...)
+		if strings.Contains(rec[2], "true") {
+			for _, p := range byUUID {
+				from = append(from, p)
+			}
+		}
+		for _, to := range ovsPortNames(rec[3], byUUID) {
+			ov, ok := vlanOf[to]
+			if !ok {
+				continue
+			}
+			for _, src := range from {
+				iv, ok := vlanOf[src]
+				if !ok || iv == ov {
+					continue
+				}
+				out = append(out, fmt.Sprintf(
+					"%s is told to copy every frame of %s (VLAN %d) onto %s (VLAN %d)",
+					d.Name, src, iv, to, ov))
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// ovsCSV parses what `ovs-vsctl --format=csv` prints, keeping whatever it
+// managed to read when a line will not parse.
+func ovsCSV(s string) [][]string {
+	r := csv.NewReader(strings.NewReader(s))
+	r.FieldsPerRecord = -1
+	r.LazyQuotes = true
+	var out [][]string
+	for {
+		rec, err := r.Read()
+		if err != nil {
+			return out
+		}
+		out = append(out, rec)
+	}
+}
+
+// ovsPortNames turns a database field holding one port row, or a set of them,
+// into the names of those ports.
+func ovsPortNames(field string, byUUID map[string]string) []string {
+	var out []string
+	for _, t := range strings.FieldsFunc(field, func(r rune) bool {
+		return r == '[' || r == ']' || r == ',' || r == ' ' || r == '"'
+	}) {
+		if n, ok := byUUID[t]; ok {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
 // ovsPortMap reads the switch's port numbering and each port's access VLAN.
-func ovsPortMap(show, csv string) (map[string]string, map[string]int) {
+func ovsPortMap(show, tags string) (map[string]string, map[string]int) {
 	byNum := map[string]string{}
 	for _, line := range strings.Split(show, "\n") {
 		t := strings.TrimSpace(line)
@@ -1336,7 +1967,7 @@ func ovsPortMap(show, csv string) (map[string]string, map[string]int) {
 		byNum[t[:i]] = t[i+1 : j]
 	}
 	vlan := map[string]int{}
-	for _, line := range strings.Split(csv, "\n") {
+	for _, line := range strings.Split(tags, "\n") {
 		f := strings.Split(strings.TrimSpace(line), ",")
 		if len(f) < 2 {
 			continue
@@ -1350,41 +1981,417 @@ func ovsPortMap(show, csv string) (map[string]string, map[string]int) {
 	return byNum, vlan
 }
 
-// ovsFlowPorts pulls the ingress port and every explicit output port out of one
-// line of `ovs-ofctl dump-flows`, resolving numbers to names.
-func ovsFlowPorts(line string, byNum map[string]string) (string, []string) {
-	name := func(tok string) string {
-		tok = strings.Trim(tok, " \t,)")
-		if n, ok := byNum[tok]; ok {
-			return n
-		}
-		return tok
+// ovsFlowPorts pulls the ingress port and every port a flow can send a frame
+// out of, from one line of `ovs-ofctl dump-flows`, resolving numbers to names.
+func ovsFlowPorts(line string, byNum map[string]string, groups map[string]string) (string, []string) {
+	// The match ends where the actions begin, and they are separated by a
+	// space, not a comma. Reading in_port out of the whole line made the port
+	// of `in_port=1 actions=output:2` come out as `1 actions=output:2`, which
+	// resolved to no port at all -- so the flow was read as one that had never
+	// said where its frames came from, and the rule that catches a frame
+	// leaving its VLAN never fired on it.
+	match, actions := line, ""
+	if i := strings.Index(line, "actions="); i >= 0 {
+		match, actions = line[:i], line[i+len("actions="):]
 	}
 	in := ""
-	for _, f := range strings.Split(line, ",") {
+	for _, f := range strings.Split(match, ",") {
 		t := strings.TrimSpace(f)
 		if v, ok := strings.CutPrefix(t, "in_port="); ok {
-			in = name(v)
+			in = ovsPortName(v, byNum)
 		}
 	}
+	return in, ovsActionPorts(actions, byNum, groups, map[string]bool{})
+}
+
+// ovsPortName resolves a port number to the port's name where it can.
+func ovsPortName(tok string, byNum map[string]string) string {
+	// `ovs-ofctl --names` prints ports by name and in quotes, and a quoted
+	// name matches nothing: not the number table, and not the VLAN table
+	// either, so the port was treated as one this had never heard of.
+	tok = strings.Trim(tok, " \t,)\"")
+	if n, ok := byNum[tok]; ok {
+		return n
+	}
+	return tok
+}
+
+// ovsActionPorts expands one action string into every port it can put a frame
+// on, following each group it names into that group's buckets.
+//
+// "output:" is not the only way to emit a frame, and reading only that was
+// enough to miss `enqueue:8:0`, which puts the frame on a queue of port 8 and
+// sends it exactly as `output` would. Every action that names a port counts,
+// and the ones that name none but reach every port -- flood, all -- count as
+// reaching all of them.
+//
+// A group is a second table the flow table only points at: `actions=group:461`
+// names no port whatsoever, and the frame leaves by whichever port the group's
+// buckets say. Reading only the flow table saw an action with no destination
+// and found nothing to complain about, so a group carrying a frame from one
+// VLAN straight into another scored full marks.
+func ovsActionPorts(actions string, byNum map[string]string,
+	groups map[string]string, seen map[string]bool) []string {
 	var outs []string
-	rest := line
-	for {
-		i := strings.Index(rest, "output:")
-		if i < 0 {
+	// Anything of the form "<verb>:<port>[:...]", plus the port-in-parens form.
+	for _, verb := range []string{"output:", "enqueue:", "resubmit:"} {
+		rest := actions
+		for {
+			i := strings.Index(rest, verb)
+			if i < 0 {
+				break
+			}
+			rest = rest[i+len(verb):]
+			end := strings.IndexAny(rest, ", \t")
+			tok := rest
+			if end >= 0 {
+				tok = rest[:end]
+			}
+			// enqueue names the port first and the queue after a colon;
+			// resubmit names a port before a comma inside parentheses.
+			tok = strings.TrimLeft(tok, "(")
+			if j := strings.IndexByte(tok, ':'); j >= 0 {
+				tok = tok[:j]
+			}
+			if tok != "" {
+				outs = append(outs, ovsPortName(tok, byNum))
+			}
+		}
+	}
+	for _, form := range []string{"output(port="} {
+		rest := actions
+		for {
+			i := strings.Index(rest, form)
+			if i < 0 {
+				break
+			}
+			rest = rest[i+len(form):]
+			end := strings.IndexAny(rest, ",) \t")
+			if end < 0 {
+				end = len(rest)
+			}
+			if tok := rest[:end]; tok != "" {
+				outs = append(outs, ovsPortName(tok, byNum))
+			}
+		}
+	}
+	// Every group the actions name, and every group those name in turn. The
+	// visited set is what stops a group that points at itself from spinning.
+	for _, verb := range []string{"group:", "group_id="} {
+		rest := actions
+		for {
+			i := strings.Index(rest, verb)
+			if i < 0 {
+				break
+			}
+			rest = rest[i+len(verb):]
+			id := rest
+			if end := strings.IndexAny(id, ",) \t"); end >= 0 {
+				id = id[:end]
+			}
+			if id == "" || seen[id] {
+				continue
+			}
+			seen[id] = true
+			if b, ok := groups[id]; ok {
+				outs = append(outs, ovsActionPorts(b, byNum, groups, seen)...)
+			}
+		}
+	}
+	// Actions that reach every port at once. Matched as whole actions: the
+	// letters "all" inside a longer word are not the flood action, and
+	// expanding on those would take marks off a switch that forwards nothing
+	// of the sort.
+	for _, a := range ovsSplitActions(actions) {
+		l := strings.ToLower(strings.TrimSpace(a))
+		if l == "flood" || l == "all" {
+			for _, n := range byNum {
+				outs = append(outs, n)
+			}
 			break
 		}
-		rest = rest[i+len("output:"):]
-		end := strings.IndexAny(rest, ", \t")
-		tok := rest
-		if end >= 0 {
-			tok = rest[:end]
+	}
+	return outs
+}
+
+// ovsUnreadableActions describes the actions of a flow whose effect this
+// cannot work out, which is not the same as a flow that does nothing.
+//
+// `output:NXM_NX_REG0[]` sends the frame wherever a register says, and the
+// register is filled in by earlier flows; a reader looking for a port number
+// finds a token that is not one, and a destination that cannot be named cannot
+// be said to be in the frame's own VLAN. `learn(...)` installs flows that do
+// not exist yet, so the table does not yet say what the switch will do. Both
+// are reported as unread rather than passed over: this is the difference
+// between "it forwards nothing across" and "what it forwards could not be
+// read".
+func ovsUnreadableActions(actions string, byNum map[string]string,
+	vlanOf map[string]int) []string {
+	var out []string
+	for _, raw := range ovsSplitActions(actions) {
+		a := strings.TrimSpace(raw)
+		l := strings.ToLower(a)
+		if strings.HasPrefix(l, "learn(") {
+			out = append(out, "installs flows of its own with `learn`, which are not in the "+
+				"table yet, so what it will forward could not be read")
+			continue
 		}
-		if tok != "" {
-			outs = append(outs, name(tok))
+		tok, ok := strings.CutPrefix(l, "output:")
+		if !ok {
+			continue
+		}
+		tok = strings.Trim(tok, " \t\"")
+		// Back out of the port it came in on is not a way into another VLAN.
+		if tok == "" || tok == "in_port" {
+			continue
+		}
+		name := ovsPortName(tok, byNum)
+		if _, known := vlanOf[name]; known {
+			continue
+		}
+		if _, known := byNum[tok]; known {
+			continue
+		}
+		out = append(out, fmt.Sprintf(
+			"is told to send frames out of `%s`, which is not a port this could name, so "+
+				"the VLAN they leave in could not be read", strings.TrimSpace(a)))
+	}
+	return out
+}
+
+// ovsRewrite is what an action list does to a frame before the switch decides
+// where it goes: which VLAN it is now in, which port it now counts as having
+// arrived on, and whether it is then handed to NORMAL.
+//
+// This is the difference between reading an action list and running it.
+// `actions=NORMAL` puts a frame out of the ports of its own VLAN and leaks
+// nothing, which is why it was read as harmless. But an action list is a
+// program: `load:4->NXM_OF_IN_PORT[],mod_vlan_vid:20,NORMAL` hands NORMAL a
+// frame that is now tagged 20 and now claims to have come in on port 4, and
+// NORMAL faithfully delivers it into VLAN 20. Nothing in that flow names an
+// output port, so a reader looking for output ports finds none.
+type ovsRewrite struct {
+	vlan      int  // the VLAN the frame carries after the rewrites
+	vlanKnown bool // whether that VLAN could be worked out
+	vlanSet   bool // whether the actions touched the tag at all
+	inPort    string
+	inKnown   bool
+	inSet     bool
+	normal    bool // handed to NORMAL, which forwards by VLAN
+	resubmit  bool // handed back to the tables, which may end at NORMAL
+}
+
+// ovsVLANValue reads the VLAN out of an action's argument. The forms differ:
+// `mod_vlan_vid:20` carries the id on its own, while `set_field:4116->vlan_vid`
+// and the VLAN_TCI register carry the present bit above it.
+func ovsVLANValue(tok string, masked bool) (int, bool) {
+	tok = strings.TrimSpace(tok)
+	if i := strings.IndexByte(tok, '/'); i >= 0 { // value/mask
+		tok = tok[:i]
+	}
+	n, err := strconv.ParseUint(tok, 0, 32)
+	if err != nil {
+		return 0, false
+	}
+	if masked {
+		return int(n & 0xfff), true
+	}
+	return int(n), true
+}
+
+// ovsWalkActions runs an action list far enough to know what the frame looks
+// like by the time the switch decides where to send it.
+func ovsWalkActions(actions string, byNum map[string]string) ovsRewrite {
+	var r ovsRewrite
+	for _, raw := range ovsSplitActions(actions) {
+		a := strings.TrimSpace(raw)
+		l := strings.ToLower(a)
+		switch {
+		case l == "normal":
+			r.normal = true
+		case strings.HasPrefix(l, "resubmit"):
+			r.resubmit = true
+			// resubmit(<port>,<table>) re-runs the tables with the frame
+			// counting as having arrived on that port.
+			if i := strings.IndexByte(a, '('); i >= 0 {
+				arg := a[i+1:]
+				arg = strings.TrimSuffix(strings.TrimSpace(arg), ")")
+				port := arg
+				if j := strings.IndexByte(port, ','); j >= 0 {
+					port = port[:j]
+				}
+				if port = strings.TrimSpace(port); port != "" {
+					r.inSet = true
+					r.inPort = ovsPortName(port, byNum)
+					_, r.inKnown = byNum[strings.TrimSpace(port)]
+				}
+			}
+		case strings.HasPrefix(l, "mod_vlan_vid:"):
+			r.vlanSet = true
+			r.vlan, r.vlanKnown = ovsVLANValue(a[len("mod_vlan_vid:"):], false)
+		case strings.HasPrefix(l, "strip_vlan"), strings.HasPrefix(l, "pop_vlan"):
+			// The frame leaves untagged, so NORMAL gives it the VLAN of
+			// whichever port it counts as having arrived on.
+			r.vlanSet, r.vlanKnown, r.vlan = true, true, 0
+		case strings.HasPrefix(l, "push_vlan"):
+			r.vlanSet, r.vlanKnown = true, false
+		case strings.HasPrefix(l, "set_field:"), strings.HasPrefix(l, "load:"):
+			arrow := strings.Index(a, "->")
+			if arrow < 0 {
+				continue
+			}
+			val := a[strings.IndexByte(a, ':')+1 : arrow]
+			dst := strings.ToLower(a[arrow+2:])
+			switch {
+			case strings.Contains(dst, "vlan_vid"), strings.Contains(dst, "vlan_tci"):
+				r.vlanSet = true
+				r.vlan, r.vlanKnown = ovsVLANValue(val, true)
+			case strings.Contains(dst, "dl_vlan"):
+				r.vlanSet = true
+				r.vlan, r.vlanKnown = ovsVLANValue(val, false)
+			case strings.Contains(dst, "in_port"):
+				r.inSet = true
+				if n, ok := ovsVLANValue(val, false); ok {
+					num := strconv.Itoa(n)
+					r.inPort = ovsPortName(num, byNum)
+					_, r.inKnown = byNum[num]
+				}
+			}
+		case strings.HasPrefix(l, "move:"):
+			if strings.Contains(l, "in_port") {
+				r.inSet = true // copied from somewhere; the value is not readable here
+			}
+			if strings.Contains(l, "vlan_vid") || strings.Contains(l, "vlan_tci") {
+				r.vlanSet = true
+			}
 		}
 	}
-	return in, outs
+	return r
+}
+
+// ovsMatchVLAN is the VLAN a frame is in when it reaches a flow: the tag the
+// flow matches on if it names one, otherwise the VLAN of the port it came in
+// on, because an access port's frames are in its VLAN by definition.
+func ovsMatchVLAN(line, in string, vlanOf map[string]int) (int, bool) {
+	for _, f := range ovsSplitActions(line) {
+		t := strings.TrimSpace(f)
+		if v, ok := strings.CutPrefix(t, "dl_vlan="); ok {
+			if n, ok := ovsVLANValue(v, false); ok {
+				return n, true
+			}
+		}
+		if v, ok := strings.CutPrefix(t, "vlan_tci="); ok {
+			if n, ok := ovsVLANValue(v, true); ok {
+				return n, true
+			}
+		}
+	}
+	if in != "" {
+		if v, ok := vlanOf[in]; ok {
+			return v, true
+		}
+	}
+	return 0, false
+}
+
+// normalCrossing reports a flow that rewrites a frame and then lets the switch
+// forward it by VLAN, when the VLAN it is forwarded in is not the one it
+// arrived in. It returns the delivered VLAN so the caller can record where
+// such a frame can get to.
+//
+// It says nothing about a flow that rewrites nothing: `priority=0
+// actions=NORMAL` is the whole of a correct switch's table, and NORMAL on an
+// untouched frame keeps it in its own VLAN.
+func normalCrossing(dev, line, in string, r ovsRewrite,
+	vlanOf map[string]int, bridgeHasNormal bool) (string, int, bool) {
+	if !r.vlanSet && !r.inSet {
+		return "", 0, false
+	}
+	if !r.normal && (!r.resubmit || !bridgeHasNormal) {
+		return "", 0, false
+	}
+	from, fromKnown := ovsMatchVLAN(line, in, vlanOf)
+
+	// Where the frame ends up: its own tag if it still has one, otherwise the
+	// VLAN of the port it now counts as having arrived on.
+	to, toKnown := 0, false
+	switch {
+	case r.vlanSet && r.vlanKnown && r.vlan != 0:
+		to, toKnown = r.vlan, true
+	case r.inSet && r.inKnown:
+		to, toKnown = vlanOf[r.inPort]
+	case !r.inSet && in != "":
+		to, toKnown = vlanOf[in]
+	}
+
+	where := "frames"
+	if in != "" {
+		where = "frames from " + in
+	}
+	switch {
+	case fromKnown && toKnown && from == to:
+		return "", 0, false
+	case fromKnown && toKnown:
+		return fmt.Sprintf(
+			"%s is told to put %s (VLAN %d) into VLAN %d and then forward them by VLAN, "+
+				"which delivers them there", dev, where, from, to), to, true
+	default:
+		// One end could not be worked out, and a rewrite was made. Which VLAN
+		// the frame is delivered in is then not something this can vouch for.
+		return fmt.Sprintf(
+			"%s is told to rewrite %s before forwarding them by VLAN, so the VLAN they are "+
+				"delivered in is not the one they arrived in", dev, where), to, toKnown
+	}
+}
+
+// ovsSplitActions splits an action list into its actions, keeping whatever is
+// inside parentheses or brackets together: `resubmit(,10)` and
+// `load:4->NXM_OF_IN_PORT[]` are each one action, commas and all.
+func ovsSplitActions(s string) []string {
+	var out []string
+	depth, start := 0, 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '(', '[':
+			depth++
+		case ')', ']':
+			if depth > 0 {
+				depth--
+			}
+		case ',':
+			if depth == 0 {
+				out = append(out, s[start:i])
+				start = i + 1
+			}
+		}
+	}
+	return append(out, s[start:])
+}
+
+// ovsGroupBuckets reads `ovs-ofctl dump-groups` into the buckets of every
+// group, keyed by group id.
+func ovsGroupBuckets(dump string) map[string]string {
+	out := map[string]string{}
+	for _, line := range strings.Split(dump, "\n") {
+		t := strings.TrimSpace(line)
+		i := strings.Index(t, "group_id=")
+		if i < 0 {
+			continue
+		}
+		id := t[i+len("group_id="):]
+		if j := strings.IndexAny(id, ", \t"); j >= 0 {
+			id = id[:j]
+		}
+		// From the first bucket onwards, and no earlier: what comes before it
+		// names the group's type, and `type=all` is not an instruction to
+		// flood -- reading it as one would fail every switch that has a group.
+		j := strings.Index(t, "bucket=")
+		if id == "" || j < 0 {
+			continue
+		}
+		out[id] += "," + t[j:]
+	}
+	return out
 }
 
 // crossVLANFrames sends a broadcast in one VLAN and asks the other whether it
@@ -1657,7 +2664,8 @@ func checkVLANIsolation(ctx context.Context, env *Env) Result {
 	// where it belonged, and the question kept its mark. A switch that has
 	// been told to send a frame from a port in one VLAN out of a port in
 	// another is not keeping them apart, whatever the frame is.
-	rules := crossVLANForwarding(ctx, env, domain)
+	rules, notes := crossVLANForwarding(ctx, env, domain,
+		labDestinations(ctx, env, hosts, gateway))
 	probed, tested := crossVLANFrames(ctx, env, vlans, hosts, sem)
 	leaks := append(rules, probed...)
 	for i := 0; i < tested-len(probed); i++ {
@@ -1679,7 +2687,7 @@ func checkVLANIsolation(ctx context.Context, env *Env) Result {
 				"probed pairs", crossed, len(rules), len(probed), tested),
 			Detail:  strings.Join(truncate(leaks, 8), "\n"),
 			Hint:    "an access port belongs to one VLAN; check for anything bridging, mirroring or forwarding between them",
-			Command: "arping; ip neigh show; ovs-ofctl dump-flows br0",
+			Command: "arping; ip neigh show; ovs-vsctl list-br; ovs-ofctl dump-flows <bridge>",
 		})
 	}
 
@@ -1694,11 +2702,12 @@ func checkVLANIsolation(ctx context.Context, env *Env) Result {
 	}
 	sort.Strings(problems)
 	var detail strings.Builder
-	detail.WriteString(strings.Join(truncate(problems, 8), "\n"))
+	detail.WriteString(strings.Join(truncate(append(problems, notes...), 8), "\n"))
 
 	if total > 0 && passed == total {
 		return Pass("l2.vlan_isolation", Evidence{
-			Observed: fmt.Sprintf("%d VLANs isolated correctly, routed via %s", len(vlans), gateway.Name)})
+			Observed: fmt.Sprintf("%d VLANs isolated correctly, routed via %s", len(vlans), gateway.Name),
+			Detail:   strings.Join(truncate(notes, 8), "\n")})
 	}
 	return Partial("l2.vlan_isolation", ratio(passed, total), Evidence{
 		Expected: "same VLAN adjacent, different VLANs via the gateway",
@@ -1834,9 +2843,12 @@ func checkInternalReachability(ctx context.Context, env *Env) Result {
 	// all eighty-eight of them succeeding and the question at full marks,
 	// while nothing but a ping could cross between the two. A connection is
 	// attempted to a port nothing is listening on, so no service has to be
-	// arranged: being refused proves the packets made the journey both ways,
-	// where being dropped is silence.
+	// arranged, and the destination's own count of what reached it is read --
+	// a refusal proves only that somebody answered, and any router on the way
+	// can send one carrying the destination's address.
 	pingOnly := unreachableByTCP(ctx, env, hosts, addrOf)
+	pingOnly = append(pingOnly, unreachableByUDP(ctx, env, hosts, addrOf)...)
+	sort.Strings(pingOnly)
 	failed = append(failed, pingOnly...)
 
 	tried := len(pairs) + len(hosts)*(len(hosts)-1)
@@ -1946,52 +2958,128 @@ func serviceAttachments(env *Env) []svcAttachment {
 // unreachableByTCP tries a connection between every ordered pair of hosts and
 // names the ones where the packets do not arrive.
 //
-// The port is one nothing listens on, so the answer is a reset: "refused" is
-// the far side speaking, and silence is something on the path swallowing the
-// attempt. That distinction is the whole test -- both look like a failed
-// connection to the program making it.
+// The port is one nothing listens on, so the answer from a host that receives
+// the attempt is a reset. But a reset is not proof that the host received
+// anything: any router on the way can send one carrying the destination's
+// address, and a student whose network drops forwarded TCP could clear this
+// check with a single `REJECT --reject-with tcp-reset` rule. The destination's
+// own count of the resets it sent is the witness, and silence there is
+// something on the path swallowing the attempt.
 func unreachableByTCP(ctx context.Context, env *Env, hosts []*model.Device,
 	addrOf map[string]string) []string {
-	var (
-		mu  sync.Mutex
-		out []string
-		wg  sync.WaitGroup
-	)
-	sem := make(chan struct{}, 16)
+	type attempt struct{ from, to *model.Device }
+	var pairs []attempt
 	for _, a := range hosts {
 		for _, b := range hosts {
 			if a.ID == b.ID || addrOf[b.ID] == "" {
 				continue
 			}
+			pairs = append(pairs, attempt{a, b})
+		}
+	}
+
+	var (
+		mu  sync.Mutex
+		out []string
+	)
+	// Serialised by destination, so a counter that moved belongs to the
+	// attempt that moved it rather than to somebody else's probe.
+	for _, round := range roundsByDestinationOf(pairs, func(p attempt) string { return p.to.ID }) {
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, 16)
+		for _, p := range round {
 			wg.Add(1)
-			go func(a, b *model.Device) {
+			go func(p attempt) {
 				defer wg.Done()
 				sem <- struct{}{}
 				defer func() { <-sem }()
-				addr := addrOf[b.ID]
-				res, err := env.Probe(ctx, a.ID,
-					[]string{"nc", "-v", "-w", "3", "-z", addr, probePort()})
-				if err != nil {
-					return // the machinery failed, which is not a verdict
-				}
-				answered := res.ExitCode == 0
-				said := strings.ToLower(res.Stderr + res.Stdout)
-				if strings.Contains(said, "refused") || strings.Contains(said, "reset") {
-					answered = true
-				}
-				if answered {
+				addr := addrOf[p.to.ID]
+				w, ok := tryConnection(ctx, env, p.from.ID, p.to.ID, addr, probePort())
+				if !ok || w.reached() {
 					return
 				}
 				mu.Lock()
 				out = append(out, fmt.Sprintf(
 					"%s can ping %s (%s) but no connection to it arrives: something on the "+
-						"path carries ICMP and discards the rest", a.Name, b.Name, addr))
+						"path carries ICMP and discards the rest", p.from.Name, p.to.Name, addr))
 				mu.Unlock()
-			}(a, b)
+			}(p)
+		}
+		wg.Wait()
+	}
+	sort.Strings(out)
+	return out
+}
+
+// unreachableByUDP sends a datagram between every ordered pair of hosts and
+// names the ones that do not arrive.
+//
+// Arrival is read at the far side, from its count of datagrams delivered for a
+// port nothing is bound to. The sender cannot be trusted to tell: when the
+// datagram is dropped it hears nothing, and hearing nothing is exactly what
+// `nc` reports as success.
+//
+// The pairs are done in rounds, each round a different offset, so that no two
+// senders aim at the same host at once and the counter says who arrived.
+func unreachableByUDP(ctx context.Context, env *Env, hosts []*model.Device,
+	addrOf map[string]string) []string {
+	n := len(hosts)
+	if n < 2 {
+		return nil
+	}
+	var out []string
+	for k := 1; k < n; k++ {
+		before := udpCounters(ctx, env, hosts)
+		var wg sync.WaitGroup
+		for i, src := range hosts {
+			dst := hosts[(i+k)%n]
+			if addrOf[dst.ID] == "" {
+				continue
+			}
+			wg.Add(1)
+			go func(src, dst *model.Device) {
+				defer wg.Done()
+				_, _ = env.Probe(ctx, src.ID, []string{"sh", "-c",
+					"echo twinet | nc -u -w 2 " + addrOf[dst.ID] + " " + probePort()})
+			}(src, dst)
+		}
+		wg.Wait()
+		after := udpCounters(ctx, env, hosts)
+		for i, src := range hosts {
+			dst := hosts[(i+k)%n]
+			b, okB := before[dst.ID]
+			a, okA := after[dst.ID]
+			if !okB || !okA || a > b {
+				continue
+			}
+			out = append(out, fmt.Sprintf(
+				"a datagram from %s to %s (%s) never arrived, though pings and connections "+
+					"do: something on the path is filtering by protocol",
+				src.Name, dst.Name, addrOf[dst.ID]))
 		}
 	}
-	wg.Wait()
 	sort.Strings(out)
+	return out
+}
+
+// udpCounters reads every host's count of datagrams delivered for an unbound
+// port, at once.
+func udpCounters(ctx context.Context, env *Env, hosts []*model.Device) map[string]int {
+	out := map[string]int{}
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for _, h := range hosts {
+		wg.Add(1)
+		go func(h *model.Device) {
+			defer wg.Done()
+			if n, ok := udpNoPortsV4(ctx, env, h.ID); ok {
+				mu.Lock()
+				out[h.ID] = n
+				mu.Unlock()
+			}
+		}(h)
+	}
+	wg.Wait()
 	return out
 }
 

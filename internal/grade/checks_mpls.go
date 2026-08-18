@@ -4,8 +4,12 @@ import (
 	"context"
 	"fmt"
 	"net/netip"
+	"path"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/HongyuHe/twinet/internal/model"
 )
@@ -100,6 +104,19 @@ func checkBGPFreeCore(ctx context.Context, env *Env) Result {
 				break
 			}
 		}
+		// And what `vtysh` is not connected to.
+		//
+		// `vtysh` speaks to one set of sockets, and a second BGP daemon does
+		// not have to use them: FRR will run as many instances as you like,
+		// each in its own pathspace with its own socket, and a daemon that is
+		// not FRR at all shares none of its furniture. Either holds sessions,
+		// a table and an identifier while `show bgp summary` answers for an
+		// instance that does not exist.
+		hidden, err := hiddenBGP(ctx, env, d.Name)
+		if err != nil {
+			return Errored("mpls.bgp_free_core", err)
+		}
+		bad = append(bad, hidden...)
 	}
 	// And no edge may name a core router as a neighbour: a session configured
 	// towards a router with no BGP sits idle and is easy to miss.
@@ -137,8 +154,216 @@ func checkBGPFreeCore(ctx context.Context, env *Env) Result {
 	})
 }
 
-// checkLDPAdjacencies confirms label distribution reached the forwarding table.
+// hiddenBGP reports the BGP a router is running somewhere `vtysh` is not
+// looking.
 //
+// `vtysh` connects to one set of sockets under /var/run/frr, and asking it
+// whether a router runs BGP asks only about the daemons that own those
+// sockets. FRR will run as many instances as it is told to, each in a
+// pathspace of its own with its own sockets, and `vtysh -c 'show bgp summary'`
+// answers "BGP instance not found" for a router holding an established session,
+// a table and an identifier in one of them. A daemon that is not FRR at all
+// shares none of FRR's furniture and is just as invisible.
+//
+// So the router is asked what it is running rather than what it will admit to:
+// its processes, its sockets, and every FRR pathspace either of those reveals.
+// None of this fires on a core router as the exercise wants it -- FRR starts
+// bgpd there and leaves it unconfigured, which holds nothing, listens on
+// nothing and is the state being asked for.
+func hiddenBGP(ctx context.Context, env *Env, device string) ([]string, error) {
+	id := model.DeviceID(env.AS, device)
+
+	ps, err := env.Probe(ctx, id, []string{"ps", "-eo", "args"})
+	if err != nil {
+		return nil, err
+	}
+	if ps.ExitCode != 0 {
+		return nil, fmt.Errorf("could not list what %s is running, so whether it runs a "+
+			"second BGP daemon cannot be told: %s", device, firstLine(ps.Stderr))
+	}
+	spaces, out := bgpDaemons(device, ps.Stdout)
+
+	// The sockets of a pathspace, for a daemon whose own name says nothing --
+	// a copy of bgpd under another name is still an FRR daemon and still puts
+	// its socket where FRR does.
+	socks, err := env.Probe(ctx, id, []string{"sh", "-c",
+		`for f in /var/run/frr/*/*.vty; do [ -e "$f" ] && echo "$f"; done`})
+	if err != nil {
+		return nil, err
+	}
+	for _, line := range strings.Split(socks.Stdout, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		ns := path.Base(path.Dir(line))
+		if !slices.Contains(spaces, ns) {
+			spaces = append(spaces, ns)
+			out = append(out, fmt.Sprintf("%s runs a second FRR instance in pathspace %q",
+				device, ns))
+		}
+	}
+
+	// What each of them holds, so the report says something a marker can act
+	// on rather than only that something is there.
+	sort.Strings(spaces)
+	for _, ns := range spaces {
+		res, err := env.Probe(ctx, id, []string{"vtysh", "-N", ns, "-c", "show bgp summary"})
+		if err != nil {
+			return nil, err
+		}
+		if res.ExitCode != 0 || strings.Contains(res.Stdout, "instance not found") {
+			continue
+		}
+		if n := bgpPeerCount(res.Stdout); n > 0 {
+			out = append(out, fmt.Sprintf("%s holds %d BGP neighbour(s) in pathspace %q, "+
+				"where the default vtysh cannot see them", device, n, ns))
+		}
+	}
+
+	// And the wire, because a BGP daemon that has been configured opens the
+	// BGP port whatever it calls itself. A core router as the exercise wants
+	// it has no socket on 179 in any state.
+	ss, err := env.Probe(ctx, id, []string{"ss", "-Htan"})
+	if err != nil {
+		return nil, err
+	}
+	if ss.ExitCode != 0 {
+		return nil, fmt.Errorf("could not read the sockets of %s, so whether it speaks BGP "+
+			"cannot be told: %s", device, firstLine(ss.Stderr))
+	}
+	out = append(out, bgpSockets(device, ss.Stdout)...)
+	return out, nil
+}
+
+// bgpSpeakers names the programs that speak BGP, by the name they run under.
+//
+// FRR's own bgpd is the one the exercise expects to be present and idle, so it
+// is judged by how it was started rather than by being there at all; the rest
+// have no reason to be on a core router in any state.
+var bgpSpeakers = map[string]string{
+	"bird": "BIRD", "bird6": "BIRD", "gobgpd": "GoBGP", "exabgp": "ExaBGP",
+	"openbgpd": "OpenBGPD", "bgpd-openbsd": "OpenBGPD",
+}
+
+// bgpDaemons reads a process listing for BGP daemons the grader is not talking
+// to, and returns the FRR pathspaces among them.
+func bgpDaemons(device, ps string) (spaces, findings []string) {
+	defaults := 0
+	for _, line := range strings.Split(ps, "\n") {
+		args := strings.Fields(line)
+		if len(args) == 0 {
+			continue
+		}
+		prog := path.Base(args[0])
+		if name, ok := bgpSpeakers[prog]; ok {
+			findings = append(findings, fmt.Sprintf("%s runs %s, a BGP daemon of its own",
+				device, name))
+			continue
+		}
+		if prog != "bgpd" {
+			continue
+		}
+		ns := pathspaceOf(args)
+		switch {
+		case ns != "":
+			spaces = append(spaces, ns)
+			findings = append(findings, fmt.Sprintf(
+				"%s runs a second BGP daemon in pathspace %q, which vtysh does not answer for",
+				device, ns))
+		default:
+			// The one FRR starts. A second copy of it, started by hand with
+			// its own socket, is not that one.
+			defaults++
+			if defaults > 1 {
+				findings = append(findings, fmt.Sprintf(
+					"%s runs %d BGP daemons; vtysh answers for one of them", device, defaults))
+			}
+		}
+	}
+	return spaces, findings
+}
+
+// pathspaceOf reads the FRR pathspace a daemon was started in, by whichever of
+// the three spellings started it. A daemon given its own socket directory
+// rather than a pathspace is reported under that directory's name, because it
+// is the same act.
+func pathspaceOf(args []string) string {
+	for i, a := range args {
+		switch {
+		case a == "-N" || a == "--pathspace":
+			if i+1 < len(args) {
+				return args[i+1]
+			}
+		case strings.HasPrefix(a, "--pathspace="):
+			return strings.TrimPrefix(a, "--pathspace=")
+		case a == "--vty_socket":
+			if i+1 < len(args) {
+				return path.Base(strings.TrimSuffix(args[i+1], "/"))
+			}
+		case strings.HasPrefix(a, "--vty_socket="):
+			return path.Base(strings.TrimSuffix(strings.TrimPrefix(a, "--vty_socket="), "/"))
+		}
+	}
+	return ""
+}
+
+// bgpPeerCount reads how many neighbours a summary lists, so the evidence can
+// say what was hidden rather than only that something was.
+func bgpPeerCount(summary string) int {
+	for _, line := range strings.Split(summary, "\n") {
+		f := strings.Fields(strings.TrimSpace(line))
+		if len(f) >= 4 && f[0] == "Total" && f[1] == "number" && f[2] == "of" {
+			n, err := strconv.Atoi(f[len(f)-1])
+			if err == nil {
+				return n
+			}
+		}
+	}
+	return 0
+}
+
+// bgpSockets reports every socket on the BGP port, whoever opened it.
+//
+// This is what catches a BGP speaker that has been renamed: the name it runs
+// under is its to choose, and the port its peers connect to is not.
+func bgpSockets(device, ss string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, line := range strings.Split(ss, "\n") {
+		f := strings.Fields(line)
+		if len(f) < 5 {
+			continue
+		}
+		state, local, peer := f[0], f[3], f[4]
+		var what string
+		switch {
+		case portOf(local) == "179" && state == "LISTEN":
+			what = fmt.Sprintf("%s is listening for BGP connections on %s", device, local)
+		case portOf(local) == "179" || portOf(peer) == "179":
+			what = fmt.Sprintf("%s holds a BGP connection, %s to %s", device, local, peer)
+		default:
+			continue
+		}
+		if !seen[what] {
+			seen[what] = true
+			out = append(out, what)
+		}
+	}
+	return out
+}
+
+// portOf reads the port from an ss address, which is the text after the last
+// colon in both `0.0.0.0:179` and `[::]:179`.
+func portOf(addr string) string {
+	i := strings.LastIndex(addr, ":")
+	if i < 0 {
+		return ""
+	}
+	return addr[i+1:]
+}
+
+// checkLDPAdjacencies confirms label distribution reached the forwarding table.
 // An operational LDP session is not the claim. A router can hold every session
 // and still install nothing, and a router can install labels the kernel then
 // refuses to act on. Both were real failures here. So the session and the
@@ -228,10 +453,13 @@ func checkLDPAdjacencies(ctx context.Context, env *Env) Result {
 
 // checkVPNReachability asks whether each customer's sites can reach each other.
 //
-// It pings between hosts of the same customer, from one site to another. That
+// It sends between hosts of the same customer, from one site to another. That
 // is the only claim the exercise makes that a student can be sure of: the
 // branches run ordinary eBGP and know nothing about MPLS, so if two sites of a
 // bank can reach each other it is because the provider carried them.
+//
+// Ping, connection and datagram, because a bank's branches exchange none of
+// their business over ICMP.
 func checkVPNReachability(ctx context.Context, env *Env) Result {
 	groups, err := customerGroups(env)
 	if err != nil {
@@ -255,6 +483,7 @@ func checkVPNReachability(ctx context.Context, env *Env) Result {
 	var problems []string
 	tried := 0
 	sentTo := map[string]int{}
+	var carried []directedPair
 	for name, sites := range groups {
 		if len(sites) < 2 {
 			continue
@@ -275,11 +504,15 @@ func checkVPNReachability(ctx context.Context, env *Env) Result {
 						problems = append(problems, fmt.Sprintf(
 							"%s cannot reach %s (%s), both sites of %s",
 							d.from.host, d.to.host, d.to.addr, name))
+						continue
 					}
+					carried = append(carried, d)
 				}
 			}
 		}
 	}
+	// The pairs that answer a ping are asked to carry ordinary traffic too.
+	pingOnly, pingOnlyPairs := vpnTransportGaps(ctx, env, carried)
 	after := receivedEchoesAt(ctx, env, allSites)
 	for _, site := range allSites {
 		if sentTo[site.host] == 0 {
@@ -308,11 +541,109 @@ func checkVPNReachability(ctx context.Context, env *Env) Result {
 			Command:  "ping",
 		})
 	}
+	if len(pingOnly) > 0 {
+		// Half: the tables are joined and the pings cross, so the VPN exists,
+		// but a link that carries nothing a customer would send is not one they
+		// could use.
+		return Partial("vpn.site_reachability", 0.5, Evidence{
+			Expected: "each customer's sites exchange ordinary traffic, not only pings",
+			Observed: fmt.Sprintf("%d of %d site pair(s) carry ICMP and nothing else",
+				pingOnlyPairs, tried),
+			Detail: strings.Join(truncate(pingOnly, 6), "\n"),
+			Hint: "a VPN that answers a ping but drops connections and datagrams is not " +
+				"carrying the customer; check for filtering by protocol on the edge",
+			Command: "nc; /proc/net/snmp",
+		})
+	}
 	return Pass("vpn.site_reachability", Evidence{
 		Expected: "each customer's sites reach each other",
-		Observed: fmt.Sprintf("%d site pair(s) reachable, and every site received the traffic "+
-			"addressed to it", tried),
+		Observed: fmt.Sprintf("%d site pair(s) reachable by ping, connection and datagram, and "+
+			"every site received the traffic addressed to it", tried),
 	})
+}
+
+// vpnTransportGaps names the site pairs that answer a ping but do not carry
+// ordinary traffic.
+//
+// A VPN carrying ICMP and nothing else is not one a customer could use, and
+// ICMP is the easy thing to leave working: dropping TCP and UDP on the
+// provider's edges left every probe of this question succeeding and the mark
+// untouched, on a network where no bank could have opened a connection to its
+// own branch.
+//
+// Both transports are tried, in the direction the pair names, and arrival is
+// read at the destination. The sender's view is not evidence on its own: a
+// rule on the path can answer a connection with a reset of its own making, and
+// a dropped datagram is indistinguishable from a delivered one to whoever sent
+// it. The destination's kernel counts the resets it sent and the datagrams it
+// took delivery of for an unbound port, and neither is a number anything on the
+// way can raise.
+//
+// One pair at a time, so that a counter that moves belongs to the probe that
+// just ran. Returns the gaps found and how many pairs they fall across.
+func vpnTransportGaps(ctx context.Context, env *Env, pairs []directedPair) ([]string, int) {
+	var out []string
+	affected := 0
+	for _, d := range pairs {
+		n := len(out)
+		if p := vpnTCPGap(ctx, env, d); p != "" {
+			out = append(out, p)
+		}
+		if p := vpnUDPGap(ctx, env, d); p != "" {
+			out = append(out, p)
+		}
+		if len(out) > n {
+			affected++
+		}
+	}
+	sort.Strings(out)
+	return out, affected
+}
+
+// vpnTCPGap attempts one connection across a site pair and reports what did not
+// happen.
+func vpnTCPGap(ctx context.Context, env *Env, d directedPair) string {
+	before, okB := tcpAnswers(ctx, env, d.to.host)
+	res, err := env.Probe(ctx, d.from.host,
+		[]string{"nc", "-v", "-w", "3", "-z", d.to.addr, probePort()})
+	if err != nil {
+		return "" // the machinery failed, which is not a verdict
+	}
+	after, okA := tcpAnswers(ctx, env, d.to.host)
+	said := strings.ToLower(res.Stderr + res.Stdout)
+	answered := res.ExitCode == 0 ||
+		strings.Contains(said, "refused") || strings.Contains(said, "reset")
+	arrived := okB && okA && after > before
+
+	switch {
+	case answered && okB && okA && !arrived:
+		return fmt.Sprintf("%s got an answer from %s (%s) to a connection %s never saw: "+
+			"something on the path is answering for it", d.from.host, d.to.host, d.to.addr,
+			d.to.host)
+	case !answered && arrived:
+		return fmt.Sprintf("a connection from %s reaches %s (%s) but the answer does not come "+
+			"back, though pings do", d.from.host, d.to.host, d.to.addr)
+	case !answered:
+		return fmt.Sprintf("%s can ping %s (%s) but no connection to it arrives: the VPN is "+
+			"carrying ICMP and discarding the rest", d.from.host, d.to.host, d.to.addr)
+	}
+	return ""
+}
+
+// vpnUDPGap sends one datagram across a site pair and reads, at the far side,
+// whether it arrived.
+func vpnUDPGap(ctx context.Context, env *Env, d directedPair) string {
+	before, okB := datagramsDelivered(ctx, env, d.to)
+	if _, err := env.Probe(ctx, d.from.host, []string{"sh", "-c",
+		"echo twinet | nc -u -w 2 " + d.to.addr + " " + probePort()}); err != nil {
+		return ""
+	}
+	after, okA := datagramsDelivered(ctx, env, d.to)
+	if !okB || !okA || after > before {
+		return ""
+	}
+	return fmt.Sprintf("a datagram from %s to %s (%s) never arrived, though pings do: the VPN "+
+		"is filtering by protocol", d.from.host, d.to.host, d.to.addr)
 }
 
 // receivedEchoesAt reads each site host's count of ICMP echo requests the
@@ -398,12 +729,14 @@ func checkVPNIsolation(ctx context.Context, env *Env) Result {
 	// this replaced walked straight past it.
 	var leaks []string
 	tried := 0
+	var crossPairs []directedPair
 	for x := 0; x < len(names); x++ {
 		for y := x + 1; y < len(names); y++ {
 			for _, a := range groups[names[x]] {
 				for _, b := range groups[names[y]] {
 					for _, d := range directed(a, b) {
 						tried++
+						crossPairs = append(crossPairs, d)
 						reached, err := env.reaches(ctx, d.from.host, d.to.addr)
 						if err != nil {
 							return Errored("vpn.isolation", err)
@@ -418,6 +751,13 @@ func checkVPNIsolation(ctx context.Context, env *Env) Result {
 			}
 		}
 	}
+	// The same pairs over the transports a ping does not exercise. Isolation
+	// asked only of ICMP is isolation of ICMP: a path that discards echo
+	// requests between the customers and carries their connections and
+	// datagrams reads as perfectly separated tables, while the two banks are
+	// exchanging traffic.
+	leaks = append(leaks, vpnCrossTalk(ctx, env, crossPairs)...)
+
 	// And the tables themselves, because a probe that needs a reply cannot see
 	// a leak that only goes one way.
 	//
@@ -446,9 +786,121 @@ func checkVPNIsolation(ctx context.Context, env *Env) Result {
 	return Pass("vpn.isolation", Evidence{
 		Expected: "customers are kept apart, over a VPN that carries their traffic",
 		Observed: fmt.Sprintf("%d directed site pair(s) across %d customer(s) mutually "+
-			"unreachable, and no customer's table holds another's prefixes",
-			tried, len(names)),
+			"unreachable by ping, connection and datagram, and no customer's table holds "+
+			"another's prefixes", tried, len(names)),
 	})
+}
+
+// vpnCrossTalk names the cross-customer pairs that exchange anything at all.
+//
+// The ping between them is one protocol of three, and the one a leak is most
+// likely to be missing: a path that discards echo requests and carries the rest
+// is separated for the purposes of a check built on ping and joined for the
+// purposes of the customers. Both other transports are tried, and the evidence
+// for each is chosen so that a leak has to be real:
+//
+//   - a connection counts only when the destination itself answered it, which
+//     its kernel records and nothing on the path can forge. A reset carries the
+//     destination's address because whoever wrote it put that address on it,
+//     and a provider that rejects cross-customer traffic rather than dropping
+//     it silently -- which is isolation, done more helpfully -- was read as the
+//     two customers talking to each other;
+//   - a datagram counts only when the far side's kernel takes delivery of
+//     several, so that a single unrelated packet arriving in the window is not
+//     read as a breach and does not cost a correct submission its marks.
+func vpnCrossTalk(ctx context.Context, env *Env, pairs []directedPair) []string {
+	var (
+		mu  sync.Mutex
+		out []string
+	)
+	// Serialised by destination: a counter that moved is only attributable to
+	// this attempt if no other attempt is aimed at the same host at the time.
+	for _, round := range roundsByDestinationOf(pairs, func(d directedPair) string {
+		return d.to.host
+	}) {
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, 8)
+		for _, d := range round {
+			wg.Add(1)
+			go func(d directedPair) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+				w, ok := tryConnection(ctx, env, d.from.host, d.to.host, d.to.addr, probePort())
+				if !ok || !w.proves() {
+					return
+				}
+				mu.Lock()
+				out = append(out, fmt.Sprintf(
+					"a connection from %s to %s (%s) was answered by %s itself: the two "+
+						"customers are not separated, whatever happens to their pings",
+					d.from.host, d.to.host, d.to.addr, d.to.host))
+				mu.Unlock()
+			}(d)
+		}
+		wg.Wait()
+	}
+	out = append(out, vpnDatagramLeaks(ctx, env, pairs)...)
+	sort.Strings(out)
+	return out
+}
+
+// vpnDatagramLeaks sends datagrams across every cross-customer pair and reads,
+// at each destination, whether they arrived.
+//
+// A datagram is one way, so the sender learns nothing; the destination's count
+// of datagrams delivered for an unbound port is the only witness. The pairs are
+// scheduled so that no destination is aimed at twice at once, which is what
+// makes a counter that moved attributable to the sender that moved it.
+func vpnDatagramLeaks(ctx context.Context, env *Env, pairs []directedPair) []string {
+	const burst = 3 // several, so one stray packet in the window is not a verdict
+
+	var out []string
+	for _, round := range roundsByDestinationOf(pairs, func(d directedPair) string {
+		return d.to.host
+	}) {
+		before := map[string]int{}
+		for _, d := range round {
+			if n, ok := datagramsDelivered(ctx, env, d.to); ok {
+				before[d.to.host] = n
+			}
+		}
+		var wg sync.WaitGroup
+		for _, d := range round {
+			wg.Add(1)
+			go func(d directedPair) {
+				defer wg.Done()
+				for i := 0; i < burst; i++ {
+					_, _ = env.Probe(ctx, d.from.host, []string{"sh", "-c",
+						"echo twinet | nc -u -w 1 " + d.to.addr + " " + probePort()})
+				}
+			}(d)
+		}
+		wg.Wait()
+		for _, d := range round {
+			b, ok := before[d.to.host]
+			if !ok {
+				continue
+			}
+			a, ok := datagramsDelivered(ctx, env, d.to)
+			if !ok || a-b < burst {
+				continue
+			}
+			out = append(out, fmt.Sprintf(
+				"datagrams from %s arrived at %s (%s): the two customers are not separated, "+
+					"whatever happens to their pings", d.from.host, d.to.host, d.to.addr))
+		}
+	}
+	return out
+}
+
+// datagramsDelivered reads a site's count of datagrams the kernel took delivery
+// of for a port nothing is bound to, in the family the site is addressed in.
+func datagramsDelivered(ctx context.Context, env *Env, s sitePoint) (int, bool) {
+	if strings.Contains(s.addr, ":") {
+		return udpNoPorts(ctx, env, s.host)
+	}
+	return udpNoPortsV4(ctx, env, s.host)
 }
 
 // anyCustomerTrafficArrives reports whether at least one customer's site can

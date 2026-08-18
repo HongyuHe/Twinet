@@ -233,6 +233,225 @@ still keeps hidden checks for the graded run.
 - The event log records whether the graded AS's config matches what was live in
   the class network at the deadline.
 
+### The programs a mark rests on
+
+A student has root in their own containers — that is the exercise. It also means
+every program the grader runs there is theirs to replace. A shell script called
+`ping` that prints `3 packets transmitted, 3 received` earns the reachability
+marks on a network that forwards nothing, and one called `vtysh` earns the
+configuration marks for configuration that was never written. Neither has to
+overwrite the image's copy: a file earlier on the search path is the one that
+runs.
+
+So before a grading command executes in a container, its programs are compared
+against the image it is running. Both sides are read by the grader, never by
+asking the container: the container's through `/proc` on its node, the image's
+out of a container of that image created and never started. Resolution follows
+the search path, so a `ping` planted in `/usr/local/bin` is found while the
+image's copy sits untouched below it, and a program the image does not ship at
+all is a plant. A program the student *removed* is not a finding — it cannot
+answer anything either.
+
+A container that fails this is **not marked down**. The run is quarantined and
+says which container and which program, because a grader that cannot trust what
+it was told does not know what the marks should have been.
+
+Two consequences worth knowing:
+
+- Rebuilding the images under a tag that already has containers leaves those
+  containers running bytes the node may no longer have. Grading then stops with
+  "this container is running an image that is no longer on this node"; redeploy
+  the lab.
+- `twinet grade batch` is unaffected either way: it rebuilds every container
+  from the image and loads only the submitted configuration, so nothing a
+  student did to their container's filesystem is present at all.
+
+What this does not cover is stated plainly: a shared library replaced underneath
+an untouched program, and a program replaced in the twenty seconds between one
+check and the next. Both are narrower than what it does cover, and neither is
+reachable by editing a configuration file.
+
+### Where a switch has been told to send a frame
+
+`l2.vlan_isolation` does not only send probes. A broadcast finds two VLANs that
+share a broadcast domain, but it does not find a rule aimed at one flow, so the
+check also reads what each switch has actually been told to do and calls any
+instruction that carries a frame from a port in one VLAN out of a port in
+another a way across.
+
+"What it has been told" is larger than the flow table, and each place it turned
+out to be larger cost a mark:
+
+- **Actions that name a port in an unfamiliar way.** `enqueue:8:0` puts the
+  frame on a queue of port 8 and sends it exactly as `output:8` would. Every
+  action naming a port is read, and `flood` and `all`, which name none and reach
+  every port, count as reaching all of them.
+- **Actions that name no port at all.** `actions=group:461` says only that the
+  frame goes wherever group 461 says; the ports are in the group's buckets,
+  which `dump-flows` never shows. The groups are dumped as well and every
+  `group:` is followed into its buckets, and those into any group they name in
+  turn — stopping at one already walked, so a group pointing at itself cannot
+  spin. A group's own `type=all` is not part of a bucket and is deliberately not
+  read as flooding; reading it as flooding would fail every switch that has a
+  group at all.
+- **A bridge by another name.** `br0` is what the reference answer builds, and
+  it was the only bridge ever asked about; a switch whose bridge is called
+  anything else had nothing read, and `ovs-ofctl show br0` failing was passed
+  over in silence. Every bridge is now listed and read, port numbers are
+  resolved against the bridge that used them, and a switch that cannot be asked
+  is reported as unread rather than clean. The hops are also assembled into a
+  graph, so a way across through a patch port into a second bridge and back out
+  in another VLAN — which no single flow describes — is found.
+- **Actions that are a program, not a list of ports.**
+  `actions=load:4->NXM_OF_IN_PORT[],mod_vlan_vid:20,NORMAL` names no port to
+  send anything out of. It retags the frame into the other VLAN, tells it that
+  it arrived on a port that is in that VLAN, and hands it to `NORMAL`, which
+  delivers it there. `NORMAL` on an untouched frame keeps it in its own VLAN,
+  which is why it had been read as harmless. The actions are therefore walked
+  in order, carrying the frame's VLAN and its input port, and a rewritten frame
+  reaching `NORMAL` — directly, or by a resubmit to a table that ends at one —
+  is read as delivered wherever the rewrite puts it. A flow that rewrites
+  nothing says nothing, so a correct switch's `priority=0 actions=NORMAL` costs
+  it nothing.
+- **Copies made outside the switch's tables.** `tc filter … action mirred egress
+  mirror dev <other>` has the kernel copy the frames of an access port into
+  another VLAN with the flow table exactly as it should be, and the switch's own
+  `ovs-vsctl` mirror does the same with neither the flow table nor traffic
+  control touched. Both are read.
+
+The pattern is worth naming, because it is the one that keeps recurring: a check
+that reads one table and concludes from its silence. Silence in a table that
+only points at another table says nothing.
+
+### Asking a router what it runs, not what it will admit to
+
+The same shape, one layer down. `vtysh` is not the router; it is a client that
+connects to whichever daemons own the sockets in `/var/run/frr`. Asking it
+whether a core router runs BGP asks only about those, and FRR will happily run a
+second `bgpd` in a pathspace of its own — `bgpd -N x` — holding an instance, a
+neighbour and the BGP port while `vtysh -c 'show bgp summary'` reports `% BGP
+instance not found`. A daemon that is not FRR at all shares none of FRR's
+furniture and is invisible in the same way.
+
+`mpls.bgp_free_core` therefore reads three things about each core router, none
+of which the router gets to narrate:
+
+- **its processes**, for a second `bgpd` — started with `-N`, `--pathspace` or
+  its own `--vty_socket`, or simply a second copy — and for BIRD, GoBGP, ExaBGP
+  or OpenBGPD under their own names;
+- **its FRR pathspaces**, from the process list and from any `.vty` socket in a
+  subdirectory of `/var/run/frr`, each then asked what it holds so the evidence
+  names the hidden neighbours;
+- **its sockets**, for the BGP port in any state — which is what catches a BGP
+  speaker that has been renamed, since the name it runs under is its to choose
+  and the port its peers connect to is not.
+
+The delicate half is the false positive. FRR *does* start `bgpd` on a correct
+core router and leaves it unconfigured, and that is the state the exercise asks
+for: no instance, no table, no listener. "A bgpd is running" is therefore not a
+finding, and a check that made it one would fail every correct answer — the more
+expensive of the two mistakes. What remains uncovered is a BGP speaker that has
+been renamed *and* moved off port 179, which is stated here rather than papered
+over.
+
+### Which policy governs a session
+
+A route-map is judged by what it does to the session it is on, so the grader has
+to work out which route-map that is — and the answer is not "the one written on
+a line with this address in it".
+
+FRR resolves it in two steps the reader has to follow. A session takes each
+setting from its peer-group unless it states that setting itself, per setting
+and per direction; and a binding governs only the address family it was written
+in. A peer-group is a template: nothing peers with it, and it has no marks of
+its own.
+
+Skipping either step is wrong in both directions at once, which is what makes it
+worth spelling out:
+
+- **The correct answer loses marks.** Binding an import policy once on a
+  peer-group and pointing every session at it is how this is written in
+  practice. Read literally, each of those sessions has no policy — so the
+  reference lost the origin-validation mark for filtering it was performing.
+  This is the more serious of the two failures. A student who is right has no
+  way to discover that the grader is wrong, and no evidence to argue with.
+- **The wrong answer keeps them.** Put the correct policy on the group, then
+  override it on the session with one that filters nothing. The clause the
+  grader searches for is still in the configuration, and the router never runs
+  it. If the group also carries the `remote-as` — which it usually will, since
+  that is half the point of a group — then the group itself appears in the list
+  of external sessions in place of its own members, and the sessions are never
+  examined at all.
+
+The same applies across families: FRR prints `address-family ipv6 unicast` after
+`ipv4`, so a reader that keeps the last binding it saw will report an IPv6
+policy as the policy on an IPv4 session.
+
+The rule this comes down to is that a configuration is a program with scoping
+rules, and grepping it is not reading it. Wherever a check asks what a
+configuration says about one object, it has to resolve the same inheritance the
+daemon does, or it is reading a different program from the one that runs.
+
+### Who answered a connection
+
+A program making a TCP connection learns whether it got an answer. It does not
+learn who sent it, and it cannot. A reset carries the destination's address
+because whoever wrote it put that address there: `iptables -j REJECT
+--reject-with tcp-reset` on any router along the way forges one, an ICMP
+unreachable from a router reaches the caller in the same words, and a host
+firewall on the sender produces it without a packet ever leaving.
+
+Three checks read "refused" as the far side speaking, and the premise is wrong
+in both directions at once:
+
+- **Isolation.** A refusal was counted as two customers exchanging traffic. A
+  network that rejects cross-customer connections rather than dropping them in
+  silence is isolating — more helpfully than one that leaves the sender waiting
+  for a timeout — and it was marked as leaking.
+- **Reachability.** A refusal was counted as proof that packets arrive. One
+  `REJECT` rule on a router restored full marks for a network across which no
+  connection could pass.
+
+What settles it is the destination's own record: the resets it sent plus the
+connections it accepted, read before and after the attempt. Neither counter
+moves unless the packets got there, and nothing on the path can raise either.
+Probes are scheduled so that no destination is aimed at twice at once — a
+counter that moved while two attempts were in flight is nobody's in particular.
+
+The two directions part company where the destination cannot be asked, and the
+asymmetry is deliberate. Reachability falls back to the prober's view: failing a
+correct path because a file could not be read is the more expensive mistake. An
+accusation does not, because it carries the burden of proof, and isolation has
+two further witnesses — the routing tables and the datagram counters — so
+nothing rests on this one alone.
+
+### Who sent a packet a host received
+
+The same question one layer down. A datagram socket reports what the kernel
+handed it; it cannot report where that came from. Multicast makes the gap
+concrete: a host that sends to a group on its own segment receives its own
+packets, because loopback is on by default. So "the group arrived here" is
+something any site can arrange for itself, with no tree anywhere.
+
+A tag on the payload does not fix it. The student owns the sending host in
+these exercises, so anything the probe puts on the wire can be read off it —
+and while the tag was passed on the probe's command line it did not even need
+that, since the probe's argv sits in the student's own process table.
+
+What settles it is the kernel. A packet socket is told, for every frame,
+whether it was received, transmitted, or looped back by this host, and that is
+not something a program in the namespace can rewrite. The probe therefore binds
+one — to every protocol, not just IP, so that the host's own traffic arrives
+too and can be *named* rather than merely missed — and only frames that came in
+off the wire count as delivery.
+
+Two smaller things follow. The probe no longer holds the tag: it reports what it
+saw as digests, and the matching happens in the grader, which is the only place
+that knows what was sent. And delivery also requires the router on the
+receiver's own segment to be putting the group there, which is the network's
+doing and not the host's — it is what separates a tree that reached a site from
+a site that found some other way to see the traffic.
+
 ## Grading a class
 
 Two modes, and the difference is what they cost.

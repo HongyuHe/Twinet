@@ -584,6 +584,352 @@ reached students, and each motivated a permanent test.
     and the connections working, and the paths carrying two thirds of what they
     should, at full marks. A datagram is now sent to a port nothing is bound to,
     and the far side's count of those records its arrival.
+62. **A copy the switch's own tables knew nothing about.** The isolation check
+    reads the flow table, and the kernel will copy a frame for anybody who asks:
+    `tc filter ... action mirred egress mirror dev <other port>` carried ICMP
+    from one VLAN into another with the flow table exactly as it should be, at
+    full marks. Every access port's traffic-control rules are now read too, in
+    both directions.
+63. **A table emptied so that nothing is owed.** What a customer was owed came
+    from the table of the router holding its session, and that table is the
+    submission's to empty. Denying every announcement inbound left the router
+    holding only this AS's own prefix, advertising exactly that to its
+    customers, and the check reporting that every selected route had been passed
+    on -- nothing had been selected. What the AS as a whole has learned is now
+    the measure, minus what that customer taught us itself.
+64. **A pair that exchanged everything but datagrams.** The internal data plane
+    was tried with a ping and a connection, so a rule dropping UDP between two
+    hosts left all one hundred and forty-four probes succeeding. Every ordered
+    pair now also exchanges a datagram, read at the far side from its count of
+    datagrams delivered for an unbound port -- the sender cannot be trusted to
+    tell, because when the datagram is dropped it hears nothing, and hearing
+    nothing is what `nc` reports as success. The pairs go in rounds so that no
+    two senders aim at the same host at once and the counter says who arrived.
+65. **A session that carried keepalives and no routes.** The liveness probe
+    compared the total of all messages received on a session. A firewall
+    permitting keepalives and route refreshes by packet length, and discarding
+    everything else, left those totals climbing on a session across which no
+    route could pass -- the refresh the grader asked for was itself the traffic
+    it then counted. An UPDATE is what a session exists to carry, and both the
+    internal mesh and the external sessions now require that count to move.
+66. **An OSPF instance the reader never opened.** Whether an inter-AS range was
+    in OSPF was decided from the default VRF's database and routing table, so an
+    instance in another VRF holding one was invisible and the report said there
+    was none. FRR keys both answers by VRF when asked for all of them, and a
+    finding now names the instance it is in.
+67. **Our own prefix, sent with somebody else's origin.** Originating a prefix
+    means the path you send for it ends with your own AS number. `set as-path
+    exclude all` and a prepend of a foreign number produced an announcement
+    every neighbour treated as somebody else's, rejected as invalid and routed
+    around -- while the table on this side still showed the prefix locally
+    injected, and the question was marked from that. What leaves the AS is now
+    read for what it says about the origin of our own block.
+68. **Two whole sites cut off from the preserved network.** The probe for an
+    unsigned origin's reachability skipped every host in a layer-2 domain,
+    because their reachability to *each other* is a layer-2 question graded
+    elsewhere. Their reachability to the rest of the internet is not: rejecting
+    traffic from both VLANs towards that prefix left every remaining probe
+    succeeding and the question at full marks, with two whole sites unable to
+    reach it.
+69. **A decision made where the routing protocols have no say.** `ip rule add to
+    X lookup 100`, with a route in table 100, sends that destination wherever it
+    says while zebra's main table -- all a routing daemon reports -- still shows
+    the route BGP chose. A customer's destination was diverted through a
+    provider that way for no loss of marks, and the same trick hides anything
+    else. A router has three rules when nobody has interfered, plus the one the
+    kernel adds for itself once any VRF exists; anything else is now reported.
+70. **A frame emitted by an action the reader did not know.** The flow-table
+    check recognised `output:` and nothing else, so `enqueue:8:0` -- which puts
+    the frame on a queue of port 8 and sends it exactly as `output` would --
+    carried frames from one VLAN into another at full marks. Every action that
+    names a port now counts, and the ones that name none but reach every port,
+    flood and all, count as reaching all of them.
+71. **A second address on an interface whose address is dictated.** Any address
+    inside an interface's own subnet was excused, on the reasoning that the plan
+    sometimes leaves the choice open. Where the assignment dictates the address
+    it does not: a spare address on a prescribed loopback went unnoticed, and a
+    spare address in the right subnet is exactly what an impersonation needs.
+    Only the exact address counts on a prescribed interface now; where the
+    choice is the student's, anything inside the mandated prefix still does.
+72. **An adjacency held up by a timer that had not expired.** An OSPF neighbour
+    stays Full for forty seconds after the hellos stop, so discarding OSPF
+    between two routers and grading straight away found every adjacency Full and
+    carrying nothing. Every hello resets that timer, so a second reading a hello
+    interval later says whether one arrived: a healthy adjacency cannot lose
+    more than one hello interval of dead time between two readings, and a silent
+    one loses the whole wait.
+73. **Half a group range rooted somewhere else.** The rendezvous point was
+    checked for the one group the rest of the exercise uses, and PIM takes the
+    most specific mapping for each group separately. A mapping covering the half
+    of the declared range the tested address is not in leaves the test alone and
+    takes the rest with it, which was worth nothing. Any mapping inside the
+    declared range that points elsewhere is now part of that range going to the
+    wrong root, whichever address the exercise happens to test.
+74. **A VPN carrying only pings.** Both L3VPN questions were asked entirely in
+    ICMP. Dropping TCP and UDP on the provider's routers, and leaving ICMP
+    alone, left every probe of `vpn.site_reachability` succeeding and the
+    advanced lab at six out of six, on a network across which no bank could have
+    opened a connection to its own branch. Reachability now tries a connection
+    and a datagram across every pair that answers a ping, reading arrival at the
+    far side — the destination's count of resets it sent, and of datagrams it
+    took delivery of for an unbound port — so an answer forged on the path is
+    told apart from the site replying; a pair carrying ICMP alone is half marks.
+    `vpn.isolation` had the mirror hole, a leak that discards echo requests
+    between two customers and carries their connections reading as perfectly
+    separated tables, and is now asked over all three.
+75. **Receivers answering the question by talking to themselves.** Delivery was
+    measured as "something arrived on the group", and a host that sends to a
+    group on its own segment receives its own packets. Blocking the graded
+    traffic outright on every router and leaving a sender running on every host
+    therefore satisfied the question for every host at once, with nothing
+    delivered anywhere, and kept all four marks. Every packet the grader sends
+    now carries a token drawn when the check runs, and only packets carrying it
+    are counted. The tree behind them is read the same way: state *for the
+    group* is not enough, because a join creates a shared-tree entry whether or
+    not a packet ever crosses and a local sender creates one of its own, so the
+    routers must hold state naming the source this run sent from.
+76. **A program the student wrote answering for them.** Every data-plane
+    question is settled by running a program inside a student's container and
+    reading what it printed, and a student has root there. A shell script called
+    `ping` that prints "3 packets transmitted, 3 received" earns the
+    reachability marks on a network that forwards nothing, and one called
+    `vtysh` earns the configuration marks for configuration that was never
+    written — and neither has to replace the image's copy, because a file
+    earlier on the search path is the one that runs. Measured at 10.00 of 10.00
+    with a two-line `/usr/local/bin/ping`. Before a grading command runs, the
+    container's programs are now compared against the image it is running, both
+    sides read by the grader rather than by asking the container: through
+    `/proc` on the node, with symbolic links followed by hand because an
+    absolute link met under `/proc/<pid>/root` resolves against the node's own
+    root and would have hashed the node's shell. A container that fails is not
+    marked down — it is quarantined, because a grader that cannot trust what it
+    was told does not know what the marks should have been. Two further holes
+    were found while building it: comparing against the image *tag* rather than
+    the image the container runs made every container look tampered with the
+    moment the images were rebuilt, and keeping a container's verdict for its
+    lifetime meant a program planted after one run was believed by every run
+    after it.
+
+77. **A group is a second table the flow table only points at.** The VLAN
+    isolation check reads what a switch has been told to do, and a flow whose
+    action is `group:461` has been told nothing at all about where the frame
+    goes: the ports are in the group's buckets, which live in a table of their
+    own that `dump-flows` never shows. The reader saw an action naming no port
+    and found nothing to complain about, so a group carrying UDP from a VLAN-10
+    access port straight out of a VLAN-20 one scored 10.00 of 10.00. The reader
+    now dumps the groups too and follows every `group:` into its buckets, and
+    those into any group they name in turn, stopping on one it has already
+    walked so a group pointing at itself cannot spin. The group's own `type=all`
+    is not part of a bucket and is deliberately not read as an instruction to
+    flood — reading it as one would have failed every switch that has a group.
+    The same hole had a second door: the switch's built-in mirror leaves the
+    flow table and the kernel's traffic control exactly as a correct switch
+    would have them and still copies every frame of one port onto another,
+    whatever VLAN either is in. Both are now read; measured at 9.50 and 8.70 of
+    10.00 respectively, against 10.00 before.
+
+78. **`vtysh` answers for one BGP daemon, not for the router.** The BGP-free
+    core is the point of the MPLS exercise, and the check asked each core router
+    `show bgp summary` and believed "% BGP instance not found". `vtysh` speaks
+    to the daemons owning one set of sockets under /var/run/frr, and FRR will
+    run as many instances as it is told to: `bgpd -N x` puts a second one in a
+    pathspace with sockets of its own. A core router holding a BGP instance, a
+    configured neighbour and a listener on port 179 in a pathspace answered
+    "instance not found" to the grader and scored 6.00 of 6.00 for a BGP-free
+    core. A daemon that is not FRR at all -- BIRD, GoBGP, ExaBGP -- shares none
+    of FRR's furniture and was equally invisible. Core routers are now asked
+    what they are running rather than what they will admit to: their process
+    list, every FRR pathspace that either the process list or a stray vty socket
+    reveals, and their sockets. Each pathspace is then asked what it holds, so
+    the report names the hidden neighbours rather than only their existence.
+    None of it fires on a correct answer, and that is the delicate part: FRR
+    starts bgpd on core routers and leaves it unconfigured, so "a bgpd is
+    running" is the state the exercise *wants* -- an unconfigured daemon holds
+    no instance, opens no port and is not a finding. Measured at 4.80 of 6.00
+    with the hidden daemon, 6.00 without. `ps` joined the programs a mark
+    depends on and is hashed against the image with the rest.
+79. **The policy written near a session is not the policy it runs.** A
+    neighbour's route-map was looked up by the address on the line, which is not
+    how FRR decides what governs a session. A session takes its settings from
+    its peer-group unless it states its own, and a peer-group is a template that
+    nothing peers with. Reading only the lines written against the address got
+    this wrong in both directions at once. Binding a correct policy once on a
+    peer-group and pointing the sessions at it -- the ordinary way to write this
+    -- was marked as no policy at all: the cos461 reference scored 9.80 for
+    accepting invalid origins it was in fact rejecting, which is the worse
+    failure of the two, because a student who is right has no way to tell the
+    grader is wrong. And the same blindness gave full marks to a submission that
+    put the correct policy on the group while overriding it on the session with
+    one that filters nothing. The group carried the remote AS, so the group
+    stood among the external sessions in place of its own member, and the check
+    read the decoy; on the cluster the session ran the override -- the local
+    preference the routes carried was the override's -- and the AS scored 10.00
+    with no origin validation on its only external session. A binding also
+    governs only the address family it was written in; FRR prints IPv6 after
+    IPv4 and the last one parsed was kept, so a policy bound inbound under
+    `address-family ipv6 unicast` stood for the IPv4 session, measured at 10.00
+    before and 9.80 after. Neighbour lookups now resolve group inheritance per
+    setting and per direction, keep the family a binding was written in, and
+    never grade a peer-group as a session. Measured: the decoy 10.00 → 9.80, the
+    correct peer-group answer 9.80 → 10.00.
+80. **A refusal is not the far side speaking.** A program making a TCP
+    connection learns whether it got an answer, never who sent it. A reset
+    carries the destination's address because whoever wrote it put that address
+    there, and any router on the way can write one — `iptables -j REJECT
+    --reject-with tcp-reset` forges exactly the answer three checks were reading
+    as proof of who answered, and an ICMP unreachable reaches the caller in the
+    same words. The premise was wrong in both directions at once. `vpn.isolation`
+    counted a refusal as two customers exchanging traffic, so a network that
+    rejects cross-customer connections rather than dropping them in silence —
+    which is isolation, implemented more helpfully — was reported as leaking:
+    a host firewall on a customer site, whose packets never left the host, cost
+    the provider 2.00 of 6.00. In the other direction `dataplane.internal_
+    reachability` and the transit check read a refusal as proof that packets
+    arrive, so one `REJECT --reject-with tcp-reset` on a router restored the
+    mark for a network across which no connection could pass; the transit check
+    had even read the destination's counter already and then cleared itself on
+    the refusal regardless. Every one of them now reads the destination's own
+    record — the resets it sent plus the connections it accepted, neither of
+    which moves unless the packets got there — and probes are scheduled so no
+    destination is aimed at twice at once, since a counter that moved is
+    otherwise nobody's in particular. Where the destination cannot be asked the
+    two directions part company deliberately: reachability falls back to the
+    prober's view, because failing a correct path over an unreadable file is the
+    more expensive mistake, while an accusation does not, because it carries the
+    burden of proof. Measured: the forged refusal 4.00 → 6.00, the forged reset
+    10.00 → 9.90, and on a connection that genuinely lands the destination's
+    `OutRsts` moves 18 → 19.
+81. **A host cannot be its own delivery.** The multicast question asks whether
+    the tree carried the source's packets to a site, and it was answered by a
+    datagram socket -- which reports what the kernel handed it and cannot say
+    where it came from. A host that sends to a group on its own segment
+    receives its own packets, so any site could produce the traffic the network
+    was failing to deliver. The tag was meant to close that, and it was handed
+    to the probe on its command line, in the student's own process table: a
+    fifteen-line watcher polling `/proc/*/cmdline` read it and forged the rest.
+    Dropping every genuine delivery cost half the mark; adding the watchers put
+    it back, on a network across which nothing was carried. Three things are
+    different now. The probe reads with a packet socket bound to every
+    protocol, so the kernel tells it whether each frame was received,
+    transmitted or looped back, and only what came in off the wire counts --
+    the host's own traffic is not merely excluded but named in the report. The
+    probe no longer holds the tag at all: it reports digests of what it saw and
+    the matching happens in the grader, which is the only place that knows what
+    was sent. And delivery now also requires the router on the receiver's own
+    segment to be putting the group there, which is the network's doing rather
+    than the host's. Measured: the drop 4.00 → 2.00, and with a thief better
+    placed than any student -- reading every host's process table from outside
+    the lab and distributing the stolen tag instantly -- still 2.00, where it
+    had been 4.00. Restored, 4.00.
+82. **The switch was asked about one bridge by name.** Every reading of Open
+    vSwitch named `br0`, because that is what the reference answer builds, and
+    `ovs-ofctl show br0` failing made the grader skip that switch without a
+    word. A submission that did its switching on a bridge called anything else
+    therefore had nothing read at all -- and since the isolation probe sends a
+    broadcast, which a rule aimed at one flow does not leak, a targeted
+    cross-VLAN forwarding entry on such a bridge cost nothing. Three things
+    were wrong at once: the name, the silence when it was not found, and the
+    assumption that one bridge is the whole switch. Now every bridge the switch
+    has is listed and read, port numbers are resolved against the bridge that
+    used them rather than whichever was read first, a switch that cannot be
+    asked is reported as unread instead of clean, and the hops are assembled
+    into a graph so that a way across through a second bridge -- out of a patch
+    port, in on its peer, back out in another VLAN, which no single flow
+    describes -- is found. The same name was hardcoded in the snapshot and
+    archive paths, so a submission that built its own bridge lost those ports'
+    VLANs on the way through its own backup; both now walk every bridge.
+83. **A flow's actions were read, not run.** An action list is a program.
+    Looking through one for output ports found none in
+    `in_port=1,udp,tp_dst=55555 actions=load:4->NXM_OF_IN_PORT[],
+    mod_vlan_vid:20,NORMAL`, which names no port to send anything out of: it
+    retags the frame into the other VLAN, tells it that it arrived on a port
+    that is in that VLAN, and hands it to the switch's own forwarding, which
+    delivers it there. `NORMAL` had been read as harmless because on an
+    untouched frame it is. The actions are now walked in order, keeping the
+    VLAN the frame carries and the port it counts as having arrived on, and a
+    rewritten frame handed to `NORMAL` -- or resubmitted to a table that ends
+    at one -- is read as delivered wherever the rewrite puts it. A flow that
+    rewrites nothing says nothing, so `priority=0 actions=NORMAL`, which is
+    the whole table of a correct switch, costs nothing. Measured: 10.00 ->
+    9.50 with the flow installed, and 10.00 with it removed.
+    Two parsing faults surfaced while pinning this down, each of which had
+    been hiding crossings of the ordinary kind. The match ends at a space
+    before `actions=`, not at a comma, so a flow whose only match was its
+    input port had that port read as `1 actions=output:2`, resolved to
+    nothing, and counted as a flow that had never said where its frames came
+    from -- so the rule that catches a frame leaving its VLAN never fired on
+    it. And a port printed by name arrives in quotes, which matched neither
+    the port-number table nor the VLAN table. Separately, the flood action was
+    being matched as a substring, so the letters `all` anywhere in an action
+    expanded to every port on the switch -- a way to lose marks for forwarding
+    that never happened.
+84. **Three more ways a switch's forwarding is not in its table.** Found while
+    pinning down 83, and closed before anyone had to use them. An
+    `output:NXM_NX_REG0[]` sends the frame wherever an earlier flow put the
+    register, and a reader looking for a port number found a token that was not
+    one and moved on; a destination that cannot be named cannot be said to be
+    in the frame's own VLAN, so it is now reported as unread. A `learn(...)`
+    action installs flows that are not in the table yet, so the table does not
+    yet say what the switch will do; also reported. And a bridge with a
+    controller set does not forward by its table at all -- the controller is a
+    program of the student's own, free to send any frame anywhere on any
+    packet-in -- so a bridge under one is reported as something this cannot
+    vouch for. Every switch in all three labs was read first to confirm the
+    reference answer has one bridge, no controller and the single flow
+    `priority=0 actions=NORMAL`, so none of the three can fire on a correct
+    submission.
+85. **A forgotten experiment failed a correct answer.** `tunnel.sixin4` took
+    the first 6in4 tunnel `ip -d tunnel show` listed and judged the submission
+    on its endpoints. A device may carry several, and a student debugging their
+    answer routinely leaves one behind; the kernel lists them in its own order.
+    A correct `tun6` sitting behind an abandoned `bad_tun` was therefore
+    reported as "sourced from 3.0.10.1, not its loopback" and lost half a mark
+    for a tunnel that was not the one carrying the traffic. Every tunnel is now
+    judged on its own endpoints and the first sound one is taken, which cannot
+    award an unearned mark because whether the traffic goes through *that*
+    tunnel is settled afterwards by what the gateway does with a packet for the
+    far host and by the tunnel's counters in both directions. Measured: with a
+    leftover tunnel listed first and the reference tunnel otherwise untouched,
+    9.50 before and 10.00 after; with only the wrong-endpoint tunnel present,
+    9.00, so the mark still cannot be had without the right tunnel.
+86. **A class nobody had marked was reported as a class that scored zero.** The
+    run summary printed `graded 1 submission(s)` and `mean 0.00 median 0.00
+    min 0.00 max 0.00` for a submission that had been held for review and never
+    marked at all. The statistics were right to exclude it -- a quarantined
+    zero measures the platform, not the student -- but the line above them
+    counted the submissions attempted rather than the submissions the
+    distribution covers, so the two disagreed, and the shape they disagreed
+    into was indistinguishable from a cohort that had failed everything. The
+    line now says `graded 0 of 1` and states plainly that there is no
+    distribution; when only some are held it says `graded 88 of 100` and names
+    how many are waiting.
+87. **The same forgotten experiment, one layer down.** Found while fixing 85.
+    Having picked which tunnel to judge, the check found that tunnel's line in
+    `ip -d tunnel show` with a substring search for `tun6:` -- which also
+    matches `xtun6:`. A leftover tunnel whose name merely ends in the real
+    one's, listed first, therefore supplied the endpoints of the tunnel being
+    judged, and the fix for 85 did not help because the wrong line was read for
+    the right name. The line is now matched on the whole device name. In the
+    same function, a name that matched no line at all returned "nothing wrong
+    with these endpoints", which awarded the mark for output nobody could read;
+    it now says so.
+88. **Deducting for a crossing that cannot happen.** A student debugging a
+    switch adds `ovs-ofctl add-flow br0 "ip,nw_dst=192.168.99.99,in_port=1,
+    actions=output:2"` to watch whether traffic moves between two ports, and
+    forgets to remove it. Nothing in the lab has that address, so no frame ever
+    matches; the grader's own probes found 0 of 8 pairs leaking. The VLAN
+    isolation check failed the domain anyway, because it read the *existence*
+    of a rule that names ports in two VLANs and never asked whether any frame
+    the lab can produce satisfies its match. Half a point for a rule that
+    carries nothing. A rule is now excused only when its destination match
+    covers no address the plan assigns anywhere in the topology and none
+    configured on the domain's hosts or their gateway right now, and only on a
+    bridge whose every action merely chooses a port -- one that rewrites
+    addresses, resubmits or learns can manufacture a frame addressed to
+    anything. The excused rule is still reported to the student. Note what was
+    *not* done: excusing rules whose packet counter is zero, which was the
+    obvious fix and would have passed a submission with its VLANs wide open so
+    long as nobody sent anything while the grader watched.
 
 ## Environment findings
 

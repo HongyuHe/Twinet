@@ -18,6 +18,7 @@ import (
 	"github.com/HongyuHe/twinet/internal/agent"
 	"github.com/HongyuHe/twinet/internal/client"
 	"github.com/HongyuHe/twinet/internal/grade"
+	"github.com/HongyuHe/twinet/internal/integrity"
 	"github.com/HongyuHe/twinet/internal/model"
 	"github.com/HongyuHe/twinet/internal/netx"
 	"github.com/HongyuHe/twinet/internal/runtime"
@@ -273,10 +274,27 @@ func execFunc(ctx context.Context, top *model.Topology, token string) (
 
 	if !clustered(top) {
 		rt := runtime.NewDocker()
+		tools := integrity.NewChecker(rt)
 		return func(ctx context.Context, deviceID string, cmd []string) (runtime.ExecResult, error) {
 			d, ok := top.Device(deviceID)
 			if !ok {
 				return runtime.ExecResult{}, fmt.Errorf("no device %q", deviceID)
+			}
+			// The same rule as the clustered path: a container's programs are
+			// its owner's to replace, so they are compared against the image
+			// before anything they print becomes a mark.
+			c, err := rt.Inspect(ctx, d.Container)
+			if err != nil {
+				return runtime.ExecResult{}, err
+			}
+			findings, err := tools.Verify(ctx, c)
+			if err != nil {
+				return runtime.ExecResult{}, fmt.Errorf("the programs in %s could not be "+
+					"checked against %s, so the evidence they produce cannot be relied "+
+					"on: %w", c.Name, c.Image, err)
+			}
+			if len(findings) > 0 {
+				return runtime.ExecResult{}, &integrity.Error{Container: c.Name, Findings: findings}
 			}
 			return rt.Exec(ctx, d.Container, runtime.ExecCmd{Cmd: cmd})
 		}, nil
@@ -297,7 +315,7 @@ func execFunc(ctx context.Context, top *model.Topology, token string) (
 			return runtime.ExecResult{}, fmt.Errorf("device %s is on unknown node %q", deviceID, d.Node)
 		}
 		r, err := n.Exec(ctx, agent.ExecRequest{
-			Container: d.Container, Cmd: cmd, Hold: currentHoldToken()})
+			Container: d.Container, Cmd: cmd, Hold: currentHoldToken(), Grading: true})
 		return runtime.ExecResult{ExitCode: r.ExitCode, Stdout: r.Stdout, Stderr: r.Stderr}, err
 	}, nil
 }
