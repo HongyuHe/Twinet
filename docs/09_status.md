@@ -1065,6 +1065,24 @@ reached students, and each motivated a permanent test.
     39, 59 and 65 were about: a blackholed session's sender still believes it is
     advertising its routes.
 
+99. **The best of several equal-cost paths, reported as the route.** A VPN
+    prefix with several equal-cost paths gets one nexthop per path, each with
+    its own transport label, and the kernel hashes flows across all of them.
+    `vpn.label_switched` took the deepest label stack among those paths and
+    called it the route, so two well-labelled paths hid a third that carried
+    the VPN label alone. Removing LDP from one interior link left the route to
+    the far site with three paths, one of them unlabelled, and the check passed
+    it with full marks and the words "resolve through a transport label and a
+    VPN label". Measured, not inferred: the core router's label table had no
+    entry for the VPN label such a packet arrives carrying, and five of nine
+    source addresses lost every packet. It now looks at every installed path,
+    names the ones carrying the VPN label alone, and passes only when all of
+    them are label-switched. Two labels stays the right floor even where the
+    two edges are neighbours: LDP signals implicit-null one hop away, so
+    nothing but the VPN label goes on the wire, but the implicit-null is still
+    in the stack the kernel reports, and the lab's directly-connected edge pair
+    keeps its mark.
+
 
 
 

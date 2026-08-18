@@ -1264,6 +1264,64 @@ func (e *Env) reaches(ctx context.Context, deviceID, addr string) (bool, error) 
 // edge which customer it belongs to. A static route has no labels; a route in
 // the global table is not in the VRF; and a single label is a backbone path
 // with no VPN on it.
+// vpnNexthop is one path the kernel holds for a VPN prefix, with the label
+// stack it would push on a packet taking that path.
+type vpnNexthop struct {
+	IP            string `json:"ip"`
+	FIB           bool   `json:"fib"`
+	InterfaceName string `json:"interfaceName"`
+	Labels        []int  `json:"labels"`
+}
+
+// labelDepth reports how many of a prefix's paths the kernel has installed,
+// which of them carry fewer than the two labels a VPN route needs, and the
+// thinnest stack among them.
+//
+// It looks at every installed path rather than the best one. A prefix with
+// several equal-cost paths gets a nexthop per path, each with its own transport
+// label, and the kernel hashes flows across all of them; the deepest stack
+// among them describes the best path, not the route. With LDP missing on one
+// interior link the two good paths hid the third, which carried the VPN label
+// alone -- and flows hashed onto it arrived at the core router bearing a label
+// it had never handed out and were dropped, five of nine source addresses
+// losing everything, while this reported the prefix as resolving through a
+// transport label and a VPN label. A route is label-switched only if all of it
+// is.
+//
+// Two labels is the right floor even where the two edges are neighbours. LDP
+// signals implicit-null for a prefix one hop away, so the ingress pushes only
+// the VPN label onto the wire -- but the stack the kernel reports still has the
+// implicit-null in it, so the depth is two either way and a correct submission
+// is not caught by this.
+func labelDepth(nhs []vpnNexthop) (installed int, shallow []string, thinnest int) {
+	thinnest = -1
+	for _, nh := range nhs {
+		if !nh.FIB {
+			continue
+		}
+		installed++
+		if thinnest < 0 || len(nh.Labels) < thinnest {
+			thinnest = len(nh.Labels)
+		}
+		if len(nh.Labels) >= 2 {
+			continue
+		}
+		via := nh.IP
+		if nh.InterfaceName != "" {
+			via = nh.InterfaceName
+		}
+		if via == "" {
+			via = "unnamed path"
+		}
+		shallow = append(shallow, via)
+	}
+	if thinnest < 0 {
+		thinnest = 0
+	}
+	sort.Strings(shallow)
+	return installed, shallow, thinnest
+}
+
 func checkVPNLabelSwitched(ctx context.Context, env *Env) Result {
 	as, ok := env.Topology.ASes[env.AS]
 	if !ok || len(as.VRFs) == 0 {
@@ -1330,18 +1388,14 @@ func checkVPNLabelSwitched(ctx context.Context, env *Env) Result {
 	}
 
 	var problems []string
-	checked, labelled := 0, 0
+	checked, labelled, paths := 0, 0, 0
 	for _, e := range edges {
 		for _, prefix := range e.remote {
 			checked++
 			var doc map[string][]struct {
-				Protocol string `json:"protocol"`
-				Selected bool   `json:"selected"`
-				Nexthops []struct {
-					IP     string `json:"ip"`
-					FIB    bool   `json:"fib"`
-					Labels []int  `json:"labels"`
-				} `json:"nexthops"`
+				Protocol string       `json:"protocol"`
+				Selected bool         `json:"selected"`
+				Nexthops []vpnNexthop `json:"nexthops"`
 			}
 			cmd := fmt.Sprintf("show ip route vrf %s %s json", e.vrf, prefix)
 			if err := env.VtyshJSON(ctx, e.router, cmd, &doc); err != nil {
@@ -1367,20 +1421,29 @@ func checkVPNLabelSwitched(ctx context.Context, env *Env) Result {
 					e.router, prefix, e.vrf, best.Protocol))
 				continue
 			}
-			// The stack, in the entry the kernel is actually using.
-			stack := 0
-			for _, nh := range best.Nexthops {
-				if !nh.FIB {
-					continue
-				}
-				if len(nh.Labels) > stack {
-					stack = len(nh.Labels)
-				}
-			}
+			// Every path the kernel would use, not the best-labelled one.
+			installed, shallow, thinnest := labelDepth(best.Nexthops)
+			paths += installed
 			switch {
-			case stack >= 2:
+			case installed == 0:
+				problems = append(problems, fmt.Sprintf(
+					"%s has %s in %s but no path installed for it, so nothing is carrying it",
+					e.router, prefix, e.vrf))
+			case len(shallow) == 0:
 				labelled++
-			case stack == 1:
+			case len(shallow) < installed:
+				problems = append(problems, fmt.Sprintf(
+					"%s reaches %s in %s over %d equal-cost paths and %d of them (%s) carry the "+
+						"VPN label alone; a flow hashed onto one of those arrives at the next "+
+						"router carrying a label that router never handed out",
+					e.router, prefix, e.vrf, installed, len(shallow), strings.Join(shallow, ", ")))
+			case installed > 1:
+				problems = append(problems, fmt.Sprintf(
+					"%s reaches %s in %s over %d equal-cost paths and not one of them carries "+
+						"a transport label; a VPN route needs two -- a transport label across "+
+						"the interior and a VPN label the far edge reads",
+					e.router, prefix, e.vrf, installed))
+			case thinnest == 1:
 				problems = append(problems, fmt.Sprintf(
 					"%s reaches %s in %s with one label; a VPN route needs two -- a transport "+
 						"label across the interior and a VPN label the far edge reads",
@@ -1418,7 +1481,8 @@ func checkVPNLabelSwitched(ctx context.Context, env *Env) Result {
 		return Pass("vpn.label_switched", Evidence{
 			Expected: "each customer's remote sites reached over a two-label path",
 			Observed: fmt.Sprintf("%d remote prefix(es) across %d edge/table pair(s) resolve "+
-				"through a transport label and a VPN label", labelled, len(edges)),
+				"through a transport label and a VPN label, on every one of the %d path(s) "+
+				"installed for them", labelled, len(edges), paths),
 			Command: "show ip route vrf <table> <prefix> json",
 		})
 	}
