@@ -1102,6 +1102,25 @@ reached students, and each motivated a permanent test.
      when no baseline can be established while candidates exist, the check says
      so instead of reading silence as "nobody has published a ROA".
 
+101. **A working filter marked down for the mechanism it used.** The IXP
+     question asks a member to refuse the routes whose path crosses its own
+     region, and says nothing about how. `checkIXPCommunities` looked for
+     `match as-path` in the inbound route-map and nothing else, so a member
+     that refused exactly the same routes with a prefix-list scored 0.5 and was
+     told "nothing filters arrivals from 180.140.0.140 on AS path" -- while its
+     table held the same two out-of-region routes as the reference answer's and
+     none of the six in-region ones the exchange had offered. The comment
+     directly above that code already said "the table is what the question is
+     about"; the code was not reading the table. Now it does: where the
+     exchange offered in-region routes and none arrived, something refused
+     them, whatever it was written with. That reads the table only where the
+     table can speak -- at an exchange relaying no in-region route at all, an
+     empty set of wrongly-admitted routes is the lab's doing rather than the
+     submission's, so the configuration stays the only evidence and a member
+     with no filter still does not get the mark for free. Both evidence lines
+     said "on AS path" whichever way the verdict went; they now report how many
+     in-region routes were offered and whether they arrived.
+
 
 
 
