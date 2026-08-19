@@ -1330,33 +1330,36 @@ func everyFlowArrives(ctx context.Context, env *Env, from, to string) (string, b
 	}
 	srcAddr, dstAddr := addrOnly(slo.Addr4), addrOnly(dlo.Addr4)
 
-	base := 20000 + rand.IntN(30000)
-	ports := make([]string, 0, sweepFlowCount)
+	base := 20000 + rand.IntN(20000)
+	first := make([]string, 0, sweepFlowCount)
+	second := make([]string, 0, sweepFlowCount)
 	for i := range sweepFlowCount {
-		ports = append(ports, strconv.Itoa(base+i))
+		first = append(first, strconv.Itoa(base+i))
+		second = append(second, strconv.Itoa(base+sweepFlowCount+i))
 	}
-	lost, ok := lostFlows(ctx, env, src.ID, dst.ID, srcAddr, dstAddr, ports)
+	lost, ok := lostFlows(ctx, env, src.ID, dst.ID, srcAddr, dstAddr, first)
 	if !ok || len(lost) == 0 {
 		return "", true
 	}
 	// A flow can go missing for reasons that are nobody's fault -- a frame
 	// lost while a neighbour entry is resolved, a scheduler delay on a loaded
-	// node -- and a mark should not turn on one of those. Only the flows that
-	// fail twice are counted, from source ports that are not the ones tried
-	// the first time, so that a port the far side happens to be filtering is
-	// not mistaken for a path that is.
-	retry := make([]string, 0, len(lost))
-	for i := range lost {
-		retry = append(retry, strconv.Itoa(base+sweepFlowCount+i))
-	}
-	again, ok := lostFlows(ctx, env, src.ID, dst.ID, srcAddr, dstAddr, retry)
+	// node -- and a mark should not turn on one of those. So the whole sweep
+	// is repeated, from a fresh set of source ports, and the fault has to
+	// still be there. A path that discards traffic discards the second sweep
+	// as surely as the first; a frame lost once does not come back.
+	//
+	// Repeating only the flows that failed would not do, because a source port
+	// is not a path: the second attempt would be hashed afresh and would
+	// mostly land on the paths that work, which is a test that clears a real
+	// fault most of the time.
+	again, ok := lostFlows(ctx, env, src.ID, dst.ID, srcAddr, dstAddr, second)
 	if !ok || len(again) == 0 {
 		return "", true
 	}
 	return fmt.Sprintf(
 		"%d of %d flows from %s to %s never arrived, and %d did: the paths are installed "+
 			"and at least one of them is discarding what is sent along it",
-		len(again), len(retry), from, to, len(retry)-len(again)), false
+		len(again), len(second), from, to, len(second)-len(again)), false
 }
 
 // lostFlows aims one flow from each of the given source ports at a port on the
