@@ -5,6 +5,11 @@ import (
 	"testing"
 )
 
+// stillRunning marks a capture that was still watching when it was read. It is
+// what the reader writes ahead of the capture's own output; a capture that had
+// already stopped is marked EARLY=1 and is not a witness to anything.
+func stillRunning(out string) string { return "EARLY=0\n" + out }
+
 // The banner tcpdump writes to standard error when a capture starts, taken
 // verbatim from a lab router.
 const tapBanner = `tcpdump: data link type LINUX_SLL2
@@ -57,10 +62,10 @@ func TestCountTapFramesLoopbackFloodCreditsNothing(t *testing.T) {
 }
 
 func TestParseTapOutputNeedsTheCaptureToHaveRun(t *testing.T) {
-	if _, ok := parseTapOutput("---\n" + frameFromNYC); ok {
+	if _, ok := parseTapOutput(stillRunning("---\n" + frameFromNYC)); ok {
 		t.Fatal("a capture that never announced itself must not be a witness")
 	}
-	if _, ok := parseTapOutput(tapBanner + frameFromNYC); ok {
+	if _, ok := parseTapOutput(stillRunning(tapBanner + frameFromNYC)); ok {
 		t.Fatal("output with no separator must not be a witness")
 	}
 }
@@ -68,13 +73,13 @@ func TestParseTapOutputNeedsTheCaptureToHaveRun(t *testing.T) {
 func TestParseTapOutputNeedsInterfaceNames(t *testing.T) {
 	old := "tcpdump: verbose output suppressed\n" +
 		"listening on any, link-type LINUX_SLL (Linux cooked v1), snapshot length 262144\n"
-	if _, ok := parseTapOutput(old + "---\n" + frameFromNYC); ok {
+	if _, ok := parseTapOutput(stillRunning(old + "---\n" + frameFromNYC)); ok {
 		t.Fatal("a capture that cannot name the interface cannot tell loopback from arrival")
 	}
 }
 
 func TestParseTapOutputEmptyCaptureIsAWitness(t *testing.T) {
-	got, ok := parseTapOutput(tapBanner + "---\n")
+	got, ok := parseTapOutput(stillRunning(tapBanner + "---\n"))
 	if !ok {
 		t.Fatal("a capture that ran and saw nothing is evidence of non-arrival")
 	}
@@ -84,7 +89,7 @@ func TestParseTapOutputEmptyCaptureIsAWitness(t *testing.T) {
 }
 
 func TestParseTapOutputCountsRealArrivals(t *testing.T) {
-	got, ok := parseTapOutput(tapBanner + "---\n" + frameFromATL + frameSelfLoopback)
+	got, ok := parseTapOutput(stillRunning(tapBanner + "---\n" + frameFromATL + frameSelfLoopback))
 	if !ok {
 		t.Fatal("the capture ran, so it is a witness")
 	}
@@ -182,5 +187,23 @@ func TestNilTapIsNotAWitness(t *testing.T) {
 	}
 	if _, ok := (&arrivalTap{}).seen(context.TODO(), nil); ok {
 		t.Fatal("a capture that failed to start says nothing")
+	}
+}
+
+func TestParseTapOutputAStoppedCaptureIsNoWitness(t *testing.T) {
+	// A capture that ended before it was read -- its own timeout expired, or
+	// it hit its frame limit -- was not watching for the whole of the flow.
+	// Its silence is not evidence that nothing arrived, and reading it as such
+	// once reported a working IPv6 tunnel as filtering datagrams.
+	if _, ok := parseTapOutput("EARLY=1\n" + tapBanner + "---\n"); ok {
+		t.Fatal("a capture that had already stopped must not be a witness")
+	}
+	// Not even when it saw something: it may have stopped before the rest.
+	if _, ok := parseTapOutput("EARLY=1\n" + tapBanner + "---\n" + frameFromATL); ok {
+		t.Fatal("a capture that had already stopped must not be a witness")
+	}
+	// And output with no marker at all is a read that did not happen.
+	if _, ok := parseTapOutput(tapBanner + "---\n" + frameFromATL); ok {
+		t.Fatal("output without the running marker must not be a witness")
 	}
 }
