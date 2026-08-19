@@ -1794,3 +1794,59 @@ environment, not about the code.** Twinet's environment is a cluster whose
 latency the grader does not control. Every such constant is a check that will
 eventually report on a window it was not present for -- so the honest form is
 not a bigger number, it is a mechanism that knows whether it was watching.
+
+### 115. Marking the mechanism when the question asked for an outcome
+
+`rpki.invalid_rejected` searched a session's inbound policy for a `deny`
+clause naming the invalid state. A submission wrote no such clause:
+
+    route-map LP-SLOW-PROVIDER permit 10
+     match rpki notfound
+    route-map LP-SLOW-PROVIDER permit 20
+     match rpki valid
+
+That admits the two states it names and drops everything else, because FRR
+ends every route-map with an implicit deny. It is a perfectly ordinary way to
+write the policy -- arguably the cleaner one, since it states what is allowed
+rather than what is not -- and the router was doing exactly what the question
+asked.
+
+Measured on `as3/MSP`:
+
+    show bgp ipv4 unicast rpki invalid   -> (empty)
+
+Not one invalid route was selected. To be sure the implicit deny was what
+stopped them, and not an absence of invalid routes to stop, a catch-all
+`permit 30` was added at the bottom:
+
+    I*> 10.128.0.0/9  179.1.3.1  ...  1 1 1 1 i
+
+The invalid origin appeared immediately, and vanished again when the catch-all
+was removed. The implicit deny was doing the whole job. The check reported
+*"1 of 6 external session(s) accept invalid origins"* and took half the mark.
+
+This is the third finding in this one check (110, 119, and now 115), and they
+all have the same shape: the check knows what the reference answer looks like
+and grades resemblance to it. A route-map is not a document to be searched for
+a keyword; it is a program, and the question is what it does to a route in the
+state being asked about. So that is what is now asked -- walk the clauses in
+sequence order, and if none of them admits such a route, the implicit deny at
+the bottom rejects it.
+
+Reading a catch-all clause had the same flaw in miniature: any clause with no
+match statements was treated as a way in, so an explicit `deny 30` at the
+bottom -- the implicit deny written out longhand -- was also read as accepting
+everything. Which direction the clause points is now the answer.
+
+An empty body remains the one case that is not protection: no route-map bound
+to the session, or a name that was never defined, leaves no clause list for an
+implicit deny to sit at the end of, and nothing is filtered.
+
+| | before | after |
+| --- | --- | --- |
+| explicit `deny 5: match rpki invalid` (reference) | 1.00 | 1.00 |
+| permit-valid + permit-notfound, implicit deny | **0.50** | 1.00 |
+| the same, plus a catch-all `permit 30` (a real hole) | 0.50 | 0.50 |
+| no inbound route-map at all | 0.40 | 0.40 |
+
+Full labs after the fix: cos461 10.00, advnet 6.00, multicast 4.00.
