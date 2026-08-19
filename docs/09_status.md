@@ -1709,3 +1709,88 @@ closed a hole and, in the same breath, wrote down that the neighbouring hole was
 shut -- on the strength of a single measurement of a single spelling. A reader
 of the ledger would have skipped it. **A closed door recorded here should say
 what was actually tried**, because the next reader will not retry it.
+
+### 113. The tunnel gateway was asked about a packet it never sees
+
+`tunnel.sixin4` establishes that traffic between the two IPv6 datacentres is
+really encapsulated, by asking the gateway where it would send it:
+
+    ip -6 route get <dst>
+
+That describes a packet the gateway *originates*. It carries no source address
+and no arrival interface, so an `ip -6 rule` keyed on either never fires and the
+lookup falls through to the main table. A submission that put its tunnel routes
+in a second table and pointed a rule at it -- an ordinary way to write the
+answer, and the way an operator would write it -- got:
+
+    ip -6 route get 3:200::1                 -> (nothing; network unreachable)
+    ip -6 route get 3:200::1 from 3:201::1   -> dev tun6 table 100
+
+The tunnel was working. `tun6`'s counters advanced by exactly the packets just
+sent, pings crossed it, and the check reported *"BOS forwards traffic for
+3:200::a over , not through tun6"* and took half the mark. The empty word in
+that sentence is the whole finding: there was no interface to name because the
+lookup had returned nothing at all, and "nothing" was rendered as "somewhere
+else".
+
+This is finding **109** again -- the same lookup, the same missing source -- in
+the IPv6 path, which was never revisited when 109 was fixed for IPv4. Fixing a
+defect in one place and not looking for its twin is its own kind of incomplete
+claim.
+
+The lookup now describes the real packet: from the sending host's address,
+arriving on the interface facing it. Neither has to be guessed -- the interface
+a reply to that host would leave by is the one its packets arrive on. And a
+lookup that cannot be made returns an error rather than an empty interface
+name, so "could not ask" and "answered natively" are no longer the same verdict.
+
+Measured on `as3/BOS`, with the tunnel routes moved to table 100 behind
+`ip -6 rule add from 3:201::/32 lookup 100`:
+
+| | before | after |
+| --- | --- | --- |
+| routes in the main table (correct, ordinary) | 1.00 | 1.00 |
+| routes in table 100 behind a rule (correct, unusual) | **0.50** | 1.00 (x3) |
+| UDP filtered on the destination (genuinely broken) | 0.50 | 0.50 |
+
+Full labs after the fix: cos461 10.00, advnet 6.00, multicast 4.00.
+
+### 114. A capture that had already stopped, testifying to silence
+
+Chasing 113 turned up a run that scored 0.50 with a *different* complaint --
+*"a datagram from A_CHA to A_MGH never arrived -- no packet of it reached any
+interface"* -- on a path that was working. Three runs either side of it scored
+1.00, and sending the datagram by hand showed it arriving. A check that gives
+two different verdicts on unchanged state is a finding in its own right.
+
+The arrival witness from findings 105/106 runs `tcpdump` on the destination for
+the exact flow, under `timeout 15`. Fifteen seconds was chosen to outlast the
+probes it watches for: a connection attempt waits three seconds, a datagram two.
+But between them are half a dozen round trips to a machine that may be on
+another node, and on a loaded cluster -- or just after an agent redeploy -- the
+capture's own timeout expired before the last probe was sent.
+
+The reading then found the capture's start-up banner and an empty body, and
+reported **a live witness that saw nothing**. `tapLive` answered "was tcpdump
+ever running?" while the caller was asking "was anyone watching when the packet
+went past?" Those are different questions, and only the second is evidence.
+
+The window now covers the probes by construction rather than by estimate: the
+capture is stopped explicitly when it is read, the timeout is demoted to a leak
+guard for an interrupted run, and the capture records the moment it stops. A
+capture that stopped before it was asked -- its own timeout, or its frame limit
+-- is discarded, and the check falls back to the kernel counter or declines to
+accuse.
+
+The witness is not weakened by this. With `ip6tables -I INPUT -p udp -j DROP` on
+the destination it still scores 0.50 and still distinguishes the two failures
+precisely: *"it reached the interface but the kernel took no delivery of it"*,
+which is exactly what an INPUT-chain drop looks like from the wire. No capture
+files were left behind on any host.
+
+The general shape, and the reason this one is worth writing down: **a timeout
+picked to be "comfortably longer than" something is a claim about the
+environment, not about the code.** Twinet's environment is a cluster whose
+latency the grader does not control. Every such constant is a check that will
+eventually report on a window it was not present for -- so the honest form is
+not a bigger number, it is a mechanism that knows whether it was watching.
