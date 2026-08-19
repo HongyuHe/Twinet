@@ -1455,3 +1455,48 @@ move it further, in the order they are worth doing:
 | Containers per node at that scale | 731 / 731 / 550 with `pack-by-as`, 660 / 675 / 677 with `spread-by-as` |
 | Node utilisation at that scale | 22 GiB of 251, load average 13 of 56 cores |
 | Emulated latency on a cross-node link at that scale | 20.07 ms for 20 ms configured |
+
+### 108. A forwarding decision reported without reading the forwarding decision
+
+`policy.traffic_engineering` asks whether a destination leaves by the slow
+link. `installedVia` answered by reading `show ip route` -- and its own comment
+claimed that this was where "a static route, a policy route or an
+administrative distance shows up". A policy route does not show up there. An
+`ip rule` diverts the lookup to a different table *before* the daemon's table
+is consulted, and a route the daemon selected but failed to push is not in the
+kernel at all. The daemon's opinion of its own table shows neither.
+
+Measured on the live cos461 lab, on `as3/MSP`:
+
+    ip route add 2.0.0.0/8 via 179.1.3.1 table 100
+    ip rule  add to 2.0.0.0/8 lookup 100
+
+    # ip route get 2.0.0.1
+    2.0.0.1 via 179.1.3.1 dev ext_1_ALL table 100 src 179.1.3.2
+    # vtysh -c 'show ip route 2.0.0.0/8'
+      *   3.0.2.2, via port_CHI
+
+The kernel forwards that destination over the slow provider link; the daemon
+still shows the fast one. The check scored a full **1.00**, reporting that
+nothing is forwarded over the slow link.
+
+This was surfaced by review round 117 and dismissed there as unexploitable,
+on the grounds that a student with a wrong local-preference would still have
+the daemon pointing at the slow link, so the trick cannot turn a wrong answer
+into a right one. That is true, and it is not the point: the check named a
+forwarding decision it had never looked at. The same blindness hides an
+injected fault -- a NIKA policy-routing fault would leave the grader reporting
+the network healthy -- and it is exactly the defect class findings 97-107 are
+about.
+
+Each router is now also asked `ip route get` for one address inside every
+prefix that has a fast alternative, batched into a single command per router
+so the cost is one round trip rather than one per destination. The kernel's
+answer is held to the same slow-link test as the table, and the two are a
+union, so the new path can only fire where the daemon and the kernel disagree
+-- which is never the case on a correct submission. Clean: cos461 10.00,
+advnet 6.00, multicast 4.00. With the rule in place: 0.88, evidence
+`2.0.0.0/8 on MSP (kernel)`.
+
+Reading the kernel rather than the daemon also removes one more dependence on
+FRR specifically, which the heterogeneous-vendor goal needs.
