@@ -1599,3 +1599,55 @@ had not established either -- it never asked whether the permit clause could
 match an invalid route, it asked what the clause was made of. Reading a
 configuration for its shape rather than its consequence is the same mistake
 whichever way the marks move.
+
+### 111. Balancing over two links while every packet takes one
+
+`ospf.ecmp_paths` read the routing table the daemon writes, at every router the
+prescribed paths pass through, and awarded the marks when the equal-cost next
+hops were all there. A policy rule is consulted *before* that table ever is, so
+a submission could leave the route installed, untouched and plainly visible,
+and still send every packet down one of its next hops:
+
+    ip route add 3.153.0.1/32 via 3.0.10.1 dev port_BOS table 100
+    ip rule add to 3.153.0.1/32 lookup 100 priority 100
+
+`ip route show 3.153.0.1/32` still showed both next hops. `ip route get
+3.153.0.1` answered `via 3.0.10.1 dev port_BOS table 100`, and a traceroute to
+BOS was one hop. The check reported *"all 3 prescribed paths installed; ATL
+balances over port_BOS (3.0.10.1), port_PHY (3.0.8.1)"* and gave full marks for
+a question about which paths carry traffic.
+
+The check's own comment, added when a firewall rule was found dropping the
+traffic it had just called delivered, says this is the class of divergence it
+exists to catch. The rule is the same trick without the packet loss.
+
+Every router the paths pass through is now asked what it will really do with
+the traffic. The comparison is between **two readings of the kernel**, not
+between the kernel and the daemon: a rule pointing at a table that holds the
+same next hops changes nothing, and a submission that writes one has answered
+the question. What is reported is a table that carries the traffic differently
+from the one OSPF wrote.
+
+Measured, all four cases:
+
+| state of `as3/ATL` | score |
+| --- | --- |
+| untouched (twice) | 1.00 |
+| rule to a table pinning one hop | **0.50** |
+| rule to a table holding *both* hops | 1.00 |
+| rule to an empty table (falls through) | 1.00 |
+
+Full labs after the fix: cos461 10.00, advnet 6.00, multicast 4.00.
+
+Overriding the route in the main table instead -- `ip route replace 3.153.0.1/32
+via 3.0.10.1 dev port_BOS` -- turned out to be caught already, and it is worth
+recording why: zebra reads the kernel back and reports such a route as learned
+by `kernel` rather than by OSPF, which the protocol test rejects. Measured at
+0.50 before this fix existed. A policy rule leaves no trace in the daemon at
+all, which is why it needed asking about separately.
+
+Findings 108, 109 and this one are the same sentence three times: *the routing
+daemon's table is an opinion, and the kernel is the one that forwards.* 108 read
+only the daemon; 109 asked the kernel the wrong question; this one never asked
+it. The last check that reasons about forwarding from the daemon alone is worth
+finding before a student does.
