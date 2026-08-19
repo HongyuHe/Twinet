@@ -2652,6 +2652,93 @@ func sortedInts(m map[int]bool) []int {
 	return out
 }
 
+// kernelHop is where the kernel itself says it would send a packet: the next
+// hop address, and the interface it would leave by. Either may be empty -- a
+// destination on a connected subnet has no next hop -- and both are compared
+// against the slow link, because a route may be named either way.
+type kernelHop struct {
+	via string
+	dev string
+}
+
+// probeAddr picks an address inside prefix to ask the kernel about. The network
+// address of a subnet is not a useful target, so the first host address is used;
+// a host route is asked about directly.
+func probeAddr(prefix string) string {
+	p, err := netip.ParsePrefix(prefix)
+	if err != nil || !p.Addr().Is4() {
+		return ""
+	}
+	p = p.Masked()
+	if p.Bits() >= 31 {
+		return p.Addr().String()
+	}
+	return p.Addr().Next().String()
+}
+
+// parseKernelHops reads the output of the batched "ip route get" script: an
+// echoed address, then the first line of the kernel's answer for it.
+func parseKernelHops(out string) map[string]kernelHop {
+	hops := map[string]kernelHop{}
+	var want string
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "@ ") {
+			want = strings.TrimPrefix(line, "@ ")
+			continue
+		}
+		if want == "" {
+			continue
+		}
+		f := strings.Fields(line)
+		var h kernelHop
+		for i := 0; i+1 < len(f); i++ {
+			switch f[i] {
+			case "via":
+				h.via = f[i+1]
+			case "dev":
+				h.dev = f[i+1]
+			}
+		}
+		// "RTNETLINK answers: Network is unreachable" and similar carry
+		// neither field; there is nothing to compare, so nothing is recorded.
+		if h.via != "" || h.dev != "" {
+			hops[want] = h
+		}
+		want = ""
+	}
+	return hops
+}
+
+// kernelVia asks one router where it would really send each address.
+//
+// The table read from the routing daemon is only the daemon's opinion. A policy
+// rule ("ip rule") sends the lookup to a different table before the daemon's
+// table is ever consulted, and a route the daemon selected but failed to push
+// is not in the kernel at all. Neither appears in "show ip route", so a check
+// that reads only that reports on a forwarding decision it never looked at.
+//
+// One command per router, not one per destination: the lookups are batched into
+// a single shell invocation because the cost here is the round trip, not the
+// lookup.
+func kernelVia(ctx context.Context, env *Env, router string, addrs []string) (map[string]kernelHop, error) {
+	if len(addrs) == 0 {
+		return nil, nil
+	}
+	var b strings.Builder
+	for _, a := range addrs {
+		fmt.Fprintf(&b, "echo '@ %s'; ip route get %s 2>&1 | head -1; ", a, a)
+	}
+	res, err := env.Probe(ctx, router, []string{"sh", "-c", b.String()})
+	if err != nil {
+		return nil, err
+	}
+	return parseKernelHops(res.Stdout), nil
+}
+
 // installedVia names the destinations whose selected route leaves by one of the
 // slow links, when a path through a fast one is also available. A link is
 // recognised by the neighbour's address or by the local interface it leaves by,
@@ -2659,8 +2746,9 @@ func sortedInts(m map[int]bool) []int {
 // no next-hop address in the table at all.
 //
 // It reads the routing table rather than BGP, because that is where a static
-// route, a policy route or an administrative distance shows up and BGP does
-// not. Every router is asked, and a router that cannot be read stops the check:
+// route or an administrative distance shows up and BGP does not, and it then
+// asks the kernel directly, because a policy rule shows up in neither. Every
+// router is asked, and a router that cannot be read stops the check:
 // concluding "nothing goes the slow way" from the routers that answered is the
 // kind of verdict this project keeps having to take back.
 func installedVia(ctx context.Context, env *Env, slow []string, slowIf map[string]map[string]bool, fast []string) (via []string, unreadable string) {
@@ -2697,6 +2785,19 @@ func installedVia(ctx context.Context, env *Env, slow []string, slowIf map[strin
 			}
 		}
 	}
+	// The destinations to ask the kernel about, and the prefix each one stands
+	// for. Only prefixes with a fast alternative are worth asking about, which
+	// is the same population the table scan below considers.
+	probes := map[string]string{}
+	var probeList []string
+	for prefix := range alt {
+		if a := probeAddr(prefix); a != "" {
+			probes[a] = prefix
+			probeList = append(probeList, a)
+		}
+	}
+	sort.Strings(probeList)
+
 	for _, r := range env.Routers() {
 		var routes map[string][]struct {
 			Protocol string `json:"protocol"`
@@ -2711,6 +2812,7 @@ func installedVia(ctx context.Context, env *Env, slow []string, slowIf map[strin
 			return nil, fmt.Sprintf("%s: its routing table could not be read (%v), so where "+
 				"its traffic actually goes could not be established", r.Name, err)
 		}
+		flagged := map[string]bool{}
 		for prefix, entries := range routes {
 			if !alt[prefix] {
 				continue
@@ -2735,9 +2837,30 @@ func installedVia(ctx context.Context, env *Env, slow []string, slowIf map[strin
 						continue
 					}
 					via = append(via, fmt.Sprintf("%s on %s (%s)", prefix, r.Name, e.Protocol))
+					flagged[prefix] = true
 					break
 				}
 			}
+		}
+
+		// Now ask the kernel the same question. A policy rule diverts the
+		// lookup to a table the daemon never shows, so agreeing with the table
+		// above is not the same as agreeing with what the machine does.
+		hops, err := kernelVia(ctx, env, r.Name, probeList)
+		if err != nil {
+			return nil, fmt.Sprintf("%s: where it would really send traffic could not be "+
+				"established (%v)", r.Name, err)
+		}
+		for addr, h := range hops {
+			prefix := probes[addr]
+			if flagged[prefix] {
+				continue
+			}
+			if !isSlow[h.via] && !slowIf[r.Name][h.dev] {
+				continue
+			}
+			via = append(via, fmt.Sprintf("%s on %s (kernel)", prefix, r.Name))
+			flagged[prefix] = true
 		}
 	}
 	return via, ""
