@@ -1613,30 +1613,33 @@ func checkECMP(ctx context.Context, env *Env) Result {
 		sort.Strings(extra)
 	}
 
-	// And the routing table has to be the one that decides.
+	// And the table the daemon writes has to be the one that decides.
 	//
-	// Everything above reads the table the routing daemon writes. A policy
-	// rule is consulted before that table ever is, so a submission can leave
-	// the equal-cost route installed, untouched and plainly visible, and still
-	// send every packet down one of its next hops. The tables then say
-	// "balances over port_BOS, port_PHY" and the kernel sends everything to
-	// port_BOS, and this check reported the first sentence.
-	//
-	// Overriding the route in the main table instead is already caught: the
-	// daemon reads the kernel back and reports such a route as learned by
-	// "kernel" rather than by OSPF, which the protocol test above rejects. A
-	// rule leaves no trace in the daemon at all, so it has to be asked about
-	// separately.
+	// Everything above reads what the routing daemon reports. Two things can
+	// make that not the table doing the forwarding. A policy rule is consulted
+	// before any table is, so traffic can be sent to a different table
+	// entirely. And the main table is shared: a second route for the same
+	// destination with a lower metric wins, and if it is labelled with the
+	// daemon's own protocol -- `ip route add ... proto ospf` -- the daemon
+	// never notices it and goes on reporting its own route as best. Both leave
+	// the equal-cost route installed, untouched and plainly visible, and this
+	// check reported "balances over port_BOS, port_PHY" while the kernel sent
+	// everything to port_BOS.
 	var diverted string
 	for _, router := range pathRouters(wantPaths) {
 		dev, ok := env.Device(router)
 		if !ok {
 			continue
 		}
-		why, err := divertedFrom(ctx, env, dev.ID, target)
+		hops, err := fetch(router)
+		if err != nil {
+			// Already recorded by the loops above.
+			continue
+		}
+		why, err := kernelDisagrees(ctx, env, dev.ID, target, hopNames(hops))
 		if err != nil {
 			return Errored("ospf.ecmp_paths", fmt.Errorf(
-				"reading the policy rules of %s: %w", router, err))
+				"reading what %s does with traffic to %s: %w", router, target, err))
 		}
 		if why != "" {
 			diverted = router + ": " + why
@@ -1649,10 +1652,10 @@ func checkECMP(ctx context.Context, env *Env) Result {
 				from, to, len(wantPaths)),
 			Observed: diverted,
 			Detail:   strings.TrimRight(detail.String(), "\n"),
-			Hint: "a policy rule is consulted before the routing table, so the equal-cost " +
-				"route is installed and carries nothing; this question is about the paths " +
-				"traffic takes, which OSPF costs alone should decide",
-			Command: "ip rule show; ip route show " + target,
+			Hint: "the route the daemon reports is not the one forwarding this traffic, so " +
+				"the equal-cost paths are installed and carry nothing; this question is " +
+				"about the paths traffic takes, which OSPF costs alone should decide",
+			Command: "ip rule show; ip route show to match " + target,
 		})
 	}
 
@@ -1769,10 +1772,38 @@ func pathRouters(paths [][]string) []string {
 // kernelHops reads the next hops out of "ip route show". A route with several
 // of them prints one "nexthop via ... dev ..." line each; a route with one
 // prints it on the line with the prefix.
-func kernelHops(out string) []installedHop {
-	var hops []installedHop
-	for _, line := range strings.Split(out, "\n") {
-		f := strings.Fields(line)
+// kernelRoute is one entry of a kernel routing table.
+//
+// The entries matter separately, rather than as one pile of next hops,
+// because several can exist for the same destination and only one of them
+// forwards: the kernel takes the longest prefix, and among equal prefixes the
+// lowest metric. Reading them together says "balances over both links" about a
+// router that has been told to prefer one.
+type kernelRoute struct {
+	prefix netip.Prefix
+	metric int
+	// kind is the route type when it is not a plain unicast route --
+	// "blackhole", "unreachable" and the like, which forward nothing.
+	kind string
+	hops []installedHop
+	text string
+}
+
+// routeKinds are the leading keywords iproute2 prints for a route that is not
+// a plain unicast one. Everything but "unicast" discards the traffic or
+// belongs to a table this reading does not reach.
+var routeKinds = map[string]bool{
+	"unicast": true, "local": true, "broadcast": true, "multicast": true,
+	"anycast": true, "blackhole": true, "unreachable": true, "prohibit": true,
+	"throw": true, "nat": true,
+}
+
+// kernelRoutes reads `ip route show` output into its entries. A line that
+// starts with whitespace continues the entry above it, which is how multipath
+// next hops are printed.
+func kernelRoutes(out string) []kernelRoute {
+	var routes []kernelRoute
+	addHops := func(r *kernelRoute, f []string) {
 		var h installedHop
 		for i := 0; i+1 < len(f); i++ {
 			switch f[i] {
@@ -1783,8 +1814,82 @@ func kernelHops(out string) []installedHop {
 			}
 		}
 		if h.ip != "" || h.iface != "" {
-			hops = append(hops, h)
+			r.hops = append(r.hops, h)
 		}
+	}
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		if len(f) == 0 {
+			continue
+		}
+		if line[0] == ' ' || line[0] == '\t' {
+			if n := len(routes); n > 0 {
+				addHops(&routes[n-1], f)
+			}
+			continue
+		}
+		r := kernelRoute{text: strings.Join(f, " ")}
+		if routeKinds[f[0]] {
+			if f[0] != "unicast" {
+				r.kind = f[0]
+			}
+			f = f[1:]
+		}
+		if len(f) == 0 {
+			continue
+		}
+		switch {
+		case f[0] == "default":
+			r.prefix = netip.PrefixFrom(netip.IPv4Unspecified(), 0)
+		case strings.Contains(f[0], "/"):
+			p, err := netip.ParsePrefix(f[0])
+			if err != nil {
+				continue
+			}
+			r.prefix = p.Masked()
+		default:
+			a, err := netip.ParseAddr(f[0])
+			if err != nil {
+				continue
+			}
+			r.prefix = netip.PrefixFrom(a, a.BitLen())
+		}
+		for i := 0; i+1 < len(f); i++ {
+			if f[i] == "metric" {
+				if m, err := strconv.Atoi(f[i+1]); err == nil {
+					r.metric = m
+				}
+			}
+		}
+		addHops(&r, f)
+		routes = append(routes, r)
+	}
+	return routes
+}
+
+// forwarding picks the entry that decides where traffic to dst goes: the
+// longest prefix that covers it, and among those the lowest metric.
+func forwarding(routes []kernelRoute, dst netip.Addr) (kernelRoute, bool) {
+	var best kernelRoute
+	found := false
+	for _, r := range routes {
+		if !r.prefix.IsValid() || !r.prefix.Contains(dst) {
+			continue
+		}
+		switch {
+		case !found,
+			r.prefix.Bits() > best.prefix.Bits(),
+			r.prefix.Bits() == best.prefix.Bits() && r.metric < best.metric:
+			best, found = r, true
+		}
+	}
+	return best, found
+}
+
+func kernelHops(out string) []installedHop {
+	var hops []installedHop
+	for _, r := range kernelRoutes(out) {
+		hops = append(hops, r.hops...)
 	}
 	return hops
 }
@@ -1835,19 +1940,29 @@ func mayCarry(r ipRule, dst netip.Addr) bool {
 	return true
 }
 
-// divertedFrom reports how a policy rule changes what a router really does
-// with traffic to one destination, and returns "" when none does.
+// kernelDisagrees reports how a router really forwards traffic to one
+// destination when that differs from what the check has been reading, and
+// returns "" when it does not.
 //
-// The comparison is between two readings of the kernel, not between the kernel
-// and the routing daemon: a rule that sends this traffic to a table holding
-// the same next hops changes nothing, and a submission that writes one has
-// answered the question. What is reported is a table that forwards the traffic
-// differently from the one the daemon wrote -- which is the whole of the
-// difference between an equal-cost route that carries traffic and one that
-// merely exists.
-func divertedFrom(ctx context.Context, env *Env, deviceID, target string) (string, error) {
+// Two things can make the routing daemon's table not the one that decides. A
+// policy rule is consulted before any table is, so traffic can be sent to a
+// different table entirely. And the table the daemon writes is shared: another
+// entry for the same destination with a lower metric wins, and if it is
+// labelled with the daemon's own protocol the daemon never notices it and goes
+// on reporting its own route as best. Both leave the equal-cost route
+// installed, untouched and plainly visible, while every packet takes one link.
+//
+// The rule comparison is between two readings of the kernel: a rule that sends
+// this traffic to a table holding the same next hops changes nothing, and a
+// submission that writes one has answered the question. The main-table
+// comparison is against the daemon, because that is the claim being made --
+// the check reports the daemon's next hops, so the kernel has to agree with
+// them.
+func kernelDisagrees(ctx context.Context, env *Env, deviceID, target string,
+	daemon map[string]bool) (string, error) {
+
 	res, err := env.Probe(ctx, deviceID, []string{"sh", "-c",
-		"ip rule show; echo '@@'; ip route show " + target})
+		"ip rule show; echo '@@'; ip route show to match " + target})
 	if err != nil {
 		return "", err
 	}
@@ -1858,14 +1973,29 @@ func divertedFrom(ctx context.Context, env *Env, deviceID, target string) (strin
 			"cannot be read for, so where this traffic goes cannot be established",
 			unsupported[0])
 	}
-	if len(rules) == 0 {
-		return "", nil
-	}
 	dst, err := netip.ParseAddr(addrOnly(target))
 	if err != nil {
 		return "", fmt.Errorf("reading the destination %q: %w", target, err)
 	}
-	want := hopNames(kernelHops(mainOut))
+
+	// What the main table really answers with. An empty answer means the
+	// destination is this router's own or reached by no route at all, and
+	// the probes further on are what settle that.
+	main, ok := forwarding(kernelRoutes(mainOut), dst)
+	if !ok {
+		return "", nil
+	}
+	if main.kind != "" {
+		return fmt.Sprintf("the kernel's own route for %s is %q, which forwards nothing",
+			target, main.text), nil
+	}
+	want := hopNames(main.hops)
+	if len(want) > 0 && len(daemon) > 0 && !sameHops(want, daemon) {
+		return fmt.Sprintf("the daemon reports it forwards to %s over %s, but the route "+
+			"the kernel prefers is %q, which uses %s", target,
+			strings.Join(sortedKeysOfBool(daemon), ", "), main.text,
+			strings.Join(sortedKeysOfBool(want), ", ")), nil
+	}
 
 	for _, r := range rules {
 		if !mayCarry(r, dst) {
@@ -1881,17 +2011,21 @@ func divertedFrom(ctx context.Context, env *Env, deviceID, target string) (strin
 			continue
 		}
 		res, err := env.Probe(ctx, deviceID, []string{"sh", "-c",
-			"ip route show table " + r.table + " " + target})
+			"ip route show table " + r.table + " to match " + target})
 		if err != nil {
 			return "", err
 		}
-		hops := kernelHops(res.Stdout)
-		if len(hops) == 0 {
+		alt, ok := forwarding(kernelRoutes(res.Stdout), dst)
+		if !ok {
 			// Nothing there for this destination, so the lookup falls through
 			// to the next rule and the daemon's table still decides.
 			continue
 		}
-		if got := hopNames(hops); !sameHops(got, want) {
+		if alt.kind != "" {
+			return fmt.Sprintf("policy rule %q sends traffic to %s to table %s, where "+
+				"%q forwards nothing", r.text, target, r.table, alt.text), nil
+		}
+		if got := hopNames(alt.hops); !sameHops(got, want) {
 			return fmt.Sprintf("policy rule %q sends traffic to %s to table %s, which "+
 				"forwards it over %s, not over %s", r.text, target, r.table,
 				strings.Join(sortedKeysOfBool(got), ", "),

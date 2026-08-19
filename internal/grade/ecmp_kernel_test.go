@@ -113,3 +113,80 @@ func TestTwoReadingsOfTheSameLinksAgree(t *testing.T) {
 		t.Fatal("no links at all is not the same as two")
 	}
 }
+
+func TestKernelRoutesSeparatesEntries(t *testing.T) {
+	// A route added by hand with the daemon's own protocol label sits beside
+	// the daemon's route, with the lower metric, and wins.
+	out := "3.153.0.1 via 3.0.10.1 dev port_BOS proto ospf \n" +
+		"3.153.0.1 nhid 57 proto ospf metric 20 \n" +
+		"\tnexthop via 3.0.8.1 dev port_PHY weight 1 \n" +
+		"\tnexthop via 3.0.10.1 dev port_BOS weight 1 \n"
+	routes := kernelRoutes(out)
+	if len(routes) != 2 {
+		t.Fatalf("want 2 entries, got %d: %+v", len(routes), routes)
+	}
+	if len(routes[0].hops) != 1 || routes[0].metric != 0 {
+		t.Fatalf("first entry: want 1 hop at metric 0, got %+v", routes[0])
+	}
+	if len(routes[1].hops) != 2 || routes[1].metric != 20 {
+		t.Fatalf("second entry: want 2 hops at metric 20, got %+v", routes[1])
+	}
+	win, ok := forwarding(routes, netip.MustParseAddr("3.153.0.1"))
+	if !ok {
+		t.Fatal("no forwarding entry")
+	}
+	if got := hopNames(win.hops); !sameHops(got, map[string]bool{"port_BOS": true}) {
+		t.Fatalf("the lower metric decides; got %v", got)
+	}
+}
+
+func TestForwardingPrefersLongestPrefix(t *testing.T) {
+	out := "default via 3.0.1.1 dev port_A \n" +
+		"3.153.0.0/24 via 3.0.2.1 dev port_B \n" +
+		"3.153.0.1 via 3.0.3.1 dev port_C metric 100 \n"
+	win, ok := forwarding(kernelRoutes(out), netip.MustParseAddr("3.153.0.1"))
+	if !ok {
+		t.Fatal("no forwarding entry")
+	}
+	if got := hopNames(win.hops); !sameHops(got, map[string]bool{"port_C": true}) {
+		t.Fatalf("a higher metric on a longer prefix still wins; got %v", got)
+	}
+	// And a destination the host route does not cover falls to the /24.
+	win, _ = forwarding(kernelRoutes(out), netip.MustParseAddr("3.153.0.9"))
+	if got := hopNames(win.hops); !sameHops(got, map[string]bool{"port_B": true}) {
+		t.Fatalf("want the covering prefix; got %v", got)
+	}
+	// And one neither covers falls to the default.
+	win, _ = forwarding(kernelRoutes(out), netip.MustParseAddr("9.9.9.9"))
+	if got := hopNames(win.hops); !sameHops(got, map[string]bool{"port_A": true}) {
+		t.Fatalf("want the default route; got %v", got)
+	}
+}
+
+func TestForwardingReportsDiscardingRoutes(t *testing.T) {
+	for _, kind := range []string{"blackhole", "unreachable", "prohibit"} {
+		win, ok := forwarding(kernelRoutes(kind+" 3.153.0.1 \n"),
+			netip.MustParseAddr("3.153.0.1"))
+		if !ok {
+			t.Fatalf("%s: no forwarding entry", kind)
+		}
+		if win.kind != kind {
+			t.Fatalf("%s: read as %q", kind, win.kind)
+		}
+	}
+	// A plain unicast route is not one of them, spelled either way.
+	win, _ := forwarding(kernelRoutes("unicast 3.153.0.1 via 3.0.1.1 dev port_A \n"),
+		netip.MustParseAddr("3.153.0.1"))
+	if win.kind != "" || len(win.hops) != 1 {
+		t.Fatalf("explicit unicast misread: %+v", win)
+	}
+}
+
+func TestForwardingIgnoresUncoveredEntries(t *testing.T) {
+	// `ip route show to match` returns only covering routes, but a table read
+	// in full must not have an unrelated entry mistaken for the answer.
+	out := "3.100.0.0/24 via 3.0.9.1 dev port_Z \n"
+	if _, ok := forwarding(kernelRoutes(out), netip.MustParseAddr("3.153.0.1")); ok {
+		t.Fatal("an entry that does not cover the destination decided the route")
+	}
+}
