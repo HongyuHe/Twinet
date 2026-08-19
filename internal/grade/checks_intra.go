@@ -1613,6 +1613,49 @@ func checkECMP(ctx context.Context, env *Env) Result {
 		sort.Strings(extra)
 	}
 
+	// And the routing table has to be the one that decides.
+	//
+	// Everything above reads the table the routing daemon writes. A policy
+	// rule is consulted before that table ever is, so a submission can leave
+	// the equal-cost route installed, untouched and plainly visible, and still
+	// send every packet down one of its next hops. The tables then say
+	// "balances over port_BOS, port_PHY" and the kernel sends everything to
+	// port_BOS, and this check reported the first sentence.
+	//
+	// Overriding the route in the main table instead is already caught: the
+	// daemon reads the kernel back and reports such a route as learned by
+	// "kernel" rather than by OSPF, which the protocol test above rejects. A
+	// rule leaves no trace in the daemon at all, so it has to be asked about
+	// separately.
+	var diverted string
+	for _, router := range pathRouters(wantPaths) {
+		dev, ok := env.Device(router)
+		if !ok {
+			continue
+		}
+		why, err := divertedFrom(ctx, env, dev.ID, target)
+		if err != nil {
+			return Errored("ospf.ecmp_paths", fmt.Errorf(
+				"reading the policy rules of %s: %w", router, err))
+		}
+		if why != "" {
+			diverted = router + ": " + why
+			break
+		}
+	}
+	if diverted != "" {
+		return Partial("ospf.ecmp_paths", 0, Evidence{
+			Expected: fmt.Sprintf("traffic from %s to %s carried by the %d equal-cost paths",
+				from, to, len(wantPaths)),
+			Observed: diverted,
+			Detail:   strings.TrimRight(detail.String(), "\n"),
+			Hint: "a policy rule is consulted before the routing table, so the equal-cost " +
+				"route is installed and carries nothing; this question is about the paths " +
+				"traffic takes, which OSPF costs alone should decide",
+			Command: "ip rule show; ip route show " + target,
+		})
+	}
+
 	// And the paths have to carry a packet.
 	//
 	// Everything above reads the forwarding tables, which say exactly which
@@ -1703,6 +1746,159 @@ func checkECMP(ctx context.Context, env *Env) Result {
 		Hint:     "the cost of a path is the sum of its links; make exactly the intended paths equal",
 		Command:  "show ip route json",
 	})
+}
+
+// pathRouters names every router the prescribed paths pass through, in a
+// stable order. The last hop of a path is left out: it is the destination, and
+// what it does with traffic addressed to itself is not what is being asked.
+func pathRouters(paths [][]string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, p := range paths {
+		for i := 0; i+1 < len(p); i++ {
+			if !seen[p[i]] {
+				seen[p[i]] = true
+				out = append(out, p[i])
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// kernelHops reads the next hops out of "ip route show". A route with several
+// of them prints one "nexthop via ... dev ..." line each; a route with one
+// prints it on the line with the prefix.
+func kernelHops(out string) []installedHop {
+	var hops []installedHop
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		var h installedHop
+		for i := 0; i+1 < len(f); i++ {
+			switch f[i] {
+			case "via":
+				h.ip = f[i+1]
+			case "dev":
+				h.iface = f[i+1]
+			}
+		}
+		if h.ip != "" || h.iface != "" {
+			hops = append(hops, h)
+		}
+	}
+	return hops
+}
+
+// hopNames reduces a set of next hops to the links they leave by, so two
+// readings can be compared. The interface decides which link carries the
+// traffic; the address is used only when the route names no interface.
+func hopNames(hops []installedHop) map[string]bool {
+	names := map[string]bool{}
+	for _, h := range hops {
+		name := h.iface
+		if name == "" {
+			name = h.ip
+		}
+		if name != "" {
+			names[name] = true
+		}
+	}
+	return names
+}
+
+func sameHops(a, b map[string]bool) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k := range a {
+		if !b[k] {
+			return false
+		}
+	}
+	return true
+}
+
+// mayCarry reports whether a policy rule can govern traffic to this
+// destination. A rule that names no destination governs all of it.
+func mayCarry(r ipRule, dst netip.Addr) bool {
+	if r.to == "" || r.to == "all" {
+		return true
+	}
+	if p, err := netip.ParsePrefix(r.to); err == nil {
+		return p.Contains(dst)
+	}
+	if a, err := netip.ParseAddr(r.to); err == nil {
+		return a == dst
+	}
+	// A destination that cannot be read is not a reason to conclude the rule
+	// is harmless.
+	return true
+}
+
+// divertedFrom reports how a policy rule changes what a router really does
+// with traffic to one destination, and returns "" when none does.
+//
+// The comparison is between two readings of the kernel, not between the kernel
+// and the routing daemon: a rule that sends this traffic to a table holding
+// the same next hops changes nothing, and a submission that writes one has
+// answered the question. What is reported is a table that forwards the traffic
+// differently from the one the daemon wrote -- which is the whole of the
+// difference between an equal-cost route that carries traffic and one that
+// merely exists.
+func divertedFrom(ctx context.Context, env *Env, deviceID, target string) (string, error) {
+	res, err := env.Probe(ctx, deviceID, []string{"sh", "-c",
+		"ip rule show; echo '@@'; ip route show " + target})
+	if err != nil {
+		return "", err
+	}
+	rulesOut, mainOut, _ := strings.Cut(res.Stdout, "@@")
+	rules, unsupported := parseIPRules(rulesOut)
+	if len(unsupported) > 0 {
+		return "", fmt.Errorf("policy rule %q selects on something a routing table "+
+			"cannot be read for, so where this traffic goes cannot be established",
+			unsupported[0])
+	}
+	if len(rules) == 0 {
+		return "", nil
+	}
+	dst, err := netip.ParseAddr(addrOnly(target))
+	if err != nil {
+		return "", fmt.Errorf("reading the destination %q: %w", target, err)
+	}
+	want := hopNames(kernelHops(mainOut))
+
+	for _, r := range rules {
+		if !mayCarry(r, dst) {
+			continue
+		}
+		if r.table == "" {
+			// No table to look in: the rule drops or rejects the traffic
+			// rather than routing it.
+			return fmt.Sprintf("policy rule %q takes traffic to %s out of the routing "+
+				"tables altogether", r.text, target), nil
+		}
+		if r.table == "main" {
+			continue
+		}
+		res, err := env.Probe(ctx, deviceID, []string{"sh", "-c",
+			"ip route show table " + r.table + " " + target})
+		if err != nil {
+			return "", err
+		}
+		hops := kernelHops(res.Stdout)
+		if len(hops) == 0 {
+			// Nothing there for this destination, so the lookup falls through
+			// to the next rule and the daemon's table still decides.
+			continue
+		}
+		if got := hopNames(hops); !sameHops(got, want) {
+			return fmt.Sprintf("policy rule %q sends traffic to %s to table %s, which "+
+				"forwards it over %s, not over %s", r.text, target, r.table,
+				strings.Join(sortedKeysOfBool(got), ", "),
+				strings.Join(sortedKeysOfBool(want), ", ")), nil
+		}
+	}
+	return "", nil
 }
 
 // checkVLANIsolation verifies that hosts in the same VLAN reach each other
