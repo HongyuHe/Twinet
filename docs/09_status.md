@@ -2193,3 +2193,73 @@ than adding a second one; it already carries its own scar, having once matched
 the "Local host:" line that every learned path prints.
 
 Full labs after the fix: cos461 10.00, advnet 6.00, multicast 4.00.
+
+### 121. A dry run that reported it had deployed the lab
+
+```
+$ twinet deploy --dry-run
+twinet: docker 29.7.2, lab demo (topology a345547bd0b68597)
+
+deployed 57 devices and 74 links in 1ms
+$ echo $?
+0
+$ sudo docker ps -a --format '{{.Names}}' | grep -c '^demo'
+0
+```
+
+Nothing was created. The word was "deployed", the exit status was zero, and an
+operator scripting a preview -- or a TA gating the next step of a deployment
+script on that exit code -- had no way to tell it apart from a real run.
+
+The summary took its numbers from `top.Stats()`, the topology as written. That
+figure is the same for every run of the same manifest, which makes it wrong in
+three independent ways, only the first of which the reviewer had to trip over:
+
+- `--dry-run`, which builds nothing, announced the whole lab;
+- `--only as=1`, which built seven devices, announced all 57;
+- a deploy that fell over half way announced the whole topology on the line
+  immediately above the list of scopes that had failed.
+
+The last is the one that would have cost somebody a night. The counts now come
+from the execution report -- create and wire steps that actually ran and
+returned no error -- so each of those runs reports what it did. The agent's
+reply had the same shape: `Steps` was `p.Len()`, the planned length, so the
+per-node table showed a full step count for a run that performed none of them.
+It now sends completed and planned separately, and the table prints `0/333`
+when they differ.
+
+**The fix had the defect in it.** The per-node link totals double-count
+cross-node links, which are wired from both ends, so the summary subtracted the
+topology's cross-node count to get back to distinct links. That identity holds
+only for a run covering the whole topology, and the first version applied it
+unconditionally:
+
+```
+$ twinet deploy --dry-run --only as=3
+dry run: 33 devices and 10 links would be deployed across 3 nodes
+```
+
+Forty-three endpoints, minus a whole lab's 33 cross-node links, reported as 10
+-- a fix for a number that could not be supported, printing a number that could
+not be supported. A restricted or partly answered run now reports endpoints and
+says that is what they are. Caught only because the fix was re-run against the
+mutation it was written for, which is the rule that keeps earning its place.
+
+The check that matters for the class as a whole: **on a normal, complete deploy
+the output is byte-for-byte what it was before** -- `212 devices, 299 links (33
+cross-node) across 3 nodes` -- because on that run the intended number and the
+achieved number agree. The fix is invisible exactly when the old code was right,
+and speaks up exactly when it was lying.
+
+An unreachable node turns out not to reach the degraded branch at all: the
+pre-flight image check refuses first, non-zero and before anything is created.
+Verified by stopping node-2's agent.
+
+Swept the neighbours. `destroy` prints its node count only after checking every
+node succeeded. `inspect`'s use of `Stats()` is correct -- it is describing the
+manifest, which is what inspect is for. The remaining `p.Len()` uses are a
+progress-bar denominator and an empty-plan guard.
+
+Verified: dry run and `--only` on both the single-node and cluster paths, a
+clean cluster deploy unchanged, node-2 stopped and restored, cos461 back to
+10.00.
