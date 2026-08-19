@@ -433,11 +433,14 @@ func denyMatches(body, condition string) bool {
 		// A permit clause reached first is a way in. Route-maps stop at the
 		// first clause that matches, so `permit 4: match ip address
 		// prefix-list EVERYTHING-BUT-THE-ONE-THEY-TEST` in front of the deny
-		// admits every invalid route but the one the grader knows about. A
-		// preceding permit is only harmless when nothing it matches on could
-		// be true of a route in the state being denied -- which is to say,
-		// when it selects on the validation state itself.
-		if !c.deny && !onlyValidationMatches(c.matches, want) {
+		// admits every invalid route but the one the grader knows about.
+		//
+		// It is harmless only when a route in the state being denied could
+		// not match it at all. FRR requires every match in a clause to hold,
+		// so one match the state rules out is enough on its own: no invalid
+		// route matches `match rpki valid`, however many prefix lists or
+		// communities the clause also asks for.
+		if !c.deny && !excludesState(c.matches, want) {
 			return false
 		}
 		for _, m := range c.matches {
@@ -461,20 +464,50 @@ func denyMatches(body, condition string) bool {
 	return false
 }
 
-// onlyValidationMatches reports whether every match in a clause selects on the
-// RPKI validation state, and on a state other than the one being asked about.
+// rpkiState returns the validation state a match line selects on, or "" when
+// the line does not select on one.
+func rpkiState(match string) string {
+	f := strings.Fields(strings.TrimSpace(strings.ToLower(match)))
+	if len(f) == 3 && f[0] == "match" && f[1] == "rpki" {
+		return f[2]
+	}
+	return ""
+}
+
+// excludesState reports whether a route in the given validation state could
+// not match a clause at all.
 //
-// Such a clause cannot be the way an invalid route gets in: it does not match
-// one. Anything else -- a prefix list, an AS path, a community -- can be true
-// of an invalid route as easily as of a valid one.
-func onlyValidationMatches(matches []string, want string) bool {
+// FRR requires every match in a clause to hold, so a single match the state
+// makes false rules the whole clause out -- and a validation-state match is
+// the only kind that can be decided from the configuration alone. A prefix
+// list, an AS path or a community can be true of an invalid route as easily
+// as of a valid one, so a clause resting on one of those has to be treated as
+// a way in.
+//
+// Reading this the other way round, as "every match selects on some other
+// state", is what round 119 caught: it failed a submission whose
+// `permit: match rpki valid, match ip address prefix-list ...` sat in front
+// of the deny, even though that clause cannot match an invalid route and the
+// deny behind it was doing its job.
+func excludesState(matches []string, want string) bool {
+	state := strings.ToLower(strings.TrimSpace(want))
+	if f := strings.Fields(state); len(f) > 0 {
+		state = f[len(f)-1]
+	}
+	excluded := false
 	for _, m := range matches {
-		t := strings.TrimSpace(strings.ToLower(m))
-		if !strings.HasPrefix(t, "match rpki ") || strings.Contains(t, want) {
+		switch s := rpkiState(m); s {
+		case "":
+			continue
+		case state:
+			// The clause asks for the very state being denied, so a route in
+			// that state matches it and stops there.
 			return false
+		default:
+			excluded = true
 		}
 	}
-	return len(matches) > 0
+	return excluded
 }
 
 // hasRemoteAS reports whether a neighbour's settings name this AS number,

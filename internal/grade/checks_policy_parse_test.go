@@ -80,3 +80,63 @@ func TestAnUnreachableDenyIsNotProtection(t *testing.T) {
 		t.Error("a clause that permits invalid origins was counted as denying them")
 	}
 }
+
+// A clause is reached only if every one of its match statements holds, so a
+// permit clause asking for a validation state cannot be the way a route in a
+// different state gets in -- whatever else it also asks for. Reading this as
+// "every match must select on the state" failed a correct submission whose
+// permit clause set local-preference for valid routes on a prefix list.
+func TestAPermitThatCannotMatchTheDeniedStateIsNotAWayIn(t *testing.T) {
+	withPrefixList := "route-map RPKI-IN permit 3" + "\n" +
+		" match ip address prefix-list ALL-ROUTES" + "\n" +
+		" match rpki valid" + "\n" +
+		"route-map RPKI-IN deny 5" + "\n" +
+		" match rpki invalid" + "\n" +
+		"route-map RPKI-IN permit 20" + "\n"
+	if !denyMatches(withPrefixList, "rpki invalid") {
+		t.Error("a permit clause that no invalid route can match was treated as letting " +
+			"invalid routes through, failing a submission that rejects them")
+	}
+
+	// The same clause, written with the validation state first.
+	stateFirst := "route-map RPKI-IN permit 3" + "\n" +
+		" match rpki valid" + "\n" +
+		" match community 1:30" + "\n" +
+		"route-map RPKI-IN deny 5" + "\n" +
+		" match rpki invalid" + "\n"
+	if !denyMatches(stateFirst, "rpki invalid") {
+		t.Error("the verdict depended on the order the match statements were written in")
+	}
+
+	notfound := "route-map RPKI-IN permit 3" + "\n" +
+		" match rpki notfound" + "\n" +
+		"route-map RPKI-IN deny 5" + "\n" +
+		" match rpki invalid" + "\n"
+	if !denyMatches(notfound, "rpki invalid") {
+		t.Error("a permit clause selecting a third validation state was treated as a way in")
+	}
+}
+
+// The reason the preceding-permit rule exists in the first place: a clause
+// resting on anything the configuration cannot decide can be true of an
+// invalid route, so it still hides the deny behind it.
+func TestAPermitThatCouldMatchTheDeniedStateStillHidesTheDeny(t *testing.T) {
+	prefixOnly := "route-map RPKI-IN permit 3" + "\n" +
+		" match ip address prefix-list ALL-BUT-THE-TESTED-ONE" + "\n" +
+		"route-map RPKI-IN deny 5" + "\n" +
+		" match rpki invalid" + "\n"
+	if denyMatches(prefixOnly, "rpki invalid") {
+		t.Error("a permit clause an invalid route can match was counted as harmless")
+	}
+
+	// Permitting the very state the deny behind it names.
+	sameState := "route-map RPKI-IN permit 3" + "\n" +
+		" match rpki invalid" + "\n" +
+		" match ip address prefix-list SOME" + "\n" +
+		"route-map RPKI-IN deny 5" + "\n" +
+		" match rpki invalid" + "\n"
+	if denyMatches(sameState, "rpki invalid") {
+		t.Error("a clause that permits invalid origins on a prefix list was counted as " +
+			"denying them")
+	}
+}
