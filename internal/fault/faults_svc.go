@@ -103,16 +103,35 @@ func init() {
 			return State{"device": t.DeviceID(), "protos": strings.Join(done, " ")}, nil
 		},
 		Verify: func(ctx context.Context, e *Env, t Target, s State) (Evidence, error) {
-			out, _, err := e.TryE(ctx, t.DeviceID(), "iptables -w -S INPUT")
-			if err != nil {
-				return Evidence{}, err
+			// Asked per protocol, and only about the protocols this injection
+			// recorded. Counting every line containing "--dport 53 -j DROP"
+			// answered a different question twice over. It could not tell
+			// which protocol was still blocked, so removing the udp rule --
+			// the one that actually stops name resolution -- left the report
+			// saying "still in effect" on a resolver that answers lookups
+			// again. And it counted rules this fault never added, which is
+			// the same mistake the injection guard above was written to
+			// avoid: a rule somebody else left behind kept this fault
+			// verified after its own rules were gone.
+			protos := strings.Fields(s["protos"])
+			if len(protos) == 0 {
+				return Evidence{}, fmt.Errorf(
+					"no protocols were recorded for this fault, so there is nothing to check")
 			}
-			n := strings.Count(out, "--dport 53 -j DROP")
-			return Evidence{
-				Verified: n > 0,
-				Observed: fmt.Sprintf("%d rule(s) dropping port 53", n),
-				Expected: "queries to the resolver are dropped",
-			}, nil
+			var still, clear []string
+			for _, p := range protos {
+				n := countACL(ctx, e, t, "INPUT", fmt.Sprintf("-p %s --dport 53", p))
+				if n < 0 {
+					return Evidence{}, fmt.Errorf(
+						"could not read the INPUT chain on %s", t.DeviceID())
+				}
+				if n > 0 {
+					still = append(still, p)
+				} else {
+					clear = append(clear, p)
+				}
+			}
+			return dnsBlockedEvidence(protos, still, clear), nil
 		},
 		Resolve: func(ctx context.Context, e *Env, t Target, s State) error {
 			protos := strings.Fields(s["protos"])
@@ -435,14 +454,30 @@ func init() {
 			return State{"iface": iface}, nil
 		},
 		Verify: func(ctx context.Context, e *Env, t Target, s State) (Evidence, error) {
+			// Both halves are asked about, because both were installed. This
+			// used to read the egress qdisc alone, so taking the netem off --
+			// `tc qdisc replace dev X root pfifo_fast`, the obvious way to
+			// undo it -- reported the link healthy while the ingress filter
+			// went on dropping every inbound packet. The link was still cut,
+			// the ping was still 100% lost, and the verify said the fault was
+			// gone: an agent that did half the repair was told it had done
+			// all of it, and anything scored against this episode was scored
+			// against a problem the ledger believed was absent.
 			out, _, err := e.TryE(ctx, t.DeviceID(), "tc qdisc show dev "+s["iface"])
 			if err != nil {
 				return Evidence{}, err
 			}
+			egress := strings.Contains(out, "loss 100%")
+			filt, _, err := e.TryE(ctx, t.DeviceID(),
+				"tc filter show dev "+s["iface"]+" ingress")
+			if err != nil {
+				return Evidence{}, err
+			}
+			ingress := strings.Contains(filt, "action drop")
 			return Evidence{
-				Verified: strings.Contains(out, "loss 100%"),
-				Observed: firstLine(out),
-				Expected: "the interface carries nothing",
+				Verified: egress || ingress,
+				Observed: detachObserved(out, egress, ingress),
+				Expected: "the interface carries nothing, in both directions",
 			}, nil
 		},
 		Resolve: func(ctx context.Context, e *Env, t Target, s State) error {
@@ -468,6 +503,47 @@ func reloadNamed() string {
 		"rm -f /var/run/named/named.pid 2>/dev/null || true",
 		"named -c /etc/bind/named.conf -u named",
 	}, "\n")
+}
+
+// dnsBlockedEvidence names which protocols this fault still blocks.
+//
+// "1 rule(s) dropping port 53" was true of two quite different situations --
+// tcp still blocked with lookups working again, and udp still blocked with
+// them broken -- and told them apart in neither direction.
+func dnsBlockedEvidence(protos, still, clear []string) Evidence {
+	obs := fmt.Sprintf("%s dropped", strings.Join(still, " and "))
+	switch {
+	case len(still) == 0:
+		obs = fmt.Sprintf("%s reach the resolver", strings.Join(clear, " and "))
+	case len(clear) > 0:
+		obs += fmt.Sprintf("; %s reach the resolver", strings.Join(clear, " and "))
+	}
+	return Evidence{
+		Verified: len(still) > 0,
+		Observed: obs,
+		Expected: fmt.Sprintf("%s queries to the resolver are dropped",
+			strings.Join(protos, " and ")),
+	}
+}
+
+// detachObserved describes which halves of a link_detach are still installed.
+//
+// The two halves fail independently, so "the fault is still there" is not one
+// fact but two, and a report that collapses them hides the case that matters:
+// egress clear, ingress still dropping, traffic still going nowhere.
+func detachObserved(qdisc string, egress, ingress bool) string {
+	q := firstLine(qdisc)
+	switch {
+	case egress && ingress:
+		return "dropped in both directions: " + q
+	case egress:
+		return "outbound dropped: " + q + "; no ingress drop filter remains"
+	case ingress:
+		return "outbound is clear (" + q + ") but every inbound packet is " +
+			"still dropped by the ingress filter"
+	default:
+		return q + "; no ingress drop filter"
+	}
 }
 
 // netemDelayMS extracts a netem delay from tc output, in milliseconds.

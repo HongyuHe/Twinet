@@ -108,9 +108,34 @@ func init() {
 			if err != nil {
 				return Evidence{}, err
 			}
-			return Evidence{Verified: alive > 0,
-				Expected: "the flap loop running",
-				Observed: fmt.Sprintf("%d flap loop(s) running", alive)}, nil
+			if alive > 0 {
+				return Evidence{Verified: true,
+					Expected: "the flap loop running, or the link it left down",
+					Observed: fmt.Sprintf("%d flap loop(s) running", alive)}, nil
+			}
+			// The loop spends a third of its cycle with the link down, so
+			// killing it is as likely as not to leave the interface down for
+			// good -- which Resolve has always known and repaired, and which
+			// this check used to be blind to. Counting loops alone reported
+			// the fault gone while the link carried nothing at all and every
+			// ping across it was lost. A dead loop is not the same as an
+			// undone fault, and saying otherwise is a claim about the link
+			// made without looking at it.
+			state, _, err := e.TryE(ctx, t.DeviceID(),
+				"cat /sys/class/net/"+s["iface"]+"/operstate 2>/dev/null")
+			if err != nil {
+				return Evidence{}, err
+			}
+			if strings.TrimSpace(state) == "down" {
+				return Evidence{Verified: true,
+					Expected: "the flap loop running, or the link it left down",
+					Observed: "no flap loop is running, but it stopped on a down " +
+						"cycle and " + s["iface"] + " is still down"}, nil
+			}
+			return Evidence{Verified: false,
+				Expected: "the flap loop running, or the link it left down",
+				Observed: "no flap loop is running and " + s["iface"] + " is " +
+					strings.TrimSpace(state)}, nil
 		},
 		Resolve: func(ctx context.Context, e *Env, t Target, s State) error {
 			if s["pids"] == "" || s["iface"] == "" {
