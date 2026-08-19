@@ -434,13 +434,15 @@ func deployCluster(ctx context.Context, top *model.Topology, tok string, req age
 
 	// Summed from what the nodes reported doing, not from the manifest. A
 	// cross-node link is wired from both ends, so the per-node totals count it
-	// twice; subtracting them is exact only when every node was reached and
-	// nothing failed, which is why the degraded case below counts endpoints
-	// and says so rather than quietly reporting a number it cannot support.
+	// twice. Subtracting the topology's cross-node count undoes that, but only
+	// for a run that covered the whole topology: with --only, or a node that
+	// did not answer, the endpoints summed here are a subset the manifest's
+	// figure says nothing about. Those cases report endpoints and say so
+	// rather than printing a link count they cannot support.
 	s := top.Stats()
-	clean := failed == 0 && reached == len(c.Nodes)
+	whole := failed == 0 && reached == len(c.Nodes) && len(req.OnlySteps) == 0
 	if req.DryRun {
-		if clean {
+		if whole {
 			fmt.Fprintf(out, "\ndry run: %d devices and %d links would be deployed "+
 				"across %d nodes; nothing was changed\n",
 				wantDev, wantLink-s.CrossNode, len(c.Nodes))
@@ -454,7 +456,7 @@ func deployCluster(ctx context.Context, top *model.Topology, tok string, req age
 		}
 		return nil
 	}
-	if clean {
+	if whole {
 		fmt.Fprintf(out, "\n%d devices, %d links (%d cross-node) across %d nodes in %s\n",
 			devices, links-s.CrossNode, s.CrossNode, len(c.Nodes),
 			time.Since(start).Round(time.Millisecond))
