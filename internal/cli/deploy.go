@@ -220,10 +220,21 @@ after a partial failure, a reboot, or a topology edit.`,
 				return err
 			}
 
-			s := top.Stats()
+			// Counted from what the run actually did, not from the manifest.
+			// top.Stats() is the lab as written, which is the same number for a
+			// --dry-run that touched nothing, for an --only that built one AS,
+			// and for a deploy that fell over half way.
+			devices := rep.Completed(plan.StageCreate)
+			links := rep.Completed(plan.StageWire)
+			if dryRun {
+				fmt.Fprintf(cmd.OutOrStdout(),
+					"\ndry run: %d devices and %d links would be deployed; nothing was changed\n",
+					rep.Planned(plan.StageCreate), rep.Planned(plan.StageWire))
+				return nil
+			}
 			fmt.Fprintf(cmd.OutOrStdout(),
 				"\ndeployed %d devices and %d links in %s\n",
-				s.Devices, s.Links, rep.Duration.Round(time.Millisecond))
+				devices, links, rep.Duration.Round(time.Millisecond))
 			if rep.Failed() {
 				fmt.Fprintln(cmd.ErrOrStderr())
 				printScopeFailures(cmd.ErrOrStderr(), rep)
