@@ -116,6 +116,15 @@ type arrivalTap struct {
 // was still running when the probes went past is the difference between "no
 // packet arrived" and "nobody was watching", and only one of those is evidence.
 func startArrivalTap(ctx context.Context, env *Env, device, port string) *arrivalTap {
+	return startArrivalTapN(ctx, env, device, port, tapFrames)
+}
+
+// startArrivalTapN is startArrivalTap with the frame limit named, for the
+// callers that aim more than one flow at the same port. Reaching the limit
+// stops the capture early and voids its witness, so a caller sending many
+// probes has to raise it or lose the evidence it went to the trouble of
+// creating.
+func startArrivalTapN(ctx context.Context, env *Env, device, port string, frames int) *arrivalTap {
 	t := &arrivalTap{
 		device: device,
 		file:   fmt.Sprintf("/tmp/twinet-tap-%d-%d", rand.Uint32(), rand.Uint32()),
@@ -129,7 +138,7 @@ func startArrivalTap(ctx context.Context, env *Env, device, port string) *arriva
 			"n=0; while [ $n -lt 100 ]; do "+
 			"grep -q 'listening on' %[1]s.err 2>/dev/null && exit 0; "+
 			"n=$((n+1)); sleep 0.05; done; exit 4",
-		t.file, port, tapSeconds, tapFrames)
+		t.file, port, tapSeconds, frames)
 	res, err := env.Probe(ctx, device, []string{"sh", "-c", script})
 	t.begun = err == nil && res.ExitCode == 0
 	return t
@@ -153,8 +162,18 @@ type tapCounts struct {
 // stopped on its own beforehand -- its own timeout, or its frame limit -- it
 // was not watching for the whole of the flow and its silence proves nothing.
 func (t *arrivalTap) seen(ctx context.Context, env *Env) (tapCounts, bool) {
+	c, _, live := t.seenFlows(ctx, env)
+	return c, live
+}
+
+// seenFlows is seen, and also which source ports the arriving frames came
+// from. A caller that aims several flows at one port distinguishes them that
+// way: the source port is the only thing that differs between them, and it is
+// also what the kernel hashes to choose between equal-cost next hops, so it
+// names both the flow and the path it was steered onto.
+func (t *arrivalTap) seenFlows(ctx context.Context, env *Env) (tapCounts, map[string]int, bool) {
 	if t == nil || !t.begun {
-		return tapCounts{}, false
+		return tapCounts{}, nil, false
 	}
 	res, err := env.Probe(ctx, t.device, []string{"sh", "-c",
 		fmt.Sprintf("early=0; [ -f %[1]s.end ] && early=1; "+
@@ -164,35 +183,72 @@ func (t *arrivalTap) seen(ctx context.Context, env *Env) (tapCounts, bool) {
 			"cat %[1]s 2>/dev/null; "+
 			"rm -f %[1]s %[1]s.err %[1]s.pid %[1]s.end; exit 0", t.file)})
 	if err != nil || res.ExitCode != 0 {
-		return tapCounts{}, false
+		return tapCounts{}, nil, false
 	}
-	return parseTapOutput(res.Stdout)
+	return parseTapFlows(res.Stdout)
 }
 
 // parseTapOutput separates what tcpdump said about itself from what it
 // captured, and reports nothing rather than nothing-arrived where the capture
 // cannot be trusted to tell the difference.
 func parseTapOutput(out string) (tapCounts, bool) {
+	c, _, ok := parseTapFlows(out)
+	return c, ok
+}
+
+// parseTapFlows is parseTapOutput, also grouping the arrivals by the source
+// port they came from.
+func parseTapFlows(out string) (tapCounts, map[string]int, bool) {
 	marker, rest, ok := strings.Cut(out, "\n")
 	if !ok || !strings.HasPrefix(marker, "EARLY=") {
-		return tapCounts{}, false
+		return tapCounts{}, nil, false
 	}
 	// The capture had already stopped before it was asked, so the window it
 	// watched does not cover the flow and it has nothing to testify to.
 	if strings.TrimPrefix(marker, "EARLY=") != "0" {
-		return tapCounts{}, false
+		return tapCounts{}, nil, false
 	}
 	head, body, ok := strings.Cut(rest, "---\n")
 	if !ok || !strings.Contains(head, "listening on") {
-		return tapCounts{}, false
+		return tapCounts{}, nil, false
 	}
 	// Without the cooked-v2 header there is no interface name on the line, and
 	// a loopback frame is indistinguishable from an arrival. Better to have no
 	// witness than a witness that cannot tell the two apart.
 	if !strings.Contains(head, "LINUX_SLL2") {
-		return tapCounts{}, false
+		return tapCounts{}, nil, false
 	}
-	return countTapFrames(body), true
+	return countTapFrames(body), tapSourcePorts(body), true
+}
+
+// tapSourcePorts counts the arriving frames by the port they were sent from.
+//
+// tcpdump renders an address and port as one dotted field, so the port is
+// what follows the last dot of the source field. A line whose source cannot
+// be read that way is left out rather than guessed at: the caller counts a
+// flow as lost when its port is absent, and a misparse would be an accusation
+// against a submission that did nothing wrong.
+func tapSourcePorts(body string) map[string]int {
+	out := map[string]int{}
+	for _, line := range strings.Split(body, "\n") {
+		f := strings.Fields(line)
+		if len(f) < 5 || f[2] != "In" || f[1] == "lo" {
+			continue
+		}
+		if !strings.Contains(line, "UDP,") && !strings.Contains(line, "Flags [") {
+			continue
+		}
+		i := strings.LastIndex(f[4], ".")
+		if i < 0 {
+			continue
+		}
+		port := f[4][i+1:]
+		if port == "" || strings.Trim(port, "0123456789") != "" {
+			continue
+		}
+		out[port]++
+	}
+	return out
 }
 
 // countTapFrames reads tcpdump's `-i any` output, whose second field is the

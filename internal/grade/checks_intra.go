@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/bits"
+	"math/rand/v2"
 	"net/netip"
 	"regexp"
 	"sort"
@@ -1285,8 +1286,138 @@ func deadHops(ctx context.Context, env *Env, paths [][]string) []string {
 	return broken
 }
 
+// sweepFlowCount is how many flows are aimed at the destination to find out
+// whether every path carries them.
+//
+// The routers hash the source port to choose between equal-cost next hops, so
+// distinct source ports spread over the paths -- and they do so at every
+// router along the way, not only the first, which is what makes a path of
+// three routers reachable by this. Thirty-two flows over the three paths of
+// the shipped lab leave a chance of about one in ten thousand of never trying
+// one of them, and failing to try a path can only understate a fault.
+const sweepFlowCount = 32
+
+// everyFlowArrives sends many flows between two routers and reports the ones
+// that never arrived.
+//
+// A single end-to-end probe answers for a single path: which one it takes is a
+// hash of the flow, and the same flow takes the same path every time. With
+// three paths installed between two routers, one of them can discard
+// everything sent along it while the probe, hashed onto another, reports the
+// pair as healthy. That is not a hypothetical -- a rule dropping forwarded
+// connections on one middle router cost a quarter of the traffic between two
+// routers and left this question on full marks.
+//
+// The path a flow will take is not predicted. The kernel can be asked, but its
+// answer for a forwarded packet turned out not to be what it then did with the
+// packet, and a check that grades on a prediction grades on the wrong thing.
+// What is asked instead is the question the mark is actually for: of the flows
+// sent between these two, did every one of them arrive? A lost flow means some
+// path is discarding traffic, and which one it is the student can find.
+//
+// Both protocols are spread across the sweep, alternating by port, because a
+// filter is written per protocol as easily as per path.
+func everyFlowArrives(ctx context.Context, env *Env, from, to string) (string, bool) {
+	src, sok := env.Device(from)
+	dst, dok := env.Device(to)
+	if !sok || !dok {
+		return "", true
+	}
+	slo, sok := src.IfaceByName("lo")
+	dlo, dok := dst.IfaceByName("lo")
+	if !sok || !dok || slo.Addr4 == "" || dlo.Addr4 == "" {
+		return "", true
+	}
+	srcAddr, dstAddr := addrOnly(slo.Addr4), addrOnly(dlo.Addr4)
+
+	base := 20000 + rand.IntN(30000)
+	ports := make([]string, 0, sweepFlowCount)
+	for i := range sweepFlowCount {
+		ports = append(ports, strconv.Itoa(base+i))
+	}
+	lost, ok := lostFlows(ctx, env, src.ID, dst.ID, srcAddr, dstAddr, ports)
+	if !ok || len(lost) == 0 {
+		return "", true
+	}
+	// A flow can go missing for reasons that are nobody's fault -- a frame
+	// lost while a neighbour entry is resolved, a scheduler delay on a loaded
+	// node -- and a mark should not turn on one of those. Only the flows that
+	// fail twice are counted, from source ports that are not the ones tried
+	// the first time, so that a port the far side happens to be filtering is
+	// not mistaken for a path that is.
+	retry := make([]string, 0, len(lost))
+	for i := range lost {
+		retry = append(retry, strconv.Itoa(base+sweepFlowCount+i))
+	}
+	again, ok := lostFlows(ctx, env, src.ID, dst.ID, srcAddr, dstAddr, retry)
+	if !ok || len(again) == 0 {
+		return "", true
+	}
+	return fmt.Sprintf(
+		"%d of %d flows from %s to %s never arrived, and %d did: the paths are installed "+
+			"and at least one of them is discarding what is sent along it",
+		len(again), len(retry), from, to, len(retry)-len(again)), false
+}
+
+// lostFlows aims one flow from each of the given source ports at a port on the
+// far side that nothing is listening on, and returns the ports whose flows
+// were not seen arriving there.
+//
+// A flow that could not be sent is not a flow that was lost: a source port
+// already in use fails to bind, and counting that as a discarded packet would
+// blame a submission for the grader's own choice of port. The sender says
+// which ports it managed to use and only those are looked for.
+//
+// The second return says whether the capture was in a position to testify at
+// all. It is false when there was no witness, and also when the witness saw
+// nothing whatsoever -- which is either a total blackhole, already reported by
+// the end-to-end probe that runs before this, or a capture whose output could
+// not be read. Neither is a per-path finding.
+func lostFlows(ctx context.Context, env *Env, srcDev, dstDev, srcAddr, dstAddr string,
+	ports []string) ([]string, bool) {
+
+	if len(ports) == 0 {
+		return nil, false
+	}
+	dport := probePort()
+	// Every flow of the sweep lands on the same port, so the capture has to
+	// hold all of them: a frame limit reached partway through stops the
+	// capture, and a capture that stopped early is not a witness.
+	tap := startArrivalTapN(ctx, env, dstDev, dport, 8*len(ports)+32)
+	var b strings.Builder
+	for i, p := range ports {
+		if i%2 == 0 {
+			fmt.Fprintf(&b, "e=$(nc -w 1 -s %s -p %s %s %s </dev/null 2>&1 >/dev/null); ",
+				srcAddr, p, dstAddr, dport)
+		} else {
+			fmt.Fprintf(&b, "e=$(echo twinet | nc -u -w 1 -s %s -p %s %s %s 2>&1 >/dev/null); ",
+				srcAddr, p, dstAddr, dport)
+		}
+		fmt.Fprintf(&b, "case \"$e\" in *bind*) ;; *) echo %s;; esac; ", p)
+	}
+	res, err := env.Probe(ctx, srcDev, []string{"sh", "-c", b.String()})
+	arrived, _, live := tapFlowsOf(ctx, env, tap)
+	if err != nil || !live || len(arrived) == 0 {
+		return nil, false
+	}
+	var lost []string
+	for _, p := range strings.Fields(res.Stdout) {
+		if arrived[p] == 0 {
+			lost = append(lost, p)
+		}
+	}
+	sort.Strings(lost)
+	return lost, true
+}
+
+// tapFlowsOf reads a capture's arrivals by source port, in the order the rest
+// of this file reads captures.
+func tapFlowsOf(ctx context.Context, env *Env, t *arrivalTap) (map[string]int, tapCounts, bool) {
+	counts, byPort, live := t.seenFlows(ctx, env)
+	return byPort, counts, live
+}
+
 // carriesTCPBothWays opens a connection each way between two routers, to a
-// port nothing is listening on, and reads the far side's own count of the
 // resets it sent -- together with a capture on the far side of the flow the
 // probe creates, which is what makes the count attributable to this probe
 // rather than to any traffic the submission cares to generate.
@@ -1701,6 +1832,16 @@ func checkECMP(ctx context.Context, env *Env) Result {
 		// means.
 		if dead == "" {
 			if why, ok := carriesTCPBothWays(ctx, env, from, to); !ok {
+				dead = why
+				fmt.Fprintf(&detail, "%s\n", why)
+			}
+		}
+		// And on every path, not just the one the probe above was hashed
+		// onto. Two of three paths can discard everything while a single
+		// end-to-end flow, which takes one of them and the same one every
+		// time, arrives and reports the pair healthy.
+		if dead == "" && len(wantPaths) > 1 {
+			if why, ok := everyFlowArrives(ctx, env, from, to); !ok {
 				dead = why
 				fmt.Fprintf(&detail, "%s\n", why)
 			}

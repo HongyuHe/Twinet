@@ -207,3 +207,68 @@ func TestParseTapOutputAStoppedCaptureIsNoWitness(t *testing.T) {
 		t.Fatal("output without the running marker must not be a witness")
 	}
 }
+
+// A sweep aims many flows at one port and tells them apart by where they came
+// from, so the reader has to group the arrivals by source port and has to
+// leave out the frames that are not arrivals at all.
+func TestTapSourcePortsGroupsArrivalsByTheirSourcePort(t *testing.T) {
+	got := tapSourcePorts(frameFromNYC + frameFromATL + frameUDPFromNYC +
+		frameSelfLoopback + frameSelfRoutable + frameSelfUDP)
+	want := map[string]int{"39125": 1, "36229": 1, "43931": 1}
+	if len(got) != len(want) {
+		t.Fatalf("source ports = %v, want %v", got, want)
+	}
+	for p, n := range want {
+		if got[p] != n {
+			t.Errorf("port %s = %d, want %d", p, got[p], n)
+		}
+	}
+	// The loopback frames carry source ports too, and crediting them would
+	// let a machine answer for a flow that never left it.
+	for _, p := range []string{"36553", "35201"} {
+		if got[p] != 0 {
+			t.Errorf("loopback source port %s was credited", p)
+		}
+	}
+}
+
+// Two frames of one flow are one flow, not two: the caller asks whether a port
+// arrived at all, and a retransmitted SYN must not read as a second arrival.
+func TestTapSourcePortsCountsEveryFrameOfAFlow(t *testing.T) {
+	got := tapSourcePorts(frameFromNYC + frameFromNYC)
+	if got["39125"] != 2 {
+		t.Fatalf("frames from 39125 = %d, want 2", got["39125"])
+	}
+	if len(got) != 1 {
+		t.Fatalf("flows = %d, want 1", len(got))
+	}
+}
+
+// A line whose source field cannot be read is left out rather than guessed at.
+// Counting a flow as lost is an accusation, and it has to rest on the capture
+// rather than on a parser that fell through.
+func TestTapSourcePortsIgnoresLinesItCannotRead(t *testing.T) {
+	for _, line := range []string{
+		"22:48:24.720723 port_NYC In  IP 3.152.0.1 > 3.154.0.1: ICMP echo request, length 8\n",
+		"22:48:24.720723 port_NYC In  ARP, Request who-has 3.0.1.1 tell 3.0.1.2, length 28\n",
+		"garbage\n",
+		"22:48:24.720723 port_NYC Out IP 3.152.0.1.39125 > 3.154.0.1.33434: Flags [S], length 0\n",
+	} {
+		if got := tapSourcePorts(line); len(got) != 0 {
+			t.Errorf("line %q yielded %v, want nothing", line, got)
+		}
+	}
+}
+
+// The whole reading is void when the capture stopped before it was asked, and
+// the per-flow view has to be void with it -- otherwise a sweep would read
+// every one of its flows as lost.
+func TestSeenFlowsIsVoidWhenTheCaptureStoppedEarly(t *testing.T) {
+	if _, _, ok := parseTapFlows("EARLY=1\n" + tapBanner + "---\n" + frameFromATL); ok {
+		t.Fatal("a capture that stopped early testified about its flows")
+	}
+	_, ports, ok := parseTapFlows(stillRunning(tapBanner + "---\n" + frameFromATL))
+	if !ok || ports["36229"] != 1 {
+		t.Fatalf("live capture: ok=%v ports=%v", ok, ports)
+	}
+}
