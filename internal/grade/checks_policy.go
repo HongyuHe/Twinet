@@ -2776,7 +2776,7 @@ func parseIPRules(out string) (rules []ipRule, unsupported []string) {
 		if line == "" {
 			continue
 		}
-		r := ipRule{text: line}
+		r := ipRule{text: strings.Join(strings.Fields(line), " ")}
 		if i := strings.Index(line, ":"); i > 0 {
 			r.prio = strings.TrimSpace(line[:i])
 			line = strings.TrimSpace(line[i+1:])
