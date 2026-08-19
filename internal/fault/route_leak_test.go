@@ -58,7 +58,7 @@ func TestLeakWithAnnouncementWithdrawnIsStillInEffect(t *testing.T) {
 	if originating {
 		t.Fatal("the prefix is only learned here, but it was read as locally originated")
 	}
-	if !(discarding || originating) {
+	if !discarding && !originating {
 		t.Fatal("half-undone leak reported as no longer in effect")
 	}
 	got := leakObserved("7.0.0.0/8", discarding, originating)
@@ -88,7 +88,7 @@ func TestLeakWithDiscardRemovedIsStillInEffect(t *testing.T) {
 }
 
 func TestLeakFullyInjectedAndFullyResolved(t *testing.T) {
-	if !(blackholeFor(leakRouteBlackhole, "7.0.0.0/8") && locallyOriginated(leakBGPOriginated)) {
+	if !blackholeFor(leakRouteBlackhole, "7.0.0.0/8") || !locallyOriginated(leakBGPOriginated) {
 		t.Fatal("a fully injected leak was not recognised")
 	}
 	if blackholeFor(leakRouteAbsent, "7.0.0.0/8") || locallyOriginated(leakBGPLearnedOnly) {
