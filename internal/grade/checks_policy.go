@@ -2724,7 +2724,7 @@ func parseKernelHops(out string) map[string]kernelHop {
 // One command per router, not one per destination: the lookups are batched into
 // a single shell invocation because the cost here is the round trip, not the
 // lookup.
-func kernelVia(ctx context.Context, env *Env, router string, addrs []string) (map[string]kernelHop, error) {
+func kernelVia(ctx context.Context, env *Env, deviceID string, addrs []string) (map[string]kernelHop, error) {
 	if len(addrs) == 0 {
 		return nil, nil
 	}
@@ -2732,7 +2732,7 @@ func kernelVia(ctx context.Context, env *Env, router string, addrs []string) (ma
 	for _, a := range addrs {
 		fmt.Fprintf(&b, "echo '@ %s'; ip route get %s 2>&1 | head -1; ", a, a)
 	}
-	res, err := env.Probe(ctx, router, []string{"sh", "-c", b.String()})
+	res, err := env.Probe(ctx, deviceID, []string{"sh", "-c", b.String()})
 	if err != nil {
 		return nil, err
 	}
@@ -2846,7 +2846,7 @@ func installedVia(ctx context.Context, env *Env, slow []string, slowIf map[strin
 		// Now ask the kernel the same question. A policy rule diverts the
 		// lookup to a table the daemon never shows, so agreeing with the table
 		// above is not the same as agreeing with what the machine does.
-		hops, err := kernelVia(ctx, env, r.Name, probeList)
+		hops, err := kernelVia(ctx, env, r.ID, probeList)
 		if err != nil {
 			return nil, fmt.Sprintf("%s: where it would really send traffic could not be "+
 				"established (%v)", r.Name, err)
