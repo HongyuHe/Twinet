@@ -75,29 +75,56 @@ func init() {
 			return State{"prefix": prefix, "asn": fmt.Sprint(asn)}, nil
 		},
 		Verify: func(ctx context.Context, e *Env, t Target, s State) (Evidence, error) {
-			// The damage is that traffic for the prefix is drawn here and
-			// dropped, so check the forwarding table: the route must be in the
-			// RIB pointing at Null0. Confirming both configuration lines were
-			// typed said nothing about whether the router had installed
-			// anything, and a leak that is not installed swallows no traffic.
+			// This fault installs two things that can be removed
+			// independently: the discard route, and the announcement that
+			// draws other networks' traffic onto it. Reading the forwarding
+			// table alone answered for the discard and said nothing about the
+			// leak, so withdrawing the announcement -- the repair that stops
+			// the internet-wide diversion -- left this reporting "traffic for
+			// the prefix is discarded here", a sentence about a leak that was
+			// no longer happening.
+			//
+			// Both halves are asked about, and either one surviving means the
+			// fault is still in effect, because either one alone still costs
+			// traffic. Measured on the lab: with the announcement withdrawn
+			// and the discard route left behind, this AS lost every packet to
+			// the prefix; with the discard route removed and the announcement
+			// left behind, the router still advertised a prefix it does not
+			// own to its external peers and had no route for what arrived.
+			// Requiring both to be present before saying so would have called
+			// each of those labs clean.
 			prefix := s["prefix"]
+			if prefix == "" {
+				return Evidence{}, fmt.Errorf("no leaked prefix was recorded, so there is nothing to check")
+			}
 			out, err := e.Settled(ctx, SymptomWindow,
 				func(c context.Context) (string, error) {
-					return e.Vtysh(c, t.DeviceID(), "show ip route "+prefix)
+					route, err := e.Vtysh(c, t.DeviceID(), "show ip route "+prefix)
+					if err != nil {
+						return "", err
+					}
+					bgp, err := e.Vtysh(c, t.DeviceID(), "show bgp ipv4 unicast "+prefix)
+					if err != nil {
+						return "", err
+					}
+					return route + leakProbeSep + bgp, nil
 				},
 				// FRR reports a discard route as "unreachable (blackhole)" in
 				// `show ip route`; the Null0 spelling only exists in the
 				// configuration, so looking for it here never matched and the
 				// fault was rolled back as ineffective every time.
-				func(o string) bool { return strings.Contains(o, "blackhole") })
+				func(o string) bool {
+					route, bgp, _ := strings.Cut(o, leakProbeSep)
+					return blackholeFor(route, prefix) || locallyOriginated(bgp)
+				})
 			if err != nil {
 				return Evidence{}, err
 			}
-			leaked := strings.Contains(out, "blackhole")
+			route, bgp, _ := strings.Cut(out, leakProbeSep)
+			discarding, originating := blackholeFor(route, prefix), locallyOriginated(bgp)
 			return Evidence{
-				Verified: leaked,
-				Observed: boolWord(leaked, "traffic for "+prefix+" is discarded here",
-					"the router has no discard route for "+prefix),
+				Verified: discarding || originating,
+				Observed: leakObserved(prefix, discarding, originating),
 				Expected: "the router originates " + prefix + " into a null route",
 			}, nil
 		},
@@ -695,4 +722,46 @@ func probeServiceHealth(ctx context.Context, e *Env, t Target, addr, port string
 		return -1
 	}
 	return n
+}
+
+// leakProbeSep joins the two tables the route-leak check reads, so one settle
+// loop can watch both. vtysh never prints it.
+const leakProbeSep = "\n--- twinet: bgp ---\n"
+
+// blackholeFor reports whether the routing table entry shown is the one for
+// prefix and discards it.
+//
+// The prefix is checked, not just the word: `show ip route` is asked about one
+// prefix but answers with whatever entry covers it, so a discard route for a
+// different network read as this fault still being in place.
+func blackholeFor(out, prefix string) bool {
+	if !strings.Contains(out, "blackhole") {
+		return false
+	}
+	for _, ln := range strings.Split(out, "\n") {
+		f := strings.Fields(ln)
+		if len(f) == 4 && f[0] == "Routing" && f[1] == "entry" && f[2] == "for" {
+			return f[3] == prefix
+		}
+	}
+	return false
+}
+
+// leakObserved says which half of the leak is still standing, so that a
+// half-repaired lab does not read like an untouched one.
+func leakObserved(prefix string, discarding, originating bool) string {
+	switch {
+	case discarding && originating:
+		return "the router originates " + prefix + ", which it does not own, " +
+			"and discards the traffic that follows it"
+	case discarding:
+		return prefix + " is no longer originated into BGP, so the leak itself is " +
+			"gone, but the discard route is still installed and every packet " +
+			"that reaches this router for " + prefix + " is still dropped"
+	case originating:
+		return "the discard route is gone, but the router still originates " +
+			prefix + ", which it does not own, so traffic for it is still " +
+			"drawn here and this router has no route for what arrives"
+	}
+	return "the router neither originates nor discards " + prefix
 }
