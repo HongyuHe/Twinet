@@ -1640,14 +1640,72 @@ Measured, all four cases:
 Full labs after the fix: cos461 10.00, advnet 6.00, multicast 4.00.
 
 Overriding the route in the main table instead -- `ip route replace 3.153.0.1/32
-via 3.0.10.1 dev port_BOS` -- turned out to be caught already, and it is worth
-recording why: zebra reads the kernel back and reports such a route as learned
-by `kernel` rather than by OSPF, which the protocol test rejects. Measured at
-0.50 before this fix existed. A policy rule leaves no trace in the daemon at
-all, which is why it needed asking about separately.
+via 3.0.10.1 dev port_BOS` -- appeared to be caught already: zebra reads the
+kernel back and reports such a route as learned by `kernel` rather than by
+OSPF, which the protocol test rejects. Measured at 0.50 before this fix
+existed. **That conclusion was too broad and finding 112 overturned it** -- it
+holds only for the default protocol label. The paragraph is left standing
+because drawing a general conclusion from one measurement is the mistake, and
+it is the same mistake the findings themselves are about.
 
 Findings 108, 109 and this one are the same sentence three times: *the routing
 daemon's table is an opinion, and the kernel is the one that forwards.* 108 read
 only the daemon; 109 asked the kernel the wrong question; this one never asked
 it. The last check that reasons about forwarding from the daemon alone is worth
 finding before a student does.
+
+### 112. The daemon does not notice a route wearing its own name
+
+Finding 111 asked whether a policy rule diverted the equal-cost traffic, and
+recorded that overriding the route in the main table was caught already because
+zebra reads such a route back and calls it `kernel` rather than `ospf`. That was
+measured once, with the default protocol label, and stated as though it were
+general. It is not. The label is an argument:
+
+    ip route add 3.153.0.1/32 via 3.0.10.1 dev port_BOS proto ospf
+
+The kernel now holds two routes for the destination. The added one has metric 0
+and zebra's has metric 20, so the added one forwards. Zebra sees a route
+carrying its own protocol label and leaves it alone; `show ip route` still says
+`Known via "ospf", distance 110, metric 20, best` over both next hops. Nothing
+in the daemon changed, no rule exists to find, and `ip route get 3.153.0.1`
+answers `via 3.0.10.1 dev port_BOS`. Traceroute to BOS is one hop. The check
+reported *"ATL balances over port_BOS, port_PHY"* and gave full marks; the full
+rubric still totalled 10.00.
+
+The reading was also wrong in a way no one had exploited: `ip route show
+<target>` output was collapsed into one list of next hops, so two entries for
+the same destination read as one route with all their hops. The route the
+kernel prefers and the routes it ignores were indistinguishable.
+
+Kernel output is now read as **entries** -- prefix, metric, type, next hops --
+and the entry that answers for a destination is chosen the way the kernel
+chooses it: longest prefix, then lowest metric. That entry is compared with
+what the daemon claims, and a type that forwards nothing (`blackhole`,
+`unreachable`, `prohibit`) is reported by name.
+
+Reading entries fixed a second case that no reviewer had found. A policy rule
+pointing at a table was checked with `ip route show table N <target>`, an exact
+prefix match, so a table answering with a *less specific* route read as empty
+and was treated as falling through to the daemon's table. Both lookups now use
+`to match`, which is how the kernel itself resolves a destination.
+
+Measured, every state of `as3/ATL`:
+
+| state | score |
+| --- | --- |
+| untouched (twice) | 1.00 |
+| `proto ospf` shadow route at a lower metric | **0.50** |
+| rule to a table pinning one hop | **0.50** |
+| rule to a table answering with a covering /24, one hop | **0.50** |
+| `blackhole` for the destination | **0.00** |
+| rule to a table holding *both* hops | 1.00 |
+| rule to an empty table (falls through) | 1.00 |
+
+Full labs after the fix: cos461 10.00, advnet 6.00, multicast 4.00.
+
+The finding under the finding is about this ledger rather than the code. 111
+closed a hole and, in the same breath, wrote down that the neighbouring hole was
+shut -- on the strength of a single measurement of a single spelling. A reader
+of the ledger would have skipped it. **A closed door recorded here should say
+what was actually tried**, because the next reader will not retry it.
