@@ -1986,3 +1986,136 @@ match on the recorded subnet.
 | fault injected and left alone (all three) | still in effect | still in effect |
 
 Full labs after the fix: cos461 10.00, advnet 6.00, multicast 4.00.
+
+### 118. Half a fault undone, reported as none
+
+`link_detach` installs two independent things: a 100% loss netem on egress, and
+a `u32` filter on the ingress qdisc that drops everything. Its verify read the
+egress qdisc alone. Removing the netem -- `tc qdisc replace dev X root
+pfifo_fast`, the ordinary way to take netem off an interface, and the first
+thing anyone tries -- left the check reporting the link healthy:
+
+```
+link_detach  as3/SFO  NO   qdisc pfifo_fast 800e: root refcnt 57 bands 3 ...
+```
+
+while the filter was still installed and the link still carried nothing:
+
+```
+$ twinet exec as3/SFO -- tc filter show dev ext_7_MSP ingress
+  match 00000000/00000000 at 0
+	action order 1: gact action drop
+$ twinet exec as7/MSP -- ping -c 3 -W 1 179.3.7.1
+3 packets transmitted, 0 received, 100% packet loss
+```
+
+An agent that did half the repair was told it had done all of it, and the
+ledger believed a lab was clean while a link on it was cut.
+
+Sweeping for the shape -- *the fault installed more than one mechanism and the
+check asks about one of them* -- found three more. All four were reproduced on
+the running lab before being changed, and each was measured against the
+mutation that exposes it.
+
+**`link_flap`** counted running loops. The loop holds the link down for five
+seconds of every fifteen, so killing it lands on a down cycle a third of the
+time and leaves the interface down for good. `Resolve` had always known this
+and set the link back up; `Verify` never asked. Killed mid-cycle, it reported
+`NO -- 0 flap loop(s) running` on an interface that was down and losing every
+packet.
+
+**`host_incorrect_gateway`** reported `NO` -- with an empty observation, which
+is the least useful way possible to be wrong -- after the bogus default route
+was simply deleted. The host was then left with no default route at all and
+answered `Network unreachable`: the symptom the fault exists to produce, fully
+present, on a fault recorded as gone. `Resolve` already insisted the baseline
+be back rather than merely the wrong gateway gone, and said so in a comment.
+The check never learned it. It also compared the gateway with
+`strings.Contains`, so `via 3.106.0.2` matched a route `via 3.106.0.254` -- and
+the bogus neighbour this fault picks differs from the real gateway by one
+digit, so the two addresses that must not be confused are exactly the two that
+were.
+
+**`dns_port_blocked`** installs a rule for udp and a rule for tcp, then counted
+lines containing `--dport 53 -j DROP` anywhere in `INPUT` and reported `n > 0`.
+Freeing udp -- the half that actually stops name resolution -- still read `yes,
+1 rule(s) dropping port 53`, naming neither protocol. Its own `Inject` carries
+a comment identifying this exact hazard and guards against it by refusing to
+inject over a pre-existing rule; the guard was added to `Inject` and never
+carried across to `Verify`.
+
+Each now asks about everything it installed, and the evidence distinguishes
+*partly undone* from *undone* and from *untouched*:
+
+| mutation | before | after |
+| --- | --- | --- |
+| `link_detach`, egress netem removed | no longer in effect | **still in effect** -- "outbound is clear but every inbound packet is still dropped by the ingress filter" |
+| `link_detach`, both halves removed | no longer in effect | no longer in effect |
+| `link_flap`, loop killed on a down cycle | no longer in effect | **still in effect** -- "it stopped on a down cycle and ext_7_MSP is still down" |
+| `host_incorrect_gateway`, bogus route deleted | no longer in effect (blank) | **still in effect** -- "no default route at all; the one this fault replaced (default via 3.106.0.2 dev ATLrouter) was never put back" |
+| `dns_port_blocked`, udp rule removed | still in effect, "1 rule(s)" | still in effect, **"tcp dropped; udp reach the resolver"** |
+| each fault injected and left alone | still in effect | still in effect |
+
+Two things worth recording beyond the fix.
+
+The first is that finding 117 swept for its own shape and reported, in this
+document, that "the remaining verifies were checked and are already scoped ...
+the wrong-gateway one reads `ip route show default` and names the wrong
+gateway". That sweep was looking for one defect -- *is the check scoped to what
+was injected?* -- and `host_incorrect_gateway` passed it while failing a
+different one standing next to it. A sweep answers the question it asks. Saying
+"the rest were checked" invites the reader to hear "the rest are correct", and
+those are not the same claim.
+
+The second is a limitation this fix does not remove. `dns_port_blocked` now
+counts rules per protocol, but it still cannot tell its own rule from an
+identical rule somebody added afterwards; nothing in `iptables -S` distinguishes
+them. Injection refuses to run when such a rule is already present, so the
+window is between inject and verify only. Tagging the rules with `-m comment`
+would close it -- the module is present in the images, and this was checked --
+but it would change helpers several ACL faults share, and that is not a change
+to make in the same breath as a fix. It is recorded here rather than described
+as done.
+
+### 119. A link whose shaping could never be put back
+
+Resolving `link_detach` reported:
+
+```
+resolve link_detach: the fault is gone but as3/SFO was not left as it was
+found: not put back: qdisc netem 1: dev ext_7_MSP root limit 1000 delay 25ms
+(the undo also reported: interface ext_7_MSP: add netem: file exists)
+```
+
+`ApplyShaping` clears the root qdisc and then adds netem there. `clearRootQdisc`
+deliberately skips `pfifo_fast`, on the theory that it is the one the kernel
+installs by default and "cannot be deleted, only replaced". That holds for the
+implicit default. It does not hold for a `pfifo_fast` somebody installed on
+purpose -- and installing one is precisely how a person takes netem off an
+interface. After anyone did that, the root was occupied, `QdiscAdd` failed with
+`EEXIST`, and the platform could never restore that link's delay or its rate
+limit again. The link kept working, so nothing looked wrong; it simply no longer
+had the 25ms and 1Mbit its own manifest describes, and every later episode over
+it ran with different physics than the file says. For a benchmark whose episodes
+must be comparable, a link that quietly stops matching its manifest is worse
+than one that breaks.
+
+The reviewer who found 118 hit this too, and reported resolving the fault "after
+manual cleanup" -- the cleanup was this.
+
+`QdiscReplace` installs at the root over whatever is there. Measured on the
+wedged interface:
+
+```
+before:  qdisc pfifo_fast 800e: root refcnt 57 bands 3 priomap ...
+resolve: resolved link_detach on as3/SFO
+after:   qdisc netem 1: root refcnt 57 limit 1000 delay 25ms
+         qdisc tbf a: parent 1:1 rate 1Mbit burst 14500b lat 50ms
+```
+
+The honest part of this one is that the failure was loud: resolve refused to
+call the lab clean, printed what it could not put back, and exited non-zero.
+The check that caught it was working. What was missing was the ability to act
+on what it found.
+
+Full labs after both fixes: cos461 10.00, advnet 6.00, multicast 4.00.
