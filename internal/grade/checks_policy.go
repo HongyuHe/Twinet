@@ -347,17 +347,27 @@ func checkSixIn4(ctx context.Context, env *Env) Result {
 			// What the gateway would do with a packet for that host is not a
 			// total, and it is the thing the question asks about.
 			nativeFwd := ""
+			unknownFwd := ""
 			if reachable && tunnels[domains[0]] != "" {
-				if via, ok := forwardsVia(ctx, env, gw.ID, addr, tunnels[domains[0]]); !ok {
+				via, ok, err := forwardsVia(ctx, env, gw.ID, deviceAddr6(ctx, env, src),
+					addr, tunnels[domains[0]])
+				switch {
+				case err != nil:
+					unknownFwd = fmt.Sprintf("IPv6 reaches %s, but whether %s encapsulates "+
+						"that traffic could not be established: %v", dst.Name, gw.Name, err)
+				case !ok:
 					nativeFwd = fmt.Sprintf("%s forwards traffic for %s over %s, not through "+
 						"%s: the tunnel's counters moved, but not for this traffic",
 						gw.Name, addr, via, tunnels[domains[0]])
 				}
 			}
-			if reachable && tunnels[domains[0]] != "" && after > before && nativeFwd == "" {
+			if reachable && tunnels[domains[0]] != "" && after > before &&
+				nativeFwd == "" && unknownFwd == "" {
 				throughTunnel = true
 			} else if nativeFwd != "" {
 				reach = nativeFwd
+			} else if unknownFwd != "" {
+				return Errored("tunnel.sixin4", errors.New(unknownFwd))
 			} else if reachable && tunnels[domains[0]] != "" && (before < 0 || after < 0) {
 				// A counter that could not be read is not a counter that did
 				// not move. Reporting it as one deducted for native routing
@@ -394,17 +404,23 @@ func checkSixIn4(ctx context.Context, env *Env) Result {
 						res, err := env.Probe(ctx, bs.ID,
 							[]string{"ping6", "-c", "3", "-W", "5", "-i", "0.3", addr})
 						after := tunnelTx(ctx, env, back.ID, tunnels[domains[1]])
-						via, encapsulated := forwardsVia(ctx, env, back.ID, addr, tunnels[domains[1]])
+						via, encapsulated, verr := forwardsVia(ctx, env, back.ID,
+							deviceAddr6(ctx, env, bs), addr, tunnels[domains[1]])
 						switch {
+						case err != nil || res.ExitCode != 0:
+							throughTunnel = false
+							reach = fmt.Sprintf("%s cannot reach %s at %s over IPv6, so the "+
+								"tunnel carries traffic one way only", bs.Name, bd.Name, addr)
+						case verr != nil:
+							return Errored("tunnel.sixin4", fmt.Errorf(
+								"IPv6 reaches %s from %s, but whether %s encapsulates the "+
+									"return traffic could not be established: %w",
+								bd.Name, bs.Name, back.Name, verr))
 						case !encapsulated:
 							throughTunnel = false
 							reach = fmt.Sprintf("%s forwards traffic for %s over %s, not "+
 								"through %s, so the return path is not encapsulated",
 								back.Name, addr, via, tunnels[domains[1]])
-						case err != nil || res.ExitCode != 0:
-							throughTunnel = false
-							reach = fmt.Sprintf("%s cannot reach %s at %s over IPv6, so the "+
-								"tunnel carries traffic one way only", bs.Name, bd.Name, addr)
 						case before < 0 || after < 0:
 							throughTunnel = false
 							reach = fmt.Sprintf("IPv6 reaches %s from %s, but %s's packet "+
@@ -2545,24 +2561,79 @@ func selectedRoute(line string) bool {
 	return selectedRouteRE.MatchString(strings.TrimSpace(line))
 }
 
-// forwardsVia reports whether a device would send a packet for an address out
-// of the interface it is supposed to, and names the interface it would use.
+// forwardsVia reports whether a device would send *this host's* packet for an
+// address out of the interface it is supposed to, and names the interface it
+// would use.
 //
 // This is what the tunnel question is about. A counter says traffic crossed the
 // tunnel; it does not say *which* traffic, and a total can be moved by anything
 // the submission cares to send.
-func forwardsVia(ctx context.Context, env *Env, deviceID, addr, want string) (string, bool) {
-	res, err := env.Probe(ctx, deviceID, []string{"ip", "-6", "route", "get", addr})
-	if err != nil || res.ExitCode != 0 {
-		return "", false
-	}
-	f := strings.Fields(res.Stdout)
-	for i := 0; i+1 < len(f); i++ {
-		if f[i] == "dev" {
-			return f[i+1], f[i+1] == want
+//
+// The packet has to be described the way it really arrives. A bare `ip -6 route
+// get <dst>` answers for a packet the gateway *originates*: it carries no
+// source and no arrival interface, so a policy rule keyed on either never
+// fires and the lookup falls through to the main table. A submission that put
+// its tunnel routes in another table and pointed an `ip -6 rule` at it -- a
+// perfectly ordinary way to write the answer -- was told its traffic was
+// "routed natively rather than encapsulated" while the tunnel's own counters
+// were incrementing by exactly the packets it had just sent.
+//
+// The kernel is asked about the real packet instead: from the sending host's
+// address, arriving on the interface that faces it. Neither has to be guessed
+// -- the interface a reply to that host would leave by is the one its packets
+// arrive on.
+//
+// A lookup that cannot be made returns an error rather than a name. Not being
+// able to ask is not the same as an answer of "natively", and reporting the
+// second when the first happened is how this check came to fail a working
+// tunnel.
+func forwardsVia(ctx context.Context, env *Env, deviceID, src, dst, want string) (string, bool, error) {
+	// A rule this lookup cannot express is a rule that could change the answer
+	// without showing up in it.
+	if res, err := env.Probe(ctx, deviceID, []string{"ip", "-6", "rule", "show"}); err == nil {
+		if _, unsupported := parseIPRules(res.Stdout); len(unsupported) > 0 {
+			return "", false, fmt.Errorf("IPv6 policy rule %q selects on something a "+
+				"route lookup cannot be asked about, so where this traffic goes cannot "+
+				"be established", unsupported[0])
 		}
 	}
-	return "", false
+
+	devOf := func(out string) string {
+		f := strings.Fields(out)
+		for i := 0; i+1 < len(f); i++ {
+			if f[i] == "dev" {
+				return f[i+1]
+			}
+		}
+		return ""
+	}
+
+	query := []string{"ip", "-6", "route", "get", dst}
+	if src != "" {
+		query = append(query, "from", src)
+		// The interface facing the sender, which is where its packets land.
+		if res, err := env.Probe(ctx, deviceID,
+			[]string{"ip", "-6", "route", "get", src}); err == nil && res.ExitCode == 0 {
+			if in := devOf(res.Stdout); in != "" {
+				query = append(query, "iif", in)
+			}
+		}
+	}
+
+	res, err := env.Probe(ctx, deviceID, query)
+	if err != nil {
+		return "", false, err
+	}
+	if res.ExitCode != 0 {
+		return "", false, fmt.Errorf("%s could not be asked where it sends traffic "+
+			"for %s: %s", deviceID, dst, firstLine(res.Stdout+res.Stderr))
+	}
+	via := devOf(res.Stdout)
+	if via == "" {
+		return "", false, fmt.Errorf("%s named no outgoing interface for traffic to %s",
+			deviceID, dst)
+	}
+	return via, via == want, nil
 }
 
 // crossDatacentreGaps names the host pairs that cannot reach each other across
