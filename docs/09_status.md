@@ -1917,3 +1917,72 @@ protocol as easily as per path.
 
 Full labs after the fix: cos461 10.00 in 4m14 (4m13 before), advnet 6.00,
 multicast 4.00.
+
+### 117. A rule like the one that was injected
+
+`twinet fault verify` reports whether an injected fault is still doing what it
+was injected to do. Scoring an agent's root-cause analysis rests on that
+answer: if the fault has stopped biting, whatever the agent is being marked
+against is not the problem it was given.
+
+The two switch-fabric faults asked the flow table two independent questions --
+does the string `priority=100` appear anywhere, and does the string
+`actions=drop` appear anywhere -- and reported the fault in effect if both did.
+Neither question mentions the port the fault recorded, and nothing requires the
+two answers to come from the same rule.
+
+Moving the drop rule from the port the fault names to a different port on the
+same switch is enough:
+
+```
+$ twinet fault inject flow_rule_shadowing --as 3 --device DCS_S2
+  verified: yes; observed ... priority=100,in_port=1 actions=drop
+
+$ twinet exec as3/DCS_S2 -- sh -c \
+    "ovs-ofctl --strict del-flows br0 'priority=100,in_port=1'; \
+     ovs-ofctl add-flow br0 'priority=100,in_port=2,actions=drop'"
+
+$ twinet fault verify
+flow_rule_shadowing  as3/DCS_S2  yes  ... priority=100,in_port=2 actions=drop
+```
+
+The host the fault is about is reachable again, and the report says the fault
+is still in effect -- quoting, as its evidence, a rule about a different host.
+
+Flow lines are now split at ` actions=` into their match fields and their
+actions, and the match fields are compared as whole terms. That is not
+decoration over a longer needle: `in_port=1` is a prefix of `in_port=10`, so a
+substring test lets a rule on port 10 answer for port 1, and `ovs-ofctl` makes
+no promise about field order, so a fixed `priority=100,in_port=1` needle is a
+guess about formatting rather than a reading of the rule.
+
+The report now separates the two situations that matter to whoever reads it:
+
+```
+NO   no rule at priority=100 on port 1; a rule at that priority sits
+     elsewhere: ... priority=100,in_port=2 actions=drop
+NO   no rule at priority=100 on port 1
+```
+
+Sweeping the other faults for the same shape found a third instance the review
+had not named. `host_static_blackhole` installs a blackhole route for a
+recorded prefix and then asked `ip route show | grep blackhole` whether *any*
+blackhole route existed. Deleting the route it installed and adding an
+unrelated one elsewhere left it reporting "still in effect". It is now scoped
+to the prefix it recorded, and refuses rather than guessing when no prefix was
+recorded.
+
+The remaining verifies were checked and are already scoped: the `tc` ones name
+their device, `NOARP` names its interface, the ACL one asks `iptables -C` with
+the exact rule, the wrong-gateway one reads `ip route show default` and names
+the wrong gateway, and the DHCP ones reach their `Verified: true` only inside a
+match on the recorded subnet.
+
+| | before | after |
+| --- | --- | --- |
+| drop rule moved to another port | still in effect | **no longer in effect** |
+| loop rule moved to another port | still in effect | **no longer in effect** |
+| blackhole replaced by one for another prefix | still in effect | **no longer in effect** |
+| fault injected and left alone (all three) | still in effect | still in effect |
+
+Full labs after the fix: cos461 10.00, advnet 6.00, multicast 4.00.
