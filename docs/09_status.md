@@ -1500,3 +1500,50 @@ advnet 6.00, multicast 4.00. With the rule in place: 0.88, evidence
 
 Reading the kernel rather than the daemon also removes one more dependence on
 FRR specifically, which the heterogeneous-vendor goal needs.
+
+### 109. Asking the kernel about the wrong packet
+
+Finding 108 added a kernel lookup to `policy.traffic_engineering`. Round 118
+showed the lookup asked about the wrong packet. `ip route get <dst>` with no
+source answers for a packet *the router originates itself*. A policy rule keyed
+on the **source** -- which is exactly how transit traffic is singled out --
+never fires under that lookup.
+
+Measured on the live cos461 lab, on `as3/MSP`:
+
+    ip route add default via 179.1.3.1 table 100
+    ip rule  add from 4.0.0.0/8 table 100 priority 100
+
+    # ip route get 1.0.0.1
+    1.0.0.1 via 3.0.2.2 dev port_CHI                       <- fast, what the check saw
+    # ip route get 1.0.0.1 from 4.100.0.1 iif port_CHI
+    1.0.0.1 from 4.100.0.1 via 179.1.3.1 dev ext_1_ALL     <- slow, what actually happens
+
+All transit traffic from AS4 leaves by the slow provider. The check scored a
+full **1.00**.
+
+The obvious repair -- guess a source, say this AS's own host prefix -- would
+not have found it: the rule names AS4's space, not AS3's. There is no source
+worth guessing, so the rules are read instead. Each rule the submission added
+is asked about as a packet it would match: its own source prefix, its own
+arrival interface, its own firewall mark. The kernel refuses a forwarding
+lookup unless both a source and an arrival interface are given, so both are
+supplied; a rule keyed only on a mark needs neither.
+
+A rule keyed on something a route lookup cannot stand in for -- a port, a uid,
+`oif`, a negation -- is **refused**, and the check reports that it could not
+establish where traffic goes, rather than passing over it. Reporting that
+nothing goes the slow way without having looked is the whole substance of
+finding 108, and the repair must not reintroduce it in a narrower form.
+
+A submission with no rules of its own is asked exactly what it was asked
+before, so the cost is unchanged for every correct submission. Clean: cos461
+10.00, advnet 6.00, multicast 4.00, and 1.00 on three consecutive isolated
+runs. With the rule in place: 0.88, evidence
+`1.0.0.0/8 on MSP (kernel, from 4.0.0.0/8)` -- naming the rule's own selector,
+so the student is told which rule is at fault.
+
+Two findings in a row now on the same few lines. That is worth stating plainly:
+reading the kernel instead of the daemon was right, but "the kernel" is not one
+answer -- it is an answer *per packet*, and a check has to say which packet it
+means.
