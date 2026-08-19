@@ -426,9 +426,11 @@ func denyMatches(body, condition string) bool {
 	want := strings.ToLower(condition)
 	for _, c := range clauses {
 		// A clause with no match statements matches everything, so nothing
-		// after it is ever reached.
+		// after it is ever reached. Which way it points is then the whole
+		// answer: a catch-all permit is a way in, and a catch-all deny is
+		// the implicit deny below written out longhand.
 		if len(c.matches) == 0 {
-			return false
+			return c.deny
 		}
 		// A permit clause reached first is a way in. Route-maps stop at the
 		// first clause that matches, so `permit 4: match ip address
@@ -461,7 +463,30 @@ func denyMatches(body, condition string) bool {
 			return c.deny
 		}
 	}
-	return false
+	// Every clause has now been read and none of them lets a route in this
+	// state through: the permits are ones it cannot match, and the denies did
+	// not settle it either way. FRR ends every route-map with an implicit
+	// deny, so such a route is dropped at the bottom.
+	//
+	// Looking only for the word `deny` missed that, and failed a submission
+	// that wrote
+	//
+	//	route-map LP-IN permit 10
+	//	 match rpki notfound
+	//	route-map LP-IN permit 20
+	//	 match rpki valid
+	//
+	// -- which admits the two states it names and drops every other, and is
+	// how an operator who trusts the implicit deny would write it. The router
+	// selected no invalid route at all, and the check said the session
+	// accepted invalid origins. The question asks for an outcome; this was
+	// marking the mechanism.
+	//
+	// An empty body is the one case that is not protection: it means no
+	// route-map is bound to the session, or the one named was never defined,
+	// and there is then no clause list for an implicit deny to sit at the end
+	// of.
+	return len(clauses) > 0
 }
 
 // rpkiState returns the validation state a match line selects on, or "" when

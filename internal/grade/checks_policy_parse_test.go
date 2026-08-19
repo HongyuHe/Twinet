@@ -140,3 +140,48 @@ func TestAPermitThatCouldMatchTheDeniedStateStillHidesTheDeny(t *testing.T) {
 			"denying them")
 	}
 }
+
+// FRR ends every route-map with an implicit deny, so a policy that admits the
+// validation states it wants and names no others rejects the rest without ever
+// writing the word. Reading only for explicit deny clauses failed a correct
+// submission for the mechanism it chose rather than the outcome it reached.
+func TestTheImplicitDenyAtTheEndOfARouteMapIsProtection(t *testing.T) {
+	implicit := "route-map LP-IN permit 10" + "\n" +
+		" match rpki notfound" + "\n" +
+		" set local-preference 25" + "\n" +
+		"route-map LP-IN permit 20" + "\n" +
+		" match rpki valid" + "\n" +
+		" set local-preference 50" + "\n"
+	if !denyMatches(implicit, "rpki invalid") {
+		t.Error("a route-map whose every permit clause selects another validation state " +
+			"was read as accepting invalid origins, though nothing in it admits one")
+	}
+
+	// The same policy with a way in at the bottom is not protection: the
+	// catch-all is reached by exactly the routes the earlier clauses did not
+	// name.
+	withCatchAll := implicit + "route-map LP-IN permit 30" + "\n"
+	if denyMatches(withCatchAll, "rpki invalid") {
+		t.Error("a catch-all permit at the end of the map was counted as protection")
+	}
+
+	// A catch-all deny is the implicit deny written out, and reads the same.
+	explicit := implicit + "route-map LP-IN deny 30" + "\n"
+	if !denyMatches(explicit, "rpki invalid") {
+		t.Error("a catch-all deny clause was not recognised as rejecting the state")
+	}
+
+	// No route-map bound to the session at all. There is no clause list for
+	// an implicit deny to sit at the end of, and nothing is filtered.
+	if denyMatches("", "rpki invalid") {
+		t.Error("a session with no inbound route-map was counted as filtering")
+	}
+
+	// A permit resting on something the configuration cannot decide still
+	// admits invalid routes, whatever follows it.
+	indeterminate := "route-map LP-IN permit 10" + "\n" +
+		" match ip address prefix-list ALL" + "\n"
+	if denyMatches(indeterminate, "rpki invalid") {
+		t.Error("a permit an invalid route can match was covered by the implicit deny")
+	}
+}
