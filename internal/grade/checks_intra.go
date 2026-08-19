@@ -1254,25 +1254,31 @@ func deadHops(ctx context.Context, env *Env, paths [][]string) []string {
 		if !ok {
 			continue
 		}
-		i, ok := a.IfaceByName("port_" + h.b)
-		if !ok || i.Peer == nil || i.Peer.Addr4 == "" {
+		addrs := linksToward(env, h.a, h.b).peerAddrs()
+		if len(addrs) == 0 {
 			continue
 		}
 		wg.Add(1)
-		go func(h hop, from *model.Device, addr string) {
+		go func(h hop, from *model.Device, addrs []string) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			reached, err := env.reaches(ctx, from.ID, addrOnly(addr))
-			if err != nil || reached {
-				return
+			// A pair joined by more than one link has more than one way to
+			// carry the hop, and the path names the routers rather than the
+			// cable; one working link is the hop working. With the single link
+			// between any pair in the shipped labs this is that link.
+			for _, addr := range addrs {
+				reached, err := env.reaches(ctx, from.ID, addr)
+				if err != nil || reached {
+					return
+				}
 			}
 			mu.Lock()
 			broken = append(broken, fmt.Sprintf(
 				"%s cannot reach %s over the link between them (%s), so the path through "+
-					"it carries nothing", h.a, h.b, addrOnly(addr)))
+					"it carries nothing", h.a, h.b, strings.Join(addrs, ", ")))
 			mu.Unlock()
-		}(h, a, i.Peer.Addr4)
+		}(h, a, addrs)
 	}
 	wg.Wait()
 	sort.Strings(broken)
@@ -1364,6 +1370,89 @@ func udpNoPortsV4(ctx context.Context, env *Env, device string) (counterWitness,
 	})
 }
 
+// installedHop is one next hop of an installed route: the interface it leaves
+// by, the address it is handed to, or both.
+type installedHop struct{ iface, ip string }
+
+func (h installedHop) label() string {
+	switch {
+	case h.iface != "" && h.ip != "":
+		return h.iface + " (" + h.ip + ")"
+	case h.iface != "":
+		return h.iface
+	default:
+		return h.ip
+	}
+}
+
+// hopToward is how a forwarding table can show that a router sends traffic to
+// a particular neighbour: over one of the interfaces the topology says faces
+// that neighbour, or to one of the addresses the neighbour holds on them.
+//
+// This used to be the single string "port_" + neighbour, which is not a
+// property of the network but of Twinet's own FRR renderer, which happens to
+// name interfaces that way. A second link between the same pair is named
+// differently, and so is every interface on a device configured by something
+// other than FRR -- both of which the topology supports. A router forwarding
+// perfectly well over such an interface was reported as not forwarding at all.
+// What the neighbour is called is in the plan; it does not have to be guessed
+// from a name.
+type hopToward struct {
+	ifaces map[string]bool
+	addrs  map[string]bool
+}
+
+// linksToward reads out of the plan every interface of a that faces b, and
+// every address of b on those links.
+func linksToward(env *Env, a, b string) hopToward {
+	out := hopToward{ifaces: map[string]bool{}, addrs: map[string]bool{}}
+	dev, ok := env.Device(a)
+	if !ok {
+		return out
+	}
+	peer, ok := env.Device(b)
+	if !ok {
+		return out
+	}
+	for _, i := range dev.Ifaces {
+		if i.Peer == nil || i.Peer.Device == nil || i.Peer.Device.ID != peer.ID {
+			continue
+		}
+		out.ifaces[i.Name] = true
+		if s := addrOnly(i.Peer.Addr4); s != "" {
+			out.addrs[s] = true
+		}
+	}
+	return out
+}
+
+// known says whether the plan has any link between the pair at all.
+func (h hopToward) known() bool { return len(h.ifaces) > 0 || len(h.addrs) > 0 }
+
+func (h hopToward) matches(hop installedHop) bool {
+	return (hop.iface != "" && h.ifaces[hop.iface]) || (hop.ip != "" && h.addrs[hop.ip])
+}
+
+// installed says whether any of the router's next hops leads to the neighbour.
+func (h hopToward) installed(hops []installedHop) bool {
+	for _, hop := range hops {
+		if h.matches(hop) {
+			return true
+		}
+	}
+	return false
+}
+
+// peerAddrs is the neighbour's addresses on the links between the pair.
+func (h hopToward) peerAddrs() []string { return sortedKeysOfBool(h.addrs) }
+
+func (h hopToward) describe() string {
+	if len(h.ifaces) == 0 {
+		return "no next hop toward it"
+	}
+	return "no next hop on " + strings.Join(sortedKeysOfBool(h.ifaces), " or ")
+}
+
 func checkECMP(ctx context.Context, env *Env) Result {
 	from := env.ArgString("a", "ATL")
 	to := env.ArgString("b", "BOS")
@@ -1384,17 +1473,18 @@ func checkECMP(ctx context.Context, env *Env) Result {
 	target := hostRoute(lo.Addr4)
 
 	// Cache each router's next hops toward the destination.
-	nextHops := map[string]map[string]bool{}
+	nextHops := map[string][]installedHop{}
+	read := map[string]bool{}
 	other := map[string]bool{}
-	fetch := func(router string) (map[string]bool, error) {
-		if v, ok := nextHops[router]; ok {
-			return v, nil
+	fetch := func(router string) ([]installedHop, error) {
+		if read[router] {
+			return nextHops[router], nil
 		}
 		var routes ospfRouteJSON
 		if err := env.VtyshJSON(ctx, router, "show ip route json", &routes); err != nil {
 			return nil, err
 		}
-		set := map[string]bool{}
+		var hops []installedHop
 		for _, e := range routes[target] {
 			if !e.Selected && !e.Installed {
 				continue
@@ -1411,13 +1501,15 @@ func checkECMP(ctx context.Context, env *Env) Result {
 				continue
 			}
 			for _, nh := range e.Nexthops {
-				if nh.InterfaceName != "" {
-					set[nh.InterfaceName] = true
+				if nh.InterfaceName == "" && nh.IP == "" {
+					continue
 				}
+				hops = append(hops, installedHop{iface: nh.InterfaceName, ip: nh.IP})
 			}
 		}
-		nextHops[router] = set
-		return set, nil
+		nextHops[router] = hops
+		read[router] = true
+		return hops, nil
 	}
 
 	if hops, err := fetch(from); err != nil {
@@ -1451,21 +1543,17 @@ func checkECMP(ctx context.Context, env *Env) Result {
 				fmt.Fprintf(&detail, "could not read the routing table of %s: %v\n", path[i], err)
 				break
 			}
-			want := "port_" + path[i+1]
-			if path[i+1] == to && len(hops) > 0 && !hops[want] {
-				// The final hop may be reached over any interface toward the
-				// destination; only require the named one when it exists.
-				if !hops[want] {
-					ok = false
-					fmt.Fprintf(&detail, "%s does not forward toward %s (no next hop on %s)\n",
-						path[i], path[i+1], want)
-					break
-				}
-			}
-			if !hops[want] {
+			leads := linksToward(env, path[i], path[i+1])
+			if !leads.known() {
 				ok = false
-				fmt.Fprintf(&detail, "%s does not forward toward %s (no next hop on %s)\n",
-					path[i], path[i+1], want)
+				fmt.Fprintf(&detail, "the plan has no link between %s and %s, so no "+
+					"forwarding table can put the path through them\n", path[i], path[i+1])
+				break
+			}
+			if !leads.installed(hops) {
+				ok = false
+				fmt.Fprintf(&detail, "%s does not forward toward %s (%s)\n",
+					path[i], path[i+1], leads.describe())
 				break
 			}
 		}
@@ -1489,7 +1577,7 @@ func checkECMP(ctx context.Context, env *Env) Result {
 		allowed := map[string][]string{}
 		for _, p := range wantPaths {
 			for i := 0; i+1 < len(p); i++ {
-				allowed[p[i]] = append(allowed[p[i]], "port_"+p[i+1])
+				allowed[p[i]] = append(allowed[p[i]], p[i+1])
 			}
 		}
 		for _, router := range sortedKeysOfStrings(allowed) {
@@ -1500,16 +1588,26 @@ func checkECMP(ctx context.Context, env *Env) Result {
 				extra = append(extra, router+": unreadable")
 				continue
 			}
-			ok := map[string]bool{}
-			for _, h := range allowed[router] {
-				ok[h] = true
+			var leads []hopToward
+			for _, peer := range allowed[router] {
+				leads = append(leads, linksToward(env, router, peer))
 			}
-			for h := range hops {
-				if !ok[h] {
-					extra = append(extra, router+" via "+h)
-					fmt.Fprintf(&detail, "%s also forwards toward %s over %s, which no "+
-						"prescribed path uses\n", router, to, h)
+			named := map[string]bool{}
+			for _, h := range hops {
+				prescribed := false
+				for _, l := range leads {
+					if l.matches(h) {
+						prescribed = true
+						break
+					}
 				}
+				if prescribed || named[h.label()] {
+					continue
+				}
+				named[h.label()] = true
+				extra = append(extra, router+" via "+h.label())
+				fmt.Fprintf(&detail, "%s also forwards toward %s over %s, which no "+
+					"prescribed path uses\n", router, to, h.label())
 			}
 		}
 		sort.Strings(extra)
@@ -1564,8 +1662,12 @@ func checkECMP(ctx context.Context, env *Env) Result {
 	}
 
 	got := make([]string, 0)
-	for h := range nextHops[from] {
-		got = append(got, h)
+	seenHop := map[string]bool{}
+	for _, h := range nextHops[from] {
+		if !seenHop[h.label()] {
+			seenHop[h.label()] = true
+			got = append(got, h.label())
+		}
 	}
 	sort.Strings(got)
 

@@ -1224,6 +1224,29 @@ reached students, and each motivated a permanent test.
      before. Measured: the attack 1.00 -> 0.00 on the load-balancing question,
      and the three shipped labs unchanged at 10.00, 6.00 and 4.00.
 
+107. **A hop identified by a name instead of by where it leads.** The
+     load-balancing question asks whether each router along a prescribed path
+     forwards toward the next one, and decided it by looking for a next hop on
+     an interface called `port_<next router>`. That is not a property of the
+     network: it is how Twinet's own FRR renderer happens to name interfaces.
+     A second link between the same pair is named differently, and so is every
+     interface on a device configured by anything other than FRR -- both of
+     which the topology supports and the heterogeneous-vendor goal requires --
+     so a router forwarding perfectly well over such an interface was reported
+     as not forwarding at all, and a path that was installed and carrying
+     packets lost its mark. A route that names only the address it hands the
+     packet to, with no interface at all, was invisible for the same reason.
+     The plan already records which interface faces which neighbour and what
+     address the neighbour holds on it, so that is what the check reads now:
+     a hop is installed if any next hop leaves by an interface the plan says
+     faces the neighbour or is handed to an address the neighbour owns. The
+     same name was used to decide which links to probe and which next hops
+     were unprescribed, and both now come from the plan too. A prescribed pair
+     the topology does not join is reported as a rubric error rather than as a
+     student one. Found as a dead branch: the code contained an `if !hops[want]`
+     nested inside `if ... && !hops[want]`, with a comment describing a leniency
+     for the final hop that the code did not implement.
+
 
 
 
