@@ -1850,3 +1850,70 @@ implicit deny to sit at the end of, and nothing is filtered.
 | no inbound route-map at all | 0.40 | 0.40 |
 
 Full labs after the fix: cos461 10.00, advnet 6.00, multicast 4.00.
+
+### 116. One probe answers for one path
+
+`ospf.ecmp_paths` promises *"N equal-cost paths from X to Y, carrying
+traffic"*. It established the paths from the forwarding tables and then, for
+whether they carry anything, sent pings hop by hop and one connection end to
+end. The hop-by-hop sweep covers every link of every path, but only with ICMP.
+The connection covers every protocol the question cares about, but takes one
+path -- and the same one every time, because the router picks by hashing the
+flow.
+
+So a router discarding forwarded connections in the middle of one of three
+paths was invisible. On `as3/NYC`:
+
+    iptables -A FORWARD -p tcp -d 3.153.0.1 -j DROP
+
+Pings still went through, the end-to-end connection was hashed onto a path that
+avoided NYC, and the question kept **1.00 / 1.00** across eight runs. Measured
+directly, 40 connections from ATL to BOS with different source ports:
+
+    30 of 40 arrived; NYC's DROP counter +15
+
+A quarter of the traffic between the two routers was on the floor and the
+question was reporting the pair as healthy.
+
+The first instinct was to steer a flow deliberately onto the broken path. The
+kernel will say where a flow is going:
+
+    ip route get 3.153.0.1 from 3.156.0.1 ipproto tcp sport 2001 dport 8899
+      -> via 3.0.8.1 dev port_PHY        (at ATL)
+      -> via 3.0.4.1 dev port_NYC        (at PHY, iif port_ATL)
+
+and then the packet went to BOS instead. For a forwarded packet the answer is
+a prediction, and grading a prediction grades the wrong thing. So nothing is
+predicted. The question the mark is for is asked directly: of the flows sent
+between these two, did every one arrive? Thirty-two flows with different source
+ports, spread over the paths by the same hash the routers use -- at every hop,
+not only the first, which is what lets a three-router path be reached at all --
+and a capture on the far side saying which source ports came in. A lost flow
+means a path is discarding traffic, and the student is told how many.
+
+Two mistakes made on the way to this, both worth keeping:
+
+*Repeating only the failed flows is not a retry.* A source port is not a path.
+Re-sending the lost ports hashes them afresh, so they mostly land on the paths
+that work, and a real fault clears itself most of the time -- which is exactly
+what happened: the first version of the fix scored the mutation 1.00. The whole
+sweep is repeated instead, from fresh ports, and the fault has to survive both.
+That still rejects a frame lost to a scheduler delay, which is what the retry
+was for.
+
+*A flow that could not be sent is not a flow that was lost.* A source port
+already in use fails to bind, and counting that would blame a submission for
+the grader's choice of port. The sender reports which ports it managed to use
+and only those are looked for.
+
+Both protocols alternate across the sweep, because a filter is written per
+protocol as easily as per path.
+
+| | before | after |
+| --- | --- | --- |
+| healthy (reference), five runs | 1.00 | 1.00, 1.00, 1.00, 1.00, 1.00 |
+| TCP dropped mid-path on one of three | 1.00 | **0.50** -- *4 of 32 flows never arrived, and 28 did* |
+| UDP dropped mid-path on one of three | 1.00 | **0.50 / 0.00 / 0.00** over three runs |
+
+Full labs after the fix: cos461 10.00 in 4m14 (4m13 before), advnet 6.00,
+multicast 4.00.
