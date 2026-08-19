@@ -226,9 +226,17 @@ func saveAS(ctx context.Context, top *model.Topology, asn int, outDir string,
 			"is graded in a lab of its own", as.ASN, rerr)
 	}
 	if len(roas) > 0 {
-		if raw, err := json.MarshalIndent(roas, "", "  "); err == nil {
-			contents["roas.json"] = append(raw, '\n')
+		raw, err := json.MarshalIndent(roas, "", "  ")
+		if err != nil {
+			// Reading them was already treated as worth failing the save for.
+			// Dropping them here instead would produce an archive that looks
+			// complete and is not, which is the failure this whole block
+			// exists to prevent.
+			return "", fmt.Errorf("what AS %d has published at the trust anchor could not be "+
+				"written into the archive (%w); saving without it would produce an archive "+
+				"that loses the mark for publishing", as.ASN, err)
 		}
+		contents["roas.json"] = append(raw, '\n')
 	}
 
 	if len(contents) == 0 {
@@ -491,7 +499,15 @@ blame them for it.`,
 				if err != nil {
 					return fmt.Errorf("%s: %w", filepath.Base(p), err)
 				}
-				fmt.Fprintf(cmd.OutOrStdout(), "restored %s into AS %d (%d device(s))\n", b.Group, b.AS, n)
+				// Naming the authorisations separately because they are not a
+				// device and would otherwise be invisible in the one line an
+				// operator reads to decide the work is back.
+				extra := ""
+				if _, ok := files["roas.json"]; ok {
+					extra = " and its published authorisations"
+				}
+				fmt.Fprintf(cmd.OutOrStdout(), "restored %s into AS %d (%d device(s)%s)\n",
+					b.Group, b.AS, n, extra)
 			}
 			return nil
 		},
@@ -626,11 +642,22 @@ func restoreBundle(ctx context.Context, top *model.Topology, b Bundle,
 	}
 	sort.Strings(names)
 
+	// Every archive member has to be accounted for before this returns. The
+	// archive is one Twinet wrote and signed, so a member this code does not
+	// recognise is not junk to step over: it is a piece of the student's
+	// answer that this version cannot put back. Skipping it quietly is how
+	// the published authorisations were lost -- they were added to save and
+	// wired into the grading harness, and this function, which matched on
+	// file extension and ignored everything else, said nothing and reported
+	// the restore as complete.
+	handled := map[string]bool{}
+
 	n := 0
 	for _, name := range names {
 		if !strings.HasSuffix(name, ".conf") {
 			continue
 		}
+		handled[name] = true
 		short := strings.TrimSuffix(name, ".conf")
 		d, ok := byName[strings.ToUpper(short)]
 		if !ok {
@@ -649,6 +676,7 @@ func restoreBundle(ctx context.Context, top *model.Topology, b Bundle,
 		if !strings.HasSuffix(name, ".sh") {
 			continue
 		}
+		handled[name] = true
 		short := strings.TrimSuffix(name, ".sh")
 		d, ok := byName[strings.ToUpper(short)]
 		if !ok {
@@ -683,6 +711,29 @@ func restoreBundle(ctx context.Context, top *model.Topology, b Bundle,
 				d.ID, res.ExitCode, strings.TrimSpace(firstLines(res.Stderr, 3)))
 		}
 		n++
+	}
+
+	// What the group published at the trust anchor. Publishing is an action,
+	// not a line of anyone's running-config, so nothing above can carry it:
+	// on a lab that was rebuilt, the trust anchor starts empty and the
+	// archive is the only remaining record that the group ever published.
+	// Without this the restore reported success and the group lost the mark
+	// for publishing -- the exact loss the save side documents having already
+	// measured once, at 9.70 out of 10.
+	if body, ok := files["roas.json"]; ok {
+		handled["roas.json"] = true
+		if err := replayROAs(ctx, exec, top, as, body); err != nil {
+			return n, fmt.Errorf("restoring what AS %d published at the trust anchor: %w", b.AS, err)
+		}
+	}
+
+	for _, name := range names {
+		if !handled[name] {
+			return n, fmt.Errorf(
+				"archive contains %s, which this version of twinet does not know how to "+
+					"restore; it is part of the saved answer, so applying the rest and "+
+					"reporting success would report work as loaded that is not", name)
+		}
 	}
 	return n, nil
 }
