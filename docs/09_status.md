@@ -2119,3 +2119,77 @@ The check that caught it was working. What was missing was the ability to act
 on what it found.
 
 Full labs after both fixes: cos461 10.00, advnet 6.00, multicast 4.00.
+
+### 120. Half a leak, and the half that was checked was not the half that matters
+
+`bgp_blackhole_route_leak` installs two things that can be removed
+independently: a discard route (`ip route <prefix> Null0`) and the BGP
+`network` statement that advertises the prefix so other networks' traffic comes
+looking for it. Its verify read the forwarding table and nothing else.
+
+Withdraw the announcement -- the repair that stops the internet-wide diversion,
+and the one an agent that has correctly diagnosed a route leak would reach for
+first -- and the check answered:
+
+```
+bgp_blackhole_route_leak  as3/SFO  yes   traffic for 7.0.0.0/8 is discarded here
+```
+
+a sentence about a leak that had stopped, offered as the ground truth an agent's
+diagnosis is scored against. This is finding 118's shape, in a fault 118's sweep
+did not reach: that sweep was a regex over the commands each `Inject` issues,
+and this one builds both of its lines inside a single `VtyshConfig` call with
+`fmt.Sprintf`, so it read as one mechanism. Re-run structurally -- parse each
+registered fault, count the artifacts `Inject` leaves behind, print what
+`Verify` probes -- it is the only remaining fault of the shape. The others that
+install more than one thing (`bgp_asn_misconfig`, `dns_record_error`,
+`ospf_area_misconfiguration`) all verify an *outcome*: no established sessions,
+the name resolving to the wrong address, the adjacency down. **A verify that
+asks about an outcome cannot have this defect. A verify that asks about a
+mechanism has it whenever the fault installs more than one.** That is the rule
+worth keeping.
+
+The interesting part was deciding what "still in effect" should mean, because
+the obvious answer is wrong. The reviewer who found this proposed requiring
+*both* halves to be present. Measured on the lab, each half alone is an outage:
+
+```
+announcement withdrawn, discard route left:
+  $ twinet exec as3/ATL_host -- ping -c 3 -W 2 7.152.0.1
+  3 packets transmitted, 0 received, 100% packet loss
+
+discard route removed, announcement left:
+  $ twinet exec as3/SFO -- vtysh -c 'show ip route 7.0.0.0/8'
+  % Network not in table
+```
+
+The first is plain. The second is worth spelling out: with the router
+originating the prefix itself, its own path wins best-path selection on weight,
+and a locally sourced path installs nothing in the forwarding table -- so the
+router advertises a prefix it does not own to both of its external peers and
+then has no route for the traffic that arrives. Requiring both halves would
+have called each of those labs clean. It would have been finding 118 again,
+written the other way round: a check that declares a lab repaired while packets
+are on the floor. Either half surviving now reads as still in effect, which is
+also what `Resolve` has always required.
+
+The old code was already wrong in the second direction and nobody had looked:
+with the discard route removed it reported **NO -- no longer in effect** on a
+router that was still leaking.
+
+| state | before | after |
+| --- | --- | --- |
+| fully injected | yes, "traffic is discarded here" | yes, "originates 7.0.0.0/8, which it does not own, and discards the traffic that follows it" |
+| announcement withdrawn | yes, "traffic is discarded here" (silent about the leak) | yes, **"no longer originated into BGP, so the leak itself is gone, but the discard route is still installed and every packet ... is still dropped"** |
+| discard route removed | **NO** | yes, **"the discard route is gone, but the router still originates 7.0.0.0/8 ... and this router has no route for what arrives"** |
+| correctly resolved | not in effect | not in effect |
+
+`blackholeFor` also scopes the discard to the recorded prefix. `show ip route
+<prefix>` answers with whatever entry covers the prefix it is asked about, so a
+discard route for a neighbouring network read as this fault still being in
+place -- finding 117's shape, sitting inside the fault being repaired. The
+locally-originated test reuses the existing `locallyOriginated` helper rather
+than adding a second one; it already carries its own scar, having once matched
+the "Local host:" line that every learned path prints.
+
+Full labs after the fix: cos461 10.00, advnet 6.00, multicast 4.00.
