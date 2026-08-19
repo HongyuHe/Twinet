@@ -395,9 +395,19 @@ func init() {
 			return State{"prefix": prefix}, nil
 		},
 		Verify: func(ctx context.Context, e *Env, t Target, s State) (Evidence, error) {
-			out, _ := e.Try(ctx, t.DeviceID(), "ip route show | grep blackhole")
-			return Evidence{Verified: strings.Contains(out, "blackhole"),
-				Observed: strings.TrimSpace(out)}, nil
+			// Scoped to the prefix this fault recorded. "some blackhole route
+			// exists" is a different claim: a lab that blackholes anything of
+			// its own, or a second injection of this fault at another prefix,
+			// answers for a rule that is no longer there.
+			prefix := s["prefix"]
+			if prefix == "" {
+				return Evidence{}, fmt.Errorf("no prefix was recorded for this fault, so the "+
+					"route it installed cannot be identified (device %s)", t.DeviceID())
+			}
+			out, _ := e.Try(ctx, t.DeviceID(), "ip route show "+prefix)
+			return Evidence{Verified: strings.HasPrefix(strings.TrimSpace(out), "blackhole"),
+				Observed: observedRoute(out, prefix),
+				Expected: "traffic to " + prefix + " discarded by a blackhole route"}, nil
 		},
 		Resolve: func(ctx context.Context, e *Env, t Target, s State) error {
 			if s["prefix"] == "" {
@@ -418,6 +428,16 @@ func init() {
 // shellQuote makes a string safe to embed in a shell command.
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// observedRoute describes what the routing table holds for a prefix, so that
+// "there is no route at all" reads differently from "there is a route, but it
+// forwards".
+func observedRoute(out, prefix string) string {
+	if s := strings.TrimSpace(out); s != "" {
+		return s
+	}
+	return "no route for " + prefix
 }
 
 func hostAddr(e *Env, t Target) (iface, addr string, err error) {

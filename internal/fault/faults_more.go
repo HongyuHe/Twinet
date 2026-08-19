@@ -412,11 +412,8 @@ func init() {
 			if err != nil {
 				return Evidence{}, err
 			}
-			return Evidence{
-				Verified: strings.Contains(out, fmt.Sprintf("priority=%d", ovsDropPriority)) && strings.Contains(out, "actions=drop"),
-				Observed: matchingLine(out, fmt.Sprintf("priority=%d", ovsDropPriority)),
-				Expected: "a drop rule on port " + s["port"],
-			}, nil
+			return ovsFlowEvidence(out, ovsDropPriority, s["port"], "drop",
+				"a drop rule on port "+s["port"]), nil
 		},
 		Resolve: func(ctx context.Context, e *Env, t Target, s State) error {
 			// Refuse rather than delete by an empty cookie. "cookie=/-1" is a
@@ -463,11 +460,8 @@ func init() {
 			if err != nil {
 				return Evidence{}, err
 			}
-			return Evidence{
-				Verified: strings.Contains(out, fmt.Sprintf("priority=%d", ovsLoopPriority)),
-				Observed: matchingLine(out, fmt.Sprintf("priority=%d", ovsLoopPriority)),
-				Expected: "a rule returning traffic to port " + s["port"],
-			}, nil
+			return ovsFlowEvidence(out, ovsLoopPriority, s["port"], "IN_PORT",
+				"a rule returning traffic to port "+s["port"]), nil
 		},
 		Resolve: func(ctx context.Context, e *Env, t Target, s State) error {
 			// Refuse rather than delete by an empty cookie. "cookie=/-1" is a
@@ -484,6 +478,76 @@ func init() {
 			return err
 		},
 	})
+}
+
+// ovsFlowOn returns the flow-table line whose match selects exactly the given
+// priority and ingress port, along with its action list.
+//
+// Substring search cannot answer this question. "priority=100" and
+// "actions=drop" can come from two entirely different rules, so a table holding
+// an unrelated drop and an unrelated priority-100 forward satisfies both tests
+// while nothing is dropped; "in_port=1" is a prefix of "in_port=10", so a rule
+// on port 10 answers for port 1; and ovs-ofctl does not promise a field order,
+// so a fixed "priority=100,in_port=1" needle is a guess about formatting rather
+// than a reading of the rule. Splitting each line into its match fields and its
+// actions asks what the rule actually selects.
+func ovsFlowOn(out string, priority int, port string) (line, actions string, ok bool) {
+	if port == "" {
+		return "", "", false
+	}
+	wantPrio := fmt.Sprintf("priority=%d", priority)
+	wantPort := "in_port=" + port
+	for _, l := range strings.Split(out, "\n") {
+		i := strings.Index(l, " actions=")
+		if i < 0 {
+			continue
+		}
+		var gotPrio, gotPort bool
+		for _, f := range strings.Split(l[:i], ",") {
+			switch strings.TrimSpace(f) {
+			case wantPrio:
+				gotPrio = true
+			case wantPort:
+				gotPort = true
+			}
+		}
+		if gotPrio && gotPort {
+			return strings.TrimSpace(l), strings.TrimSpace(l[i+len(" actions="):]), true
+		}
+	}
+	return "", "", false
+}
+
+// hasAction reports whether an ovs-ofctl action list contains a given action as
+// a whole term. "drop" must not be found inside a longer action name, and OVS
+// prints IN_PORT in upper case while it is written in lower case on the wire.
+func hasAction(actions, want string) bool {
+	for _, a := range strings.Split(actions, ",") {
+		if strings.EqualFold(strings.TrimSpace(a), want) {
+			return true
+		}
+	}
+	return false
+}
+
+// ovsFlowEvidence reports on the rule the fault recorded, not on whatever else
+// the table happens to hold. When the recorded port carries no such rule the
+// observation says so, and names the rule that does sit at that priority if
+// there is one, because "the rule moved to another port" and "the rule is gone"
+// are different situations for whoever is reading the report.
+func ovsFlowEvidence(out string, priority int, port, action, expected string) Evidence {
+	line, actions, ok := ovsFlowOn(out, priority, port)
+	if ok && hasAction(actions, action) {
+		return Evidence{Verified: true, Observed: line, Expected: expected}
+	}
+	obs := fmt.Sprintf("no rule at priority=%d on port %s", priority, port)
+	if ok {
+		obs = fmt.Sprintf("the rule at priority=%d on port %s does not %s: %s",
+			priority, port, action, line)
+	} else if other := matchingLine(out, fmt.Sprintf("priority=%d", priority)); other != "" {
+		obs = fmt.Sprintf("%s; a rule at that priority sits elsewhere: %s", obs, other)
+	}
+	return Evidence{Verified: false, Observed: obs, Expected: expected}
 }
 
 // matchingLine returns the first line containing a substring, for evidence that
