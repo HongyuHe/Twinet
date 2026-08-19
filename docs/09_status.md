@@ -1547,3 +1547,55 @@ Two findings in a row now on the same few lines. That is worth stating plainly:
 reading the kernel instead of the daemon was right, but "the kernel" is not one
 answer -- it is an answer *per packet*, and a check has to say which packet it
 means.
+
+### 110. Failing a correct submission for the shape of its route-map
+
+`rpki.invalid_rejected` will not credit a `deny` clause that sits behind a
+`permit`, because route-maps stop at the first clause that matches and a permit
+in front of the deny is usually a way in. That rule is right. The exception to
+it was read too narrowly: a preceding permit was tolerated only when **every**
+one of its match statements selected on some other validation state.
+
+FRR requires *every* match in a clause to hold, so a single match the state
+rules out is enough on its own. No invalid route matches `match rpki valid`,
+however many prefix lists or communities sit beside it.
+
+Round 119 measured it on the live cos461 lab, on `as3/MSP`:
+
+    route-map LP-SLOW-PROVIDER permit 3
+     match ip address prefix-list ALL-ROUTES
+     match rpki valid
+     set local-preference 50
+    route-map LP-SLOW-PROVIDER deny 5
+     match rpki invalid
+
+`show route-map` reported the deny invoked 38 times and
+`show bgp ipv4 unicast rpki invalid` was empty -- the router was rejecting
+invalid origins exactly as asked. The check reported *"1 of 6 external
+session(s) accept invalid origins"* and took half the marks; the full rubric
+fell to 9.80.
+
+Setting local-preference for valid routes on a prefix list is an ordinary thing
+to write, so this was a correct submission being failed for not matching the
+reference answer's shape -- the fairness direction, and the one students
+actually feel.
+
+The test now asks the question that decides it: *can a route in the denied
+state match this clause at all?* It answers no as soon as any one match rules
+it out, and yes otherwise. A clause naming the denied state itself is still a
+way in, and so is one resting on a prefix list, an AS path or a community --
+none of which the configuration can decide, since any of them can be true of an
+invalid route as easily as of a valid one.
+
+Measured both directions after the fix: the correct-but-unusual route-map above
+scores **1.00**, and a genuine bypass (`permit 2: match ip address prefix-list
+ALL-ROUTES` with no validation match, which really does hide the deny) still
+scores **0.50**. Clean: cos461 10.00, advnet 6.00, multicast 4.00.
+
+The lesson is one this ledger keeps relearning from the other side. Findings
+97--109 were all checks that credited something they had not established.
+This one is the mirror image: a check that *withheld* credit for something it
+had not established either -- it never asked whether the permit clause could
+match an invalid route, it asked what the clause was made of. Reading a
+configuration for its shape rather than its consequence is the same mistake
+whichever way the marks move.
