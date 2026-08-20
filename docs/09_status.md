@@ -2503,8 +2503,16 @@ $ ... three attempts from 3.103.0.1 to 3.102.0.1 ...
 NoPorts on the far side: 139 -> 142             -> all three arrive
 ```
 
-Ten consecutive full-class gradings after the fix -- eight systems each, about
-twelve hundred check results -- with no deduction of any kind.
+Ten consecutive gradings of the whole lab in place after the fix -- eight
+systems each, about twelve hundred check results -- with no deduction of any
+kind.
+
+**It was not enough, and finding 128 is what was actually wrong.** Sending three
+datagrams removes independent loss, and independent loss was not what this was.
+The entry is kept as written because the reasoning it records is sound and the
+change is worth having on its own; but a fix that is only tested where the
+defect does not appear is not tested. The class path is where it appeared, and
+it took an hour to run, and it was run afterwards.
 
 ### 127. A refusal whose stated reason denies itself
 
@@ -2538,3 +2546,61 @@ the second grading as surely as the first, and one that lost a probe does not.
 Both fixes were mutated to prove the tests hold them. Reverting the precision
 reproduces the original message verbatim -- `scores 10.00 of 10.00` -- and
 reverting the retry lets a lab that grades clean the second time refuse a class.
+
+### 128. One observation of a path, however many packets it took
+
+Finding 126 sent three datagrams where one had been sent, and a class run of
+eight copies of the reference solution still came back with one of them at 9.90:
+
+```
+wave 3/8: group4
+  group4       9.90 / 10.00
+```
+```
+a datagram from SFO_host to HOU_host (4.108.0.1) never arrived
+-- no packet of it reached any interface -- though pings and
+connections do: something on the path is filtering by protocol
+```
+
+So the pair was asked directly, afterwards, and the two possible causes were
+separated:
+
+| what was tested | result |
+| --- | --- |
+| 300 datagrams over that exact pair, counted at the far side | **300 of 300 arrived** |
+| the capture started, three datagrams sent, capture read, 30 times | **30 of 30 recorded all three** |
+
+Neither the path nor the witness loses packets. So the three datagrams were not
+lost independently -- they were lost *together*, and the reason is in the
+sending:
+
+```
+$ for k in 1 2 3; do echo twinet | nc -u -w 1 -p 31999 <dst> 33456; done
+elapsed=0
+```
+
+`-w` is how long netcat waits for a reply, not a pause between sends. All three
+datagrams leave in the same instant. Whatever takes a pair out for a moment --
+and at roughly one probe in a thousand, on a lab that answers every one of 300
+when asked again, it is a moment and not a filter -- takes all three with it.
+
+**Three packets milliseconds apart are one observation of the path, not three.**
+The retry has to repeat the *observation*. A round that finds something is now
+run again, with fresh ports, fresh captures and fresh counters, and only the
+pairs that fail both times are reported.
+
+This is exactly the rule finding 116 arrived at for the load-balancing sweep --
+*the whole sweep is repeated instead, from fresh ports, and the fault has to
+survive both* -- applied to the check that never got it. The connection sweep
+beside it has the same structure and the same cap on the score, so it is
+repeated on the same terms. Nothing is repeated where nothing was found, so a
+healthy submission costs exactly what it did before.
+
+The lesson worth keeping is about the earlier fix, not this one. Finding 126 was
+verified ten times over on the path where the defect does not appear, and passed
+ten times, and was wrong. The defect lived in an hour-long class run, and only
+running the hour-long class run could have said so.
+
+| | before 126 | after 126 | after 128 |
+| --- | --- | --- | --- |
+| eight submissions, class path | 9.90 on one | 9.90 on one | **10.00 on all eight** |
