@@ -90,8 +90,9 @@ func tunnelCarriesTransport(ctx context.Context, env *Env, hosts map[string]*mod
 		// side counts the datagrams it received for a port nothing is bound
 		// to, which is a fact about arrival and not about any answer.
 		udpBefore, okU := udpNoPorts(ctx, env, dst.ID)
-		_, _ = env.Probe(ctx, src.ID, []string{"sh", "-c",
-			"echo twinet | nc -6 -u -w 2 " + addr + " " + port})
+		udpSent := sendDatagrams(ctx, env, src.ID, datagramProbe{
+			dstAddr: addr, port: port, v6: true,
+		})
 		udpAfter, okU2 := udpNoPorts(ctx, env, dst.ID)
 		frames, live := tap.seen(ctx, env)
 
@@ -117,7 +118,7 @@ func tunnelCarriesTransport(ctx context.Context, env *Env, hosts map[string]*mod
 			tapped: frames.udp, tapLive: live,
 			counted: offBoxDelta(udpBefore, udpAfter), counterOK: okU && okU2,
 		}
-		if !gotUDP.attributable() {
+		if !gotUDP.attributable() || !udpSent {
 			continue
 		}
 		if !gotUDP.arrived() {

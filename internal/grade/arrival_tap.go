@@ -376,3 +376,83 @@ func (a arrival) why() string {
 	}
 	return "it did not arrive"
 }
+
+// datagramAttempts is how many datagrams stand behind a claim that none arrived.
+//
+// UDP does not retransmit. One datagram lost to a full socket buffer, to a
+// neighbour entry being resolved, or to a scheduler delay on a loaded node is
+// indistinguishable from a network that discards the protocol -- and every
+// check that sent one then told the student, in as many words, that something
+// on the path was filtering by protocol. In a sixteen-submission class run of
+// the reference solution it cost two correct submissions a mark, on a different
+// pair of hosts each time.
+//
+// Several are sent and one arriving is enough, which is the tolerance the ping
+// probes have had all along: they send two echo requests and ask for one.
+const datagramAttempts = 3
+
+// datagramProbe is a datagram to send, and what is known about where from.
+//
+// srcAddr may be empty. It is the sender's own address, used to pin every
+// attempt to one source port, and where the caller does not know it the
+// attempts are left to the kernel.
+type datagramProbe struct {
+	srcAddr string
+	dstAddr string
+	port    string
+	v6      bool
+}
+
+// sendDatagrams sends the same datagram several times and reports whether the
+// sender managed to send any of them.
+//
+// All of the attempts leave from one source port, not a fresh one each time,
+// because a source port is not a path. Where equal-cost paths exist, a new port
+// is hashed afresh and lands on whichever path happens to work, so a fault that
+// discards one path clears itself on the retry -- which is finding 116, and is
+// easier to repeat here than it looks. Pinned, the attempts all take the path
+// the first one took, so a retry can rescue a dropped packet without rescuing a
+// dropped path.
+//
+// A datagram that could not be sent is not a datagram that was lost. Binding a
+// source port fails if the grader picked one already in use, and reading that
+// as a datagram that did not arrive would blame a submission for the grader's
+// own choice; such an attempt falls back to an unbound one so that the pair is
+// still probed, and the caller is told how it went so it can stay silent rather
+// than accuse on no evidence.
+func sendDatagrams(ctx context.Context, env *Env, from string, p datagramProbe) bool {
+	nc := "nc -u -w 1"
+	if p.v6 {
+		nc = "nc -6 -u -w 1"
+	}
+	send := func(bind bool) string {
+		if bind {
+			return fmt.Sprintf("echo twinet | %s -s %s -p $sport %s %s 2>&1 >/dev/null",
+				nc, p.srcAddr, p.dstAddr, p.port)
+		}
+		return fmt.Sprintf("echo twinet | %s %s %s 2>&1 >/dev/null",
+			nc, p.dstAddr, p.port)
+	}
+	var b strings.Builder
+	b.WriteString("n=0; ")
+	if p.srcAddr != "" {
+		// One port for every attempt, drawn once. UDP has no lingering state
+		// to stop it being bound again a moment later.
+		fmt.Fprintf(&b, "sport=%s; ", probePort())
+	}
+	for range datagramAttempts {
+		if p.srcAddr != "" {
+			fmt.Fprintf(&b, "e=$(%s); case \"$e\" in *bind*) e=$(%s);; esac; ",
+				send(true), send(false))
+		} else {
+			fmt.Fprintf(&b, "e=$(%s); ", send(false))
+		}
+		b.WriteString("case \"$e\" in *bind*) ;; *) n=$((n+1));; esac; ")
+	}
+	b.WriteString("echo sent=$n")
+	res, err := env.Probe(ctx, from, []string{"sh", "-c", b.String()})
+	if err != nil {
+		return false
+	}
+	return !strings.Contains(res.Stdout, "sent=0")
+}

@@ -1464,11 +1464,9 @@ func carriesTCPBothWays(ctx context.Context, env *Env, from, to string) (string,
 		// connections working and the paths carrying two thirds of what they
 		// should.
 		udpBefore, okU := udpNoPortsV4(ctx, env, dst.ID)
-		cmd := "echo twinet | nc -u -w 2"
-		if src4 != "" {
-			cmd += " -s " + src4
-		}
-		_, _ = env.Probe(ctx, src.ID, []string{"sh", "-c", cmd + " " + addr + " " + port})
+		udpSent := sendDatagrams(ctx, env, src.ID, datagramProbe{
+			srcAddr: src4, dstAddr: addr, port: port,
+		})
 		udpAfter, okU2 := udpNoPortsV4(ctx, env, dst.ID)
 		frames, live := tap.seen(ctx, env)
 
@@ -1485,7 +1483,7 @@ func carriesTCPBothWays(ctx context.Context, env *Env, from, to string) (string,
 			tapped: frames.udp, tapLive: live,
 			counted: offBoxDelta(udpBefore, udpAfter), counterOK: okU && okU2,
 		}
-		if gotUDP.attributable() && !gotUDP.arrived() {
+		if udpSent && gotUDP.attributable() && !gotUDP.arrived() {
 			return fmt.Sprintf(
 				"%s answers pings and connections from %s but no datagram from it arrives "+
 					"-- %s: something on the paths is filtering by protocol",
@@ -3923,6 +3921,8 @@ func unreachableByUDP(ctx context.Context, env *Env, hosts []*model.Device,
 		taps := startTaps(ctx, env, ports)
 		before := udpCounters(ctx, env, hosts)
 		var wg sync.WaitGroup
+		var mu sync.Mutex
+		unsent := map[string]bool{}
 		for i, src := range hosts {
 			dst := hosts[(i+k)%n]
 			if addrOf[dst.ID] == "" {
@@ -3931,8 +3931,16 @@ func unreachableByUDP(ctx context.Context, env *Env, hosts []*model.Device,
 			wg.Add(1)
 			go func(src, dst *model.Device) {
 				defer wg.Done()
-				_, _ = env.Probe(ctx, src.ID, []string{"sh", "-c",
-					"echo twinet | nc -u -w 2 " + addrOf[dst.ID] + " " + ports[dst.ID]})
+				ok := sendDatagrams(ctx, env, src.ID, datagramProbe{
+					srcAddr: addrOf[src.ID],
+					dstAddr: addrOf[dst.ID],
+					port:    ports[dst.ID],
+				})
+				if !ok {
+					mu.Lock()
+					unsent[src.ID+"\x00"+dst.ID] = true
+					mu.Unlock()
+				}
 			}(src, dst)
 		}
 		wg.Wait()
@@ -3948,6 +3956,11 @@ func unreachableByUDP(ctx context.Context, env *Env, hosts []*model.Device,
 				counted: offBoxDelta(b, a), counterOK: okB && okA,
 			}
 			if !got.attributable() || got.arrived() {
+				continue
+			}
+			// Nothing left the sender, so nothing can be concluded about the
+			// path between them.
+			if unsent[src.ID+"\x00"+dst.ID] {
 				continue
 			}
 			out = append(out, fmt.Sprintf(
