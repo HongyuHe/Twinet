@@ -106,7 +106,7 @@ mark, unless --keep-labs is given for a dispute.`,
 			if len(subs) == 0 && len(unread) == 0 {
 				return fmt.Errorf("no submissions found under %s", subDir)
 			}
-			announceUnreadable(cmd.ErrOrStderr(), unread)
+			announceUnreadable(cmd.ErrOrStderr(), unread, len(subs))
 			tok, err := tokenFor(token)
 			if err != nil {
 				return err

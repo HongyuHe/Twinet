@@ -154,16 +154,26 @@ func TestTheOperatorIsToldBeforeTheRunNotAfterIt(t *testing.T) {
 	var out bytes.Buffer
 	announceUnreadable(&out, []unreadable{
 		{Name: "group6", Reason: "unexpected EOF while reading the archive"},
-	})
+	}, 7)
 	s := out.String()
 	if !strings.Contains(s, "group6") || !strings.Contains(s, "unexpected EOF") {
 		t.Fatalf("the announcement does not say which submission or why:\n%s", s)
 	}
-	if !strings.Contains(s, "graded normally") {
+	if !strings.Contains(s, "other 7 are graded normally") {
 		t.Errorf("the announcement should make clear the rest of the class is still graded:\n%s", s)
 	}
 	out.Reset()
-	announceUnreadable(&out, nil)
+	announceUnreadable(&out, nil, 8)
+
+	// When nothing else was handed in, it must not claim the rest is graded.
+	out.Reset()
+	announceUnreadable(&out, []unreadable{{Name: "group6", Reason: "unexpected EOF"}}, 0)
+	if strings.Contains(out.String(), "graded normally") {
+		t.Errorf("with nothing else to grade, the announcement still promised to grade it:\n%s",
+			out.String())
+	}
+	out.Reset()
+	announceUnreadable(&out, nil, 8)
 	if out.Len() != 0 {
 		t.Errorf("nothing should be printed when every submission is readable: %q", out.String())
 	}

@@ -2604,3 +2604,83 @@ running the hour-long class run could have said so.
 | | before 126 | after 126 | after 128 |
 | --- | --- | --- | --- |
 | eight submissions, class path | 9.90 on one | 9.90 on one | **10.00 on all eight** |
+
+### 129. One corrupt upload was the whole class's problem
+
+Found by review round 134, which was otherwise a PASS. Every per-submission
+failure came out of `readSubmissions` as an error, and both grading commands
+returned it unchanged:
+
+```
+$ twinet grade class -s submissions
+twinet: group6.tar.gz: group6.tar.gz is not a gzip archive: gzip: invalid header
+$ echo $?
+1
+```
+
+Nothing was graded. Not the corrupt submission, and not the ninety-nine
+submissions beside it. A course with one truncated upload got no marks at all,
+and the only remedy on offer was to go and find the bad file and take it out of
+the directory by hand — which is also, exactly, how a student silently ends up
+with no mark at all. The failure and its remedy were the same action.
+
+The distinction that was missing is between **one submission being bad** and
+**the set being ambiguous**. A directory that cannot be listed, or two archives
+both claiming AS 5, still stops everything: there the question of who would be
+silently skipped has no answer, and finding 111 already settled that guessing
+between two submissions is a decision about late work that belongs to a course
+and not to a grader. But one unreadable file answers that question by itself.
+
+So an unreadable submission is now quarantined rather than fatal. It is named
+at the *start* of the run, not the end — an operator who learns at minute one
+can fix the upload and re-run, one who learns at minute sixty runs the hour
+again. It becomes a `Report` with `NeedsReview` set, which is the same shape a
+submission gets when its harness fails to deploy, so it travels the existing
+summary, CSV, report-writing and release-guard path rather than a second one
+invented beside it. It carries no total, it is excluded from the class
+statistics, and the command still exits non-zero so no script mistakes a
+partial class for a complete one.
+
+Verified on the real thing — two solved submissions and two corrupt uploads:
+
+```
+2 submission(s) cannot be read and will not be graded:
+  group6         group6.tar.gz: group6.tar.gz is not a gzip archive: gzip: invalid header
+  group7         group7.tar.gz: group7.tar.gz is not a gzip archive: unexpected EOF
+They are reported as needing review, and the other 2 are graded normally.
+...
+graded 2 of 4 submission(s) against cos461-routing in 14m50.587s
+  mean 10.00  median 10.00  min 10.00  max 10.00  (out of 10.00, over the 2 graded; 2 need review)
+```
+
+Before this, that command graded nobody.
+
+### 130. A report that was never completed printed a zero
+
+Falling out of 129, in the artifact that actually reaches a student. Every
+per-student `.txt` report opened with its score, including the ones that had no
+score:
+
+```
+group6 (AS 0)
+============================================================  0.00 / 10.00 (0%)
+
+grading failed: this submission could not be read...
+```
+
+`0.00 / 10.00 (0%)` is what a student who did nothing looks like. A corrupt
+upload, a harness that failed to deploy, and a genuinely empty submission were
+typographically identical, and the number was in the largest type on the page
+while the reason was a line of prose below it.
+
+The CSV had been taught this lesson already — its comment says a report that
+needs review "carries no total at all rather than a zero", so that a gradebook
+import cannot silently award a zero the platform is responsible for. The
+human-readable version had not, and it is the one anybody actually reads. It
+now prints `not graded` where the score would be, and ends with a sentence
+saying so in words: *this is not a score of zero: nothing about the work was
+assessed.*
+
+The lesson is the one behind finding 122 and finding 124, in a new place: when
+two artifacts describe the same fact, they will drift, and the one that drifts
+is the one without a test. Both are now tested against the same rule.

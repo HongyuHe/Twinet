@@ -108,7 +108,7 @@ The lab must already be deployed with --solve.`,
 			if len(subs) == 0 && len(unread) == 0 {
 				return fmt.Errorf("no submissions found under %s", subDir)
 			}
-			announceUnreadable(cmd.ErrOrStderr(), unread)
+			announceUnreadable(cmd.ErrOrStderr(), unread, len(subs))
 			exec, err := execFunc(cmd.Context(), top, token)
 			if err != nil {
 				return err

@@ -521,7 +521,7 @@ func quarantineUnreadable(bad []unreadable, rubric *grade.Rubric, lab string) []
 // The summary says so too, but an hour later. An operator who learns at the
 // start that one archive is corrupt can fix it and re-run before the class run
 // has finished; one who learns at the end has to run the whole thing again.
-func announceUnreadable(w io.Writer, bad []unreadable) {
+func announceUnreadable(w io.Writer, bad []unreadable, gradeable int) {
 	if len(bad) == 0 {
 		return
 	}
@@ -529,7 +529,13 @@ func announceUnreadable(w io.Writer, bad []unreadable) {
 	for _, u := range bad {
 		fmt.Fprintf(w, "  %-14s %s\n", u.Name, firstLine(u.Reason))
 	}
-	fmt.Fprintln(w, "They are reported as needing review, and everything else is graded normally.")
+	if gradeable == 0 {
+		fmt.Fprintln(w, "They are reported as needing review. Nothing else was handed in, "+
+			"so there is nothing to grade.")
+		return
+	}
+	fmt.Fprintf(w, "They are reported as needing review, and the other %d are graded normally.\n",
+		gradeable)
 }
 
 func releaseGuard(s *grade.Summary, out io.Writer) error {
