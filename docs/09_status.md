@@ -2391,3 +2391,56 @@ class-scale marking path had never been run end to end against the reference
 lab. Two of them made it refuse to work at all, which is the failure mode to be
 grateful for. The first, in the restore it shares with that path, quietly
 marked a group 9.70 for an answer worth 10.00.
+
+### 125. A mark for label distribution, given without waiting for label distribution
+
+Grading waits for the control plane to settle before it marks. The wait watched
+OSPF, then BGP sessions, then the RIB. It never watched LDP -- in the course
+whose entire subject is MPLS.
+
+Graded in place, advnet scores 6.00. The same submission, through the path a
+class run uses, scored 5.20:
+
+```
+graded 1 submission(s) against advnet-mpls-l3vpn in 2m57.365s
+  mean 5.20  median 5.20  min 5.20  max 5.20  (out of 6.00)
+most-missed checks:
+  mpls.ldp_adjacencies                     1 of 1
+```
+
+with the evidence `R2 has no LDP session with R5`. Read back after the run:
+
+```
+$ twinet exec as1/R2 -- vtysh -c 'show mpls ldp neighbor'
+ipv4 1.151.0.1       OPERATIONAL 1.151.0.1       00:00:15
+ipv4 1.153.0.1       OPERATIONAL 1.153.0.1       00:00:10
+```
+
+Ten and fifteen seconds of uptime: the sessions came up *after* the mark was
+recorded. The student's answer was right and the grader was early.
+
+Grading in place hides this completely, because a lab that has been running for
+minutes converged long ago. It appears only when grading follows a reset --
+which is what `grade class` and `grade batch` do to every submission, one after
+another. Every student in an advnet class run loses this mark, and the report
+they receive says their LDP session does not exist.
+
+The rubric's own question asks for `converge_scope: ospf` and then marks
+`mpls.ldp_adjacencies` inside it, so the wait established one thing and the mark
+was given on another -- the ledger's oldest shape, in the one place where it
+costs marks rather than credibility.
+
+The wait now reads each router's **configuration** to decide whether LDP belongs
+to this lab, because "no session yet" and "this lab has no LDP" are the same
+output from `show mpls ldp neighbor`, and a predicate that cannot tell them
+apart returns instantly and declares the network settled. A lab that runs no
+LDP passes straight through without a single query. A submission whose LDP is
+genuinely broken times out, is recorded as a warning, and is still marked --
+non-convergence is a mark, not an outage.
+
+After the fix, the same submission through the same path:
+
+```
+graded 1 submission(s) against advnet-mpls-l3vpn in 4m15.616s
+  mean 6.00  median 6.00  min 6.00  max 6.00  (out of 6.00)
+```
