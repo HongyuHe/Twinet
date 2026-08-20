@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -86,5 +87,92 @@ func TestNotApplicableIsNotBlamedForMissingMarks(t *testing.T) {
 	}
 	if !strings.Contains(why, "rpki.roa_published") {
 		t.Errorf("did not name the check that actually failed: %s", why)
+	}
+}
+
+// The complaint about a total is printed with two decimal places, so a
+// shortfall smaller than that came out as "scores 10.00 of 10.00" -- a refusal
+// whose stated reason denies itself, and which names no check at all. The
+// reachability check scores in proportion to the probes that arrived, and one
+// lost ping in a hundred and forty-four takes about a thousandth of a mark.
+func TestAReferenceIsNeverRefusedForLessThanItPrints(t *testing.T) {
+	rep := refReport(10-0.0014, false, grade.StatusPass, grade.StatusPass, grade.StatusPass)
+	why := referenceComplaint(rep, 10)
+	if strings.Contains(why, "scores 10.00 of 10.00") {
+		t.Fatalf("the reason a lab was refused contradicts itself: %s", why)
+	}
+	if why != "" {
+		t.Fatalf("every check passed and the shortfall does not survive printing: %s", why)
+	}
+}
+
+// But a shortfall that does survive printing is still a complaint, and the
+// smallest such must be caught rather than rounded away.
+func TestAShortfallThatPrintsIsStillRefused(t *testing.T) {
+	rep := refReport(9.99, false, grade.StatusPass, grade.StatusPass, grade.StatusPartial)
+	why := referenceComplaint(rep, 10)
+	if !strings.Contains(why, "scores 9.99 of 10.00") {
+		t.Fatalf("a shortfall the operator can see must be reported: %q", why)
+	}
+}
+
+// And a check that did not pass is named even when the marks it cost round
+// away, so tolerating the total never tolerates a broken lab.
+func TestACheckThatDidNotPassIsNamedEvenWhenItCostAlmostNothing(t *testing.T) {
+	rep := refReport(10-0.0014, false, grade.StatusPass, grade.StatusPartial, grade.StatusPass)
+	why := referenceComplaint(rep, 10)
+	if !strings.Contains(why, "bgp.session_up") {
+		t.Fatalf("a check that did not pass must be named: %q", why)
+	}
+	if !strings.Contains(why, "did not pass") {
+		t.Fatalf("want the per-check complaint, got %q", why)
+	}
+}
+
+// This gate refuses the whole class run, so a complaint raised on the weather
+// costs every student their marks until an operator gives up and passes
+// --skip-reference-check, which turns the gate off entirely. A lab that is
+// really not the reference solution fails the second grading as surely as the
+// first; a lab that lost one probe of a hundred and forty-four does not.
+func TestAComplaintMustSurviveBeingAskedAgain(t *testing.T) {
+	asked := 0
+	why := settledComplaint(referenceAttempts, func() string {
+		asked++
+		if asked == 1 {
+			return "scores 9.90 of 10.00"
+		}
+		return ""
+	})
+	if why != "" {
+		t.Fatalf("a lab that grades clean the second time is not a broken lab: %q", why)
+	}
+	if asked < 2 {
+		t.Fatalf("the reference was refused on one grading, after %d attempt(s)", asked)
+	}
+}
+
+// A lab that really is not the reference solution must still be caught, and the
+// complaint reported must be the one that was still true at the end.
+func TestAComplaintThatSurvivesIsStillReported(t *testing.T) {
+	asked := 0
+	why := settledComplaint(referenceAttempts, func() string {
+		asked++
+		return fmt.Sprintf("scores 9.70 of 10.00 (grading %d)", asked)
+	})
+	if !strings.Contains(why, "9.70") {
+		t.Fatalf("a broken lab must still be refused, got %q", why)
+	}
+	if !strings.Contains(why, fmt.Sprintf("grading %d", referenceAttempts)) {
+		t.Fatalf("want the complaint that was still true at the end, got %q", why)
+	}
+	if asked != referenceAttempts {
+		t.Fatalf("want %d gradings, got %d", referenceAttempts, asked)
+	}
+}
+
+// Retrying is worth nothing if the gate is not retried at all.
+func TestTheReferenceIsGradedMoreThanOnceBeforeARefusal(t *testing.T) {
+	if referenceAttempts < 2 {
+		t.Fatal("one grading is the defect this exists to prevent")
 	}
 }

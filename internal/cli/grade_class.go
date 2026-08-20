@@ -798,14 +798,18 @@ func attestReference(ctx context.Context, top *model.Topology, rubric *grade.Rub
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			rep := grade.Run(ctx, rubric, &grade.Env{Topology: top, AS: asn, Exec: exec},
-				grade.RunOptions{ConvergeTimeout: converge, Parallel: 4})
-
-			if why := referenceComplaint(rep, rubric.MaxTotal()); why != "" {
-				mu.Lock()
-				bad = append(bad, fmt.Sprintf("AS %d %s", asn, why))
-				mu.Unlock()
+			why := settledComplaint(referenceAttempts, func() string {
+				return referenceComplaint(
+					grade.Run(ctx, rubric, &grade.Env{Topology: top, AS: asn, Exec: exec},
+						grade.RunOptions{ConvergeTimeout: converge, Parallel: 4}),
+					rubric.MaxTotal())
+			})
+			if why == "" {
+				return
 			}
+			mu.Lock()
+			bad = append(bad, fmt.Sprintf("AS %d %s, every time it was graded", asn, why))
+			mu.Unlock()
 		}(asn)
 	}
 	wg.Wait()
@@ -825,6 +829,41 @@ func attestReference(ctx context.Context, top *model.Topology, rubric *grade.Rub
 		"for a lab you have just checked by hand",
 		strings.Join(bad, "\n  "), manifest)
 }
+
+// referenceAttempts is how many gradings a complaint has to survive before the
+// gate refuses a class run on it.
+//
+// This gate is the only thing standing between a class and being marked against
+// a broken internet, and it refuses the whole run. So a complaint it raises on
+// the weather costs every student their marks until an operator gives up and
+// passes --skip-reference-check, which turns the gate off entirely -- the same
+// trap as finding 123, reached from the other side. A lab that really is not
+// the reference solution fails the second grading as surely as the first; a lab
+// that lost one probe of a hundred and forty-four does not.
+const referenceAttempts = 2
+
+// settledComplaint returns the complaint only if it survives being asked again,
+// and returns the last one made rather than the first, so what is reported is
+// what was still true at the end.
+func settledComplaint(attempts int, ask func() string) string {
+	var why string
+	for i := 0; i < max(attempts, 1); i++ {
+		if why = ask(); why == "" {
+			return ""
+		}
+	}
+	return why
+}
+
+// displayedPrecision is the smallest shortfall that survives being printed.
+//
+// The complaint about a total is written with "%.2f", so a shortfall below
+// half of the last place shown produced "scores 10.00 of 10.00" as the reason a
+// lab was refused -- which reads as a bug in the gate rather than a fact about
+// the lab, and left the check responsible unnamed. Anything smaller is not a
+// total worth complaining about; if a check really did not pass, the scan below
+// names it.
+const displayedPrecision = 0.005
 
 // referenceComplaint says what is wrong with the reference solution's report,
 // or returns empty if nothing is.
@@ -849,7 +888,7 @@ func referenceComplaint(rep *grade.Report, max float64) string {
 	}
 
 	switch {
-	case rep.Total < max:
+	case max-rep.Total >= displayedPrecision:
 		// Which check, not just the total. "AS 5 scores 9.80 of 10.00" tells
 		// an operator that something is wrong and nothing about what, so the
 		// only way to act on it was to grade the system again by hand and hope
