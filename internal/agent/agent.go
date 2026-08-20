@@ -621,8 +621,18 @@ type ApplyRequest struct {
 
 // ApplyResponse reports the outcome.
 type ApplyResponse struct {
-	Node       string              `json:"node"`
+	Node string `json:"node"`
+	// Steps is how many steps ran and succeeded, and Planned how many the
+	// plan held. They differ on a dry run, on an --only, and on a deploy that
+	// failed part way, which are exactly the runs whose summary must not read
+	// like a complete one.
 	Steps      int                 `json:"steps"`
+	Planned    int                 `json:"planned,omitempty"`
+	Devices    int                 `json:"devices"`
+	Links      int                 `json:"links"`
+	WantDevice int                 `json:"want_devices,omitempty"`
+	WantLinks  int                 `json:"want_links,omitempty"`
+	DryRun     bool                `json:"dry_run,omitempty"`
 	DurationMS int64               `json:"duration_ms"`
 	Failures   map[string][]string `json:"failures,omitempty"`
 	Pruned     []string            `json:"pruned,omitempty"`
@@ -770,7 +780,12 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := ApplyResponse{
-		Node: s.cfg.Node, Steps: p.Len(),
+		Node: s.cfg.Node, Steps: rep.Done(), Planned: p.Len(),
+		Devices:    rep.Completed(plan.StageCreate),
+		Links:      rep.Completed(plan.StageWire),
+		WantDevice: rep.Planned(plan.StageCreate),
+		WantLinks:  rep.Planned(plan.StageWire),
+		DryRun:     req.DryRun,
 		DurationMS: rep.Duration.Milliseconds(),
 	}
 	if recordFailure != "" {

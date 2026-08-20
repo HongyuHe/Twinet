@@ -397,18 +397,29 @@ func deployCluster(ctx context.Context, top *model.Topology, tok string, req age
 	w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(w, "NODE\tSTEPS\tDURATION\tSTATUS")
 	failed := 0
+	devices, links, wantDev, wantLink := 0, 0, 0, 0
+	reached := 0
 	for _, r := range results {
 		if r.Err != nil {
 			failed++
 			fmt.Fprintf(w, "%s\t-\t-\t%s\n", r.Node, firstLine(r.Err.Error()))
 			continue
 		}
+		reached++
+		devices += r.Value.Devices
+		links += r.Value.Links
+		wantDev += r.Value.WantDevice
+		wantLink += r.Value.WantLinks
 		status := "ok"
 		if len(r.Value.Failures) > 0 {
 			failed++
 			status = fmt.Sprintf("%d scope(s) degraded", len(r.Value.Failures))
 		}
-		fmt.Fprintf(w, "%s\t%d\t%s\t%s\n", r.Node, r.Value.Steps,
+		steps := fmt.Sprintf("%d", r.Value.Steps)
+		if r.Value.Planned > r.Value.Steps {
+			steps = fmt.Sprintf("%d/%d", r.Value.Steps, r.Value.Planned)
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", r.Node, steps,
 			time.Duration(r.Value.DurationMS)*time.Millisecond, status)
 	}
 	_ = w.Flush()
@@ -421,9 +432,40 @@ func deployCluster(ctx context.Context, top *model.Topology, tok string, req age
 		}
 	}
 
+	// Summed from what the nodes reported doing, not from the manifest. A
+	// cross-node link is wired from both ends, so the per-node totals count it
+	// twice. Subtracting the topology's cross-node count undoes that, but only
+	// for a run that covered the whole topology: with --only, or a node that
+	// did not answer, the endpoints summed here are a subset the manifest's
+	// figure says nothing about. Those cases report endpoints and say so
+	// rather than printing a link count they cannot support.
 	s := top.Stats()
-	fmt.Fprintf(out, "\n%d devices, %d links (%d cross-node) across %d nodes in %s\n",
-		s.Devices, s.Links, s.CrossNode, len(c.Nodes), time.Since(start).Round(time.Millisecond))
+	whole := failed == 0 && reached == len(c.Nodes) && len(req.OnlySteps) == 0
+	if req.DryRun {
+		if whole {
+			fmt.Fprintf(out, "\ndry run: %d devices and %d links would be deployed "+
+				"across %d nodes; nothing was changed\n",
+				wantDev, wantLink-s.CrossNode, len(c.Nodes))
+		} else {
+			fmt.Fprintf(out, "\ndry run: %d devices and %d link endpoints would be "+
+				"deployed across the %d node(s) that answered; nothing was changed\n",
+				wantDev, wantLink, reached)
+		}
+		if failed > 0 {
+			return fmt.Errorf("%d node(s) reported problems; re-run deploy to converge", failed)
+		}
+		return nil
+	}
+	if whole {
+		fmt.Fprintf(out, "\n%d devices, %d links (%d cross-node) across %d nodes in %s\n",
+			devices, links-s.CrossNode, s.CrossNode, len(c.Nodes),
+			time.Since(start).Round(time.Millisecond))
+	} else {
+		fmt.Fprintf(out, "\n%d of %d devices and %d of %d link endpoints deployed "+
+			"across the %d node(s) that answered, in %s\n",
+			devices, wantDev, links, wantLink, reached,
+			time.Since(start).Round(time.Millisecond))
+	}
 
 	if failed > 0 {
 		return fmt.Errorf("%d node(s) reported problems; re-run deploy to converge", failed)

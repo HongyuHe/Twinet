@@ -168,6 +168,100 @@ func ribFingerprint(ctx context.Context, env *Env) (string, int, error) {
 	return hex.EncodeToString(h.Sum(nil))[:16], total, nil
 }
 
+// ldpConfigured returns the routers whose configuration runs LDP.
+//
+// Read from the configuration rather than from the sessions, because "no
+// session yet" and "this lab does not use LDP" are the same output from
+// `show mpls ldp neighbor`. Telling them apart by what is currently up is how
+// a wait for something still starting returns instantly and declares it
+// settled.
+func ldpConfigured(ctx context.Context, env *Env) map[string]bool {
+	out := map[string]bool{}
+	for _, r := range env.Routers() {
+		cfg, err := env.Vtysh(ctx, r.Name, "show running-config")
+		if err != nil {
+			continue
+		}
+		if strings.Contains(cfg, "mpls ldp") {
+			out[r.Name] = true
+		}
+	}
+	return out
+}
+
+// WaitLDP waits until every interior link between LDP routers has an
+// operational session.
+//
+// Nothing waited for label distribution. The wait watched OSPF, then BGP, then
+// the RIB, and a lab whose entire subject is MPLS was marked the moment the
+// RIB stopped moving -- while LDP was still bringing its sessions up. Grading
+// in place hid it, because a lab that has been running for minutes converged
+// long ago; it appears the moment grading follows a reset, which is what every
+// class and batch run does to every submission.
+//
+// Measured on advnet: the same submission scores 6.00 graded in place and 5.20
+// through `grade class`, losing mpls.ldp_adjacencies with "R2 has no LDP
+// session with R5". Read back afterwards, R2's sessions were up with fifteen
+// seconds of uptime -- they had come up after the mark was recorded.
+//
+// A submission that has not configured LDP at all is not waited for: there is
+// nothing to converge, and the check will say so.
+func WaitLDP(ctx context.Context, env *Env, timeout time.Duration) error {
+	running := ldpConfigured(ctx, env)
+	if len(running) == 0 {
+		return nil
+	}
+	as, ok := env.Topology.ASes[env.AS]
+	if !ok {
+		return nil
+	}
+	return plan.Wait(ctx, plan.Waiter{
+		Describe:  fmt.Sprintf("LDP sessions in AS %d to become operational", env.AS),
+		Interval:  500 * time.Millisecond,
+		Timeout:   timeout,
+		StableFor: 2,
+		Check: func(ctx context.Context) (bool, error) {
+			var down []string
+			seen := 0
+			for _, d := range as.Routers {
+				if !running[d.Name] {
+					continue
+				}
+				peers := interiorPeers(as, d)
+				if len(peers) == 0 {
+					continue
+				}
+				out, err := env.Vtysh(ctx, d.Name, "show mpls ldp neighbor")
+				if err != nil {
+					continue
+				}
+				for _, p := range peers {
+					// Only peers that run LDP themselves. A session cannot
+					// come up with a router that is not speaking, and waiting
+					// for one would spend the whole budget before the checks
+					// that can be answered.
+					if !running[p.name] {
+						continue
+					}
+					seen++
+					if !operationalWith(out, p.addr) {
+						down = append(down, fmt.Sprintf("%s->%s", d.Name, p.name))
+					}
+				}
+			}
+			if seen == 0 {
+				return true, nil
+			}
+			if len(down) == 0 {
+				return true, nil
+			}
+			sort.Strings(down)
+			return false, fmt.Errorf("%d of %d LDP session(s) not operational: %s",
+				len(down), seen, strings.Join(truncate(down, 3), ", "))
+		},
+	})
+}
+
 // waitForScope waits for whichever part of the control plane a question is
 // about.
 //
@@ -175,10 +269,20 @@ func ribFingerprint(ctx context.Context, env *Env) (string, int, error) {
 // question about the interior that waits for external sessions reports a
 // student whose OSPF is perfect as ungradeable because their BGP is not written
 // yet, and an ungradeable report is a mark nobody receives.
+//
+// "ospf" means the interior control plane, which includes label distribution
+// where a submission runs it: the advnet rubric asks for this scope and then
+// marks mpls.ldp_adjacencies inside it. Waiting for LDP costs nothing in a lab
+// that does not run it, because the wait reads the configuration first and
+// returns immediately when no router speaks LDP.
 func waitForScope(ctx context.Context, env *Env, scope string, timeout time.Duration) error {
 	switch scope {
 	case "ospf":
-		return WaitOSPF(ctx, env, timeout)
+		deadline := time.Now().Add(timeout)
+		if err := WaitOSPF(ctx, env, timeout); err != nil {
+			return err
+		}
+		return WaitLDP(ctx, env, time.Until(deadline))
 	case "bgp":
 		deadline := time.Now().Add(timeout)
 		if err := WaitBGPSessions(ctx, env, timeout); err != nil {
@@ -207,6 +311,11 @@ func WaitConverged(ctx context.Context, env *Env, timeout time.Duration) error {
 	// OSPF first: BGP next hops cannot resolve until the interior is up, so
 	// waiting on BGP before OSPF would just time out with a confusing message.
 	if err := WaitOSPF(ctx, env, remaining()); err != nil {
+		return err
+	}
+	// Label distribution is part of the interior too, and a lab that does not
+	// run it passes straight through.
+	if err := WaitLDP(ctx, env, remaining()); err != nil {
 		return err
 	}
 	if err := WaitBGPSessions(ctx, env, remaining()); err != nil {

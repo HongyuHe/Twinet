@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/bits"
+	"math/rand/v2"
 	"net/netip"
 	"regexp"
 	"sort"
@@ -1254,33 +1255,172 @@ func deadHops(ctx context.Context, env *Env, paths [][]string) []string {
 		if !ok {
 			continue
 		}
-		i, ok := a.IfaceByName("port_" + h.b)
-		if !ok || i.Peer == nil || i.Peer.Addr4 == "" {
+		addrs := linksToward(env, h.a, h.b).peerAddrs()
+		if len(addrs) == 0 {
 			continue
 		}
 		wg.Add(1)
-		go func(h hop, from *model.Device, addr string) {
+		go func(h hop, from *model.Device, addrs []string) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			reached, err := env.reaches(ctx, from.ID, addrOnly(addr))
-			if err != nil || reached {
-				return
+			// A pair joined by more than one link has more than one way to
+			// carry the hop, and the path names the routers rather than the
+			// cable; one working link is the hop working. With the single link
+			// between any pair in the shipped labs this is that link.
+			for _, addr := range addrs {
+				reached, err := env.reaches(ctx, from.ID, addr)
+				if err != nil || reached {
+					return
+				}
 			}
 			mu.Lock()
 			broken = append(broken, fmt.Sprintf(
 				"%s cannot reach %s over the link between them (%s), so the path through "+
-					"it carries nothing", h.a, h.b, addrOnly(addr)))
+					"it carries nothing", h.a, h.b, strings.Join(addrs, ", ")))
 			mu.Unlock()
-		}(h, a, i.Peer.Addr4)
+		}(h, a, addrs)
 	}
 	wg.Wait()
 	sort.Strings(broken)
 	return broken
 }
 
+// sweepFlowCount is how many flows are aimed at the destination to find out
+// whether every path carries them.
+//
+// The routers hash the source port to choose between equal-cost next hops, so
+// distinct source ports spread over the paths -- and they do so at every
+// router along the way, not only the first, which is what makes a path of
+// three routers reachable by this. Thirty-two flows over the three paths of
+// the shipped lab leave a chance of about one in ten thousand of never trying
+// one of them, and failing to try a path can only understate a fault.
+const sweepFlowCount = 32
+
+// everyFlowArrives sends many flows between two routers and reports the ones
+// that never arrived.
+//
+// A single end-to-end probe answers for a single path: which one it takes is a
+// hash of the flow, and the same flow takes the same path every time. With
+// three paths installed between two routers, one of them can discard
+// everything sent along it while the probe, hashed onto another, reports the
+// pair as healthy. That is not a hypothetical -- a rule dropping forwarded
+// connections on one middle router cost a quarter of the traffic between two
+// routers and left this question on full marks.
+//
+// The path a flow will take is not predicted. The kernel can be asked, but its
+// answer for a forwarded packet turned out not to be what it then did with the
+// packet, and a check that grades on a prediction grades on the wrong thing.
+// What is asked instead is the question the mark is actually for: of the flows
+// sent between these two, did every one of them arrive? A lost flow means some
+// path is discarding traffic, and which one it is the student can find.
+//
+// Both protocols are spread across the sweep, alternating by port, because a
+// filter is written per protocol as easily as per path.
+func everyFlowArrives(ctx context.Context, env *Env, from, to string) (string, bool) {
+	src, sok := env.Device(from)
+	dst, dok := env.Device(to)
+	if !sok || !dok {
+		return "", true
+	}
+	slo, sok := src.IfaceByName("lo")
+	dlo, dok := dst.IfaceByName("lo")
+	if !sok || !dok || slo.Addr4 == "" || dlo.Addr4 == "" {
+		return "", true
+	}
+	srcAddr, dstAddr := addrOnly(slo.Addr4), addrOnly(dlo.Addr4)
+
+	base := 20000 + rand.IntN(20000)
+	first := make([]string, 0, sweepFlowCount)
+	second := make([]string, 0, sweepFlowCount)
+	for i := range sweepFlowCount {
+		first = append(first, strconv.Itoa(base+i))
+		second = append(second, strconv.Itoa(base+sweepFlowCount+i))
+	}
+	lost, ok := lostFlows(ctx, env, src.ID, dst.ID, srcAddr, dstAddr, first)
+	if !ok || len(lost) == 0 {
+		return "", true
+	}
+	// A flow can go missing for reasons that are nobody's fault -- a frame
+	// lost while a neighbour entry is resolved, a scheduler delay on a loaded
+	// node -- and a mark should not turn on one of those. So the whole sweep
+	// is repeated, from a fresh set of source ports, and the fault has to
+	// still be there. A path that discards traffic discards the second sweep
+	// as surely as the first; a frame lost once does not come back.
+	//
+	// Repeating only the flows that failed would not do, because a source port
+	// is not a path: the second attempt would be hashed afresh and would
+	// mostly land on the paths that work, which is a test that clears a real
+	// fault most of the time.
+	again, ok := lostFlows(ctx, env, src.ID, dst.ID, srcAddr, dstAddr, second)
+	if !ok || len(again) == 0 {
+		return "", true
+	}
+	return fmt.Sprintf(
+		"%d of %d flows from %s to %s never arrived, and %d did: the paths are installed "+
+			"and at least one of them is discarding what is sent along it",
+		len(again), len(second), from, to, len(second)-len(again)), false
+}
+
+// lostFlows aims one flow from each of the given source ports at a port on the
+// far side that nothing is listening on, and returns the ports whose flows
+// were not seen arriving there.
+//
+// A flow that could not be sent is not a flow that was lost: a source port
+// already in use fails to bind, and counting that as a discarded packet would
+// blame a submission for the grader's own choice of port. The sender says
+// which ports it managed to use and only those are looked for.
+//
+// The second return says whether the capture was in a position to testify at
+// all. It is false when there was no witness, and also when the witness saw
+// nothing whatsoever -- which is either a total blackhole, already reported by
+// the end-to-end probe that runs before this, or a capture whose output could
+// not be read. Neither is a per-path finding.
+func lostFlows(ctx context.Context, env *Env, srcDev, dstDev, srcAddr, dstAddr string,
+	ports []string) ([]string, bool) {
+
+	if len(ports) == 0 {
+		return nil, false
+	}
+	dport := probePort()
+	// Every flow of the sweep lands on the same port, so the capture has to
+	// hold all of them: a frame limit reached partway through stops the
+	// capture, and a capture that stopped early is not a witness.
+	tap := startArrivalTapN(ctx, env, dstDev, dport, 8*len(ports)+32)
+	var b strings.Builder
+	for i, p := range ports {
+		if i%2 == 0 {
+			fmt.Fprintf(&b, "e=$(nc -w 1 -s %s -p %s %s %s </dev/null 2>&1 >/dev/null); ",
+				srcAddr, p, dstAddr, dport)
+		} else {
+			fmt.Fprintf(&b, "e=$(echo twinet | nc -u -w 1 -s %s -p %s %s %s 2>&1 >/dev/null); ",
+				srcAddr, p, dstAddr, dport)
+		}
+		fmt.Fprintf(&b, "case \"$e\" in *bind*) ;; *) echo %s;; esac; ", p)
+	}
+	res, err := env.Probe(ctx, srcDev, []string{"sh", "-c", b.String()})
+	arrived, _, live := tapFlowsOf(ctx, env, tap)
+	if err != nil || !live || len(arrived) == 0 {
+		return nil, false
+	}
+	var lost []string
+	for _, p := range strings.Fields(res.Stdout) {
+		if arrived[p] == 0 {
+			lost = append(lost, p)
+		}
+	}
+	sort.Strings(lost)
+	return lost, true
+}
+
+// tapFlowsOf reads a capture's arrivals by source port, in the order the rest
+// of this file reads captures.
+func tapFlowsOf(ctx context.Context, env *Env, t *arrivalTap) (map[string]int, tapCounts, bool) {
+	counts, byPort, live := t.seenFlows(ctx, env)
+	return byPort, counts, live
+}
+
 // carriesTCPBothWays opens a connection each way between two routers, to a
-// port nothing is listening on, and reads the far side's own count of the
 // resets it sent -- together with a capture on the far side of the flow the
 // probe creates, which is what makes the count attributable to this probe
 // rather than to any traffic the submission cares to generate.
@@ -1364,6 +1504,89 @@ func udpNoPortsV4(ctx context.Context, env *Env, device string) (counterWitness,
 	})
 }
 
+// installedHop is one next hop of an installed route: the interface it leaves
+// by, the address it is handed to, or both.
+type installedHop struct{ iface, ip string }
+
+func (h installedHop) label() string {
+	switch {
+	case h.iface != "" && h.ip != "":
+		return h.iface + " (" + h.ip + ")"
+	case h.iface != "":
+		return h.iface
+	default:
+		return h.ip
+	}
+}
+
+// hopToward is how a forwarding table can show that a router sends traffic to
+// a particular neighbour: over one of the interfaces the topology says faces
+// that neighbour, or to one of the addresses the neighbour holds on them.
+//
+// This used to be the single string "port_" + neighbour, which is not a
+// property of the network but of Twinet's own FRR renderer, which happens to
+// name interfaces that way. A second link between the same pair is named
+// differently, and so is every interface on a device configured by something
+// other than FRR -- both of which the topology supports. A router forwarding
+// perfectly well over such an interface was reported as not forwarding at all.
+// What the neighbour is called is in the plan; it does not have to be guessed
+// from a name.
+type hopToward struct {
+	ifaces map[string]bool
+	addrs  map[string]bool
+}
+
+// linksToward reads out of the plan every interface of a that faces b, and
+// every address of b on those links.
+func linksToward(env *Env, a, b string) hopToward {
+	out := hopToward{ifaces: map[string]bool{}, addrs: map[string]bool{}}
+	dev, ok := env.Device(a)
+	if !ok {
+		return out
+	}
+	peer, ok := env.Device(b)
+	if !ok {
+		return out
+	}
+	for _, i := range dev.Ifaces {
+		if i.Peer == nil || i.Peer.Device == nil || i.Peer.Device.ID != peer.ID {
+			continue
+		}
+		out.ifaces[i.Name] = true
+		if s := addrOnly(i.Peer.Addr4); s != "" {
+			out.addrs[s] = true
+		}
+	}
+	return out
+}
+
+// known says whether the plan has any link between the pair at all.
+func (h hopToward) known() bool { return len(h.ifaces) > 0 || len(h.addrs) > 0 }
+
+func (h hopToward) matches(hop installedHop) bool {
+	return (hop.iface != "" && h.ifaces[hop.iface]) || (hop.ip != "" && h.addrs[hop.ip])
+}
+
+// installed says whether any of the router's next hops leads to the neighbour.
+func (h hopToward) installed(hops []installedHop) bool {
+	for _, hop := range hops {
+		if h.matches(hop) {
+			return true
+		}
+	}
+	return false
+}
+
+// peerAddrs is the neighbour's addresses on the links between the pair.
+func (h hopToward) peerAddrs() []string { return sortedKeysOfBool(h.addrs) }
+
+func (h hopToward) describe() string {
+	if len(h.ifaces) == 0 {
+		return "no next hop toward it"
+	}
+	return "no next hop on " + strings.Join(sortedKeysOfBool(h.ifaces), " or ")
+}
+
 func checkECMP(ctx context.Context, env *Env) Result {
 	from := env.ArgString("a", "ATL")
 	to := env.ArgString("b", "BOS")
@@ -1384,17 +1607,18 @@ func checkECMP(ctx context.Context, env *Env) Result {
 	target := hostRoute(lo.Addr4)
 
 	// Cache each router's next hops toward the destination.
-	nextHops := map[string]map[string]bool{}
+	nextHops := map[string][]installedHop{}
+	read := map[string]bool{}
 	other := map[string]bool{}
-	fetch := func(router string) (map[string]bool, error) {
-		if v, ok := nextHops[router]; ok {
-			return v, nil
+	fetch := func(router string) ([]installedHop, error) {
+		if read[router] {
+			return nextHops[router], nil
 		}
 		var routes ospfRouteJSON
 		if err := env.VtyshJSON(ctx, router, "show ip route json", &routes); err != nil {
 			return nil, err
 		}
-		set := map[string]bool{}
+		var hops []installedHop
 		for _, e := range routes[target] {
 			if !e.Selected && !e.Installed {
 				continue
@@ -1411,13 +1635,15 @@ func checkECMP(ctx context.Context, env *Env) Result {
 				continue
 			}
 			for _, nh := range e.Nexthops {
-				if nh.InterfaceName != "" {
-					set[nh.InterfaceName] = true
+				if nh.InterfaceName == "" && nh.IP == "" {
+					continue
 				}
+				hops = append(hops, installedHop{iface: nh.InterfaceName, ip: nh.IP})
 			}
 		}
-		nextHops[router] = set
-		return set, nil
+		nextHops[router] = hops
+		read[router] = true
+		return hops, nil
 	}
 
 	if hops, err := fetch(from); err != nil {
@@ -1451,21 +1677,17 @@ func checkECMP(ctx context.Context, env *Env) Result {
 				fmt.Fprintf(&detail, "could not read the routing table of %s: %v\n", path[i], err)
 				break
 			}
-			want := "port_" + path[i+1]
-			if path[i+1] == to && len(hops) > 0 && !hops[want] {
-				// The final hop may be reached over any interface toward the
-				// destination; only require the named one when it exists.
-				if !hops[want] {
-					ok = false
-					fmt.Fprintf(&detail, "%s does not forward toward %s (no next hop on %s)\n",
-						path[i], path[i+1], want)
-					break
-				}
-			}
-			if !hops[want] {
+			leads := linksToward(env, path[i], path[i+1])
+			if !leads.known() {
 				ok = false
-				fmt.Fprintf(&detail, "%s does not forward toward %s (no next hop on %s)\n",
-					path[i], path[i+1], want)
+				fmt.Fprintf(&detail, "the plan has no link between %s and %s, so no "+
+					"forwarding table can put the path through them\n", path[i], path[i+1])
+				break
+			}
+			if !leads.installed(hops) {
+				ok = false
+				fmt.Fprintf(&detail, "%s does not forward toward %s (%s)\n",
+					path[i], path[i+1], leads.describe())
 				break
 			}
 		}
@@ -1489,7 +1711,7 @@ func checkECMP(ctx context.Context, env *Env) Result {
 		allowed := map[string][]string{}
 		for _, p := range wantPaths {
 			for i := 0; i+1 < len(p); i++ {
-				allowed[p[i]] = append(allowed[p[i]], "port_"+p[i+1])
+				allowed[p[i]] = append(allowed[p[i]], p[i+1])
 			}
 		}
 		for _, router := range sortedKeysOfStrings(allowed) {
@@ -1500,19 +1722,75 @@ func checkECMP(ctx context.Context, env *Env) Result {
 				extra = append(extra, router+": unreadable")
 				continue
 			}
-			ok := map[string]bool{}
-			for _, h := range allowed[router] {
-				ok[h] = true
+			var leads []hopToward
+			for _, peer := range allowed[router] {
+				leads = append(leads, linksToward(env, router, peer))
 			}
-			for h := range hops {
-				if !ok[h] {
-					extra = append(extra, router+" via "+h)
-					fmt.Fprintf(&detail, "%s also forwards toward %s over %s, which no "+
-						"prescribed path uses\n", router, to, h)
+			named := map[string]bool{}
+			for _, h := range hops {
+				prescribed := false
+				for _, l := range leads {
+					if l.matches(h) {
+						prescribed = true
+						break
+					}
 				}
+				if prescribed || named[h.label()] {
+					continue
+				}
+				named[h.label()] = true
+				extra = append(extra, router+" via "+h.label())
+				fmt.Fprintf(&detail, "%s also forwards toward %s over %s, which no "+
+					"prescribed path uses\n", router, to, h.label())
 			}
 		}
 		sort.Strings(extra)
+	}
+
+	// And the table the daemon writes has to be the one that decides.
+	//
+	// Everything above reads what the routing daemon reports. Two things can
+	// make that not the table doing the forwarding. A policy rule is consulted
+	// before any table is, so traffic can be sent to a different table
+	// entirely. And the main table is shared: a second route for the same
+	// destination with a lower metric wins, and if it is labelled with the
+	// daemon's own protocol -- `ip route add ... proto ospf` -- the daemon
+	// never notices it and goes on reporting its own route as best. Both leave
+	// the equal-cost route installed, untouched and plainly visible, and this
+	// check reported "balances over port_BOS, port_PHY" while the kernel sent
+	// everything to port_BOS.
+	var diverted string
+	for _, router := range pathRouters(wantPaths) {
+		dev, ok := env.Device(router)
+		if !ok {
+			continue
+		}
+		hops, err := fetch(router)
+		if err != nil {
+			// Already recorded by the loops above.
+			continue
+		}
+		why, err := kernelDisagrees(ctx, env, dev.ID, target, hopNames(hops))
+		if err != nil {
+			return Errored("ospf.ecmp_paths", fmt.Errorf(
+				"reading what %s does with traffic to %s: %w", router, target, err))
+		}
+		if why != "" {
+			diverted = router + ": " + why
+			break
+		}
+	}
+	if diverted != "" {
+		return Partial("ospf.ecmp_paths", 0, Evidence{
+			Expected: fmt.Sprintf("traffic from %s to %s carried by the %d equal-cost paths",
+				from, to, len(wantPaths)),
+			Observed: diverted,
+			Detail:   strings.TrimRight(detail.String(), "\n"),
+			Hint: "the route the daemon reports is not the one forwarding this traffic, so " +
+				"the equal-cost paths are installed and carry nothing; this question is " +
+				"about the paths traffic takes, which OSPF costs alone should decide",
+			Command: "ip rule show; ip route show to match " + target,
+		})
 	}
 
 	// And the paths have to carry a packet.
@@ -1561,11 +1839,25 @@ func checkECMP(ctx context.Context, env *Env) Result {
 				fmt.Fprintf(&detail, "%s\n", why)
 			}
 		}
+		// And on every path, not just the one the probe above was hashed
+		// onto. Two of three paths can discard everything while a single
+		// end-to-end flow, which takes one of them and the same one every
+		// time, arrives and reports the pair healthy.
+		if dead == "" && len(wantPaths) > 1 {
+			if why, ok := everyFlowArrives(ctx, env, from, to); !ok {
+				dead = why
+				fmt.Fprintf(&detail, "%s\n", why)
+			}
+		}
 	}
 
 	got := make([]string, 0)
-	for h := range nextHops[from] {
-		got = append(got, h)
+	seenHop := map[string]bool{}
+	for _, h := range nextHops[from] {
+		if !seenHop[h.label()] {
+			seenHop[h.label()] = true
+			got = append(got, h.label())
+		}
 	}
 	sort.Strings(got)
 
@@ -1601,6 +1893,290 @@ func checkECMP(ctx context.Context, env *Env) Result {
 		Hint:     "the cost of a path is the sum of its links; make exactly the intended paths equal",
 		Command:  "show ip route json",
 	})
+}
+
+// pathRouters names every router the prescribed paths pass through, in a
+// stable order. The last hop of a path is left out: it is the destination, and
+// what it does with traffic addressed to itself is not what is being asked.
+func pathRouters(paths [][]string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, p := range paths {
+		for i := 0; i+1 < len(p); i++ {
+			if !seen[p[i]] {
+				seen[p[i]] = true
+				out = append(out, p[i])
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// kernelHops reads the next hops out of "ip route show". A route with several
+// of them prints one "nexthop via ... dev ..." line each; a route with one
+// prints it on the line with the prefix.
+// kernelRoute is one entry of a kernel routing table.
+//
+// The entries matter separately, rather than as one pile of next hops,
+// because several can exist for the same destination and only one of them
+// forwards: the kernel takes the longest prefix, and among equal prefixes the
+// lowest metric. Reading them together says "balances over both links" about a
+// router that has been told to prefer one.
+type kernelRoute struct {
+	prefix netip.Prefix
+	metric int
+	// kind is the route type when it is not a plain unicast route --
+	// "blackhole", "unreachable" and the like, which forward nothing.
+	kind string
+	hops []installedHop
+	text string
+}
+
+// routeKinds are the leading keywords iproute2 prints for a route that is not
+// a plain unicast one. Everything but "unicast" discards the traffic or
+// belongs to a table this reading does not reach.
+var routeKinds = map[string]bool{
+	"unicast": true, "local": true, "broadcast": true, "multicast": true,
+	"anycast": true, "blackhole": true, "unreachable": true, "prohibit": true,
+	"throw": true, "nat": true,
+}
+
+// kernelRoutes reads `ip route show` output into its entries. A line that
+// starts with whitespace continues the entry above it, which is how multipath
+// next hops are printed.
+func kernelRoutes(out string) []kernelRoute {
+	var routes []kernelRoute
+	addHops := func(r *kernelRoute, f []string) {
+		var h installedHop
+		for i := 0; i+1 < len(f); i++ {
+			switch f[i] {
+			case "via":
+				h.ip = f[i+1]
+			case "dev":
+				h.iface = f[i+1]
+			}
+		}
+		if h.ip != "" || h.iface != "" {
+			r.hops = append(r.hops, h)
+		}
+	}
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		if len(f) == 0 {
+			continue
+		}
+		if line[0] == ' ' || line[0] == '\t' {
+			if n := len(routes); n > 0 {
+				addHops(&routes[n-1], f)
+			}
+			continue
+		}
+		r := kernelRoute{text: strings.Join(f, " ")}
+		if routeKinds[f[0]] {
+			if f[0] != "unicast" {
+				r.kind = f[0]
+			}
+			f = f[1:]
+		}
+		if len(f) == 0 {
+			continue
+		}
+		switch {
+		case f[0] == "default":
+			r.prefix = netip.PrefixFrom(netip.IPv4Unspecified(), 0)
+		case strings.Contains(f[0], "/"):
+			p, err := netip.ParsePrefix(f[0])
+			if err != nil {
+				continue
+			}
+			r.prefix = p.Masked()
+		default:
+			a, err := netip.ParseAddr(f[0])
+			if err != nil {
+				continue
+			}
+			r.prefix = netip.PrefixFrom(a, a.BitLen())
+		}
+		for i := 0; i+1 < len(f); i++ {
+			if f[i] == "metric" {
+				if m, err := strconv.Atoi(f[i+1]); err == nil {
+					r.metric = m
+				}
+			}
+		}
+		addHops(&r, f)
+		routes = append(routes, r)
+	}
+	return routes
+}
+
+// forwarding picks the entry that decides where traffic to dst goes: the
+// longest prefix that covers it, and among those the lowest metric.
+func forwarding(routes []kernelRoute, dst netip.Addr) (kernelRoute, bool) {
+	var best kernelRoute
+	found := false
+	for _, r := range routes {
+		if !r.prefix.IsValid() || !r.prefix.Contains(dst) {
+			continue
+		}
+		switch {
+		case !found,
+			r.prefix.Bits() > best.prefix.Bits(),
+			r.prefix.Bits() == best.prefix.Bits() && r.metric < best.metric:
+			best, found = r, true
+		}
+	}
+	return best, found
+}
+
+func kernelHops(out string) []installedHop {
+	var hops []installedHop
+	for _, r := range kernelRoutes(out) {
+		hops = append(hops, r.hops...)
+	}
+	return hops
+}
+
+// hopNames reduces a set of next hops to the links they leave by, so two
+// readings can be compared. The interface decides which link carries the
+// traffic; the address is used only when the route names no interface.
+func hopNames(hops []installedHop) map[string]bool {
+	names := map[string]bool{}
+	for _, h := range hops {
+		name := h.iface
+		if name == "" {
+			name = h.ip
+		}
+		if name != "" {
+			names[name] = true
+		}
+	}
+	return names
+}
+
+func sameHops(a, b map[string]bool) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k := range a {
+		if !b[k] {
+			return false
+		}
+	}
+	return true
+}
+
+// mayCarry reports whether a policy rule can govern traffic to this
+// destination. A rule that names no destination governs all of it.
+func mayCarry(r ipRule, dst netip.Addr) bool {
+	if r.to == "" || r.to == "all" {
+		return true
+	}
+	if p, err := netip.ParsePrefix(r.to); err == nil {
+		return p.Contains(dst)
+	}
+	if a, err := netip.ParseAddr(r.to); err == nil {
+		return a == dst
+	}
+	// A destination that cannot be read is not a reason to conclude the rule
+	// is harmless.
+	return true
+}
+
+// kernelDisagrees reports how a router really forwards traffic to one
+// destination when that differs from what the check has been reading, and
+// returns "" when it does not.
+//
+// Two things can make the routing daemon's table not the one that decides. A
+// policy rule is consulted before any table is, so traffic can be sent to a
+// different table entirely. And the table the daemon writes is shared: another
+// entry for the same destination with a lower metric wins, and if it is
+// labelled with the daemon's own protocol the daemon never notices it and goes
+// on reporting its own route as best. Both leave the equal-cost route
+// installed, untouched and plainly visible, while every packet takes one link.
+//
+// The rule comparison is between two readings of the kernel: a rule that sends
+// this traffic to a table holding the same next hops changes nothing, and a
+// submission that writes one has answered the question. The main-table
+// comparison is against the daemon, because that is the claim being made --
+// the check reports the daemon's next hops, so the kernel has to agree with
+// them.
+func kernelDisagrees(ctx context.Context, env *Env, deviceID, target string,
+	daemon map[string]bool) (string, error) {
+
+	res, err := env.Probe(ctx, deviceID, []string{"sh", "-c",
+		"ip rule show; echo '@@'; ip route show to match " + target})
+	if err != nil {
+		return "", err
+	}
+	rulesOut, mainOut, _ := strings.Cut(res.Stdout, "@@")
+	rules, unsupported := parseIPRules(rulesOut)
+	if len(unsupported) > 0 {
+		return "", fmt.Errorf("policy rule %q selects on something a routing table "+
+			"cannot be read for, so where this traffic goes cannot be established",
+			unsupported[0])
+	}
+	dst, err := netip.ParseAddr(addrOnly(target))
+	if err != nil {
+		return "", fmt.Errorf("reading the destination %q: %w", target, err)
+	}
+
+	// What the main table really answers with. An empty answer means the
+	// destination is this router's own or reached by no route at all, and
+	// the probes further on are what settle that.
+	main, ok := forwarding(kernelRoutes(mainOut), dst)
+	if !ok {
+		return "", nil
+	}
+	if main.kind != "" {
+		return fmt.Sprintf("the kernel's own route for %s is %q, which forwards nothing",
+			target, main.text), nil
+	}
+	want := hopNames(main.hops)
+	if len(want) > 0 && len(daemon) > 0 && !sameHops(want, daemon) {
+		return fmt.Sprintf("the daemon reports it forwards to %s over %s, but the route "+
+			"the kernel prefers is %q, which uses %s", target,
+			strings.Join(sortedKeysOfBool(daemon), ", "), main.text,
+			strings.Join(sortedKeysOfBool(want), ", ")), nil
+	}
+
+	for _, r := range rules {
+		if !mayCarry(r, dst) {
+			continue
+		}
+		if r.table == "" {
+			// No table to look in: the rule drops or rejects the traffic
+			// rather than routing it.
+			return fmt.Sprintf("policy rule %q takes traffic to %s out of the routing "+
+				"tables altogether", r.text, target), nil
+		}
+		if r.table == "main" {
+			continue
+		}
+		res, err := env.Probe(ctx, deviceID, []string{"sh", "-c",
+			"ip route show table " + r.table + " to match " + target})
+		if err != nil {
+			return "", err
+		}
+		alt, ok := forwarding(kernelRoutes(res.Stdout), dst)
+		if !ok {
+			// Nothing there for this destination, so the lookup falls through
+			// to the next rule and the daemon's table still decides.
+			continue
+		}
+		if alt.kind != "" {
+			return fmt.Sprintf("policy rule %q sends traffic to %s to table %s, where "+
+				"%q forwards nothing", r.text, target, r.table, alt.text), nil
+		}
+		if got := hopNames(alt.hops); !sameHops(got, want) {
+			return fmt.Sprintf("policy rule %q sends traffic to %s to table %s, which "+
+				"forwards it over %s, not over %s", r.text, target, r.table,
+				strings.Join(sortedKeysOfBool(got), ", "),
+				strings.Join(sortedKeysOfBool(want), ", ")), nil
+		}
+	}
+	return "", nil
 }
 
 // checkVLANIsolation verifies that hosts in the same VLAN reach each other

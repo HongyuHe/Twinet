@@ -1224,6 +1224,29 @@ reached students, and each motivated a permanent test.
      before. Measured: the attack 1.00 -> 0.00 on the load-balancing question,
      and the three shipped labs unchanged at 10.00, 6.00 and 4.00.
 
+107. **A hop identified by a name instead of by where it leads.** The
+     load-balancing question asks whether each router along a prescribed path
+     forwards toward the next one, and decided it by looking for a next hop on
+     an interface called `port_<next router>`. That is not a property of the
+     network: it is how Twinet's own FRR renderer happens to name interfaces.
+     A second link between the same pair is named differently, and so is every
+     interface on a device configured by anything other than FRR -- both of
+     which the topology supports and the heterogeneous-vendor goal requires --
+     so a router forwarding perfectly well over such an interface was reported
+     as not forwarding at all, and a path that was installed and carrying
+     packets lost its mark. A route that names only the address it hands the
+     packet to, with no interface at all, was invisible for the same reason.
+     The plan already records which interface faces which neighbour and what
+     address the neighbour holds on it, so that is what the check reads now:
+     a hop is installed if any next hop leaves by an interface the plan says
+     faces the neighbour or is handed to an address the neighbour owns. The
+     same name was used to decide which links to probe and which next hops
+     were unprescribed, and both now come from the plan too. A prescribed pair
+     the topology does not join is reported as a rubric error rather than as a
+     student one. Found as a dead branch: the code contained an `if !hops[want]`
+     nested inside `if ... && !hops[want]`, with a comment describing a leniency
+     for the final hop that the code did not implement.
+
 
 
 
@@ -1432,3 +1455,992 @@ move it further, in the order they are worth doing:
 | Containers per node at that scale | 731 / 731 / 550 with `pack-by-as`, 660 / 675 / 677 with `spread-by-as` |
 | Node utilisation at that scale | 22 GiB of 251, load average 13 of 56 cores |
 | Emulated latency on a cross-node link at that scale | 20.07 ms for 20 ms configured |
+
+### 108. A forwarding decision reported without reading the forwarding decision
+
+`policy.traffic_engineering` asks whether a destination leaves by the slow
+link. `installedVia` answered by reading `show ip route` -- and its own comment
+claimed that this was where "a static route, a policy route or an
+administrative distance shows up". A policy route does not show up there. An
+`ip rule` diverts the lookup to a different table *before* the daemon's table
+is consulted, and a route the daemon selected but failed to push is not in the
+kernel at all. The daemon's opinion of its own table shows neither.
+
+Measured on the live cos461 lab, on `as3/MSP`:
+
+    ip route add 2.0.0.0/8 via 179.1.3.1 table 100
+    ip rule  add to 2.0.0.0/8 lookup 100
+
+    # ip route get 2.0.0.1
+    2.0.0.1 via 179.1.3.1 dev ext_1_ALL table 100 src 179.1.3.2
+    # vtysh -c 'show ip route 2.0.0.0/8'
+      *   3.0.2.2, via port_CHI
+
+The kernel forwards that destination over the slow provider link; the daemon
+still shows the fast one. The check scored a full **1.00**, reporting that
+nothing is forwarded over the slow link.
+
+This was surfaced by review round 117 and dismissed there as unexploitable,
+on the grounds that a student with a wrong local-preference would still have
+the daemon pointing at the slow link, so the trick cannot turn a wrong answer
+into a right one. That is true, and it is not the point: the check named a
+forwarding decision it had never looked at. The same blindness hides an
+injected fault -- a NIKA policy-routing fault would leave the grader reporting
+the network healthy -- and it is exactly the defect class findings 97-107 are
+about.
+
+Each router is now also asked `ip route get` for one address inside every
+prefix that has a fast alternative, batched into a single command per router
+so the cost is one round trip rather than one per destination. The kernel's
+answer is held to the same slow-link test as the table, and the two are a
+union, so the new path can only fire where the daemon and the kernel disagree
+-- which is never the case on a correct submission. Clean: cos461 10.00,
+advnet 6.00, multicast 4.00. With the rule in place: 0.88, evidence
+`2.0.0.0/8 on MSP (kernel)`.
+
+Reading the kernel rather than the daemon also removes one more dependence on
+FRR specifically, which the heterogeneous-vendor goal needs.
+
+### 109. Asking the kernel about the wrong packet
+
+Finding 108 added a kernel lookup to `policy.traffic_engineering`. Round 118
+showed the lookup asked about the wrong packet. `ip route get <dst>` with no
+source answers for a packet *the router originates itself*. A policy rule keyed
+on the **source** -- which is exactly how transit traffic is singled out --
+never fires under that lookup.
+
+Measured on the live cos461 lab, on `as3/MSP`:
+
+    ip route add default via 179.1.3.1 table 100
+    ip rule  add from 4.0.0.0/8 table 100 priority 100
+
+    # ip route get 1.0.0.1
+    1.0.0.1 via 3.0.2.2 dev port_CHI                       <- fast, what the check saw
+    # ip route get 1.0.0.1 from 4.100.0.1 iif port_CHI
+    1.0.0.1 from 4.100.0.1 via 179.1.3.1 dev ext_1_ALL     <- slow, what actually happens
+
+All transit traffic from AS4 leaves by the slow provider. The check scored a
+full **1.00**.
+
+The obvious repair -- guess a source, say this AS's own host prefix -- would
+not have found it: the rule names AS4's space, not AS3's. There is no source
+worth guessing, so the rules are read instead. Each rule the submission added
+is asked about as a packet it would match: its own source prefix, its own
+arrival interface, its own firewall mark. The kernel refuses a forwarding
+lookup unless both a source and an arrival interface are given, so both are
+supplied; a rule keyed only on a mark needs neither.
+
+A rule keyed on something a route lookup cannot stand in for -- a port, a uid,
+`oif`, a negation -- is **refused**, and the check reports that it could not
+establish where traffic goes, rather than passing over it. Reporting that
+nothing goes the slow way without having looked is the whole substance of
+finding 108, and the repair must not reintroduce it in a narrower form.
+
+A submission with no rules of its own is asked exactly what it was asked
+before, so the cost is unchanged for every correct submission. Clean: cos461
+10.00, advnet 6.00, multicast 4.00, and 1.00 on three consecutive isolated
+runs. With the rule in place: 0.88, evidence
+`1.0.0.0/8 on MSP (kernel, from 4.0.0.0/8)` -- naming the rule's own selector,
+so the student is told which rule is at fault.
+
+Two findings in a row now on the same few lines. That is worth stating plainly:
+reading the kernel instead of the daemon was right, but "the kernel" is not one
+answer -- it is an answer *per packet*, and a check has to say which packet it
+means.
+
+### 110. Failing a correct submission for the shape of its route-map
+
+`rpki.invalid_rejected` will not credit a `deny` clause that sits behind a
+`permit`, because route-maps stop at the first clause that matches and a permit
+in front of the deny is usually a way in. That rule is right. The exception to
+it was read too narrowly: a preceding permit was tolerated only when **every**
+one of its match statements selected on some other validation state.
+
+FRR requires *every* match in a clause to hold, so a single match the state
+rules out is enough on its own. No invalid route matches `match rpki valid`,
+however many prefix lists or communities sit beside it.
+
+Round 119 measured it on the live cos461 lab, on `as3/MSP`:
+
+    route-map LP-SLOW-PROVIDER permit 3
+     match ip address prefix-list ALL-ROUTES
+     match rpki valid
+     set local-preference 50
+    route-map LP-SLOW-PROVIDER deny 5
+     match rpki invalid
+
+`show route-map` reported the deny invoked 38 times and
+`show bgp ipv4 unicast rpki invalid` was empty -- the router was rejecting
+invalid origins exactly as asked. The check reported *"1 of 6 external
+session(s) accept invalid origins"* and took half the marks; the full rubric
+fell to 9.80.
+
+Setting local-preference for valid routes on a prefix list is an ordinary thing
+to write, so this was a correct submission being failed for not matching the
+reference answer's shape -- the fairness direction, and the one students
+actually feel.
+
+The test now asks the question that decides it: *can a route in the denied
+state match this clause at all?* It answers no as soon as any one match rules
+it out, and yes otherwise. A clause naming the denied state itself is still a
+way in, and so is one resting on a prefix list, an AS path or a community --
+none of which the configuration can decide, since any of them can be true of an
+invalid route as easily as of a valid one.
+
+Measured both directions after the fix: the correct-but-unusual route-map above
+scores **1.00**, and a genuine bypass (`permit 2: match ip address prefix-list
+ALL-ROUTES` with no validation match, which really does hide the deny) still
+scores **0.50**. Clean: cos461 10.00, advnet 6.00, multicast 4.00.
+
+The lesson is one this ledger keeps relearning from the other side. Findings
+97--109 were all checks that credited something they had not established.
+This one is the mirror image: a check that *withheld* credit for something it
+had not established either -- it never asked whether the permit clause could
+match an invalid route, it asked what the clause was made of. Reading a
+configuration for its shape rather than its consequence is the same mistake
+whichever way the marks move.
+
+### 111. Balancing over two links while every packet takes one
+
+`ospf.ecmp_paths` read the routing table the daemon writes, at every router the
+prescribed paths pass through, and awarded the marks when the equal-cost next
+hops were all there. A policy rule is consulted *before* that table ever is, so
+a submission could leave the route installed, untouched and plainly visible,
+and still send every packet down one of its next hops:
+
+    ip route add 3.153.0.1/32 via 3.0.10.1 dev port_BOS table 100
+    ip rule add to 3.153.0.1/32 lookup 100 priority 100
+
+`ip route show 3.153.0.1/32` still showed both next hops. `ip route get
+3.153.0.1` answered `via 3.0.10.1 dev port_BOS table 100`, and a traceroute to
+BOS was one hop. The check reported *"all 3 prescribed paths installed; ATL
+balances over port_BOS (3.0.10.1), port_PHY (3.0.8.1)"* and gave full marks for
+a question about which paths carry traffic.
+
+The check's own comment, added when a firewall rule was found dropping the
+traffic it had just called delivered, says this is the class of divergence it
+exists to catch. The rule is the same trick without the packet loss.
+
+Every router the paths pass through is now asked what it will really do with
+the traffic. The comparison is between **two readings of the kernel**, not
+between the kernel and the daemon: a rule pointing at a table that holds the
+same next hops changes nothing, and a submission that writes one has answered
+the question. What is reported is a table that carries the traffic differently
+from the one OSPF wrote.
+
+Measured, all four cases:
+
+| state of `as3/ATL` | score |
+| --- | --- |
+| untouched (twice) | 1.00 |
+| rule to a table pinning one hop | **0.50** |
+| rule to a table holding *both* hops | 1.00 |
+| rule to an empty table (falls through) | 1.00 |
+
+Full labs after the fix: cos461 10.00, advnet 6.00, multicast 4.00.
+
+Overriding the route in the main table instead -- `ip route replace 3.153.0.1/32
+via 3.0.10.1 dev port_BOS` -- appeared to be caught already: zebra reads the
+kernel back and reports such a route as learned by `kernel` rather than by
+OSPF, which the protocol test rejects. Measured at 0.50 before this fix
+existed. **That conclusion was too broad and finding 112 overturned it** -- it
+holds only for the default protocol label. The paragraph is left standing
+because drawing a general conclusion from one measurement is the mistake, and
+it is the same mistake the findings themselves are about.
+
+Findings 108, 109 and this one are the same sentence three times: *the routing
+daemon's table is an opinion, and the kernel is the one that forwards.* 108 read
+only the daemon; 109 asked the kernel the wrong question; this one never asked
+it. The last check that reasons about forwarding from the daemon alone is worth
+finding before a student does.
+
+### 112. The daemon does not notice a route wearing its own name
+
+Finding 111 asked whether a policy rule diverted the equal-cost traffic, and
+recorded that overriding the route in the main table was caught already because
+zebra reads such a route back and calls it `kernel` rather than `ospf`. That was
+measured once, with the default protocol label, and stated as though it were
+general. It is not. The label is an argument:
+
+    ip route add 3.153.0.1/32 via 3.0.10.1 dev port_BOS proto ospf
+
+The kernel now holds two routes for the destination. The added one has metric 0
+and zebra's has metric 20, so the added one forwards. Zebra sees a route
+carrying its own protocol label and leaves it alone; `show ip route` still says
+`Known via "ospf", distance 110, metric 20, best` over both next hops. Nothing
+in the daemon changed, no rule exists to find, and `ip route get 3.153.0.1`
+answers `via 3.0.10.1 dev port_BOS`. Traceroute to BOS is one hop. The check
+reported *"ATL balances over port_BOS, port_PHY"* and gave full marks; the full
+rubric still totalled 10.00.
+
+The reading was also wrong in a way no one had exploited: `ip route show
+<target>` output was collapsed into one list of next hops, so two entries for
+the same destination read as one route with all their hops. The route the
+kernel prefers and the routes it ignores were indistinguishable.
+
+Kernel output is now read as **entries** -- prefix, metric, type, next hops --
+and the entry that answers for a destination is chosen the way the kernel
+chooses it: longest prefix, then lowest metric. That entry is compared with
+what the daemon claims, and a type that forwards nothing (`blackhole`,
+`unreachable`, `prohibit`) is reported by name.
+
+Reading entries fixed a second case that no reviewer had found. A policy rule
+pointing at a table was checked with `ip route show table N <target>`, an exact
+prefix match, so a table answering with a *less specific* route read as empty
+and was treated as falling through to the daemon's table. Both lookups now use
+`to match`, which is how the kernel itself resolves a destination.
+
+Measured, every state of `as3/ATL`:
+
+| state | score |
+| --- | --- |
+| untouched (twice) | 1.00 |
+| `proto ospf` shadow route at a lower metric | **0.50** |
+| rule to a table pinning one hop | **0.50** |
+| rule to a table answering with a covering /24, one hop | **0.50** |
+| `blackhole` for the destination | **0.00** |
+| rule to a table holding *both* hops | 1.00 |
+| rule to an empty table (falls through) | 1.00 |
+
+Full labs after the fix: cos461 10.00, advnet 6.00, multicast 4.00.
+
+The finding under the finding is about this ledger rather than the code. 111
+closed a hole and, in the same breath, wrote down that the neighbouring hole was
+shut -- on the strength of a single measurement of a single spelling. A reader
+of the ledger would have skipped it. **A closed door recorded here should say
+what was actually tried**, because the next reader will not retry it.
+
+### 113. The tunnel gateway was asked about a packet it never sees
+
+`tunnel.sixin4` establishes that traffic between the two IPv6 datacentres is
+really encapsulated, by asking the gateway where it would send it:
+
+    ip -6 route get <dst>
+
+That describes a packet the gateway *originates*. It carries no source address
+and no arrival interface, so an `ip -6 rule` keyed on either never fires and the
+lookup falls through to the main table. A submission that put its tunnel routes
+in a second table and pointed a rule at it -- an ordinary way to write the
+answer, and the way an operator would write it -- got:
+
+    ip -6 route get 3:200::1                 -> (nothing; network unreachable)
+    ip -6 route get 3:200::1 from 3:201::1   -> dev tun6 table 100
+
+The tunnel was working. `tun6`'s counters advanced by exactly the packets just
+sent, pings crossed it, and the check reported *"BOS forwards traffic for
+3:200::a over , not through tun6"* and took half the mark. The empty word in
+that sentence is the whole finding: there was no interface to name because the
+lookup had returned nothing at all, and "nothing" was rendered as "somewhere
+else".
+
+This is finding **109** again -- the same lookup, the same missing source -- in
+the IPv6 path, which was never revisited when 109 was fixed for IPv4. Fixing a
+defect in one place and not looking for its twin is its own kind of incomplete
+claim.
+
+The lookup now describes the real packet: from the sending host's address,
+arriving on the interface facing it. Neither has to be guessed -- the interface
+a reply to that host would leave by is the one its packets arrive on. And a
+lookup that cannot be made returns an error rather than an empty interface
+name, so "could not ask" and "answered natively" are no longer the same verdict.
+
+Measured on `as3/BOS`, with the tunnel routes moved to table 100 behind
+`ip -6 rule add from 3:201::/32 lookup 100`:
+
+| | before | after |
+| --- | --- | --- |
+| routes in the main table (correct, ordinary) | 1.00 | 1.00 |
+| routes in table 100 behind a rule (correct, unusual) | **0.50** | 1.00 (x3) |
+| UDP filtered on the destination (genuinely broken) | 0.50 | 0.50 |
+
+Full labs after the fix: cos461 10.00, advnet 6.00, multicast 4.00.
+
+### 114. A capture that had already stopped, testifying to silence
+
+Chasing 113 turned up a run that scored 0.50 with a *different* complaint --
+*"a datagram from A_CHA to A_MGH never arrived -- no packet of it reached any
+interface"* -- on a path that was working. Three runs either side of it scored
+1.00, and sending the datagram by hand showed it arriving. A check that gives
+two different verdicts on unchanged state is a finding in its own right.
+
+The arrival witness from findings 105/106 runs `tcpdump` on the destination for
+the exact flow, under `timeout 15`. Fifteen seconds was chosen to outlast the
+probes it watches for: a connection attempt waits three seconds, a datagram two.
+But between them are half a dozen round trips to a machine that may be on
+another node, and on a loaded cluster -- or just after an agent redeploy -- the
+capture's own timeout expired before the last probe was sent.
+
+The reading then found the capture's start-up banner and an empty body, and
+reported **a live witness that saw nothing**. `tapLive` answered "was tcpdump
+ever running?" while the caller was asking "was anyone watching when the packet
+went past?" Those are different questions, and only the second is evidence.
+
+The window now covers the probes by construction rather than by estimate: the
+capture is stopped explicitly when it is read, the timeout is demoted to a leak
+guard for an interrupted run, and the capture records the moment it stops. A
+capture that stopped before it was asked -- its own timeout, or its frame limit
+-- is discarded, and the check falls back to the kernel counter or declines to
+accuse.
+
+The witness is not weakened by this. With `ip6tables -I INPUT -p udp -j DROP` on
+the destination it still scores 0.50 and still distinguishes the two failures
+precisely: *"it reached the interface but the kernel took no delivery of it"*,
+which is exactly what an INPUT-chain drop looks like from the wire. No capture
+files were left behind on any host.
+
+The general shape, and the reason this one is worth writing down: **a timeout
+picked to be "comfortably longer than" something is a claim about the
+environment, not about the code.** Twinet's environment is a cluster whose
+latency the grader does not control. Every such constant is a check that will
+eventually report on a window it was not present for -- so the honest form is
+not a bigger number, it is a mechanism that knows whether it was watching.
+
+### 115. Marking the mechanism when the question asked for an outcome
+
+`rpki.invalid_rejected` searched a session's inbound policy for a `deny`
+clause naming the invalid state. A submission wrote no such clause:
+
+    route-map LP-SLOW-PROVIDER permit 10
+     match rpki notfound
+    route-map LP-SLOW-PROVIDER permit 20
+     match rpki valid
+
+That admits the two states it names and drops everything else, because FRR
+ends every route-map with an implicit deny. It is a perfectly ordinary way to
+write the policy -- arguably the cleaner one, since it states what is allowed
+rather than what is not -- and the router was doing exactly what the question
+asked.
+
+Measured on `as3/MSP`:
+
+    show bgp ipv4 unicast rpki invalid   -> (empty)
+
+Not one invalid route was selected. To be sure the implicit deny was what
+stopped them, and not an absence of invalid routes to stop, a catch-all
+`permit 30` was added at the bottom:
+
+    I*> 10.128.0.0/9  179.1.3.1  ...  1 1 1 1 i
+
+The invalid origin appeared immediately, and vanished again when the catch-all
+was removed. The implicit deny was doing the whole job. The check reported
+*"1 of 6 external session(s) accept invalid origins"* and took half the mark.
+
+This is the third finding in this one check (110, 119, and now 115), and they
+all have the same shape: the check knows what the reference answer looks like
+and grades resemblance to it. A route-map is not a document to be searched for
+a keyword; it is a program, and the question is what it does to a route in the
+state being asked about. So that is what is now asked -- walk the clauses in
+sequence order, and if none of them admits such a route, the implicit deny at
+the bottom rejects it.
+
+Reading a catch-all clause had the same flaw in miniature: any clause with no
+match statements was treated as a way in, so an explicit `deny 30` at the
+bottom -- the implicit deny written out longhand -- was also read as accepting
+everything. Which direction the clause points is now the answer.
+
+An empty body remains the one case that is not protection: no route-map bound
+to the session, or a name that was never defined, leaves no clause list for an
+implicit deny to sit at the end of, and nothing is filtered.
+
+| | before | after |
+| --- | --- | --- |
+| explicit `deny 5: match rpki invalid` (reference) | 1.00 | 1.00 |
+| permit-valid + permit-notfound, implicit deny | **0.50** | 1.00 |
+| the same, plus a catch-all `permit 30` (a real hole) | 0.50 | 0.50 |
+| no inbound route-map at all | 0.40 | 0.40 |
+
+Full labs after the fix: cos461 10.00, advnet 6.00, multicast 4.00.
+
+### 116. One probe answers for one path
+
+`ospf.ecmp_paths` promises *"N equal-cost paths from X to Y, carrying
+traffic"*. It established the paths from the forwarding tables and then, for
+whether they carry anything, sent pings hop by hop and one connection end to
+end. The hop-by-hop sweep covers every link of every path, but only with ICMP.
+The connection covers every protocol the question cares about, but takes one
+path -- and the same one every time, because the router picks by hashing the
+flow.
+
+So a router discarding forwarded connections in the middle of one of three
+paths was invisible. On `as3/NYC`:
+
+    iptables -A FORWARD -p tcp -d 3.153.0.1 -j DROP
+
+Pings still went through, the end-to-end connection was hashed onto a path that
+avoided NYC, and the question kept **1.00 / 1.00** across eight runs. Measured
+directly, 40 connections from ATL to BOS with different source ports:
+
+    30 of 40 arrived; NYC's DROP counter +15
+
+A quarter of the traffic between the two routers was on the floor and the
+question was reporting the pair as healthy.
+
+The first instinct was to steer a flow deliberately onto the broken path. The
+kernel will say where a flow is going:
+
+    ip route get 3.153.0.1 from 3.156.0.1 ipproto tcp sport 2001 dport 8899
+      -> via 3.0.8.1 dev port_PHY        (at ATL)
+      -> via 3.0.4.1 dev port_NYC        (at PHY, iif port_ATL)
+
+and then the packet went to BOS instead. For a forwarded packet the answer is
+a prediction, and grading a prediction grades the wrong thing. So nothing is
+predicted. The question the mark is for is asked directly: of the flows sent
+between these two, did every one arrive? Thirty-two flows with different source
+ports, spread over the paths by the same hash the routers use -- at every hop,
+not only the first, which is what lets a three-router path be reached at all --
+and a capture on the far side saying which source ports came in. A lost flow
+means a path is discarding traffic, and the student is told how many.
+
+Two mistakes made on the way to this, both worth keeping:
+
+*Repeating only the failed flows is not a retry.* A source port is not a path.
+Re-sending the lost ports hashes them afresh, so they mostly land on the paths
+that work, and a real fault clears itself most of the time -- which is exactly
+what happened: the first version of the fix scored the mutation 1.00. The whole
+sweep is repeated instead, from fresh ports, and the fault has to survive both.
+That still rejects a frame lost to a scheduler delay, which is what the retry
+was for.
+
+*A flow that could not be sent is not a flow that was lost.* A source port
+already in use fails to bind, and counting that would blame a submission for
+the grader's choice of port. The sender reports which ports it managed to use
+and only those are looked for.
+
+Both protocols alternate across the sweep, because a filter is written per
+protocol as easily as per path.
+
+| | before | after |
+| --- | --- | --- |
+| healthy (reference), five runs | 1.00 | 1.00, 1.00, 1.00, 1.00, 1.00 |
+| TCP dropped mid-path on one of three | 1.00 | **0.50** -- *4 of 32 flows never arrived, and 28 did* |
+| UDP dropped mid-path on one of three | 1.00 | **0.50 / 0.00 / 0.00** over three runs |
+
+Full labs after the fix: cos461 10.00 in 4m14 (4m13 before), advnet 6.00,
+multicast 4.00.
+
+### 117. A rule like the one that was injected
+
+`twinet fault verify` reports whether an injected fault is still doing what it
+was injected to do. Scoring an agent's root-cause analysis rests on that
+answer: if the fault has stopped biting, whatever the agent is being marked
+against is not the problem it was given.
+
+The two switch-fabric faults asked the flow table two independent questions --
+does the string `priority=100` appear anywhere, and does the string
+`actions=drop` appear anywhere -- and reported the fault in effect if both did.
+Neither question mentions the port the fault recorded, and nothing requires the
+two answers to come from the same rule.
+
+Moving the drop rule from the port the fault names to a different port on the
+same switch is enough:
+
+```
+$ twinet fault inject flow_rule_shadowing --as 3 --device DCS_S2
+  verified: yes; observed ... priority=100,in_port=1 actions=drop
+
+$ twinet exec as3/DCS_S2 -- sh -c \
+    "ovs-ofctl --strict del-flows br0 'priority=100,in_port=1'; \
+     ovs-ofctl add-flow br0 'priority=100,in_port=2,actions=drop'"
+
+$ twinet fault verify
+flow_rule_shadowing  as3/DCS_S2  yes  ... priority=100,in_port=2 actions=drop
+```
+
+The host the fault is about is reachable again, and the report says the fault
+is still in effect -- quoting, as its evidence, a rule about a different host.
+
+Flow lines are now split at ` actions=` into their match fields and their
+actions, and the match fields are compared as whole terms. That is not
+decoration over a longer needle: `in_port=1` is a prefix of `in_port=10`, so a
+substring test lets a rule on port 10 answer for port 1, and `ovs-ofctl` makes
+no promise about field order, so a fixed `priority=100,in_port=1` needle is a
+guess about formatting rather than a reading of the rule.
+
+The report now separates the two situations that matter to whoever reads it:
+
+```
+NO   no rule at priority=100 on port 1; a rule at that priority sits
+     elsewhere: ... priority=100,in_port=2 actions=drop
+NO   no rule at priority=100 on port 1
+```
+
+Sweeping the other faults for the same shape found a third instance the review
+had not named. `host_static_blackhole` installs a blackhole route for a
+recorded prefix and then asked `ip route show | grep blackhole` whether *any*
+blackhole route existed. Deleting the route it installed and adding an
+unrelated one elsewhere left it reporting "still in effect". It is now scoped
+to the prefix it recorded, and refuses rather than guessing when no prefix was
+recorded.
+
+The remaining verifies were checked and are already scoped: the `tc` ones name
+their device, `NOARP` names its interface, the ACL one asks `iptables -C` with
+the exact rule, the wrong-gateway one reads `ip route show default` and names
+the wrong gateway, and the DHCP ones reach their `Verified: true` only inside a
+match on the recorded subnet.
+
+| | before | after |
+| --- | --- | --- |
+| drop rule moved to another port | still in effect | **no longer in effect** |
+| loop rule moved to another port | still in effect | **no longer in effect** |
+| blackhole replaced by one for another prefix | still in effect | **no longer in effect** |
+| fault injected and left alone (all three) | still in effect | still in effect |
+
+Full labs after the fix: cos461 10.00, advnet 6.00, multicast 4.00.
+
+### 118. Half a fault undone, reported as none
+
+`link_detach` installs two independent things: a 100% loss netem on egress, and
+a `u32` filter on the ingress qdisc that drops everything. Its verify read the
+egress qdisc alone. Removing the netem -- `tc qdisc replace dev X root
+pfifo_fast`, the ordinary way to take netem off an interface, and the first
+thing anyone tries -- left the check reporting the link healthy:
+
+```
+link_detach  as3/SFO  NO   qdisc pfifo_fast 800e: root refcnt 57 bands 3 ...
+```
+
+while the filter was still installed and the link still carried nothing:
+
+```
+$ twinet exec as3/SFO -- tc filter show dev ext_7_MSP ingress
+  match 00000000/00000000 at 0
+	action order 1: gact action drop
+$ twinet exec as7/MSP -- ping -c 3 -W 1 179.3.7.1
+3 packets transmitted, 0 received, 100% packet loss
+```
+
+An agent that did half the repair was told it had done all of it, and the
+ledger believed a lab was clean while a link on it was cut.
+
+Sweeping for the shape -- *the fault installed more than one mechanism and the
+check asks about one of them* -- found three more. All four were reproduced on
+the running lab before being changed, and each was measured against the
+mutation that exposes it.
+
+**`link_flap`** counted running loops. The loop holds the link down for five
+seconds of every fifteen, so killing it lands on a down cycle a third of the
+time and leaves the interface down for good. `Resolve` had always known this
+and set the link back up; `Verify` never asked. Killed mid-cycle, it reported
+`NO -- 0 flap loop(s) running` on an interface that was down and losing every
+packet.
+
+**`host_incorrect_gateway`** reported `NO` -- with an empty observation, which
+is the least useful way possible to be wrong -- after the bogus default route
+was simply deleted. The host was then left with no default route at all and
+answered `Network unreachable`: the symptom the fault exists to produce, fully
+present, on a fault recorded as gone. `Resolve` already insisted the baseline
+be back rather than merely the wrong gateway gone, and said so in a comment.
+The check never learned it. It also compared the gateway with
+`strings.Contains`, so `via 3.106.0.2` matched a route `via 3.106.0.254` -- and
+the bogus neighbour this fault picks differs from the real gateway by one
+digit, so the two addresses that must not be confused are exactly the two that
+were.
+
+**`dns_port_blocked`** installs a rule for udp and a rule for tcp, then counted
+lines containing `--dport 53 -j DROP` anywhere in `INPUT` and reported `n > 0`.
+Freeing udp -- the half that actually stops name resolution -- still read `yes,
+1 rule(s) dropping port 53`, naming neither protocol. Its own `Inject` carries
+a comment identifying this exact hazard and guards against it by refusing to
+inject over a pre-existing rule; the guard was added to `Inject` and never
+carried across to `Verify`.
+
+Each now asks about everything it installed, and the evidence distinguishes
+*partly undone* from *undone* and from *untouched*:
+
+| mutation | before | after |
+| --- | --- | --- |
+| `link_detach`, egress netem removed | no longer in effect | **still in effect** -- "outbound is clear but every inbound packet is still dropped by the ingress filter" |
+| `link_detach`, both halves removed | no longer in effect | no longer in effect |
+| `link_flap`, loop killed on a down cycle | no longer in effect | **still in effect** -- "it stopped on a down cycle and ext_7_MSP is still down" |
+| `host_incorrect_gateway`, bogus route deleted | no longer in effect (blank) | **still in effect** -- "no default route at all; the one this fault replaced (default via 3.106.0.2 dev ATLrouter) was never put back" |
+| `dns_port_blocked`, udp rule removed | still in effect, "1 rule(s)" | still in effect, **"tcp dropped; udp reach the resolver"** |
+| each fault injected and left alone | still in effect | still in effect |
+
+Two things worth recording beyond the fix.
+
+The first is that finding 117 swept for its own shape and reported, in this
+document, that "the remaining verifies were checked and are already scoped ...
+the wrong-gateway one reads `ip route show default` and names the wrong
+gateway". That sweep was looking for one defect -- *is the check scoped to what
+was injected?* -- and `host_incorrect_gateway` passed it while failing a
+different one standing next to it. A sweep answers the question it asks. Saying
+"the rest were checked" invites the reader to hear "the rest are correct", and
+those are not the same claim.
+
+The second is a limitation this fix does not remove. `dns_port_blocked` now
+counts rules per protocol, but it still cannot tell its own rule from an
+identical rule somebody added afterwards; nothing in `iptables -S` distinguishes
+them. Injection refuses to run when such a rule is already present, so the
+window is between inject and verify only. Tagging the rules with `-m comment`
+would close it -- the module is present in the images, and this was checked --
+but it would change helpers several ACL faults share, and that is not a change
+to make in the same breath as a fix. It is recorded here rather than described
+as done.
+
+### 119. A link whose shaping could never be put back
+
+Resolving `link_detach` reported:
+
+```
+resolve link_detach: the fault is gone but as3/SFO was not left as it was
+found: not put back: qdisc netem 1: dev ext_7_MSP root limit 1000 delay 25ms
+(the undo also reported: interface ext_7_MSP: add netem: file exists)
+```
+
+`ApplyShaping` clears the root qdisc and then adds netem there. `clearRootQdisc`
+deliberately skips `pfifo_fast`, on the theory that it is the one the kernel
+installs by default and "cannot be deleted, only replaced". That holds for the
+implicit default. It does not hold for a `pfifo_fast` somebody installed on
+purpose -- and installing one is precisely how a person takes netem off an
+interface. After anyone did that, the root was occupied, `QdiscAdd` failed with
+`EEXIST`, and the platform could never restore that link's delay or its rate
+limit again. The link kept working, so nothing looked wrong; it simply no longer
+had the 25ms and 1Mbit its own manifest describes, and every later episode over
+it ran with different physics than the file says. For a benchmark whose episodes
+must be comparable, a link that quietly stops matching its manifest is worse
+than one that breaks.
+
+The reviewer who found 118 hit this too, and reported resolving the fault "after
+manual cleanup" -- the cleanup was this.
+
+`QdiscReplace` installs at the root over whatever is there. Measured on the
+wedged interface:
+
+```
+before:  qdisc pfifo_fast 800e: root refcnt 57 bands 3 priomap ...
+resolve: resolved link_detach on as3/SFO
+after:   qdisc netem 1: root refcnt 57 limit 1000 delay 25ms
+         qdisc tbf a: parent 1:1 rate 1Mbit burst 14500b lat 50ms
+```
+
+The honest part of this one is that the failure was loud: resolve refused to
+call the lab clean, printed what it could not put back, and exited non-zero.
+The check that caught it was working. What was missing was the ability to act
+on what it found.
+
+Full labs after both fixes: cos461 10.00, advnet 6.00, multicast 4.00.
+
+### 120. Half a leak, and the half that was checked was not the half that matters
+
+`bgp_blackhole_route_leak` installs two things that can be removed
+independently: a discard route (`ip route <prefix> Null0`) and the BGP
+`network` statement that advertises the prefix so other networks' traffic comes
+looking for it. Its verify read the forwarding table and nothing else.
+
+Withdraw the announcement -- the repair that stops the internet-wide diversion,
+and the one an agent that has correctly diagnosed a route leak would reach for
+first -- and the check answered:
+
+```
+bgp_blackhole_route_leak  as3/SFO  yes   traffic for 7.0.0.0/8 is discarded here
+```
+
+a sentence about a leak that had stopped, offered as the ground truth an agent's
+diagnosis is scored against. This is finding 118's shape, in a fault 118's sweep
+did not reach: that sweep was a regex over the commands each `Inject` issues,
+and this one builds both of its lines inside a single `VtyshConfig` call with
+`fmt.Sprintf`, so it read as one mechanism. Re-run structurally -- parse each
+registered fault, count the artifacts `Inject` leaves behind, print what
+`Verify` probes -- it is the only remaining fault of the shape. The others that
+install more than one thing (`bgp_asn_misconfig`, `dns_record_error`,
+`ospf_area_misconfiguration`) all verify an *outcome*: no established sessions,
+the name resolving to the wrong address, the adjacency down. **A verify that
+asks about an outcome cannot have this defect. A verify that asks about a
+mechanism has it whenever the fault installs more than one.** That is the rule
+worth keeping.
+
+The interesting part was deciding what "still in effect" should mean, because
+the obvious answer is wrong. The reviewer who found this proposed requiring
+*both* halves to be present. Measured on the lab, each half alone is an outage:
+
+```
+announcement withdrawn, discard route left:
+  $ twinet exec as3/ATL_host -- ping -c 3 -W 2 7.152.0.1
+  3 packets transmitted, 0 received, 100% packet loss
+
+discard route removed, announcement left:
+  $ twinet exec as3/SFO -- vtysh -c 'show ip route 7.0.0.0/8'
+  % Network not in table
+```
+
+The first is plain. The second is worth spelling out: with the router
+originating the prefix itself, its own path wins best-path selection on weight,
+and a locally sourced path installs nothing in the forwarding table -- so the
+router advertises a prefix it does not own to both of its external peers and
+then has no route for the traffic that arrives. Requiring both halves would
+have called each of those labs clean. It would have been finding 118 again,
+written the other way round: a check that declares a lab repaired while packets
+are on the floor. Either half surviving now reads as still in effect, which is
+also what `Resolve` has always required.
+
+The old code was already wrong in the second direction and nobody had looked:
+with the discard route removed it reported **NO -- no longer in effect** on a
+router that was still leaking.
+
+| state | before | after |
+| --- | --- | --- |
+| fully injected | yes, "traffic is discarded here" | yes, "originates 7.0.0.0/8, which it does not own, and discards the traffic that follows it" |
+| announcement withdrawn | yes, "traffic is discarded here" (silent about the leak) | yes, **"no longer originated into BGP, so the leak itself is gone, but the discard route is still installed and every packet ... is still dropped"** |
+| discard route removed | **NO** | yes, **"the discard route is gone, but the router still originates 7.0.0.0/8 ... and this router has no route for what arrives"** |
+| correctly resolved | not in effect | not in effect |
+
+`blackholeFor` also scopes the discard to the recorded prefix. `show ip route
+<prefix>` answers with whatever entry covers the prefix it is asked about, so a
+discard route for a neighbouring network read as this fault still being in
+place -- finding 117's shape, sitting inside the fault being repaired. The
+locally-originated test reuses the existing `locallyOriginated` helper rather
+than adding a second one; it already carries its own scar, having once matched
+the "Local host:" line that every learned path prints.
+
+Full labs after the fix: cos461 10.00, advnet 6.00, multicast 4.00.
+
+### 121. A dry run that reported it had deployed the lab
+
+```
+$ twinet deploy --dry-run
+twinet: docker 29.7.2, lab demo (topology a345547bd0b68597)
+
+deployed 57 devices and 74 links in 1ms
+$ echo $?
+0
+$ sudo docker ps -a --format '{{.Names}}' | grep -c '^demo'
+0
+```
+
+Nothing was created. The word was "deployed", the exit status was zero, and an
+operator scripting a preview -- or a TA gating the next step of a deployment
+script on that exit code -- had no way to tell it apart from a real run.
+
+The summary took its numbers from `top.Stats()`, the topology as written. That
+figure is the same for every run of the same manifest, which makes it wrong in
+three independent ways, only the first of which the reviewer had to trip over:
+
+- `--dry-run`, which builds nothing, announced the whole lab;
+- `--only as=1`, which built seven devices, announced all 57;
+- a deploy that fell over half way announced the whole topology on the line
+  immediately above the list of scopes that had failed.
+
+The last is the one that would have cost somebody a night. The counts now come
+from the execution report -- create and wire steps that actually ran and
+returned no error -- so each of those runs reports what it did. The agent's
+reply had the same shape: `Steps` was `p.Len()`, the planned length, so the
+per-node table showed a full step count for a run that performed none of them.
+It now sends completed and planned separately, and the table prints `0/333`
+when they differ.
+
+**The fix had the defect in it.** The per-node link totals double-count
+cross-node links, which are wired from both ends, so the summary subtracted the
+topology's cross-node count to get back to distinct links. That identity holds
+only for a run covering the whole topology, and the first version applied it
+unconditionally:
+
+```
+$ twinet deploy --dry-run --only as=3
+dry run: 33 devices and 10 links would be deployed across 3 nodes
+```
+
+Forty-three endpoints, minus a whole lab's 33 cross-node links, reported as 10
+-- a fix for a number that could not be supported, printing a number that could
+not be supported. A restricted or partly answered run now reports endpoints and
+says that is what they are. Caught only because the fix was re-run against the
+mutation it was written for, which is the rule that keeps earning its place.
+
+The check that matters for the class as a whole: **on a normal, complete deploy
+the output is byte-for-byte what it was before** -- `212 devices, 299 links (33
+cross-node) across 3 nodes` -- because on that run the intended number and the
+achieved number agree. The fix is invisible exactly when the old code was right,
+and speaks up exactly when it was lying.
+
+An unreachable node turns out not to reach the degraded branch at all: the
+pre-flight image check refuses first, non-zero and before anything is created.
+Verified by stopping node-2's agent.
+
+Swept the neighbours. `destroy` prints its node count only after checking every
+node succeeded. `inspect`'s use of `Stats()` is correct -- it is describing the
+manifest, which is what inspect is for. The remaining `p.Len()` uses are a
+progress-bar denominator and an empty-plan guard.
+
+Verified: dry run and `--only` on both the single-node and cluster paths, a
+clean cluster deploy unchanged, node-2 stopped and restored, cos461 back to
+10.00.
+
+### 122. A restore that reported success on work it had not put back
+
+Publishing a ROA is something a student *does*, not a line of configuration, so
+it appears in no router's running-config. The save side knows this and writes
+`roas.json` into the archive, with a comment recording that a re-mark in a
+harness whose trust anchor starts empty had already cost a group the mark for
+publishing, at 9.70 out of 10.
+
+`restoreBundle` matched archive members by file extension. It handled `.conf`
+and `.sh`. `roas.json` matched neither, so it was stepped over in silence:
+
+```
+$ twinet restore submissions/2026-08-19-234332/group3.tar.gz
+restored group3 into AS 3 (33 device(s))
+```
+
+Reproduced end to end on the cluster. With AS 3's authorisation removed from
+the trust anchor -- the state a rebuilt lab starts in -- the lab grades:
+
+```
+mean 9.70  median 9.70  min 9.70  max 9.70  (out of 10.00)
+  rpki.roa_published                       1 of 1
+```
+
+the same 9.70 the save-side comment describes. The restore above then reported
+success and left it at 9.70. It now reports
+
+```
+restored group3 into AS 3 (33 device(s) and its published authorisations)
+```
+
+and the lab grades 10.00 again.
+
+**The twin was worse than the finding.** Two consumers read these archives:
+`restoreBundle` and `bundleSubmission`, the one batch grading uses. Each
+decided separately what an archive may contain, which is exactly how one came
+to apply the authorisations while the other ignored them -- and the one that
+ignored them at class scale would have marked every submission in a run on
+partial work, silently. Both now call `classifyBundle`, which places every
+member or refuses by name. An archive member this version cannot apply is not a
+stray file to skip: it is part of a submission, and applying the rest while
+reporting success is the defect the ledger keeps finding.
+
+On the save side, a marshal failure dropped the authorisations from the archive
+with `if err == nil`, three lines after the code had treated failing to *read*
+them as worth aborting the whole save for.
+
+### 123. A gate that refused the reference solution for passing
+
+`twinet grade class` attests that the deployed lab is the reference solution
+before it marks anybody against it -- the one thing standing between a class and
+being graded against a broken internet. It refused:
+
+```
+$ twinet grade class -s submissions/2026-08-19-234332
+twinet: this lab is not the reference solution, so nothing can be graded against it:
+  AS 10 scores full marks, but policy.transit_for_customers did not pass (not_applicable)
+  AS 7 scores full marks, but policy.transit_for_customers did not pass (not_applicable)
+  AS 8 scores full marks, but policy.transit_for_customers did not pass (not_applicable)
+  AS 9 scores full marks, but policy.transit_for_customers did not pass (not_applicable)
+```
+
+Read the sentence: *scores full marks, but did not pass*. `not_applicable` means
+the question cannot arise -- a stub system that sells transit to nobody cannot
+withhold transit from a customer -- and the scorer deliberately leaves such a
+check out of the weighting, which is why those systems are standing there with
+full marks. The gate counted it as a failure, so it was contradicting the
+grader it exists to guard.
+
+cos461 has four stub systems, so `grade class` could not be run on cos461 at
+all. Neither remedy offered helps: `deploy --solve` had already been run and
+cannot change a check's applicability, and `--skip-reference-check` disables the
+gate itself -- working around a fault in a safety check by turning the safety
+check off, for every future run.
+
+The verdict is now a pure function, `referenceComplaint`, so the semantics are
+pinned by tests rather than reachable only through a six-minute class run. It
+still fires on every case it was built for: a failed check behind a full total,
+a check the grader could not run, a total below full marks, and a report the
+grader itself flagged for review.
+
+### 124. Every submission in a class quarantined for a device the kernel owns
+
+With 123 fixed, `grade class` ran and quarantined the only submission in it:
+
+```
+1 of 1 submission(s) could not be graded and are quarantined:
+  group3   loading the submission: as3/ATL still carries the previous
+           submission's work after being reset (tunnel gre0)
+```
+
+`gre0` is not the previous submission's work. It is the fallback device the
+kernel creates when the `gre` module loads, and it cannot be removed:
+
+```
+$ twinet exec as3/ATL -- ip tunnel del gre0
+delete tunnel "gre0" failed: Operation not permitted
+```
+
+The reset excluded `sit0` and nothing else, so on any router where a tunnel
+module had ever been loaded -- in a course that teaches tunnelling, every router
+a student has touched -- the wipe could not remove `gre0`, and the read-back
+that follows it counted what the wipe had left as somebody's leftover answer.
+Every submission in the run is quarantined. A whole class receives no marks:
+honestly, which is the one thing that stops this being a marking scandal, and
+uselessly.
+
+Both the wipe and the read-back now share one list of the devices the kernel
+owns, so they cannot drift apart. The exclusion is not a hiding place: `gre1`,
+`tun6` and `sit01` are still reported, which is what the read-back is for. On
+the router that produced the quarantine, the filter keeps exactly `tun6` -- the
+student's tunnel -- and drops the kernel's `sit0` and `gre0`.
+
+With 122, 123 and 124 fixed, `twinet grade class` completes on cos461 for the
+first time:
+
+```
+wave 1/1: group3
+  group3       10.00 / 10.00
+graded 1 submission(s) against cos461-routing in 6m18.694s
+```
+
+Three defects in one command, all in the same direction: the platform's
+class-scale marking path had never been run end to end against the reference
+lab. Two of them made it refuse to work at all, which is the failure mode to be
+grateful for. The first, in the restore it shares with that path, quietly
+marked a group 9.70 for an answer worth 10.00.
+
+### 125. A mark for label distribution, given without waiting for label distribution
+
+Grading waits for the control plane to settle before it marks. The wait watched
+OSPF, then BGP sessions, then the RIB. It never watched LDP -- in the course
+whose entire subject is MPLS.
+
+Graded in place, advnet scores 6.00. The same submission, through the path a
+class run uses, scored 5.20:
+
+```
+graded 1 submission(s) against advnet-mpls-l3vpn in 2m57.365s
+  mean 5.20  median 5.20  min 5.20  max 5.20  (out of 6.00)
+most-missed checks:
+  mpls.ldp_adjacencies                     1 of 1
+```
+
+with the evidence `R2 has no LDP session with R5`. Read back after the run:
+
+```
+$ twinet exec as1/R2 -- vtysh -c 'show mpls ldp neighbor'
+ipv4 1.151.0.1       OPERATIONAL 1.151.0.1       00:00:15
+ipv4 1.153.0.1       OPERATIONAL 1.153.0.1       00:00:10
+```
+
+Ten and fifteen seconds of uptime: the sessions came up *after* the mark was
+recorded. The student's answer was right and the grader was early.
+
+Grading in place hides this completely, because a lab that has been running for
+minutes converged long ago. It appears only when grading follows a reset --
+which is what `grade class` and `grade batch` do to every submission, one after
+another. Every student in an advnet class run loses this mark, and the report
+they receive says their LDP session does not exist.
+
+The rubric's own question asks for `converge_scope: ospf` and then marks
+`mpls.ldp_adjacencies` inside it, so the wait established one thing and the mark
+was given on another -- the ledger's oldest shape, in the one place where it
+costs marks rather than credibility.
+
+The wait now reads each router's **configuration** to decide whether LDP belongs
+to this lab, because "no session yet" and "this lab has no LDP" are the same
+output from `show mpls ldp neighbor`, and a predicate that cannot tell them
+apart returns instantly and declares the network settled. A lab that runs no
+LDP passes straight through without a single query. A submission whose LDP is
+genuinely broken times out, is recorded as a warning, and is still marked --
+non-convergence is a mark, not an outage.
+
+After the fix, the same submission through the same path:
+
+```
+graded 1 submission(s) against advnet-mpls-l3vpn in 4m15.616s
+  mean 6.00  median 6.00  min 6.00  max 6.00  (out of 6.00)
+```

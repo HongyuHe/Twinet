@@ -79,15 +79,23 @@ func readCounter(ctx context.Context, env *Env, device, file string,
 	return counterWitness{global: n, loopRx: loopbackRx(res.Stdout)}, true
 }
 
-// tapSeconds bounds how long a capture runs. It has to outlast the probes it
-// watches for -- a connection attempt waits three seconds for an answer and a
-// datagram two -- and then stop of its own accord, so that nothing is left
-// behind on a machine if the grader is interrupted.
-const tapSeconds = 15
+// tapSeconds bounds how long a capture can outlive the grader that started it.
+// It is a leak guard and nothing more: the capture is stopped explicitly when
+// it is read, so this only matters if the grading run is interrupted between
+// the two.
+//
+// It used to be the window itself, at fifteen seconds, chosen to outlast the
+// probes it watches for. That was a guess about how long several round trips
+// to a machine on another node would take, and on a loaded cluster the guess
+// was sometimes wrong: the capture had already exited when the last probe was
+// sent, reported no frames, and the check called a working path filtered.
+const tapSeconds = 180
 
-// tapFrames bounds how many frames a capture records. The flow is one probe on
-// a port drawn at random, so a handful covers it with room for retransmissions.
-const tapFrames = 16
+// tapFrames bounds how many frames a capture records, so that nothing
+// unbounded is written to a machine being graded. Reaching the limit ends the
+// capture early, which now voids the witness rather than silencing it, so the
+// number is set well above what the probes can produce.
+const tapFrames = 64
 
 // arrivalTap watches one machine's interfaces for the frames of a single flow.
 type arrivalTap struct {
@@ -103,19 +111,34 @@ type arrivalTap struct {
 // goes past records nothing, and a working path would be reported broken; the
 // loop watches for tcpdump's own announcement that it is listening rather than
 // guessing at a delay.
+//
+// The capture also records the moment it stops, in a marker file. Whether it
+// was still running when the probes went past is the difference between "no
+// packet arrived" and "nobody was watching", and only one of those is evidence.
 func startArrivalTap(ctx context.Context, env *Env, device, port string) *arrivalTap {
+	return startArrivalTapN(ctx, env, device, port, tapFrames)
+}
+
+// startArrivalTapN is startArrivalTap with the frame limit named, for the
+// callers that aim more than one flow at the same port. Reaching the limit
+// stops the capture early and voids its witness, so a caller sending many
+// probes has to raise it or lose the evidence it went to the trouble of
+// creating.
+func startArrivalTapN(ctx context.Context, env *Env, device, port string, frames int) *arrivalTap {
 	t := &arrivalTap{
 		device: device,
 		file:   fmt.Sprintf("/tmp/twinet-tap-%d-%d", rand.Uint32(), rand.Uint32()),
 	}
 	script := fmt.Sprintf(
-		"command -v tcpdump >/dev/null 2>&1 || exit 3; rm -f %[1]s %[1]s.err; "+
-			"(timeout %[3]d tcpdump -i any -n -l -Q in -c %[4]d 'dst port %[2]s' "+
-			">%[1]s 2>%[1]s.err &); "+
+		"command -v tcpdump >/dev/null 2>&1 || exit 3; "+
+			"rm -f %[1]s %[1]s.err %[1]s.pid %[1]s.end; "+
+			"( ( timeout %[3]d tcpdump -i any -n -l -Q in -c %[4]d 'dst port %[2]s' "+
+			">%[1]s 2>%[1]s.err & echo $! >%[1]s.pid; wait; : >%[1]s.end ) "+
+			">/dev/null 2>&1 & ); "+
 			"n=0; while [ $n -lt 100 ]; do "+
-			"grep -q 'listening on' %[1]s.err && exit 0; "+
+			"grep -q 'listening on' %[1]s.err 2>/dev/null && exit 0; "+
 			"n=$((n+1)); sleep 0.05; done; exit 4",
-		t.file, port, tapSeconds, tapFrames)
+		t.file, port, tapSeconds, frames)
 	res, err := env.Probe(ctx, device, []string{"sh", "-c", script})
 	t.begun = err == nil && res.ExitCode == 0
 	return t
@@ -133,34 +156,99 @@ type tapCounts struct {
 // A capture that could not be read, or that cannot name the interface a frame
 // arrived on, reports nothing rather than nothing-arrived: the difference
 // matters, because the second would fail a submission over a missing tool.
+//
+// The capture is stopped here rather than left to expire, so that the window
+// it watched covers the probes by construction instead of by estimate. If it
+// stopped on its own beforehand -- its own timeout, or its frame limit -- it
+// was not watching for the whole of the flow and its silence proves nothing.
 func (t *arrivalTap) seen(ctx context.Context, env *Env) (tapCounts, bool) {
+	c, _, live := t.seenFlows(ctx, env)
+	return c, live
+}
+
+// seenFlows is seen, and also which source ports the arriving frames came
+// from. A caller that aims several flows at one port distinguishes them that
+// way: the source port is the only thing that differs between them, and it is
+// also what the kernel hashes to choose between equal-cost next hops, so it
+// names both the flow and the path it was steered onto.
+func (t *arrivalTap) seenFlows(ctx context.Context, env *Env) (tapCounts, map[string]int, bool) {
 	if t == nil || !t.begun {
-		return tapCounts{}, false
+		return tapCounts{}, nil, false
 	}
 	res, err := env.Probe(ctx, t.device, []string{"sh", "-c",
-		fmt.Sprintf("cat %[1]s.err 2>/dev/null; echo '---'; cat %[1]s 2>/dev/null; "+
-			"rm -f %[1]s %[1]s.err; exit 0", t.file)})
+		fmt.Sprintf("early=0; [ -f %[1]s.end ] && early=1; "+
+			"[ -f %[1]s.pid ] && kill -TERM \"$(cat %[1]s.pid)\" 2>/dev/null; "+
+			"n=0; while [ $n -lt 40 ] && [ ! -f %[1]s.end ]; do n=$((n+1)); sleep 0.05; done; "+
+			"echo \"EARLY=$early\"; cat %[1]s.err 2>/dev/null; echo '---'; "+
+			"cat %[1]s 2>/dev/null; "+
+			"rm -f %[1]s %[1]s.err %[1]s.pid %[1]s.end; exit 0", t.file)})
 	if err != nil || res.ExitCode != 0 {
-		return tapCounts{}, false
+		return tapCounts{}, nil, false
 	}
-	return parseTapOutput(res.Stdout)
+	return parseTapFlows(res.Stdout)
 }
 
 // parseTapOutput separates what tcpdump said about itself from what it
 // captured, and reports nothing rather than nothing-arrived where the capture
 // cannot be trusted to tell the difference.
 func parseTapOutput(out string) (tapCounts, bool) {
-	head, body, ok := strings.Cut(out, "---\n")
+	c, _, ok := parseTapFlows(out)
+	return c, ok
+}
+
+// parseTapFlows is parseTapOutput, also grouping the arrivals by the source
+// port they came from.
+func parseTapFlows(out string) (tapCounts, map[string]int, bool) {
+	marker, rest, ok := strings.Cut(out, "\n")
+	if !ok || !strings.HasPrefix(marker, "EARLY=") {
+		return tapCounts{}, nil, false
+	}
+	// The capture had already stopped before it was asked, so the window it
+	// watched does not cover the flow and it has nothing to testify to.
+	if strings.TrimPrefix(marker, "EARLY=") != "0" {
+		return tapCounts{}, nil, false
+	}
+	head, body, ok := strings.Cut(rest, "---\n")
 	if !ok || !strings.Contains(head, "listening on") {
-		return tapCounts{}, false
+		return tapCounts{}, nil, false
 	}
 	// Without the cooked-v2 header there is no interface name on the line, and
 	// a loopback frame is indistinguishable from an arrival. Better to have no
 	// witness than a witness that cannot tell the two apart.
 	if !strings.Contains(head, "LINUX_SLL2") {
-		return tapCounts{}, false
+		return tapCounts{}, nil, false
 	}
-	return countTapFrames(body), true
+	return countTapFrames(body), tapSourcePorts(body), true
+}
+
+// tapSourcePorts counts the arriving frames by the port they were sent from.
+//
+// tcpdump renders an address and port as one dotted field, so the port is
+// what follows the last dot of the source field. A line whose source cannot
+// be read that way is left out rather than guessed at: the caller counts a
+// flow as lost when its port is absent, and a misparse would be an accusation
+// against a submission that did nothing wrong.
+func tapSourcePorts(body string) map[string]int {
+	out := map[string]int{}
+	for _, line := range strings.Split(body, "\n") {
+		f := strings.Fields(line)
+		if len(f) < 5 || f[2] != "In" || f[1] == "lo" {
+			continue
+		}
+		if !strings.Contains(line, "UDP,") && !strings.Contains(line, "Flags [") {
+			continue
+		}
+		i := strings.LastIndex(f[4], ".")
+		if i < 0 {
+			continue
+		}
+		port := f[4][i+1:]
+		if port == "" || strings.Trim(port, "0123456789") != "" {
+			continue
+		}
+		out[port]++
+	}
+	return out
 }
 
 // countTapFrames reads tcpdump's `-i any` output, whose second field is the

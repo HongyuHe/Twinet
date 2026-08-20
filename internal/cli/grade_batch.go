@@ -741,15 +741,16 @@ func submissionFromArchive(p string, class *model.Topology) (submission, error) 
 		Group: group, AS: b.AS, Dir: p,
 		Files: map[string]string{}, Scripts: map[string]string{},
 	}
-	for name, body := range files {
-		switch {
-		case name == "roas.json":
-			sub.ROAs = body
-		case strings.HasSuffix(name, ".conf"):
-			sub.Files[strings.TrimSuffix(name, ".conf")] = string(body)
-		case strings.HasSuffix(name, ".sh"):
-			sub.Scripts[strings.TrimSuffix(name, ".sh")] = string(body)
-		}
+	m, err := classifyBundle(files)
+	if err != nil {
+		return submission{}, fmt.Errorf("%s: %w", filepath.Base(p), err)
+	}
+	sub.ROAs = m.ROAs
+	for name, body := range m.Configs {
+		sub.Files[name] = string(body)
+	}
+	for name, body := range m.Scripts {
+		sub.Scripts[name] = string(body)
 	}
 	if len(sub.Files) == 0 && len(sub.Scripts) == 0 {
 		return submission{}, fmt.Errorf("%s contains no configuration", filepath.Base(p))
@@ -908,13 +909,50 @@ func withdrawROAs(ctx context.Context, exec execFn, top *model.Topology, as *mod
 	return nil
 }
 
+// kernelFallbackTunnels are the tunnel devices the kernel creates for itself
+// when a tunnel module is loaded, one per encapsulation, and refuses to let
+// anybody delete.
+//
+// They are not anybody's answer: `ip tunnel del gre0` fails with "Operation
+// not permitted" on every device where the gre module has ever been loaded --
+// which, in a course that teaches tunnelling, is every router a student has
+// touched. Only sit0 was excluded, so the reset could not remove gre0, the
+// read-back that follows counted it as the previous submission's leftover
+// work, and every submission in the run was quarantined:
+//
+//	group3  loading the submission: as3/ATL still carries the previous
+//	        submission's work after being reset (tunnel gre0)
+//
+// A whole class receives no marks, honestly and uselessly. They carry no state
+// between submissions either: any address on one is flushed and any route
+// through one is removed by the lines that follow.
+var kernelFallbackTunnels = []string{
+	"sit0", "gre0", "gretap0", "erspan0", "tunl0",
+	"ip6tnl0", "ip6gre0", "ip6gretap0", "ip_vti0", "ip6_vti0",
+}
+
+// fallbackTunnelPattern matches those names at the head of an `ip tunnel show`
+// line, for a grep that keeps only what somebody actually created.
+func fallbackTunnelPattern() string {
+	return "^(" + strings.Join(kernelFallbackTunnels, "|") + "):"
+}
+
+// fallbackTunnelCases is the same set as shell `case` patterns.
+func fallbackTunnelCases() string {
+	out := make([]string, 0, len(kernelFallbackTunnels))
+	for _, n := range kernelFallbackTunnels {
+		out = append(out, n+":*")
+	}
+	return strings.Join(out, "|")
+}
+
 // wipeDeviceState removes what a submission can install and puts back what the
 // platform owns, without recreating the container.
 func wipeDeviceState(ctx context.Context, exec execFn, d *model.Device) error {
 	lines := []string{
 		// Tunnels first: deleting one takes the routes through it as well.
 		`ip -d tunnel show 2>/dev/null | while read -r l; do ` +
-			`case "$l" in sit0:*) continue;; esac; n=${l%%:*}; ` +
+			`case "$l" in ` + fallbackTunnelCases() + `) continue;; esac; n=${l%%:*}; ` +
 			`[ -n "$n" ] && ip tunnel del "$n" 2>/dev/null; done`,
 		// Routes with no proto are the hand-installed ones, which is exactly
 		// what distinguishes a student's work from a routing daemon's.
@@ -999,7 +1037,8 @@ func wipeDeviceState(ctx context.Context, exec execFn, d *model.Device) error {
 func verifyWiped(ctx context.Context, exec execFn, d *model.Device) error {
 	var b strings.Builder
 	b.WriteString("echo '--tunnels'\n")
-	b.WriteString("ip -d tunnel show 2>/dev/null | grep -v '^sit0:' | cut -d: -f1 || true\n")
+	b.WriteString("ip -d tunnel show 2>/dev/null | grep -Ev '" + fallbackTunnelPattern() +
+		"' | cut -d: -f1 || true\n")
 	b.WriteString("echo '--routes'\n")
 	b.WriteString(`ip -o -4 route show 2>/dev/null | grep -v " proto " || true` + "\n")
 	b.WriteString("echo '--routes6'\n")

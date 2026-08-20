@@ -232,7 +232,26 @@ func init() {
 					return Evidence{}, err
 				}
 			}
-			return Evidence{Verified: strings.Contains(out, "via "+wrong),
+			// Deleting the bogus route is not repairing it. Injection refuses
+			// unless a default route was there to misdirect, so a host with
+			// none afterwards is in that state because of this fault, and it
+			// cannot leave its own subnet -- the symptom the fault was
+			// injected to produce, still fully present. This used to report
+			// "no longer in effect" with an empty observation, which is the
+			// least informative way possible to be wrong: Resolve already
+			// insisted the baseline be back rather than merely the wrong
+			// gateway gone, and the check never learned the same lesson.
+			if strings.TrimSpace(out) == "" {
+				return Evidence{Verified: true,
+					Expected: "the default route via " + wrong,
+					Observed: "no default route at all; the one this fault replaced (" +
+						s["route"] + ") was never put back, so the host still " +
+						"cannot leave its subnet"}, nil
+			}
+			// Whole-field, because "via 10.0.0.1" is a prefix of
+			// "via 10.0.0.10" and the neighbour address this fault picks
+			// differs from a real one by a single digit.
+			return Evidence{Verified: routeVia(out, wrong),
 				Expected: "the default route via " + wrong, Observed: strings.TrimSpace(out)}, nil
 		},
 		Resolve: func(ctx context.Context, e *Env, t Target, s State) error {
@@ -395,9 +414,19 @@ func init() {
 			return State{"prefix": prefix}, nil
 		},
 		Verify: func(ctx context.Context, e *Env, t Target, s State) (Evidence, error) {
-			out, _ := e.Try(ctx, t.DeviceID(), "ip route show | grep blackhole")
-			return Evidence{Verified: strings.Contains(out, "blackhole"),
-				Observed: strings.TrimSpace(out)}, nil
+			// Scoped to the prefix this fault recorded. "some blackhole route
+			// exists" is a different claim: a lab that blackholes anything of
+			// its own, or a second injection of this fault at another prefix,
+			// answers for a rule that is no longer there.
+			prefix := s["prefix"]
+			if prefix == "" {
+				return Evidence{}, fmt.Errorf("no prefix was recorded for this fault, so the "+
+					"route it installed cannot be identified (device %s)", t.DeviceID())
+			}
+			out, _ := e.Try(ctx, t.DeviceID(), "ip route show "+prefix)
+			return Evidence{Verified: strings.HasPrefix(strings.TrimSpace(out), "blackhole"),
+				Observed: observedRoute(out, prefix),
+				Expected: "traffic to " + prefix + " discarded by a blackhole route"}, nil
 		},
 		Resolve: func(ctx context.Context, e *Env, t Target, s State) error {
 			if s["prefix"] == "" {
@@ -418,6 +447,37 @@ func init() {
 // shellQuote makes a string safe to embed in a shell command.
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// observedRoute describes what the routing table holds for a prefix, so that
+// "there is no route at all" reads differently from "there is a route, but it
+// forwards".
+func observedRoute(out, prefix string) string {
+	if s := strings.TrimSpace(out); s != "" {
+		return s
+	}
+	return "no route for " + prefix
+}
+
+// routeVia reports whether any route in the output forwards via exactly the
+// given gateway.
+//
+// Whole-field, because a substring search for "via 10.0.0.1" also matches a
+// route via 10.0.0.10, and the bogus neighbour this fault installs is chosen
+// to sit one address away from the real gateway.
+func routeVia(out, gw string) bool {
+	if gw == "" {
+		return false
+	}
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		for i, w := range f {
+			if w == "via" && i+1 < len(f) && f[i+1] == gw {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func hostAddr(e *Env, t Target) (iface, addr string, err error) {

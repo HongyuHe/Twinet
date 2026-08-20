@@ -75,29 +75,56 @@ func init() {
 			return State{"prefix": prefix, "asn": fmt.Sprint(asn)}, nil
 		},
 		Verify: func(ctx context.Context, e *Env, t Target, s State) (Evidence, error) {
-			// The damage is that traffic for the prefix is drawn here and
-			// dropped, so check the forwarding table: the route must be in the
-			// RIB pointing at Null0. Confirming both configuration lines were
-			// typed said nothing about whether the router had installed
-			// anything, and a leak that is not installed swallows no traffic.
+			// This fault installs two things that can be removed
+			// independently: the discard route, and the announcement that
+			// draws other networks' traffic onto it. Reading the forwarding
+			// table alone answered for the discard and said nothing about the
+			// leak, so withdrawing the announcement -- the repair that stops
+			// the internet-wide diversion -- left this reporting "traffic for
+			// the prefix is discarded here", a sentence about a leak that was
+			// no longer happening.
+			//
+			// Both halves are asked about, and either one surviving means the
+			// fault is still in effect, because either one alone still costs
+			// traffic. Measured on the lab: with the announcement withdrawn
+			// and the discard route left behind, this AS lost every packet to
+			// the prefix; with the discard route removed and the announcement
+			// left behind, the router still advertised a prefix it does not
+			// own to its external peers and had no route for what arrived.
+			// Requiring both to be present before saying so would have called
+			// each of those labs clean.
 			prefix := s["prefix"]
+			if prefix == "" {
+				return Evidence{}, fmt.Errorf("no leaked prefix was recorded, so there is nothing to check")
+			}
 			out, err := e.Settled(ctx, SymptomWindow,
 				func(c context.Context) (string, error) {
-					return e.Vtysh(c, t.DeviceID(), "show ip route "+prefix)
+					route, err := e.Vtysh(c, t.DeviceID(), "show ip route "+prefix)
+					if err != nil {
+						return "", err
+					}
+					bgp, err := e.Vtysh(c, t.DeviceID(), "show bgp ipv4 unicast "+prefix)
+					if err != nil {
+						return "", err
+					}
+					return route + leakProbeSep + bgp, nil
 				},
 				// FRR reports a discard route as "unreachable (blackhole)" in
 				// `show ip route`; the Null0 spelling only exists in the
 				// configuration, so looking for it here never matched and the
 				// fault was rolled back as ineffective every time.
-				func(o string) bool { return strings.Contains(o, "blackhole") })
+				func(o string) bool {
+					route, bgp, _ := strings.Cut(o, leakProbeSep)
+					return blackholeFor(route, prefix) || locallyOriginated(bgp)
+				})
 			if err != nil {
 				return Evidence{}, err
 			}
-			leaked := strings.Contains(out, "blackhole")
+			route, bgp, _ := strings.Cut(out, leakProbeSep)
+			discarding, originating := blackholeFor(route, prefix), locallyOriginated(bgp)
 			return Evidence{
-				Verified: leaked,
-				Observed: boolWord(leaked, "traffic for "+prefix+" is discarded here",
-					"the router has no discard route for "+prefix),
+				Verified: discarding || originating,
+				Observed: leakObserved(prefix, discarding, originating),
 				Expected: "the router originates " + prefix + " into a null route",
 			}, nil
 		},
@@ -412,11 +439,8 @@ func init() {
 			if err != nil {
 				return Evidence{}, err
 			}
-			return Evidence{
-				Verified: strings.Contains(out, fmt.Sprintf("priority=%d", ovsDropPriority)) && strings.Contains(out, "actions=drop"),
-				Observed: matchingLine(out, fmt.Sprintf("priority=%d", ovsDropPriority)),
-				Expected: "a drop rule on port " + s["port"],
-			}, nil
+			return ovsFlowEvidence(out, ovsDropPriority, s["port"], "drop",
+				"a drop rule on port "+s["port"]), nil
 		},
 		Resolve: func(ctx context.Context, e *Env, t Target, s State) error {
 			// Refuse rather than delete by an empty cookie. "cookie=/-1" is a
@@ -463,11 +487,8 @@ func init() {
 			if err != nil {
 				return Evidence{}, err
 			}
-			return Evidence{
-				Verified: strings.Contains(out, fmt.Sprintf("priority=%d", ovsLoopPriority)),
-				Observed: matchingLine(out, fmt.Sprintf("priority=%d", ovsLoopPriority)),
-				Expected: "a rule returning traffic to port " + s["port"],
-			}, nil
+			return ovsFlowEvidence(out, ovsLoopPriority, s["port"], "IN_PORT",
+				"a rule returning traffic to port "+s["port"]), nil
 		},
 		Resolve: func(ctx context.Context, e *Env, t Target, s State) error {
 			// Refuse rather than delete by an empty cookie. "cookie=/-1" is a
@@ -484,6 +505,76 @@ func init() {
 			return err
 		},
 	})
+}
+
+// ovsFlowOn returns the flow-table line whose match selects exactly the given
+// priority and ingress port, along with its action list.
+//
+// Substring search cannot answer this question. "priority=100" and
+// "actions=drop" can come from two entirely different rules, so a table holding
+// an unrelated drop and an unrelated priority-100 forward satisfies both tests
+// while nothing is dropped; "in_port=1" is a prefix of "in_port=10", so a rule
+// on port 10 answers for port 1; and ovs-ofctl does not promise a field order,
+// so a fixed "priority=100,in_port=1" needle is a guess about formatting rather
+// than a reading of the rule. Splitting each line into its match fields and its
+// actions asks what the rule actually selects.
+func ovsFlowOn(out string, priority int, port string) (line, actions string, ok bool) {
+	if port == "" {
+		return "", "", false
+	}
+	wantPrio := fmt.Sprintf("priority=%d", priority)
+	wantPort := "in_port=" + port
+	for _, l := range strings.Split(out, "\n") {
+		i := strings.Index(l, " actions=")
+		if i < 0 {
+			continue
+		}
+		var gotPrio, gotPort bool
+		for _, f := range strings.Split(l[:i], ",") {
+			switch strings.TrimSpace(f) {
+			case wantPrio:
+				gotPrio = true
+			case wantPort:
+				gotPort = true
+			}
+		}
+		if gotPrio && gotPort {
+			return strings.TrimSpace(l), strings.TrimSpace(l[i+len(" actions="):]), true
+		}
+	}
+	return "", "", false
+}
+
+// hasAction reports whether an ovs-ofctl action list contains a given action as
+// a whole term. "drop" must not be found inside a longer action name, and OVS
+// prints IN_PORT in upper case while it is written in lower case on the wire.
+func hasAction(actions, want string) bool {
+	for _, a := range strings.Split(actions, ",") {
+		if strings.EqualFold(strings.TrimSpace(a), want) {
+			return true
+		}
+	}
+	return false
+}
+
+// ovsFlowEvidence reports on the rule the fault recorded, not on whatever else
+// the table happens to hold. When the recorded port carries no such rule the
+// observation says so, and names the rule that does sit at that priority if
+// there is one, because "the rule moved to another port" and "the rule is gone"
+// are different situations for whoever is reading the report.
+func ovsFlowEvidence(out string, priority int, port, action, expected string) Evidence {
+	line, actions, ok := ovsFlowOn(out, priority, port)
+	if ok && hasAction(actions, action) {
+		return Evidence{Verified: true, Observed: line, Expected: expected}
+	}
+	obs := fmt.Sprintf("no rule at priority=%d on port %s", priority, port)
+	if ok {
+		obs = fmt.Sprintf("the rule at priority=%d on port %s does not %s: %s",
+			priority, port, action, line)
+	} else if other := matchingLine(out, fmt.Sprintf("priority=%d", priority)); other != "" {
+		obs = fmt.Sprintf("%s; a rule at that priority sits elsewhere: %s", obs, other)
+	}
+	return Evidence{Verified: false, Observed: obs, Expected: expected}
 }
 
 // matchingLine returns the first line containing a substring, for evidence that
@@ -631,4 +722,46 @@ func probeServiceHealth(ctx context.Context, e *Env, t Target, addr, port string
 		return -1
 	}
 	return n
+}
+
+// leakProbeSep joins the two tables the route-leak check reads, so one settle
+// loop can watch both. vtysh never prints it.
+const leakProbeSep = "\n--- twinet: bgp ---\n"
+
+// blackholeFor reports whether the routing table entry shown is the one for
+// prefix and discards it.
+//
+// The prefix is checked, not just the word: `show ip route` is asked about one
+// prefix but answers with whatever entry covers it, so a discard route for a
+// different network read as this fault still being in place.
+func blackholeFor(out, prefix string) bool {
+	if !strings.Contains(out, "blackhole") {
+		return false
+	}
+	for _, ln := range strings.Split(out, "\n") {
+		f := strings.Fields(ln)
+		if len(f) == 4 && f[0] == "Routing" && f[1] == "entry" && f[2] == "for" {
+			return f[3] == prefix
+		}
+	}
+	return false
+}
+
+// leakObserved says which half of the leak is still standing, so that a
+// half-repaired lab does not read like an untouched one.
+func leakObserved(prefix string, discarding, originating bool) string {
+	switch {
+	case discarding && originating:
+		return "the router originates " + prefix + ", which it does not own, " +
+			"and discards the traffic that follows it"
+	case discarding:
+		return prefix + " is no longer originated into BGP, so the leak itself is " +
+			"gone, but the discard route is still installed and every packet " +
+			"that reaches this router for " + prefix + " is still dropped"
+	case originating:
+		return "the discard route is gone, but the router still originates " +
+			prefix + ", which it does not own, so traffic for it is still " +
+			"drawn here and this router has no route for what arrives"
+	}
+	return "the router neither originates nor discards " + prefix
 }

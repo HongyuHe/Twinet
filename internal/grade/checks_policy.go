@@ -347,17 +347,27 @@ func checkSixIn4(ctx context.Context, env *Env) Result {
 			// What the gateway would do with a packet for that host is not a
 			// total, and it is the thing the question asks about.
 			nativeFwd := ""
+			unknownFwd := ""
 			if reachable && tunnels[domains[0]] != "" {
-				if via, ok := forwardsVia(ctx, env, gw.ID, addr, tunnels[domains[0]]); !ok {
+				via, ok, err := forwardsVia(ctx, env, gw.ID, deviceAddr6(ctx, env, src),
+					addr, tunnels[domains[0]])
+				switch {
+				case err != nil:
+					unknownFwd = fmt.Sprintf("IPv6 reaches %s, but whether %s encapsulates "+
+						"that traffic could not be established: %v", dst.Name, gw.Name, err)
+				case !ok:
 					nativeFwd = fmt.Sprintf("%s forwards traffic for %s over %s, not through "+
 						"%s: the tunnel's counters moved, but not for this traffic",
 						gw.Name, addr, via, tunnels[domains[0]])
 				}
 			}
-			if reachable && tunnels[domains[0]] != "" && after > before && nativeFwd == "" {
+			if reachable && tunnels[domains[0]] != "" && after > before &&
+				nativeFwd == "" && unknownFwd == "" {
 				throughTunnel = true
 			} else if nativeFwd != "" {
 				reach = nativeFwd
+			} else if unknownFwd != "" {
+				return Errored("tunnel.sixin4", errors.New(unknownFwd))
 			} else if reachable && tunnels[domains[0]] != "" && (before < 0 || after < 0) {
 				// A counter that could not be read is not a counter that did
 				// not move. Reporting it as one deducted for native routing
@@ -394,17 +404,23 @@ func checkSixIn4(ctx context.Context, env *Env) Result {
 						res, err := env.Probe(ctx, bs.ID,
 							[]string{"ping6", "-c", "3", "-W", "5", "-i", "0.3", addr})
 						after := tunnelTx(ctx, env, back.ID, tunnels[domains[1]])
-						via, encapsulated := forwardsVia(ctx, env, back.ID, addr, tunnels[domains[1]])
+						via, encapsulated, verr := forwardsVia(ctx, env, back.ID,
+							deviceAddr6(ctx, env, bs), addr, tunnels[domains[1]])
 						switch {
+						case err != nil || res.ExitCode != 0:
+							throughTunnel = false
+							reach = fmt.Sprintf("%s cannot reach %s at %s over IPv6, so the "+
+								"tunnel carries traffic one way only", bs.Name, bd.Name, addr)
+						case verr != nil:
+							return Errored("tunnel.sixin4", fmt.Errorf(
+								"IPv6 reaches %s from %s, but whether %s encapsulates the "+
+									"return traffic could not be established: %w",
+								bd.Name, bs.Name, back.Name, verr))
 						case !encapsulated:
 							throughTunnel = false
 							reach = fmt.Sprintf("%s forwards traffic for %s over %s, not "+
 								"through %s, so the return path is not encapsulated",
 								back.Name, addr, via, tunnels[domains[1]])
-						case err != nil || res.ExitCode != 0:
-							throughTunnel = false
-							reach = fmt.Sprintf("%s cannot reach %s at %s over IPv6, so the "+
-								"tunnel carries traffic one way only", bs.Name, bd.Name, addr)
 						case before < 0 || after < 0:
 							throughTunnel = false
 							reach = fmt.Sprintf("IPv6 reaches %s from %s, but %s's packet "+
@@ -2545,24 +2561,79 @@ func selectedRoute(line string) bool {
 	return selectedRouteRE.MatchString(strings.TrimSpace(line))
 }
 
-// forwardsVia reports whether a device would send a packet for an address out
-// of the interface it is supposed to, and names the interface it would use.
+// forwardsVia reports whether a device would send *this host's* packet for an
+// address out of the interface it is supposed to, and names the interface it
+// would use.
 //
 // This is what the tunnel question is about. A counter says traffic crossed the
 // tunnel; it does not say *which* traffic, and a total can be moved by anything
 // the submission cares to send.
-func forwardsVia(ctx context.Context, env *Env, deviceID, addr, want string) (string, bool) {
-	res, err := env.Probe(ctx, deviceID, []string{"ip", "-6", "route", "get", addr})
-	if err != nil || res.ExitCode != 0 {
-		return "", false
-	}
-	f := strings.Fields(res.Stdout)
-	for i := 0; i+1 < len(f); i++ {
-		if f[i] == "dev" {
-			return f[i+1], f[i+1] == want
+//
+// The packet has to be described the way it really arrives. A bare `ip -6 route
+// get <dst>` answers for a packet the gateway *originates*: it carries no
+// source and no arrival interface, so a policy rule keyed on either never
+// fires and the lookup falls through to the main table. A submission that put
+// its tunnel routes in another table and pointed an `ip -6 rule` at it -- a
+// perfectly ordinary way to write the answer -- was told its traffic was
+// "routed natively rather than encapsulated" while the tunnel's own counters
+// were incrementing by exactly the packets it had just sent.
+//
+// The kernel is asked about the real packet instead: from the sending host's
+// address, arriving on the interface that faces it. Neither has to be guessed
+// -- the interface a reply to that host would leave by is the one its packets
+// arrive on.
+//
+// A lookup that cannot be made returns an error rather than a name. Not being
+// able to ask is not the same as an answer of "natively", and reporting the
+// second when the first happened is how this check came to fail a working
+// tunnel.
+func forwardsVia(ctx context.Context, env *Env, deviceID, src, dst, want string) (string, bool, error) {
+	// A rule this lookup cannot express is a rule that could change the answer
+	// without showing up in it.
+	if res, err := env.Probe(ctx, deviceID, []string{"ip", "-6", "rule", "show"}); err == nil {
+		if _, unsupported := parseIPRules(res.Stdout); len(unsupported) > 0 {
+			return "", false, fmt.Errorf("IPv6 policy rule %q selects on something a "+
+				"route lookup cannot be asked about, so where this traffic goes cannot "+
+				"be established", unsupported[0])
 		}
 	}
-	return "", false
+
+	devOf := func(out string) string {
+		f := strings.Fields(out)
+		for i := 0; i+1 < len(f); i++ {
+			if f[i] == "dev" {
+				return f[i+1]
+			}
+		}
+		return ""
+	}
+
+	query := []string{"ip", "-6", "route", "get", dst}
+	if src != "" {
+		query = append(query, "from", src)
+		// The interface facing the sender, which is where its packets land.
+		if res, err := env.Probe(ctx, deviceID,
+			[]string{"ip", "-6", "route", "get", src}); err == nil && res.ExitCode == 0 {
+			if in := devOf(res.Stdout); in != "" {
+				query = append(query, "iif", in)
+			}
+		}
+	}
+
+	res, err := env.Probe(ctx, deviceID, query)
+	if err != nil {
+		return "", false, err
+	}
+	if res.ExitCode != 0 {
+		return "", false, fmt.Errorf("%s could not be asked where it sends traffic "+
+			"for %s: %s", deviceID, dst, firstLine(res.Stdout+res.Stderr))
+	}
+	via := devOf(res.Stdout)
+	if via == "" {
+		return "", false, fmt.Errorf("%s named no outgoing interface for traffic to %s",
+			deviceID, dst)
+	}
+	return via, via == want, nil
 }
 
 // crossDatacentreGaps names the host pairs that cannot reach each other across
@@ -2652,6 +2723,348 @@ func sortedInts(m map[int]bool) []int {
 	return out
 }
 
+// kernelHop is where the kernel itself says it would send a packet: the next
+// hop address, and the interface it would leave by. Either may be empty -- a
+// destination on a connected subnet has no next hop -- and both are compared
+// against the slow link, because a route may be named either way.
+type kernelHop struct {
+	via string
+	dev string
+}
+
+// probeAddr picks an address inside prefix to ask the kernel about. The network
+// address of a subnet is not a useful target, so the first host address is used;
+// a host route is asked about directly.
+func probeAddr(prefix string) string {
+	p, err := netip.ParsePrefix(prefix)
+	if err != nil || !p.Addr().Is4() {
+		return ""
+	}
+	p = p.Masked()
+	if p.Bits() >= 31 {
+		return p.Addr().String()
+	}
+	return p.Addr().Next().String()
+}
+
+// parseKernelHops reads the output of the batched "ip route get" script: an
+// echoed address, then the first line of the kernel's answer for it.
+func parseKernelHops(out string) map[string]kernelHop {
+	hops := map[string]kernelHop{}
+	var want string
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "@ ") {
+			want = strings.TrimPrefix(line, "@ ")
+			continue
+		}
+		if want == "" {
+			continue
+		}
+		f := strings.Fields(line)
+		var h kernelHop
+		for i := 0; i+1 < len(f); i++ {
+			switch f[i] {
+			case "via":
+				h.via = f[i+1]
+			case "dev":
+				h.dev = f[i+1]
+			}
+		}
+		// "RTNETLINK answers: Network is unreachable" and similar carry
+		// neither field; there is nothing to compare, so nothing is recorded.
+		if h.via != "" || h.dev != "" {
+			hops[want] = h
+		}
+		want = ""
+	}
+	return hops
+}
+
+// ipRule is one policy rule, reduced to the packet properties it selects on.
+type ipRule struct {
+	prio  string
+	from  string
+	to    string
+	iif   string
+	mark  string
+	table string
+	text  string
+}
+
+// selectors names the packet properties this rule keys on, for evidence.
+func (r ipRule) selectors() string {
+	var parts []string
+	if r.from != "" && r.from != "all" {
+		parts = append(parts, "from "+r.from)
+	}
+	if r.iif != "" {
+		parts = append(parts, "arriving on "+r.iif)
+	}
+	if r.mark != "" {
+		parts = append(parts, "marked "+r.mark)
+	}
+	if len(parts) == 0 {
+		return "rule " + r.prio
+	}
+	return strings.Join(parts, " ")
+}
+
+// isDefaultRule reports whether this is one of the three rules the kernel
+// installs by itself. Anything else was put there by the submission.
+func isDefaultRule(r ipRule) bool {
+	if r.from != "all" || r.to != "" || r.iif != "" || r.mark != "" {
+		return false
+	}
+	switch r.table {
+	case "local":
+		return r.prio == "0"
+	case "main":
+		return r.prio == "32766"
+	case "default":
+		return r.prio == "32767"
+	}
+	return false
+}
+
+// unsimulatable are rule selectors that a route lookup cannot be asked to
+// stand in for. A rule keyed on one of these is not something this check can
+// reason about, and saying nothing goes the slow way would be a guess.
+var unsimulatable = map[string]bool{
+	"not": true, "oif": true, "tos": true, "dsfield": true, "ipproto": true,
+	"sport": true, "dport": true, "uidrange": true, "l3mdev": true,
+	"suppress_prefixlength": true, "suppress_ifgroup": true,
+}
+
+// parseIPRules reads "ip rule show" and returns the rules the submission added,
+// along with any it added that cannot be simulated.
+func parseIPRules(out string) (rules []ipRule, unsupported []string) {
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		r := ipRule{text: strings.Join(strings.Fields(line), " ")}
+		if i := strings.Index(line, ":"); i > 0 {
+			r.prio = strings.TrimSpace(line[:i])
+			line = strings.TrimSpace(line[i+1:])
+		}
+		f := strings.Fields(line)
+		bad := false
+		for i := 0; i < len(f); i++ {
+			key := f[i]
+			if unsimulatable[key] {
+				bad = true
+				continue
+			}
+			if i+1 >= len(f) {
+				continue
+			}
+			switch key {
+			case "from":
+				r.from, i = f[i+1], i+1
+			case "to":
+				r.to, i = f[i+1], i+1
+			case "iif":
+				r.iif, i = f[i+1], i+1
+			case "fwmark":
+				r.mark, i = f[i+1], i+1
+			case "lookup", "table":
+				r.table, i = f[i+1], i+1
+			}
+		}
+		if bad {
+			unsupported = append(unsupported, r.text)
+			continue
+		}
+		if isDefaultRule(r) {
+			continue
+		}
+		rules = append(rules, r)
+	}
+	return rules, unsupported
+}
+
+// pickIif names an interface a forwarded packet could plausibly have arrived
+// on. The kernel refuses a lookup for a packet it did not originate unless it
+// is told one, and any interface that is up will do when no rule keys on which.
+func pickIif(out string) string {
+	var names []string
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		if len(f) < 3 {
+			continue
+		}
+		name := strings.TrimSuffix(f[1], ":")
+		if i := strings.Index(name, "@"); i > 0 {
+			name = name[:i]
+		}
+		if name == "" || name == "lo" || !strings.Contains(f[2], "UP") {
+			continue
+		}
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	if len(names) == 0 {
+		return ""
+	}
+	return names[0]
+}
+
+// kernelAnswer is where the kernel said it would send one packet.
+type kernelAnswer struct {
+	addr string
+	ctx  string // how the packet was described, "" if the router originates it
+	hop  kernelHop
+}
+
+// routeProbe is one lookup to make: a destination, plus the packet context it
+// is made under.
+type routeProbe struct {
+	addr string
+	ctx  string
+	args string
+}
+
+// standIn picks a source address for a rule that matches any source. Which one
+// does not matter for whether the rule fires, only that it is not this
+// router's own -- the kernel answers for a packet it originated otherwise.
+func standIn(addrs []string, dst string) string {
+	for _, a := range addrs {
+		if a != dst {
+			return a
+		}
+	}
+	return ""
+}
+
+// routeProbes lists the lookups needed to learn where each address really
+// goes. Every destination is asked about as a packet this router originates,
+// and then once more under each policy rule the submission added -- presented
+// as a packet that rule would match, since a rule keyed on the source governs
+// traffic the router forwards and is invisible to a plain lookup.
+func routeProbes(addrs []string, rules []ipRule, iif string) ([]routeProbe, error) {
+	var probes []routeProbe
+	for _, a := range addrs {
+		probes = append(probes, routeProbe{addr: a})
+	}
+	for _, r := range rules {
+		mark := r.mark
+		if i := strings.Index(mark, "/"); i > 0 {
+			mark = mark[:i]
+		}
+		src := ""
+		if r.from != "" && r.from != "all" {
+			if src = probeAddr(r.from); src == "" {
+				if _, err := netip.ParseAddr(r.from); err == nil {
+					src = r.from
+				}
+			}
+			if src == "" {
+				return nil, fmt.Errorf("policy rule %q selects on a source that "+
+					"cannot be asked about", r.text)
+			}
+		}
+		in := r.iif
+		if in == "" {
+			in = iif
+		}
+		// A rule keyed only on the mark needs no forwarding context: the kernel
+		// will answer for a marked packet the router originates itself.
+		markOnly := src == "" && r.iif == "" && mark != ""
+		if !markOnly && in == "" {
+			return nil, fmt.Errorf("policy rule %q needs an arrival interface to "+
+				"be asked about and this router has none", r.text)
+		}
+		for _, a := range addrs {
+			var args []string
+			if !markOnly {
+				from := src
+				if from == "" {
+					from = standIn(addrs, a)
+				}
+				if from == "" {
+					return nil, fmt.Errorf("policy rule %q could not be asked about", r.text)
+				}
+				args = append(args, "from", from, "iif", in)
+			}
+			if mark != "" {
+				args = append(args, "mark", mark)
+			}
+			probes = append(probes, routeProbe{
+				addr: a,
+				ctx:  r.selectors(),
+				args: strings.Join(args, " "),
+			})
+		}
+	}
+	return probes, nil
+}
+
+// kernelVia asks one router where it would really send each address.
+//
+// The table read from the routing daemon is only the daemon's opinion. A policy
+// rule ("ip rule") sends the lookup to a different table before the daemon's
+// table is ever consulted, and a route the daemon selected but failed to push
+// is not in the kernel at all. Neither appears in "show ip route", so a check
+// that reads only that reports on a forwarding decision it never looked at.
+//
+// A plain lookup is not enough either. It answers for a packet the router
+// originates, with no source address, so a rule keyed on the source -- which is
+// exactly how transit traffic is singled out -- never fires and the fast path
+// is reported while forwarded traffic takes the slow one. So the rules are read
+// first, and each one is asked about as a packet it would match.
+//
+// Two commands per router, not one per lookup: the cost here is the round trip.
+func kernelVia(ctx context.Context, env *Env, deviceID string, addrs []string) ([]kernelAnswer, error) {
+	if len(addrs) == 0 {
+		return nil, nil
+	}
+	res, err := env.Probe(ctx, deviceID, []string{"sh", "-c", "ip rule show; echo '@@'; ip -o link show"})
+	if err != nil {
+		return nil, err
+	}
+	rulesOut, linksOut, _ := strings.Cut(res.Stdout, "@@")
+	rules, unsupported := parseIPRules(rulesOut)
+	if len(unsupported) > 0 {
+		return nil, fmt.Errorf("policy rule %q selects on something a route lookup "+
+			"cannot stand in for", unsupported[0])
+	}
+	probes, err := routeProbes(addrs, rules, pickIif(linksOut))
+	if err != nil {
+		return nil, err
+	}
+
+	var b strings.Builder
+	for i, p := range probes {
+		fmt.Fprintf(&b, "echo '@ %d'; ip route get %s %s 2>&1 | head -1; ", i, p.addr, p.args)
+	}
+	res, err = env.Probe(ctx, deviceID, []string{"sh", "-c", b.String()})
+	if err != nil {
+		return nil, err
+	}
+
+	hops := parseKernelHops(res.Stdout)
+	var answers []kernelAnswer
+	for key, h := range hops {
+		i, err := strconv.Atoi(key)
+		if err != nil || i < 0 || i >= len(probes) {
+			continue
+		}
+		answers = append(answers, kernelAnswer{addr: probes[i].addr, ctx: probes[i].ctx, hop: h})
+	}
+	sort.Slice(answers, func(i, j int) bool {
+		if answers[i].addr != answers[j].addr {
+			return answers[i].addr < answers[j].addr
+		}
+		return answers[i].ctx < answers[j].ctx
+	})
+	return answers, nil
+}
+
 // installedVia names the destinations whose selected route leaves by one of the
 // slow links, when a path through a fast one is also available. A link is
 // recognised by the neighbour's address or by the local interface it leaves by,
@@ -2659,8 +3072,9 @@ func sortedInts(m map[int]bool) []int {
 // no next-hop address in the table at all.
 //
 // It reads the routing table rather than BGP, because that is where a static
-// route, a policy route or an administrative distance shows up and BGP does
-// not. Every router is asked, and a router that cannot be read stops the check:
+// route or an administrative distance shows up and BGP does not, and it then
+// asks the kernel directly, because a policy rule shows up in neither. Every
+// router is asked, and a router that cannot be read stops the check:
 // concluding "nothing goes the slow way" from the routers that answered is the
 // kind of verdict this project keeps having to take back.
 func installedVia(ctx context.Context, env *Env, slow []string, slowIf map[string]map[string]bool, fast []string) (via []string, unreadable string) {
@@ -2697,6 +3111,19 @@ func installedVia(ctx context.Context, env *Env, slow []string, slowIf map[strin
 			}
 		}
 	}
+	// The destinations to ask the kernel about, and the prefix each one stands
+	// for. Only prefixes with a fast alternative are worth asking about, which
+	// is the same population the table scan below considers.
+	probes := map[string]string{}
+	var probeList []string
+	for prefix := range alt {
+		if a := probeAddr(prefix); a != "" {
+			probes[a] = prefix
+			probeList = append(probeList, a)
+		}
+	}
+	sort.Strings(probeList)
+
 	for _, r := range env.Routers() {
 		var routes map[string][]struct {
 			Protocol string `json:"protocol"`
@@ -2711,6 +3138,7 @@ func installedVia(ctx context.Context, env *Env, slow []string, slowIf map[strin
 			return nil, fmt.Sprintf("%s: its routing table could not be read (%v), so where "+
 				"its traffic actually goes could not be established", r.Name, err)
 		}
+		flagged := map[string]bool{}
 		for prefix, entries := range routes {
 			if !alt[prefix] {
 				continue
@@ -2735,9 +3163,34 @@ func installedVia(ctx context.Context, env *Env, slow []string, slowIf map[strin
 						continue
 					}
 					via = append(via, fmt.Sprintf("%s on %s (%s)", prefix, r.Name, e.Protocol))
+					flagged[prefix] = true
 					break
 				}
 			}
+		}
+
+		// Now ask the kernel the same question. A policy rule diverts the
+		// lookup to a table the daemon never shows, so agreeing with the table
+		// above is not the same as agreeing with what the machine does.
+		hops, err := kernelVia(ctx, env, r.ID, probeList)
+		if err != nil {
+			return nil, fmt.Sprintf("%s: where it would really send traffic could not be "+
+				"established (%v)", r.Name, err)
+		}
+		for _, a := range hops {
+			prefix := probes[a.addr]
+			if flagged[prefix] {
+				continue
+			}
+			if !isSlow[a.hop.via] && !slowIf[r.Name][a.hop.dev] {
+				continue
+			}
+			where := "kernel"
+			if a.ctx != "" {
+				where += ", " + a.ctx
+			}
+			via = append(via, fmt.Sprintf("%s on %s (%s)", prefix, r.Name, where))
+			flagged[prefix] = true
 		}
 	}
 	return via, ""

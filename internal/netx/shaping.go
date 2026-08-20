@@ -80,7 +80,16 @@ func ApplyShaping(link netlink.Link, s Shaping) error {
 	// from the actual BDP instead, with a generous floor.
 	attrs.Limit = netemLimit(s, mtu)
 
-	if err := netlink.QdiscAdd(netlink.NewNetem(
+	// Replace, not add. clearRootQdisc deliberately leaves a pfifo_fast in
+	// place, so adding at the root fails with EEXIST whenever one is there --
+	// and one is there as soon as anybody runs the ordinary way of taking
+	// netem off an interface, `tc qdisc replace ... root pfifo_fast`. That is
+	// exactly what a student or an agent does when undoing a link fault by
+	// hand, and after it the platform could never put the link's own delay and
+	// rate back: every later episode on that link ran with different physics
+	// than the manifest describes, silently. Replace installs at the root
+	// whatever is already sitting there.
+	if err := netlink.QdiscReplace(netlink.NewNetem(
 		netlink.QdiscAttrs{
 			LinkIndex: idx,
 			Handle:    netlink.MakeHandle(1, 0),
@@ -121,7 +130,7 @@ func ApplyShaping(link netlink.Link, s Shaping) error {
 		Buffer: netlink.Xmittime(rate, uint32(burst)),
 		Limit:  tbfLimit(rate, latencyUS, burst),
 	}
-	if err := netlink.QdiscAdd(tbf); err != nil {
+	if err := netlink.QdiscReplace(tbf); err != nil {
 		return fmt.Errorf("interface %s: add tbf: %w", name, err)
 	}
 	return nil

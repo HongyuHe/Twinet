@@ -181,6 +181,46 @@ type Report struct {
 // Failed reports whether any required step failed.
 func (r *Report) Failed() bool { return len(r.ScopeErrors) > 0 }
 
+// Completed counts the steps in a stage that actually ran and succeeded.
+//
+// The count a deployment reports has to come from here rather than from the
+// topology it set out to build. The plan is what was intended: it is the same
+// number whether the run was a dry run, was restricted to one AS with --only,
+// or fell over half way. Summarising a deploy with the manifest's own device
+// count is how "deployed 57 devices and 74 links" came to be printed by a
+// --dry-run that created nothing.
+func (r *Report) Completed(stage Stage) int {
+	n := 0
+	for _, res := range r.Results {
+		if res.Step != nil && res.Step.Stage == stage && !res.Skipped && res.Err == nil {
+			n++
+		}
+	}
+	return n
+}
+
+// Planned counts the steps in a stage that the plan contained, run or not.
+func (r *Report) Planned(stage Stage) int {
+	n := 0
+	for _, res := range r.Results {
+		if res.Step != nil && res.Step.Stage == stage {
+			n++
+		}
+	}
+	return n
+}
+
+// Done counts every step that ran and succeeded, across all stages.
+func (r *Report) Done() int {
+	n := 0
+	for _, res := range r.Results {
+		if !res.Skipped && res.Err == nil {
+			n++
+		}
+	}
+	return n
+}
+
 // FailedScopes returns the affected scopes in sorted order.
 func (r *Report) FailedScopes() []string {
 	out := make([]string, 0, len(r.ScopeErrors))
