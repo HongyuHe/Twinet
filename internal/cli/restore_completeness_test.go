@@ -116,3 +116,31 @@ func TestRestoreAcceptsAnArchiveItFullyApplies(t *testing.T) {
 		t.Errorf("restored %d device entries, want 2", n)
 	}
 }
+
+// Restore and batch grading each decided separately what an archive may
+// contain, which is how one of them came to ignore the published
+// authorisations while the other applied them. Both now ask the same
+// classifier, so a member added to the save side cannot be handled in one
+// consumer and forgotten in the other; whichever has not been taught about it
+// refuses by name instead of marking a group on part of their work.
+func TestBundleClassifierPlacesEveryMemberOrRefuses(t *testing.T) {
+	m, err := classifyBundle(map[string][]byte{
+		"ATL.conf":  []byte("router bgp 3\n"),
+		"h1.sh":     []byte("ip route replace default via 3.0.0.2\n"),
+		"roas.json": []byte("[]"),
+	})
+	if err != nil {
+		t.Fatalf("refused an archive of the shape every save produces: %v", err)
+	}
+	if len(m.Configs) != 1 || len(m.Scripts) != 1 || len(m.ROAs) == 0 {
+		t.Errorf("misplaced a member: %d config(s), %d script(s), %d ROA byte(s)",
+			len(m.Configs), len(m.Scripts), len(m.ROAs))
+	}
+
+	if _, err := classifyBundle(map[string][]byte{
+		"ATL.conf":    []byte("router bgp 3\n"),
+		"answers.txt": []byte("q1: yes\n"),
+	}); err == nil {
+		t.Error("placed nothing for a member it does not understand, and said so to nobody")
+	}
+}

@@ -624,6 +624,59 @@ func readBundle(p string) (Bundle, map[string][]byte, error) {
 	return b, files, nil
 }
 
+// bundleMembers is the one place that says what a submission archive may
+// contain.
+//
+// Two consumers used to answer that question separately -- restore by file
+// extension, batch grading by a switch -- and when the published
+// authorisations were added to the save side, both quietly ignored them.
+// Restore reported success on work it had not fully loaded; batch grading
+// would have marked a whole class on a submission it had only partly read.
+// One classifier means the next addition cannot be handled in one place and
+// forgotten in the other.
+type bundleMembers struct {
+	Configs map[string][]byte // short device name -> FRR configuration
+	Scripts map[string][]byte // short device name -> commands to replay
+	ROAs    []byte            // what the group published, if anything
+}
+
+// classifyBundle sorts an archive's members, refusing any it cannot place.
+//
+// The archive is one Twinet wrote and signed, so an unplaceable member is not
+// a stray file to step over: it is part of the answer that this version does
+// not know how to apply. Saying so is the difference between an operator who
+// upgrades and one who silently marks a class on partial work.
+func classifyBundle(files map[string][]byte) (bundleMembers, error) {
+	m := bundleMembers{Configs: map[string][]byte{}, Scripts: map[string][]byte{}}
+	for name, body := range files {
+		switch {
+		case name == "roas.json":
+			m.ROAs = body
+		case strings.HasSuffix(name, ".conf"):
+			m.Configs[strings.TrimSuffix(name, ".conf")] = body
+		case strings.HasSuffix(name, ".sh"):
+			m.Scripts[strings.TrimSuffix(name, ".sh")] = body
+		default:
+			return m, fmt.Errorf(
+				"archive contains %s, which this version of twinet does not know how to "+
+					"apply; it is part of the saved answer, so applying the rest and "+
+					"reporting success would report work as loaded that is not", name)
+		}
+	}
+	return m, nil
+}
+
+// sortedKeys returns a map's keys in order, so a restore applies an archive
+// the same way every time.
+func sortedKeys(m map[string][]byte) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
 func restoreBundle(ctx context.Context, top *model.Topology, b Bundle,
 	files map[string][]byte, exec func(context.Context, string, []string) (execResult, error)) (int, error) {
 
@@ -636,34 +689,18 @@ func restoreBundle(ctx context.Context, top *model.Topology, b Bundle,
 		byName[strings.ToUpper(d.Name)] = d
 	}
 
-	names := make([]string, 0, len(files))
-	for n := range files {
-		names = append(names, n)
+	m, err := classifyBundle(files)
+	if err != nil {
+		return 0, err
 	}
-	sort.Strings(names)
-
-	// Every archive member has to be accounted for before this returns. The
-	// archive is one Twinet wrote and signed, so a member this code does not
-	// recognise is not junk to step over: it is a piece of the student's
-	// answer that this version cannot put back. Skipping it quietly is how
-	// the published authorisations were lost -- they were added to save and
-	// wired into the grading harness, and this function, which matched on
-	// file extension and ignored everything else, said nothing and reported
-	// the restore as complete.
-	handled := map[string]bool{}
 
 	n := 0
-	for _, name := range names {
-		if !strings.HasSuffix(name, ".conf") {
-			continue
-		}
-		handled[name] = true
-		short := strings.TrimSuffix(name, ".conf")
+	for _, short := range sortedKeys(m.Configs) {
 		d, ok := byName[strings.ToUpper(short)]
 		if !ok {
 			return n, fmt.Errorf("archive names a router %q that AS %d does not have", short, b.AS)
 		}
-		if err := loadFRRConfig(ctx, exec, d, string(files[name])); err != nil {
+		if err := loadFRRConfig(ctx, exec, d, string(m.Configs[short])); err != nil {
 			return n, err
 		}
 		n++
@@ -672,17 +709,12 @@ func restoreBundle(ctx context.Context, top *model.Topology, b Bundle,
 	// The rest of the answer: VLANs, addresses, routes and tunnels. Applied
 	// after the routing configuration, because a tunnel or a host route may
 	// depend on an address it has just brought up.
-	for _, name := range names {
-		if !strings.HasSuffix(name, ".sh") {
-			continue
-		}
-		handled[name] = true
-		short := strings.TrimSuffix(name, ".sh")
+	for _, short := range sortedKeys(m.Scripts) {
 		d, ok := byName[strings.ToUpper(short)]
 		if !ok {
 			return n, fmt.Errorf("archive names a device %q that AS %d does not have", short, b.AS)
 		}
-		body := string(files[name])
+		body := string(m.Scripts[short])
 		if err := checkSubmittedScript(body); err != nil {
 			return n, fmt.Errorf("%s: %w", d.ID, err)
 		}
@@ -720,19 +752,9 @@ func restoreBundle(ctx context.Context, top *model.Topology, b Bundle,
 	// Without this the restore reported success and the group lost the mark
 	// for publishing -- the exact loss the save side documents having already
 	// measured once, at 9.70 out of 10.
-	if body, ok := files["roas.json"]; ok {
-		handled["roas.json"] = true
-		if err := replayROAs(ctx, exec, top, as, body); err != nil {
+	if len(m.ROAs) > 0 {
+		if err := replayROAs(ctx, exec, top, as, m.ROAs); err != nil {
 			return n, fmt.Errorf("restoring what AS %d published at the trust anchor: %w", b.AS, err)
-		}
-	}
-
-	for _, name := range names {
-		if !handled[name] {
-			return n, fmt.Errorf(
-				"archive contains %s, which this version of twinet does not know how to "+
-					"restore; it is part of the saved answer, so applying the rest and "+
-					"reporting success would report work as loaded that is not", name)
 		}
 	}
 	return n, nil

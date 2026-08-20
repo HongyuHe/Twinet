@@ -741,15 +741,16 @@ func submissionFromArchive(p string, class *model.Topology) (submission, error) 
 		Group: group, AS: b.AS, Dir: p,
 		Files: map[string]string{}, Scripts: map[string]string{},
 	}
-	for name, body := range files {
-		switch {
-		case name == "roas.json":
-			sub.ROAs = body
-		case strings.HasSuffix(name, ".conf"):
-			sub.Files[strings.TrimSuffix(name, ".conf")] = string(body)
-		case strings.HasSuffix(name, ".sh"):
-			sub.Scripts[strings.TrimSuffix(name, ".sh")] = string(body)
-		}
+	m, err := classifyBundle(files)
+	if err != nil {
+		return submission{}, fmt.Errorf("%s: %w", filepath.Base(p), err)
+	}
+	sub.ROAs = m.ROAs
+	for name, body := range m.Configs {
+		sub.Files[name] = string(body)
+	}
+	for name, body := range m.Scripts {
+		sub.Scripts[name] = string(body)
 	}
 	if len(sub.Files) == 0 && len(sub.Scripts) == 0 {
 		return submission{}, fmt.Errorf("%s contains no configuration", filepath.Base(p))
