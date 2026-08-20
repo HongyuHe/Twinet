@@ -801,57 +801,7 @@ func attestReference(ctx context.Context, top *model.Topology, rubric *grade.Rub
 			rep := grade.Run(ctx, rubric, &grade.Env{Topology: top, AS: asn, Exec: exec},
 				grade.RunOptions{ConvergeTimeout: converge, Parallel: 4})
 
-			// Full marks is not enough on its own.
-			//
-			// A check that could not run is excluded and the remaining weights
-			// are rescaled, so a question can score full marks with half its
-			// checks errored -- and the report says so, in NeedsReview, which
-			// this ignored. An attestation that accepts a report the grader has
-			// marked untrustworthy is not an attestation.
-			var why string
-			switch {
-			case rep.Total < rubric.MaxTotal():
-				// Which check, not just the total.
-				//
-				// "AS 5 scores 9.80 of 10.00" tells an operator that something
-				// is wrong and nothing about what, so the only way to act on it
-				// was to grade the system again by hand and hope it failed the
-				// same way. The reference is expected to pass everything, so
-				// anything that did not is worth naming.
-				var short []string
-				for _, q := range rep.Questions {
-					for _, r := range q.Results {
-						if r.Status == grade.StatusPass {
-							continue
-						}
-						detail := fmt.Sprintf("%v", r.Evidence.Observed)
-						if strings.TrimSpace(detail) == "" {
-							detail = r.Err
-						}
-						short = append(short, fmt.Sprintf("%s (%s: %s)",
-							r.Check, r.Status, firstLine(detail)))
-					}
-				}
-				why = fmt.Sprintf("scores %.2f of %.2f", rep.Total, rubric.MaxTotal())
-				if len(short) > 0 {
-					why += ": " + strings.Join(truncateStrings(short, 3), "; ")
-				}
-			case rep.NeedsReview:
-				why = "scores full marks but is flagged for review"
-				if rep.Err != "" {
-					why += ": " + firstLine(rep.Err)
-				}
-			default:
-				for _, q := range rep.Questions {
-					for _, r := range q.Results {
-						if r.Status != grade.StatusPass {
-							why = fmt.Sprintf("scores full marks, but %s did not pass (%s)",
-								r.Check, r.Status)
-						}
-					}
-				}
-			}
-			if why != "" {
+			if why := referenceComplaint(rep, rubric.MaxTotal()); why != "" {
 				mu.Lock()
 				bad = append(bad, fmt.Sprintf("AS %d %s", asn, why))
 				mu.Unlock()
@@ -874,6 +824,73 @@ func attestReference(ctx context.Context, top *model.Topology, rubric *grade.Rub
 		"-m %s --solve` and check it reported no problems. Pass --skip-reference-check only "+
 		"for a lab you have just checked by hand",
 		strings.Join(bad, "\n  "), manifest)
+}
+
+// referenceComplaint says what is wrong with the reference solution's report,
+// or returns empty if nothing is.
+//
+// Full marks is not enough on its own: a check that could not run is excluded
+// and the remaining weights are rescaled, so a question can score full marks
+// with half its checks errored. The report says so in NeedsReview, which this
+// gate once ignored -- an attestation that accepts a report the grader has
+// marked untrustworthy is not an attestation.
+//
+// But the converse trap is worse, because it fires on a lab that is correct.
+// StatusNotApplicable is not a failure: the scorer deliberately leaves such a
+// check out of the weighting, which is exactly why the AS arrives here with
+// full marks. Treating it as "did not pass" was this gate contradicting the
+// grader it exists to guard, and it refused every lab containing a stub system
+// -- cos461 has four, so `grade class` could not be run on the reference
+// solution at all. The remedy on offer, --skip-reference-check, disables the
+// one gate that stops a whole class being marked against a broken internet.
+func referenceComplaint(rep *grade.Report, max float64) string {
+	notable := func(s grade.Status) bool {
+		return s != grade.StatusPass && s != grade.StatusNotApplicable
+	}
+
+	switch {
+	case rep.Total < max:
+		// Which check, not just the total. "AS 5 scores 9.80 of 10.00" tells
+		// an operator that something is wrong and nothing about what, so the
+		// only way to act on it was to grade the system again by hand and hope
+		// it failed the same way.
+		var short []string
+		for _, q := range rep.Questions {
+			for _, r := range q.Results {
+				if !notable(r.Status) {
+					continue
+				}
+				detail := fmt.Sprintf("%v", r.Evidence.Observed)
+				if strings.TrimSpace(detail) == "" {
+					detail = r.Err
+				}
+				short = append(short, fmt.Sprintf("%s (%s: %s)",
+					r.Check, r.Status, firstLine(detail)))
+			}
+		}
+		why := fmt.Sprintf("scores %.2f of %.2f", rep.Total, max)
+		if len(short) > 0 {
+			why += ": " + strings.Join(truncateStrings(short, 3), "; ")
+		}
+		return why
+
+	case rep.NeedsReview:
+		why := "scores full marks but is flagged for review"
+		if rep.Err != "" {
+			why += ": " + firstLine(rep.Err)
+		}
+		return why
+	}
+
+	for _, q := range rep.Questions {
+		for _, r := range q.Results {
+			if notable(r.Status) {
+				return fmt.Sprintf("scores full marks, but %s did not pass (%s)",
+					r.Check, r.Status)
+			}
+		}
+	}
+	return ""
 }
 
 // atLeastOne keeps a concurrency limit usable when the caller passed zero.
