@@ -1279,6 +1279,8 @@ someone has checked.
 | Advanced-course exercises | M7 | Both are done. MPLS and VRF -- `examples/advnet` is the ETH BGP-free-core and BGP/MPLS L3VPN exercise, verified end to end on the cluster: the two sites of each bank reach each other over a two-label stack, neither bank reaches the other, and the core router has no BGP instance and four operational LDP neighbours. It is graded: `examples/advnet/rubric/advnet.yaml` is worth 6 points across the BGP-free core, carrying each customer between its sites, and keeping the customers apart. Verified to discriminate on the cluster, not merely to be satisfiable -- the reference scores 6/6; putting BGP on the core scores 0.8/2 on that question alone; making both tables import both route targets scores 0/2 on isolation while reachability still passes; shutting LDP on one edge scores 3.95/6 and the label-switching check names the prefix that stopped being carried. Multicast is `examples/multicast`, the course's own six-router topology with PIM sparse mode and IGMP left to the student, graded out of 4 by `examples/multicast/rubric/multicast.yaml`: two marks for configuration that can be read back and two for a packet that a host actually received while a host that did not join heard nothing. Verified to discriminate: the reference scores 4/4, and making one router passive on its three transit interfaces scores 3.30 -- the configuration check naming all six interfaces on both ends of the three links, and the delivery check naming the site that received nothing |
 | The 15 unimplemented NIKA fault types | M8 | Each needs a substrate Twinet does not emulate (6 P4/BMv2, 4 Kubernetes, 3 SDN-southbound, 2 others); adding them means adding that substrate. The DHCP family is now implemented: 45 of NIKA's 60 types are covered, verified by asking real clients for leases rather than by reading configuration back. See [10](10_fault_injection.md) |
 | Load-balancer service, traffic generation | M8 | Prerequisites for two of those |
+| Heterogeneous vendors: a second network operating system | M9 | Designed in [03 §9](03_topology_model.md), built no further. Four device kinds exist -- `router`, `host`, `switch`, `service` -- and every router is FRR, so a lab cannot pose the question that dominates real operations: two vendors reading one standard differently. What is already right is that the grader gates `vtysh` behind a router-kind check rather than assuming it everywhere, so the checks do not silently mis-parse a non-FRR device; what is missing is `internal/nos`, the vendor-neutral state model the checks would read, capability declaration so a manifest asking a NOS for what it cannot do is refused at validation, and a second image. Acceptance is in the roadmap: change two of `examples/cos461`'s routers to a second NOS and the reference scores identically under the unchanged rubric |
+| Topology types within an AS | M10 | Designed in [03 §10](03_topology_model.md), built no further. The inter-AS graph is generated from a declared shape; the interior of an AS is not, and is written out device by device in every template. `peerings.generator` has no interior counterpart, so `ring`, `two-tier` and `clos` cannot be asked for. Acceptance is that a Clos interior deploys, converges, grades and places across three nodes, and that today's labs re-expressed as `kind: explicit` produce identical topology hashes |
 
 ### Addresses the assignment lets students choose
 
@@ -2444,3 +2446,308 @@ After the fix, the same submission through the same path:
 graded 1 submission(s) against advnet-mpls-l3vpn in 4m15.616s
   mean 6.00  median 6.00  min 6.00  max 6.00  (out of 6.00)
 ```
+
+### 126. One datagram, and a mark for the network that lost it
+
+Four checks sent a single datagram and, if it did not arrive, told the student
+that something on the path was filtering by protocol:
+
+| where | what it says |
+| --- | --- |
+| `dataplane.internal_reachability` | *"a datagram from X to Y never arrived ... though pings and connections do: something on the path is filtering by protocol"* |
+| the backbone loopback pair | *"answers pings and connections ... but no datagram from it arrives"* |
+| `vpn.isolation` (`vpnUDPGap`) | *"though pings do: the VPN is filtering by protocol"* |
+| the IPv6 tunnel | *"something on the path is filtering by protocol"* |
+
+UDP has no retransmission under it. A datagram lost to a full socket buffer, to
+a neighbour entry being resolved, or to a scheduler delay on a loaded node is
+indistinguishable from a network that discards the protocol. The ping probes
+have always sent two echo requests and asked for one, and the ledger's own
+finding 13 says why: *a mark that depends on the weather is worse than a missing
+check, because nobody re-reads a grade that looks plausible.* The datagram
+probes never got the same treatment.
+
+The cost is not proportional to one packet. `internal_reachability` scores in
+proportion to the probes that arrived, but a TCP or UDP failure **caps the whole
+check at 0.5** -- so one lost datagram out of 144 probes takes half the check,
+which at weight 0.2 in a one-point question is 0.10 marks. Grading sixteen
+copies of the reference solution through two class runs deducted exactly that
+from two of them, on a different pair of hosts each time:
+
+```
+7 of 8 scored 10.00; group6 scored 9.90    (--per-wave 1)
+7 of 8 scored 10.00; group3 scored 9.90    (--per-wave 4)
+```
+
+Three datagrams are sent now and one arriving is enough, through a single
+sender all four checks share so they cannot drift apart again.
+
+**Every attempt leaves from one source port**, not a fresh one, and that is the
+whole difficulty. A source port is not a path: where equal-cost paths exist a
+new port is hashed afresh and lands on whichever path works, so a fault that
+discards one path would clear itself on the retry. That is finding 116, and it
+is far easier to repeat here than it looks. Pinned, the attempts all take the
+path the first one took, so a retry rescues a dropped packet without rescuing a
+dropped path -- and the check becomes reproducible in *both* directions, where
+before a per-path filter was caught or missed by chance.
+
+A datagram that could not be sent is not a datagram that was lost, either. The
+grader picks the source port, so a collision is the grader's fault: an attempt
+that cannot bind is sent unbound instead, and a sender that got nothing away is
+reported as such so the caller stays silent rather than accusing on no evidence.
+Verified against the image's own netcat, which is OpenBSD's:
+
+```
+$ nc -u -w 1 -s 9.9.9.9 -p 34567 3.102.0.1 33456
+nc: bind failed: Address not available          -> matches, falls back
+
+$ ... three attempts from 3.103.0.1 to 3.102.0.1 ...
+NoPorts on the far side: 139 -> 142             -> all three arrive
+```
+
+Ten consecutive gradings of the whole lab in place after the fix -- eight
+systems each, about twelve hundred check results -- with no deduction of any
+kind.
+
+**It was not enough, and finding 128 is what was actually wrong.** Sending three
+datagrams removes independent loss, and independent loss was not what this was.
+The entry is kept as written because the reasoning it records is sound and the
+change is worth having on its own; but a fix that is only tested where the
+defect does not appear is not tested. The class path is where it appeared, and
+it took an hour to run, and it was run afterwards.
+
+### 127. A refusal whose stated reason denies itself
+
+Chasing 126 turned up the reason it was so destructive. The gate that attests a
+lab is the reference solution refused the *whole class run* on a single grading,
+and on **any** shortfall at all -- including one too small to appear in the
+number it printed. A single lost ping costs about a thousandth of a mark, and
+`%.2f` rounds that away, so the operator was told:
+
+```
+this lab is not the reference solution, so nothing can be graded against it:
+  AS 5 scores 10.00 of 10.00
+Run `twinet deploy -m . --solve` and check it reported no problems.
+Pass --skip-reference-check only for a lab you have just checked by hand
+```
+
+A refusal whose stated reason denies itself, naming no check, with a remedy that
+cannot fix a dropped packet. Observed refusing 2 of 3 attempts. What is left is
+`--skip-reference-check`, which turns off the one protection against marking a
+whole class against a broken internet -- **finding 123 again, reached from the
+other side**: when a safety check's only available remedy is to disable the
+safety check, the check is the bug.
+
+Two things were wrong. The total is now compared at the precision it is printed
+to, so the complaint cannot contradict itself; a check that did not pass is
+still named however little it cost, so tolerating the total never tolerates a
+broken lab. And a complaint must survive being asked a second time before a
+class is refused on it: a lab that really is not the reference solution fails
+the second grading as surely as the first, and one that lost a probe does not.
+
+Both fixes were mutated to prove the tests hold them. Reverting the precision
+reproduces the original message verbatim -- `scores 10.00 of 10.00` -- and
+reverting the retry lets a lab that grades clean the second time refuse a class.
+
+### 128. One observation of a path, however many packets it took
+
+Finding 126 sent three datagrams where one had been sent, and a class run of
+eight copies of the reference solution still came back with one of them at 9.90:
+
+```
+wave 3/8: group4
+  group4       9.90 / 10.00
+```
+```
+a datagram from SFO_host to HOU_host (4.108.0.1) never arrived
+-- no packet of it reached any interface -- though pings and
+connections do: something on the path is filtering by protocol
+```
+
+So the pair was asked directly, afterwards, and the two possible causes were
+separated:
+
+| what was tested | result |
+| --- | --- |
+| 300 datagrams over that exact pair, counted at the far side | **300 of 300 arrived** |
+| the capture started, three datagrams sent, capture read, 30 times | **30 of 30 recorded all three** |
+
+Neither the path nor the witness loses packets. So the three datagrams were not
+lost independently -- they were lost *together*, and the reason is in the
+sending:
+
+```
+$ for k in 1 2 3; do echo twinet | nc -u -w 1 -p 31999 <dst> 33456; done
+elapsed=0
+```
+
+`-w` is how long netcat waits for a reply, not a pause between sends. All three
+datagrams leave in the same instant. Whatever takes a pair out for a moment --
+and at roughly one probe in a thousand, on a lab that answers every one of 300
+when asked again, it is a moment and not a filter -- takes all three with it.
+
+**Three packets milliseconds apart are one observation of the path, not three.**
+The retry has to repeat the *observation*. A round that finds something is now
+run again, with fresh ports, fresh captures and fresh counters, and only the
+pairs that fail both times are reported.
+
+This is exactly the rule finding 116 arrived at for the load-balancing sweep --
+*the whole sweep is repeated instead, from fresh ports, and the fault has to
+survive both* -- applied to the check that never got it. The connection sweep
+beside it has the same structure and the same cap on the score, so it is
+repeated on the same terms. Nothing is repeated where nothing was found, so a
+healthy submission costs exactly what it did before.
+
+The lesson worth keeping is about the earlier fix, not this one. Finding 126 was
+verified ten times over on the path where the defect does not appear, and passed
+ten times, and was wrong. The defect lived in an hour-long class run, and only
+running the hour-long class run could have said so.
+
+| | before 126 | after 126 | after 128 |
+| --- | --- | --- | --- |
+| eight submissions, class path | 9.90 on one | 9.90 on one | **10.00 on all eight** |
+
+### 129. One corrupt upload was the whole class's problem
+
+Found by review round 134, which was otherwise a PASS. Every per-submission
+failure came out of `readSubmissions` as an error, and both grading commands
+returned it unchanged:
+
+```
+$ twinet grade class -s submissions
+twinet: group6.tar.gz: group6.tar.gz is not a gzip archive: gzip: invalid header
+$ echo $?
+1
+```
+
+Nothing was graded. Not the corrupt submission, and not the ninety-nine
+submissions beside it. A course with one truncated upload got no marks at all,
+and the only remedy on offer was to go and find the bad file and take it out of
+the directory by hand — which is also, exactly, how a student silently ends up
+with no mark at all. The failure and its remedy were the same action.
+
+The distinction that was missing is between **one submission being bad** and
+**the set being ambiguous**. A directory that cannot be listed, or two archives
+both claiming AS 5, still stops everything: there the question of who would be
+silently skipped has no answer, and finding 111 already settled that guessing
+between two submissions is a decision about late work that belongs to a course
+and not to a grader. But one unreadable file answers that question by itself.
+
+So an unreadable submission is now quarantined rather than fatal. It is named
+at the *start* of the run, not the end — an operator who learns at minute one
+can fix the upload and re-run, one who learns at minute sixty runs the hour
+again. It becomes a `Report` with `NeedsReview` set, which is the same shape a
+submission gets when its harness fails to deploy, so it travels the existing
+summary, CSV, report-writing and release-guard path rather than a second one
+invented beside it. It carries no total, it is excluded from the class
+statistics, and the command still exits non-zero so no script mistakes a
+partial class for a complete one.
+
+Verified on the real thing — two solved submissions and two corrupt uploads:
+
+```
+2 submission(s) cannot be read and will not be graded:
+  group6         group6.tar.gz: group6.tar.gz is not a gzip archive: gzip: invalid header
+  group7         group7.tar.gz: group7.tar.gz is not a gzip archive: unexpected EOF
+They are reported as needing review, and the other 2 are graded normally.
+...
+graded 2 of 4 submission(s) against cos461-routing in 14m50.587s
+  mean 10.00  median 10.00  min 10.00  max 10.00  (out of 10.00, over the 2 graded; 2 need review)
+```
+
+Before this, that command graded nobody.
+
+### 130. A report that was never completed printed a zero
+
+Falling out of 129, in the artifact that actually reaches a student. Every
+per-student `.txt` report opened with its score, including the ones that had no
+score:
+
+```
+group6 (AS 0)
+============================================================  0.00 / 10.00 (0%)
+
+grading failed: this submission could not be read...
+```
+
+`0.00 / 10.00 (0%)` is what a student who did nothing looks like. A corrupt
+upload, a harness that failed to deploy, and a genuinely empty submission were
+typographically identical, and the number was in the largest type on the page
+while the reason was a line of prose below it.
+
+The CSV had been taught this lesson already — its comment says a report that
+needs review "carries no total at all rather than a zero", so that a gradebook
+import cannot silently award a zero the platform is responsible for. The
+human-readable version had not, and it is the one anybody actually reads. It
+now prints `not graded` where the score would be, and ends with a sentence
+saying so in words: *this is not a score of zero: nothing about the work was
+assessed.*
+
+The lesson is the one behind finding 122 and finding 124, in a new place: when
+two artifacts describe the same fact, they will drift, and the one that drifts
+is the one without a test. Both are now tested against the same rule.
+
+### 131. A full mark was overwritten by a quarantine report
+
+Found by review round 135, and caused by the fix for finding 129 — which is
+the honest way to say it. Reports are written to a file named after the
+submission, and the ambiguity check only ever saw the submissions it could
+*read*. Quarantine introduced a second set of names it never looked at, and
+appended those reports after the graded ones. So:
+
+```
+$ ls submissions/
+group3  group3.tar.gz          # an empty directory, and a real archive
+
+$ twinet grade batch -s submissions -o reports
+  [1/1] group3       10.00 / 10.00
+$ cat reports/group3.txt
+group3 (AS 3)
+============================================================  not graded
+```
+
+A student who scored full marks was handed a report saying they had not been
+graded at all, and the class CSV carried two contradictory rows for them — one
+`graded,10.00`, one `needs-review`. An instructor importing that file would
+either double-count the student or record nothing for someone who passed.
+
+The reviewer proposed making this fatal, consistent with the existing rule.
+That would have been consistent and wrong: it puts back exactly what finding
+129 took out, one student's stray directory leaving a hundred others unmarked.
+
+The rule that was actually missing is that **ambiguity is a property of a
+name, not of the set**. Everything claiming a contested name or a contested AS
+is now withdrawn from the marking and reported; the rest of the class is
+graded. One contested name yields exactly one report, so two withdrawn entries
+cannot collide with each other either. What justified stopping the whole run
+was that somebody would otherwise be silently skipped — and nothing is silent
+now: every withdrawn submission is named before the run starts, named in the
+CSV with no total, named again by the release guard, and the command still
+exits non-zero.
+
+```
+1 submission(s) will not be graded:
+  group3         2 submissions claim to be "group3" (group3 (unreadable), group3.tar.gz), so none of them was graded. ...
+grading 1 submission(s), 8 at a time, each in its own lab
+  [1/1] group4       10.00 / 10.00
+```
+
+group4 is the point: an innocent bystander who now gets marked.
+
+Two things were tightened alongside it. Writing the reports **refuses** two
+reports for one name rather than resolving it — whatever produced them is a
+defect, and quietly replacing one mark with another is the worst possible way
+to find out about it. And the quarantine text no longer prefixes every reason
+with "this submission could not be read", which was untrue of a submission
+that read perfectly and was withdrawn because two entries claimed its name.
+Telling a student something untrue about their own work is the whole of what
+this project is trying not to do.
+
+`refuseDuplicates` was deleted rather than kept beside its replacement. It had
+three tests and no callers, which is how a function goes on being tested for a
+year after it stopped being the one that runs.
+
+The lesson is about the shape of the fix, not the bug. Finding 129 added a new
+kind of thing — a submission that is named but not graded — and every existing
+rule about names was written before that kind existed. A fix that introduces a
+new state has to be checked against every invariant that was true without it.

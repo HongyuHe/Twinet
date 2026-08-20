@@ -667,12 +667,12 @@ func vpnUDPGap(ctx context.Context, env *Env, d directedPair) (string, bool) {
 	before, okB := datagramsDelivered(ctx, env, d.to)
 	// A datagram that was never sent cannot have been filtered. Reaching a
 	// closed port exits zero here and a blocked one times out and also exits
-	// zero, so a non-zero exit means the sender itself failed -- and reading
-	// that as a datagram that did not arrive accused the VPN of filtering by
-	// protocol on no evidence.
-	sent, err := env.Probe(ctx, d.from.host, []string{"sh", "-c",
-		"echo twinet | nc -u -w 2 " + d.to.addr + " " + port})
-	if err != nil || sent.ExitCode != 0 {
+	// zero, so a sender that could not get a single attempt away is not
+	// evidence -- and reading that as a datagram that did not arrive accused
+	// the VPN of filtering by protocol on no evidence.
+	if !sendDatagrams(ctx, env, d.from.host, datagramProbe{
+		dstAddr: d.to.addr, port: port,
+	}) {
 		_, _ = tap.seen(ctx, env) // clear the capture off the machine
 		return "", false
 	}

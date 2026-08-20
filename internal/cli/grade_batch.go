@@ -99,13 +99,14 @@ mark, unless --keep-labs is given for a dispute.`,
 			if err != nil {
 				return err
 			}
-			subs, err := readSubmissions(subDir, class)
+			subs, unread, err := readSubmissions(subDir, class)
 			if err != nil {
 				return err
 			}
-			if len(subs) == 0 {
+			if len(subs) == 0 && len(unread) == 0 {
 				return fmt.Errorf("no submissions found under %s", subDir)
 			}
+			announceUnreadable(cmd.ErrOrStderr(), unread, len(subs))
 			tok, err := tokenFor(token)
 			if err != nil {
 				return err
@@ -154,6 +155,7 @@ mark, unless --keep-labs is given for a dispute.`,
 			}
 			wg.Wait()
 
+			reports = append(reports, quarantineUnreadable(unread, rubric, class.Name)...)
 			summary := grade.Summarise(rubric.Metadata.Name, reports, time.Since(start))
 			if err := writeReports(outDir, summary); err != nil {
 				return err
@@ -1209,16 +1211,47 @@ func sortedScriptCommands() []string {
 	return out
 }
 
+// unreadable is a handed-in submission that could not be turned into something
+// gradeable: a corrupt archive, a name that matches no student AS, a bundle
+// written against a different topology, a directory with no configuration in
+// it.
+type unreadable struct {
+	Name   string
+	AS     int
+	Reason string
+}
+
 // readSubmissions reads a directory of per-group submissions.
 //
 // Layout: one directory per group, named after the group in the manifest or
 // "as<N>", containing one file per router. The AS is resolved from the manifest
 // rather than from the directory name, so a group cannot be marked as, or
 // against, an AS that is not theirs.
-func readSubmissions(dir string, class *model.Topology) ([]submission, error) {
+//
+// One unreadable submission does not stop the others. It used to: any corrupt
+// archive returned an error from here, both grading commands passed it
+// straight up, and a class of a hundred got no marks at all because one
+// student's upload was truncated. The operator's only move was to find the bad
+// file by hand and take it out of the directory -- and taking a submission out
+// of the directory is exactly how a student silently ends up with no mark.
+//
+// So a submission that cannot be read is now carried out of here as an
+// `unreadable` and becomes a quarantined report: named, excluded from the
+// class statistics, given no total, and re-run once the cause is fixed. The
+// distinction that matters is between one submission being bad and the *set*
+// being ambiguous. A directory that cannot be listed, or two archives claiming
+// the same AS, still stops everything, because in those cases there is no way
+// to know which students would be silently skipped.
+func readSubmissions(dir string, class *model.Topology) ([]submission, []unreadable, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return nil, fmt.Errorf("reading submissions: %w", err)
+		return nil, nil, fmt.Errorf("reading submissions: %w", err)
+	}
+	var bad []unreadable
+	reject := func(name string, asn int, format string, args ...any) {
+		bad = append(bad, unreadable{Name: name, AS: asn,
+			Reason: "this submission could not be read, so it was not graded: " +
+				fmt.Sprintf(format, args...)})
 	}
 	byGroup := map[string]int{}
 	for asn, as := range class.ASes {
@@ -1245,7 +1278,8 @@ func readSubmissions(dir string, class *model.Topology) ([]submission, error) {
 			}
 			sub, err := submissionFromArchive(filepath.Join(dir, e.Name()), class)
 			if err != nil {
-				return nil, err
+				reject(archiveGroup(e.Name()), 0, "%v", err)
+				continue
 			}
 			subs = append(subs, sub)
 			continue
@@ -1256,17 +1290,17 @@ func readSubmissions(dir string, class *model.Topology) ([]submission, error) {
 			// Try a trailing number, so "group-7" maps to AS 7 if AS 7 is a
 			// student AS. Anything else is refused: guessing here would grade
 			// one group's work under another group's name.
-			if n, err := strconv.Atoi(strings.TrimLeft(group, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-_")); err == nil {
-				if as, ok := class.ASes[n]; ok && as.Role == model.RoleStudent {
-					asn = n
-					ok2 := true
-					_ = ok2
-				} else {
-					return nil, fmt.Errorf("submission %q does not correspond to a student AS", group)
-				}
-			} else {
-				return nil, fmt.Errorf("submission %q does not correspond to a student AS", group)
+			n, err := strconv.Atoi(strings.TrimLeft(group, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-_"))
+			if err != nil {
+				reject(group, 0, "%q does not correspond to a student AS in this lab", group)
+				continue
 			}
+			as, ok := class.ASes[n]
+			if !ok || as.Role != model.RoleStudent {
+				reject(group, 0, "%q does not correspond to a student AS in this lab", group)
+				continue
+			}
+			asn = n
 		}
 
 		sub := submission{
@@ -1275,8 +1309,10 @@ func readSubmissions(dir string, class *model.Topology) ([]submission, error) {
 		}
 		files, err := os.ReadDir(sub.Dir)
 		if err != nil {
-			return nil, err
+			reject(group, asn, "%v", err)
+			continue
 		}
+		failed := false
 		for _, f := range files {
 			if f.IsDir() || strings.HasPrefix(f.Name(), ".") {
 				continue
@@ -1288,7 +1324,9 @@ func readSubmissions(dir string, class *model.Topology) ([]submission, error) {
 			}
 			raw, err := os.ReadFile(filepath.Join(sub.Dir, f.Name()))
 			if err != nil {
-				return nil, err
+				reject(group, asn, "%v", err)
+				failed = true
+				break
 			}
 			if f.Name() == "roas.json" {
 				sub.ROAs = raw
@@ -1301,64 +1339,149 @@ func readSubmissions(dir string, class *model.Topology) ([]submission, error) {
 				sub.Files[base] = string(raw)
 			}
 		}
+		if failed {
+			continue
+		}
 		if len(sub.Files) == 0 && len(sub.Scripts) == 0 {
-			return nil, fmt.Errorf("submission %q contains no configuration files", group)
+			reject(group, asn, "contains no configuration files")
+			continue
 		}
 		subs = append(subs, sub)
 	}
 	sort.Slice(subs, func(i, j int) bool { return subs[i].Group < subs[j].Group })
-	if err := refuseDuplicates(subs); err != nil {
-		return nil, err
-	}
-	return subs, nil
+	sort.Slice(bad, func(i, j int) bool { return bad[i].Name < bad[j].Name })
+	subs, bad = withdrawContested(subs, bad)
+	return subs, bad, nil
 }
 
-// refuseDuplicates rejects a submission set in which two entries claim the same
-// group or the same autonomous system.
+// withdrawContested takes out of the marking anything that more than one
+// submission claims, and reports it instead.
 //
-// Both were accepted, and both lost work silently. Two archives for one group
-// wrote their reports to the same filename, so whichever was graded second
-// overwrote the first and nothing said which had survived. Two submissions for
-// one AS were silently dropped down to one by the wave planner, and in batch
-// mode were given the same harness name and could be deployed into the same
-// lab at once.
+// Ambiguity used to stop the whole run. That was right when there was nowhere
+// else for it to go: choosing between two submissions for one system is a
+// decision about late work that belongs to whoever runs the course, and the
+// alternative was to silently mark a student on work they did not hand in.
+// But it meant one student's stray directory left a hundred others unmarked,
+// which is finding 129 in a second dress. Quarantine answers the objection
+// that made it fatal -- nothing is silent: every contested submission is
+// named before the run, named in the CSV with no total, named again by the
+// release guard, and the command still exits non-zero.
 //
-// There is no correct guess available here. "Latest wins" is a policy about
-// late submissions that belongs to a course, not to a grader, and picking one
-// silently is how a student is marked on an attempt they did not intend to
-// hand in. So it stops, names both, and lets a person decide.
-func refuseDuplicates(subs []submission) error {
-	byGroup := map[string][]string{}
-	byAS := map[int][]string{}
+// Contested entries are withdrawn on both sides. A group name claimed by a
+// readable submission *and* an unreadable one is the case that made this
+// necessary: the readable one was graded, and then the quarantine report for
+// the same name overwrote it, so a student who scored full marks was handed a
+// report saying they had not been graded at all and the CSV carried two
+// contradictory rows for them. One name yields one report, always.
+func withdrawContested(subs []submission, bad []unreadable) ([]submission, []unreadable) {
+	byName := map[string][]string{}
+	byAS := map[int]map[string]bool{}
+	note := func(name string, asn int, what string) {
+		key := strings.ToLower(name)
+		byName[key] = append(byName[key], what)
+		if asn > 0 {
+			if byAS[asn] == nil {
+				byAS[asn] = map[string]bool{}
+			}
+			byAS[asn][key] = true
+		}
+	}
 	for _, s := range subs {
-		key := strings.ToLower(s.Group)
-		byGroup[key] = append(byGroup[key], s.Group)
-		byAS[s.AS] = append(byAS[s.AS], s.Group)
+		note(s.Group, s.AS, describeClaim(s.Group, s.Dir))
+	}
+	for _, u := range bad {
+		note(u.Name, u.AS, describeClaim(u.Name, ""))
 	}
 
-	var problems []string
-	for g, all := range byGroup {
+	// A name is contested when two entries carry it; an AS is contested when
+	// two *different* names claim it.
+	contestedName := map[string]string{}
+	for key, all := range byName {
 		if len(all) > 1 {
-			problems = append(problems, fmt.Sprintf(
-				"%d submissions claim to be group %q", len(all), g))
+			sort.Strings(all)
+			contestedName[key] = fmt.Sprintf(
+				"%d submissions claim to be %q (%s), so none of them was graded. "+
+					"Choosing between them is a decision about late work that belongs to "+
+					"whoever runs the course. Remove or rename the ones that should not count",
+				len(all), key, strings.Join(all, ", "))
 		}
 	}
-	for as, groups := range byAS {
-		if len(groups) > 1 {
-			sort.Strings(groups)
-			problems = append(problems, fmt.Sprintf(
-				"AS %d is claimed by %s", as, strings.Join(groups, ", ")))
+	for asn, names := range byAS {
+		if len(names) < 2 {
+			continue
+		}
+		var all []string
+		for n := range names {
+			all = append(all, n)
+		}
+		sort.Strings(all)
+		for _, n := range all {
+			if _, already := contestedName[n]; already {
+				continue
+			}
+			contestedName[n] = fmt.Sprintf(
+				"AS %d is claimed by %s, so none of them was graded. Two submissions for "+
+					"one system cannot both be graded against the same lab, and choosing "+
+					"between them is a decision about late work that belongs to whoever "+
+					"runs the course. Remove or rename the ones that should not count",
+				asn, strings.Join(all, ", "))
 		}
 	}
-	if len(problems) == 0 {
-		return nil
+	if len(contestedName) == 0 {
+		return subs, bad
 	}
-	sort.Strings(problems)
-	return fmt.Errorf("this set of submissions is ambiguous, so nothing was graded:\n  %s\n"+
-		"Two submissions for one system cannot both be graded against the same lab, and "+
-		"choosing between them is a decision about late work that belongs to whoever "+
-		"runs the course. Remove or rename the ones that should not count",
-		strings.Join(problems, "\n  "))
+
+	keptAS := map[string]int{}
+	kept := subs[:0]
+	for _, s := range subs {
+		key := strings.ToLower(s.Group)
+		if _, out := contestedName[key]; out {
+			keptAS[key] = s.AS
+			continue
+		}
+		kept = append(kept, s)
+	}
+	held := bad[:0]
+	for _, u := range bad {
+		key := strings.ToLower(u.Name)
+		if _, out := contestedName[key]; out {
+			if u.AS > 0 {
+				keptAS[key] = u.AS
+			}
+			continue
+		}
+		held = append(held, u)
+	}
+	// One report per contested name, naming every claimant, so two withdrawn
+	// entries cannot collide with each other either.
+	var names []string
+	for n := range contestedName {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		held = append(held, unreadable{Name: n, AS: keptAS[n], Reason: contestedName[n]})
+	}
+	sort.Slice(held, func(i, j int) bool { return held[i].Name < held[j].Name })
+	return kept, held
+}
+
+// describeClaim names where a claim on a group name came from, so an operator
+// looking at a contested name can tell which files to go and look at.
+func describeClaim(name, dir string) string {
+	if dir == "" {
+		return name + " (unreadable)"
+	}
+	return filepath.Base(dir)
+}
+
+// archiveGroup is the group an archive appears to belong to, from its filename.
+//
+// It is only used to name a submission that could not be opened, where the
+// bundle's own metadata is exactly what is unavailable. The name a student
+// uploaded is the one the operator has to go and look for.
+func archiveGroup(name string) string {
+	return strings.TrimSuffix(strings.TrimSuffix(name, ".tar.gz"), ".tgz")
 }
 
 // execFn runs a command inside a device of a harness. It matches the shape the

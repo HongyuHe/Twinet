@@ -197,12 +197,23 @@ func (r *Report) JSON() ([]byte, error) { return json.MarshalIndent(r, "", "  ")
 func (r *Report) Text() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s (AS %d)\n", r.Submission, r.AS)
-	fmt.Fprintf(&b, "%s  %.2f / %.2f (%.0f%%)\n\n", strings.Repeat("=", 60),
-		r.Total, r.MaxTotal, r.Percent())
+	// A report that was never completed carries no score line.
+	//
+	// It used to print "0.00 / 10.00 (0%)" across the top, which is what a
+	// student who did nothing looks like -- and this is the artifact a student
+	// is handed. A corrupt upload, a harness that failed to deploy and an
+	// empty submission were typographically identical. The CSV had already
+	// been taught to leave the total empty for exactly this reason; the human
+	// -readable version had not, and it is the one anybody actually reads.
 	if r.Err != "" {
+		fmt.Fprintf(&b, "%s  not graded\n\n", strings.Repeat("=", 60))
 		fmt.Fprintf(&b, "grading failed: %s\n", r.Err)
+		fmt.Fprintf(&b, "\nNo mark has been given. This is not a score of zero: "+
+			"nothing about the work was assessed.\n")
 		return b.String()
 	}
+	fmt.Fprintf(&b, "%s  %.2f / %.2f (%.0f%%)\n\n", strings.Repeat("=", 60),
+		r.Total, r.MaxTotal, r.Percent())
 	if r.NeedsReview {
 		b.WriteString("NEEDS REVIEW: part of this run did not complete correctly; " +
 			"the marks below are provisional.\n\n")

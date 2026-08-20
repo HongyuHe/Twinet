@@ -489,6 +489,61 @@ func derefInt(p *int) int {
 // releaseGuard refuses to let a run that did not fully work be mistaken for a
 // clean set of marks. It is the last line of defence against the worst failure
 // this system can have: a platform fault becoming a student's zero.
+// quarantineUnreadable turns the submissions that could not be read into
+// reports, so they travel through exactly the same summary, CSV, report-writing
+// and release path as a submission that failed while being graded.
+//
+// Both grading commands need this and they must agree, so there is one of it.
+// The alternative -- each command printing its own list of skipped files -- is
+// how a submission ends up mentioned on stderr and absent from the reports
+// directory, which is indistinguishable from never having been handed in.
+func quarantineUnreadable(bad []unreadable, rubric *grade.Rubric, lab string) []*grade.Report {
+	out := make([]*grade.Report, 0, len(bad))
+	for _, u := range bad {
+		out = append(out, &grade.Report{
+			Submission: u.Name,
+			AS:         u.AS,
+			Lab:        lab,
+			Rubric:     rubric.Metadata.Name,
+			MaxTotal:   rubric.MaxTotal(),
+			GradedAt:   time.Now().UTC(),
+			// The reason is written where the decision was made and used
+			// verbatim. It used to be prefixed here with "this submission
+			// could not be read", which was wrong for a submission that read
+			// perfectly and was withdrawn because two entries claimed its
+			// name -- the report told a student something untrue about their
+			// own work, which is the whole of what this project is for.
+			Err: u.Reason,
+			// Never a zero. A file the grader could not open says nothing
+			// about the work inside it.
+			NeedsReview: true,
+		})
+	}
+	return out
+}
+
+// announceUnreadable says at the start which submissions will not be graded.
+//
+// The summary says so too, but an hour later. An operator who learns at the
+// start that one archive is corrupt can fix it and re-run before the class run
+// has finished; one who learns at the end has to run the whole thing again.
+func announceUnreadable(w io.Writer, bad []unreadable, gradeable int) {
+	if len(bad) == 0 {
+		return
+	}
+	fmt.Fprintf(w, "%d submission(s) will not be graded:\n", len(bad))
+	for _, u := range bad {
+		fmt.Fprintf(w, "  %-14s %s\n", u.Name, firstLine(u.Reason))
+	}
+	if gradeable == 0 {
+		fmt.Fprintln(w, "They are reported as needing review. Nothing else was handed in, "+
+			"so there is nothing to grade.")
+		return
+	}
+	fmt.Fprintf(w, "They are reported as needing review, and the other %d are graded normally.\n",
+		gradeable)
+}
+
 func releaseGuard(s *grade.Summary, out io.Writer) error {
 	q := s.Quarantined()
 	if len(q) == 0 {
@@ -514,11 +569,28 @@ func reportProblem(r *grade.Report) string {
 	return "grading did not complete correctly"
 }
 
+// writeReports writes one file per submission plus the class summary.
+//
+// Two reports sharing a submission name is refused rather than resolved. The
+// files are named after the submission, so the second silently replaced the
+// first: a student who scored full marks was handed a report saying they had
+// not been graded, because a second entry in the directory carried their name.
+// Whatever produced two reports for one name is a defect, and a grader that
+// quietly overwrites one mark with another is the worst possible way to find
+// out about it.
 func writeReports(dir string, s *grade.Summary) error {
+	seen := map[string]string{}
 	for _, r := range s.Reports {
 		if r == nil {
 			continue
 		}
+		key := strings.ToLower(r.Submission)
+		if prev, dup := seen[key]; dup {
+			return fmt.Errorf("two reports were produced for %q (%s, and again %s), and "+
+				"writing both would leave only one of them; no reports were written",
+				r.Submission, prev, describeReport(r))
+		}
+		seen[key] = describeReport(r)
 		raw, err := r.JSON()
 		if err != nil {
 			return err
@@ -574,4 +646,12 @@ func defaultRubric(dir string) (string, error) {
 		return "", fmt.Errorf("this lab has %d rubrics (%s); say which one with --rubric",
 			len(found), strings.Join(found, ", "))
 	}
+}
+
+// describeReport says what a report is, for the message about two of them.
+func describeReport(r *grade.Report) string {
+	if r.NeedsReview || r.Err != "" {
+		return "held for review"
+	}
+	return fmt.Sprintf("marked %.2f", r.Total)
 }
