@@ -489,6 +489,49 @@ func derefInt(p *int) int {
 // releaseGuard refuses to let a run that did not fully work be mistaken for a
 // clean set of marks. It is the last line of defence against the worst failure
 // this system can have: a platform fault becoming a student's zero.
+// quarantineUnreadable turns the submissions that could not be read into
+// reports, so they travel through exactly the same summary, CSV, report-writing
+// and release path as a submission that failed while being graded.
+//
+// Both grading commands need this and they must agree, so there is one of it.
+// The alternative -- each command printing its own list of skipped files -- is
+// how a submission ends up mentioned on stderr and absent from the reports
+// directory, which is indistinguishable from never having been handed in.
+func quarantineUnreadable(bad []unreadable, rubric *grade.Rubric, lab string) []*grade.Report {
+	out := make([]*grade.Report, 0, len(bad))
+	for _, u := range bad {
+		out = append(out, &grade.Report{
+			Submission: u.Name,
+			AS:         u.AS,
+			Lab:        lab,
+			Rubric:     rubric.Metadata.Name,
+			MaxTotal:   rubric.MaxTotal(),
+			GradedAt:   time.Now().UTC(),
+			Err:        "this submission could not be read, so it was not graded: " + u.Reason,
+			// Never a zero. A file the grader could not open says nothing
+			// about the work inside it.
+			NeedsReview: true,
+		})
+	}
+	return out
+}
+
+// announceUnreadable says at the start which submissions will not be graded.
+//
+// The summary says so too, but an hour later. An operator who learns at the
+// start that one archive is corrupt can fix it and re-run before the class run
+// has finished; one who learns at the end has to run the whole thing again.
+func announceUnreadable(w io.Writer, bad []unreadable) {
+	if len(bad) == 0 {
+		return
+	}
+	fmt.Fprintf(w, "%d submission(s) cannot be read and will not be graded:\n", len(bad))
+	for _, u := range bad {
+		fmt.Fprintf(w, "  %-14s %s\n", u.Name, firstLine(u.Reason))
+	}
+	fmt.Fprintln(w, "They are reported as needing review, and everything else is graded normally.")
+}
+
 func releaseGuard(s *grade.Summary, out io.Writer) error {
 	q := s.Quarantined()
 	if len(q) == 0 {

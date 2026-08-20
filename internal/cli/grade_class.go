@@ -101,13 +101,14 @@ The lab must already be deployed with --solve.`,
 			if err != nil {
 				return err
 			}
-			subs, err := readSubmissions(subDir, top)
+			subs, unread, err := readSubmissions(subDir, top)
 			if err != nil {
 				return err
 			}
-			if len(subs) == 0 {
+			if len(subs) == 0 && len(unread) == 0 {
 				return fmt.Errorf("no submissions found under %s", subDir)
 			}
+			announceUnreadable(cmd.ErrOrStderr(), unread)
 			exec, err := execFunc(cmd.Context(), top, token)
 			if err != nil {
 				return err
@@ -460,6 +461,7 @@ The lab must already be deployed with --solve.`,
 				}
 			}
 
+			reports = append(reports, quarantineUnreadable(unread, rubric, top.Name)...)
 			summary := grade.Summarise(rubric.Metadata.Name, reports, time.Since(start))
 			if err := writeReports(outDir, summary); err != nil {
 				return err
