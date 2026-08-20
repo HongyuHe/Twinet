@@ -165,6 +165,20 @@ func TestASenderThatSentNothingIsNotEvidence(t *testing.T) {
 	}
 }
 
+// Binding is not the only way a send can fail, and the others are reasons the
+// datagram never left rather than evidence about the path. The VPN probe used
+// to read the sender's exit status for exactly this and must not lose it.
+func TestASendThatFailedForAnyOtherReasonIsNotASend(t *testing.T) {
+	dir, _ := stubNC(t, `echo "nc: connect: Network is unreachable" >&2; exit 1`)
+	env := runningEnv(t, dir)
+
+	if sendDatagrams(context.Background(), env, "as1/site_host", datagramProbe{
+		dstAddr: "10.0.0.1", port: "33456",
+	}) {
+		t.Fatal("the sender could not send, which is not the far side filtering by protocol")
+	}
+}
+
 // A caller that does not know the sender's address cannot pin the port, and
 // must still send something rather than nothing.
 func TestAProbeWithNoKnownSourceAddressStillSends(t *testing.T) {

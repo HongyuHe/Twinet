@@ -418,7 +418,10 @@ type datagramProbe struct {
 // source port fails if the grader picked one already in use, and reading that
 // as a datagram that did not arrive would blame a submission for the grader's
 // own choice; such an attempt falls back to an unbound one so that the pair is
-// still probed, and the caller is told how it went so it can stay silent rather
+// still probed. An attempt is counted only when the sender said nothing at all,
+// because netcat is silent on success and everything it does say -- a refused
+// bind, a network with no route to the destination -- is a reason the datagram
+// never left. The caller is told how many got away so it can stay silent rather
 // than accuse on no evidence.
 func sendDatagrams(ctx context.Context, env *Env, from string, p datagramProbe) bool {
 	nc := "nc -u -w 1"
@@ -447,7 +450,7 @@ func sendDatagrams(ctx context.Context, env *Env, from string, p datagramProbe) 
 		} else {
 			fmt.Fprintf(&b, "e=$(%s); ", send(false))
 		}
-		b.WriteString("case \"$e\" in *bind*) ;; *) n=$((n+1));; esac; ")
+		b.WriteString("if [ -z \"$e\" ]; then n=$((n+1)); fi; ")
 	}
 	b.WriteString("echo sent=$n")
 	res, err := env.Probe(ctx, from, []string{"sh", "-c", b.String()})

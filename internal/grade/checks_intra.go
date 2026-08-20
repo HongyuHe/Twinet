@@ -3856,13 +3856,12 @@ func unreachableByTCP(ctx context.Context, env *Env, hosts []*model.Device,
 		}
 	}
 
-	var (
-		mu  sync.Mutex
-		out []string
-	)
 	// Serialised by destination, so a counter that moved belongs to the
 	// attempt that moved it rather than to somebody else's probe.
-	for _, round := range roundsByDestinationOf(pairs, func(p attempt) string { return p.to.ID }) {
+	rounds := roundsByDestinationOf(pairs, func(p attempt) string { return p.to.ID })
+	try := func(round []attempt) map[string]string {
+		var mu sync.Mutex
+		bad := map[string]string{}
 		var wg sync.WaitGroup
 		sem := make(chan struct{}, 16)
 		for _, p := range round {
@@ -3877,13 +3876,31 @@ func unreachableByTCP(ctx context.Context, env *Env, hosts []*model.Device,
 					return
 				}
 				mu.Lock()
-				out = append(out, fmt.Sprintf(
+				bad[p.from.ID+"\x00"+p.to.ID] = fmt.Sprintf(
 					"%s can ping %s (%s) but no connection to it arrives: something on the "+
-						"path carries ICMP and discards the rest", p.from.Name, p.to.Name, addr))
+						"path carries ICMP and discards the rest", p.from.Name, p.to.Name, addr)
 				mu.Unlock()
 			}(p)
 		}
 		wg.Wait()
+		return bad
+	}
+
+	var out []string
+	// A round that finds something is run again before any of it is reported,
+	// for the reason set out over unreachableByUDP: one observation of a path
+	// is one observation however many packets it took, and a path that really
+	// discards connections discards the second round too.
+	for _, round := range rounds {
+		bad := try(round)
+		if len(bad) == 0 {
+			continue
+		}
+		for pair, why := range try(round) {
+			if _, both := bad[pair]; both {
+				out = append(out, why)
+			}
+		}
 	}
 	sort.Strings(out)
 	return out
@@ -3901,6 +3918,15 @@ func unreachableByTCP(ctx context.Context, env *Env, hosts []*model.Device,
 //
 // The pairs are done in rounds, each round a different offset, so that no two
 // senders aim at the same host at once and the counter says who arrived.
+//
+// A round that finds something is run again before any of it is reported. Three
+// datagrams sent back to back are milliseconds apart, so they are one
+// observation of the path and not three: they survive a packet dropped on its
+// own, and nothing that lasts. Whatever it is that takes a pair out for a
+// second at a time -- and 300 datagrams over the pair that failed a real class
+// run arrived, 300 of 300, when it was asked afterwards -- a path that is
+// really discarding the protocol discards the second round as surely as the
+// first. This is finding 116's rule in the place it was not applied.
 func unreachableByUDP(ctx context.Context, env *Env, hosts []*model.Device,
 	addrOf map[string]string) []string {
 	n := len(hosts)
@@ -3909,67 +3935,86 @@ func unreachableByUDP(ctx context.Context, env *Env, hosts []*model.Device,
 	}
 	var out []string
 	for k := 1; k < n; k++ {
-		// One port per destination for this round, so that each capture
-		// watches for exactly the datagram aimed at that host.
-		ports := map[string]string{}
-		for i := range hosts {
-			dst := hosts[(i+k)%n]
-			if addrOf[dst.ID] != "" {
-				ports[dst.ID] = probePort()
-			}
+		bad := udpRound(ctx, env, hosts, addrOf, k)
+		if len(bad) == 0 {
+			continue
 		}
-		taps := startTaps(ctx, env, ports)
-		before := udpCounters(ctx, env, hosts)
-		var wg sync.WaitGroup
-		var mu sync.Mutex
-		unsent := map[string]bool{}
-		for i, src := range hosts {
-			dst := hosts[(i+k)%n]
-			if addrOf[dst.ID] == "" {
-				continue
+		for pair, why := range udpRound(ctx, env, hosts, addrOf, k) {
+			if _, both := bad[pair]; both {
+				out = append(out, why)
 			}
-			wg.Add(1)
-			go func(src, dst *model.Device) {
-				defer wg.Done()
-				ok := sendDatagrams(ctx, env, src.ID, datagramProbe{
-					srcAddr: addrOf[src.ID],
-					dstAddr: addrOf[dst.ID],
-					port:    ports[dst.ID],
-				})
-				if !ok {
-					mu.Lock()
-					unsent[src.ID+"\x00"+dst.ID] = true
-					mu.Unlock()
-				}
-			}(src, dst)
-		}
-		wg.Wait()
-		after := udpCounters(ctx, env, hosts)
-		seen := readTaps(ctx, env, taps)
-		for i, src := range hosts {
-			dst := hosts[(i+k)%n]
-			b, okB := before[dst.ID]
-			a, okA := after[dst.ID]
-			frames, live := seen[dst.ID].counts, seen[dst.ID].live
-			got := arrival{
-				tapped: frames.udp, tapLive: live,
-				counted: offBoxDelta(b, a), counterOK: okB && okA,
-			}
-			if !got.attributable() || got.arrived() {
-				continue
-			}
-			// Nothing left the sender, so nothing can be concluded about the
-			// path between them.
-			if unsent[src.ID+"\x00"+dst.ID] {
-				continue
-			}
-			out = append(out, fmt.Sprintf(
-				"a datagram from %s to %s (%s) never arrived -- %s -- though pings and "+
-					"connections do: something on the path is filtering by protocol",
-				src.Name, dst.Name, addrOf[dst.ID], got.why()))
 		}
 	}
 	sort.Strings(out)
+	return out
+}
+
+// udpRound sends a datagram between every pair of one round and returns the
+// ones that did not arrive, keyed by the pair so that a second round can be
+// compared with the first.
+func udpRound(ctx context.Context, env *Env, hosts []*model.Device,
+	addrOf map[string]string, k int) map[string]string {
+	n := len(hosts)
+	out := map[string]string{}
+	// One port per destination for this round, so that each capture
+	// watches for exactly the datagram aimed at that host.
+	ports := map[string]string{}
+	for i := range hosts {
+		dst := hosts[(i+k)%n]
+		if addrOf[dst.ID] != "" {
+			ports[dst.ID] = probePort()
+		}
+	}
+	taps := startTaps(ctx, env, ports)
+	before := udpCounters(ctx, env, hosts)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	unsent := map[string]bool{}
+	for i, src := range hosts {
+		dst := hosts[(i+k)%n]
+		if addrOf[dst.ID] == "" {
+			continue
+		}
+		wg.Add(1)
+		go func(src, dst *model.Device) {
+			defer wg.Done()
+			ok := sendDatagrams(ctx, env, src.ID, datagramProbe{
+				srcAddr: addrOf[src.ID],
+				dstAddr: addrOf[dst.ID],
+				port:    ports[dst.ID],
+			})
+			if !ok {
+				mu.Lock()
+				unsent[src.ID+"\x00"+dst.ID] = true
+				mu.Unlock()
+			}
+		}(src, dst)
+	}
+	wg.Wait()
+	after := udpCounters(ctx, env, hosts)
+	seen := readTaps(ctx, env, taps)
+	for i, src := range hosts {
+		dst := hosts[(i+k)%n]
+		b, okB := before[dst.ID]
+		a, okA := after[dst.ID]
+		frames, live := seen[dst.ID].counts, seen[dst.ID].live
+		got := arrival{
+			tapped: frames.udp, tapLive: live,
+			counted: offBoxDelta(b, a), counterOK: okB && okA,
+		}
+		if !got.attributable() || got.arrived() {
+			continue
+		}
+		// Nothing left the sender, so nothing can be concluded about the
+		// path between them.
+		if unsent[src.ID+"\x00"+dst.ID] {
+			continue
+		}
+		out[src.ID+"\x00"+dst.ID] = fmt.Sprintf(
+			"a datagram from %s to %s (%s) never arrived -- %s -- though pings and "+
+				"connections do: something on the path is filtering by protocol",
+			src.Name, dst.Name, addrOf[dst.ID], got.why())
+	}
 	return out
 }
 

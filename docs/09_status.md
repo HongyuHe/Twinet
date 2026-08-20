@@ -2444,3 +2444,97 @@ After the fix, the same submission through the same path:
 graded 1 submission(s) against advnet-mpls-l3vpn in 4m15.616s
   mean 6.00  median 6.00  min 6.00  max 6.00  (out of 6.00)
 ```
+
+### 126. One datagram, and a mark for the network that lost it
+
+Four checks sent a single datagram and, if it did not arrive, told the student
+that something on the path was filtering by protocol:
+
+| where | what it says |
+| --- | --- |
+| `dataplane.internal_reachability` | *"a datagram from X to Y never arrived ... though pings and connections do: something on the path is filtering by protocol"* |
+| the backbone loopback pair | *"answers pings and connections ... but no datagram from it arrives"* |
+| `vpn.isolation` (`vpnUDPGap`) | *"though pings do: the VPN is filtering by protocol"* |
+| the IPv6 tunnel | *"something on the path is filtering by protocol"* |
+
+UDP has no retransmission under it. A datagram lost to a full socket buffer, to
+a neighbour entry being resolved, or to a scheduler delay on a loaded node is
+indistinguishable from a network that discards the protocol. The ping probes
+have always sent two echo requests and asked for one, and the ledger's own
+finding 13 says why: *a mark that depends on the weather is worse than a missing
+check, because nobody re-reads a grade that looks plausible.* The datagram
+probes never got the same treatment.
+
+The cost is not proportional to one packet. `internal_reachability` scores in
+proportion to the probes that arrived, but a TCP or UDP failure **caps the whole
+check at 0.5** -- so one lost datagram out of 144 probes takes half the check,
+which at weight 0.2 in a one-point question is 0.10 marks. Grading sixteen
+copies of the reference solution through two class runs deducted exactly that
+from two of them, on a different pair of hosts each time:
+
+```
+7 of 8 scored 10.00; group6 scored 9.90    (--per-wave 1)
+7 of 8 scored 10.00; group3 scored 9.90    (--per-wave 4)
+```
+
+Three datagrams are sent now and one arriving is enough, through a single
+sender all four checks share so they cannot drift apart again.
+
+**Every attempt leaves from one source port**, not a fresh one, and that is the
+whole difficulty. A source port is not a path: where equal-cost paths exist a
+new port is hashed afresh and lands on whichever path works, so a fault that
+discards one path would clear itself on the retry. That is finding 116, and it
+is far easier to repeat here than it looks. Pinned, the attempts all take the
+path the first one took, so a retry rescues a dropped packet without rescuing a
+dropped path -- and the check becomes reproducible in *both* directions, where
+before a per-path filter was caught or missed by chance.
+
+A datagram that could not be sent is not a datagram that was lost, either. The
+grader picks the source port, so a collision is the grader's fault: an attempt
+that cannot bind is sent unbound instead, and a sender that got nothing away is
+reported as such so the caller stays silent rather than accusing on no evidence.
+Verified against the image's own netcat, which is OpenBSD's:
+
+```
+$ nc -u -w 1 -s 9.9.9.9 -p 34567 3.102.0.1 33456
+nc: bind failed: Address not available          -> matches, falls back
+
+$ ... three attempts from 3.103.0.1 to 3.102.0.1 ...
+NoPorts on the far side: 139 -> 142             -> all three arrive
+```
+
+Ten consecutive full-class gradings after the fix -- eight systems each, about
+twelve hundred check results -- with no deduction of any kind.
+
+### 127. A refusal whose stated reason denies itself
+
+Chasing 126 turned up the reason it was so destructive. The gate that attests a
+lab is the reference solution refused the *whole class run* on a single grading,
+and on **any** shortfall at all -- including one too small to appear in the
+number it printed. A single lost ping costs about a thousandth of a mark, and
+`%.2f` rounds that away, so the operator was told:
+
+```
+this lab is not the reference solution, so nothing can be graded against it:
+  AS 5 scores 10.00 of 10.00
+Run `twinet deploy -m . --solve` and check it reported no problems.
+Pass --skip-reference-check only for a lab you have just checked by hand
+```
+
+A refusal whose stated reason denies itself, naming no check, with a remedy that
+cannot fix a dropped packet. Observed refusing 2 of 3 attempts. What is left is
+`--skip-reference-check`, which turns off the one protection against marking a
+whole class against a broken internet -- **finding 123 again, reached from the
+other side**: when a safety check's only available remedy is to disable the
+safety check, the check is the bug.
+
+Two things were wrong. The total is now compared at the precision it is printed
+to, so the complaint cannot contradict itself; a check that did not pass is
+still named however little it cost, so tolerating the total never tolerates a
+broken lab. And a complaint must survive being asked a second time before a
+class is refused on it: a lab that really is not the reference solution fails
+the second grading as surely as the first, and one that lost a probe does not.
+
+Both fixes were mutated to prove the tests hold them. Reverting the precision
+reproduces the original message verbatim -- `scores 10.00 of 10.00` -- and
+reverting the retry lets a lab that grades clean the second time refuse a class.
