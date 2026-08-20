@@ -563,11 +563,28 @@ func reportProblem(r *grade.Report) string {
 	return "grading did not complete correctly"
 }
 
+// writeReports writes one file per submission plus the class summary.
+//
+// Two reports sharing a submission name is refused rather than resolved. The
+// files are named after the submission, so the second silently replaced the
+// first: a student who scored full marks was handed a report saying they had
+// not been graded, because a second entry in the directory carried their name.
+// Whatever produced two reports for one name is a defect, and a grader that
+// quietly overwrites one mark with another is the worst possible way to find
+// out about it.
 func writeReports(dir string, s *grade.Summary) error {
+	seen := map[string]string{}
 	for _, r := range s.Reports {
 		if r == nil {
 			continue
 		}
+		key := strings.ToLower(r.Submission)
+		if prev, dup := seen[key]; dup {
+			return fmt.Errorf("two reports were produced for %q (%s, and again %s), and "+
+				"writing both would leave only one of them; no reports were written",
+				r.Submission, prev, describeReport(r))
+		}
+		seen[key] = describeReport(r)
 		raw, err := r.JSON()
 		if err != nil {
 			return err
@@ -623,4 +640,12 @@ func defaultRubric(dir string) (string, error) {
 		return "", fmt.Errorf("this lab has %d rubrics (%s); say which one with --rubric",
 			len(found), strings.Join(found, ", "))
 	}
+}
+
+// describeReport says what a report is, for the message about two of them.
+func describeReport(r *grade.Report) string {
+	if r.NeedsReview || r.Err != "" {
+		return "held for review"
+	}
+	return fmt.Sprintf("marked %.2f", r.Total)
 }

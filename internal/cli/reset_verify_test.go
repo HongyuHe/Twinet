@@ -98,40 +98,50 @@ func TestADeviceThatCouldNotBeReadIsNotReportedAsClean(t *testing.T) {
 // Two archives for one group wrote to the same report filename, so whichever
 // was graded second overwrote the first; two for one AS were silently dropped
 // to one by the wave planner. Both lost work with nothing said.
-func TestAnAmbiguousSubmissionSetIsRefused(t *testing.T) {
-	err := refuseDuplicates([]submission{
+//
+// Neither is graded now. Both are withdrawn and reported, rather than stopping
+// the run: see finding 131.
+func TestAnAmbiguousSubmissionSetIsNotGraded(t *testing.T) {
+	kept, held := withdrawContested([]submission{
 		{Group: "group3", AS: 3},
 		{Group: "Group3", AS: 3},
-	})
-	if err == nil {
-		t.Fatal("two submissions claiming to be the same group were accepted; one of " +
-			"them will silently overwrite the other's report")
+	}, nil)
+	if len(kept) != 0 {
+		t.Fatalf("a submission claiming a contested group name was graded; the other "+
+			"one's report will silently overwrite the mark: %+v", kept)
 	}
-	if !strings.Contains(err.Error(), "group3") {
-		t.Errorf("the refusal does not name the group: %v", err)
+	if len(held) != 1 {
+		t.Fatalf("one contested name must yield exactly one report, got %+v", held)
+	}
+	if !strings.Contains(held[0].Reason, "group3") {
+		t.Errorf("the report does not name the group: %v", held[0].Reason)
 	}
 
-	err = refuseDuplicates([]submission{
+	kept, held = withdrawContested([]submission{
 		{Group: "alice", AS: 3},
 		{Group: "bob", AS: 3},
-	})
-	if err == nil {
-		t.Fatal("two submissions for the same autonomous system were accepted; only " +
-			"one can be loaded, and the other disappears without a word")
+	}, nil)
+	if len(kept) != 0 {
+		t.Fatalf("a submission for a contested autonomous system was graded: %+v", kept)
+	}
+	if len(held) != 2 {
+		t.Fatalf("both claimants should be reported, got %+v", held)
 	}
 	for _, want := range []string{"alice", "bob", "AS 3"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("the refusal does not mention %s: %v", want, err)
+		if !strings.Contains(held[0].Reason, want) {
+			t.Errorf("the report does not mention %s: %v", want, held[0].Reason)
 		}
 	}
 }
 
 func TestAnOrdinarySubmissionSetIsAccepted(t *testing.T) {
-	if err := refuseDuplicates([]submission{
+	kept, held := withdrawContested([]submission{
 		{Group: "group3", AS: 3},
 		{Group: "group4", AS: 4},
 		{Group: "group5", AS: 5},
-	}); err != nil {
-		t.Fatalf("a perfectly ordinary set of submissions was refused: %v", err)
+	}, nil)
+	if len(kept) != 3 || len(held) != 0 {
+		t.Fatalf("a perfectly ordinary set of submissions was disturbed: kept %+v held %+v",
+			kept, held)
 	}
 }

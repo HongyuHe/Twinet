@@ -178,3 +178,99 @@ func TestTheOperatorIsToldBeforeTheRunNotAfterIt(t *testing.T) {
 		t.Errorf("nothing should be printed when every submission is readable: %q", out.String())
 	}
 }
+
+// A student who scored full marks was handed a report saying they had not been
+// graded, because a second entry in the directory carried their name. Found by
+// review round 135; introduced by the fix for finding 129, which added a set of
+// names that the ambiguity check never saw.
+func TestAGradedSubmissionIsNotOverwrittenByAQuarantinedOne(t *testing.T) {
+	dir := t.TempDir()
+	goodSubmission(t, dir, "group3")
+	// An empty directory of the same name: readable as a name, unreadable as
+	// a submission.
+	if err := os.MkdirAll(filepath.Join(dir, "group3.tar.gz.d"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Use the archive form so both resolve to "group3".
+	if err := os.WriteFile(filepath.Join(dir, "group3.tar.gz"), []byte("not a gzip"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	subs, bad, err := readSubmissions(dir, classOfEight(t))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, s := range subs {
+		if strings.EqualFold(s.Group, "group3") {
+			t.Fatalf("group3 was graded even though two submissions claim that name; "+
+				"the quarantine report for the other one will overwrite the mark: %+v", subs)
+		}
+	}
+	var found int
+	for _, u := range bad {
+		if strings.EqualFold(u.Name, "group3") {
+			found++
+			if !strings.Contains(u.Reason, "claim") {
+				t.Errorf("the reason should say the name is contested: %q", u.Reason)
+			}
+		}
+	}
+	if found != 1 {
+		t.Fatalf("one contested name must yield exactly one report, got %d: %+v", found, bad)
+	}
+}
+
+// Two different students claiming one AS are both withdrawn, and the rest of
+// the class is still marked -- one student's mistake is not a hundred students'
+// problem.
+func TestOneContestedASDoesNotStopTheClass(t *testing.T) {
+	subs := []submission{
+		{Group: "alice", AS: 3, Dir: "/s/alice"},
+		{Group: "bob", AS: 3, Dir: "/s/bob"},
+		{Group: "group4", AS: 4, Dir: "/s/group4"},
+		{Group: "group5", AS: 5, Dir: "/s/group5"},
+	}
+	kept, held := withdrawContested(subs, nil)
+	if len(kept) != 2 {
+		t.Fatalf("the uncontested submissions should still be graded, got %+v", kept)
+	}
+	for _, s := range kept {
+		if s.AS == 3 {
+			t.Fatalf("a contested AS was graded anyway: %+v", s)
+		}
+	}
+	if len(held) != 2 {
+		t.Fatalf("both claimants should be held, got %+v", held)
+	}
+	for _, u := range held {
+		if !strings.Contains(u.Reason, "AS 3") ||
+			!strings.Contains(u.Reason, "alice") || !strings.Contains(u.Reason, "bob") {
+			t.Errorf("a held report should name the conflict: %q", u.Reason)
+		}
+	}
+}
+
+func TestAnUncontestedSetIsUntouched(t *testing.T) {
+	subs := []submission{
+		{Group: "group3", AS: 3}, {Group: "group4", AS: 4}, {Group: "group5", AS: 5},
+	}
+	kept, held := withdrawContested(subs, []unreadable{{Name: "group6", Reason: "EOF"}})
+	if len(kept) != 3 || len(held) != 1 {
+		t.Fatalf("an ordinary set was disturbed: kept %+v held %+v", kept, held)
+	}
+}
+
+func TestTwoReportsForOneNameAreRefusedRatherThanOverwritten(t *testing.T) {
+	dir := t.TempDir()
+	s := grade.Summarise("r", []*grade.Report{
+		{Submission: "group3", AS: 3, Total: 10, MaxTotal: 10},
+		{Submission: "group3", AS: 3, MaxTotal: 10, NeedsReview: true, Err: "unreadable"},
+	}, 0)
+	err := writeReports(dir, s)
+	if err == nil {
+		t.Fatal("two reports for one student were written, so one mark silently replaced the other")
+	}
+	if !strings.Contains(err.Error(), "group3") || !strings.Contains(err.Error(), "marked 10.00") {
+		t.Errorf("the error should say whose mark was at risk: %v", err)
+	}
+}

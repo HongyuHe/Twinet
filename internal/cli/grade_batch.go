@@ -1348,10 +1348,129 @@ func readSubmissions(dir string, class *model.Topology) ([]submission, []unreada
 	}
 	sort.Slice(subs, func(i, j int) bool { return subs[i].Group < subs[j].Group })
 	sort.Slice(bad, func(i, j int) bool { return bad[i].Name < bad[j].Name })
-	if err := refuseDuplicates(subs); err != nil {
-		return nil, nil, err
-	}
+	subs, bad = withdrawContested(subs, bad)
 	return subs, bad, nil
+}
+
+// withdrawContested takes out of the marking anything that more than one
+// submission claims, and reports it instead.
+//
+// Ambiguity used to stop the whole run. That was right when there was nowhere
+// else for it to go: choosing between two submissions for one system is a
+// decision about late work that belongs to whoever runs the course, and the
+// alternative was to silently mark a student on work they did not hand in.
+// But it meant one student's stray directory left a hundred others unmarked,
+// which is finding 129 in a second dress. Quarantine answers the objection
+// that made it fatal -- nothing is silent: every contested submission is
+// named before the run, named in the CSV with no total, named again by the
+// release guard, and the command still exits non-zero.
+//
+// Contested entries are withdrawn on both sides. A group name claimed by a
+// readable submission *and* an unreadable one is the case that made this
+// necessary: the readable one was graded, and then the quarantine report for
+// the same name overwrote it, so a student who scored full marks was handed a
+// report saying they had not been graded at all and the CSV carried two
+// contradictory rows for them. One name yields one report, always.
+func withdrawContested(subs []submission, bad []unreadable) ([]submission, []unreadable) {
+	byName := map[string][]string{}
+	byAS := map[int]map[string]bool{}
+	note := func(name string, asn int, what string) {
+		key := strings.ToLower(name)
+		byName[key] = append(byName[key], what)
+		if asn > 0 {
+			if byAS[asn] == nil {
+				byAS[asn] = map[string]bool{}
+			}
+			byAS[asn][key] = true
+		}
+	}
+	for _, s := range subs {
+		note(s.Group, s.AS, describeClaim(s.Group, s.Dir))
+	}
+	for _, u := range bad {
+		note(u.Name, u.AS, describeClaim(u.Name, ""))
+	}
+
+	// A name is contested when two entries carry it; an AS is contested when
+	// two *different* names claim it.
+	contestedName := map[string]string{}
+	for key, all := range byName {
+		if len(all) > 1 {
+			sort.Strings(all)
+			contestedName[key] = fmt.Sprintf(
+				"%d submissions claim to be %q (%s), so none of them was graded: "+
+					"choosing between them is a decision about late work that belongs to "+
+					"whoever runs the course. Remove or rename the ones that should not count",
+				len(all), key, strings.Join(all, ", "))
+		}
+	}
+	for asn, names := range byAS {
+		if len(names) < 2 {
+			continue
+		}
+		var all []string
+		for n := range names {
+			all = append(all, n)
+		}
+		sort.Strings(all)
+		for _, n := range all {
+			if _, already := contestedName[n]; already {
+				continue
+			}
+			contestedName[n] = fmt.Sprintf(
+				"AS %d is claimed by %s, so none of them was graded: two submissions for "+
+					"one system cannot both be graded against the same lab, and choosing "+
+					"between them is a decision about late work that belongs to whoever "+
+					"runs the course. Remove or rename the ones that should not count",
+				asn, strings.Join(all, ", "))
+		}
+	}
+	if len(contestedName) == 0 {
+		return subs, bad
+	}
+
+	keptAS := map[string]int{}
+	kept := subs[:0]
+	for _, s := range subs {
+		key := strings.ToLower(s.Group)
+		if _, out := contestedName[key]; out {
+			keptAS[key] = s.AS
+			continue
+		}
+		kept = append(kept, s)
+	}
+	held := bad[:0]
+	for _, u := range bad {
+		key := strings.ToLower(u.Name)
+		if _, out := contestedName[key]; out {
+			if u.AS > 0 {
+				keptAS[key] = u.AS
+			}
+			continue
+		}
+		held = append(held, u)
+	}
+	// One report per contested name, naming every claimant, so two withdrawn
+	// entries cannot collide with each other either.
+	var names []string
+	for n := range contestedName {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		held = append(held, unreadable{Name: n, AS: keptAS[n], Reason: contestedName[n]})
+	}
+	sort.Slice(held, func(i, j int) bool { return held[i].Name < held[j].Name })
+	return kept, held
+}
+
+// describeClaim names where a claim on a group name came from, so an operator
+// looking at a contested name can tell which files to go and look at.
+func describeClaim(name, dir string) string {
+	if dir == "" {
+		return name + " (unreadable)"
+	}
+	return filepath.Base(dir)
 }
 
 // archiveGroup is the group an archive appears to belong to, from its filename.
@@ -1361,54 +1480,6 @@ func readSubmissions(dir string, class *model.Topology) ([]submission, []unreada
 // uploaded is the one the operator has to go and look for.
 func archiveGroup(name string) string {
 	return strings.TrimSuffix(strings.TrimSuffix(name, ".tar.gz"), ".tgz")
-}
-
-// refuseDuplicates rejects a submission set in which two entries claim the same
-// group or the same autonomous system.
-//
-// Both were accepted, and both lost work silently. Two archives for one group
-// wrote their reports to the same filename, so whichever was graded second
-// overwrote the first and nothing said which had survived. Two submissions for
-// one AS were silently dropped down to one by the wave planner, and in batch
-// mode were given the same harness name and could be deployed into the same
-// lab at once.
-//
-// There is no correct guess available here. "Latest wins" is a policy about
-// late submissions that belongs to a course, not to a grader, and picking one
-// silently is how a student is marked on an attempt they did not intend to
-// hand in. So it stops, names both, and lets a person decide.
-func refuseDuplicates(subs []submission) error {
-	byGroup := map[string][]string{}
-	byAS := map[int][]string{}
-	for _, s := range subs {
-		key := strings.ToLower(s.Group)
-		byGroup[key] = append(byGroup[key], s.Group)
-		byAS[s.AS] = append(byAS[s.AS], s.Group)
-	}
-
-	var problems []string
-	for g, all := range byGroup {
-		if len(all) > 1 {
-			problems = append(problems, fmt.Sprintf(
-				"%d submissions claim to be group %q", len(all), g))
-		}
-	}
-	for as, groups := range byAS {
-		if len(groups) > 1 {
-			sort.Strings(groups)
-			problems = append(problems, fmt.Sprintf(
-				"AS %d is claimed by %s", as, strings.Join(groups, ", ")))
-		}
-	}
-	if len(problems) == 0 {
-		return nil
-	}
-	sort.Strings(problems)
-	return fmt.Errorf("this set of submissions is ambiguous, so nothing was graded:\n  %s\n"+
-		"Two submissions for one system cannot both be graded against the same lab, and "+
-		"choosing between them is a decision about late work that belongs to whoever "+
-		"runs the course. Remove or rename the ones that should not count",
-		strings.Join(problems, "\n  "))
 }
 
 // execFn runs a command inside a device of a harness. It matches the shape the
