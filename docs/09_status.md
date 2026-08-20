@@ -2263,3 +2263,131 @@ progress-bar denominator and an empty-plan guard.
 Verified: dry run and `--only` on both the single-node and cluster paths, a
 clean cluster deploy unchanged, node-2 stopped and restored, cos461 back to
 10.00.
+
+### 122. A restore that reported success on work it had not put back
+
+Publishing a ROA is something a student *does*, not a line of configuration, so
+it appears in no router's running-config. The save side knows this and writes
+`roas.json` into the archive, with a comment recording that a re-mark in a
+harness whose trust anchor starts empty had already cost a group the mark for
+publishing, at 9.70 out of 10.
+
+`restoreBundle` matched archive members by file extension. It handled `.conf`
+and `.sh`. `roas.json` matched neither, so it was stepped over in silence:
+
+```
+$ twinet restore submissions/2026-08-19-234332/group3.tar.gz
+restored group3 into AS 3 (33 device(s))
+```
+
+Reproduced end to end on the cluster. With AS 3's authorisation removed from
+the trust anchor -- the state a rebuilt lab starts in -- the lab grades:
+
+```
+mean 9.70  median 9.70  min 9.70  max 9.70  (out of 10.00)
+  rpki.roa_published                       1 of 1
+```
+
+the same 9.70 the save-side comment describes. The restore above then reported
+success and left it at 9.70. It now reports
+
+```
+restored group3 into AS 3 (33 device(s) and its published authorisations)
+```
+
+and the lab grades 10.00 again.
+
+**The twin was worse than the finding.** Two consumers read these archives:
+`restoreBundle` and `bundleSubmission`, the one batch grading uses. Each
+decided separately what an archive may contain, which is exactly how one came
+to apply the authorisations while the other ignored them -- and the one that
+ignored them at class scale would have marked every submission in a run on
+partial work, silently. Both now call `classifyBundle`, which places every
+member or refuses by name. An archive member this version cannot apply is not a
+stray file to skip: it is part of a submission, and applying the rest while
+reporting success is the defect the ledger keeps finding.
+
+On the save side, a marshal failure dropped the authorisations from the archive
+with `if err == nil`, three lines after the code had treated failing to *read*
+them as worth aborting the whole save for.
+
+### 123. A gate that refused the reference solution for passing
+
+`twinet grade class` attests that the deployed lab is the reference solution
+before it marks anybody against it -- the one thing standing between a class and
+being graded against a broken internet. It refused:
+
+```
+$ twinet grade class -s submissions/2026-08-19-234332
+twinet: this lab is not the reference solution, so nothing can be graded against it:
+  AS 10 scores full marks, but policy.transit_for_customers did not pass (not_applicable)
+  AS 7 scores full marks, but policy.transit_for_customers did not pass (not_applicable)
+  AS 8 scores full marks, but policy.transit_for_customers did not pass (not_applicable)
+  AS 9 scores full marks, but policy.transit_for_customers did not pass (not_applicable)
+```
+
+Read the sentence: *scores full marks, but did not pass*. `not_applicable` means
+the question cannot arise -- a stub system that sells transit to nobody cannot
+withhold transit from a customer -- and the scorer deliberately leaves such a
+check out of the weighting, which is why those systems are standing there with
+full marks. The gate counted it as a failure, so it was contradicting the
+grader it exists to guard.
+
+cos461 has four stub systems, so `grade class` could not be run on cos461 at
+all. Neither remedy offered helps: `deploy --solve` had already been run and
+cannot change a check's applicability, and `--skip-reference-check` disables the
+gate itself -- working around a fault in a safety check by turning the safety
+check off, for every future run.
+
+The verdict is now a pure function, `referenceComplaint`, so the semantics are
+pinned by tests rather than reachable only through a six-minute class run. It
+still fires on every case it was built for: a failed check behind a full total,
+a check the grader could not run, a total below full marks, and a report the
+grader itself flagged for review.
+
+### 124. Every submission in a class quarantined for a device the kernel owns
+
+With 123 fixed, `grade class` ran and quarantined the only submission in it:
+
+```
+1 of 1 submission(s) could not be graded and are quarantined:
+  group3   loading the submission: as3/ATL still carries the previous
+           submission's work after being reset (tunnel gre0)
+```
+
+`gre0` is not the previous submission's work. It is the fallback device the
+kernel creates when the `gre` module loads, and it cannot be removed:
+
+```
+$ twinet exec as3/ATL -- ip tunnel del gre0
+delete tunnel "gre0" failed: Operation not permitted
+```
+
+The reset excluded `sit0` and nothing else, so on any router where a tunnel
+module had ever been loaded -- in a course that teaches tunnelling, every router
+a student has touched -- the wipe could not remove `gre0`, and the read-back
+that follows it counted what the wipe had left as somebody's leftover answer.
+Every submission in the run is quarantined. A whole class receives no marks:
+honestly, which is the one thing that stops this being a marking scandal, and
+uselessly.
+
+Both the wipe and the read-back now share one list of the devices the kernel
+owns, so they cannot drift apart. The exclusion is not a hiding place: `gre1`,
+`tun6` and `sit01` are still reported, which is what the read-back is for. On
+the router that produced the quarantine, the filter keeps exactly `tun6` -- the
+student's tunnel -- and drops the kernel's `sit0` and `gre0`.
+
+With 122, 123 and 124 fixed, `twinet grade class` completes on cos461 for the
+first time:
+
+```
+wave 1/1: group3
+  group3       10.00 / 10.00
+graded 1 submission(s) against cos461-routing in 6m18.694s
+```
+
+Three defects in one command, all in the same direction: the platform's
+class-scale marking path had never been run end to end against the reference
+lab. Two of them made it refuse to work at all, which is the failure mode to be
+grateful for. The first, in the restore it shares with that path, quietly
+marked a group 9.70 for an answer worth 10.00.
