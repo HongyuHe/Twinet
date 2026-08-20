@@ -507,7 +507,13 @@ func quarantineUnreadable(bad []unreadable, rubric *grade.Rubric, lab string) []
 			Rubric:     rubric.Metadata.Name,
 			MaxTotal:   rubric.MaxTotal(),
 			GradedAt:   time.Now().UTC(),
-			Err:        "this submission could not be read, so it was not graded: " + u.Reason,
+			// The reason is written where the decision was made and used
+			// verbatim. It used to be prefixed here with "this submission
+			// could not be read", which was wrong for a submission that read
+			// perfectly and was withdrawn because two entries claimed its
+			// name -- the report told a student something untrue about their
+			// own work, which is the whole of what this project is for.
+			Err: u.Reason,
 			// Never a zero. A file the grader could not open says nothing
 			// about the work inside it.
 			NeedsReview: true,
@@ -525,7 +531,7 @@ func announceUnreadable(w io.Writer, bad []unreadable, gradeable int) {
 	if len(bad) == 0 {
 		return
 	}
-	fmt.Fprintf(w, "%d submission(s) cannot be read and will not be graded:\n", len(bad))
+	fmt.Fprintf(w, "%d submission(s) will not be graded:\n", len(bad))
 	for _, u := range bad {
 		fmt.Fprintf(w, "  %-14s %s\n", u.Name, firstLine(u.Reason))
 	}

@@ -1249,7 +1249,9 @@ func readSubmissions(dir string, class *model.Topology) ([]submission, []unreada
 	}
 	var bad []unreadable
 	reject := func(name string, asn int, format string, args ...any) {
-		bad = append(bad, unreadable{Name: name, AS: asn, Reason: fmt.Sprintf(format, args...)})
+		bad = append(bad, unreadable{Name: name, AS: asn,
+			Reason: "this submission could not be read, so it was not graded: " +
+				fmt.Sprintf(format, args...)})
 	}
 	byGroup := map[string]int{}
 	for asn, as := range class.ASes {
@@ -1398,8 +1400,8 @@ func withdrawContested(subs []submission, bad []unreadable) ([]submission, []unr
 		if len(all) > 1 {
 			sort.Strings(all)
 			contestedName[key] = fmt.Sprintf(
-				"%d submissions claim to be %q (%s), so none of them was graded: "+
-					"choosing between them is a decision about late work that belongs to "+
+				"%d submissions claim to be %q (%s), so none of them was graded. "+
+					"Choosing between them is a decision about late work that belongs to "+
 					"whoever runs the course. Remove or rename the ones that should not count",
 				len(all), key, strings.Join(all, ", "))
 		}
@@ -1418,7 +1420,7 @@ func withdrawContested(subs []submission, bad []unreadable) ([]submission, []unr
 				continue
 			}
 			contestedName[n] = fmt.Sprintf(
-				"AS %d is claimed by %s, so none of them was graded: two submissions for "+
+				"AS %d is claimed by %s, so none of them was graded. Two submissions for "+
 					"one system cannot both be graded against the same lab, and choosing "+
 					"between them is a decision about late work that belongs to whoever "+
 					"runs the course. Remove or rename the ones that should not count",

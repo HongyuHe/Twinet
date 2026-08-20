@@ -2684,3 +2684,68 @@ assessed.*
 The lesson is the one behind finding 122 and finding 124, in a new place: when
 two artifacts describe the same fact, they will drift, and the one that drifts
 is the one without a test. Both are now tested against the same rule.
+
+### 131. A full mark was overwritten by a quarantine report
+
+Found by review round 135, and caused by the fix for finding 129 — which is
+the honest way to say it. Reports are written to a file named after the
+submission, and the ambiguity check only ever saw the submissions it could
+*read*. Quarantine introduced a second set of names it never looked at, and
+appended those reports after the graded ones. So:
+
+```
+$ ls submissions/
+group3  group3.tar.gz          # an empty directory, and a real archive
+
+$ twinet grade batch -s submissions -o reports
+  [1/1] group3       10.00 / 10.00
+$ cat reports/group3.txt
+group3 (AS 3)
+============================================================  not graded
+```
+
+A student who scored full marks was handed a report saying they had not been
+graded at all, and the class CSV carried two contradictory rows for them — one
+`graded,10.00`, one `needs-review`. An instructor importing that file would
+either double-count the student or record nothing for someone who passed.
+
+The reviewer proposed making this fatal, consistent with the existing rule.
+That would have been consistent and wrong: it puts back exactly what finding
+129 took out, one student's stray directory leaving a hundred others unmarked.
+
+The rule that was actually missing is that **ambiguity is a property of a
+name, not of the set**. Everything claiming a contested name or a contested AS
+is now withdrawn from the marking and reported; the rest of the class is
+graded. One contested name yields exactly one report, so two withdrawn entries
+cannot collide with each other either. What justified stopping the whole run
+was that somebody would otherwise be silently skipped — and nothing is silent
+now: every withdrawn submission is named before the run starts, named in the
+CSV with no total, named again by the release guard, and the command still
+exits non-zero.
+
+```
+1 submission(s) will not be graded:
+  group3         2 submissions claim to be "group3" (group3 (unreadable), group3.tar.gz), so none of them was graded. ...
+grading 1 submission(s), 8 at a time, each in its own lab
+  [1/1] group4       10.00 / 10.00
+```
+
+group4 is the point: an innocent bystander who now gets marked.
+
+Two things were tightened alongside it. Writing the reports **refuses** two
+reports for one name rather than resolving it — whatever produced them is a
+defect, and quietly replacing one mark with another is the worst possible way
+to find out about it. And the quarantine text no longer prefixes every reason
+with "this submission could not be read", which was untrue of a submission
+that read perfectly and was withdrawn because two entries claimed its name.
+Telling a student something untrue about their own work is the whole of what
+this project is trying not to do.
+
+`refuseDuplicates` was deleted rather than kept beside its replacement. It had
+three tests and no callers, which is how a function goes on being tested for a
+year after it stopped being the one that runs.
+
+The lesson is about the shape of the fix, not the bug. Finding 129 added a new
+kind of thing — a submission that is named but not graded — and every existing
+rule about names was written before that kind existed. A fix that introduces a
+new state has to be checked against every invariant that was true without it.

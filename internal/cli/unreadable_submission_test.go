@@ -274,3 +274,33 @@ func TestTwoReportsForOneNameAreRefusedRatherThanOverwritten(t *testing.T) {
 		t.Errorf("the error should say whose mark was at risk: %v", err)
 	}
 }
+
+// A withdrawn submission must not be told it was unreadable: it read fine.
+func TestAContestedSubmissionIsNotCalledUnreadable(t *testing.T) {
+	_, held := withdrawContested([]submission{
+		{Group: "group3", AS: 3, Dir: "/s/group3"},
+		{Group: "Group3", AS: 3, Dir: "/s/Group3"},
+	}, nil)
+	if len(held) != 1 {
+		t.Fatalf("expected one report, got %+v", held)
+	}
+	rubric := &grade.Rubric{}
+	rubric.Questions = []grade.QuestionSpec{{ID: "q1", Points: 10}}
+	reps := quarantineUnreadable(held, rubric, "cos461")
+	if strings.Contains(reps[0].Err, "could not be read") {
+		t.Errorf("a submission that read perfectly is reported as unreadable: %q", reps[0].Err)
+	}
+	if strings.Count(reps[0].Err, "was not graded") > 1 {
+		t.Errorf("the reason is doubled up: %q", reps[0].Err)
+	}
+	if !strings.Contains(reps[0].Err, "claim to be") {
+		t.Errorf("the reason should say the name is contested: %q", reps[0].Err)
+	}
+	// And one that really was unreadable still says so.
+	reps = quarantineUnreadable([]unreadable{
+		{Name: "group6", Reason: "this submission could not be read, so it was not graded: EOF"},
+	}, rubric, "cos461")
+	if !strings.Contains(reps[0].Err, "could not be read") {
+		t.Errorf("an unreadable submission no longer says why: %q", reps[0].Err)
+	}
+}
