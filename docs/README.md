@@ -52,6 +52,7 @@ and replaces the machinery underneath it.
 | 08 | [Resources needed](08_resources_needed.md) | What I need from you to execute this plan |
 | 09 | [Implementation status](09_status.md) | What is built and verified, with measurements |
 | 10 | [Fault injection and RCA](10_fault_injection.md) | Injecting the NIKA fault taxonomy, for assessing AI agents at root-cause analysis |
+| 11 | [Scalability and reliability objectives](11_scalability_and_reliability_objectives.md) | Comparative audit, critical issues, measurable remediation objectives, and review gate |
 
 ## Repository conventions
 

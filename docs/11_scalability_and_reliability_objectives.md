@@ -1,0 +1,423 @@
+# 11 - Scalability, reliability, and extensibility objectives
+
+## 1. Verdict
+
+Twinet is already a materially better teaching and assessment platform than the
+mini-Internet implementation it replaces. It has a typed topology model,
+deterministic addressing, isolated grading, multi-node links, configuration
+preservation, and a fault lifecycle that neither mini-Internet, containerlab,
+nor Kathara provides as one coherent product.
+
+It does **not** yet meet all of its own design goals.
+
+The current three-node implementation proves that Twinet can distribute a
+course lab. It does not yet prove that Twinet is a reliable cluster
+orchestrator:
+
+- the 84-AS deployment takes 22 minutes 38 seconds, against a target below 10
+  minutes;
+- fair grading of 100 submissions takes about 3 hours 15 minutes, against a
+  target below 15 minutes;
+- an eight-way grading run can saturate the cluster and quarantine correct
+  submissions;
+- cluster mutation, overlay allocation, capacity admission, node failover, and
+  student-state replication are not transactional;
+- every router still runs FRR and every AS interior is explicitly enumerated;
+- the 24-hour scale soak and automated multi-node chaos gates have not run.
+
+Development cost in time or money is not a constraint. The objectives below
+therefore optimize solely for correctness, scalability, operability, and the
+quality of the final system.
+
+## 2. Comparison with existing frameworks
+
+The mini-Internet comparison follows the source audit already recorded in
+[01](01_assessment.md). The containerlab comparison uses its official
+[multi-node documentation](https://containerlab.dev/manual/multi-node/), public
+runtime and node-kind interfaces, and
+[Clabernetes](https://containerlab.dev/manual/clabernetes/). The Kathara
+comparison follows its local manager, Docker, and Kubernetes implementations.
+
+| Property | mini-Internet | containerlab | Kathara | Twinet now |
+|---|---|---|---|---|
+| Multi-node deployment | None; one Docker host | Core is single-host; manual VXLAN or separate Clabernetes for Kubernetes | Kubernetes backend distributes pods and collision domains | Native three-node placement and VXLAN, but no HA scheduler or automatic node-loss recovery |
+| Topology model | Eight positional files and shell-derived state | Mature generic YAML and node-kind model | Simple Netkit-compatible `lab.conf` model | Strong typed course model, templates, IPAM, and inter-AS generation |
+| Vendor breadth | FRR-centric | More than 40 NOS kinds, plus vrnetlab VMs | Generic image/backend abstraction | FRR only |
+| Runtime breadth | Docker-specific scripts | Docker and Podman abstractions | Docker and Kubernetes managers | Docker only |
+| Reconciliation | Teardown and rebuild | Real topology/link diff classes for supported changes | Kubernetes supplies declarative reconciliation in that backend | Idempotent ensure plus repair loop; no true desired/observed minimal diff |
+| Distributed scheduling | None | None in core; Kubernetes in Clabernetes | Kubernetes scheduler | Static AS placement from manifest-declared nodes |
+| Observability | Ad hoc containers and text files | Strong CLI plus external telemetry ecosystem | Runtime stats and Kubernetes tooling | Matrix and looking glass, but no metrics/event stream or resource telemetry |
+| Teaching workflow | Excellent pedagogy, fragile machinery | General network labs | Strong educational UX | Best course semantics of the four |
+| Autograding | Slow, invasive, serial | Not a first-class product | Not a first-class product | Isolated, rubric-driven, evidence-aware, but far above the throughput target |
+| RCA/fault injection | Ad hoc scenarios | External tooling | NIKA-compatible substrate | First-class reversible faults and protected ground truth; 45 of 60 NIKA types |
+
+The right direction is not to replace Twinet with one of these frameworks.
+Twinet should retain its course compiler, grader, preservation model, and fault
+engine while adopting the proven substrate properties that the mature systems
+already demonstrate: pluggable runtimes and NOS kinds from containerlab, and
+declarative scheduling, admission, failover, and reconciliation from
+Kubernetes-backed systems.
+
+## 3. Evidence that drives the objectives
+
+| Evidence | Result |
+|---|---:|
+| 84 ASes / 2,012 devices / 2,927 links / three nodes | 22m38s deployment |
+| Placement computation for that topology | 0.46s |
+| Links crossing the fabric | 302 / 2,927 (10.3%) |
+| Service links crossing the fabric | 204 / 320 (64%) |
+| Fair reduced-harness grading at concurrency 8 | about 3h15m projected for 100; one observed infrastructure quarantine |
+| VNI test, 100 concurrent 300-link labs | 23 collisions before sequential deconfliction |
+| Live node-0 after labs were gone | 0 managed containers, 28 Twinet VXLANs, 28 Twinet bridges |
+| Production Go | 57,234 lines |
+| Core orchestration Go | 16,755 lines |
+| Go tests | 26,690 lines |
+
+The hardware was not saturated during the 84-AS deployment. Placement takes
+less than a second. The dominant problems are orchestration, process creation,
+global serialization, repeated observation, convergence strategy, and missing
+admission control rather than graph partitioning or raw machine capacity.
+
+## 4. Required objectives
+
+Every objective is mandatory. An implementation is not complete because an
+interface or design exists; it is complete only when its acceptance test has
+run successfully.
+
+### O1 - Meet the scale and grading targets
+
+**Problem.** The two headline acceptance targets are missed: deployment by more
+than 2x and grading by about 13x. The 24-hour stability claim is untested.
+
+**Required outcome.**
+
+- Deploy and converge the 84-AS reference lab in under 10 minutes.
+- Grade 100 deterministic synthetic submissions in under 15 minutes without
+  mutating the class lab.
+- Run the reference lab for 24 hours under synthetic student, matrix, save, and
+  fault activity with no unexplained process death, stale overlay, lost
+  configuration, or false grading deduction.
+- Record phase timings and resource consumption so a regression names its
+  bottleneck.
+
+### O2 - Remove orchestration hot-path serialization
+
+**Problem.** The runtime spawns the Docker CLI for lifecycle and exec calls,
+all namespace work passes through one global mutex, deployment has whole-stage
+barriers, and capture and teardown are sequential.
+
+**Required outcome.**
+
+- Use a long-lived Docker/containerd API client for lifecycle, list, inspect,
+  exec, copy, and event operations; retain a CLI fallback only as an explicit
+  compatibility mode.
+- Replace process-wide namespace serialization with namespace-scoped netlink
+  handles or an equivalently safe concurrent implementation.
+- Execute the dependency DAG as a DAG, allowing create, wire, configure, and
+  readiness work to pipeline when their own prerequisites are satisfied.
+- Use bounded parallel capture, pruning, and teardown.
+- A no-change deployment performs no file copy, daemon restart, interface
+  recreation, or shaping update.
+
+**Acceptance.** Trace a 2,012-device initial deployment and no-change redeploy.
+The trace must prove useful concurrency, no global namespace lock, no Docker CLI
+processes on the default path, and zero unintended mutations on redeploy.
+
+### O3 - Add real admission control and backpressure
+
+**Problem.** `cpus` and `memory` are container limits but also act as placement
+demand only when optional node capacities are present. Bundled cluster
+manifests declare no capacities, so placement is effectively based on container
+count. Different labs each create their own worker pool with no node-wide
+limit.
+
+**Required outcome.**
+
+- Model resource **requests** separately from hard **limits**.
+- Discover allocatable CPU, memory, disk, PID, file-descriptor, and network
+  device capacity from every agent.
+- Make strict admission the default; require an explicit, audited override for
+  overcommit.
+- Add node-wide budgets for lifecycle calls, exec/probes, netlink work, image
+  pulls, and state capture across all labs.
+- Schedule grading harnesses from available capacity rather than a fixed
+  concurrency number.
+
+**Acceptance.** An intentionally oversized lab is refused before creating
+anything. Eight grading harnesses on the three-node cluster are queued to a safe
+width and all correct submissions complete without infrastructure quarantine.
+
+### O4 - Make cluster mutation and overlay allocation transactional
+
+**Problem.** Operation leases are local to each node. Concurrent controllers
+can each win a different subset of nodes. Overlay deconfliction is a
+query-then-apply operation, so concurrent labs can select the same apparently
+free identifier.
+
+**Required outcome.**
+
+- Introduce a cluster-scoped per-lab lease with TTL, ordered acquisition,
+  rollback, and fencing tokens.
+- Require a valid fencing token on every mutating agent operation.
+- Reserve overlay identifiers atomically for the nodes on which they can
+  appear; release reservations on failure or lease expiry.
+- Make deployment generations compare-and-swap rather than last-writer-wins.
+
+**Acceptance.** Repeatedly race two incompatible deployments of one lab and 100
+concurrent 300-link labs. Exactly one incompatible deployment may commit, no
+node may carry a mixed generation, no VNI may be shared, and no request may
+report success for a partial cluster mutation.
+
+### O5 - Bound overlay object growth and collect garbage automatically
+
+**Problem.** Each cross-node link creates a bridge and VXLAN interface on both
+ends. Concurrent grading multiplies those objects. Orphan cleanup is manual;
+the live cluster currently retains 28 Twinet tunnels and bridges while running
+no Twinet containers.
+
+**Required outcome.**
+
+- Multiplex isolated links over a bounded set of tunnels per lab/node pair,
+  using kernel-supported VLAN-to-VNI mapping, OVS, eBPF, or another measured
+  design.
+- Keep shaping at the container edge so local and remote links remain
+  behaviorally identical.
+- Persist ownership and last-use generation for every host object.
+- Garbage-collect abandoned veths, bridges, tunnels, reservations, and lab
+  records after a safe grace period, while refusing to remove anything an
+  active operation can still use.
+
+**Acceptance.** Overlay tunnel/bridge count grows with active lab/node pairs,
+not cross-node links. Killing a controller halfway through deployment leaves no
+objects after the lease/grace period. The existing 28-object leak is detected
+and safely removable by the automatic path.
+
+### O6 - Remove front-node service bottlenecks
+
+**Problem.** Shared services default to one front node. In the scale topology,
+64% of service links cross the fabric, and the gateway, web tier, and service
+containers are single failure and concentration points.
+
+**Required outcome.**
+
+- Support per-node or sharded replicas for DNS, RPKI RTR, matrix probes,
+  measurement, and other attach-to-every-AS services.
+- Place each AS's service attachment locally when possible.
+- Give replicas stable anycast or generated service identities.
+- Run gateway and web endpoints in active/standby or active/active form without
+  weakening group authorization.
+
+**Acceptance.** Losing the original front node does not remove student access,
+DNS, RTR, or the web overview for ASes on surviving nodes. Service cross-links
+are reduced to the minimum implied by replication.
+
+### O7 - Preserve work through node loss and migration
+
+**Problem.** Student snapshots and topology records are node-local. Node-loss
+rescheduling is documented but not implemented. Export capture is best effort,
+so a migration can transfer stale state and later strand the fresh snapshot on
+the old node.
+
+**Required outcome.**
+
+- Maintain at least two failure-domain-separated copies of every current
+  student snapshot and topology record.
+- Capture periodically and on every destructive boundary.
+- Make migration two-phase: fresh capture, replicated durable write,
+  destination restore verification, then source removal.
+- Fail closed on stale or unavailable state unless an operator explicitly
+  chooses data loss.
+- Implement node drain and `on_node_loss: reschedule` using the replicated
+  state.
+
+**Acceptance.** Change every supported kind, destroy the node that owns the AS,
+reschedule it, and compare the restored configuration byte-for-byte and
+semantically. No acknowledged configuration may be lost when any one node or
+disk disappears.
+
+### O8 - Implement true reconciliation and correct self-healing
+
+**Problem.** Deploy is idempotent but does not compute a minimal change plan.
+The repair loop performs a serial Docker inspect/exec survey every minute,
+treats exited or unreadable containers as healthy, and permanently stops
+trying after three failed repairs.
+
+**Required outcome.**
+
+- Implement desired/observed change classes: live, config, rewire, restart,
+  recreate, and delete.
+- Subscribe to runtime events for immediate lifecycle repair, with sampled
+  audits as a backstop rather than a full minute-by-minute exec sweep.
+- Represent healthy, broken, and unknown separately.
+- Restart exited containers, repair partial wiring, and retry failures with
+  bounded exponential backoff; recovery must clear failure history.
+- Coordinate deliberate faults and grading through fenced exemptions/holds.
+
+**Acceptance.** Changing one link delay touches only its qdisc. Restarting one
+router causes no other AS flap. A device that fails repair three times and then
+becomes repairable is recovered automatically.
+
+### O9 - Add cluster-grade observability and bounded collection
+
+**Problem.** Prometheus metrics and an event stream are designed but absent.
+Node status omits memory, disk, load, and operation pressure. One 82-AS matrix
+refresh can issue up to 13,284 separate container execs.
+
+**Required outcome.**
+
+- Export Prometheus-compatible operation, queue, runtime, resource, overlay,
+  convergence, repair, grading, and underlay metrics.
+- Add a structured, bounded event stream with lab, node, generation, scope, and
+  correlation identifiers.
+- Report allocatable and used CPU, memory, disk, PIDs, file descriptors,
+  netdevs, image cache, clock skew, and active work.
+- Batch matrix and looking-glass collection agent-side; update incrementally
+  from routing/runtime events where possible.
+
+**Acceptance.** An 82-AS matrix refresh uses at most two container execs per
+source AS, metrics explain every deployment phase, and a failed cross-node link
+can be traced from controller request to both endpoint agents.
+
+### O10 - Support heterogeneous NOSes and pluggable runtimes
+
+**Problem.** The runtime interface has one Docker implementation and every
+router is FRR. Containerlab supports Docker/Podman and more than 40 NOS kinds;
+Kathara cleanly separates Docker and Kubernetes managers.
+
+**Required outcome.**
+
+- Add explicit NOS and runtime registries with capability declarations.
+- Move rendering, apply, readiness, operational-state collection, and save
+  semantics behind NOS interfaces.
+- Introduce vendor-neutral route, protocol-session, interface, policy, and
+  forwarding state consumed by grading and observability.
+- Add a second open NOS image, initially BIRD or OpenBGPD, and a second runtime
+  backend.
+- Refuse unsupported device/feature combinations during validation.
+
+**Acceptance.** Replace two routers in `examples/cos461` with the second NOS.
+The unchanged rubric must award the unchanged reference score, while an
+unsupported MPLS request is refused before deployment.
+
+### O11 - Generate and distribute intra-AS topology types
+
+**Problem.** Inter-AS topology is generated, but AS interiors remain explicit
+and AS-granular placement forbids distributing a large Clos.
+
+**Required outcome.**
+
+- Add one generator registry shared by inter-AS and interior generators.
+- Implement `explicit`, `ring`, `two-tier`, and `clos`.
+- Add role-derived scalable addressing and shape-aware rubric compatibility.
+- Introduce placement groups so ordinary teaching ASes stay local while a
+  declared fabric can split at a controlled boundary.
+
+**Acceptance.** Existing labs represented as `kind: explicit` retain identical
+topology hashes. A generated Clos deploys, converges, grades, and distributes
+across three nodes with deterministic placement.
+
+### O12 - Harden tenant and operator security
+
+**Problem.** Student routers run as root with `CAP_SYS_ADMIN`, label scoping is
+not a kernel tenancy boundary, and one cluster-wide controller identity can
+mutate every lab.
+
+**Required outcome.**
+
+- Remove `CAP_SYS_ADMIN` and every other unnecessary device capability.
+- Apply no-new-privileges, explicit seccomp/AppArmor policy, read-only mounts
+  where possible, and resource requests/limits to every device.
+- Issue scoped operator/TA identities and enforce lab/action RBAC from the mTLS
+  identity, not only a shared bearer token.
+- Support a stronger sandbox or dedicated worker pool for hostile student and
+  evaluated-agent code.
+- Audit every privileged mutation.
+
+**Acceptance.** A credential for one lab cannot list or mutate another; a
+student container cannot reach the Docker socket, host namespaces, underlay, or
+another lab; all course exercises still work without `CAP_SYS_ADMIN`.
+
+### O13 - Make documentation describe shipped behavior
+
+**Problem.** Architecture documents claim gRPC, two binaries, no state store,
+minimal diff apply, Prometheus metrics, underlay health metrics, and node-loss
+rescheduling. The implementation uses HTTP, builds five binaries, persists
+file state, and lacks the latter features. The root README also contains stale
+course status.
+
+**Required outcome.**
+
+- Separate current architecture from target architecture.
+- Generate command, schema, capability, fault-coverage, and benchmark tables
+  from code or tests.
+- Make CI fail when an implemented/remaining-work claim contradicts the
+  corresponding executable capability.
+
+**Acceptance.** Every feature claim in `README` and docs has an executable
+evidence reference, and an intentionally stale claim fails a documentation
+test.
+
+### O14 - Make bootstrap, images, and upgrades reproducible
+
+**Problem.** `twinet node bootstrap` emits a non-loopback service with only a
+bearer token, while `twinetd` correctly refuses to start without mTLS or
+`-insecure`. Examples use mutable image tags, and exact build matching prevents
+rolling upgrades.
+
+**Required outcome.**
+
+- Provide one idempotent secure bootstrap that validates prerequisites,
+  installs binaries and certificates, starts the agent, and verifies health,
+  underlay reachability, MTU, and version.
+- Pin released and grading images by digest and verify all nodes after pulling.
+- Version the agent protocol and renderer contract separately from the binary;
+  permit rolling upgrades only across declared-compatible versions.
+
+**Acceptance.** Bootstrap fresh supported nodes without manual repair, deploy a
+lab during a one-node-at-a-time compatible upgrade, and reproduce a grade using
+only its recorded source revision and image digests.
+
+### O15 - Continuously test scale and failure behavior
+
+**Problem.** Cluster E2E is manual, there is no reproducible scale benchmark
+script, and concurrent-controller, node-loss, migration, overlay-GC, and
+24-hour soak behavior are not release gates.
+
+**Required outcome.**
+
+- Add reproducible benchmark commands and machine-readable result artifacts.
+- Add multi-node tests for concurrent deploys, VNI reservation, node reboot and
+  disk loss, state migration, underlay flap, partial deployment, abandoned
+  controller, overlay collection, and grading saturation.
+- Run short chaos tests on every stable merge and scheduled scale/soak tests on
+  `main`.
+- Compare performance against stored budgets and fail on regression.
+
+**Acceptance.** The full gate demonstrates O1-O14 from a clean cluster and
+produces an auditable report tied to source and image digests.
+
+## 5. Implementation order
+
+1. **Protect correctness first:** O4, O7, O12.
+2. **Remove scale bottlenecks:** O2, O3, O5, O6, O8, O9.
+3. **Complete extensibility:** O10, O11.
+4. **Make operation and evidence durable:** O13, O14, O15.
+5. **Run O1 acceptance and optimize until every threshold is met.**
+
+Each coherent milestone is developed on `dev`, tested, committed as
+`Hongyu Hè <hhy@princeton.edu>`, and pushed. Only stable milestones move to
+`main`.
+
+## 6. Completion and review gate
+
+After all objectives and acceptance tests pass:
+
+1. Start a **fresh** reviewer with model **GPT-5.6 Sol**, maximum reasoning
+   effort, and long context.
+2. Give it this document, the implementation diff, test/benchmark evidence, and
+   instructions to be objective, adversarial, and constructive.
+3. Treat any verdict other than exactly `PASS` as `FAIL`.
+4. Record every finding, fix it, rerun the relevant acceptance evidence, and
+   start a new reviewer with clean context.
+5. Stop only after **two fresh review rounds in succession** return `PASS`.
+
