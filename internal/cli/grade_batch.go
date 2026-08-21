@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -23,6 +24,7 @@ import (
 	"github.com/HongyuHe/twinet/internal/grade"
 	"github.com/HongyuHe/twinet/internal/harness"
 	"github.com/HongyuHe/twinet/internal/model"
+	"github.com/HongyuHe/twinet/internal/place"
 	"github.com/HongyuHe/twinet/internal/render"
 	rt "github.com/HongyuHe/twinet/internal/runtime"
 	"github.com/HongyuHe/twinet/internal/svc"
@@ -124,39 +126,98 @@ mark, unless --keep-labs is given for a dispute.`,
 				parallel = 8
 			}
 
-			fmt.Fprintf(cmd.ErrOrStderr(),
-				"grading %d submission(s), %d at a time, each in its own lab\n",
-				len(subs), parallel)
-
 			start := time.Now()
 			reports := make([]*grade.Report, len(subs))
-			var wg sync.WaitGroup
-			sem := make(chan struct{}, parallel)
+			plans := make([]*batchHarness, 0, len(subs))
+			for i, sub := range subs {
+				h, err := harness.Slice(class, sub.AS, harness.Options{
+					Depth: depth, KeepHosts: keepHosts, Reduce: reduce, Suffix: sub.Group,
+				})
+				if err != nil {
+					reports[i] = ungradeableReport(sub, rubric, "building the harness", err)
+					continue
+				}
+				plans = append(plans, &batchHarness{
+					index: i, queueIndex: len(plans), submission: sub, topology: h,
+				})
+			}
+
+			c := client.NewCluster(class.Lab, tok)
+			workloads := make([]place.Workload, 0, len(plans))
+			for _, plan := range plans {
+				workloads = append(workloads, place.Workload{
+					Name: plan.submission.Group, DemandByNode: place.TopologyDemandByNode(plan.topology),
+				})
+			}
+			var waves [][]int
+			if len(workloads) > 0 {
+				inventory, err := c.Inventories(cmd.Context())
+				if err != nil {
+					return fmt.Errorf("cannot schedule grading harnesses before marking: %w", err)
+				}
+				waves, err = place.ScheduleWaves(class.Lab, inventory, workloads, parallel)
+				if err != nil {
+					return fmt.Errorf("cannot schedule grading harnesses before marking: %w", err)
+				}
+			}
+			fmt.Fprintf(cmd.ErrOrStderr(),
+				"grading %d submission(s) in %d capacity-safe wave(s), at most %d at a time\n",
+				len(plans), len(waves), parallel)
+
 			var mu sync.Mutex
 			done := 0
+			for waveIndex := 0; waveIndex < len(waves); waveIndex++ {
+				wave := waves[waveIndex]
+				wavePlans := make([]*batchHarness, 0, len(wave))
+				waveWorkloads := make([]place.Workload, 0, len(wave))
+				for _, index := range wave {
+					wavePlans = append(wavePlans, plans[index])
+					waveWorkloads = append(waveWorkloads, workloads[index])
+				}
+				if err := waitForHarnessCapacity(cmd.Context(), c, class.Lab, waveWorkloads); err != nil {
+					return fmt.Errorf("harness wave was not admitted before marking: %w", err)
+				}
+				var wg sync.WaitGroup
+				var retryMu sync.Mutex
+				var retry []int
+				for _, plan := range wavePlans {
+					wg.Add(1)
+					go func(plan *batchHarness) {
+						defer wg.Done()
+						rep := gradeOneHarness(cmd.Context(), class, rubric, plan.submission, plan.topology, batchOpts{
+							token: tok, depth: depth, keepHosts: keepHosts, reduce: reduce,
+							keepLab: keepLabs, converge: converge, settle: settle,
+							outDir: outDir,
+						})
+						if capacityBlockedReport(rep) {
+							retryMu.Lock()
+							retry = append(retry, plan.queueIndex)
+							retryMu.Unlock()
+							return
+						}
+						reports[plan.index] = rep
 
-			for i, s := range subs {
-				wg.Add(1)
-				go func(i int, s submission) {
-					defer wg.Done()
-					sem <- struct{}{}
-					defer func() { <-sem }()
-
-					rep := gradeOne(cmd.Context(), class, rubric, s, batchOpts{
-						token: tok, depth: depth, keepHosts: keepHosts, reduce: reduce,
-						keepLab: keepLabs, converge: converge, settle: settle,
-						outDir: outDir,
-					})
-					reports[i] = rep
-
-					mu.Lock()
-					done++
-					fmt.Fprintf(cmd.ErrOrStderr(), "  [%d/%d] %-12s %.2f / %.2f\n",
-						done, len(subs), rep.Submission, rep.Total, rep.MaxTotal)
-					mu.Unlock()
-				}(i, s)
+						mu.Lock()
+						done++
+						fmt.Fprintf(cmd.ErrOrStderr(), "  [%d/%d] %-12s %.2f / %.2f\n",
+							done, len(subs), rep.Submission, rep.Total, rep.MaxTotal)
+						mu.Unlock()
+					}(plan)
+				}
+				wg.Wait()
+				if len(retry) > 0 {
+					// A concurrent external deployment won capacity between
+					// the preflight and agent admission. These submissions
+					// have not been marked; queue them for a fresh capacity
+					// check instead of quarantining correct work for host
+					// pressure.
+					sort.Ints(retry)
+					waves = append(waves, retry)
+					fmt.Fprintf(cmd.ErrOrStderr(),
+						"  capacity changed during admission; queued %d harness(es) for a later safe wave\n",
+						len(retry))
+				}
 			}
-			wg.Wait()
 
 			reports = append(reports, quarantineUnreadable(unread, rubric, class.Name)...)
 			summary := grade.Summarise(rubric.Metadata.Name, reports, time.Since(start))
@@ -211,30 +272,91 @@ type batchOpts struct {
 	outDir    string
 }
 
+type batchHarness struct {
+	index      int
+	queueIndex int
+	submission submission
+	topology   *model.Topology
+}
+
+func ungradeableReport(s submission, rubric *grade.Rubric, stage string, err error) *grade.Report {
+	return &grade.Report{
+		Submission:  s.Group,
+		MaxTotal:    rubric.MaxTotal(),
+		AS:          s.AS,
+		Err:         fmt.Sprintf("%s: %v", stage, err),
+		NeedsReview: true,
+	}
+}
+
+const capacityAdmissionPrefix = "capacity admission: "
+
+func capacityBlockedReport(rep *grade.Report) bool {
+	return rep != nil && strings.HasPrefix(rep.Err, capacityAdmissionPrefix)
+}
+
+type capacityAdmissionError struct{ err error }
+
+func (e *capacityAdmissionError) Error() string { return e.err.Error() }
+func (e *capacityAdmissionError) Unwrap() error { return e.err }
+
+// waitForHarnessCapacity queues a wave while another lab is consuming the
+// shared node budget. It never lets a correct submission enter gradeOne until
+// the entire wave fits; pressure therefore cannot turn into a post-deployment
+// quarantine attributed to the student.
+func waitForHarnessCapacity(ctx context.Context, c *client.Cluster, lab *model.Lab,
+	workloads []place.Workload,
+) error {
+	if len(workloads) == 0 {
+		return nil
+	}
+	for {
+		inventory, err := c.Inventories(ctx)
+		if err == nil {
+			waves, scheduleErr := place.ScheduleWaves(lab, inventory, workloads, len(workloads))
+			if scheduleErr == nil && len(waves) == 1 {
+				return nil
+			}
+			err = scheduleErr
+			if err == nil {
+				err = fmt.Errorf("current infrastructure capacity requires this wave to wait")
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("waiting for capacity: %w", ctx.Err())
+		case <-time.After(2 * time.Second):
+			slog.Info("waiting for capacity-safe grading wave", "reason", err)
+		}
+	}
+}
+
 // gradeOne deploys a harness, loads the submission into it, grades it and tears
 // it down. A failure at any stage produces a report explaining the failure
 // rather than an absent mark, because a submission that crashes the grader
 // still needs a defensible answer for the student.
 func gradeOne(ctx context.Context, class *model.Topology, rubric *grade.Rubric,
 	s submission, o batchOpts) *grade.Report {
-
-	fail := func(stage string, err error) *grade.Report {
-		return &grade.Report{
-			Submission: s.Group,
-			MaxTotal:   rubric.MaxTotal(),
-			AS:         s.AS,
-			Err:        fmt.Sprintf("%s: %v", stage, err),
-			// A submission the grader could not mark must never look like a
-			// submission that scored zero on its merits.
-			NeedsReview: true,
-		}
-	}
-
 	h, err := harness.Slice(class, s.AS, harness.Options{
 		Depth: o.depth, KeepHosts: o.keepHosts, Reduce: o.reduce, Suffix: s.Group,
 	})
 	if err != nil {
-		return fail("building the harness", err)
+		return ungradeableReport(s, rubric, "building the harness", err)
+	}
+	return gradeOneHarness(ctx, class, rubric, s, h, o)
+}
+
+func gradeOneHarness(ctx context.Context, class *model.Topology, rubric *grade.Rubric,
+	s submission, h *model.Topology, o batchOpts,
+) *grade.Report {
+
+	fail := func(stage string, err error) *grade.Report {
+		rep := ungradeableReport(s, rubric, stage, err)
+		var capacityErr *capacityAdmissionError
+		if errors.As(err, &capacityErr) {
+			rep.Err = capacityAdmissionPrefix + err.Error()
+		}
+		return rep
 	}
 
 	// Record which network produced the mark, before anything can go wrong.
@@ -482,14 +604,19 @@ func deployQuiet(ctx context.Context, c *client.Cluster, h *model.Topology, targ
 		// The surrounding internet is solved so the submission is marked
 		// against neighbours that actually work; the graded AS keeps platform
 		// mode so what is marked is the student's own configuration.
-		Mode:       "solve",
-		Ungraded:   target,
-		PullPolicy: string(rt.PullIfMissing),
-		Workers:    8,
-		Generation: time.Now().UTC().Format("20060102T150405.000"),
+		Mode:            "solve",
+		Ungraded:        target,
+		PullPolicy:      string(rt.PullIfMissing),
+		Workers:         8,
+		Generation:      time.Now().UTC().Format("20060102T150405.000"),
+		StrictAdmission: true,
 	})
 	for _, r := range results {
 		if r.Err != nil {
+			if strings.Contains(r.Err.Error(), "strict admission") ||
+				strings.Contains(r.Err.Error(), "allocatable") {
+				return &capacityAdmissionError{err: fmt.Errorf("node %s: %w", r.Node, r.Err)}
+			}
 			return fmt.Errorf("node %s: %w", r.Node, r.Err)
 		}
 		for scope, msgs := range r.Value.Failures {

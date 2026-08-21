@@ -18,6 +18,7 @@ defaults:
 kinds:
   router:
     image: hyhe/twinet-router:0.1
+    requests: {cpus: 0.50, memory: 128Mi, pids: 64, ephemeral_storage: 256Mi, file_descriptors: 1024, netdevs: 10}
     capabilities: [NET_ADMIN, NET_RAW]
     sysctls:
       net.ipv4.ip_forward: "1"
@@ -32,14 +33,17 @@ kinds:
       net.mpls.conf.lo.input: "1"
   host:
     image: hyhe/twinet-host:0.1
+    requests: {cpus: 0.10, memory: 64Mi, pids: 32, ephemeral_storage: 64Mi, file_descriptors: 256, netdevs: 2}
     capabilities: [NET_ADMIN, NET_RAW]
     pids: 128
   switch:
     image: hyhe/twinet-switch:0.1
+    requests: {cpus: 0.25, memory: 128Mi, pids: 64, ephemeral_storage: 128Mi, file_descriptors: 1024, netdevs: 16}
     capabilities: [NET_ADMIN, NET_RAW, SYS_NICE]
     pids: 512
   service:
     image: hyhe/twinet-svc:0.1
+    requests: {cpus: 0.25, memory: 128Mi, pids: 64, ephemeral_storage: 256Mi, file_descriptors: 1024, netdevs: 8}
     capabilities: [NET_ADMIN, NET_RAW]
 
 link_defaults:

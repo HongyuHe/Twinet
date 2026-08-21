@@ -9,6 +9,7 @@ import (
 	"net/http"
 
 	"github.com/HongyuHe/twinet/internal/deploy"
+	"github.com/HongyuHe/twinet/internal/limiter"
 	"github.com/HongyuHe/twinet/internal/model"
 	"github.com/HongyuHe/twinet/internal/netx"
 	"github.com/HongyuHe/twinet/internal/plan"
@@ -234,6 +235,7 @@ func (s *Server) transactionEngine(top *model.Topology, tx applyTransaction) *de
 	return &deploy.Engine{
 		Runtime:         s.rt,
 		Node:            s.cfg.Node,
+		Limiter:         s.workLimiter(),
 		Renderer:        renderer(top, mode, tx.Ungraded),
 		WritesReference: mode == render.ModeSolve,
 		Authoritative:   mode == render.ModeSolve && tx.Ungraded == 0,
@@ -304,7 +306,7 @@ func (s *Server) rollbackPreparedApply(ctx context.Context, lab string, fence Fe
 	tx applyTransaction,
 ) error {
 	if len(tx.Previous) == 0 {
-		eng := &deploy.Engine{Runtime: s.rt, Node: s.cfg.Node, State: s.store}
+		eng := &deploy.Engine{Runtime: s.rt, Node: s.cfg.Node, State: s.store, Limiter: s.workLimiter()}
 		if err := eng.Destroy(ctx, lab); err != nil {
 			return fmt.Errorf("removing partially applied lab %q: %w", lab, err)
 		}
@@ -351,7 +353,9 @@ func (s *Server) rollbackPreparedApply(ctx context.Context, lab string, fence Fe
 	if err != nil {
 		return fmt.Errorf("build rollback plan: %w", err)
 	}
-	rep, err := p.Execute(ctx, plan.Options{Workers: 0, ContinueOnError: true})
+	rep, err := p.Execute(ctx, plan.Options{
+		Workers: s.workLimiter().ClampWorkers(limiter.Apply, 0), ContinueOnError: true,
+	})
 	if err != nil {
 		return fmt.Errorf("run rollback plan: %w", err)
 	}

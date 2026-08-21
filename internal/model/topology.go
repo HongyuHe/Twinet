@@ -139,10 +139,13 @@ type Device struct {
 	// ImageID is the digest the reference resolved to when the lab was
 	// planned. It is part of a container's identity: a tag rebuilt in place is
 	// different software under an unchanged name.
-	ImageID      string
-	CPUs         float64
-	Memory       string
-	Pids         int64
+	ImageID string
+	CPUs    float64
+	Memory  string
+	Pids    int64
+	// Requests is the fully resolved scheduling reservation. CPUs, Memory,
+	// and Pids above remain hard container limits.
+	Requests     ResourceRequest
 	Restart      string
 	Env          map[string]string
 	Sysctls      map[string]string

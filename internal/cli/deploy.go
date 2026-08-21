@@ -86,9 +86,42 @@ after a partial failure, a reboot, or a topology edit.`,
 						len(rec.ByAS))
 				}
 			}
-			a, err := place.Place(top, place.Options{Fixed: rec, Rebalance: rebalance})
+			var inventory []place.NodeInventory
+			if clustered(top) {
+				tok, err := tokenFor(token)
+				if err != nil {
+					return err
+				}
+				inventory, err = client.NewCluster(top.Lab, tok).Inventories(cmd.Context())
+				if err != nil {
+					if !overcommit {
+						return fmt.Errorf("strict admission requires live inventory before placement: %w", err)
+					}
+					fmt.Fprintf(cmd.ErrOrStderr(),
+						"AUDIT: --overcommit bypasses unavailable live inventory for lab %q: %v\n",
+						top.Name, err)
+					inventory = nil
+				}
+			}
+			a, err := place.Place(top, place.Options{
+				Fixed: rec, Rebalance: rebalance, Inventory: inventory,
+				Strict: clustered(top), Overcommit: overcommit,
+			})
 			if err != nil {
 				return err
+			}
+			// Re-read inventory after placement and before saving its record.
+			// The first read informed placement; this one makes the strict
+			// refusal boundary explicit even if another lab changed while the
+			// graph was being partitioned.
+			if clustered(top) {
+				tok, err := tokenFor(token)
+				if err != nil {
+					return err
+				}
+				if err := client.NewCluster(top.Lab, tok).Admit(cmd.Context(), top, true, overcommit); err != nil {
+					return fmt.Errorf("strict admission refused deployment before placement record write: %w", err)
+				}
 			}
 			warnAboutMoves(cmd.ErrOrStderr(), a, rebalance)
 			// A node asked for more than it declares is refused rather than
@@ -107,6 +140,11 @@ after a partial failure, a reboot, or a topology edit.`,
 					"Raise the node budgets in the manifest, add a node, or pass "+
 					"--overcommit to deploy anyway", strings.Join(a.Overloaded, "\n  "))
 			}
+			if overcommit {
+				fmt.Fprintf(cmd.ErrOrStderr(),
+					"AUDIT: --overcommit accepted placement for lab %q; requests may exceed live allocatable capacity\n",
+					top.Name)
+			}
 			if err := resolveImageIDs(cmd.Context(), top, token); err != nil {
 				return err
 			}
@@ -116,8 +154,9 @@ after a partial failure, a reboot, or a topology edit.`,
 			// lab placed one way and the record saying another, which is the
 			// drift the record exists to prevent.
 			if !dryRun {
-				if err := place.SaveRecord(labPrivateDir(top),
-					a.Record(top.Name, strategyOf(top, rebalance, adopted))); err != nil {
+				record := a.Record(top.Name, strategyOf(top, rebalance, adopted))
+				record.Overcommit = overcommit
+				if err := place.SaveRecord(labPrivateDir(top), record); err != nil {
 					return fmt.Errorf("recording where the lab was placed: %w", err)
 				}
 			}
@@ -132,10 +171,12 @@ after a partial failure, a reboot, or a topology edit.`,
 					return err
 				}
 				return deployCluster(cmd.Context(), top, tok, agent.ApplyRequest{
-					Mode:       modeName(solve),
-					PullPolicy: pull,
-					Workers:    workers,
-					DryRun:     dryRun,
+					Mode:            modeName(solve),
+					PullPolicy:      pull,
+					Workers:         workers,
+					DryRun:          dryRun,
+					StrictAdmission: true,
+					Overcommit:      overcommit,
 					// A deployment that moves an autonomous system to a
 					// different machine must remove it from the old one.
 					//
@@ -257,7 +298,7 @@ after a partial failure, a reboot, or a topology edit.`,
 	cmd.Flags().BoolVarP(&quiet, "quiet", "q", false, "suppress per-step progress")
 	cmd.Flags().StringVar(&token, "token", "", "agent token for cluster deployments (or set TWINET_TOKEN)")
 	cmd.Flags().BoolVar(&overcommit, "overcommit", false,
-		"deploy even though a node is asked for more than it declares room for")
+		"audited escape hatch: deploy despite strict live-capacity admission")
 	cmd.Flags().BoolVar(&rebalance, "rebalance", false,
 		"recompute placement from scratch; every AS that moves has its containers rebuilt "+
 			"and removed from the node it left")

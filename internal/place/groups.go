@@ -11,7 +11,7 @@ import (
 // and complete leaf-with-hosts groups on different nodes. Every other AS
 // remains one atomic unit and therefore keeps all of its intra-AS links local.
 func distributePlacementGroups(top *model.Topology, a *Assignment, names []string,
-	caps map[string]demand, hasCap map[string]bool, opts Options,
+	caps map[string]demand, hasCap map[string]bool, baseline map[string]demand, opts Options,
 	explicitPinned map[int]bool) ([]string, error) {
 
 	if len(names) < 2 {
@@ -20,7 +20,7 @@ func distributePlacementGroups(top *model.Topology, a *Assignment, names []strin
 	if a.ByGroup == nil {
 		a.ByGroup = map[string]string{}
 	}
-	loads := placementDemands(top, a)
+	loads := placementDemands(top, a, baseline)
 	nominal := nominalCapacity(names, caps, hasCap, len(top.Devices))
 	var moved []string
 
@@ -146,8 +146,11 @@ func placementAnchorDemand(as *model.AS) demand {
 // placementDemands recreates the post-AS-placement load so controlled group
 // splitting can rebalance actual CPU/memory/container demand rather than a
 // count of group IDs.
-func placementDemands(top *model.Topology, a *Assignment) map[string]demand {
+func placementDemands(top *model.Topology, a *Assignment, baseline map[string]demand) map[string]demand {
 	out := map[string]demand{}
+	for node, load := range baseline {
+		out[node] = load
+	}
 	for _, asn := range top.SortedASNs() {
 		n := a.ByAS[asn]
 		for _, d := range top.ASes[asn].Devices {

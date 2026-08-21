@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/HongyuHe/twinet/internal/limiter"
 	"github.com/HongyuHe/twinet/internal/model"
 	rt "github.com/HongyuHe/twinet/internal/runtime"
 	"github.com/HongyuHe/twinet/internal/state"
@@ -206,9 +207,11 @@ func (e *Engine) CaptureAll(ctx context.Context, top *model.Topology, store *sta
 
 	captures := make([][]state.Snapshot, len(devices))
 	_, captureErrs, ctxErr := e.runBounded(ctx, len(devices), func(i int) error {
-		snaps, err := Capture(ctx, e.Runtime, devices[i], top.Name, top.Hash)
-		captures[i] = snaps
-		return err
+		return e.limited(ctx, []limiter.Kind{limiter.Capture}, func() error {
+			snaps, err := Capture(ctx, e.Runtime, devices[i], top.Name, top.Hash)
+			captures[i] = snaps
+			return err
+		})
 	})
 
 	saved := 0

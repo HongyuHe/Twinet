@@ -66,36 +66,37 @@ type Wire struct {
 
 // WireDev is one device.
 type WireDev struct {
-	ID                string            `json:"id"`
-	Name              string            `json:"name"`
-	Kind              string            `json:"kind"`
-	AS                int               `json:"as,omitempty"`
-	RouterID          int               `json:"router_id,omitempty"`
-	InteriorRole      string            `json:"interior_role,omitempty"`
-	InteriorRoleIndex int               `json:"interior_role_index,omitempty"`
-	PlacementGroup    string            `json:"placement_group,omitempty"`
-	Node              string            `json:"node"`
-	Image             string            `json:"image"`
-	ImageID           string            `json:"image_id,omitempty"`
-	Container         string            `json:"container"`
-	Hostname          string            `json:"hostname"`
-	Owner             string            `json:"owner,omitempty"`
-	CPUs              float64           `json:"cpus,omitempty"`
-	Memory            string            `json:"memory,omitempty"`
-	Pids              int64             `json:"pids,omitempty"`
-	Restart           string            `json:"restart,omitempty"`
-	Privileged        bool              `json:"privileged,omitempty"`
-	Env               map[string]string `json:"env,omitempty"`
-	Sysctls           map[string]string `json:"sysctls,omitempty"`
-	Capabilities      []string          `json:"capabilities,omitempty"`
-	Binds             []string          `json:"binds,omitempty"`
-	Command           []string          `json:"command,omitempty"`
-	Labels            map[string]string `json:"labels,omitempty"`
-	ServiceKind       string            `json:"service_kind,omitempty"`
-	L2Gateway         string            `json:"l2_gateway,omitempty"`
-	L2Domain          string            `json:"l2_domain,omitempty"`
-	VLANs             []int             `json:"vlans,omitempty"`
-	Ifaces            []WireIface       `json:"ifaces,omitempty"`
+	ID                string                `json:"id"`
+	Name              string                `json:"name"`
+	Kind              string                `json:"kind"`
+	AS                int                   `json:"as,omitempty"`
+	RouterID          int                   `json:"router_id,omitempty"`
+	InteriorRole      string                `json:"interior_role,omitempty"`
+	InteriorRoleIndex int                   `json:"interior_role_index,omitempty"`
+	PlacementGroup    string                `json:"placement_group,omitempty"`
+	Node              string                `json:"node"`
+	Image             string                `json:"image"`
+	ImageID           string                `json:"image_id,omitempty"`
+	Container         string                `json:"container"`
+	Hostname          string                `json:"hostname"`
+	Owner             string                `json:"owner,omitempty"`
+	CPUs              float64               `json:"cpus,omitempty"`
+	Memory            string                `json:"memory,omitempty"`
+	Pids              int64                 `json:"pids,omitempty"`
+	Requests          model.ResourceRequest `json:"requests"`
+	Restart           string                `json:"restart,omitempty"`
+	Privileged        bool                  `json:"privileged,omitempty"`
+	Env               map[string]string     `json:"env,omitempty"`
+	Sysctls           map[string]string     `json:"sysctls,omitempty"`
+	Capabilities      []string              `json:"capabilities,omitempty"`
+	Binds             []string              `json:"binds,omitempty"`
+	Command           []string              `json:"command,omitempty"`
+	Labels            map[string]string     `json:"labels,omitempty"`
+	ServiceKind       string                `json:"service_kind,omitempty"`
+	L2Gateway         string                `json:"l2_gateway,omitempty"`
+	L2Domain          string                `json:"l2_domain,omitempty"`
+	VLANs             []int                 `json:"vlans,omitempty"`
+	Ifaces            []WireIface           `json:"ifaces,omitempty"`
 }
 
 // WireIface is one interface.
@@ -223,7 +224,7 @@ func Serialise(top *model.Topology) *Wire {
 			InteriorRoleIndex: d.InteriorRoleIndex, PlacementGroup: d.PlacementGroup,
 			Node: d.Node, Image: d.Image, ImageID: d.ImageID,
 			Container: d.Container, Hostname: d.Hostname, Owner: d.Owner,
-			CPUs: d.CPUs, Memory: d.Memory, Pids: d.Pids, Restart: d.Restart,
+			CPUs: d.CPUs, Memory: d.Memory, Pids: d.Pids, Requests: d.Requests, Restart: d.Restart,
 			Privileged: d.Privileged, Env: d.Env, Sysctls: d.Sysctls,
 			Capabilities: d.Capabilities, Binds: d.Binds, Command: d.Command,
 			Labels: d.Labels, L2Gateway: d.L2Gateway, L2Domain: d.L2Domain,
@@ -336,13 +337,22 @@ func (w *Wire) Rehydrate() (*model.Topology, error) {
 	ifaceOf := map[string]*model.Iface{} // "devID|ifName" -> iface
 	for i := range w.Devices {
 		wd := &w.Devices[i]
+		requests := wd.Requests
+		if requests.Empty() {
+			// Wires persisted before requests were introduced carry no field.
+			// Give them the same conservative defaults as a newly expanded
+			// legacy manifest rather than treating an unknown reservation as
+			// free capacity.
+			requests = model.DefaultResourceRequest(model.DeviceKind(wd.Kind))
+		}
 		d := &model.Device{
 			ID: wd.ID, Name: wd.Name, Kind: model.DeviceKind(wd.Kind), ASN: wd.AS,
 			RouterID: wd.RouterID, InteriorRole: model.InteriorRole(wd.InteriorRole),
 			InteriorRoleIndex: wd.InteriorRoleIndex, PlacementGroup: wd.PlacementGroup,
 			Node: wd.Node, Image: wd.Image, ImageID: wd.ImageID,
 			Container: wd.Container, Hostname: wd.Hostname, Owner: wd.Owner,
-			CPUs: wd.CPUs, Memory: wd.Memory, Pids: wd.Pids, Restart: wd.Restart,
+			CPUs: wd.CPUs, Memory: wd.Memory, Pids: wd.Pids,
+			Requests: requests, Restart: wd.Restart,
 			Privileged: wd.Privileged, Env: wd.Env, Sysctls: wd.Sysctls,
 			Capabilities: wd.Capabilities, Binds: wd.Binds, Command: wd.Command,
 			Labels: wd.Labels, L2Gateway: wd.L2Gateway, L2Domain: wd.L2Domain,

@@ -50,6 +50,16 @@ defaults:                       # inherited by every device; lowest precedence
   cpus: 2
   memory: 512Mi
   pids: 256
+  # cpus/memory/pids above are hard container limits. Requests are what the
+  # scheduler reserves from a node; omitting a dimension gets a conservative
+  # per-kind default.
+  requests:
+    cpus: 0.25
+    memory: 128Mi
+    pids: 64
+    ephemeral_storage: 256Mi
+    file_descriptors: 1024
+    netdevs: 8
   dns: auto                     # point hosts at the lab DNS service
   restart: unless-stopped
 
@@ -145,6 +155,15 @@ placement:
   pin:
     - {match: {service: "*"}, node: node-0}   # services on the front node
 ```
+
+### Resource requests and limits
+
+`cpus`, `memory`, and `pids` remain Docker hard limits for compatibility.
+They are not placement demand. `requests:` reserves CPU, memory, PIDs,
+ephemeral storage, file descriptors, and a host-netdev estimate. Requests
+inherit through `defaults → kinds → device`; omitted dimensions use
+conservative defaults for router, host, switch, and service devices. A request
+may not exceed its corresponding CPU, memory, or PID limit.
 
 ## 4. An AS template
 

@@ -880,6 +880,7 @@ func (e *expander) materialize(name string, kind model.DeviceKind, over model.De
 		ASN:          asn,
 		Image:        dd.Image,
 		Memory:       dd.Memory,
+		Requests:     model.EffectiveResourceRequest(kind, dd.Requests),
 		Restart:      orDefault(dd.Restart, "unless-stopped"),
 		Env:          dd.Env,
 		Sysctls:      dd.Sysctls,

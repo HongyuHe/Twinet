@@ -142,6 +142,10 @@ var skipped = map[string]string{
 	// the machine it was made on.
 	"Node":   "which cluster machine holds the device; placement is not topology",
 	"Labels": "container labels carry the node and lab name, which vary by deployment",
+	// Requests affect admission and placement, not the network a submitted
+	// configuration was written against. Changing host headroom must not make
+	// every archive appear to belong to another exercise revision.
+	"Requests": "host admission reservation, not topology",
 
 	// Lab fields that describe the deployment rather than the exercise. The
 	// same lab must hash identically on a laptop and on a twelve-node cluster,

@@ -143,6 +143,16 @@ limit.
 - Schedule grading harnesses from available capacity rather than a fixed
   concurrency number.
 
+**Shipped admission contract.** `cpus`, `memory`, and `pids` are container
+limits; `requests` are independent scheduler reservations for CPU, memory,
+PIDs, ephemeral storage, file descriptors, and netdevs. Agents report
+physical, allocatable, observed-used, and Twinet-reserved inventory, with
+unknown dimensions explicitly null/named rather than represented as zero.
+Cluster deploy refuses an over-capacity or unknown assignment before writing a
+placement record or beginning a mutation. `--overcommit` is the explicit,
+recorded and agent-logged exception. Batch grading prebuilds harness demand and
+queues capacity-safe waves; `--parallel` only caps a wave.
+
 **Acceptance.** An intentionally oversized lab is refused before creating
 anything. Eight grading harnesses on the three-node cluster are queued to a safe
 width and all correct submissions complete without infrastructure quarantine.
@@ -420,4 +430,3 @@ After all objectives and acceptance tests pass:
 4. Record every finding, fix it, rerun the relevant acceptance evidence, and
    start a new reviewer with clean context.
 5. Stop only after **two fresh review rounds in succession** return `PASS`.
-

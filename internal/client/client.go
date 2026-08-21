@@ -28,6 +28,7 @@ import (
 	"github.com/HongyuHe/twinet/internal/agent"
 	"github.com/HongyuHe/twinet/internal/deploy"
 	"github.com/HongyuHe/twinet/internal/model"
+	"github.com/HongyuHe/twinet/internal/place"
 	rt "github.com/HongyuHe/twinet/internal/runtime"
 )
 
@@ -476,6 +477,105 @@ func (c *Cluster) Status(ctx context.Context) []NodeResult[agent.StatusResponse]
 	})
 }
 
+// Inventories obtains a complete live reservation view from every node. A
+// missing response is an admission error rather than an empty node: treating
+// an unreachable host as zero or unlimited capacity would make either answer
+// silently unsafe.
+func (c *Cluster) Inventories(ctx context.Context) ([]place.NodeInventory, error) {
+	results := c.Status(ctx)
+	out := make([]place.NodeInventory, 0, len(results))
+	var problems []string
+	for _, result := range results {
+		if result.Err != nil {
+			problems = append(problems, fmt.Sprintf("%s: %v", result.Node, result.Err))
+			continue
+		}
+		out = append(out, placementInventory(result.Node, result.Value.Inventory))
+	}
+	if len(problems) > 0 {
+		sort.Strings(problems)
+		return nil, fmt.Errorf("could not obtain live inventory from every node: %s", strings.Join(problems, "; "))
+	}
+	return out, nil
+}
+
+func placementInventory(name string, in agent.HostInventory) place.NodeInventory {
+	out := place.NodeInventory{
+		Name:          name,
+		Allocatable:   placementCapacity(in.Allocatable),
+		Reserved:      placementResources(in.Reserved),
+		ReservedByLab: map[string]place.Resources{},
+		Unknown:       append([]string(nil), in.Unknown...),
+	}
+	for lab, reservation := range in.Reservations {
+		out.ReservedByLab[lab] = placementResources(reservation)
+	}
+	return out
+}
+
+func placementCapacity(in agent.ResourceInventory) place.Capacity {
+	return place.Capacity{
+		Containers:      in.Containers,
+		CPUs:            in.CPUs,
+		MemoryBytes:     in.MemoryBytes,
+		DiskBytes:       in.DiskBytes,
+		Pids:            in.Pids,
+		FileDescriptors: in.FileDescriptors,
+		NetDevices:      in.NetDevices,
+	}
+}
+
+func placementResources(in agent.ResourceInventory) place.Resources {
+	var out place.Resources
+	if in.Containers != nil {
+		out.Containers = *in.Containers
+	}
+	if in.CPUs != nil {
+		out.CPUs = *in.CPUs
+	}
+	if in.MemoryBytes != nil {
+		out.MemoryBytes, out.MemBytes = *in.MemoryBytes, *in.MemoryBytes
+	}
+	if in.DiskBytes != nil {
+		out.DiskBytes = *in.DiskBytes
+	}
+	if in.Pids != nil {
+		out.Pids = *in.Pids
+	}
+	if in.FileDescriptors != nil {
+		out.FileDescriptors = *in.FileDescriptors
+	}
+	if in.NetDevices != nil {
+		out.NetDevices = *in.NetDevices
+	}
+	return out
+}
+
+// Admit checks a fully placed topology against fresh host inventory. The
+// deploy command also feeds the same inventory into Place; this second check
+// closes the gap between placement and the fenced mutation transaction so a
+// recorded or pinned assignment cannot bypass admission.
+func (c *Cluster) Admit(ctx context.Context, top *model.Topology, strict, overcommit bool) error {
+	if !strict {
+		return nil
+	}
+	inventory, err := c.Inventories(ctx)
+	if err != nil {
+		if overcommit {
+			slog.Warn("audited overcommit bypassed unavailable live inventory", "lab", top.Name, "err", err)
+			return nil
+		}
+		return err
+	}
+	if err := place.AdmitPlaced(top, inventory, true, overcommit); err != nil {
+		return err
+	}
+	if overcommit {
+		slog.Warn("audited overcommit accepted a deployment despite capacity constraints", "lab", top.Name)
+	}
+	return nil
+}
+
 // Apply converges the whole cluster.
 //
 // Every node receives the *entire* topology, not just its own devices: an agent
@@ -489,6 +589,15 @@ func (c *Cluster) Apply(ctx context.Context, top *model.Topology, req agent.Appl
 			out = append(out, NodeResult[agent.ApplyResponse]{Node: n.Name, Err: err})
 		}
 		return out
+	}
+	if req.StrictAdmission {
+		if err := c.Admit(ctx, top, true, req.Overcommit); err != nil {
+			out := make([]NodeResult[agent.ApplyResponse], 0, len(c.Nodes))
+			for _, n := range c.Nodes {
+				out = append(out, NodeResult[agent.ApplyResponse]{Node: n.Name, Err: err})
+			}
+			return out
+		}
 	}
 	// Stamp the image identities before serialising, if the caller has not.
 	//

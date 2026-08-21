@@ -33,6 +33,7 @@ import (
 
 	"github.com/HongyuHe/twinet/internal/deploy"
 	"github.com/HongyuHe/twinet/internal/integrity"
+	"github.com/HongyuHe/twinet/internal/limiter"
 	"github.com/HongyuHe/twinet/internal/model"
 	"github.com/HongyuHe/twinet/internal/netx"
 	"github.com/HongyuHe/twinet/internal/plan"
@@ -133,6 +134,11 @@ type Server struct {
 	toolsMu   sync.Mutex
 	toolsSeen map[string]toolsVerdict
 
+	inventoryMu sync.Mutex
+	inventory   *hostInventoryObserver
+	workMu      sync.Mutex
+	work        *limiter.Limiter
+
 	mu sync.Mutex
 	// current is the last topology applied, per lab. One node may host several
 	// labs at once -- a class lab beside a harness per submission being graded
@@ -185,6 +191,15 @@ type Server struct {
 	// partial counts consecutive surveys in which a device has been missing
 	// some, but not all, of its interfaces.
 	partial map[string]int
+}
+
+func (s *Server) workLimiter() *limiter.Limiter {
+	s.workMu.Lock()
+	defer s.workMu.Unlock()
+	if s.work == nil {
+		s.work = limiter.New(limiter.DefaultConfig())
+	}
+	return s.work
 }
 
 // lease records an in-flight mutating operation on one lab.
@@ -544,6 +559,12 @@ type StatusResponse struct {
 	// Generations are the only committed deployment generations. A prepared
 	// transaction is deliberately absent: it is not a cluster commit.
 	Generations map[string]string `json:"generations,omitempty"`
+	// Inventory distinguishes observed physical and allocatable capacity from
+	// Twinet's own reservations. Unknown values are nil and named explicitly
+	// in Inventory.Unknown; they are never reported as zero capacity.
+	Inventory HostInventory `json:"inventory"`
+	// Backpressure exposes node-wide queue depth and wait time by work class.
+	Backpressure map[string]limiter.Stats `json:"backpressure"`
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -552,7 +573,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusServiceUnavailable, err)
 		return
 	}
-	cs, _ := s.rt.List(r.Context(), rt.Filter{All: true,
+	cs, listErr := s.rt.List(r.Context(), rt.Filter{All: true,
 		Labels: map[string]string{deploy.LabelManaged: "true"}})
 
 	resp := StatusResponse{
@@ -564,6 +585,8 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		UnderlayDev: s.cfg.UnderlayDev,
 		Containers:  len(cs),
 	}
+	resp.Inventory = s.observeHostInventory(cs, listErr)
+	resp.Backpressure = s.workLimiter().Snapshot()
 	s.mu.Lock()
 	labs := make([]string, 0, len(s.current))
 	for name := range s.current {
@@ -596,6 +619,15 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		resp.Hash = ""
 		resp.Lab = ""
 		resp.Generations = nil
+		// Reservations name other labs, which is cluster business a
+		// diagnostic credential is not entitled to enumerate.
+		if own, found := resp.Inventory.Reservations[scope]; found {
+			resp.Inventory.Reservations = map[string]ResourceInventory{scope: own}
+			resp.Inventory.Reserved = own
+		} else {
+			resp.Inventory.Reservations = nil
+			resp.Inventory.Reserved = ResourceInventory{}
+		}
 		for _, l := range labs {
 			if l == scope {
 				resp.Lab, resp.Labs = scope, []string{scope}
@@ -650,9 +682,15 @@ type ApplyRequest struct {
 	// lab is rendered with the reference solution. It is how a grading harness
 	// surrounds a submission with a correct internet without also configuring
 	// the work being marked.
-	Ungraded     int               `json:"ungraded_as,omitempty"`
-	Workers      int               `json:"workers"`
-	DryRun       bool              `json:"dry_run"`
+	Ungraded int  `json:"ungraded_as,omitempty"`
+	Workers  int  `json:"workers"`
+	DryRun   bool `json:"dry_run"`
+	// StrictAdmission makes the controller verify live inventory before any
+	// cluster mutation. It is set by deploy and grading; low-level callers
+	// retain their explicit compatibility behavior.
+	StrictAdmission bool `json:"strict_admission,omitempty"`
+	// Overcommit is the explicit, audited exception to strict admission.
+	Overcommit   bool              `json:"overcommit,omitempty"`
 	PeerUnderlay map[string]string `json:"peer_underlay"`
 	// Prune removes containers and overlays this node holds that the topology
 	// no longer wants. Only safe when the topology is complete.
@@ -740,6 +778,13 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 			httpError(w, http.StatusConflict, err)
 			return
 		}
+		if req.Overcommit {
+			// The controller records this in placement.json as well. Keep a
+			// node-local audit trail because this agent is where pressure and
+			// any resulting eviction are observed.
+			slog.Warn("applying deployment under audited overcommit override",
+				"lab", top.Name, "generation", req.Generation, "node", s.cfg.Node)
+		}
 	}
 	if err := s.acquire(top.Name, "apply"); err != nil {
 		httpError(w, http.StatusConflict, err)
@@ -754,6 +799,7 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 	eng := &deploy.Engine{
 		Runtime:         s.rt,
 		Node:            s.cfg.Node,
+		Limiter:         s.workLimiter(),
 		PullPolicy:      rt.PullPolicy(req.PullPolicy),
 		Renderer:        renderer(top, mode, req.Ungraded),
 		WritesReference: mode == render.ModeSolve,
@@ -786,7 +832,7 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 	}
 	defer stopFence()
 	rep, err := p.Execute(execCtx, plan.Options{
-		Workers:         req.Workers,
+		Workers:         s.workLimiter().ClampWorkers(limiter.Apply, req.Workers),
 		ContinueOnError: true,
 		DryRun:          req.DryRun,
 	})
@@ -1017,7 +1063,7 @@ func (s *Server) handleDestroy(w http.ResponseWriter, r *http.Request) {
 	defer stopFence()
 	r = r.WithContext(fenced)
 
-	eng := &deploy.Engine{Runtime: s.rt, Node: s.cfg.Node, State: s.store}
+	eng := &deploy.Engine{Runtime: s.rt, Node: s.cfg.Node, State: s.store, Limiter: s.workLimiter()}
 
 	// Destroying a lab must not lose a class's work: everything is captured
 	// first, and refusing is better than proceeding blind.
@@ -1278,7 +1324,9 @@ func (s *Server) handleReshape(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusInternalServerError, err)
 		return
 	}
-	if err := netx.ReshapeInNS(ns, req.Iface, req.Shaping, req.MTU); err != nil {
+	if err := s.workLimiter().Run(r.Context(), []limiter.Kind{limiter.Netlink}, func() error {
+		return netx.ReshapeInNS(ns, req.Iface, req.Shaping, req.MTU)
+	}); err != nil {
 		httpError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -1352,23 +1400,25 @@ func (s *Server) handleLifecycle(w http.ResponseWriter, r *http.Request) {
 	}
 	defer s.release(c.Labels[deploy.LabelLab])
 
-	switch req.Action {
-	case "pause":
-		err = s.rt.Pause(r.Context(), req.Container)
-	case "unpause":
-		err = s.rt.Unpause(r.Context(), req.Container)
-	case "stop":
-		err = s.rt.Stop(r.Context(), req.Container, 10*time.Second)
-	case "start":
-		err = s.rt.Start(r.Context(), req.Container)
-	case "restart":
-		if err = s.rt.Stop(r.Context(), req.Container, 10*time.Second); err == nil {
-			err = s.rt.Start(r.Context(), req.Container)
+	err = s.workLimiter().Run(r.Context(), []limiter.Kind{limiter.Lifecycle}, func() error {
+		switch req.Action {
+		case "pause":
+			return s.rt.Pause(r.Context(), req.Container)
+		case "unpause":
+			return s.rt.Unpause(r.Context(), req.Container)
+		case "stop":
+			return s.rt.Stop(r.Context(), req.Container, 10*time.Second)
+		case "start":
+			return s.rt.Start(r.Context(), req.Container)
+		case "restart":
+			if err := s.rt.Stop(r.Context(), req.Container, 10*time.Second); err != nil {
+				return err
+			}
+			return s.rt.Start(r.Context(), req.Container)
+		default:
+			return fmt.Errorf("unknown action %q", req.Action)
 		}
-	default:
-		httpError(w, http.StatusBadRequest, fmt.Errorf("unknown action %q", req.Action))
-		return
-	}
+	})
 	if err != nil {
 		httpError(w, http.StatusInternalServerError, err)
 		return
@@ -1434,13 +1484,17 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 	}
 	// Nothing a container says can be believed until the programs saying it
 	// are the ones its image ships.
-	if req.Grading {
-		if err := s.verifyTools(r.Context(), c); err != nil {
-			httpError(w, http.StatusInternalServerError, err)
-			return
+	var res rt.ExecResult
+	err = s.workLimiter().Run(r.Context(), []limiter.Kind{limiter.ExecProbe}, func() error {
+		if req.Grading {
+			if err := s.verifyTools(r.Context(), c); err != nil {
+				return err
+			}
 		}
-	}
-	res, err := s.rt.Exec(r.Context(), req.Container, rt.ExecCmd{Cmd: req.Cmd})
+		var execErr error
+		res, execErr = s.rt.Exec(r.Context(), req.Container, rt.ExecCmd{Cmd: req.Cmd})
+		return execErr
+	})
 	if err != nil {
 		httpError(w, http.StatusInternalServerError, err)
 		return
@@ -1511,7 +1565,15 @@ func (s *Server) handleUnderlay(w http.ResponseWriter, r *http.Request) {
 	peer := r.URL.Query().Get("peer")
 	resp := UnderlayResponse{Node: s.cfg.Node, IP: s.cfg.UnderlayIP, Dev: s.cfg.UnderlayDev}
 	if peer != "" {
-		mtu, dev, err := netx.UnderlayMTU(peer)
+		var (
+			mtu int
+			dev string
+		)
+		err := s.workLimiter().Run(r.Context(), []limiter.Kind{limiter.Netlink}, func() error {
+			var probeErr error
+			mtu, dev, probeErr = netx.UnderlayMTU(peer)
+			return probeErr
+		})
 		if err != nil {
 			httpError(w, http.StatusBadRequest, err)
 			return
@@ -1670,7 +1732,12 @@ func (s *Server) handleSweep(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	found, err := netx.FindOrphans(live)
+	var found []netx.Orphan
+	err := s.workLimiter().Run(r.Context(), []limiter.Kind{limiter.Netlink}, func() error {
+		var findErr error
+		found, findErr = netx.FindOrphans(live)
+		return findErr
+	})
 	if err != nil {
 		httpError(w, http.StatusInternalServerError, err)
 		return
@@ -1685,7 +1752,9 @@ func (s *Server) handleSweep(w http.ResponseWriter, r *http.Request) {
 		if !req.Remove {
 			continue
 		}
-		if err := netx.RemoveOverlay(o.VNI); err != nil {
+		if err := s.workLimiter().Run(r.Context(), []limiter.Kind{limiter.Netlink}, func() error {
+			return netx.RemoveOverlay(o.VNI)
+		}); err != nil {
 			resp.Errs = append(resp.Errs, fmt.Sprintf("vni %d: %v", o.VNI, err))
 			continue
 		}

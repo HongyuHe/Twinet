@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/HongyuHe/twinet/internal/deploy"
+	"github.com/HongyuHe/twinet/internal/limiter"
 	"github.com/HongyuHe/twinet/internal/model"
 	"github.com/HongyuHe/twinet/internal/render"
 	rt "github.com/HongyuHe/twinet/internal/runtime"
@@ -186,6 +187,7 @@ func (s *Server) repairLab(ctx context.Context, top *model.Topology, broken []*m
 	s.mu.Unlock()
 	eng := &deploy.Engine{
 		Runtime: s.rt, Node: s.cfg.Node, State: s.store,
+		Limiter:         s.workLimiter(),
 		Renderer:        renderer(top, render.Mode(mode), ungraded),
 		WritesReference: render.Mode(mode) == render.ModeSolve,
 		UnderlayIP:      s.cfg.UnderlayIP,
@@ -259,12 +261,22 @@ func (s *Server) repairLab(ctx context.Context, top *model.Topology, broken []*m
 // to start them, not to rewire the device, so the two cases are told apart.
 const daemonsDown = "these routing daemons are not running:"
 
+func (s *Server) probeExec(ctx context.Context, container string, cmd rt.ExecCmd) (rt.ExecResult, error) {
+	var result rt.ExecResult
+	err := s.workLimiter().Run(ctx, []limiter.Kind{limiter.ExecProbe}, func() error {
+		var execErr error
+		result, execErr = s.rt.Exec(ctx, container, cmd)
+		return execErr
+	})
+	return result, err
+}
+
 // missingDaemons names the routing processes a router should be running and is
 // not, or "" when they are all there.
 func (s *Server) missingDaemons(ctx context.Context, d *model.Device, as *model.AS) string {
 	script := "miss=''; for p in " + strings.Join(render.EnabledDaemonsFor(as), " ") +
 		"; do pidof \"$p\" >/dev/null 2>&1 || miss=\"$miss $p\"; done; echo \"$miss\""
-	r, err := s.rt.Exec(ctx, d.Container, rt.ExecCmd{Cmd: []string{"sh", "-c", script}})
+	r, err := s.probeExec(ctx, d.Container, rt.ExecCmd{Cmd: []string{"sh", "-c", script}})
 	if err != nil || r.ExitCode != 0 {
 		// Not reachable is not the same as not running, and guessing here
 		// would have the loop rewiring devices because a node was busy.
@@ -302,7 +314,7 @@ func (s *Server) brokenBecause(ctx context.Context, lab string, d *model.Device)
 		return ""
 	}
 
-	res, err := s.rt.Exec(ctx, d.Container, rt.ExecCmd{
+	res, err := s.probeExec(ctx, d.Container, rt.ExecCmd{
 		Cmd: []string{"sh", "-c", `ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1`}})
 	if err != nil || res.ExitCode != 0 {
 		return ""
@@ -366,7 +378,7 @@ func (s *Server) brokenBecause(ctx context.Context, lab string, d *model.Device)
 		}
 	}
 	if d.Kind == model.KindSwitch {
-		if r, err := s.rt.Exec(ctx, d.Container, rt.ExecCmd{
+		if r, err := s.probeExec(ctx, d.Container, rt.ExecCmd{
 			Cmd: []string{"sh", "-c", "ovs-vsctl list-br 2>/dev/null | grep -c ."}}); err == nil &&
 			strings.TrimSpace(r.Stdout) == "0" {
 			return "it has no bridge"
@@ -410,7 +422,7 @@ func (s *Server) startDaemons(ctx context.Context, lab string, d *model.Device) 
 		"rm -f /var/run/frr/*.pid /var/run/frr/*.vty 2>/dev/null || true",
 		"/usr/lib/frr/frrinit.sh start >/dev/null 2>&1 || true",
 	}, "\n")
-	if _, err := s.rt.Exec(ctx, d.Container, rt.ExecCmd{Cmd: []string{"sh", "-c", script}}); err != nil {
+	if _, err := s.probeExec(ctx, d.Container, rt.ExecCmd{Cmd: []string{"sh", "-c", script}}); err != nil {
 		return err
 	}
 	// And given time to come up.
@@ -456,7 +468,7 @@ func (s *Server) duplicateDaemons(ctx context.Context, d *model.Device, as *mode
 		// symptom was a class whose marks fell a little further every time
 		// it was graded.
 		script := "ps -ef | awk '/usr\\/lib\\/frr\\/" + name + " -d/ && !/awk/' | wc -l"
-		r, err := s.rt.Exec(ctx, d.Container, rt.ExecCmd{Cmd: []string{"sh", "-c", script}})
+		r, err := s.probeExec(ctx, d.Container, rt.ExecCmd{Cmd: []string{"sh", "-c", script}})
 		if err != nil || r.ExitCode != 0 {
 			return ""
 		}

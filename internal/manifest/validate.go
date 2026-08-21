@@ -493,19 +493,7 @@ func (l *Loaded) validateServices(d *Diagnostics, file string) {
 func (l *Loaded) validateResources(d *Diagnostics, file string) {
 	root := l.Nodes[file]
 	check := func(path string, dd model.DeviceDefaults, node *yaml.Node) {
-		if dd.Memory != "" {
-			if _, err := runtime.ParseMemory(dd.Memory); err != nil {
-				d.AddHint(file, path+".memory", node, err.Error(),
-					"use Kubernetes-style quantities such as 512Mi or 2Gi")
-			}
-		}
-		if dd.CPUs != nil && *dd.CPUs <= 0 {
-			d.Addf(file, path+".cpus", node, "cpus must be positive, got %v", *dd.CPUs)
-		}
-		if dd.Pids != nil && *dd.Pids < 16 {
-			d.Addf(file, path+".pids", node,
-				"a pids limit of %d is too low for a container running a routing daemon", *dd.Pids)
-		}
+		validateDeviceResources(d, file, path, dd, node)
 	}
 	check("defaults", l.Lab.Defaults, nodeAt(root, "defaults"))
 	for _, k := range sortedMapKeys(mapKeysAsStrings(l.Lab.Kinds)) {
@@ -523,18 +511,119 @@ func (l *Loaded) validateResources(d *Diagnostics, file string) {
 		}
 		troot := l.Nodes[tf]
 		for _, rn := range sortedMapKeys(tpl.Routers) {
-			checkIn(d, tf, "routers."+rn, tpl.Routers[rn].DeviceDefaults, nodeAt(troot, "routers."+rn))
+			validateDeviceResources(d, tf, "routers."+rn, tpl.Routers[rn].DeviceDefaults,
+				nodeAt(troot, "routers."+rn))
 		}
 	}
 }
 
-func checkIn(d *Diagnostics, file, path string, dd model.DeviceDefaults, node *yaml.Node) {
+func validateDeviceResources(d *Diagnostics, file, path string, dd model.DeviceDefaults, node *yaml.Node) {
 	if dd.Memory != "" {
 		if _, err := runtime.ParseMemory(dd.Memory); err != nil {
 			d.AddHint(file, path+".memory", node, err.Error(),
 				"use Kubernetes-style quantities such as 512Mi or 2Gi")
 		}
 	}
+	if dd.CPUs != nil && *dd.CPUs <= 0 {
+		d.Addf(file, path+".cpus", node, "cpus must be positive, got %v", *dd.CPUs)
+	}
+	if dd.Pids != nil && *dd.Pids < 16 {
+		d.Addf(file, path+".pids", node,
+			"a pids limit of %d is too low for a container running a routing daemon", *dd.Pids)
+	}
+	if dd.Requests == nil {
+		return
+	}
+	r := *dd.Requests
+	rpath := path + ".requests"
+	if r.CPUs < 0 || (r.CPUs == 0 && requestField(node, "cpus")) {
+		d.Addf(file, rpath+".cpus", node, "request CPUs must be positive, got %v", r.CPUs)
+	}
+	if r.Memory != "" {
+		if quantity, err := runtime.ParseMemory(r.Memory); err != nil {
+			d.AddHint(file, rpath+".memory", node, err.Error(),
+				"use Kubernetes-style quantities such as 128Mi or 1Gi")
+		} else if quantity <= 0 {
+			d.Add(file, rpath+".memory", "request memory must be positive", node)
+		}
+	}
+	if r.Memory == "" && requestField(node, "memory") {
+		d.Add(file, rpath+".memory", "request memory must be positive when specified", node)
+	}
+	if r.Pids < 0 || (r.Pids == 0 && requestField(node, "pids")) {
+		d.Addf(file, rpath+".pids", node, "request pids must be positive, got %d", r.Pids)
+	}
+	if r.EphemeralStorage != "" && r.Disk != "" {
+		d.Add(file, rpath, "specify only one of ephemeral_storage and disk", node)
+	}
+	if r.Storage() != "" {
+		if quantity, err := runtime.ParseMemory(r.Storage()); err != nil {
+			d.AddHint(file, rpath+".ephemeral_storage", node, err.Error(),
+				"use Kubernetes-style quantities such as 256Mi or 1Gi")
+		} else if quantity <= 0 {
+			d.Add(file, rpath+".ephemeral_storage", "request ephemeral storage must be positive", node)
+		}
+	}
+	if r.Storage() == "" && (requestField(node, "ephemeral_storage") || requestField(node, "disk")) {
+		d.Add(file, rpath+".ephemeral_storage", "request ephemeral storage must be positive when specified", node)
+	}
+	if r.FileDescriptors < 0 || (r.FileDescriptors == 0 && requestField(node, "file_descriptors")) {
+		d.Addf(file, rpath+".file_descriptors", node,
+			"request file_descriptors must be positive, got %d", r.FileDescriptors)
+	}
+	if r.NetDevices < 0 || (r.NetDevices == 0 && requestField(node, "netdevs")) {
+		d.Addf(file, rpath+".netdevs", node, "request netdevs must be positive, got %d", r.NetDevices)
+	}
+
+	// A reservation above its own hard limit is neither a useful request nor
+	// an enforceable container contract. Keep the two terms distinct in the
+	// diagnostic so authors do not mistake the legacy limits for placement
+	// demand.
+	if dd.CPUs != nil && r.CPUs > *dd.CPUs {
+		d.Addf(file, rpath+".cpus", node,
+			"CPU request %.3g exceeds the hard container limit %.3g", r.CPUs, *dd.CPUs)
+	}
+
+	if dd.Memory != "" && r.Memory != "" {
+		requested, rerr := runtime.ParseMemory(r.Memory)
+		limited, lerr := runtime.ParseMemory(dd.Memory)
+		if rerr == nil && lerr == nil && requested > limited {
+			d.Addf(file, rpath+".memory", node,
+				"memory request %s exceeds the hard container limit %s", r.Memory, dd.Memory)
+		}
+	}
+
+	if dd.Pids != nil && r.Pids > *dd.Pids {
+		d.Addf(file, rpath+".pids", node,
+			"PID request %d exceeds the hard container limit %d", r.Pids, *dd.Pids)
+	}
+}
+
+// requestField reports whether an authored requests mapping explicitly named a
+// dimension. Zero is otherwise the inheritance sentinel, so this preserves
+// partial requests while still rejecting `cpus: 0` as an invalid reservation.
+func requestField(node *yaml.Node, key string) bool {
+	if node == nil {
+		return false
+	}
+	if node.Kind == yaml.DocumentNode && len(node.Content) > 0 {
+		node = node.Content[0]
+	}
+	if node.Kind != yaml.MappingNode {
+		return false
+	}
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		if node.Content[i].Value != "requests" || node.Content[i+1].Kind != yaml.MappingNode {
+			continue
+		}
+		requests := node.Content[i+1]
+		for j := 0; j+1 < len(requests.Content); j += 2 {
+			if requests.Content[j].Value == key {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // mapKeysAsStrings adapts a DeviceKind-keyed map for the string helpers.
@@ -579,6 +668,9 @@ func (l *Loaded) validatePlacement(d *Diagnostics, file string) {
 				fmt.Sprintf("node %q has no underlay_ip", n.Name),
 				"cross-node links need a VTEP source address on each node")
 		}
+		if n.Capacity != nil {
+			validateBudget(d, file, path+".capacity", *n.Capacity, node)
+		}
 	}
 	if fronts > 1 {
 		d.Add(file, "placement.nodes", "more than one node is marked front", nodeAt(root, "placement.nodes"))
@@ -595,6 +687,32 @@ func (l *Loaded) validatePlacement(d *Diagnostics, file string) {
 	for name := range p.Reserve {
 		if !names[name] {
 			d.Addf(file, "placement.reserve."+name, nodeAt(root, "placement.reserve"), "unknown node %q", name)
+		}
+		validateBudget(d, file, "placement.reserve."+name, p.Reserve[name],
+			nodeAt(root, "placement.reserve."+name))
+	}
+}
+
+func validateBudget(d *Diagnostics, file, path string, b model.Budget, node *yaml.Node) {
+	if b.CPUs < 0 {
+		d.Addf(file, path+".cpus", node, "CPU capacity must not be negative, got %v", b.CPUs)
+	}
+	if b.Memory != "" {
+		if _, err := runtime.ParseMemory(b.Memory); err != nil {
+			d.AddHint(file, path+".memory", node, err.Error(),
+				"use Kubernetes-style quantities such as 16Gi")
+		}
+	}
+	if b.Pids < 0 || b.FileDescriptors < 0 || b.NetDevices < 0 || b.Containers < 0 {
+		d.Add(file, path, "resource capacities and reservations must not be negative", node)
+	}
+	if b.EphemeralStorage != "" && b.Disk != "" {
+		d.Add(file, path, "specify only one of ephemeral_storage and disk", node)
+	}
+	if b.Storage() != "" {
+		if _, err := runtime.ParseMemory(b.Storage()); err != nil {
+			d.AddHint(file, path+".ephemeral_storage", node, err.Error(),
+				"use Kubernetes-style quantities such as 32Gi")
 		}
 	}
 }

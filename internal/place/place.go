@@ -40,11 +40,9 @@ type Assignment struct {
 	// Moved records ASes that could not be left where the record says they
 	// were, and why. Each one is a set of containers that will be rebuilt.
 	Moved []string
-	// Overloaded names nodes asked to carry more than they declare capacity
-	// for. Reported rather than refused: the budgets are hand-written and a
-	// stale one should not stop a class running, but the failure it predicts
-	// arrives as containers being killed under load an hour later, looking
-	// like a bug in the lab.
+	// Overloaded names nodes whose resource requests exceed effective
+	// allocatable capacity. Strict placement refuses these; an audited
+	// overcommit retains the diagnostics for the deployment record and UI.
 	Overloaded []string
 }
 
@@ -88,6 +86,16 @@ type Options struct {
 	// Rebalance recomputes from scratch, ignoring the record. Containers move,
 	// so it is never implicit.
 	Rebalance bool
+	// Inventory is the live allocatable and already-reserved state reported by
+	// agents. It is optional for offline inspection and mandatory for strict
+	// clustered admission.
+	Inventory []NodeInventory
+	// Strict refuses unknown or over-capacity assignments before placement
+	// records or deployment operations can be written.
+	Strict bool
+	// Overcommit permits an explicit audited escape from Strict. Callers must
+	// persist and report this choice; it is never inferred from a warning.
+	Overcommit bool
 }
 
 // Record is a placement as it was actually deployed.
@@ -97,6 +105,9 @@ type Record struct {
 	ByAS      map[int]string    `json:"by_as"`
 	ByGroup   map[string]string `json:"by_group,omitempty"`
 	ByService map[string]string `json:"by_service"`
+	// Overcommit records an operator's explicit admission override so a
+	// capacity incident can be traced back to the deployment that accepted it.
+	Overcommit bool `json:"overcommit,omitempty"`
 }
 
 // Place assigns every AS and service to a node and writes the result back onto
@@ -127,6 +138,12 @@ func Place(top *model.Topology, opts Options) (*Assignment, error) {
 		ByService: map[string]string{},
 		Load:      map[string]int{},
 	}
+	capacity := buildCapacityState(top, opts)
+	names, caps, hasCap := capacity.names, capacity.caps, capacity.hasCap
+	loads := map[string]demand{}
+	for node, load := range capacity.baseline {
+		loads[node] = load
+	}
 
 	if strategy == "single-node" {
 		for _, asn := range top.SortedASNs() {
@@ -135,19 +152,27 @@ func Place(top *model.Topology, opts Options) (*Assignment, error) {
 		for _, s := range top.SortedServiceNames() {
 			a.ByService[s] = front
 		}
-		return finish(top, a)
+		if opts.Strict && !opts.Overcommit {
+			if err := strictAssignmentError(top, a, capacity); err != nil {
+				return nil, err
+			}
+		}
+		res, err := finish(top, a)
+		if err != nil {
+			return nil, err
+		}
+		res.Overloaded = overloads(top, a, capacity)
+		return res, nil
 	}
-
-	names := make([]string, 0, len(nodes))
-	caps := map[string]demand{}
-	hasCap := map[string]bool{}
-	loads := map[string]demand{}
-	for _, n := range nodes {
-		names = append(names, n.Name)
-		c, ok := capacityOf(n, lab.Placement.Reserve)
-		caps[n.Name], hasCap[n.Name] = c, ok
+	if len(names) == 0 {
+		if opts.Strict && !opts.Overcommit {
+			return nil, fmt.Errorf(
+				"strict admission has no node with complete allocatable inventory: %s. "+
+					"Unknown capacity is neither zero nor unlimited; fix inventory or declare safe capacities, or use the audited --overcommit escape hatch",
+				capacity.unknownSummary())
+		}
+		return nil, fmt.Errorf("no nodes declared under placement.nodes")
 	}
-	sort.Strings(names)
 
 	// Explicit pins win over everything.
 	pinned := map[int]string{}
@@ -194,15 +219,33 @@ func Place(top *model.Topology, opts Options) (*Assignment, error) {
 			if _, alreadyPinned := pinned[asn]; alreadyPinned {
 				continue
 			}
-			if !contains(names, n) {
+			if !capacity.allNodeName[n] {
 				moved = append(moved, fmt.Sprintf("AS %d was on %s, which is no longer a node", asn, n))
 				continue
 			}
 			pinned[asn] = n
 		}
 		for _, s := range top.SortedServiceNames() {
-			if n, ok := opts.Fixed.ByService[s]; ok && contains(names, n) {
-				pinnedSvc[s] = n
+			if n, ok := opts.Fixed.ByService[s]; ok {
+				if capacity.allNodeName[n] {
+					pinnedSvc[s] = n
+				}
+				if opts.Strict && !opts.Overcommit {
+					groups := make([]string, 0, len(opts.Fixed.ByGroup))
+					for group := range opts.Fixed.ByGroup {
+						groups = append(groups, group)
+					}
+					sort.Strings(groups)
+					for _, group := range groups {
+						node := opts.Fixed.ByGroup[group]
+						if capacity.allNodeName[node] && len(capacity.unknown[node]) > 0 {
+							return nil, fmt.Errorf(
+								"strict admission refuses recorded placement group %s on %s because allocatable %s is unknown; "+
+									"use the audited --overcommit escape hatch only when this is intentional",
+								group, node, strings.Join(capacity.unknown[node], ", "))
+						}
+					}
+				}
 			}
 		}
 	}
@@ -247,8 +290,14 @@ func Place(top *model.Topology, opts Options) (*Assignment, error) {
 	var free []int
 	for _, asn := range top.SortedASNs() {
 		if n, ok := pinned[asn]; ok {
-			if !contains(names, n) {
+			if !capacity.allNodeName[n] {
 				return nil, fmt.Errorf("AS %d is pinned to unknown node %q", asn, n)
+			}
+			if opts.Strict && !opts.Overcommit && len(capacity.unknown[n]) > 0 {
+				return nil, fmt.Errorf(
+					"strict admission refuses pinned AS %d on %s because allocatable %s is unknown; "+
+						"use the audited --overcommit escape hatch only when this is intentional",
+					asn, n, strings.Join(capacity.unknown[n], ", "))
 			}
 			a.ByAS[asn] = n
 			loads[n] = loads[n].add(weight[asn])
@@ -301,81 +350,31 @@ func Place(top *model.Topology, opts Options) (*Assignment, error) {
 		return nil, fmt.Errorf("unknown placement strategy %q; use pack-by-as, spread-by-as or single-node", strategy)
 	}
 
-	if splitMoved, err := distributePlacementGroups(top, a, names, caps, hasCap, opts, explicitPinned); err != nil {
+	if splitMoved, err := distributePlacementGroups(top, a, names, caps, hasCap, capacity.baseline, opts, explicitPinned); err != nil {
 		return nil, err
 	} else {
 		moved = append(moved, splitMoved...)
 	}
 
+	// This check deliberately happens before finish stamps Node onto any
+	// device. A strict refusal must leave no placement record-worthy mutation,
+	// including for pins, recorded locations, services, and split groups.
+	if opts.Strict && !opts.Overcommit {
+		if err := strictAssignmentError(top, a, capacity); err != nil {
+			return nil, err
+		}
+	}
 	res, err := finish(top, a)
 	if err != nil {
 		return nil, err
 	}
 	res.Moved = moved
+	res.Overloaded = overloads(top, a, capacity)
 	return res, nil
 }
 
-// finish stamps the assignment onto devices and computes summary statistics.
-// checkCapacity reports nodes asked to carry more than they declared.
-//
-// It runs on the finished assignment rather than inside the balanced placer,
-// because it was inside the balanced placer and three ways of placing a lab
-// never reached it: the single-node strategy, which puts everything on the
-// front node; an explicit pin, which wins over every other consideration; and
-// services, which are placed separately. So the arrangements most likely to
-// overload a machine -- "put it all here", "put this one here specifically" --
-// were exactly the ones nothing checked, and the check applied only to the
-// strategy that was already trying to avoid the problem.
-//
-// It is a warning and not a refusal. The budgets are declared by hand in the
-// manifest, and a node whose declared memory is stale should not stop a class
-// from running; but somebody has to be told, because the failure it predicts
-// arrives as containers being killed under load, an hour later, looking like a
-// bug in the lab.
-func checkCapacity(top *model.Topology, a *Assignment) []string {
-	lab := top.Lab
-	if lab == nil {
-		return nil
-	}
-	caps := map[string]demand{}
-	known := map[string]bool{}
-	for _, n := range lab.Placement.Nodes {
-		if c, ok := capacityOf(n, lab.Placement.Reserve); ok {
-			caps[n.Name], known[n.Name] = c, true
-		}
-	}
-	if len(known) == 0 {
-		return nil
-	}
-	load := map[string]demand{}
-	for _, d := range top.SortedDevices() {
-		if d.Node == "" {
-			continue
-		}
-		load[d.Node] = load[d.Node].add(deviceDemand(d))
-	}
-	var out []string
-	for _, name := range sortedNodeNames(load) {
-		if !known[name] {
-			continue
-		}
-		c, l := caps[name], load[name]
-		switch {
-		case c.Containers > 0 && l.Containers > c.Containers:
-			out = append(out, fmt.Sprintf("%s is asked to run %d containers but declares room for %d",
-				name, l.Containers, c.Containers))
-		case c.CPUs > 0 && l.CPUs > c.CPUs:
-			out = append(out, fmt.Sprintf("%s is asked for %.1f CPUs but declares %.1f",
-				name, l.CPUs, c.CPUs))
-		case c.MemBytes > 0 && l.MemBytes > c.MemBytes:
-			out = append(out, fmt.Sprintf("%s is asked for %d MiB but declares %d MiB",
-				name, l.MemBytes>>20, c.MemBytes>>20))
-		}
-	}
-	return out
-}
-
-func sortedNodeNames(m map[string]demand) []string {
+// sortedNodeNames returns names in stable order for capacity diagnostics.
+func sortedNodeNames[V any](m map[string]V) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {
 		out = append(out, k)
@@ -384,10 +383,9 @@ func sortedNodeNames(m map[string]demand) []string {
 	return out
 }
 
-// finish resolves every device onto a node and is the single point every
-// placement strategy passes through, which is why the capacity check lives
-// here: put anywhere earlier, it is a check on one strategy rather than on the
-// answer.
+// finish resolves every device onto a node and computes summary statistics.
+// Strict admission runs before this function so a refusal leaves no placement
+// side effect, even in memory.
 func finish(top *model.Topology, a *Assignment) (*Assignment, error) {
 	for _, d := range top.SortedDevices() {
 		if d.ASN > 0 {
@@ -434,7 +432,6 @@ func finish(top *model.Topology, a *Assignment) (*Assignment, error) {
 		}
 		a.Locality[class] = locality
 	}
-	a.Overloaded = checkCapacity(top, a)
 	return a, nil
 }
 

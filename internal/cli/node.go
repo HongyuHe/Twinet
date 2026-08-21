@@ -96,7 +96,7 @@ func newNodeCmd(opts *Options) *cobra.Command {
 			// those is something the next command will refuse to do, and being
 			// told afterwards is not the same as being told.
 			w := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
-			fmt.Fprintln(w, "NODE\tSTATE\tVERSION\tRUNTIME\tCPUS\tUNDERLAY\tCONTAINERS\tLAB")
+			fmt.Fprintln(w, "NODE\tSTATE\tVERSION\tRUNTIME\tALLOCATABLE\tRESERVED\tLOAD\tIMAGES\tUNDERLAY\tCONTAINERS\tLAB")
 			bad, degraded := 0, 0
 			for _, r := range results {
 				if r.Err != nil {
@@ -113,8 +113,10 @@ func newNodeCmd(opts *Options) *cobra.Command {
 				if why != "" {
 					lab = why
 				}
-				fmt.Fprintf(w, "%s\t%s\t%s\t%s %s\t%d\t%s\t%d\t%s\n",
-					r.Node, state, v.Version, v.Runtime, v.RuntimeVer, v.CPUs,
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s %s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\n",
+					r.Node, state, v.Version, v.Runtime, v.RuntimeVer,
+					inventorySummary(v.Inventory.Allocatable), inventorySummary(v.Inventory.Reserved),
+					loadSummary(v.Inventory.Load), imageCacheSummary(v.Inventory.ImageCache),
 					dash(v.UnderlayIP), v.Containers, lab)
 			}
 			if err := w.Flush(); err != nil {
@@ -391,11 +393,12 @@ func redeployScopes(ctx context.Context, top *model.Topology, token string, scop
 	// only the create and configure stages carry an AS scope.
 	only := restoreScopes(scopes)
 	results := c.Apply(ctx, top, agent.ApplyRequest{
-		Mode:       "solve",
-		PullPolicy: "if-missing",
-		Workers:    8,
-		OnlySteps:  only,
-		Generation: time.Now().UTC().Format("20060102T150405.000"),
+		Mode:            "solve",
+		PullPolicy:      "if-missing",
+		Workers:         8,
+		OnlySteps:       only,
+		StrictAdmission: true,
+		Generation:      time.Now().UTC().Format("20060102T150405.000"),
 		// Grading holds the lab, and this is grading putting a system back.
 		Hold: currentHoldToken(),
 	})
@@ -416,6 +419,15 @@ func deployCluster(ctx context.Context, top *model.Topology, tok string, req age
 	Write([]byte) (int, error)
 }) error {
 	c := client.NewCluster(top.Lab, tok)
+
+	// Admission must precede overlay deconfliction, state migration, record
+	// writes by callers, and every node mutation. A capacity refusal after
+	// any of those has already changed the cluster it was meant to protect.
+	if req.StrictAdmission {
+		if err := c.Admit(ctx, top, true, req.Overcommit); err != nil {
+			return fmt.Errorf("strict admission refused deployment before mutation: %w", err)
+		}
+	}
 
 	// Move any overlay identifier another lab is already using, before the
 	// topology is sent anywhere. Doing it here means both ends of every link
@@ -568,6 +580,41 @@ func nodeState(v agent.StatusResponse, controller string) (state, why string) {
 		return "busy", "operation in flight: " + strings.Join(v.Busy, ", ")
 	}
 	return "ok", ""
+}
+
+func inventorySummary(v agent.ResourceInventory) string {
+	if v.CPUs == nil || v.MemoryBytes == nil || v.DiskBytes == nil || v.Pids == nil ||
+		v.FileDescriptors == nil || v.NetDevices == nil {
+		return "unknown"
+	}
+	return fmt.Sprintf("%.1fc/%s/%s/%dp/%dfd/%dnd",
+		*v.CPUs, inventoryBytes(*v.MemoryBytes), inventoryBytes(*v.DiskBytes),
+		*v.Pids, *v.FileDescriptors, *v.NetDevices)
+}
+
+func inventoryBytes(v int64) string {
+	switch {
+	case v >= 1<<30:
+		return fmt.Sprintf("%.1fGi", float64(v)/(1<<30))
+	case v >= 1<<20:
+		return fmt.Sprintf("%dMi", v>>20)
+	default:
+		return fmt.Sprintf("%dB", v)
+	}
+}
+
+func loadSummary(v agent.LoadAverage) string {
+	if v.One == nil {
+		return "unknown"
+	}
+	return fmt.Sprintf("%.2f", *v.One)
+}
+
+func imageCacheSummary(v agent.ImageCacheInventory) string {
+	if v.Count == nil {
+		return "unknown"
+	}
+	return fmt.Sprintf("%d", *v.Count)
 }
 
 // newNodeSweepCmd finds and removes the overlays a node is carrying for nobody.

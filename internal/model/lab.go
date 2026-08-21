@@ -178,10 +178,17 @@ type Lab struct {
 // defaults -> kind -> device inheritance chain. Pointer fields distinguish
 // "unset" (inherit) from "explicitly set to the zero value".
 type DeviceDefaults struct {
-	Image        string            `yaml:"image,omitempty" json:"image,omitempty"`
-	CPUs         *float64          `yaml:"cpus,omitempty" json:"cpus,omitempty"`
-	Memory       string            `yaml:"memory,omitempty" json:"memory,omitempty"`
-	Pids         *int64            `yaml:"pids,omitempty" json:"pids,omitempty"`
+	Image string `yaml:"image,omitempty" json:"image,omitempty"`
+	// CPUs, Memory, and Pids are hard runtime limits. They retain the original
+	// manifest spelling for backwards compatibility; placement uses Requests,
+	// never these limits.
+	CPUs   *float64 `yaml:"cpus,omitempty" json:"cpus,omitempty"`
+	Memory string   `yaml:"memory,omitempty" json:"memory,omitempty"`
+	Pids   *int64   `yaml:"pids,omitempty" json:"pids,omitempty"`
+	// Requests is the schedulable reservation for one device. A nil value
+	// inherits; omitted dimensions receive conservative per-kind defaults when
+	// the expanded device is materialised.
+	Requests     *ResourceRequest  `yaml:"requests,omitempty" json:"requests,omitempty"`
 	Restart      string            `yaml:"restart,omitempty" json:"restart,omitempty"`
 	DNS          string            `yaml:"dns,omitempty" json:"dns,omitempty"`
 	Env          map[string]string `yaml:"env,omitempty" json:"env,omitempty"`
@@ -190,6 +197,106 @@ type DeviceDefaults struct {
 	Binds        []string          `yaml:"binds,omitempty" json:"binds,omitempty"`
 	Privileged   *bool             `yaml:"privileged,omitempty" json:"privileged,omitempty"`
 	Command      []string          `yaml:"command,omitempty" json:"command,omitempty"`
+}
+
+// ResourceRequest is the capacity a device reserves on its host. It is
+// intentionally separate from Docker's CPU, memory, and PID limits: a device
+// can be allowed to burst to a limit without reserving that entire limit on a
+// node. Zero values mean "inherit" while the request is still authored; every
+// expanded Device has a fully populated request.
+//
+// Disk is accepted as a backwards-friendly synonym for EphemeralStorage.
+// New manifests should use ephemeral_storage, which says explicitly that the
+// reservation is for disposable container writable-layer and scratch space.
+type ResourceRequest struct {
+	CPUs             float64 `yaml:"cpus,omitempty" json:"cpus,omitempty"`
+	Memory           string  `yaml:"memory,omitempty" json:"memory,omitempty"`
+	Pids             int64   `yaml:"pids,omitempty" json:"pids,omitempty"`
+	EphemeralStorage string  `yaml:"ephemeral_storage,omitempty" json:"ephemeral_storage,omitempty"`
+	Disk             string  `yaml:"disk,omitempty" json:"disk,omitempty"`
+	FileDescriptors  int64   `yaml:"file_descriptors,omitempty" json:"file_descriptors,omitempty"`
+	NetDevices       int64   `yaml:"netdevs,omitempty" json:"netdevs,omitempty"`
+}
+
+// Merge returns r with every unset dimension inherited from base.
+func (r ResourceRequest) Merge(base ResourceRequest) ResourceRequest {
+	out := r
+	if out.CPUs == 0 {
+		out.CPUs = base.CPUs
+	}
+	if out.Memory == "" {
+		out.Memory = base.Memory
+	}
+	if out.Pids == 0 {
+		out.Pids = base.Pids
+	}
+	// Disk is an authored compatibility alias. Canonicalise it while
+	// merging so `disk: 1Gi` overrides the per-kind
+	// ephemeral_storage default instead of being shadowed by it.
+	storage := out.Storage()
+	if storage == "" {
+		storage = base.Storage()
+	}
+	out.EphemeralStorage, out.Disk = storage, ""
+	if out.FileDescriptors == 0 {
+		out.FileDescriptors = base.FileDescriptors
+	}
+	if out.NetDevices == 0 {
+		out.NetDevices = base.NetDevices
+	}
+	return out
+}
+
+// Empty reports whether no request dimension was authored.
+func (r ResourceRequest) Empty() bool {
+	return r.CPUs == 0 && r.Memory == "" && r.Pids == 0 &&
+		r.EphemeralStorage == "" && r.Disk == "" &&
+		r.FileDescriptors == 0 && r.NetDevices == 0
+}
+
+// Storage returns the canonical ephemeral-storage quantity, accepting Disk
+// from manifests written while the field was still commonly called disk.
+func (r ResourceRequest) Storage() string {
+	if r.EphemeralStorage != "" {
+		return r.EphemeralStorage
+	}
+	return r.Disk
+}
+
+// DefaultResourceRequest returns conservative host reservations for one
+// device kind. Limits remain a separate authoring concern.
+func DefaultResourceRequest(kind DeviceKind) ResourceRequest {
+	switch kind {
+	case KindRouter:
+		return ResourceRequest{
+			CPUs: 0.50, Memory: "128Mi", Pids: 64, EphemeralStorage: "256Mi",
+			FileDescriptors: 1024, NetDevices: 10,
+		}
+	case KindSwitch:
+		return ResourceRequest{
+			CPUs: 0.25, Memory: "128Mi", Pids: 64, EphemeralStorage: "128Mi",
+			FileDescriptors: 1024, NetDevices: 16,
+		}
+	case KindService:
+		return ResourceRequest{
+			CPUs: 0.25, Memory: "128Mi", Pids: 64, EphemeralStorage: "256Mi",
+			FileDescriptors: 1024, NetDevices: 8,
+		}
+	default: // hosts and unknown legacy kinds
+		return ResourceRequest{
+			CPUs: 0.10, Memory: "64Mi", Pids: 32, EphemeralStorage: "64Mi",
+			FileDescriptors: 256, NetDevices: 2,
+		}
+	}
+}
+
+// EffectiveResourceRequest fills omitted dimensions with the per-kind default.
+func EffectiveResourceRequest(kind DeviceKind, authored *ResourceRequest) ResourceRequest {
+	base := DefaultResourceRequest(kind)
+	if authored == nil {
+		return base
+	}
+	return authored.Merge(base)
 }
 
 // Merge returns a copy of d with any unset field taken from base.
@@ -207,6 +314,12 @@ func (d DeviceDefaults) Merge(base DeviceDefaults) DeviceDefaults {
 	}
 	if out.Pids == nil {
 		out.Pids = base.Pids
+	}
+	if out.Requests == nil {
+		out.Requests = base.Requests
+	} else if base.Requests != nil {
+		merged := out.Requests.Merge(*base.Requests)
+		out.Requests = &merged
 	}
 	if out.Restart == "" {
 		out.Restart = base.Restart
@@ -728,9 +841,23 @@ type NodeSpec struct {
 
 // Budget is a resource allowance.
 type Budget struct {
-	CPUs       float64 `yaml:"cpus,omitempty" json:"cpus,omitempty"`
-	Memory     string  `yaml:"memory,omitempty" json:"memory,omitempty"`
-	Containers int     `yaml:"containers,omitempty" json:"containers,omitempty"`
+	CPUs             float64 `yaml:"cpus,omitempty" json:"cpus,omitempty"`
+	Memory           string  `yaml:"memory,omitempty" json:"memory,omitempty"`
+	Pids             int64   `yaml:"pids,omitempty" json:"pids,omitempty"`
+	EphemeralStorage string  `yaml:"ephemeral_storage,omitempty" json:"ephemeral_storage,omitempty"`
+	// Disk is a compatibility alias for ephemeral_storage.
+	Disk            string `yaml:"disk,omitempty" json:"disk,omitempty"`
+	FileDescriptors int64  `yaml:"file_descriptors,omitempty" json:"file_descriptors,omitempty"`
+	NetDevices      int64  `yaml:"netdevs,omitempty" json:"netdevs,omitempty"`
+	Containers      int    `yaml:"containers,omitempty" json:"containers,omitempty"`
+}
+
+// Storage returns the canonical disk budget, accepting the legacy disk alias.
+func (b Budget) Storage() string {
+	if b.EphemeralStorage != "" {
+		return b.EphemeralStorage
+	}
+	return b.Disk
 }
 
 // PlacementPin forces matching objects onto a node.
