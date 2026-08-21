@@ -16,7 +16,7 @@ metadata:
 kinds:
   router:
     image: hyhe/twinet-router:0.1
-    capabilities: [NET_ADMIN, NET_RAW, SYS_ADMIN]
+    capabilities: [NET_ADMIN, NET_RAW]
     sysctls:
       net.ipv4.ip_forward: "1"
       net.ipv4.conf.all.rp_filter: "0"

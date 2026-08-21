@@ -3,11 +3,15 @@ package pki
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/pem"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"testing"
+	"time"
+
+	"github.com/HongyuHe/twinet/internal/authz"
 )
 
 // The agent API creates privileged containers and rewires hosts. A shared
@@ -89,6 +93,55 @@ func TestMutualTLSRefusesAnUnknownClient(t *testing.T) {
 		resp.Body.Close()
 		t.Error("a certificate from an unrelated CA was admitted")
 	}
+}
+
+func TestIssuedIdentitiesCarryAuthorizationBoundaries(t *testing.T) {
+	dir := t.TempDir()
+	b, err := Generate(dir, map[string][]string{"node-0": {"127.0.0.1"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller := parseLeaf(t, b.Client.CertPath)
+	id, err := authz.FromCertificate(controller)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id.Role != authz.RoleController || !id.Allows("any-lab", "destroy") {
+		t.Fatal("the controller certificate is not a cluster-wide controller")
+	}
+
+	scoped, err := IssueScoped(dir, t.TempDir(), "course-ta", authz.RoleOperator,
+		[]string{"cos461"}, []string{"inspect", "deploy"}, 8*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	operator, err := authz.FromCertificate(parseLeaf(t, scoped.CertPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !operator.Allows("cos461", "deploy") {
+		t.Fatal("the scoped operator cannot perform its declared action")
+	}
+	if operator.Allows("advnet", "deploy") || operator.Allows("cos461", "destroy") {
+		t.Fatal("the scoped operator escaped its lab or action boundary")
+	}
+}
+
+func parseLeaf(t *testing.T, path string) *x509.Certificate {
+	t.Helper()
+	pemBytes, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block, _ := pem.Decode(pemBytes)
+	if block == nil {
+		t.Fatalf("%s contains no PEM block", path)
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cert
 }
 
 // Each node gets its own key. One shared server certificate would recreate the

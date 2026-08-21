@@ -23,9 +23,12 @@ import (
 	"fmt"
 	"math/big"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/HongyuHe/twinet/internal/authz"
 )
 
 // Material is one issued identity on disk.
@@ -106,8 +109,12 @@ func Generate(dir string, nodes map[string][]string) (*Bundle, error) {
 		b.Nodes[name] = m
 	}
 
-	client, err := issue(dir, "controller", caCert, caKey, nil,
-		[]x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth})
+	claims, err := authz.URIs(authz.RoleController, []string{"*"}, []string{"*"})
+	if err != nil {
+		return nil, err
+	}
+	client, err := issueForClaims(dir, "controller", caCert, caKey, nil,
+		claims, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, leafValidity)
 	if err != nil {
 		return nil, err
 	}
@@ -125,7 +132,11 @@ func issue(dir, name string, caCert *x509.Certificate, caKey *ecdsa.PrivateKey,
 // something under evaluation can be short-lived.
 func issueFor(dir, name string, caCert *x509.Certificate, caKey *ecdsa.PrivateKey,
 	sans []string, usage []x509.ExtKeyUsage, valid time.Duration) (Material, error) {
+	return issueForClaims(dir, name, caCert, caKey, sans, nil, usage, valid)
+}
 
+func issueForClaims(dir, name string, caCert *x509.Certificate, caKey *ecdsa.PrivateKey,
+	sans []string, uris []*url.URL, usage []x509.ExtKeyUsage, valid time.Duration) (Material, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return Material{}, err
@@ -137,6 +148,7 @@ func issueFor(dir, name string, caCert *x509.Certificate, caKey *ecdsa.PrivateKe
 		NotAfter:     time.Now().Add(valid),
 		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
 		ExtKeyUsage:  usage,
+		URIs:         uris,
 	}
 	for _, s := range sans {
 		if ip := net.ParseIP(s); ip != nil {
@@ -211,12 +223,47 @@ func IssueDiagnostic(pkiDir, outDir string, valid time.Duration) (Material, erro
 	if err := os.MkdirAll(outDir, 0o700); err != nil {
 		return Material{}, err
 	}
-	m, err := issueFor(outDir, "diagnostic", caCert, caKey, nil,
+	claims, err := authz.URIs(authz.RoleDiagnostic, []string{"*"}, []string{"observe"})
+	if err != nil {
+		return Material{}, err
+	}
+	m, err := issueForClaims(outDir, "diagnostic", caCert, caKey, nil, claims,
 		[]x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, valid)
 	if err != nil {
 		return Material{}, err
 	}
 	// The agent needs the authority to verify the nodes it talks to.
+	ca, err := os.ReadFile(filepath.Join(pkiDir, "ca_cert.pem"))
+	if err != nil {
+		return Material{}, err
+	}
+	m.CAPath = filepath.Join(outDir, "ca_cert.pem")
+	if err := os.WriteFile(m.CAPath, ca, 0o644); err != nil {
+		return Material{}, err
+	}
+	return m, nil
+}
+
+// IssueScoped mints a short-lived operator identity limited to the named labs
+// and actions.
+func IssueScoped(pkiDir, outDir, name, role string, labs, actions []string,
+	valid time.Duration) (Material, error) {
+	caCert, caKey, err := loadCA(pkiDir)
+	if err != nil {
+		return Material{}, err
+	}
+	if err := os.MkdirAll(outDir, 0o700); err != nil {
+		return Material{}, err
+	}
+	claims, err := authz.URIs(role, labs, actions)
+	if err != nil {
+		return Material{}, err
+	}
+	m, err := issueForClaims(outDir, name, caCert, caKey, nil, claims,
+		[]x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, valid)
+	if err != nil {
+		return Material{}, err
+	}
 	ca, err := os.ReadFile(filepath.Join(pkiDir, "ca_cert.pem"))
 	if err != nil {
 		return Material{}, err
