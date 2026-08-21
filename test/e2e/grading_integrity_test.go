@@ -45,7 +45,7 @@ func gradeASBroken(t *testing.T, dir string, as int) (map[string]float64, map[st
 func gradeASWithin(t *testing.T, dir string, as int, converge string, requireClean bool) (
 	map[string]float64, map[string]float64, string) {
 	t.Helper()
-	out := t.TempDir()
+	out := e2eArtifactDir(t, "grade")
 	res, err := twinet(t, "grade", "run", "-m", dir, "--as", itoa(as),
 		"-o", out, "--converge-timeout", converge)
 	// A run that could not mark every question exits non-zero, correctly: a

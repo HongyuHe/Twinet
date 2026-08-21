@@ -1,0 +1,93 @@
+name: Scale reliability evidence
+
+# This workflow is intentionally the only CI surface that can touch a cluster.
+# A push to main is a stable merge; scheduled runs provide the 24-hour release
+# soak, and a manual run can request either a short or full soak.
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 2 * * 0"
+  workflow_dispatch:
+    inputs:
+      soak:
+        description: Soak duration after benchmark and chaos evidence
+        required: true
+        default: short
+        type: choice
+        options: [short, 24h]
+
+permissions:
+  contents: read
+
+jobs:
+  cluster-release-evidence:
+    # workflow_dispatch can be run from another ref in the UI. Do not let that
+    # turn an experiment or dev branch into a cluster job.
+    if: github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, linux, twinet-cluster]
+    timeout-minutes: 1620
+    concurrency:
+      group: twinet-cluster-release-evidence
+      cancel-in-progress: false
+    env:
+      TWINET_TOKEN: ${{ secrets.TWINET_TOKEN }}
+      TWINET_SCALE_MANIFEST: examples/scale
+      TWINET_CHAOS_AGENT_RESTART_CMD: ${{ vars.TWINET_CHAOS_AGENT_RESTART_CMD }}
+      TWINET_CHAOS_AGENT_STOP_CMD: ${{ vars.TWINET_CHAOS_AGENT_STOP_CMD }}
+      TWINET_CHAOS_NODE_REBOOT_CMD: ${{ vars.TWINET_CHAOS_NODE_REBOOT_CMD }}
+      TWINET_CHAOS_UNDERLAY_DOWN_CMD: ${{ vars.TWINET_CHAOS_UNDERLAY_DOWN_CMD }}
+      TWINET_CHAOS_UNDERLAY_UP_CMD: ${{ vars.TWINET_CHAOS_UNDERLAY_UP_CMD }}
+      TWINET_CHAOS_MIGRATION_MANIFEST: ${{ vars.TWINET_CHAOS_MIGRATION_MANIFEST }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.25"
+          cache: true
+
+      - name: Refuse incomplete cluster configuration
+        run: |
+          : "${TWINET_TOKEN:?missing TWINET_TOKEN secret}"
+          : "${TWINET_CHAOS_AGENT_RESTART_CMD:?missing agent restart hook}"
+          : "${TWINET_CHAOS_AGENT_STOP_CMD:?missing agent stop hook}"
+          : "${TWINET_CHAOS_NODE_REBOOT_CMD:?missing node reboot hook}"
+          : "${TWINET_CHAOS_UNDERLAY_DOWN_CMD:?missing underlay-down hook}"
+          : "${TWINET_CHAOS_UNDERLAY_UP_CMD:?missing underlay-up hook}"
+          : "${TWINET_CHAOS_MIGRATION_MANIFEST:?missing migration manifest}"
+
+      - name: Validate release runner arguments
+        run: make script-tests
+
+      - name: Record scale benchmark
+        env:
+          TWINET_BENCHMARK_ALLOW_DESTRUCTIVE: "1"
+        run: make benchmark
+
+      - name: Run fenced multi-node chaos
+        env:
+          TWINET_CHAOS_ALLOW_DESTRUCTIVE: "1"
+        run: make chaos
+
+      - name: Run short post-merge soak
+        if: github.event_name != 'schedule' && inputs.soak != '24h'
+        env:
+          TWINET_SOAK_ALLOW_DESTRUCTIVE: "1"
+        run: make soak-short
+
+      - name: Run 24-hour release soak
+        if: github.event_name == 'schedule' || inputs.soak == '24h'
+        env:
+          TWINET_SOAK_ALLOW_DESTRUCTIVE: "1"
+        run: make soak-24h
+
+      - name: Upload release evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scale-reliability-${{ github.run_id }}
+          path: |
+            reports/scale_benchmark/
+            reports/chaos/
+            reports/scale_soak/
+          if-no-files-found: warn

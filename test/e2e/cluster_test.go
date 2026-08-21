@@ -55,7 +55,11 @@ func TestMain(m *testing.M) {
 		fmt.Fprintln(os.Stderr, "e2e: no lab manifest found; set TWINET_LAB")
 		os.Exit(1)
 	}
-	os.Exit(m.Run())
+	status := m.Run()
+	if binDir != "" {
+		_ = os.RemoveAll(binDir)
+	}
+	os.Exit(status)
 }
 
 func labDirPath() string {
@@ -85,6 +89,7 @@ func labDir(t *testing.T) string {
 // evidence proves nothing about the code it is attached to.
 var (
 	binOnce sync.Once
+	binDir  string
 	binPath string
 	binErr  error
 )
@@ -92,11 +97,20 @@ var (
 func controller(t *testing.T) string {
 	t.Helper()
 	binOnce.Do(func() {
-		dir, err := os.MkdirTemp("", "twinet-e2e")
+		root := os.Getenv("TWINET_E2E_ARTIFACT_DIR")
+		if root == "" {
+			root = filepath.Join("..", "..", "reports", "e2e")
+		}
+		if err := os.MkdirAll(root, 0o700); err != nil {
+			binErr = err
+			return
+		}
+		dir, err := os.MkdirTemp(root, "controller-")
 		if err != nil {
 			binErr = err
 			return
 		}
+		binDir = dir
 		binPath = filepath.Join(dir, "twinet")
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()

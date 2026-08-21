@@ -113,5 +113,6 @@ jobs:
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
           shellcheck scripts/*.sh
+          bash scripts/test_release_runners.sh
       - name: Check naming conventions
         run: ./scripts/check_naming.sh

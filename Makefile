@@ -25,7 +25,8 @@ BUILD_TAG ?= $(TAG)-$(COMMIT)
 # Must match .github/workflows/ci.yml, or local lint and CI can disagree.
 GOLANGCI_VERSION ?= v2.5.0
 
-.PHONY: all build test lint fmt vet images push digests clean install e2e ci ci-tools tidy-check naming
+.PHONY: all build test lint fmt vet images push digests clean install e2e ci ci-tools tidy-check naming \
+	script-tests benchmark chaos soak-short soak-24h
 
 all: build
 
@@ -158,6 +159,49 @@ install: build
 # behind that refuses the next thing anybody does to the lab.
 e2e: build
 	$(GO) test -count=1 -tags e2e -timeout 40m -ldflags '$(LDFLAGS)' ./test/e2e/...
+
+# These argument-level tests deliberately need no controller, token, Docker
+# daemon, or cluster. They make a missing destructive acknowledgement a
+# testable contract rather than a convention hidden in release instructions.
+script-tests:
+	shellcheck scripts/*.sh
+	bash scripts/test_release_runners.sh
+
+# Cluster evidence is never part of ordinary CI: it mutates a real cluster and
+# must be run by an explicitly configured self-hosted runner. Every target
+# requires an operator acknowledgement instead of quietly turning destructive
+# coverage into a no-op.
+benchmark:
+	@test "$${TWINET_BENCHMARK_ALLOW_DESTRUCTIVE:-}" = "1" || \
+		{ echo "make benchmark requires TWINET_BENCHMARK_ALLOW_DESTRUCTIVE=1"; exit 2; }
+	@$(MAKE) --no-print-directory build
+	@set --; \
+	if [ -n "$${TWINET_BENCHMARK_SUBMISSIONS:-}" ]; then \
+		set -- --submissions "$${TWINET_BENCHMARK_SUBMISSIONS}"; \
+	fi; \
+	./scripts/scale_benchmark.sh --allow-destructive --binary ./bin/twinet \
+		--manifest "$${TWINET_SCALE_MANIFEST:-examples/scale}" "$$@"
+
+chaos:
+	@test "$${TWINET_CHAOS_ALLOW_DESTRUCTIVE:-}" = "1" || \
+		{ echo "make chaos requires TWINET_CHAOS_ALLOW_DESTRUCTIVE=1"; exit 2; }
+	@$(MAKE) --no-print-directory build
+	@TWINET_CHAOS_ALLOW_DESTRUCTIVE=1 ./scripts/chaos_e2e.sh --allow-destructive \
+		--binary ./bin/twinet --manifest "$${TWINET_SCALE_MANIFEST:-examples/scale}"
+
+soak-short:
+	@test "$${TWINET_SOAK_ALLOW_DESTRUCTIVE:-}" = "1" || \
+		{ echo "make soak-short requires TWINET_SOAK_ALLOW_DESTRUCTIVE=1"; exit 2; }
+	@$(MAKE) --no-print-directory build
+	@TWINET_SOAK_ALLOW_DESTRUCTIVE=1 ./scripts/scale_soak.sh --allow-destructive --short \
+		--binary ./bin/twinet --manifest "$${TWINET_SCALE_MANIFEST:-examples/scale}"
+
+soak-24h:
+	@test "$${TWINET_SOAK_ALLOW_DESTRUCTIVE:-}" = "1" || \
+		{ echo "make soak-24h requires TWINET_SOAK_ALLOW_DESTRUCTIVE=1"; exit 2; }
+	@$(MAKE) --no-print-directory build
+	@TWINET_SOAK_ALLOW_DESTRUCTIVE=1 ./scripts/scale_soak.sh --allow-destructive \
+		--binary ./bin/twinet --manifest "$${TWINET_SCALE_MANIFEST:-examples/scale}"
 
 clean:
 	rm -rf $(BIN)
