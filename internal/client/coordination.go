@@ -646,12 +646,38 @@ func (c *Cluster) Reshape(ctx context.Context, lab, nodeName string,
 		if node == nil {
 			return fmt.Errorf("node %q is not in this cluster", nodeName)
 		}
+
 		if lease != nil {
 			req.Fence, _ = lease.Fence(nodeName)
 			return node.Reshape(lease.Context(), req)
 		}
 		return node.Reshape(ctx, req)
 	})
+}
+
+// MPLSLabelSpace runs a namespace-side allocation operation under the same
+// cluster mutation lease as lifecycle and shaping. Label exhaustion changes
+// forwarding state and must not race a deploy or another incident.
+func (c *Cluster) MPLSLabelSpace(ctx context.Context, lab, nodeName string,
+	req agent.MPLSLabelSpaceRequest,
+) (agent.MPLSLabelSpaceResponse, error) {
+	var out agent.MPLSLabelSpaceResponse
+	err := c.withMutationLease(ctx, lab, func(lease *MutationLease) error {
+		node := c.node(nodeName)
+		if node == nil {
+			return fmt.Errorf("node %q is not in this cluster", nodeName)
+		}
+		if lease != nil {
+			req.Fence, _ = lease.Fence(nodeName)
+			var err error
+			out, err = node.MPLSLabelSpace(lease.Context(), req)
+			return err
+		}
+		var err error
+		out, err = node.MPLSLabelSpace(ctx, req)
+		return err
+	})
+	return out, err
 }
 
 // Exempt changes a repair exemption under a cluster-wide lab fence.

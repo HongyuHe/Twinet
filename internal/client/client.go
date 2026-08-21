@@ -403,6 +403,13 @@ func (n *Node) Reshape(ctx context.Context, req agent.ReshapeRequest) error {
 	return n.do(ctx, http.MethodPost, "/v1/reshape", req, nil)
 }
 
+// MPLSLabelSpace executes the fenced namespace-side label allocator operation.
+func (n *Node) MPLSLabelSpace(ctx context.Context, req agent.MPLSLabelSpaceRequest) (agent.MPLSLabelSpaceResponse, error) {
+	var resp agent.MPLSLabelSpaceResponse
+	err := n.do(ctx, http.MethodPost, "/v1/mpls-label-space", req, &resp)
+	return resp, err
+}
+
 // Underlay probes the fabric MTU toward a peer.
 func (n *Node) Underlay(ctx context.Context, peer string) (agent.UnderlayResponse, error) {
 	var resp agent.UnderlayResponse

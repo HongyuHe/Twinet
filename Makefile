@@ -13,7 +13,7 @@ LDFLAGS := -s -w \
 # Docker may need privilege depending on how the host is set up; overriding one
 # variable is better than every recipe guessing.
 DOCKER  ?= docker
-IMAGES  := router host switch svc bird
+IMAGES  := router host switch svc bird p4 controller
 REGISTRY?= hyhe
 TAG     ?= 0.1
 # Every image is also published under the commit it was built from. The moving
@@ -26,7 +26,8 @@ BUILD_TAG ?= $(TAG)-$(COMMIT)
 GOLANGCI_VERSION ?= v2.5.0
 
 .PHONY: all build test lint fmt vet images push digests clean install e2e ci ci-tools tidy-check naming \
-	script-tests benchmark chaos soak-short soak-24h nos-images
+	script-tests benchmark chaos soak-short soak-24h nos-images substrate-images substrate-integration \
+	fault-integration k8s-fault-integration fault-stress fault-stress-release
 
 all: build
 
@@ -36,6 +37,8 @@ build:
 	CGO_ENABLED=0 $(GO) build -trimpath -ldflags '$(LDFLAGS)' -o $(BIN)/twinet-rtr ./cmd/twinet-rtr
 	CGO_ENABLED=0 $(GO) build -trimpath -ldflags '$(LDFLAGS)' -o $(BIN)/twinet-dhcpd ./cmd/twinet-dhcpd
 	CGO_ENABLED=0 $(GO) build -trimpath -ldflags '$(LDFLAGS)' -o $(BIN)/twinet-mcast ./cmd/twinet-mcast
+	CGO_ENABLED=0 $(GO) build -trimpath -ldflags '$(LDFLAGS)' -o $(BIN)/twinet-traffic ./cmd/twinet-traffic
+	CGO_ENABLED=0 $(GO) build -trimpath -ldflags '$(LDFLAGS)' -o $(BIN)/twinet-openflow-controller ./cmd/twinet-openflow-controller
 
 test:
 	$(GO) test -race -count=1 ./...
@@ -121,6 +124,8 @@ images: build
 	@cp $(BIN)/twinet-dhcpd images/router/twinet-dhcpd
 	@cp $(BIN)/twinet-mcast images/host/twinet-mcast
 	@cp $(BIN)/twinet-mcast images/router/twinet-mcast
+	@cp $(BIN)/twinet-traffic images/svc/twinet-traffic
+	@cp $(BIN)/twinet-openflow-controller images/controller/twinet-openflow-controller
 	@for i in $(IMAGES); do \
 		echo "building $(REGISTRY)/twinet-$$i:$(TAG)"; \
 		$(DOCKER) build -q -t $(REGISTRY)/twinet-$$i:$(TAG) images/$$i || exit 1; \
@@ -213,6 +218,48 @@ nos-images: images
 		{ echo "make nos-images requires a reachable Docker daemon"; exit 2; }
 	REGISTRY="$(REGISTRY)" TAG="$(TAG)" DOCKER="$(DOCKER)" \
 		$(GO) test -count=1 -tags nosimages ./test/integration/...
+
+# O16 images are explicit because they pull a large pinned BMv2 base and may
+# need a privileged Docker daemon. This target never reports a green result
+# merely because the daemon is unavailable.
+substrate-images: images
+	@command -v $(DOCKER) >/dev/null 2>&1 || \
+		{ echo "make substrate-images requires $(DOCKER)"; exit 2; }
+	@$(DOCKER) info >/dev/null 2>&1 || \
+		{ echo "make substrate-images requires a reachable Docker daemon"; exit 2; }
+	@echo "P4/BMv2 and OpenFlow controller images built"
+
+# Docker/root gated native round trips. The test itself refuses missing
+# prerequisites rather than using t.Skip, so a release job cannot accidentally
+# claim that all registered native faults ran.
+fault-integration:
+	@test "$${TWINET_FAULT_INTEGRATION_ALLOW_DESTRUCTIVE:-}" = "1" || \
+		{ echo "make fault-integration requires TWINET_FAULT_INTEGRATION_ALLOW_DESTRUCTIVE=1"; exit 2; }
+	@$(DOCKER) info >/dev/null 2>&1 || \
+		{ echo "make fault-integration requires a reachable Docker daemon"; exit 2; }
+	@$(MAKE) --no-print-directory images
+	TWINET_BIN="$(CURDIR)/bin/twinet" \
+		TWINET_FAULT_INTEGRATION_ALLOW_DESTRUCTIVE=1 \
+		$(GO) test -count=1 -tags faultintegration -timeout 45m ./test/integration/...
+
+# Short locally, release-sized when TWINET_FAULT_STRESS_EPISODES=100 is set.
+fault-stress:
+	$(GO) test -count=1 -run TestConcurrentEpisodeIsolation ./internal/fault/...
+
+fault-stress-release:
+	TWINET_FAULT_STRESS_EPISODES=100 $(GO) test -race -count=1 -run TestConcurrentEpisodeIsolation ./internal/fault/...
+
+# Kubernetes is delegated to NIKA rather than emulated in Docker. This is an
+# opt-in real-backend gate; its tag never turns an unconfigured cluster into a
+# skip or a green result.
+k8s-fault-integration:
+	@test -n "$${TWINET_NIKA_KUBERNETES_ENDPOINT:-}" && \
+		test -n "$${TWINET_NIKA_KUBERNETES_CONTEXT:-}" && \
+		test -n "$${TWINET_NIKA_KUBERNETES_BRIDGE:-}" || \
+		{ echo "make k8s-fault-integration requires NIKA endpoint, context, and bridge"; exit 2; }
+	$(GO) test -count=1 -tags k8sbackend ./internal/cli/...
+
+substrate-integration: substrate-images fault-integration
 
 clean:
 	rm -rf $(BIN)

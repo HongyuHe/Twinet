@@ -66,41 +66,44 @@ type Wire struct {
 
 // WireDev is one device.
 type WireDev struct {
-	ID                string                `json:"id"`
-	Name              string                `json:"name"`
-	Kind              string                `json:"kind"`
-	AS                int                   `json:"as,omitempty"`
-	RouterID          int                   `json:"router_id,omitempty"`
-	InteriorRole      string                `json:"interior_role,omitempty"`
-	InteriorRoleIndex int                   `json:"interior_role_index,omitempty"`
-	PlacementGroup    string                `json:"placement_group,omitempty"`
-	Node              string                `json:"node"`
-	Image             string                `json:"image"`
-	NOS               string                `json:"nos,omitempty"`
-	ImageID           string                `json:"image_id,omitempty"`
-	Container         string                `json:"container"`
-	Hostname          string                `json:"hostname"`
-	Owner             string                `json:"owner,omitempty"`
-	CPUs              float64               `json:"cpus,omitempty"`
-	Memory            string                `json:"memory,omitempty"`
-	Pids              int64                 `json:"pids,omitempty"`
-	Requests          model.ResourceRequest `json:"requests"`
-	Restart           string                `json:"restart,omitempty"`
-	Privileged        bool                  `json:"privileged,omitempty"`
-	Env               map[string]string     `json:"env,omitempty"`
-	Sysctls           map[string]string     `json:"sysctls,omitempty"`
-	Capabilities      []string              `json:"capabilities,omitempty"`
-	Binds             []string              `json:"binds,omitempty"`
-	Command           []string              `json:"command,omitempty"`
-	Labels            map[string]string     `json:"labels,omitempty"`
-	ServiceKind       string                `json:"service_kind,omitempty"`
-	ServiceName       string                `json:"service_name,omitempty"`
-	ServiceReplica    string                `json:"service_replica,omitempty"`
-	ServiceIdentity   string                `json:"service_identity,omitempty"`
-	L2Gateway         string                `json:"l2_gateway,omitempty"`
-	L2Domain          string                `json:"l2_domain,omitempty"`
-	VLANs             []int                 `json:"vlans,omitempty"`
-	Ifaces            []WireIface           `json:"ifaces,omitempty"`
+	ID                 string                 `json:"id"`
+	Name               string                 `json:"name"`
+	Kind               string                 `json:"kind"`
+	AS                 int                    `json:"as,omitempty"`
+	RouterID           int                    `json:"router_id,omitempty"`
+	InteriorRole       string                 `json:"interior_role,omitempty"`
+	InteriorRoleIndex  int                    `json:"interior_role_index,omitempty"`
+	PlacementGroup     string                 `json:"placement_group,omitempty"`
+	Node               string                 `json:"node"`
+	Image              string                 `json:"image"`
+	NOS                string                 `json:"nos,omitempty"`
+	ImageID            string                 `json:"image_id,omitempty"`
+	Container          string                 `json:"container"`
+	Hostname           string                 `json:"hostname"`
+	Owner              string                 `json:"owner,omitempty"`
+	CPUs               float64                `json:"cpus,omitempty"`
+	Memory             string                 `json:"memory,omitempty"`
+	Pids               int64                  `json:"pids,omitempty"`
+	Requests           model.ResourceRequest  `json:"requests"`
+	Restart            string                 `json:"restart,omitempty"`
+	Privileged         bool                   `json:"privileged,omitempty"`
+	Env                map[string]string      `json:"env,omitempty"`
+	Sysctls            map[string]string      `json:"sysctls,omitempty"`
+	Capabilities       []string               `json:"capabilities,omitempty"`
+	Binds              []string               `json:"binds,omitempty"`
+	Command            []string               `json:"command,omitempty"`
+	Labels             map[string]string      `json:"labels,omitempty"`
+	ServiceKind        string                 `json:"service_kind,omitempty"`
+	ServiceName        string                 `json:"service_name,omitempty"`
+	ServiceReplica     string                 `json:"service_replica,omitempty"`
+	ServiceIdentity    string                 `json:"service_identity,omitempty"`
+	P4                 *model.P4Runtime       `json:"p4,omitempty"`
+	OpenFlow           *model.OpenFlowRuntime `json:"openflow,omitempty"`
+	OpenFlowController string                 `json:"openflow_controller,omitempty"`
+	L2Gateway          string                 `json:"l2_gateway,omitempty"`
+	L2Domain           string                 `json:"l2_domain,omitempty"`
+	VLANs              []int                  `json:"vlans,omitempty"`
+	Ifaces             []WireIface            `json:"ifaces,omitempty"`
 }
 
 // WireIface is one interface.
@@ -249,6 +252,7 @@ func Serialise(top *model.Topology) *Wire {
 			Labels: d.Labels, L2Gateway: d.L2Gateway, L2Domain: d.L2Domain,
 			VLANs: d.VLANs, ServiceName: d.ServiceName,
 			ServiceReplica: d.ServiceReplica, ServiceIdentity: d.ServiceIdentity,
+			P4: d.P4, OpenFlow: d.OpenFlow, OpenFlowController: d.OpenFlowController,
 		}
 		for _, i := range d.Ifaces {
 			wi := WireIface{
@@ -402,6 +406,7 @@ func (w *Wire) Rehydrate() (*model.Topology, error) {
 			Labels: wd.Labels, L2Gateway: wd.L2Gateway, L2Domain: wd.L2Domain,
 			ServiceKind: wd.ServiceKind, ServiceName: wd.ServiceName,
 			ServiceReplica: wd.ServiceReplica, ServiceIdentity: wd.ServiceIdentity,
+			P4: wd.P4, OpenFlow: wd.OpenFlow, OpenFlowController: wd.OpenFlowController,
 			VLANs: wd.VLANs,
 		}
 		for _, wi := range wd.Ifaces {

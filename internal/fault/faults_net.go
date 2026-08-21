@@ -190,7 +190,10 @@ func init() {
 	Register(&Fault{
 		Name: "frr_service_down", Category: CatNodeError, Needs: []Capability{CapService, CapFRR},
 		Precondition: func(ctx context.Context, e *Env, t Target) (string, error) {
-			out, _ := e.Try(ctx, t.DeviceID(), procRunning("/bgpd")+" && echo running || echo stopped")
+			out, _, err := e.FRRTry(ctx, t.DeviceID(), procRunning("/bgpd")+" && echo running || echo stopped")
+			if err != nil {
+				return "", err
+			}
 			if strings.Contains(out, "stopped") {
 				return "FRR is not running on " + t.DeviceID() + " to begin with", nil
 			}
@@ -204,7 +207,7 @@ func init() {
 			// its pid lock, which then prevents the service from starting again.
 			// The supervisor has to go first, and the daemons are killed by
 			// path so the match is unambiguous.
-			_, err := e.Sh(ctx, t.DeviceID(), strings.Join([]string{
+			_, err := e.FRRSh(ctx, t.DeviceID(), strings.Join([]string{
 				"/usr/lib/frr/frrinit.sh stop >/dev/null 2>&1 || true",
 				killMatching("/usr/lib/frr/"),
 				"for i in 1 2 3 4 5; do " + procRunning("/bgpd") + " || break; sleep 1; done",
@@ -216,7 +219,10 @@ func init() {
 			return State{"service": "frr"}, nil
 		},
 		Verify: func(ctx context.Context, e *Env, t Target, s State) (Evidence, error) {
-			out, _ := e.Try(ctx, t.DeviceID(), procRunning("/bgpd")+" && echo running || echo stopped")
+			out, _, err := e.FRRTry(ctx, t.DeviceID(), procRunning("/bgpd")+" && echo running || echo stopped")
+			if err != nil {
+				return Evidence{}, err
+			}
 			return Evidence{Verified: strings.Contains(out, "stopped"),
 				Expected: "bgpd stopped", Observed: strings.TrimSpace(out)}, nil
 		},
@@ -226,7 +232,7 @@ func init() {
 			// leave the router permanently dead after a single fault.
 			// The daemons also take a moment to bind, so returning early would
 			// race the post-resolve verification.
-			_, err := e.Sh(ctx, t.DeviceID(), strings.Join([]string{
+			_, err := e.FRRSh(ctx, t.DeviceID(), strings.Join([]string{
 				killMatching("/usr/lib/frr/watchfrr"),
 				"sleep 1",
 				"rm -f /run/frr/*.pid /var/run/frr/*.pid 2>/dev/null || true",

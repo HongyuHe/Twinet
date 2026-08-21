@@ -44,4 +44,6 @@ images/svc/twinet-rtr
 images/router/twinet-dhcpd
 images/host/twinet-mcast
 images/router/twinet-mcast
+images/svc/twinet-traffic
+images/controller/twinet-openflow-controller
 /twinet-mcast

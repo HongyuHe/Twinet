@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+
+	"github.com/HongyuHe/twinet/internal/model"
 )
 
 // baselineKey is where the pre-injection fingerprint is kept in the injection
@@ -57,6 +59,31 @@ func fingerprint(ctx context.Context, e *Env, deviceID string) string {
 		// empty one would make every later comparison trivially equal, which
 		// is the failure this whole mechanism exists to prevent.
 		return ""
+	}
+	// P4 table entries and an OVS controller endpoint are forwarding state,
+	// not ordinary Linux configuration. Without them a table-delete or
+	// southbound-port fault could resolve its predicate while leaving the
+	// switch's actual data/control plane different from its baseline.
+	//
+	// BMv2 counter values intentionally do not participate: they change as
+	// traffic flows and are evidence, not configuration.
+	if e != nil && e.Topology != nil {
+		if d, ok := e.Topology.Device(deviceID); ok {
+			switch {
+			case d.Kind == model.KindP4 && d.P4 != nil:
+				if p4, p4Code := e.Try(ctx, deviceID, fmt.Sprintf(
+					"printf 'table_dump %s\\n' | simple_switch_CLI --thrift-port %d 2>/dev/null | "+
+						"grep -v -E 'packets|bytes' | sed -E 's/(Entry )?handle:?[[:space:]]*[0-9]+/handle:<id>/; s/Dumping entry 0x[0-9a-fA-F]+/Dumping entry <id>/'",
+					shellQuote(d.P4.Table), d.P4.ThriftPort)); p4Code == 0 {
+					out += "\n---\np4-table\n" + p4
+				}
+			case d.Kind == model.KindSwitch && d.OpenFlowController != "":
+				if ovs, ovsCode := e.Try(ctx, deviceID,
+					"ovs-vsctl get-controller br0 2>/dev/null; ovs-vsctl get-fail-mode br0 2>/dev/null"); ovsCode == 0 {
+					out += "\n---\novs-controller\n" + ovs
+				}
+			}
+		}
 	}
 	return normaliseFingerprint(out)
 }

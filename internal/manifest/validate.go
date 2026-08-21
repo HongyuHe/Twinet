@@ -1,9 +1,14 @@
 package manifest
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"regexp"
+	"strconv"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -36,6 +41,7 @@ func (l *Loaded) Validate() *Diagnostics {
 	l.validateASes(d, file)
 	l.validatePeerings(d, file)
 	l.validateServices(d, file)
+	l.validateSubstrates(d, file)
 	l.validateBehaviours(d, file)
 	l.validateEgress(d, file)
 	l.validateResources(d, file)
@@ -284,13 +290,77 @@ func (l *Loaded) validateTemplates(d *Diagnostics) {
 			}
 		}
 
+		// P4 endpoints share explicit internal_links with routers. Their IDs
+		// therefore participate in the same deterministic addressing space,
+		// but they are not routers and must not be accepted as external ports.
+		deviceNames := map[string]bool{}
+		for name := range routers {
+			deviceNames[name] = true
+		}
+		if tpl.Interior != nil && tpl.EffectiveInteriorKind() != model.InteriorExplicit &&
+			len(tpl.P4Devices) > 0 {
+			d.AddHint(file, "p4_devices", nodeAt(root, "p4_devices"),
+				"P4 devices currently require an explicit interior",
+				"declare routers/internal_links explicitly so BMv2 ports have stable endpoint IDs")
+		}
+		for _, pn := range sortedMapKeys(tpl.P4Devices) {
+			p := tpl.P4Devices[pn]
+			path := "p4_devices." + pn
+			if p == nil {
+				d.Add(file, path, "P4 device has no specification", nodeAt(root, path))
+				continue
+			}
+			if deviceNames[pn] {
+				d.Addf(file, path, nodeAt(root, path),
+					"P4 device %q conflicts with a router of the same name", pn)
+			}
+			deviceNames[pn] = true
+			if p.ID <= 0 {
+				d.Addf(file, path+".id", nodeAt(root, path), "P4 device %s: id must be a positive integer", pn)
+			} else if names := byID[p.ID]; len(names) > 0 {
+				d.AddHint(file, path+".id", nodeAt(root, path),
+					fmt.Sprintf("P4 device id %d is already used by router %s", p.ID, strings.Join(names, ", ")),
+					"router and P4 endpoint IDs share the internal-link addressing plan")
+			} else {
+				byID[p.ID] = []string{pn}
+			}
+			if len(pn) > ifaceNameMax-len("port_") {
+				d.AddHint(file, path, nodeAt(root, path),
+					fmt.Sprintf("P4 device name %q is too long", pn),
+					fmt.Sprintf("interface names are derived as port_<name> and must fit %d bytes", ifaceNameMax))
+			}
+			if p.Program.Path == "" {
+				d.Add(file, path+".program.path", "P4 program.path is required", nodeAt(root, path))
+			}
+			if p.ControlPlane.Table == "" || p.ControlPlane.ForwardAction == "" {
+				d.AddHint(file, path+".control_plane", nodeAt(root, path),
+					"a P4 control plane needs table and forward_action names",
+					"declare the program ABI so table faults can be applied and verified")
+			}
+			if p.ControlPlane.ThriftPort < 0 || p.ControlPlane.ThriftPort > 65535 {
+				d.Addf(file, path+".control_plane.thrift_port", nodeAt(root, path),
+					"Thrift port %d is outside the 1-65535 range", p.ControlPlane.ThriftPort)
+			}
+			if len(p.ControlPlane.RegisterValues) > 0 && p.ControlPlane.ThresholdRegister == "" {
+				d.AddHint(file, path+".control_plane.register_values", nodeAt(root, path),
+					"register_values requires threshold_register",
+					"declare the typed register ABI before initialising it")
+			}
+			for i, entry := range p.ControlPlane.Entries {
+				entryPath := fmt.Sprintf("%s.control_plane.entries[%d]", path, i)
+				if strings.TrimSpace(entry.Match) == "" {
+					d.Add(file, entryPath+".match", "P4 table entry match is required", nodeAt(root, entryPath))
+				}
+			}
+		}
+
 		for i, il := range tpl.EffectiveInternalLinks() {
 			path := fmt.Sprintf("internal_links[%d]", i)
-			if _, ok := routers[il.A]; !ok {
-				d.Addf(file, path+".a", nodeAt(root, path), "unknown router %q", il.A)
+			if !deviceNames[il.A] {
+				d.Addf(file, path+".a", nodeAt(root, path), "unknown router or P4 device %q", il.A)
 			}
-			if _, ok := routers[il.B]; !ok {
-				d.Addf(file, path+".b", nodeAt(root, path), "unknown router %q", il.B)
+			if !deviceNames[il.B] {
+				d.Addf(file, path+".b", nodeAt(root, path), "unknown router or P4 device %q", il.B)
 			}
 			if il.A == il.B {
 				d.Addf(file, path, nodeAt(root, path), "router %q cannot link to itself", il.A)
@@ -539,7 +609,8 @@ func (l *Loaded) validateServices(d *Diagnostics, file string) {
 		"builtin.dns": true, "builtin.matrix": true, "builtin.measurement": true,
 		"builtin.web": true, "builtin.wireguard": true, "builtin.krill": true,
 		"builtin.rpki": true, "builtin.dhcp": true,
-		"builtin.routinator": true, "container": true,
+		"builtin.routinator": true, "builtin.load-balancer": true,
+		"builtin.traffic-generator": true, "container": true,
 	}
 	for _, name := range sortedMapKeys(l.Lab.Services) {
 		s := l.Lab.Services[name]
@@ -585,6 +656,203 @@ func (l *Loaded) validateServices(d *Diagnostics, file string) {
 				d.AddHint(file, path, node,
 					fmt.Sprintf("service %q is attached per-AS but addressing.services.%s is not defined", name, name),
 					"add an entry under addressing.services so each AS gets a subnet for it")
+			}
+			switch s.Kind {
+			case "builtin.load-balancer":
+				if s.LoadBalancer == nil {
+					d.AddHint(file, path+".load_balancer", node,
+						"a builtin.load-balancer service needs a typed load_balancer specification",
+						"declare max_inflight and one or more backends so overload is measurable")
+					continue
+				}
+				lb := s.LoadBalancer
+				if lb.MaxInflight < 1 {
+					d.Add(file, path+".load_balancer.max_inflight",
+						"max_inflight must be at least one", node)
+				}
+				if len(lb.Backends) == 0 {
+					d.Add(file, path+".load_balancer.backends",
+						"at least one backend is required; a balancer with none cannot prove overload", node)
+				}
+				if lb.WorkDelay != "" {
+					if v, err := time.ParseDuration(lb.WorkDelay); err != nil || v < 0 {
+						d.Addf(file, path+".load_balancer.work_delay", node,
+							"work_delay %q must be a non-negative Go duration", lb.WorkDelay)
+					}
+				}
+			case "builtin.traffic-generator":
+				if s.TrafficGenerator == nil {
+					d.AddHint(file, path+".traffic_generator", node,
+						"a builtin.traffic-generator service needs a typed traffic_generator profile",
+						"declare target, requests, and concurrency")
+					continue
+				}
+				p := s.TrafficGenerator.Profile
+				if p.Target == "" {
+					d.Add(file, path+".traffic_generator.profile.target", "traffic target is required", node)
+				}
+				if p.Requests < 1 {
+					d.Add(file, path+".traffic_generator.profile.requests", "requests must be at least one", node)
+				}
+				if p.Concurrency < 1 {
+					d.Add(file, path+".traffic_generator.profile.concurrency", "concurrency must be at least one", node)
+				}
+				switch p.Protocol {
+				case "", "http":
+				default:
+					d.Addf(file, path+".traffic_generator.profile.protocol", node,
+						"unsupported deterministic traffic protocol %q (http)", p.Protocol)
+				}
+				if p.Timeout != "" {
+					if v, err := time.ParseDuration(p.Timeout); err != nil || v <= 0 {
+						d.Addf(file, path+".traffic_generator.profile.timeout", node,
+							"timeout %q must be a positive Go duration", p.Timeout)
+					}
+				}
+			default:
+				if s.LoadBalancer != nil || s.TrafficGenerator != nil {
+					d.AddHint(file, path, node,
+						"typed load_balancer or traffic_generator settings require their matching builtin service kind",
+						"use builtin.load-balancer or builtin.traffic-generator")
+				}
+			}
+		}
+	}
+}
+
+// validateSubstrates validates the device kinds that add a new runtime rather
+// than treating them as generic containers. The checks are deliberately before
+// expansion/deployment: an invalid P4 program or an impossible OpenFlow
+// endpoint must be refused before any container has been created.
+func (l *Loaded) validateSubstrates(d *Diagnostics, file string) {
+	for _, templateName := range l.Lab.SortedTemplateNames() {
+		tpl := l.Lab.Templates[templateName]
+		if tpl == nil {
+			continue
+		}
+		templateFile := l.Files["template:"+templateName]
+		if templateFile == "" {
+			templateFile = file
+		}
+		root := l.Nodes[templateFile]
+		for _, name := range sortedMapKeys(tpl.P4Devices) {
+			spec := tpl.P4Devices[name]
+			if spec == nil {
+				d.Add(templateFile, "p4_devices."+name, "P4 device has no specification",
+					nodeAt(root, "p4_devices."+name))
+				continue
+			}
+			path := "p4_devices." + name + ".program"
+			defaults := spec.DeviceDefaults.Merge(l.Lab.Kinds[model.KindP4]).Merge(l.Lab.Defaults)
+			if defaults.Image == "" {
+				d.AddHint(templateFile, "p4_devices."+name+".image", nodeAt(root, "p4_devices."+name),
+					"P4 device has no BMv2 image",
+					"set kinds.p4.image to the pinned twinet-p4 image")
+			}
+			if spec.Program.Path == "" {
+				continue
+			}
+			if spec.Program.Digest == "" {
+				d.AddHint(templateFile, path+".digest", nodeAt(root, path),
+					"P4 program digest is required for deterministic pipeline loading",
+					"pin the source or JSON bytes as sha256:<hex>")
+			}
+			switch spec.Program.Language {
+			case "", "p4-16":
+			default:
+				d.Addf(templateFile, path+".language", nodeAt(root, path),
+					"unsupported P4 language %q; the pinned BMv2 compiler supports p4-16", spec.Program.Language) // reported by the structural pass above
+			}
+			clean := filepath.Clean(spec.Program.Path)
+			if filepath.IsAbs(clean) || clean == ".." ||
+				len(clean) > 3 && clean[:3] == ".."+string(filepath.Separator) {
+				d.AddHint(templateFile, path+".path", nodeAt(root, path),
+					"P4 program.path must stay under the lab directory",
+					"use a relative path such as p4/ipv4.p4")
+				continue
+			}
+			programPath := filepath.Join(l.Lab.Dir, clean)
+			raw, err := os.ReadFile(programPath)
+			if err != nil {
+				d.AddHint(templateFile, path+".path", nodeAt(root, path),
+					fmt.Sprintf("cannot read P4 program %q: %v", clean, err),
+					"add the source or compiled JSON under the lab directory")
+				continue
+			}
+			if len(raw) == 0 {
+				d.Add(templateFile, path+".path", "P4 program is empty", nodeAt(root, path))
+			}
+			if spec.Program.Digest != "" {
+				sum := sha256.Sum256(raw)
+				got := "sha256:" + hex.EncodeToString(sum[:])
+				if spec.Program.Digest != got {
+					d.AddHint(templateFile, path+".digest", nodeAt(root, path),
+						fmt.Sprintf("P4 program digest is %s, not %s", got, spec.Program.Digest),
+						"update the digest after deliberately changing the program")
+				}
+			}
+			switch filepath.Ext(clean) {
+			case ".p4", ".json":
+			default:
+				d.AddHint(templateFile, path+".path", nodeAt(root, path),
+					"P4 program must be a .p4 source or BMv2 .json pipeline",
+					"compile sources deterministically during deployment or commit the generated JSON")
+			}
+		}
+	}
+
+	seenSwitches := map[string]string{}
+	for _, name := range sortedMapKeys(l.Lab.Controllers) {
+		spec := l.Lab.Controllers[name]
+		path := "controllers." + name
+		node := nodeAt(l.Nodes[file], path)
+		if spec == nil {
+			d.Add(file, path, "controller has no specification", node)
+			continue
+		}
+		defaults := spec.DeviceDefaults.Merge(l.Lab.Kinds[model.KindController]).Merge(l.Lab.Defaults)
+		if defaults.Image == "" {
+			d.AddHint(file, path+".image", node,
+				"OpenFlow controller has no image",
+				"set kinds.controller.image to the pinned twinet-controller image")
+		}
+		version := spec.OpenFlow.Version
+		if version != "" && version != "1.3" {
+			d.Addf(file, path+".openflow.version", node,
+				"OpenFlow version %q is unsupported; Twinet's pinned controller implements 1.3", version)
+		}
+		if spec.OpenFlow.Listen != "" {
+			i := strings.LastIndex(spec.OpenFlow.Listen, ":")
+			port := 0
+			if i >= 0 {
+				port, _ = strconv.Atoi(spec.OpenFlow.Listen[i+1:])
+			}
+			if port < 1 || port > 65535 {
+				d.Addf(file, path+".openflow.listen", node,
+					"%q must end in a TCP port in the 1-65535 range", spec.OpenFlow.Listen)
+			}
+		}
+		switch spec.OpenFlow.FailMode {
+		case "", "secure", "standalone":
+		default:
+			d.Addf(file, path+".openflow.fail_mode", node,
+				"unknown OpenFlow fail_mode %q (secure, standalone)", spec.OpenFlow.FailMode)
+		}
+		if len(spec.OpenFlow.Switches) == 0 {
+			d.Add(file, path+".openflow.switches",
+				"an OpenFlow controller must declare one or more OVS switch device IDs", node)
+		}
+		for i, switchID := range spec.OpenFlow.Switches {
+			itemPath := fmt.Sprintf("%s.openflow.switches[%d]", path, i)
+			if owner, duplicate := seenSwitches[switchID]; duplicate {
+				d.Addf(file, itemPath, node,
+					"OVS switch %q is already controlled by %q", switchID, owner)
+			}
+			seenSwitches[switchID] = name
+			if !regexp.MustCompile(`^as[0-9]+/[A-Za-z0-9_.-]+$`).MatchString(switchID) {
+				d.AddHint(file, itemPath, node,
+					fmt.Sprintf("switch %q is not an expanded Twinet device ID", switchID),
+					"use a value such as as5/DCN_S1")
 			}
 		}
 	}

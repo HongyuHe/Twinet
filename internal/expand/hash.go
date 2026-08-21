@@ -46,6 +46,25 @@ func canonicalise(w io.Writer, top *model.Topology) {
 			writeBlob(w, d.NOS)
 			writeString(w, "\n")
 		}
+		// New optional substrates must not perturb the identity of every
+		// legacy topology merely by adding a nil field to Device. When they
+		// are actually present their complete typed contract is part of the
+		// hash, just as an explicit NOS selection is above.
+		if d.P4 != nil {
+			writeString(w, "  p4=")
+			writeValue(w, reflect.ValueOf(*d.P4))
+			writeString(w, "\n")
+		}
+		if d.OpenFlow != nil {
+			writeString(w, "  openflow=")
+			writeValue(w, reflect.ValueOf(*d.OpenFlow))
+			writeString(w, "\n")
+		}
+		if d.OpenFlowController != "" {
+			writeString(w, "  openflow_controller=")
+			writeBlob(w, d.OpenFlowController)
+			writeString(w, "\n")
+		}
 		for _, i := range d.Ifaces {
 			if placementServiceIface(i) {
 				continue
@@ -104,6 +123,22 @@ func canonicalise(w io.Writer, top *model.Topology) {
 	if top.Lab != nil {
 		writeString(w, "lab\n")
 		writeStruct(w, "  ", reflect.ValueOf(*top.Lab))
+		if len(top.Lab.Controllers) > 0 {
+			writeString(w, "  controllers=")
+			writeValue(w, reflect.ValueOf(top.Lab.Controllers))
+			writeString(w, "\n")
+		}
+		for _, name := range top.SortedServiceNames() {
+			spec := top.Lab.Services[name]
+			if spec == nil || (spec.LoadBalancer == nil && spec.TrafficGenerator == nil) {
+				continue
+			}
+			writeString(w, "  measured_service ")
+			writeBlob(w, name)
+			writeString(w, "=")
+			writeValue(w, reflect.ValueOf(*spec))
+			writeString(w, "\n")
+		}
 	}
 
 	names := make([]string, 0, len(top.Services))
@@ -173,6 +208,8 @@ var skipped = map[string]string{
 	"Class":             "link locality reporting metadata",
 	"AddressingField":   "diagnostic metadata; resulting subnet is hashed",
 	"RouterRouterRole":  "resulting generated subnets are hashed",
+	"P4Devices":         "compiled P4 devices are hashed from their expanded runtime contract",
+	"SharedSegment":     "expanded Link.Segment is hashed with each concrete cable",
 	// A legacy router has an implicit FRR NOS. It is written explicitly by
 	// canonicalise only when authored, preserving hashes for old manifests.
 	"NOS": "empty is the legacy implicit FRR choice; explicit values are written separately",
@@ -194,6 +231,15 @@ var skipped = map[string]string{
 	"Identity":             "replica identity metadata",
 	"Shard":                "replica shard metadata",
 	"Index":                "replica ordinal metadata",
+	// Optional O16 substrate fields are emitted conditionally above. Skipping
+	// their nil/empty values is what keeps every pre-existing course topology
+	// hash stable while still making an actual substrate declaration matter.
+	"P4":                 "written conditionally by canonicalise",
+	"OpenFlow":           "written conditionally by canonicalise",
+	"OpenFlowController": "written conditionally by canonicalise",
+	"Controllers":        "written conditionally by canonicalise",
+	"LoadBalancer":       "written for declared measured services",
+	"TrafficGenerator":   "written for declared measured services",
 
 	// Deployment facts, not topology. Two clusters running the same lab must
 	// agree on the hash, or a submission could never be graded anywhere but

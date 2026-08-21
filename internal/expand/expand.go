@@ -49,6 +49,9 @@ func Expand(lab *model.Lab) (*Result, error) {
 	if err := e.expandASes(); err != nil {
 		return nil, err
 	}
+	if err := e.expandControllers(); err != nil {
+		return nil, err
+	}
 	if err := e.expandPeerings(); err != nil {
 		return nil, err
 	}
@@ -249,6 +252,37 @@ func (e *expander) expandOneAS(asn int, spec model.ASSpec) error {
 		d.AddIface(lo)
 	}
 
+	// BMv2 devices participate in ordinary point-to-point internal links but
+	// are not routers: they have no FRR loopback, cannot be selected as an
+	// external BGP port, and are configured from their typed P4 contract.
+	// Keeping them in the same name map makes an internal_links declaration
+	// describe the physical cable without inventing a parallel topology syntax.
+	for _, pn := range sortedKeys(tpl.P4Devices) {
+		ps := tpl.P4Devices[pn]
+		d := e.newDevice(as, pn, model.KindP4, ps.DeviceDefaults)
+		d.RouterID = ps.ID
+		d.P4 = &model.P4Runtime{
+			ProgramPath:       ps.Program.Path,
+			ProgramDigest:     ps.Program.Digest,
+			Language:          ps.Program.Language,
+			ThriftPort:        ps.ControlPlane.ThriftPort,
+			Table:             ps.ControlPlane.Table,
+			ForwardAction:     ps.ControlPlane.ForwardAction,
+			ThresholdRegister: ps.ControlPlane.ThresholdRegister,
+			RegisterValues:    copyIntMap(ps.ControlPlane.RegisterValues),
+			Entries:           append([]model.P4TableEntry(nil), ps.ControlPlane.Entries...),
+			ProbeSource:       ps.ControlPlane.ProbeSource,
+			ProbeDestination:  ps.ControlPlane.ProbeDestination,
+		}
+		if d.P4.Language == "" {
+			d.P4.Language = "p4-16"
+		}
+		if d.P4.ThriftPort == 0 {
+			d.P4.ThriftPort = 9090
+		}
+		byName[pn] = d
+	}
+
 	// External ports must resolve to real routers.
 	for _, pn := range sortedKeys(tpl.ExternalPorts) {
 		ep := tpl.ExternalPorts[pn]
@@ -343,11 +377,11 @@ func (e *expander) expandOneAS(asn int, spec model.ASSpec) error {
 		for li, il := range tpl.EffectiveInternalLinks() {
 			a, ok := byName[il.A]
 			if !ok {
-				return fmt.Errorf("internal_links[%d]: unknown router %q", li, il.A)
+				return fmt.Errorf("internal_links[%d]: unknown device %q", li, il.A)
 			}
 			b, ok := byName[il.B]
 			if !ok {
-				return fmt.Errorf("internal_links[%d]: unknown router %q", li, il.B)
+				return fmt.Errorf("internal_links[%d]: unknown device %q", li, il.B)
 			}
 			subnet := ""
 			if il.Subnet != "" {
@@ -369,6 +403,16 @@ func (e *expander) expandOneAS(asn int, spec model.ASSpec) error {
 				subnet = s
 			}
 			aAddr, bAddr := hostPair(subnet)
+			// BMv2 owns the forwarding pipeline but is not an L3 endpoint.
+			// Giving a P4 port the other half of a router subnet creates a
+			// fictional peer address and makes a shared programmable segment
+			// duplicate every endpoint address.
+			if a.Kind == model.KindP4 {
+				aAddr = ""
+			}
+			if b.Kind == model.KindP4 {
+				bAddr = ""
+			}
 			owner := e.ownerFor(as, tpl, il.A, model.DomainRouterInterfaces)
 			aIf := &model.Iface{Device: a, Name: "port_" + il.B, Role: model.RoleIntraAS,
 				Addr4: aAddr, Owner: owner, Prescribed: true, Subnet: subnet}
@@ -376,7 +420,8 @@ func (e *expander) expandOneAS(asn int, spec model.ASSpec) error {
 				Addr4: bAddr, Owner: owner, Prescribed: true, Subnet: subnet}
 			a.AddIface(aIf)
 			b.AddIface(bIf)
-			e.link(aIf, bIf, model.LinkVeth, il.Merge(e.lab.LinkDefaults), subnet, owner)
+			l := e.link(aIf, bIf, model.LinkVeth, il.Merge(e.lab.LinkDefaults), subnet, owner)
+			l.Segment = il.SharedSegment
 		}
 	} else {
 		for li, il := range shape.links {
@@ -607,6 +652,96 @@ func (e *expander) expandL2Domain(as *model.AS, tpl *model.ASTemplate, routers m
 		e.link(hIf, sIf, model.LinkVeth, h.LinkProps.Merge(e.lab.LinkDefaults), "", owner)
 	}
 	return nil
+}
+
+// expandControllers materialises the management plane for explicitly declared
+// SDN labs. It never looks at an OVS switch unless a controller selected it:
+// ordinary course L2 labs retain their standalone NORMAL-flow setup and their
+// topology hashes.
+func (e *expander) expandControllers() error {
+	index := 0
+	for _, name := range sortedKeys(e.lab.Controllers) {
+		spec := e.lab.Controllers[name]
+		if spec == nil {
+			return fmt.Errorf("controller %s has no specification", name)
+		}
+		if _, exists := e.top.Devices[model.DeviceID(0, name)]; exists {
+			return fmt.Errorf("controller %q conflicts with an existing global device", name)
+		}
+		port, err := openFlowPort(spec.OpenFlow.Listen)
+		if err != nil {
+			return fmt.Errorf("controller %s: %w", name, err)
+		}
+		version := spec.OpenFlow.Version
+		if version == "" {
+			version = "1.3"
+		}
+		failMode := spec.OpenFlow.FailMode
+		if failMode == "" {
+			failMode = "secure"
+		}
+		controller := e.newGlobalDevice(name, model.KindController, spec.DeviceDefaults)
+		controller.OpenFlow = &model.OpenFlowRuntime{
+			Version: version, Listen: spec.OpenFlow.Listen, Port: port,
+			FailMode: failMode, Switches: append([]string(nil), spec.OpenFlow.Switches...),
+		}
+		e.top.Devices[controller.ID] = controller
+
+		for _, switchID := range spec.OpenFlow.Switches {
+			sw, ok := e.top.Device(switchID)
+			if !ok {
+				return fmt.Errorf("controller %s references unknown switch %q", name, switchID)
+			}
+			if sw.Kind != model.KindSwitch {
+				return fmt.Errorf("controller %s references %s, which is %s not an OVS switch",
+					name, switchID, sw.Kind)
+			}
+			if sw.OpenFlowController != "" {
+				return fmt.Errorf("OVS switch %s is already owned by controller %s",
+					switchID, sw.OpenFlowController)
+			}
+			subnet := controlSubnet(index)
+			index++
+			controllerAddr, switchAddr := hostPair(subnet)
+			// Numeric names are short, unique and do not leak an AS or
+			// topology name into an interface that may be used by a student.
+			cIf := &model.Iface{Device: controller, Name: fmt.Sprintf("of%d", index),
+				Role: model.RoleOpenFlowControl, Addr4: controllerAddr,
+				Owner: model.OwnerPlatform, Prescribed: true, Subnet: subnet}
+			sIf := &model.Iface{Device: sw, Name: fmt.Sprintf("of%d", index),
+				Role: model.RoleOpenFlowControl, Addr4: switchAddr,
+				Owner: model.OwnerPlatform, Prescribed: true, Subnet: subnet}
+			controller.AddIface(cIf)
+			sw.AddIface(sIf)
+			e.link(cIf, sIf, model.LinkService, e.lab.LinkDefaults, subnet, model.OwnerPlatform)
+			sw.OpenFlowController = controller.ID
+		}
+	}
+	return nil
+}
+
+// controlSubnet returns deterministic /30s from RFC 2544's benchmarking
+// range. It is intentionally independent of authored course addressing, so an
+// SDN control cable cannot consume or accidentally overlap a published subnet.
+func controlSubnet(index int) string {
+	third := (index / 64) % 256
+	fourth := (index % 64) * 4
+	return fmt.Sprintf("198.18.%d.%d/30", third, fourth)
+}
+
+func openFlowPort(listen string) (int, error) {
+	if listen == "" {
+		return 6653, nil
+	}
+	i := strings.LastIndex(listen, ":")
+	if i < 0 || i == len(listen)-1 {
+		return 0, fmt.Errorf("openflow.listen %q must end in a TCP port", listen)
+	}
+	port, err := strconv.Atoi(listen[i+1:])
+	if err != nil || port < 1 || port > 65535 {
+		return 0, fmt.Errorf("openflow.listen %q has an invalid TCP port", listen)
+	}
+	return port, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -1017,6 +1152,17 @@ func (e *expander) materialize(name string, kind model.DeviceKind, over model.De
 		d.Privileged = *dd.Privileged
 	}
 	return d
+}
+
+func copyIntMap(in map[int]int) map[int]int {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[int]int, len(in))
+	for key, value := range in {
+		out[key] = value
+	}
+	return out
 }
 
 func (e *expander) link(a, b *model.Iface, kind model.LinkKind, props model.LinkProps, subnet string, owner model.ConfigOwner) *model.Link {

@@ -1,0 +1,53 @@
+apiVersion: twinet.dev/v1
+kind: ASTemplate
+metadata:
+  name: mixed
+
+routers:
+  R1: {id: 1}
+  R2: {id: 2}
+
+hosts: {per_router: false}
+
+p4_devices:
+  P4:
+    id: 3
+    program:
+      path: p4/threshold.p4
+      digest: sha256:950408835b4ce8392104254479c8e8e2acc64d20e08ab0f48c6337ca249707b8
+    control_plane:
+      thrift_port: 9090
+      table: IngressImpl.ipv4_lpm
+      forward_action: IngressImpl.ipv4_forward
+      threshold_register: detection_threshold
+      register_values: {0: 100}
+      probe_source: as1/R1
+      probe_destination: as1/R2
+      entries:
+        - {match: "10.1.0.1/32", params: ["1"]}
+        - {match: "10.1.0.2/32", params: ["2"]}
+        - {match: "1.150.0.1/32", params: ["1"]}
+        - {match: "1.150.0.2/32", params: ["2"]}
+
+internal_links:
+  - {a: R1, b: P4, subnet: "10.1.0.0/24", segment: p4-lan}
+  - {a: P4, b: R2, subnet: "10.1.0.0/24", segment: p4-lan}
+
+# The label-limit incident uses the router namespace's kernel allocator. This
+# compact lab intentionally enables MPLS even though its P4 path is the
+# forwarding probe, so label exhaustion can be exercised independently of an
+# FRR global-block configuration.
+mpls: {enabled: true}
+
+l2_domains:
+  FAB:
+    id: 1
+    gateway: R1
+    vlans: {10: test}
+    switches:
+      S1: {uplink: true}
+    hosts:
+      H1: {switch: S1, vlan: 10}
+
+provisioning:
+  provisioned: [{scope: all}]

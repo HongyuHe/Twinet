@@ -49,7 +49,7 @@ comparison follows its local manager, Docker, and Kubernetes implementations.
 | Observability | Ad hoc containers and text files | Strong CLI plus external telemetry ecosystem | Runtime stats and Kubernetes tooling | Matrix and looking glass, but no metrics/event stream or resource telemetry |
 | Teaching workflow | Excellent pedagogy, fragile machinery | General network labs | Strong educational UX | Best course semantics of the four |
 | Autograding | Slow, invasive, serial | Not a first-class product | Not a first-class product | Isolated, rubric-driven, evidence-aware, but far above the throughput target |
-| RCA/fault injection | Ad hoc scenarios | External tooling | NIKA-compatible substrate | First-class reversible faults and protected ground truth; 45 of 60 NIKA types |
+| RCA/fault injection | Ad hoc scenarios | External tooling | NIKA-compatible substrate | First-class reversible faults and protected ground truth; 60 of 60 NIKA types (56 native, 4 explicitly delegated) |
 
 The right direction is not to replace Twinet with one of these frameworks.
 Twinet should retain its course compiler, grader, preservation model, and fault
@@ -428,11 +428,10 @@ produces an auditable report tied to source and image digests.
 
 ### O16 - Complete the NIKA substrate coverage
 
-**Problem.** Twinet implements 45 of NIKA's 60 fault types. The missing types
-are not injector stubs; they require P4/BMv2, Kubernetes, SDN/OpenFlow,
+**Problem.** The former 45-of-60 registry could not serve as a general NIKA
+RCA platform: the remaining types need P4/BMv2, Kubernetes, SDN/OpenFlow,
 load-balancing/traffic generation, and a controllable MPLS label substrate.
-Leaving them absent means Twinet cannot yet serve as the general NIKA RCA
-platform in the original design goal.
+Each must be a real substrate lifecycle, not an injector-shaped stub.
 
 **Required outcome.**
 

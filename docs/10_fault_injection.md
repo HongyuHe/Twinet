@@ -104,9 +104,13 @@ Emitted in NIKA's shape so scoring code is shared, not reimplemented:
 
 NIKA's registry currently defines **60** injectable root causes
 (`/users/hy/nika/docs/failure-types.md`, vendored at
-`internal/fault/nika_types.json`). Twinet registers **47** fault types, of which
-**45 are NIKA types**; the remaining two (`bgp_peer_asn_misconfig`,
+`internal/fault/nika_types.json`). Twinet registers **62** fault types, of which
+**60 are NIKA types**; the remaining two (`bgp_peer_asn_misconfig`,
 `host_network_down`) are Twinet's own.
+
+The generated registry diff is **60/60**: 56 NIKA types run on native Twinet
+substrates and four retain the same taxonomy/schema through explicit NIKA
+Kubernetes delegation.
 
 The numbers below are produced by diffing the registry against the vendored
 taxonomy, not by counting entries in this document. An earlier revision claimed
@@ -120,10 +124,10 @@ the build rather than a review.
 | | Count |
 |---|---:|
 | NIKA types | 60 |
-| Implemented in Twinet | **45** |
-| Not implemented | 15 |
+| Implemented in Twinet | **60** |
+| Not implemented | 0 |
 | Twinet-only types | 2 |
-| Total Twinet types | **47** |
+| Total Twinet types | **62** |
 
 Reproduce the accounting with:
 
@@ -134,31 +138,37 @@ grep '^| `' /users/hy/nika/docs/failure-types.md \
 comm -23 /tmp/want /tmp/have    # NIKA types Twinet does not implement
 ```
 
-### 4.1 What is not implemented, and why
+### 4.1 Complete substrate coverage
 
-The 15 gaps are not scattered: they are four substrates Twinet does not emulate,
-plus two types that are design changes rather than faults.
+The taxonomy has **0 gaps**. Native substrates implement six typed P4/BMv2
+faults, three OpenFlow southbound faults, measured load-balancer overload, and
+kernel MPLS label-space exhaustion. Native faults have typed targets,
+preconditions, observed symptoms, exact undo state, and baseline fingerprints.
 
-| Group | Types | What it would take |
-|---|---:|---|
-| P4 / BMv2 | 6 | A `p4` device kind running BMv2 with a P4 program and a control plane |
-| Kubernetes | 4 | A Kubernetes node kind, or delegation to NIKA's existing backend |
-| DHCP | — | **implemented**: the gateway routers serve DHCP, and the five faults stop it, remove a subnet, or hand out the wrong gateway, resolver or pool |
-| VPN membership | — | **implemented**, once the advanced-networks lab gave the platform an L3VPN to break: `host_vpn_membership_missing` takes a customer-facing port out of its routing table |
-| SDN southbound | 3 | A `controller` device kind speaking OpenFlow to the OVS switches |
-| Other | 2 | `mpls_label_limit_exceeded`, `load_balancer_overload` |
+The four Kubernetes types are **explicitly delegated** to NIKA's Kubernetes
+backend. They are refused before injection unless
+`TWINET_NIKA_KUBERNETES_ENDPOINT`,
+`TWINET_NIKA_KUBERNETES_CONTEXT`, and a NIKA bridge are configured. No
+kubeconfig, token, or certificate enters a lab container or episode record.
 
-`mpls_label_limit_exceeded` was attempted and abandoned, which is worth
-recording because the reason is not obvious. The limit that produces the fault
-is `net.mpls.platform_labels`, and that file is read-only inside a container —
-the same limitation that already forces the node agent to write the
-per-interface MPLS input flag from the namespace rather than letting the
-container do it. FRR's own `mpls label global-block` was tried as a substitute
-and does not constrain labels LDP has already distributed: narrowing it to two
-labels left the forwarding table unchanged, and clearing every LDP neighbour to
-force re-allocation left it unchanged again. A fault that configures something
-and changes nothing is worse than an absent one, so it is absent and counted as
-a gap.
+P4 programs declare their BMv2 table/action ABI and forwarding probe; OpenFlow
+controllers declare their OVS switch IDs and create separate control links;
+traffic profiles generate bounded deterministic load and the balancer exposes
+live rejection metrics. MPLS exhaustion is executed by the fenced node agent in
+the router network namespace: it reserves actual kernel MPLS routes and proves
+the next allocation returns ENOSPC rather than changing ineffective FRR
+configuration.
+
+### 4.1.1 FRR privilege split
+
+Alpine FRR 10 requires `CAP_SYS_ADMIN` for its daemon capability set. Twinet
+does **not** add that capability to a student or evaluated-agent router shell.
+Instead, each FRR router gets a private control sidecar with the capability; it
+shares only the router network namespace and FRR config/vty directories. The
+shell retains `NET_ADMIN` and `NET_RAW`, reaches the daemon with `vtysh`, and
+cannot exec into or see the sidecar's daemon PID namespace. Deployment checks
+the sidecar daemons directly and a repeated mixed-substrate deploy verifies
+BGP, OSPF, vty configuration, and routed loopback traffic.
 
 Twinet addresses every host statically from the plan, and DHCP is served
 alongside that rather than instead of it: the pool starts at .200, outside every
@@ -191,19 +201,18 @@ against a vendored copy (`internal/fault/nika_types.json`). Six did not, and the
 test meant to catch that checked only that each category was a member of the
 enum -- which every category is by construction.
 
-The P4 and SDN groups fit the device-kind model directly and are the natural
-next extension. The Kubernetes group is a poor fit: those are a container
-orchestrator's failure modes rather than a network's, and NIKA already has a
-backend for them. **Recommendation: add P4 and SDN controller kinds; delegate
-Kubernetes to NIKA's existing backend rather than duplicating it.**
+P4 and SDN are now typed device kinds. Kubernetes remains deliberately
+delegated: those are an orchestrator's failure modes, and NIKA's existing
+backend is the authoritative substrate rather than an imitation in Docker.
 
 ### 4.2 What is implemented
 
-Of the 40 shared types, 39 round-trip against a live cluster in
-`TestEveryFaultRoundTrips`, along with one of the two Twinet-only types: each is
-injected, verified to have taken effect, resolved, and then verified to be gone
-*and* to have left the device as it was found (§4.3). The two that are skipped,
-and why, are above.
+All **60** shared taxonomy types are registered with their taxonomy
+name/category/schema. The **56 native NIKA types** and two Twinet-only types
+run in the dedicated Docker/root-gated round-trip target: each injects,
+manifests, verifies, resolves, and fingerprints back to baseline. The four
+delegated Kubernetes types run against a fake NIKA backend contract by default
+and a real backend only under its explicit release gate.
 
 - **End-host failures.** `host_incorrect_ip`, `host_missing_ip`,
   `host_incorrect_netmask`, `host_incorrect_gateway`, `host_incorrect_dns`,
@@ -482,9 +491,10 @@ Recording these here so they are not discovered late.
    time-varying. Reproducibility requires a seeded, recorded schedule rather
    than wall-clock randomness, so an episode can be replayed exactly.
 
-6. **New services are needed.** A load balancer, and traffic generation. DHCP and the web service are now built. Originally this read: DHCP (four fault types), a web service and load
-   balancer (three), and traffic generation (four) are prerequisites. These join
-   the [05](05_services.md) list, motivated now by two consumers rather than one.
+6. **Measured services are part of the substrate.** The load balancer and
+   deterministic traffic generator are typed services; DHCP and the web service
+   remain separate built-ins. Overload is established from live request and
+   rejection metrics, never inferred from a configured limit.
 
 7. **Isolation matters more.** In a class, one group's mistake affecting another
    is a nuisance. In a benchmark it is a corrupted measurement. Fault blast
@@ -494,9 +504,11 @@ Recording these here so they are not discovered late.
 
 1. `twinet fault list` reports every registered type with its NIKA category and
    required capabilities.
-2. All **47 in-substrate fault types** inject, verify and resolve on a Twinet
-   lab, each covered by a test that asserts the fault manifests *and* that
-   resolving it restores the baseline exactly.
+2. All **58 native fault types** (56 NIKA plus two Twinet-only) inject, verify
+   and resolve on a Twinet lab, each covered by a test that asserts the fault
+   manifests *and* that resolving it restores the baseline exactly. The four
+   delegated Kubernetes types use the same incident schema and a fake/opt-in
+   real NIKA backend contract.
 3. Injecting a fault twice, and resolving one never injected, are both no-ops.
 4. Ground truth serialises to NIKA's `ProblemGroundTruth` schema and is
    never observable from inside the lab.

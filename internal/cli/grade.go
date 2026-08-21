@@ -17,6 +17,7 @@ import (
 
 	"github.com/HongyuHe/twinet/internal/agent"
 	"github.com/HongyuHe/twinet/internal/client"
+	"github.com/HongyuHe/twinet/internal/deploy"
 	"github.com/HongyuHe/twinet/internal/grade"
 	"github.com/HongyuHe/twinet/internal/integrity"
 	"github.com/HongyuHe/twinet/internal/model"
@@ -339,20 +340,65 @@ func lifecycleFunc(top *model.Topology, token string) (
 			if !ok {
 				return fmt.Errorf("no device %q", deviceID)
 			}
+			apply := func(container string) error {
+				switch action {
+				case "pause":
+					return rt.Pause(ctx, container)
+				case "unpause":
+					return rt.Unpause(ctx, container)
+				case "stop":
+					return rt.Stop(ctx, container, 10*time.Second)
+				case "start":
+					return rt.Start(ctx, container)
+				case "restart":
+					if err := rt.Stop(ctx, container, 10*time.Second); err != nil {
+						return err
+					}
+					return rt.Start(ctx, container)
+				}
+				return fmt.Errorf("unknown action %q", action)
+			}
+			if !deploy.UsesFRRControl(d) {
+				return apply(d.Container)
+			}
+			control := deploy.FRRControlContainer(d)
+			if observed, err := rt.Inspect(ctx, control); err != nil || observed.State == runtime.StateAbsent {
+				// A lab deployed before the sidecar migration remains
+				// manageable until its next convergence recreates the router.
+				return apply(d.Container)
+			}
 			switch action {
 			case "pause":
-				return rt.Pause(ctx, d.Container)
+				if err := apply(control); err != nil {
+					return err
+				}
+				return apply(d.Container)
 			case "unpause":
-				return rt.Unpause(ctx, d.Container)
+				if err := apply(d.Container); err != nil {
+					return err
+				}
+				return apply(control)
 			case "stop":
-				return rt.Stop(ctx, d.Container, 10*time.Second)
+				if err := apply(control); err != nil {
+					return err
+				}
+				return apply(d.Container)
 			case "start":
-				return rt.Start(ctx, d.Container)
+				if err := apply(d.Container); err != nil {
+					return err
+				}
+				return apply(control)
 			case "restart":
+				if err := rt.Stop(ctx, control, 10*time.Second); err != nil {
+					return err
+				}
 				if err := rt.Stop(ctx, d.Container, 10*time.Second); err != nil {
 					return err
 				}
-				return rt.Start(ctx, d.Container)
+				if err := rt.Start(ctx, d.Container); err != nil {
+					return err
+				}
+				return rt.Start(ctx, control)
 			}
 			return fmt.Errorf("unknown action %q", action)
 		}, nil

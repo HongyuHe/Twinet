@@ -145,6 +145,7 @@ var (
 		reflect.TypeOf(model.DeviceKind("")): {
 			string(model.KindRouter), string(model.KindHost),
 			string(model.KindSwitch), string(model.KindService),
+			string(model.KindP4), string(model.KindController),
 		},
 		reflect.TypeOf(model.ASRole("")): {
 			string(model.RoleStudent), string(model.RoleStaff), string(model.RoleIXP),

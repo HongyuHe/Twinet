@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"github.com/HongyuHe/twinet/internal/agent"
 	"github.com/HongyuHe/twinet/internal/client"
+	"github.com/HongyuHe/twinet/internal/deploy"
 	"os"
 	"path/filepath"
 	"sort"
@@ -18,6 +19,8 @@ import (
 
 	"github.com/HongyuHe/twinet/internal/fault"
 	"github.com/HongyuHe/twinet/internal/model"
+	"github.com/HongyuHe/twinet/internal/netx"
+	"github.com/HongyuHe/twinet/internal/runtime"
 )
 
 func newFaultCmd(opts *Options) *cobra.Command {
@@ -49,14 +52,18 @@ func newFaultListCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if asJSON {
 				type out struct {
-					Name     string   `json:"name"`
-					Category string   `json:"category"`
-					Symptom  string   `json:"symptom"`
-					Needs    []string `json:"needs"`
+					Name         string               `json:"name"`
+					Category     string               `json:"category"`
+					Symptom      string               `json:"symptom"`
+					Needs        []string             `json:"needs"`
+					Requirements []fault.Requirement  `json:"requirements,omitempty"`
+					Availability []fault.Availability `json:"availability"`
 				}
 				var list []out
 				for _, f := range fault.All() {
-					o := out{Name: f.Name, Category: string(f.Category), Symptom: f.Symptom}
+					o := out{Name: f.Name, Category: string(f.Category), Symptom: f.Symptom,
+						Requirements: append([]fault.Requirement(nil), f.Requires...),
+						Availability: fault.AvailabilityFor(cmd.Context(), f, nil, fault.Target{})}
 					for _, c := range f.Needs {
 						o.Needs = append(o.Needs, string(c))
 					}
@@ -73,15 +80,38 @@ func newFaultListCmd() *cobra.Command {
 			}
 			sort.Strings(cats)
 			w := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
-			fmt.Fprintln(w, "FAULT\tCATEGORY\tNEEDS\tSYMPTOM AS REPORTED")
+			fmt.Fprintln(w, "FAULT\tCATEGORY\tNEEDS\tSUBSTRATE\tAVAILABILITY\tSYMPTOM AS REPORTED")
 			for _, c := range cats {
 				for _, f := range byCat[fault.Category(c)] {
 					needs := make([]string, 0, len(f.Needs))
 					for _, n := range f.Needs {
 						needs = append(needs, string(n))
 					}
-					fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", f.Name, c,
-						strings.Join(needs, ","), f.Symptom)
+					var substrate, availability string
+					rows := fault.AvailabilityFor(cmd.Context(), f, nil, fault.Target{})
+					for _, row := range rows {
+						if row.Substrate != "" {
+							substrate = string(row.Substrate)
+						}
+						if row.Mode != "" {
+							if availability != "" {
+								availability += ","
+							}
+							state := "unavailable"
+							if row.Available {
+								state = "available"
+							}
+							availability += string(row.Mode) + ":" + state
+						}
+					}
+					if substrate == "" {
+						substrate = "standard"
+					}
+					if availability == "" {
+						availability = "native:available"
+					}
+					fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", f.Name, c,
+						strings.Join(needs, ","), substrate, availability, f.Symptom)
 				}
 			}
 			if err := w.Flush(); err != nil {
@@ -573,9 +603,128 @@ func faultEnv(cmd *cobra.Command, top *model.Topology, token string) (*fault.Env
 	if err != nil {
 		return nil, err
 	}
+	labelSpace, err := labelSpaceFunc(top, token)
+	if err != nil {
+		return nil, err
+	}
 	return &fault.Env{
 		Topology: top, Exec: exec, Lifecycle: life,
-		Reshape: reshape, NodeState: nodeState, Exempt: exempt,
+		Reshape: reshape, NodeState: nodeState, Exempt: exempt, LabelSpace: labelSpace,
+		FRRExec:    frrExecFunc(top, token, exec),
+		Kubernetes: kubernetesBackendFromEnv(),
+	}, nil
+}
+
+// frrExecFunc directs daemon lifecycle operations to the private FRR control
+// sidecar. The router shell has only the capabilities students are allowed to
+// have; vtysh still runs there through the shared vty socket.
+func frrExecFunc(top *model.Topology, token string,
+	regular func(context.Context, string, []string) (runtime.ExecResult, error),
+) func(context.Context, string, []string) (runtime.ExecResult, error) {
+	if !clustered(top) {
+		rt := runtime.NewDocker()
+		return func(ctx context.Context, deviceID string, cmd []string) (runtime.ExecResult, error) {
+			d, ok := top.Device(deviceID)
+			if !ok {
+				return runtime.ExecResult{}, fmt.Errorf("no device %q", deviceID)
+			}
+			if !deploy.UsesFRRControl(d) {
+				return regular(ctx, deviceID, cmd)
+			}
+			control := deploy.FRRControlContainer(d)
+			if observed, err := rt.Inspect(ctx, control); err != nil || observed.State == runtime.StateAbsent {
+				return regular(ctx, deviceID, cmd)
+			}
+			return rt.Exec(ctx, control, runtime.ExecCmd{Cmd: cmd})
+		}
+	}
+	tok, err := tokenFor(token)
+	if err != nil {
+		// faultEnv already resolved token for normal exec. Preserve a closure
+		// that reports the failure rather than panicking if configuration
+		// changes between the two paths.
+		return func(context.Context, string, []string) (runtime.ExecResult, error) {
+			return runtime.ExecResult{}, err
+		}
+	}
+	cl := client.NewCluster(top.Lab, tok)
+	return func(ctx context.Context, deviceID string, cmd []string) (runtime.ExecResult, error) {
+		d, ok := top.Device(deviceID)
+		if !ok {
+			return runtime.ExecResult{}, fmt.Errorf("no device %q", deviceID)
+		}
+		if !deploy.UsesFRRControl(d) {
+			return regular(ctx, deviceID, cmd)
+		}
+		n, ok := cl.Node(d.Node)
+		if !ok {
+			return runtime.ExecResult{}, fmt.Errorf("device %s is on unknown node %q", deviceID, d.Node)
+		}
+		res, err := n.Exec(ctx, agent.ExecRequest{
+			Container: deploy.FRRControlContainer(d), Cmd: cmd, Hold: currentHoldToken(), Grading: true,
+		})
+		return runtime.ExecResult{ExitCode: res.ExitCode, Stdout: res.Stdout, Stderr: res.Stderr}, err
+	}
+}
+
+// labelSpaceFunc bridges the fault engine's typed request to either a local
+// network namespace or the fenced node-agent API. Containers never receive
+// direct write access to net.mpls.platform_labels.
+func labelSpaceFunc(top *model.Topology, token string) (
+	func(context.Context, string, fault.LabelSpaceRequest) (fault.LabelSpaceResult, error), error) {
+
+	local := func(ctx context.Context, deviceID string, req fault.LabelSpaceRequest) (fault.LabelSpaceResult, error) {
+		d, ok := top.Device(deviceID)
+		if !ok {
+			return fault.LabelSpaceResult{}, fmt.Errorf("no device %q", deviceID)
+		}
+		rt := runtime.NewDocker()
+		ns, err := rt.NSPath(ctx, d.Container)
+		if err != nil {
+			return fault.LabelSpaceResult{}, err
+		}
+		switch req.Action {
+		case "snapshot":
+			s, err := netx.SnapshotMPLSLabelsInNS(ns)
+			return fault.LabelSpaceResult{Limit: s.Limit, Allocated: s.Allocated, Labels: s.Labels, Exhausted: s.Exhausted, Detail: s.Detail}, err
+		case "probe":
+			s, err := netx.ProbeMPLSLabelExhaustionInNS(ns)
+			return fault.LabelSpaceResult{Limit: s.Limit, Allocated: s.Allocated, Labels: s.Labels, Exhausted: s.Exhausted, Detail: s.Detail}, err
+		case "exhaust":
+			s, labels, err := netx.ExhaustMPLSLabelsInNS(ns, req.Limit)
+			return fault.LabelSpaceResult{Limit: s.Limit, Allocated: s.Allocated, Labels: labels, Exhausted: s.Exhausted, Detail: s.Detail}, err
+		case "restore":
+			err := netx.RestoreMPLSLabelsInNS(ns, req.Limit, req.Labels)
+			if err != nil {
+				return fault.LabelSpaceResult{}, err
+			}
+			s, err := netx.SnapshotMPLSLabelsInNS(ns)
+			return fault.LabelSpaceResult{Limit: s.Limit, Allocated: s.Allocated, Labels: s.Labels, Exhausted: s.Exhausted, Detail: s.Detail}, err
+		default:
+			return fault.LabelSpaceResult{}, fmt.Errorf("unknown MPLS label-space action %q", req.Action)
+		}
+	}
+	if !clustered(top) {
+		return local, nil
+	}
+	tok, err := tokenFor(token)
+	if err != nil {
+		return nil, err
+	}
+	cl := client.NewCluster(top.Lab, tok)
+	return func(ctx context.Context, deviceID string, req fault.LabelSpaceRequest) (fault.LabelSpaceResult, error) {
+		d, ok := top.Device(deviceID)
+		if !ok {
+			return fault.LabelSpaceResult{}, fmt.Errorf("no device %q", deviceID)
+		}
+		resp, err := cl.MPLSLabelSpace(ctx, top.Name, d.Node, agent.MPLSLabelSpaceRequest{
+			Container: d.Container, Action: req.Action, Limit: req.Limit, Labels: req.Labels,
+			Hold: currentHoldToken(),
+		})
+		return fault.LabelSpaceResult{
+			Limit: resp.Limit, Allocated: resp.Allocated, Labels: resp.Labels,
+			Exhausted: resp.Exhausted, Detail: resp.Detail,
+		}, err
 	}, nil
 }
 

@@ -1,0 +1,9 @@
+apiVersion: twinet.dev/v1
+kind: Incident
+metadata:
+  name: delegated-kubernetes-dns
+requirements: [kubernetes]
+faults:
+  - type: k8s_coredns_isolated
+    target: {device: k8s/default/coredns}
+brief: Pods report that service DNS names time out.

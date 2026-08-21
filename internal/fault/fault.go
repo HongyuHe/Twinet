@@ -70,13 +70,97 @@ const (
 	CapFRR       Capability = "frr"
 	// CapLifecycle is the ability to change a container's run state, which is
 	// held by the platform rather than by anything inside the container.
-	CapLifecycle Capability = "lifecycle"
-	CapOVS       Capability = "ovs"
-	CapService   Capability = "service"
-	CapDNS       Capability = "dns"
-	CapTraffic   Capability = "traffic"
-	CapLink      Capability = "link"
+	CapLifecycle    Capability = "lifecycle"
+	CapOVS          Capability = "ovs"
+	CapService      Capability = "service"
+	CapDNS          Capability = "dns"
+	CapTraffic      Capability = "traffic"
+	CapLink         Capability = "link"
+	CapP4           Capability = "p4_bmv2"
+	CapOpenFlow     Capability = "openflow"
+	CapLoadBalancer Capability = "load_balancer"
+	CapLabelSpace   Capability = "mpls_label_space"
+	CapKubernetes   Capability = "kubernetes"
 )
+
+// Substrate identifies the runtime a fault needs. Capability names describe
+// individual operations; a substrate is the typed implementation that makes
+// those operations meaningful. Keeping both avoids accepting a P4 table fault
+// merely because a generic container can run `sh`.
+type Substrate string
+
+const (
+	SubstrateP4BMv2       Substrate = "p4-bmv2"
+	SubstrateOpenFlow     Substrate = "sdn-openflow"
+	SubstrateLoadBalancer Substrate = "load-balancer-traffic"
+	SubstrateMPLSLabels   Substrate = "mpls-label-space"
+	SubstrateKubernetes   Substrate = "kubernetes"
+)
+
+// Valid reports whether s is a substrate Twinet can discover.
+func (s Substrate) Valid() bool {
+	switch s {
+	case SubstrateP4BMv2, SubstrateOpenFlow, SubstrateLoadBalancer, SubstrateMPLSLabels, SubstrateKubernetes:
+		return true
+	}
+	return false
+}
+
+// SupportMode distinguishes a native Twinet implementation from an explicit
+// NIKA backend delegation. A Kubernetes incident is never emulated by a
+// Docker container merely to make a coverage table look full.
+type SupportMode string
+
+const (
+	SupportNative    SupportMode = "native"
+	SupportDelegated SupportMode = "delegated"
+)
+
+// Requirement is one substrate a scenario and fault must declare.
+type Requirement struct {
+	Substrate Substrate   `yaml:"substrate" json:"substrate"`
+	Mode      SupportMode `yaml:"mode" json:"mode"`
+}
+
+// Availability is emitted by fault list and scenario validation. It separates
+// "implemented by this binary" from "usable in this particular topology";
+// otherwise a list command either lies about an absent cluster or hides a
+// native implementation because no target was supplied yet.
+type Availability struct {
+	Substrate   Substrate   `json:"substrate"`
+	Mode        SupportMode `json:"mode"`
+	Implemented bool        `json:"implemented"`
+	Available   bool        `json:"available"`
+	Reason      string      `json:"reason,omitempty"`
+}
+
+// LabelSpaceRequest and LabelSpaceResult are the narrow privileged boundary
+// for the MPLS label allocator. The callback is implemented by a node agent
+// (or a local namespace handle), never by a container under test.
+type LabelSpaceRequest struct {
+	Action string `json:"action"`
+	Limit  int    `json:"limit,omitempty"`
+	Labels []int  `json:"labels,omitempty"`
+}
+
+type LabelSpaceResult struct {
+	Limit     int    `json:"limit"`
+	Allocated int    `json:"allocated"`
+	Labels    []int  `json:"labels,omitempty"`
+	Exhausted bool   `json:"exhausted"`
+	Detail    string `json:"detail,omitempty"`
+}
+
+// KubernetesBackend is the adapter contract for NIKA's existing Kubernetes
+// backend. It returns the same State and Evidence that native faults use, so
+// incident records and scoring never branch on the runtime. Implementations
+// must not return credentials or kubeconfig content in State/Evidence.
+type KubernetesBackend interface {
+	Available(context.Context) (bool, string, error)
+	Inject(context.Context, string, Target) (State, Evidence, error)
+	Verify(context.Context, string, Target, State) (Evidence, error)
+	Resolve(context.Context, string, Target, State) error
+}
 
 // Target selects what a fault is applied to.
 type Target struct {
@@ -144,6 +228,10 @@ type Env struct {
 	Exempt func(ctx context.Context, deviceID, injectionID string, on bool) error
 	// Exec runs a command inside a device.
 	Exec func(ctx context.Context, deviceID string, cmd []string) (rt.ExecResult, error)
+	// FRRExec runs daemon-lifecycle commands in the router's private FRR
+	// control container when the runtime splits student shell and routing
+	// privileges. Nil retains Exec for legacy/fake environments.
+	FRRExec func(ctx context.Context, deviceID string, cmd []string) (rt.ExecResult, error)
 	// Lifecycle changes a device container's run state: pause, unpause, stop,
 	// start or restart. A crashed machine is a paused container, not one with
 	// its interfaces taken down, because a paused container still holds its
@@ -163,6 +251,15 @@ type Env struct {
 	// Seed makes a time-varying fault replay exactly rather than differing run
 	// to run.
 	Seed int64
+	// LabelSpace is a fenced node-side operation on a router's network
+	// namespace. It is intentionally not an Exec command: containers cannot
+	// write net.mpls.platform_labels, and pretending they can produces a
+	// successful-looking fault with no exhausted allocator.
+	LabelSpace func(ctx context.Context, deviceID string, request LabelSpaceRequest) (LabelSpaceResult, error)
+	// Kubernetes delegates the four orchestration failures to NIKA's real
+	// Kubernetes backend. It is nil unless an explicit endpoint/context was
+	// configured; faults refuse before injection in that case.
+	Kubernetes KubernetesBackend
 }
 
 // Device resolves a target to a device in the topology.
@@ -194,6 +291,35 @@ func (e *Env) Run(ctx context.Context, deviceID string, args ...string) (string,
 // Sh runs a shell command on a device.
 func (e *Env) Sh(ctx context.Context, deviceID, script string) (string, error) {
 	return e.Run(ctx, deviceID, "sh", "-c", script)
+}
+
+// FRRSh runs a daemon-lifecycle command in the private FRR control process.
+func (e *Env) FRRSh(ctx context.Context, deviceID, script string) (string, error) {
+	exec := e.FRRExec
+	if exec == nil {
+		exec = e.Exec
+	}
+	res, err := exec(ctx, deviceID, []string{"sh", "-c", script})
+	if err != nil {
+		return "", err
+	}
+	if res.ExitCode != 0 {
+		return res.Stdout, fmt.Errorf("%s: exit %d: %s", script, res.ExitCode, firstLine(res.Stderr))
+	}
+	return res.Stdout, nil
+}
+
+// FRRTry runs an FRR control-plane probe while preserving a non-zero answer.
+func (e *Env) FRRTry(ctx context.Context, deviceID, script string) (string, int, error) {
+	exec := e.FRRExec
+	if exec == nil {
+		exec = e.Exec
+	}
+	res, err := exec(ctx, deviceID, []string{"sh", "-c", script})
+	if err != nil {
+		return "", -1, err
+	}
+	return res.Stdout, res.ExitCode, nil
 }
 
 // Try runs a shell command and tolerates a non-zero exit, for probes.
@@ -253,6 +379,14 @@ type Fault struct {
 	Describe string
 	// Needs lists the capabilities required to inject it.
 	Needs []Capability
+	// Requires names the typed substrate(s) this fault needs. Existing
+	// container/FRR faults deliberately have none; their historical runtime
+	// capabilities remain their compatibility contract.
+	Requires []Requirement
+	// Delegated marks a fault whose lifecycle executes through an external
+	// backend. Its taxonomy name/category/schema stay identical to native
+	// faults, but the core must not fingerprint or exec a fictional container.
+	Delegated bool
 	// Inject applies the fault and returns the state it replaced.
 	Inject func(ctx context.Context, env *Env, t Target) (State, error)
 	// Verify confirms the fault is actually active.
@@ -274,6 +408,11 @@ type Fault struct {
 	// backwards, because the verifiers that poll for a transition wait out
 	// their whole symptom window to conclude that nothing is wrong yet.
 	Precondition func(ctx context.Context, env *Env, t Target) (string, error)
+	// Baseline is an optional substrate-specific fingerprint. The common
+	// Linux fingerprint covers addresses, routes, packet filters and shaping;
+	// a kernel MPLS allocator has state outside those views and supplies this
+	// stronger final check instead of being silently exempted.
+	Baseline func(ctx context.Context, env *Env, t Target, s State) (Evidence, error)
 }
 
 // Truth builds the ground truth for an application of this fault.
@@ -309,6 +448,23 @@ func Register(f *Fault) {
 		// be verified might never have taken effect, and one that cannot be
 		// resolved contaminates every episode after it.
 		panic("fault: " + f.Name + " must implement Inject, Verify and Resolve")
+	}
+	for _, req := range f.Requires {
+		if !req.Substrate.Valid() {
+			panic("fault: " + f.Name + " requires unknown substrate " + string(req.Substrate))
+		}
+		if req.Mode != SupportNative && req.Mode != SupportDelegated {
+			panic("fault: " + f.Name + " has invalid support mode " + string(req.Mode))
+		}
+	}
+	if f.Delegated {
+		delegated := false
+		for _, req := range f.Requires {
+			delegated = delegated || req.Mode == SupportDelegated
+		}
+		if !delegated {
+			panic("fault: delegated " + f.Name + " has no delegated substrate requirement")
+		}
 	}
 	if _, dup := registry[f.Name]; dup {
 		panic("fault: duplicate registration " + f.Name)
@@ -378,7 +534,10 @@ func Inject(ctx context.Context, env *Env, name string, t Target) (*Injection, e
 	if !ok {
 		return nil, fmt.Errorf("no fault named %q; try `twinet fault list`", name)
 	}
-	if t.Device != "" {
+	// Delegated Kubernetes targets are resource identifiers, not Twinet
+	// containers. Resolving them through Topology.Device would reject a real
+	// cluster incident before its backend capability was even queried.
+	if t.Device != "" && !f.Delegated {
 		d, err := env.Device(t)
 		if err != nil {
 			return nil, err
@@ -397,6 +556,9 @@ func Inject(ctx context.Context, env *Env, name string, t Target) (*Injection, e
 			return nil, fmt.Errorf("device %s belongs to AS %d, not AS %d",
 				d.ID, d.ASN, t.AS)
 		}
+	}
+	if err := RequireAvailable(ctx, f, env, t); err != nil {
+		return nil, fmt.Errorf("inject %s: %w", name, err)
 	}
 
 	// The symptom must not already be there.
@@ -430,7 +592,7 @@ func Inject(ctx context.Context, env *Env, name string, t Target) (*Injection, e
 	// "the fault predicate is now false". A fault can satisfy the second while
 	// leaving the device permanently broken.
 	base := ""
-	if t.DeviceID() != "" {
+	if t.DeviceID() != "" && !f.Delegated {
 		base = fingerprint(ctx, env, t.DeviceID())
 	}
 
@@ -448,10 +610,12 @@ func Inject(ctx context.Context, env *Env, name string, t Target) (*Injection, e
 	// ground truth is false -- and every answer graded against it is wrong,
 	// with nothing anywhere saying so.
 	injID := newInjectionID()
-	if err := env.exempt(ctx, t.DeviceID(), injID, true); err != nil {
-		return nil, fmt.Errorf("inject %s: this node could not be told to leave %s alone "+
-			"(%w), so the fault would be repaired away within the minute while the "+
-			"episode went on saying it was live", name, t.DeviceID(), err)
+	if !f.Delegated {
+		if err := env.exempt(ctx, t.DeviceID(), injID, true); err != nil {
+			return nil, fmt.Errorf("inject %s: this node could not be told to leave %s alone "+
+				"(%w), so the fault would be repaired away within the minute while the "+
+				"episode went on saying it was live", name, t.DeviceID(), err)
+		}
 	}
 
 	state, err := f.Inject(ctx, env, t)
@@ -469,7 +633,9 @@ func Inject(ctx context.Context, env *Env, name string, t Target) (*Injection, e
 						"found", name, err, rerr)
 			}
 		}
-		_ = env.exempt(ctx, t.DeviceID(), injID, false)
+		if !f.Delegated {
+			_ = env.exempt(ctx, t.DeviceID(), injID, false)
+		}
 		return nil, fmt.Errorf("inject %s: %w", name, err)
 	}
 	if base != "" {
@@ -497,7 +663,9 @@ func Inject(ctx context.Context, env *Env, name string, t Target) (*Injection, e
 			return inj, fmt.Errorf("inject %s: verification failed (%w) and rollback also failed (%v)",
 				name, err, rerr)
 		}
-		_ = env.exempt(ctx, t.DeviceID(), injID, false)
+		if !f.Delegated {
+			_ = env.exempt(ctx, t.DeviceID(), injID, false)
+		}
 		return nil, fmt.Errorf("inject %s: could not verify it took effect, so it was rolled back: %w", name, err)
 	}
 	inj.Evidence = ev
@@ -506,7 +674,9 @@ func Inject(ctx context.Context, env *Env, name string, t Target) (*Injection, e
 			return inj, fmt.Errorf("inject %s: did not take effect (%s) and rollback failed (%v)",
 				name, ev.Detail, rerr)
 		}
-		_ = env.exempt(ctx, t.DeviceID(), injID, false)
+		if !f.Delegated {
+			_ = env.exempt(ctx, t.DeviceID(), injID, false)
+		}
 		return nil, fmt.Errorf("inject %s: it did not take effect, so it was rolled back: %s",
 			name, evidenceDetail(ev))
 	}
@@ -545,9 +715,11 @@ func Resolve(ctx context.Context, env *Env, inj *Injection) error {
 	// The device is probed directly first. Every verifier reads the device, so
 	// if it cannot be reached, whatever the verifier concludes is an artefact
 	// of the failure rather than an observation of the lab.
-	if err := env.reachable(ctx, inj.Target.DeviceID()); err != nil {
-		return fmt.Errorf("resolve %s: %w, so the lab must be treated as contaminated%s",
-			inj.Fault, err, alsoFailed(undoErr))
+	if !f.Delegated {
+		if err := env.reachable(ctx, inj.Target.DeviceID()); err != nil {
+			return fmt.Errorf("resolve %s: %w, so the lab must be treated as contaminated%s",
+				inj.Fault, err, alsoFailed(undoErr))
+		}
 	}
 	env.wantSymptom = false
 	ev, err := f.Verify(ctx, env, inj.Target, inj.State)
@@ -573,7 +745,7 @@ func Resolve(ctx context.Context, env *Env, inj *Injection) error {
 		// because it could not give a meaningful answer.
 		added, removed = nil, nil
 	}
-	if len(added)+len(removed) > 0 {
+	if !f.Delegated && len(added)+len(removed) > 0 {
 		now := fingerprint(ctx, env, inj.Target.DeviceID())
 		if now == "" {
 			return fmt.Errorf("resolve %s: %s could not be re-read to confirm "+
@@ -584,14 +756,27 @@ func Resolve(ctx context.Context, env *Env, inj *Injection) error {
 				inj.Fault, inj.Target.DeviceID(), r, alsoFailed(undoErr))
 		}
 	}
+	if f.Baseline != nil {
+		baseline, err := f.Baseline(ctx, env, inj.Target, inj.State)
+		if err != nil {
+			return fmt.Errorf("resolve %s: its substrate baseline could not be checked: %w%s",
+				inj.Fault, err, alsoFailed(undoErr))
+		}
+		if !baseline.Verified {
+			return fmt.Errorf("resolve %s: the fault is gone but its substrate was not restored to baseline: %s%s",
+				inj.Fault, evidenceDetail(baseline), alsoFailed(undoErr))
+		}
+	}
 	// The fault is gone and the device is as it was found, so the nodes may
 	// look after it again. Cleared last: while any doubt remained, the device
 	// was better left exempt than repaired by something that does not know
 	// what it is looking at.
-	if err := env.exempt(ctx, inj.Target.DeviceID(), inj.ID, false); err != nil {
-		return fmt.Errorf("resolve %s: the fault is gone but this node could not be told "+
-			"to look after %s again (%w); it will not be repaired automatically until "+
-			"the lab is redeployed", inj.Fault, inj.Target.DeviceID(), err)
+	if !f.Delegated {
+		if err := env.exempt(ctx, inj.Target.DeviceID(), inj.ID, false); err != nil {
+			return fmt.Errorf("resolve %s: the fault is gone but this node could not be told "+
+				"to look after %s again (%w); it will not be repaired automatically until "+
+				"the lab is redeployed", inj.Fault, inj.Target.DeviceID(), err)
+		}
 	}
 	return nil
 }

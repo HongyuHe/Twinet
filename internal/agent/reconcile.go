@@ -757,6 +757,23 @@ func (s *Server) probeExec(ctx context.Context, container string, cmd rt.ExecCmd
 	return result, err
 }
 
+// frrContainer selects the private privileged control sidecar for an FRR
+// router. The router shell remains the student-facing container; daemon
+// probes/restarts must never mistake its intentionally empty PID namespace for
+// a dead control plane.
+func (s *Server) frrContainer(ctx context.Context, d *model.Device) string {
+	if d == nil {
+		return ""
+	}
+	if deploy.UsesFRRControl(d) {
+		name := deploy.FRRControlContainer(d)
+		if c, err := s.rt.Inspect(ctx, name); err == nil && c.State != rt.StateAbsent {
+			return name
+		}
+	}
+	return d.Container
+}
+
 // missingDaemons names the routing processes a router should be running and is
 // not, or "" when they are all there.
 func (s *Server) missingDaemons(ctx context.Context, d *model.Device, as *model.AS) string {
@@ -767,7 +784,7 @@ func (s *Server) missingDaemons(ctx context.Context, d *model.Device, as *model.
 func (s *Server) missingDaemonsResult(ctx context.Context, d *model.Device, as *model.AS) (string, error) {
 	script := "miss=''; for p in " + strings.Join(render.EnabledDaemonsFor(as), " ") +
 		"; do pidof \"$p\" >/dev/null 2>&1 || miss=\"$miss $p\"; done; echo \"$miss\""
-	r, err := s.probeExec(ctx, d.Container, rt.ExecCmd{Cmd: []string{"sh", "-c", script}})
+	r, err := s.probeExec(ctx, s.frrContainer(ctx, d), rt.ExecCmd{Cmd: []string{"sh", "-c", script}})
 	if err != nil || r.ExitCode != 0 {
 		if err != nil {
 			return "", err
@@ -989,7 +1006,7 @@ func (s *Server) startDaemons(ctx context.Context, lab string, d *model.Device) 
 		"rm -f /var/run/frr/*.pid /var/run/frr/*.vty 2>/dev/null || true",
 		"/usr/lib/frr/frrinit.sh start >/dev/null 2>&1 || true",
 	}, "\n")
-	if _, err := s.probeExec(ctx, d.Container, rt.ExecCmd{Cmd: []string{"sh", "-c", script}}); err != nil {
+	if _, err := s.probeExec(ctx, s.frrContainer(ctx, d), rt.ExecCmd{Cmd: []string{"sh", "-c", script}}); err != nil {
 		return err
 	}
 	// And given time to come up.
@@ -1040,7 +1057,7 @@ func (s *Server) duplicateDaemonsResult(ctx context.Context, d *model.Device, as
 		// symptom was a class whose marks fell a little further every time
 		// it was graded.
 		script := "ps -ef | awk '/usr\\/lib\\/frr\\/" + name + " -d/ && !/awk/' | wc -l"
-		r, err := s.probeExec(ctx, d.Container, rt.ExecCmd{Cmd: []string{"sh", "-c", script}})
+		r, err := s.probeExec(ctx, s.frrContainer(ctx, d), rt.ExecCmd{Cmd: []string{"sh", "-c", script}})
 		if err != nil || r.ExitCode != 0 {
 			if err != nil {
 				return "", err

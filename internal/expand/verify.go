@@ -190,10 +190,12 @@ func (e *expander) verify() error {
 			// both addresses come out empty, the lab validates, and the two
 			// routers are deployed with nothing configured on the interface
 			// that joins them.
-			// A switch port is L2 and carries no address by design, which is
-			// what an exchange fabric is made of.
+			// A switch or P4 port is L2 and carries no address by design.
+			// A BMv2 pipeline forwards between the real cables in a declared
+			// segment; assigning it a fictional endpoint address both breaks
+			// ARP and duplicates addresses across the segment.
 			if i.Addr4 == "" {
-				if i.Device.Kind != model.KindSwitch {
+				if i.Device.Kind != model.KindSwitch && i.Device.Kind != model.KindP4 {
 					add("device %s interface %s: no address could be allocated from the "+
 						"link subnet %s; there is not enough room in it for the interfaces "+
 						"it has to number",

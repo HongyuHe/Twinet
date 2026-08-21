@@ -84,7 +84,7 @@ func TestTheCoverageTableMatchesTheRegistry(t *testing.T) {
 	}{
 		{`Twinet registers \*\*(\d+)\*\* fault types`, len(have)},
 		{`\*\*(\d+) are NIKA types\*\*`, implemented},
-		{`The (\d+) gaps are not scattered`, len(want) - implemented},
+		{`The taxonomy has \*\*(\d+) gaps\*\*`, len(want) - implemented},
 	} {
 		m := regexp.MustCompile(claim.pattern).FindStringSubmatch(doc)
 		if m == nil {

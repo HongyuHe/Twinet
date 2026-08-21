@@ -1538,8 +1538,14 @@ func (s *Server) handleMPLSLabelSpace(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusInternalServerError, err)
 		return
 	}
+	responseLabels := snapshot.Labels
+	if req.Action == "exhaust" {
+		// The fault owns only the routes it allocated, not pre-existing LDP
+		// routes visible in the post-exhaustion snapshot.
+		responseLabels = labels
+	}
 	writeJSON(w, MPLSLabelSpaceResponse{
-		Limit: snapshot.Limit, Allocated: snapshot.Allocated, Labels: labels,
+		Limit: snapshot.Limit, Allocated: snapshot.Allocated, Labels: responseLabels,
 		Exhausted: snapshot.Exhausted, Detail: snapshot.Detail,
 	})
 }
@@ -1666,20 +1672,68 @@ func (s *Server) handleLifecycle(w http.ResponseWriter, r *http.Request) {
 	defer s.release(c.Labels[deploy.LabelLab])
 
 	err = s.workLimiter().Run(r.Context(), []limiter.Kind{limiter.Lifecycle}, func() error {
+		control := ""
+		if c.Labels[deploy.LabelKind] == string(model.KindRouter) &&
+			c.Labels[deploy.LabelNOS] != "bird" && c.Labels[deploy.LabelFRRControl] != "true" {
+			name := req.Container + "-frr"
+			if sidecar, inspectErr := s.rt.Inspect(r.Context(), name); inspectErr == nil && sidecar.State != rt.StateAbsent {
+				control = name
+			}
+		}
+		apply := func(container string) error {
+			switch req.Action {
+			case "pause":
+				return s.rt.Pause(r.Context(), container)
+			case "unpause":
+				return s.rt.Unpause(r.Context(), container)
+			case "stop":
+				return s.rt.Stop(r.Context(), container, 10*time.Second)
+			case "start":
+				return s.rt.Start(r.Context(), container)
+			case "restart":
+				if err := s.rt.Stop(r.Context(), container, 10*time.Second); err != nil {
+					return err
+				}
+				return s.rt.Start(r.Context(), container)
+			default:
+				return fmt.Errorf("unknown action %q", req.Action)
+			}
+		}
+		if control == "" {
+			return apply(req.Container)
+		}
 		switch req.Action {
 		case "pause":
-			return s.rt.Pause(r.Context(), req.Container)
+			if err := apply(control); err != nil {
+				return err
+			}
+			return apply(req.Container)
 		case "unpause":
-			return s.rt.Unpause(r.Context(), req.Container)
+			if err := apply(req.Container); err != nil {
+				return err
+			}
+			return apply(control)
 		case "stop":
-			return s.rt.Stop(r.Context(), req.Container, 10*time.Second)
+			if err := apply(control); err != nil {
+				return err
+			}
+			return apply(req.Container)
 		case "start":
-			return s.rt.Start(r.Context(), req.Container)
+			if err := apply(req.Container); err != nil {
+				return err
+			}
+			return apply(control)
 		case "restart":
+			if err := s.rt.Stop(r.Context(), control, 10*time.Second); err != nil {
+				return err
+			}
 			if err := s.rt.Stop(r.Context(), req.Container, 10*time.Second); err != nil {
 				return err
 			}
-			return s.rt.Start(r.Context(), req.Container)
+			if err := s.rt.Start(r.Context(), req.Container); err != nil {
+				return err
+			}
+			return s.rt.Start(r.Context(), control)
 		default:
 			return fmt.Errorf("unknown action %q", req.Action)
 		}
@@ -1749,6 +1803,11 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusForbidden,
 			fmt.Errorf("this diagnostic session is scoped to lab %q; %s belongs to %q",
 				diagLab, req.Container, c.Labels[deploy.LabelLab]))
+		return
+	}
+	if diagnostic && c.Labels[deploy.LabelFRRControl] == "true" {
+		httpError(w, http.StatusForbidden,
+			errors.New("a diagnostic session cannot exec the private FRR control sidecar"))
 		return
 	}
 	// Nothing a container says can be believed until the programs saying it

@@ -2,8 +2,12 @@ package render
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -125,6 +129,23 @@ func (r *Renderer) Files(d *model.Device) (map[string]deploy.FileSpec, error) {
 		// which renders it on demand from the same code path.
 	case model.KindSwitch:
 		out["/etc/twinet/vlans"] = deploy.FileSpec{Content: []byte(vlanList(d)), Mode: 0o644}
+	case model.KindP4:
+		p4Files, err := r.p4Files(d)
+		if err != nil {
+			return nil, err
+		}
+		for path, spec := range p4Files {
+			out[path] = spec
+		}
+	case model.KindController:
+		if d.OpenFlow == nil {
+			return nil, fmt.Errorf("controller %s has no OpenFlow contract", d.ID)
+		}
+		out["/etc/twinet/openflow.json"] = deploy.FileSpec{
+			Content: []byte(fmt.Sprintf("{\"version\":%q,\"listen\":%q,\"port\":%d,\"fail_mode\":%q}\n",
+				d.OpenFlow.Version, d.OpenFlow.Listen, d.OpenFlow.Port, d.OpenFlow.FailMode)),
+			Mode: 0o644,
+		}
 	case model.KindService:
 		serviceFiles, err := r.serviceFiles(d)
 		if err != nil {
@@ -153,6 +174,10 @@ func (r *Renderer) Commands(d *model.Device) ([]deploy.Command, error) {
 		return append(cmds, r.rpkiReadyCommands(d)...), nil
 	case model.KindSwitch:
 		return r.switchCommands(d), nil
+	case model.KindP4:
+		return r.p4Commands(d), nil
+	case model.KindController:
+		return append(r.hostCommands(d), r.controllerCommands(d)...), nil
 	case model.KindHost:
 		return append(r.hostCommands(d), r.resolverCommands(d)...), nil
 	case model.KindService:
@@ -191,7 +216,8 @@ func (r *Renderer) routerCommands(d *model.Device) []deploy.Command {
 	// whatever they were part-way through configuring.
 	if r.modeFor(d) == ModeSolve {
 		cmds = append(cmds, deploy.Command{
-			Describe: "restart frr onto the reference configuration",
+			Describe:   "restart frr onto the reference configuration",
+			FRRControl: true,
 			Args: []string{"sh", "-c", strings.Join([]string{
 				// watchfrr outlives a plain stop and holds the pid lock, after
 				// which the daemons can never start again.
@@ -220,7 +246,8 @@ func (r *Renderer) routerCommands(d *model.Device) []deploy.Command {
 	// amount of looking at the configuration will reveal.
 	if d.Kind == model.KindRouter {
 		cmds = append(cmds, deploy.Command{
-			Describe: "check the routing daemons are running",
+			Describe:   "check the routing daemons are running",
+			FRRControl: true,
 			Args: []string{"sh", "-c", strings.Join([]string{
 				// The set comes from the daemons file, so a router is checked
 				// for every process it was told to run. Checking only zebra
@@ -327,7 +354,13 @@ func (r *Renderer) routerCommands(d *model.Device) []deploy.Command {
 				Args:     []string{"sh", "-c", "echo " + shellQuote(applyErr.Error()) + " >&2; exit 1"},
 			})
 		} else {
-			cmds = append(cmds, deployCommands(apply)...)
+			applied := deployCommands(apply)
+			if provider.Name() == model.DefaultNOS {
+				for i := range applied {
+					applied[i].FRRControl = true
+				}
+			}
+			cmds = append(cmds, applied...)
 		}
 	}
 	// Loopback addresses are configured on the interface rather than through
@@ -579,6 +612,150 @@ var RPKIRefreshScript = strings.Join([]string{
 	"echo 'the origin validator did not answer; routes will be treated as not-found' >&2",
 }, "\n")
 
+// p4Files copies the declared BMv2 pipeline under a fixed in-container name.
+// The digest is checked again here, not only by manifest validation: a source
+// tree can change between validation and deployment, and loading different
+// bytes under the same incident record would make the result irreproducible.
+func (r *Renderer) p4Files(d *model.Device) (map[string]deploy.FileSpec, error) {
+	if d.P4 == nil || d.P4.ProgramPath == "" {
+		return nil, fmt.Errorf("P4 device %s has no program contract", d.ID)
+	}
+	clean := filepath.Clean(d.P4.ProgramPath)
+	if filepath.IsAbs(clean) || clean == ".." ||
+		strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return nil, fmt.Errorf("P4 device %s names program path outside the lab", d.ID)
+	}
+	raw, err := os.ReadFile(filepath.Join(r.Top.Lab.Dir, clean))
+	if err != nil {
+		return nil, fmt.Errorf("read P4 program for %s: %w", d.ID, err)
+	}
+	if d.P4.ProgramDigest != "" {
+		sum := sha256.Sum256(raw)
+		got := "sha256:" + hex.EncodeToString(sum[:])
+		if got != d.P4.ProgramDigest {
+			return nil, fmt.Errorf("P4 device %s program digest is %s, not pinned %s",
+				d.ID, got, d.P4.ProgramDigest)
+		}
+	}
+	ext := strings.ToLower(filepath.Ext(clean))
+	switch ext {
+	case ".p4", ".json":
+	default:
+		return nil, fmt.Errorf("P4 device %s program %q is neither .p4 nor .json", d.ID, clean)
+	}
+	return map[string]deploy.FileSpec{
+		"/etc/twinet/p4/program" + ext: {Content: raw, Mode: 0o644},
+	}, nil
+}
+
+// p4Commands compiles (when needed), starts and proves the BMv2 process after
+// its veths exist. Starting it in the container entrypoint would race wiring
+// and leave it with no ports; this configure-stage order is deterministic.
+func (r *Renderer) p4Commands(d *model.Device) []deploy.Command {
+	if d.P4 == nil {
+		return nil
+	}
+	var ports []string
+	port := 1
+	for _, i := range d.Ifaces {
+		if i.Link == nil || i.Role == model.RoleOpenFlowControl {
+			continue
+		}
+		ports = append(ports, fmt.Sprintf("-i %d@%s", port, i.Name))
+		port++
+	}
+	if len(ports) == 0 {
+		return []deploy.Command{{
+			Describe: "refuse an unwired P4 device",
+			Args:     []string{"sh", "-c", "echo 'P4 device has no wired data-plane ports' >&2; exit 1"},
+		}}
+	}
+	source := "/etc/twinet/p4/program" + strings.ToLower(filepath.Ext(d.P4.ProgramPath))
+	jsonPath := "/etc/twinet/p4/program.json"
+	compile := ""
+	if strings.HasSuffix(source, ".p4") {
+		// p4c-bm2-ss writes its BMv2 JSON to the explicit -o path; a
+		// directory default depends on the source filename and is not stable.
+		compile = fmt.Sprintf("p4c-bm2-ss --std p4-16 -o %s %s", jsonPath, source)
+	} else {
+		compile = fmt.Sprintf("cp %s %s", source, jsonPath)
+	}
+	commands := []string{
+		"set -eu",
+		"mkdir -p /etc/twinet/p4 /var/log/twinet",
+		"for p in $(pidof simple_switch 2>/dev/null || true); do kill \"$p\" 2>/dev/null || true; done",
+		compile,
+		fmt.Sprintf("nohup simple_switch --log-console %s --thrift-port %d --device-id 0 %s >/var/log/twinet/bmv2.log 2>&1 &",
+			strings.Join(ports, " "), d.P4.ThriftPort, jsonPath),
+		fmt.Sprintf("for i in $(seq 1 30); do printf 'show_tables\\n' | simple_switch_CLI --thrift-port %d >/dev/null 2>&1 && exit 0; sleep 1; done",
+			d.P4.ThriftPort),
+		"echo 'BMv2 did not become ready' >&2; exit 1",
+	}
+	cmds := []deploy.Command{{
+		Describe: "compile and start BMv2 program",
+		Args:     []string{"sh", "-c", strings.Join(commands, "\n")},
+	}}
+	for _, entry := range d.P4.Entries {
+		action := entry.Action
+		if action == "" {
+			action = d.P4.ForwardAction
+		}
+		line := fmt.Sprintf("table_add %s %s %s", d.P4.Table, action, entry.Match)
+		if len(entry.Params) > 0 {
+			line += " => " + strings.Join(entry.Params, " ")
+		}
+		// `table_add` is deliberately not ignored. A duplicate or malformed
+		// entry means the declared forwarding contract is not in effect, and
+		// an incident must not run against a switch merely assumed to work.
+		cmds = append(cmds, deploy.Command{
+			Describe: "install P4 table entry",
+			Args: []string{"sh", "-c", fmt.Sprintf(
+				"printf '%%s\\n' %s | simple_switch_CLI --thrift-port %d",
+				shellQuoteP4(line), d.P4.ThriftPort)},
+		})
+	}
+	if d.P4.ThresholdRegister != "" {
+		indices := make([]int, 0, len(d.P4.RegisterValues))
+		for index := range d.P4.RegisterValues {
+			indices = append(indices, index)
+		}
+		sort.Ints(indices)
+		for _, index := range indices {
+			value := d.P4.RegisterValues[index]
+			cmds = append(cmds, deploy.Command{
+				Describe: "initialise P4 threshold register",
+				Args: []string{"sh", "-c", fmt.Sprintf(
+					"printf 'register_write %s %d %d\\n' | simple_switch_CLI --thrift-port %d",
+					shellQuoteP4(d.P4.ThresholdRegister), index, value, d.P4.ThriftPort)},
+			})
+		}
+	}
+	return cmds
+}
+
+func shellQuoteP4(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
+}
+
+func (r *Renderer) controllerCommands(d *model.Device) []deploy.Command {
+	if d.OpenFlow == nil {
+		return nil
+	}
+	port := d.OpenFlow.Port
+	if port == 0 {
+		port = 6653
+	}
+	return []deploy.Command{{
+		Describe: "start OpenFlow controller",
+		Args: []string{"sh", "-c", strings.Join([]string{
+			"for p in $(pidof twinet-openflow-controller 2>/dev/null || true); do kill \"$p\" 2>/dev/null || true; done",
+			fmt.Sprintf("nohup twinet-openflow-controller --listen :%d --state /run/twinet/openflow.json >/var/log/twinet-openflow.log 2>&1 &", port),
+			fmt.Sprintf("for i in $(seq 1 30); do nc -z 127.0.0.1 %d >/dev/null 2>&1 && exit 0; sleep 1; done", port),
+			"echo 'OpenFlow controller did not become ready' >&2; exit 1",
+		}, "\n")},
+	}}
+}
+
 func (r *Renderer) switchCommands(d *model.Device) []deploy.Command {
 	br := "br0"
 	cmds := []deploy.Command{
@@ -597,14 +774,47 @@ func (r *Renderer) switchCommands(d *model.Device) []deploy.Command {
 		{Args: []string{"sh", "-c", "ip link set " + br + " up"},
 			Describe: "bring the bridge up"},
 	}
+	// An OpenFlow management cable is an IP-only control channel, not a
+	// bridge port. Adding it to br0 leaks controller traffic into the student
+	// fabric and makes a blocked southbound port look like a forwarding
+	// failure instead of the control-plane failure it is meant to model.
 	for _, i := range d.Ifaces {
-		if i.Link == nil {
+		if i.Role != model.RoleOpenFlowControl || i.Addr4 == "" {
+			continue
+		}
+		cmds = append(cmds, deploy.Command{
+			Args: []string{"sh", "-c", fmt.Sprintf(
+				"ip addr replace %s brd + dev %s && ip link set %s up", i.Addr4, i.Name, i.Name)},
+			Describe: "configure OpenFlow control address " + i.Name,
+		})
+	}
+	for _, i := range d.Ifaces {
+		if i.Link == nil || i.Role == model.RoleOpenFlowControl {
 			continue
 		}
 		cmds = append(cmds, deploy.Command{
 			Args:     []string{"sh", "-c", fmt.Sprintf("ovs-vsctl --may-exist add-port %s %s", br, i.Name)},
 			Describe: "attach port " + i.Name,
 		})
+	}
+	if d.OpenFlowController != "" {
+		if controller, ok := r.Top.Device(d.OpenFlowController); ok && controller.OpenFlow != nil {
+			var endpoint string
+			for _, i := range d.Ifaces {
+				if i.Role == model.RoleOpenFlowControl && i.Peer != nil {
+					endpoint = addrOf(i.Peer.Addr4)
+					break
+				}
+			}
+			if endpoint != "" {
+				cmds = append(cmds, deploy.Command{
+					Args: []string{"sh", "-c", fmt.Sprintf(
+						"ovs-vsctl set-fail-mode %s %s && ovs-vsctl set-controller %s tcp:%s:%d",
+						br, controller.OpenFlow.FailMode, br, endpoint, controller.OpenFlow.Port)},
+					Describe: "connect OVS to controller " + controller.ID,
+				})
+			}
+		}
 	}
 	if r.modeFor(d) == ModeSolve {
 		cmds = append(cmds, r.switchSolution(d, br)...)
@@ -614,7 +824,7 @@ func (r *Renderer) switchCommands(d *model.Device) []deploy.Command {
 	// nothing, which presents at the routers as sessions that never establish.
 	var want []string
 	for _, i := range d.Ifaces {
-		if i.Link != nil {
+		if i.Link != nil && i.Role != model.RoleOpenFlowControl {
 			want = append(want, i.Name)
 		}
 	}
@@ -707,7 +917,7 @@ func network6(cidr string) string {
 func (r *Renderer) switchSolution(d *model.Device, br string) []deploy.Command {
 	var cmds []deploy.Command
 	for _, i := range d.Ifaces {
-		if i.Link == nil {
+		if i.Link == nil || i.Role == model.RoleOpenFlowControl {
 			continue
 		}
 		switch {
@@ -842,12 +1052,60 @@ func (r *Renderer) Ready(d *model.Device, rt runtime.Runtime) *plan.Waiter {
 				return true, nil
 			},
 		}
+	case model.KindP4:
+		if d.P4 == nil {
+			return &plan.Waiter{
+				Describe: "P4 contract for " + d.ID, Interval: 200 * time.Millisecond, Timeout: time.Second,
+				Check: func(context.Context) (bool, error) {
+					return false, fmt.Errorf("P4 device %s has no runtime contract", d.ID)
+				},
+			}
+		}
+		container, port := d.Container, d.P4.ThriftPort
+		return &plan.Waiter{
+			Describe: "BMv2 control plane on " + d.ID,
+			Interval: 200 * time.Millisecond, Timeout: 60 * time.Second, StableFor: 2,
+			Check: func(ctx context.Context) (bool, error) {
+				res, err := rt.Exec(ctx, container, runtime.ExecCmd{Cmd: []string{"sh", "-c",
+					fmt.Sprintf("printf 'show_tables\\n' | simple_switch_CLI --thrift-port %d", port)}})
+				if err != nil {
+					return false, err
+				}
+				if res.ExitCode != 0 {
+					return false, fmt.Errorf("BMv2 CLI exited %d: %s", res.ExitCode, firstLine(res.Stderr))
+				}
+				return true, nil
+			},
+		}
+	case model.KindController:
+		if d.OpenFlow == nil {
+			return nil
+		}
+		container, port := d.Container, d.OpenFlow.Port
+		return &plan.Waiter{
+			Describe: "OpenFlow controller " + d.ID + " to accept switches",
+			Interval: 200 * time.Millisecond, Timeout: 60 * time.Second, StableFor: 2,
+			Check: func(ctx context.Context) (bool, error) {
+				res, err := rt.Exec(ctx, container, runtime.ExecCmd{Cmd: []string{"sh", "-c",
+					fmt.Sprintf("nc -z 127.0.0.1 %d", port)}})
+				if err != nil {
+					return false, err
+				}
+				return res.ExitCode == 0, nil
+			},
+		}
 	case model.KindService:
 		var (
 			describe string
 			command  []string
 		)
 		switch {
+		case isLoadBalancer(d):
+			describe = "load balancer " + d.ID + " to publish metrics"
+			command = []string{"sh", "-c", "curl -fsS http://127.0.0.1:8080/metrics >/dev/null"}
+		case isTrafficGenerator(d):
+			describe = "traffic generator " + d.ID + " profile to be readable"
+			command = []string{"test", "-s", "/etc/twinet/traffic-profile.json"}
 		case isDNS(d):
 			describe = "DNS replica " + d.ID + " to answer"
 			probe := "localhost"

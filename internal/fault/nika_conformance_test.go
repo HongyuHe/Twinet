@@ -32,8 +32,8 @@ func TestSharedFaultsSitInTheSameCategoryAsTheTaxonomy(t *testing.T) {
 	if err := json.Unmarshal(nikaTypes, &want); err != nil {
 		t.Fatal(err)
 	}
-	if len(want) < 50 {
-		t.Fatalf("the vendored taxonomy has only %d types, which is too few to be it", len(want))
+	if len(want) != 60 {
+		t.Fatalf("the pinned NIKA taxonomy has %d types, want 60", len(want))
 	}
 	shared := 0
 	for _, f := range All() {
@@ -48,9 +48,9 @@ func TestSharedFaultsSitInTheSameCategoryAsTheTaxonomy(t *testing.T) {
 				f.Name, f.Category, w)
 		}
 	}
-	if shared < 40 {
-		t.Errorf("only %d faults are shared with the taxonomy; the coverage the "+
-			"documentation claims cannot be right", shared)
+	if shared != len(want) {
+		t.Errorf("only %d of %d pinned NIKA faults are registered; O16 requires 60/60",
+			shared, len(want))
 	}
 }
 

@@ -103,18 +103,52 @@ func TestEveryEnabledDaemonIsChecked(t *testing.T) {
 	if len(enabled) < 3 {
 		t.Fatalf("only %d daemons parsed out of the daemons file: %v", len(enabled), enabled)
 	}
+
 	for _, d := range enabled {
 		if !strings.Contains(script, d) {
 			t.Errorf("%s is enabled in the daemons file but the deployment never "+
 				"checks whether it is running", d)
 		}
 	}
+
 	for _, off := range []string{"ripd", "isisd", "pimd", "babeld"} {
 		for _, on := range enabled {
 			if on == off {
 				t.Errorf("%s is disabled in the daemons file but was parsed as enabled", off)
 			}
 		}
+	}
+}
+
+// The shell container deliberately lacks CAP_SYS_ADMIN. Starting/probing FRR
+// in it would recreate the exact repeated-deploy failure the sidecar exists to
+// prevent, so both lifecycle commands must be explicitly routed to the private
+// control container by deploy.Engine.
+func TestFRRLifecycleCommandsUseThePrivateControlContainer(t *testing.T) {
+	top := &model.Topology{
+		Name: "t",
+		Lab:  &model.Lab{},
+		ASes: map[int]*model.AS{1: {ASN: 1}},
+	}
+	d := &model.Device{ID: "as1/R", ASN: 1, Kind: model.KindRouter, Name: "R"}
+	top.ASes[1].Devices = []*model.Device{d}
+	top.ASes[1].Routers = []*model.Device{d}
+
+	cmds, err := (&Renderer{Top: top}).Commands(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var started, checked bool
+	for _, cmd := range cmds {
+		switch cmd.Describe {
+		case "start FRR":
+			started = cmd.FRRControl
+		case "check the routing daemons are running":
+			checked = cmd.FRRControl
+		}
+	}
+	if !started || !checked {
+		t.Fatalf("FRR start/check must target private control: start=%t check=%t", started, checked)
 	}
 }
 

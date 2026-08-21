@@ -19,9 +19,10 @@ RUN apk add --no-cache \
 # depending on an external validator keeps an exercise's answer a property of
 # the lab instead of a property of what somebody else has published today.
 COPY twinet-rtr /usr/local/bin/twinet-rtr
+COPY twinet-traffic /usr/local/bin/twinet-traffic
 
 COPY entrypoint.sh /usr/local/bin/twinet-entrypoint
-RUN chmod 0755 /usr/local/bin/twinet-entrypoint /usr/local/bin/twinet-rtr
+RUN chmod 0755 /usr/local/bin/twinet-entrypoint /usr/local/bin/twinet-rtr /usr/local/bin/twinet-traffic
 
 LABEL org.opencontainers.image.title="twinet-svc" \
       org.opencontainers.image.source="https://github.com/HongyuHe/Twinet"

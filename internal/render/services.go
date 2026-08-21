@@ -27,6 +27,50 @@ func (r *Renderer) serviceFiles(d *model.Device) (map[string]deploy.FileSpec, er
 		}
 		out["/etc/twinet/service-state.json"] = deploy.FileSpec{Content: state, Mode: 0o644}
 	}
+	if isLoadBalancer(d) {
+		spec, err := r.measuredServiceSpec(d)
+		if err != nil {
+			return nil, err
+		}
+		if spec.LoadBalancer == nil {
+			return nil, fmt.Errorf("load balancer %s has no typed specification", d.ID)
+		}
+		lb := *spec.LoadBalancer
+		for i, backend := range lb.Backends {
+			resolved, err := r.resolveTrafficTarget(backend)
+			if err != nil {
+				return nil, fmt.Errorf("load balancer %s backend %q: %w", d.ID, backend, err)
+			}
+			lb.Backends[i] = resolved
+		}
+		raw, err := json.MarshalIndent(lb, "", "  ")
+		if err != nil {
+			return nil, err
+		}
+		out["/etc/twinet/load-balancer.json"] = deploy.FileSpec{Content: append(raw, '\n'), Mode: 0o644}
+		return out, nil
+	}
+	if isTrafficGenerator(d) {
+		spec, err := r.measuredServiceSpec(d)
+		if err != nil {
+			return nil, err
+		}
+		if spec.TrafficGenerator == nil {
+			return nil, fmt.Errorf("traffic generator %s has no typed profile", d.ID)
+		}
+		profile := spec.TrafficGenerator.Profile
+		target, err := r.resolveTrafficTarget(profile.Target)
+		if err != nil {
+			return nil, fmt.Errorf("traffic generator %s target %q: %w", d.ID, profile.Target, err)
+		}
+		profile.Target = target
+		raw, err := json.MarshalIndent(profile, "", "  ")
+		if err != nil {
+			return nil, err
+		}
+		out["/etc/twinet/traffic-profile.json"] = deploy.FileSpec{Content: append(raw, '\n'), Mode: 0o644}
+		return out, nil
+	}
 	if isRPKI(d) {
 		p := svc.BuildRPKI(r.Top, r.Top.Lab.RPKI.NotFound, r.Top.Lab.RPKI.Invalid)
 		out["/etc/twinet/rpki.json"] = deploy.FileSpec{Content: p.JSON(), Mode: 0o644}
@@ -56,6 +100,31 @@ func (r *Renderer) serviceFiles(d *model.Device) (map[string]deploy.FileSpec, er
 
 // serviceCommands starts the daemon a service device exists to run.
 func (r *Renderer) serviceCommands(d *model.Device) []deploy.Command {
+	if isLoadBalancer(d) {
+		return []deploy.Command{{
+			Describe: "start deterministic load balancer",
+			Args: []string{"sh", "-c", strings.Join([]string{
+				"cfg=/etc/twinet/load-balancer.json",
+				"listen=$(jq -r '.listen // \":8080\"' \"$cfg\")",
+				"backends=$(jq -r '.backends | join(\",\")' \"$cfg\")",
+				"limit=$(jq -r '.max_inflight' \"$cfg\")",
+				"delay=$(jq -r '.work_delay // \"30ms\"' \"$cfg\")",
+				"for p in $(pidof twinet-traffic 2>/dev/null || true); do kill \"$p\" 2>/dev/null || true; done",
+				"nohup twinet-traffic load-balancer --listen \"$listen\" --backends \"$backends\" --max-inflight \"$limit\" --work-delay \"$delay\" >/var/log/twinet-load-balancer.log 2>&1 &",
+				"for i in $(seq 1 30); do curl -fsS http://127.0.0.1${listen}/metrics >/dev/null 2>&1 && exit 0; sleep 1; done",
+				"echo 'load balancer did not become ready' >&2; exit 1",
+			}, "\n")},
+		}}
+	}
+	if isTrafficGenerator(d) {
+		// The generator is deliberately idle on deployment. A declared
+		// profile is a reusable substrate; starting it implicitly would make
+		// every ordinary lab overloaded before an incident asked for it.
+		return []deploy.Command{{
+			Describe: "validate deterministic traffic profile",
+			Args:     []string{"sh", "-c", "jq -e '.target and .requests > 0 and .concurrency > 0' /etc/twinet/traffic-profile.json >/dev/null"},
+		}}
+	}
 	if isRPKI(d) {
 		return []deploy.Command{{
 			Describe: "start the RPKI validator",
@@ -78,6 +147,7 @@ func (r *Renderer) serviceCommands(d *model.Device) []deploy.Command {
 			}, "\n")},
 		}}
 	}
+
 	if !isDNS(d) {
 		return nil
 	}
@@ -112,6 +182,53 @@ func (r *Renderer) serviceCommands(d *model.Device) []deploy.Command {
 			}, "\n")},
 		},
 	}
+}
+
+func (r *Renderer) measuredServiceSpec(d *model.Device) (*model.ServiceSpec, error) {
+	if d == nil || r.Top == nil || r.Top.Lab == nil {
+		return nil, fmt.Errorf("no topology is available")
+	}
+	name := d.ServiceName
+	if name == "" {
+		name = d.Name
+	}
+	spec := r.Top.Lab.Services[name]
+	if spec == nil {
+		return nil, fmt.Errorf("service declaration %q was not found", name)
+	}
+	return spec, nil
+}
+
+// resolveTrafficTarget turns service://name into a concrete, topology-owned
+// endpoint before it reaches a container. No container is given a controller
+// credential or a host address, and an incident consequently cannot route
+// traffic outside its lab by changing a profile file.
+func (r *Renderer) resolveTrafficTarget(target string) (string, error) {
+	if !strings.HasPrefix(target, "service://") {
+		return target, nil
+	}
+	name := strings.TrimSuffix(strings.TrimPrefix(target, "service://"), "/")
+	service := r.Top.Services[name]
+	if service == nil || service.Device == nil {
+		return "", fmt.Errorf("no expanded service %q", name)
+	}
+	var addr string
+	for _, iface := range service.Device.Ifaces {
+		if iface.Addr4 != "" {
+			addr = addrOf(iface.Addr4)
+			break
+		}
+	}
+	if addr == "" {
+		return "", fmt.Errorf("service %q has no reachable IPv4 attachment", name)
+	}
+	port := "8080"
+	if spec := r.Top.Lab.Services[name]; spec != nil && spec.LoadBalancer != nil && spec.LoadBalancer.Listen != "" {
+		if i := strings.LastIndex(spec.LoadBalancer.Listen, ":"); i >= 0 && i+1 < len(spec.LoadBalancer.Listen) {
+			port = spec.LoadBalancer.Listen[i+1:]
+		}
+	}
+	return "http://" + addr + ":" + port + "/", nil
 }
 
 // resolverCommands points a device at the lab's own resolver.
@@ -235,6 +352,14 @@ func isDNS(d *model.Device) bool {
 		return d.ServiceKind == "builtin.dns"
 	}
 	return strings.Contains(strings.ToLower(d.Name), "dns")
+}
+
+func isLoadBalancer(d *model.Device) bool {
+	return d != nil && d.Kind == model.KindService && d.ServiceKind == "builtin.load-balancer"
+}
+
+func isTrafficGenerator(d *model.Device) bool {
+	return d != nil && d.Kind == model.KindService && d.ServiceKind == "builtin.traffic-generator"
 }
 
 // dnsSerial derives a zone serial from the topology, so a redeployment of an

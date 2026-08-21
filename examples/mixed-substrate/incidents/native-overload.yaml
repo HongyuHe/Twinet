@@ -1,0 +1,9 @@
+apiVersion: twinet.dev/v1
+kind: Incident
+metadata:
+  name: measured-load-balancer-overload
+requirements: [load-balancer-traffic]
+faults:
+  - type: load_balancer_overload
+    target: {device: svc/lb}
+brief: One web endpoint intermittently rejects requests under a reproducible burst.

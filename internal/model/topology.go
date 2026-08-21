@@ -191,6 +191,16 @@ type Device struct {
 	ServiceName     string
 	ServiceReplica  string
 	ServiceIdentity string
+	// P4 is present only on KindP4 devices. It is the compiled-program ABI
+	// used by the renderer and fault engine; it never relies on a device name
+	// or an undocumented BMv2 default.
+	P4 *P4Runtime
+	// OpenFlow is present only on KindController devices. Switches point back
+	// to their controller through OpenFlowController.
+	OpenFlow *OpenFlowRuntime
+	// OpenFlowController is the ID of the controller that owns this OVS
+	// switch. Empty deliberately means standalone OVS, the legacy behaviour.
+	OpenFlowController string
 	// L2Gateway is the L2 domain this router is gateway for, if any.
 	L2Gateway string
 	// VLANs is populated for switches: the set of VLAN ids in their domain.
@@ -226,6 +236,32 @@ func (d *Device) EffectiveNOS() string {
 
 // IsRouter reports whether the device is a router.
 func (d *Device) IsRouter() bool { return d.Kind == KindRouter }
+
+// P4Runtime is the fully resolved BMv2 pipeline contract carried onto an
+// expanded device. ProgramPath remains relative to the lab root so a topology
+// is portable; ProgramDigest pins the bytes that are actually loaded.
+type P4Runtime struct {
+	ProgramPath       string
+	ProgramDigest     string
+	Language          string
+	ThriftPort        int
+	Table             string
+	ForwardAction     string
+	ThresholdRegister string
+	RegisterValues    map[int]int
+	Entries           []P4TableEntry
+	ProbeSource       string
+	ProbeDestination  string
+}
+
+// OpenFlowRuntime is the resolved controller endpoint contract.
+type OpenFlowRuntime struct {
+	Version  string
+	Listen   string
+	Port     int
+	FailMode string
+	Switches []string
+}
 
 // IfaceByName returns the named interface.
 func (d *Device) IfaceByName(name string) (*Iface, bool) {
@@ -306,6 +342,9 @@ const (
 	RoleL2SubIface IfaceRole = "l2-subiface"
 	RoleService    IfaceRole = "service"
 	RoleIXPLink    IfaceRole = "ixp"
+	// RoleOpenFlowControl is a management cable. It must be configured with
+	// an IP address but must never be added as an OVS data-plane bridge port.
+	RoleOpenFlowControl IfaceRole = "openflow-control"
 )
 
 // InteriorRole classifies a generated device by its position in an AS shape.

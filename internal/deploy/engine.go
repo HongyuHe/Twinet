@@ -13,6 +13,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -51,6 +53,11 @@ const (
 	LabelRegion   = "twinet.region"
 	LabelManaged  = "twinet.managed"
 	LabelDeviceID = "twinet.device-id"
+	// LabelFRRControl marks the privileged control-plane sidecar for an FRR
+	// router. It shares the router network namespace and FRR config/vty
+	// directories, but is a separate container that a student shell cannot
+	// exec into.
+	LabelFRRControl = "twinet.frr-control"
 	// LabelNOS records an explicitly selected router NOS. Legacy routers omit
 	// it so their historic container/spec identity remains unchanged.
 	LabelNOS = "twinet.nos"
@@ -119,6 +126,10 @@ type Engine struct {
 	Prune bool
 	// Generation stamps this deployment, so pruning can identify leftovers.
 	Generation string
+	// FRRControlRoot holds the host directories shared only between an
+	// unprivileged router shell and its privileged FRR control sidecar. Empty
+	// selects the node-local runtime path.
+	FRRControlRoot string
 
 	// pendingRestore records devices whose captured configuration must be
 	// replayed once their interfaces exist.
@@ -156,6 +167,11 @@ type Command struct {
 	IgnoreError bool
 	// Describe is used in error messages.
 	Describe string
+	// FRRControl executes the command in the private privileged FRR sidecar
+	// for an FRR router. It is used only for daemon lifecycle/probes; ordinary
+	// router configuration and every student shell command remain in the
+	// unprivileged router container.
+	FRRControl bool
 }
 
 // Build constructs the deployment plan for the devices placed on this node.
@@ -309,6 +325,10 @@ func (e *Engine) ensureContainer(ctx context.Context, top *model.Topology, d *mo
 	if err != nil {
 		return err
 	}
+	controlBinds, err := e.frrControlBinds(top, d)
+	if err != nil {
+		return err
+	}
 	want := SpecHash(d)
 
 	if cur.State != runtime.StateAbsent {
@@ -318,6 +338,9 @@ func (e *Engine) ensureContainer(ctx context.Context, top *model.Topology, d *mo
 		// away whatever the student had configured inside.
 		if cur.Labels[LabelSpec] == want {
 			if cur.State.Joinable() {
+				if err := e.ensureFRRControl(ctx, top, d, controlBinds); err != nil {
+					return err
+				}
 				return nil
 			}
 			// The container exists but is stopped: start it and put back
@@ -325,13 +348,19 @@ func (e *Engine) ensureContainer(ctx context.Context, top *model.Topology, d *mo
 			if err := e.Runtime.Start(ctx, d.Container); err != nil {
 				return err
 			}
-			return e.restoreIfNeeded(ctx, top, d)
+			if err := e.restoreIfNeeded(ctx, top, d); err != nil {
+				return err
+			}
+			return e.ensureFRRControl(ctx, top, d, controlBinds)
 		}
 
 		// It genuinely must be replaced. Capture first; if capture fails we
 		// refuse rather than proceed, because the alternative is silent
 		// destruction of a student's work.
 		if err := e.captureBeforeReplace(ctx, top, d); err != nil {
+			return err
+		}
+		if err := e.removeFRRControl(ctx, d); err != nil {
 			return err
 		}
 		if err := e.Runtime.Remove(ctx, d.Container, true); err != nil {
@@ -367,6 +396,7 @@ func (e *Engine) ensureContainer(ctx context.Context, top *model.Topology, d *mo
 		}
 		spec.Binds = append(spec.Binds, bind)
 	}
+	spec.Binds = append(spec.Binds, controlBinds...)
 
 	if _, err := e.Runtime.Create(ctx, spec); err != nil {
 		return err
@@ -374,7 +404,156 @@ func (e *Engine) ensureContainer(ctx context.Context, top *model.Topology, d *mo
 	if err := e.Runtime.Start(ctx, d.Container); err != nil {
 		return err
 	}
-	return e.restoreIfNeeded(ctx, top, d)
+	if err := e.restoreIfNeeded(ctx, top, d); err != nil {
+		return err
+	}
+	return e.ensureFRRControl(ctx, top, d, controlBinds)
+}
+
+// FRRControlContainer returns the private control-plane container associated
+// with an FRR router. It is deterministic so lifecycle, repair, and cleanup
+// can operate on it without adding a student-visible topology device.
+func FRRControlContainer(d *model.Device) string {
+	if d == nil {
+		return ""
+	}
+	return d.Container + "-frr"
+}
+
+// UsesFRRControl reports whether d needs the split-privilege FRR runtime.
+//
+// Alpine FRR 10 retains CAP_SYS_ADMIN in its daemon capability vector. Giving
+// that capability to a student router shell violates O12, so every FRR router
+// gets a private sibling with the capability instead. BIRD and non-router
+// devices retain their own native runtime contracts.
+func UsesFRRControl(d *model.Device) bool {
+	return d != nil && d.Kind == model.KindRouter && d.EffectiveNOS() == model.DefaultNOS
+}
+
+func (e *Engine) usesFRRControl(d *model.Device) bool {
+	if !UsesFRRControl(d) || e.Runtime == nil {
+		return false
+	}
+	// The split runtime needs Docker/Podman namespace sharing. Unit runtimes
+	// deliberately stay single-container fakes; they test planning without
+	// creating host directories or a second process namespace.
+	switch e.Runtime.Name() {
+	case "docker", "podman":
+		return true
+	default:
+		return false
+	}
+}
+
+const frrControlContractVersion = "frr-control-v1"
+
+func (e *Engine) frrControlBinds(top *model.Topology, d *model.Device) ([]runtime.Bind, error) {
+	if !e.usesFRRControl(d) {
+		return nil, nil
+	}
+	root := e.frrControlRoot()
+	sum := sha256.Sum256([]byte(top.Name + "\x00" + d.ID))
+	dir := filepath.Join(root, top.Name, hex.EncodeToString(sum[:8]))
+	etc, run, log := filepath.Join(dir, "etc"), filepath.Join(dir, "run"), filepath.Join(dir, "log")
+	for _, path := range []string{etc, run, log} {
+		if err := os.MkdirAll(path, 0o775); err != nil {
+			return nil, fmt.Errorf("create FRR control directory for %s: %w", d.ID, err)
+		}
+	}
+	// These IDs are pinned by images/router/Dockerfile's Alpine FRR package.
+	// The shell remains root in its own container and can edit its own config,
+	// but it has no CAP_SYS_ADMIN and cannot enter the sidecar.
+	for _, path := range []string{etc, run} {
+		if err := os.Chown(path, 100, 102); err != nil {
+			return nil, fmt.Errorf("set FRR vty ownership for %s: %w", d.ID, err)
+		}
+	}
+	if err := os.Chown(log, 100, 101); err != nil {
+		return nil, fmt.Errorf("set FRR log ownership for %s: %w", d.ID, err)
+	}
+	vtysh := filepath.Join(etc, "vtysh.conf")
+	if _, err := os.Stat(vtysh); os.IsNotExist(err) {
+		if err := os.WriteFile(vtysh, []byte("service integrated-vtysh-config\n"), 0o640); err != nil {
+			return nil, fmt.Errorf("write FRR vty configuration for %s: %w", d.ID, err)
+		}
+		if err := os.Chown(vtysh, 100, 102); err != nil {
+			return nil, fmt.Errorf("set FRR vty configuration ownership for %s: %w", d.ID, err)
+		}
+	} else if err != nil {
+		return nil, fmt.Errorf("inspect FRR vty configuration for %s: %w", d.ID, err)
+	}
+	return []runtime.Bind{
+		{Source: etc, Target: "/etc/frr"},
+		{Source: run, Target: "/run/frr"},
+		{Source: log, Target: "/var/log/frr"},
+	}, nil
+}
+
+func (e *Engine) frrControlRoot() string {
+	if e.FRRControlRoot != "" {
+		return e.FRRControlRoot
+	}
+	return filepath.Join("/run", "twinet", "frr-control")
+}
+
+func (e *Engine) ensureFRRControl(ctx context.Context, top *model.Topology, d *model.Device, binds []runtime.Bind) error {
+	if !e.usesFRRControl(d) {
+		return nil
+	}
+	name := FRRControlContainer(d)
+	current, err := e.Runtime.Inspect(ctx, name)
+	if err != nil {
+		return err
+	}
+	want := frrControlSpecHash(d)
+	if current.State != runtime.StateAbsent {
+		if current.Labels[LabelSpec] == want && current.State.Joinable() {
+			return nil
+		}
+		if err := e.Runtime.Remove(ctx, name, true); err != nil {
+			return fmt.Errorf("replace FRR control for %s: %w", d.ID, err)
+		}
+	}
+	labels := e.labels(top, d)
+	labels[LabelFRRControl] = "true"
+	labels[LabelSpec] = want
+	labels[LabelKind] = "frr-control"
+	spec := &runtime.Spec{
+		Name: name, Image: d.Image,
+		Command: []string{"sleep", "infinity"},
+		Labels:  labels, Binds: append([]runtime.Bind(nil), binds...),
+		Capabilities: []string{"NET_ADMIN", "NET_RAW", "SYS_ADMIN"},
+		Restart:      d.Restart, NetworkMode: "container:" + d.Container, Init: true,
+	}
+	if _, err := e.Runtime.Create(ctx, spec); err != nil {
+		return fmt.Errorf("create FRR control for %s: %w", d.ID, err)
+	}
+	if err := e.Runtime.Start(ctx, name); err != nil {
+		return fmt.Errorf("start FRR control for %s: %w", d.ID, err)
+	}
+	return nil
+}
+
+func (e *Engine) removeFRRControl(ctx context.Context, d *model.Device) error {
+	if !e.usesFRRControl(d) {
+		return nil
+	}
+	name := FRRControlContainer(d)
+	current, err := e.Runtime.Inspect(ctx, name)
+	if err != nil {
+		return err
+	}
+	if current.State == runtime.StateAbsent {
+		return nil
+	}
+	return e.Runtime.Remove(ctx, name, true)
+}
+
+func frrControlSpecHash(d *model.Device) string {
+	h := sha256.New()
+	fmt.Fprintf(h, "%s\n%s\n%s\n", frrControlContractVersion, d.ID, d.Image)
+	fmt.Fprintf(h, "imageid=%s\nrestart=%s\n", d.ImageID, d.Restart)
+	return hex.EncodeToString(h.Sum(nil))[:24]
 }
 
 // captureBeforeReplace snapshots a student-owned device before it is destroyed.
@@ -539,6 +718,9 @@ func (e *Engine) PruneOrphans(ctx context.Context, top *model.Topology) ([]strin
 	want := map[string]bool{}
 	for _, d := range top.DevicesOnNode(e.Node) {
 		want[d.Container] = true
+		if e.usesFRRControl(d) {
+			want[FRRControlContainer(d)] = true
+		}
 	}
 	// A device that has moved to another node must also be removed from here.
 	elsewhere := map[string]bool{}
@@ -646,6 +828,12 @@ func (e *Engine) captureOrphan(ctx context.Context, top *model.Topology, c runti
 }
 
 func (e *Engine) orphanSnapshots(ctx context.Context, top *model.Topology, c runtime.Container) ([]state.Snapshot, error) {
+	if c.Labels[LabelFRRControl] == "true" {
+		// The sidecar has only the router's shared config/vty mounts. The
+		// student-owned snapshot belongs to the shell container, and capturing
+		// the sidecar would duplicate or race that state.
+		return nil, nil
+	}
 	if e.State == nil {
 		return nil, nil
 	}
@@ -774,6 +962,9 @@ func SpecHash(d *model.Device) string {
 		d.ID, d.Kind, d.Image, d.ImageID, d.Hostname, d.Node)
 	if d.NOS != "" {
 		fmt.Fprintf(h, "nos=%s\n", d.NOS)
+	}
+	if UsesFRRControl(d) {
+		fmt.Fprintf(h, "frr-control=%s\n", frrControlContractVersion)
 	}
 	fmt.Fprintf(h, "cpus=%v\nmem=%s\npids=%d\nrestart=%s\npriv=%v\n",
 		d.CPUs, d.Memory, d.Pids, d.Restart, d.Privileged)
@@ -1111,7 +1302,11 @@ func (e *Engine) configure(ctx context.Context, d *model.Device) error {
 		}
 	}
 	for _, c := range cmds {
-		res, err := e.Runtime.Exec(ctx, d.Container, runtime.ExecCmd{Cmd: c.Args})
+		container := d.Container
+		if c.FRRControl && e.usesFRRControl(d) {
+			container = FRRControlContainer(d)
+		}
+		res, err := e.Runtime.Exec(ctx, container, runtime.ExecCmd{Cmd: c.Args})
 		if err != nil {
 			return fmt.Errorf("%s: %s: %w", d.ID, c.Describe, err)
 		}
@@ -1154,6 +1349,11 @@ func ConfigHash(files map[string]FileSpec, cmds []Command) string {
 		} else {
 			write("required")
 		}
+		if c.FRRControl {
+			write("frr-control")
+		} else {
+			write("device")
+		}
 		for _, arg := range c.Args {
 			write(arg)
 		}
@@ -1169,6 +1369,14 @@ func (e *Engine) configurationCurrent(ctx context.Context, d *model.Device,
 	})
 	if err != nil || res.ExitCode != 0 || strings.TrimSpace(res.Stdout) != want {
 		return false
+	}
+	if e.usesFRRControl(d) {
+		sidecar, err := e.Runtime.Exec(ctx, FRRControlContainer(d), runtime.ExecCmd{
+			Cmd: []string{"sh", "-c", "pidof zebra >/dev/null 2>&1"},
+		})
+		if err != nil || sidecar.ExitCode != 0 {
+			return false
+		}
 	}
 	for _, path := range sortedKeys(files) {
 		// This path is controlled by the student once it has content. Do not
@@ -1283,6 +1491,11 @@ func (e *Engine) Destroy(ctx context.Context, lab string) error {
 			return removeErr
 		}); err != nil {
 			problems = append(problems, fmt.Sprintf("remove empty multiplex overlays: %v", err))
+		}
+	}
+	if len(problems) == 0 && ctxErr == nil {
+		if err := os.RemoveAll(filepath.Join(e.frrControlRoot(), lab)); err != nil {
+			problems = append(problems, fmt.Sprintf("remove FRR control state: %v", err))
 		}
 	}
 	return deterministicError(ctxErr, problems)

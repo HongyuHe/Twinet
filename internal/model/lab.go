@@ -40,12 +40,20 @@ const (
 	KindHost    DeviceKind = "host"
 	KindSwitch  DeviceKind = "switch"
 	KindService DeviceKind = "service"
+	// KindP4 is a BMv2 programmable data-plane switch. It is intentionally
+	// distinct from an OVS switch: its program and control-plane contract are
+	// part of the topology, rather than an implementation detail of a bridge.
+	KindP4 DeviceKind = "p4"
+	// KindController is an OpenFlow controller. Controllers are first-class
+	// devices so their lifecycle and southbound state can be observed and
+	// faulted without changing ordinary, controller-less OVS labs.
+	KindController DeviceKind = "controller"
 )
 
 // Valid reports whether k is a known device kind.
 func (k DeviceKind) Valid() bool {
 	switch k {
-	case KindRouter, KindHost, KindSwitch, KindService:
+	case KindRouter, KindHost, KindSwitch, KindService, KindP4, KindController:
 		return true
 	}
 	return false
@@ -148,6 +156,11 @@ type Lab struct {
 
 	// Services declares the auxiliary services attached to the lab.
 	Services map[string]*ServiceSpec `yaml:"services,omitempty" json:"services,omitempty"`
+	// Controllers declares lab-global OpenFlow controllers. A controller is a
+	// real device with point-to-point management links to the OVS switches it
+	// owns; leaving this empty preserves the historical standalone-switch
+	// behaviour exactly.
+	Controllers map[string]*ControllerSpec `yaml:"controllers,omitempty" json:"controllers,omitempty"`
 	// ServicePolicyVersion opts a manifest into a deliberately versioned set of
 	// service defaults. Empty retains the historic singleton expansion so an
 	// existing manifest and its topology hash do not change merely by loading
@@ -298,6 +311,16 @@ func DefaultResourceRequest(kind DeviceKind) ResourceRequest {
 		return ResourceRequest{
 			CPUs: 0.25, Memory: "128Mi", Pids: 64, EphemeralStorage: "256Mi",
 			FileDescriptors: 1024, NetDevices: 8,
+		}
+	case KindP4:
+		return ResourceRequest{
+			CPUs: 0.50, Memory: "256Mi", Pids: 96, EphemeralStorage: "512Mi",
+			FileDescriptors: 1024, NetDevices: 16,
+		}
+	case KindController:
+		return ResourceRequest{
+			CPUs: 0.25, Memory: "128Mi", Pids: 64, EphemeralStorage: "128Mi",
+			FileDescriptors: 1024, NetDevices: 32,
 		}
 	default: // hosts and unknown legacy kinds
 		return ResourceRequest{
@@ -528,12 +551,17 @@ type ASTemplate struct {
 	Kind       string `yaml:"kind,omitempty" json:"kind,omitempty"`
 	Metadata   Meta   `yaml:"metadata,omitempty" json:"metadata,omitempty"`
 
-	Routers       map[string]*RouterSpec `yaml:"routers,omitempty" json:"routers,omitempty"`
-	Hosts         HostPolicy             `yaml:"hosts,omitempty" json:"hosts,omitempty"`
-	InternalLinks []InternalLink         `yaml:"internal_links,omitempty" json:"internal_links,omitempty"`
-	L2Domains     map[string]*L2Domain   `yaml:"l2_domains,omitempty" json:"l2_domains,omitempty"`
-	ExternalPorts map[string]*ExtPort    `yaml:"external_ports,omitempty" json:"external_ports,omitempty"`
-	Provisioning  Provisioning           `yaml:"provisioning,omitempty" json:"provisioning,omitempty"`
+	Routers map[string]*RouterSpec `yaml:"routers,omitempty" json:"routers,omitempty"`
+	// P4Devices are BMv2 switches embedded in an AS. They share
+	// internal_links with routers, but their pipeline and typed control-plane
+	// contract are declared separately so a P4 fault cannot be accepted for an
+	// arbitrary Linux container.
+	P4Devices     map[string]*P4DeviceSpec `yaml:"p4_devices,omitempty" json:"p4_devices,omitempty"`
+	Hosts         HostPolicy               `yaml:"hosts,omitempty" json:"hosts,omitempty"`
+	InternalLinks []InternalLink           `yaml:"internal_links,omitempty" json:"internal_links,omitempty"`
+	L2Domains     map[string]*L2Domain     `yaml:"l2_domains,omitempty" json:"l2_domains,omitempty"`
+	ExternalPorts map[string]*ExtPort      `yaml:"external_ports,omitempty" json:"external_ports,omitempty"`
+	Provisioning  Provisioning             `yaml:"provisioning,omitempty" json:"provisioning,omitempty"`
 
 	// IXP marks this template as an internet exchange point, in which case
 	// Routers must contain exactly one router acting as the route server.
@@ -643,6 +671,11 @@ type HostPolicy struct {
 type InternalLink struct {
 	A string `yaml:"a" json:"a"`
 	B string `yaml:"b" json:"b"`
+	// Segment optionally declares several point-to-point cables as one
+	// shared broadcast domain. It is primarily useful for a BMv2 switch:
+	// each cable remains a real veth, while the P4 program supplies the
+	// forwarding plane between them.
+	SharedSegment string `yaml:"segment,omitempty" json:"segment,omitempty"`
 	// Subnet pins the link's prefix instead of deriving it from the addressing
 	// plan. Course material that publishes a topology figure with specific
 	// subnets should pin them here, so the platform and the figure cannot drift.
@@ -666,6 +699,77 @@ type SwitchSpec struct {
 	MAC            string `yaml:"mac,omitempty" json:"mac,omitempty"`
 	Uplink         *bool  `yaml:"uplink,omitempty" json:"uplink,omitempty" jsonschema:"description=whether this switch connects to the gateway router"`
 	DeviceDefaults `yaml:",inline" json:",inline"`
+}
+
+// P4DeviceSpec describes one BMv2 simple_switch device. ID shares the router
+// ID address-space because an internal link needs deterministic endpoint
+// addresses, but P4 devices do not become routing daemons or external ports.
+type P4DeviceSpec struct {
+	ID             int            `yaml:"id" json:"id" jsonschema:"required,description=stable endpoint ID used by the addressing plan"`
+	Program        P4Program      `yaml:"program" json:"program" jsonschema:"required"`
+	ControlPlane   P4ControlPlane `yaml:"control_plane" json:"control_plane" jsonschema:"required"`
+	DeviceDefaults `yaml:",inline" json:",inline"`
+}
+
+// P4Program identifies a source or compiled BMv2 JSON pipeline. Path is
+// relative to the lab directory; Digest pins the exact program bytes so a
+// controller cannot silently load a different program under the same path.
+//
+// A P4 source is compiled during the device's deterministic configure stage,
+// after interfaces have been wired. A JSON program is loaded directly.
+type P4Program struct {
+	Path   string `yaml:"path" json:"path" jsonschema:"required"`
+	Digest string `yaml:"digest" json:"digest" jsonschema:"required"`
+	// Language defaults to p4-16. It is explicit for the old v1model
+	// programs that need a different compiler flag.
+	Language string `yaml:"language,omitempty" json:"language,omitempty"`
+}
+
+// P4ControlPlane is the contract Twinet can operate against rather than a
+// guess at a program's private table names. The BMv2 Thrift endpoint remains
+// the transport; these names are the typed program ABI used for deterministic
+// loading, probes and reversible faults.
+type P4ControlPlane struct {
+	ThriftPort        int            `yaml:"thrift_port,omitempty" json:"thrift_port,omitempty"`
+	Table             string         `yaml:"table" json:"table" jsonschema:"required"`
+	ForwardAction     string         `yaml:"forward_action" json:"forward_action" jsonschema:"required"`
+	ThresholdRegister string         `yaml:"threshold_register,omitempty" json:"threshold_register,omitempty"`
+	RegisterValues    map[int]int    `yaml:"register_values,omitempty" json:"register_values,omitempty"`
+	Entries           []P4TableEntry `yaml:"entries,omitempty" json:"entries,omitempty"`
+	// ProbeSource and ProbeDestination name ordinary attached devices. They
+	// make a P4 fault prove a forwarding symptom, not merely read back a CLI
+	// command that was accepted.
+	ProbeSource      string `yaml:"probe_source,omitempty" json:"probe_source,omitempty"`
+	ProbeDestination string `yaml:"probe_destination,omitempty" json:"probe_destination,omitempty"`
+}
+
+// P4TableEntry is an initial BMv2 CLI command expressed as typed table,
+// action, match and action parameters. It is rendered after the program starts
+// and is also what lets a missing-entry fault remove a real forwarding entry
+// rather than inventing a config-only marker.
+type P4TableEntry struct {
+	Match  string   `yaml:"match" json:"match" jsonschema:"required"`
+	Action string   `yaml:"action,omitempty" json:"action,omitempty"`
+	Params []string `yaml:"params,omitempty" json:"params,omitempty"`
+}
+
+// ControllerSpec declares an OpenFlow controller and the switches it owns.
+// Switches contains expanded device IDs (for example as5/DCN_S1), which makes
+// ownership unambiguous across ASes with identical short switch names.
+type ControllerSpec struct {
+	OpenFlow       OpenFlowSpec `yaml:"openflow" json:"openflow" jsonschema:"required"`
+	DeviceDefaults `yaml:",inline" json:",inline"`
+}
+
+// OpenFlowSpec is the controller/switch protocol contract. Twinet's bundled
+// controller implements OpenFlow 1.3 and exposes an operational connection
+// state. A switch only receives a controller endpoint when it appears here,
+// preserving non-SDN OVS labs unchanged.
+type OpenFlowSpec struct {
+	Version  string   `yaml:"version,omitempty" json:"version,omitempty"`
+	Listen   string   `yaml:"listen,omitempty" json:"listen,omitempty"`
+	Switches []string `yaml:"switches" json:"switches" jsonschema:"required"`
+	FailMode string   `yaml:"fail_mode,omitempty" json:"fail_mode,omitempty"`
 }
 
 // L2Host is a host attached to a switch in an access VLAN.
@@ -872,8 +976,47 @@ type ServiceSpec struct {
 	Replication ServiceReplicationPolicy `yaml:"replication,omitempty" json:"replication,omitempty"`
 	// Endpoints applies to control-plane services such as builtin.web. Data
 	// plane services use Replication for their service identities instead.
-	Endpoints      EndpointPolicy `yaml:"endpoints,omitempty" json:"endpoints,omitempty"`
-	DeviceDefaults `yaml:",inline" json:",inline"`
+	Endpoints EndpointPolicy `yaml:"endpoints,omitempty" json:"endpoints,omitempty"`
+	// LoadBalancer and TrafficGenerator turn a pair of generic containers into
+	// a measured data-plane substrate. They are valid only with the matching
+	// builtin service kinds and are intentionally typed: a traffic profile
+	// declared in a stringly Config map cannot be validated or replayed.
+	LoadBalancer     *LoadBalancerSpec     `yaml:"load_balancer,omitempty" json:"load_balancer,omitempty"`
+	TrafficGenerator *TrafficGeneratorSpec `yaml:"traffic_generator,omitempty" json:"traffic_generator,omitempty"`
+	DeviceDefaults   `yaml:",inline" json:",inline"`
+}
+
+// LoadBalancerSpec describes the deterministic HTTP load-balancer runtime.
+// MaxInflight is deliberately an enforced runtime limit, not a number used
+// only by an injector, so overload is visible in the service's request and
+// rejection metrics.
+type LoadBalancerSpec struct {
+	Listen      string   `yaml:"listen,omitempty" json:"listen,omitempty"`
+	Backends    []string `yaml:"backends,omitempty" json:"backends,omitempty"`
+	MaxInflight int      `yaml:"max_inflight" json:"max_inflight" jsonschema:"required"`
+	MetricsPath string   `yaml:"metrics_path,omitempty" json:"metrics_path,omitempty"`
+	WorkDelay   string   `yaml:"work_delay,omitempty" json:"work_delay,omitempty"`
+}
+
+// TrafficGeneratorSpec describes a deterministic source of requests used by a
+// traffic incident. It can be started independently for a lab exercise and is
+// also the native substrate for load_balancer_overload.
+type TrafficGeneratorSpec struct {
+	Profile TrafficProfile `yaml:"profile" json:"profile" jsonschema:"required"`
+}
+
+// TrafficProfile is an immutable traffic shape. A seed and bounded request
+// count make a symptom reproducible across runs and prevent one incident from
+// consuming the node shared by other labs.
+type TrafficProfile struct {
+	Name        string `yaml:"name,omitempty" json:"name,omitempty"`
+	Target      string `yaml:"target" json:"target" jsonschema:"required"`
+	Protocol    string `yaml:"protocol,omitempty" json:"protocol,omitempty"`
+	Requests    int    `yaml:"requests" json:"requests" jsonschema:"required"`
+	Concurrency int    `yaml:"concurrency" json:"concurrency" jsonschema:"required"`
+	Rate        int    `yaml:"rate,omitempty" json:"rate,omitempty"`
+	Timeout     string `yaml:"timeout,omitempty" json:"timeout,omitempty"`
+	Seed        int64  `yaml:"seed,omitempty" json:"seed,omitempty"`
 }
 
 // ServiceAttach says where in each AS the service connects.

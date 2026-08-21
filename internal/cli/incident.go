@@ -29,7 +29,11 @@ type Scenario struct {
 	Kind       string       `yaml:"kind" json:"kind"`
 	Metadata   ScenarioMeta `yaml:"metadata" json:"metadata"`
 	Faults     []FaultSpec  `yaml:"faults" json:"faults"`
-	Brief      string       `yaml:"brief,omitempty" json:"brief,omitempty"`
+	// Requirements explicitly declares typed substrates the scenario needs.
+	// A scenario is rejected before injection when it omits a requirement or
+	// the selected runtime cannot discover it.
+	Requirements []fault.Substrate `yaml:"requirements,omitempty" json:"requirements,omitempty"`
+	Brief        string            `yaml:"brief,omitempty" json:"brief,omitempty"`
 	// Seed makes a time-varying fault replay exactly.
 	Seed int64 `yaml:"seed,omitempty" json:"seed,omitempty"`
 	// Control declares an episode that injects nothing.
@@ -89,6 +93,10 @@ type Episode struct {
 	// from one earned without, because the scenarios are published: it belongs
 	// beside the number rather than in the operator's memory.
 	AgentEgress []string `json:"agent_egress,omitempty"`
+	// Substrates records the native/delegated capability decision that made
+	// this episode runnable. It deliberately contains no kubeconfig, token,
+	// or backend command line.
+	Substrates []fault.Availability `json:"substrates,omitempty"`
 }
 
 func newIncidentCmd(opts *Options) *cobra.Command {
@@ -145,7 +153,9 @@ func loadScenario(path string) (*Scenario, error) {
 			path, len(s.Faults))
 	}
 	var problems []string
+	names := make([]string, 0, len(s.Faults))
 	for i, f := range s.Faults {
+		names = append(names, f.Type)
 		if _, ok := fault.Lookup(f.Type); !ok {
 			problems = append(problems,
 				fmt.Sprintf("faults[%d]: %q is not a registered fault type", i, f.Type))
@@ -153,6 +163,9 @@ func loadScenario(path string) (*Scenario, error) {
 	}
 	if len(problems) > 0 {
 		return nil, fmt.Errorf("%s:\n  %s", path, strings.Join(problems, "\n  "))
+	}
+	if err := fault.ValidateScenarioRequirements(names, s.Requirements); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	return &s, nil
 }
@@ -230,6 +243,31 @@ func newIncidentRunCmd(opts *Options) *cobra.Command {
 			ep := &Episode{
 				Scenario: sc.Metadata.Name, Lab: top.Name, Topology: top.Hash,
 				Seed: sc.Seed, StartedAt: time.Now().UTC(), Brief: sc.Brief,
+			}
+			for i, fs := range sc.Faults {
+				f, ok := fault.Lookup(fs.Type)
+				if !ok {
+					continue
+				}
+				target := fs.Target
+				if len(candidates[i]) > 0 {
+					target = candidates[i][0]
+				}
+				ep.Substrates = append(ep.Substrates,
+					fault.AvailabilityFor(cmd.Context(), f, env, target)...)
+			}
+			// Discover every declared substrate before the first mutation.
+			// In particular, a Kubernetes incident must not inject an earlier
+			// native fault and only then discover that no endpoint/context was
+			// configured for its delegated half.
+			for i, fs := range sc.Faults {
+				f, ok := fault.Lookup(fs.Type)
+				if !ok || len(candidates[i]) == 0 {
+					continue
+				}
+				if err := fault.RequireAvailable(cmd.Context(), f, env, candidates[i][0]); err != nil {
+					return fmt.Errorf("scenario substrate discovery for faults[%d] %s: %w", i, fs.Type, err)
+				}
 			}
 			if len(pinnedTargets(sc.Faults)) < len(sc.Faults) {
 				ep.SelectionSeed = drawSeed

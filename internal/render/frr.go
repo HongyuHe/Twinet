@@ -164,6 +164,14 @@ func Router(top *model.Topology, d *model.Device) (RouterConfig, error) {
 		if c := ospfCost(i); c > 0 {
 			fmt.Fprintf(b, " ip ospf cost %d\n", c)
 		}
+		if usesPointToPointOSPF(i) {
+			// A BMv2 segment is physically two veth cables and logically one
+			// point-to-point programmable path. Leaving OSPF in broadcast mode
+			// elects two DROthers and leaves the adjacency 2-Way, so loopback
+			// reachability and iBGP never converge despite a healthy data
+			// plane.
+			b.WriteString(" ip ospf network point-to-point\n")
+		}
 		b.WriteString("exit\n!\n")
 	}
 
@@ -219,6 +227,13 @@ func ospfCost(i *model.Iface) int {
 		return 0
 	}
 	return ecmpCost(i)
+}
+
+func usesPointToPointOSPF(i *model.Iface) bool {
+	if i == nil || i.Link == nil || i.Link.Segment == "" || i.Peer == nil || i.Peer.Device == nil {
+		return false
+	}
+	return i.Peer.Device.Kind == model.KindP4
 }
 
 func renderOSPF(d *model.Device) string {

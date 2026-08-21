@@ -1,0 +1,83 @@
+apiVersion: twinet.dev/v1
+kind: Lab
+metadata:
+  name: mixed-substrate
+  description: Typed BMv2, OpenFlow, traffic, MPLS, and delegated-Kubernetes incident substrate.
+
+defaults:
+  restart: unless-stopped
+
+kinds:
+  router:
+    image: hyhe/twinet-router:0.1
+    # Student shells retain only data-plane capabilities. FRR runs in Twinet's
+    # private control sidecar, which shares the router netns/config/vty socket
+    # but is not reachable through the student container.
+    capabilities: [NET_ADMIN, NET_RAW]
+    sysctls: {net.ipv4.ip_forward: "1", net.mpls.platform_labels: "256"}
+  host:
+    image: hyhe/twinet-host:0.1
+    capabilities: [NET_ADMIN, NET_RAW]
+  switch:
+    image: hyhe/twinet-switch:0.1
+    capabilities: [NET_ADMIN, NET_RAW]
+  service:
+    image: hyhe/twinet-svc:0.1
+    capabilities: [NET_ADMIN, NET_RAW]
+  p4:
+    image: hyhe/twinet-p4:0.1
+    capabilities: [NET_ADMIN, NET_RAW]
+  controller:
+    image: hyhe/twinet-controller:0.1
+    capabilities: [NET_ADMIN, NET_RAW]
+
+addressing:
+  as_block: "{{ .AS }}.0.0.0/8"
+  router_loopback: "{{ .AS }}.150.0.{{ .RouterID }}/32"
+  router_router: "{{ .AS }}.0.{{ .LinkIndex }}.0/24"
+  router_host: "{{ .AS }}.100.{{ .RouterID }}.0/24"
+  inter_as: "179.0.0.0/24"
+  services:
+    lb: "198.18.{{ .AS }}.0/24"
+    traffic: "198.19.{{ .AS }}.0/24"
+    backend: "198.20.{{ .AS }}.0/24"
+
+as_defaults: {template: mixed, role: staff}
+autonomous_systems:
+  - list: [1]
+
+services:
+  backend:
+    kind: container
+    attach: {template: mixed, router: R1, iface: backend}
+    command: ["sh", "-c", "python3 -m http.server 8080"]
+  lb:
+    kind: builtin.load-balancer
+    attach: {template: mixed, router: R1, iface: lb}
+    load_balancer:
+      max_inflight: 2
+      work_delay: 100ms
+      backends: ["service://backend"]
+  traffic:
+    kind: builtin.traffic-generator
+    attach: {template: mixed, router: R1, iface: traffic}
+    traffic_generator:
+      profile:
+        name: overload
+        target: service://lb
+        protocol: http
+        requests: 200
+        concurrency: 16
+        timeout: 2s
+
+controllers:
+  of:
+    openflow:
+      version: "1.3"
+      listen: ":6653"
+      fail_mode: secure
+      switches: ["as1/FAB_S1"]
+
+placement:
+  strategy: single-node
+  nodes: [{name: node-0, underlay_ip: 10.0.1.1, front: true}]
