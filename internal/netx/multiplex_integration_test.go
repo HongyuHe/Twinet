@@ -108,15 +108,85 @@ func TestMultiplexOverlaySharesTunnelAndIsolatesFrames(t *testing.T) {
 	if err := <-rawReady; err != nil {
 		t.Fatalf("start isolated-VLAN frame receiver: %v", err)
 	}
+	vxlanTXReady, vxlanRXReady := make(chan error, 1), make(chan error, 1)
+	vxlanTX, vxlanRX := make(chan bool, 1), make(chan bool, 1)
+	go captureVXLANPacket(hostA, "tmuxua", vxlanTXReady, vxlanTX)
+	go captureVXLANPacket(hostB, "tmuxub", vxlanRXReady, vxlanRX)
+	if err := <-vxlanTXReady; err != nil {
+		t.Fatalf("start underlay transmitter capture: %v", err)
+	}
+	if err := <-vxlanRXReady; err != nil {
+		t.Fatalf("start underlay receiver capture: %v", err)
+	}
 
 	if err := sendIntegrationUDP(clientA1, "10.77.1.2", 29001, []byte("only-vni-5001")); err != nil {
 		t.Fatal(err)
 	}
-	if err := <-udpResult; err != nil {
-		t.Fatalf("same-VNI endpoint did not receive UDP: %v", err)
+	udpErr := <-udpResult
+	txSeen, rxSeen := <-vxlanTX, <-vxlanRX
+	if udpErr != nil {
+		dumpIntegrationState(t, hostA, hostB, clientA1, clientA2)
+		t.Fatalf("same-VNI endpoint did not receive UDP: %v (underlay VXLAN tx=%t rx=%t)",
+			udpErr, txSeen, rxSeen)
+	}
+	if !txSeen || !rxSeen {
+		t.Fatalf("same-VNI traffic did not traverse both underlays: tx=%t rx=%t", txSeen, rxSeen)
 	}
 	if err := <-rawResult; err != nil {
 		t.Fatalf("frame leaked from VNI 5001 into VNI 5002: %v", err)
+	}
+
+}
+
+func dumpIntegrationState(t *testing.T, namespaces ...*NS) {
+	t.Helper()
+	for _, ns := range namespaces {
+		err := ns.Do(func() error {
+			h, err := netlink.NewHandle()
+			if err != nil {
+				return err
+			}
+			defer h.Close()
+			links, err := h.LinkList()
+			if err != nil {
+				return err
+			}
+			vlans, err := h.BridgeVlanList()
+			if err != nil {
+				return err
+			}
+			tunnels, err := h.BridgeVlanTunnelShow()
+			if err != nil {
+				return err
+			}
+			for _, link := range links {
+				t.Logf("%s link %s type=%s idx=%d master=%d up=%t alias=%q",
+					ns.path, link.Attrs().Name, link.Type(), link.Attrs().Index,
+					link.Attrs().MasterIndex, link.Attrs().Flags&net.FlagUp != 0, link.Attrs().Alias)
+				if stats := link.Attrs().Statistics; stats != nil {
+					t.Logf("%s link %s stats=%+v", ns.path, link.Attrs().Name, *stats)
+				}
+				if addrs, aerr := h.AddrList(link, netlink.FAMILY_V4); aerr == nil && len(addrs) > 0 {
+					t.Logf("%s addresses on %s: %v", ns.path, link.Attrs().Name, addrs)
+				}
+				if routes, rerr := h.RouteList(link, netlink.FAMILY_V4); rerr == nil && len(routes) > 0 {
+					t.Logf("%s routes on %s: %v", ns.path, link.Attrs().Name, routes)
+				}
+				if info := vlans[int32(link.Attrs().Index)]; len(info) > 0 {
+					t.Logf("%s VLANs on %s: %v", ns.path, link.Attrs().Name, info)
+				}
+				if vx, ok := link.(*netlink.Vxlan); ok {
+					fdb, ferr := h.NeighList(vx.Attrs().Index, syscall.AF_BRIDGE)
+					t.Logf("%s VXLAN %s flow=%t id=%d local=%s port=%d FDB=%v err=%v",
+						ns.path, vx.Attrs().Name, vx.FlowBased, vx.VxlanId, vx.SrcAddr, vx.Port, fdb, ferr)
+				}
+			}
+			t.Logf("%s VLAN tunnel mappings: %v", ns.path, tunnels)
+			return nil
+		})
+		if err != nil {
+			t.Logf("dump %s: %v", ns.path, err)
+		}
 	}
 }
 
@@ -361,6 +431,74 @@ func sendIntegrationUDP(ns *NS, ip string, port int, body []byte) error {
 		_, err = conn.Write(body)
 		return err
 	})
+}
+
+func captureVXLANPacket(ns *NS, iface string, ready chan<- error, result chan<- bool) {
+	readySent := false
+	err := ns.Do(func() error {
+		h, err := netlink.NewHandle()
+		if err != nil {
+			return err
+		}
+		defer h.Close()
+		link, err := h.LinkByName(iface)
+		if err != nil {
+			return err
+		}
+		fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW, int(htons(unix.ETH_P_ALL)))
+		if err != nil {
+			return err
+		}
+		defer unix.Close(fd)
+		if err := unix.Bind(fd, &unix.SockaddrLinklayer{
+			Protocol: htons(unix.ETH_P_ALL),
+			Ifindex:  link.Attrs().Index,
+		}); err != nil {
+			return err
+		}
+		if err := unix.SetsockoptTimeval(fd, unix.SOL_SOCKET, unix.SO_RCVTIMEO,
+			&unix.Timeval{Sec: 3}); err != nil {
+			return err
+		}
+		ready <- nil
+		readySent = true
+		buf := make([]byte, 2048)
+		for {
+			n, _, err := unix.Recvfrom(fd, buf, 0)
+			if err != nil {
+				if errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EWOULDBLOCK) {
+					result <- false
+					return nil
+				}
+				return err
+			}
+			if isVXLANUDP(buf[:n]) {
+				result <- true
+				return nil
+			}
+		}
+	})
+	if err != nil {
+		if !readySent {
+			ready <- err
+			return
+		}
+		result <- false
+	}
+}
+
+func isVXLANUDP(frame []byte) bool {
+	if len(frame) < 14+20+8 || binary.BigEndian.Uint16(frame[12:14]) != 0x0800 {
+		return false
+	}
+	ipStart := 14
+	ihl := int(frame[ipStart]&0x0f) * 4
+	if ihl < 20 || len(frame) < ipStart+ihl+8 || frame[ipStart+9] != unix.IPPROTO_UDP {
+		return false
+	}
+	udpStart := ipStart + ihl
+	return binary.BigEndian.Uint16(frame[udpStart:udpStart+2]) == VXLANPort ||
+		binary.BigEndian.Uint16(frame[udpStart+2:udpStart+4]) == VXLANPort
 }
 
 func receiveForeignFrame(ns *NS, iface string, foreignMAC net.HardwareAddr, ready chan<- error, result chan<- error) {

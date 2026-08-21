@@ -15,6 +15,7 @@ import (
 
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netlink/nl"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -521,7 +522,7 @@ func ensureMultiplexBinding(h *netlink.Handle, vx *netlink.Vxlan, vlan uint16, v
 	}
 	for _, tunnel := range tunnels {
 		if tunnel.Vid == vlan && tunnel.TunId == vni {
-			if err := ensureVNIForwarding(h, vx, vni, remote); err != nil {
+			if err := ensureVNIForwarding(vx, vni, remote); err != nil {
 				return err
 			}
 			return nil
@@ -663,8 +664,8 @@ func deleteVLANMembership(h *netlink.Handle, link netlink.Link, info *nl.BridgeV
 	return nil
 }
 
-func ensureVNIForwarding(h *netlink.Handle, vx *netlink.Vxlan, vni uint32, remote net.IP) error {
-	entries, err := h.NeighList(vx.Attrs().Index, syscall.AF_BRIDGE)
+func ensureVNIForwarding(vx *netlink.Vxlan, vni uint32, remote net.IP) error {
+	entries, err := listExternalFDB(vx)
 	if err != nil {
 		return fmt.Errorf("multiplex VXLAN %s: list forwarding entries: %w", vx.Attrs().Name, err)
 	}
@@ -675,14 +676,14 @@ func ensureVNIForwarding(h *netlink.Handle, vx *netlink.Vxlan, vni uint32, remot
 		if entry.VNI != int(vni) || !bytesEqual(entry.HardwareAddr, zero) {
 			continue
 		}
-		if entry.IP != nil && entry.IP.Equal(remote) {
+		if entry.SourceVNI == vni && entry.IP != nil && entry.IP.Equal(remote) {
 			correct++
 			if correct == 1 {
 				continue
 			}
 		}
-		entry.Flags = netlink.NTF_SELF
-		if err := h.NeighDel(&entry); err != nil && !errors.Is(err, syscall.ENOENT) {
+		if err := deleteExternalFDB(vx, entry.SourceVNI, uint32(entry.VNI), entry.IP, entry.HardwareAddr); err != nil &&
+			!errors.Is(err, syscall.ENOENT) {
 			return fmt.Errorf("multiplex VXLAN %s: remove stale VNI %d FDB entry: %w",
 				vx.Attrs().Name, vni, err)
 		}
@@ -690,19 +691,91 @@ func ensureVNIForwarding(h *netlink.Handle, vx *netlink.Vxlan, vni uint32, remot
 	if correct > 0 {
 		return nil
 	}
-	entry := &netlink.Neigh{
-		LinkIndex:    vx.Attrs().Index,
-		Family:       syscall.AF_BRIDGE,
-		State:        netlink.NUD_PERMANENT,
-		Flags:        netlink.NTF_SELF,
-		IP:           remote,
-		HardwareAddr: zero,
-		VNI:          int(vni),
-	}
-	if err := h.NeighAppend(entry); err != nil && !isExist(err) {
+	if err := addExternalFDB(vx, vni, vni, remote, zero); err != nil && !isExist(err) {
 		return fmt.Errorf("multiplex VXLAN %s: add VNI %d FDB entry: %w", vx.Attrs().Name, vni, err)
 	}
 	return nil
+}
+
+// externalFDBEntry keeps the source VNI that the public netlink.Neigh type
+// omits. On a flow-based VXLAN, NDA_VNI names the remote encapsulation VNI,
+// while NDA_SRC_VNI keys the local FDB lookup performed for bridge tunnel
+// metadata. Both must be set to the link VNI.
+type externalFDBEntry struct {
+	netlink.Neigh
+	SourceVNI uint32
+}
+
+func listExternalFDB(vx *netlink.Vxlan) ([]externalFDBEntry, error) {
+	msg := netlink.Ndmsg{Family: syscall.AF_BRIDGE, Index: uint32(vx.Attrs().Index)}
+	req := nl.NewNetlinkRequest(unix.RTM_GETNEIGH, unix.NLM_F_DUMP)
+	req.AddData(&msg)
+	msgs, err := req.Execute(unix.NETLINK_ROUTE, unix.RTM_NEWNEIGH)
+	if err != nil {
+		return nil, err
+	}
+	var out []externalFDBEntry
+	for _, raw := range msgs {
+		neigh, err := netlink.NeighDeserialize(raw)
+		if err != nil || neigh.LinkIndex != vx.Attrs().Index || neigh.Family != syscall.AF_BRIDGE {
+			continue
+		}
+		attrs, err := nl.ParseRouteAttr(raw[msg.Len():])
+		if err != nil {
+			return nil, err
+		}
+		entry := externalFDBEntry{Neigh: *neigh}
+		for _, attr := range attrs {
+			if attr.Attr.Type == unix.NDA_SRC_VNI && len(attr.Value) >= 4 {
+				entry.SourceVNI = nl.NativeEndian().Uint32(attr.Value[:4])
+			}
+		}
+		out = append(out, entry)
+	}
+	return out, nil
+}
+
+func addExternalFDB(vx *netlink.Vxlan, sourceVNI, remoteVNI uint32, remote net.IP,
+	hardware net.HardwareAddr) error {
+
+	return externalFDBRequest(unix.RTM_NEWNEIGH, unix.NLM_F_CREATE|unix.NLM_F_APPEND,
+		vx, sourceVNI, remoteVNI, remote, hardware)
+}
+
+func deleteExternalFDB(vx *netlink.Vxlan, sourceVNI, remoteVNI uint32, remote net.IP,
+	hardware net.HardwareAddr) error {
+
+	return externalFDBRequest(unix.RTM_DELNEIGH, 0, vx, sourceVNI, remoteVNI, remote, hardware)
+}
+
+func externalFDBRequest(operation, flags int, vx *netlink.Vxlan, sourceVNI, remoteVNI uint32,
+	remote net.IP, hardware net.HardwareAddr) error {
+
+	req := nl.NewNetlinkRequest(operation, flags|unix.NLM_F_ACK)
+	msg := netlink.Ndmsg{
+		Family: uint8(syscall.AF_BRIDGE),
+		Index:  uint32(vx.Attrs().Index),
+		State:  uint16(netlink.NUD_PERMANENT),
+		Flags:  uint8(netlink.NTF_SELF),
+	}
+	req.AddData(&msg)
+	ip := remote.To4()
+	if ip == nil {
+		ip = remote.To16()
+	}
+	if ip == nil {
+		return fmt.Errorf("invalid FDB remote %q", remote)
+	}
+	req.AddData(nl.NewRtAttr(unix.NDA_DST, []byte(ip)))
+	req.AddData(nl.NewRtAttr(unix.NDA_LLADDR, []byte(hardware)))
+	if remoteVNI != 0 {
+		req.AddData(nl.NewRtAttr(unix.NDA_VNI, nl.Uint32Attr(remoteVNI)))
+	}
+	if sourceVNI != 0 {
+		req.AddData(nl.NewRtAttr(unix.NDA_SRC_VNI, nl.Uint32Attr(sourceVNI)))
+	}
+	_, err := req.Execute(unix.NETLINK_ROUTE, 0)
+	return err
 }
 
 type multiplexDevice struct {
@@ -750,18 +823,18 @@ func multiplexDevices(h *netlink.Handle, lab string) ([]multiplexDevice, error) 
 	return out, nil
 }
 
-func multiplexVNIs(h *netlink.Handle, vx *netlink.Vxlan) ([]uint32, error) {
-	entries, err := h.NeighList(vx.Attrs().Index, syscall.AF_BRIDGE)
+func multiplexVNIs(_ *netlink.Handle, vx *netlink.Vxlan) ([]uint32, error) {
+	entries, err := listExternalFDB(vx)
 	if err != nil {
 		return nil, fmt.Errorf("multiplex VXLAN %s: list forwarding entries: %w", vx.Attrs().Name, err)
 	}
 	zero := net.HardwareAddr{0, 0, 0, 0, 0, 0}
 	seen := map[uint32]bool{}
 	for _, entry := range entries {
-		if entry.VNI <= 0 || !bytesEqual(entry.HardwareAddr, zero) {
+		if entry.SourceVNI == 0 || !bytesEqual(entry.HardwareAddr, zero) {
 			continue
 		}
-		seen[uint32(entry.VNI)] = true
+		seen[entry.SourceVNI] = true
 	}
 	out := make([]uint32, 0, len(seen))
 	for vni := range seen {
@@ -908,19 +981,19 @@ func multiplexDevicesForVNI(h *netlink.Handle, devices []multiplexDevice, vni ui
 }
 
 func removeVNIFromDevice(h *netlink.Handle, device multiplexDevice, vni uint32) error {
-	entries, err := h.NeighList(device.vx.Attrs().Index, syscall.AF_BRIDGE)
+	entries, err := listExternalFDB(device.vx)
 	if err != nil {
 		return fmt.Errorf("multiplex VXLAN %s: list forwarding entries: %w", device.vx.Attrs().Name, err)
 	}
 	found := false
 	for i := range entries {
 		entry := entries[i]
-		if entry.VNI != int(vni) {
+		if entry.SourceVNI != vni && uint32(entry.VNI) != vni {
 			continue
 		}
 		found = true
-		entry.Flags = netlink.NTF_SELF
-		if err := h.NeighDel(&entry); err != nil && !errors.Is(err, syscall.ENOENT) {
+		if err := deleteExternalFDB(device.vx, entry.SourceVNI, uint32(entry.VNI),
+			entry.IP, entry.HardwareAddr); err != nil && !errors.Is(err, syscall.ENOENT) {
 			return fmt.Errorf("multiplex VXLAN %s: remove VNI %d FDB entry: %w",
 				device.vx.Attrs().Name, vni, err)
 		}
