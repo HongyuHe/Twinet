@@ -1,9 +1,11 @@
 package state
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -164,6 +166,7 @@ func TestAnUnchangedSnapshotIsNotRecordedTwice(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	first, err := s.Put(snap("cos461", "as3/MSP", "same"))
 	if err != nil {
 		t.Fatal(err)
@@ -184,5 +187,90 @@ func TestAnUnchangedSnapshotIsNotRecordedTwice(t *testing.T) {
 	}
 	if len(hist) != 1 {
 		t.Errorf("history has %d entries for one distinct configuration", len(hist))
+	}
+}
+
+func TestCurrentRecordsAreContentAddressedAndReplicable(t *testing.T) {
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := []byte(`{"mode":"platform","generation":"g1"}`)
+	if changed, err := s.PutRecord(Record{Lab: "cos461", Kind: RecordTopology, Content: raw}); err != nil || !changed {
+		t.Fatalf("store topology record: changed=%v err=%v", changed, err)
+	}
+	record, err := s.CurrentRecord("cos461", RecordTopology)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Digest == "" || string(record.Content) != string(raw) {
+		t.Fatalf("record was not preserved: %+v", record)
+	}
+	if _, err := s.PutRecord(Record{Lab: "cos461", Kind: RecordTopology,
+		Digest: "not-the-content-digest", Content: raw}); err == nil {
+		t.Fatal("a record with a forged digest was accepted")
+	}
+}
+
+// Periodic capture and a destructive boundary can overlap while a controller
+// retries. The store must never share one fixed temporary filename between
+// them; run this under -race as part of the durability gate.
+func TestConcurrentSnapshotsRemainReadable(t *testing.T) {
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	const writers = 32
+	start := make(chan struct{})
+	errs := make(chan error, writers)
+	var wg sync.WaitGroup
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			_, err := s.Put(Snapshot{
+				Lab: "cos461", Device: "as3/MSP", Kind: KindFRR,
+				TakenAt: time.Unix(1_700_000_000, int64(i)).UTC(),
+				Content: []byte(fmt.Sprintf("router bgp %d\n", i)),
+			})
+			errs <- err
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent capture failed: %v", err)
+		}
+	}
+	if _, err := s.Current("cos461", "as3/MSP", KindFRR); err != nil {
+		t.Fatalf("concurrent capture left an unreadable current pointer: %v", err)
+	}
+}
+
+func TestReplicaHistoryIsNotCollectedWithoutQuorumProof(t *testing.T) {
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Put(Snapshot{Lab: "cos461", Device: "as3/MSP", Kind: KindFRR,
+		TakenAt: time.Now().Add(-2 * time.Hour), Content: []byte("old\n")}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Put(Snapshot{Lab: "cos461", Device: "as3/MSP", Kind: KindFRR,
+		TakenAt: time.Now(), Content: []byte("current\n")}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PruneRetained("cos461", time.Now().Add(-time.Hour), false); err == nil {
+		t.Fatal("replica history was garbage-collected without a quorum proof")
+	}
+	history, err := s.History("cos461", "as3/MSP", KindFRR)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(history) != 2 {
+		t.Fatalf("unproven cleanup removed history: %v", history)
 	}
 }

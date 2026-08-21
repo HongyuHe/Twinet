@@ -408,7 +408,20 @@ func (c *Cluster) coordinatedApply(ctx context.Context, top *model.Topology,
 		return transactionFailure(nodes, nil, err)
 	}
 	defer lease.Release()
+	return c.coordinatedApplyWithLease(lease.Context(), top, req, lease, nil)
+}
 
+// coordinatedApplyWithLease runs a prepared apply under a caller-owned fence.
+// Durable migration uses this form so fresh capture, replication, restore
+// verification, and source pruning are one fenced mutation rather than three
+// independently successful-looking operations.
+func (c *Cluster) coordinatedApplyWithLease(ctx context.Context, top *model.Topology,
+	req agent.ApplyRequest, lease *MutationLease, proofs map[string][]agent.StateProof,
+) []NodeResult[agent.ApplyResponse] {
+	nodes := c.sortedNodes()
+	if lease == nil {
+		return transactionFailure(nodes, nil, errors.New("a coordinated apply needs a mutation lease"))
+	}
 	expected, err := c.clusterGeneration(lease.Context(), top.Name)
 	if err != nil {
 		return transactionFailure(nodes, nil, err)
@@ -433,6 +446,9 @@ func (c *Cluster) coordinatedApply(ctx context.Context, top *model.Topology,
 	for _, node := range nodes {
 		prepare := applyRequestForNode(req, wire, peers, lease, node.Name,
 			"prepare", expected, generation)
+		if proofs != nil {
+			prepare.StateProofs = append([]agent.StateProof(nil), proofs[node.Name]...)
+		}
 		if _, err := node.Apply(lease.Context(), prepare); err != nil {
 			rollbackErrs := c.abortApply(context.WithoutCancel(ctx), lease, wire, peers, generation, req)
 			if len(rollbackErrs) > 0 {
@@ -476,6 +492,28 @@ func (c *Cluster) coordinatedApply(ctx context.Context, top *model.Topology,
 			applyErr = fmt.Errorf("%w; rollback: %v", applyErr, rollbackErrs[0])
 		}
 		return transactionFailure(nodes, values, applyErr)
+	}
+
+	// Restore proof happens while the source placement is still running. A
+	// commit below is the first path that can prune it, and transactions with
+	// proofs refuse to commit until this endpoint persisted verification.
+	for _, node := range nodes {
+		if len(proofs[node.Name]) == 0 {
+			continue
+		}
+		fence, ok := lease.Fence(node.Name)
+		if !ok {
+			return transactionFailure(nodes, values, fmt.Errorf("no mutation fence for node %s", node.Name))
+		}
+		if _, err := node.VerifyStateRestore(lease.Context(), agent.StateVerifyRequest{
+			Lab: top.Name, Fence: fence, Generation: generation,
+		}); err != nil {
+			rollbackErrs := c.abortApply(context.WithoutCancel(ctx), lease, wire, peers, generation, req)
+			if len(rollbackErrs) > 0 {
+				err = fmt.Errorf("%w; rollback: %v", err, rollbackErrs[0])
+			}
+			return transactionFailure(nodes, values, fmt.Errorf("verify restored state on %s: %w", node.Name, err))
+		}
 	}
 
 	for _, node := range nodes {

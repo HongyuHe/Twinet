@@ -13,6 +13,10 @@ const (
 	RoleController = "controller"
 	RoleOperator   = "operator"
 	RoleDiagnostic = "diagnostic"
+	// RolePeer is issued only to node agents. It has one narrow capability:
+	// exchange durable replicas over the peer API. It is intentionally not a
+	// controller role, even though a node certificate is also used for TLS.
+	RolePeer = "peer"
 
 	ActionObserve   = "observe"
 	ActionExec      = "exec"
@@ -22,6 +26,7 @@ const (
 	ActionFault     = "fault"
 	ActionState     = "state"
 	ActionAdmin     = "admin"
+	ActionPeerState = "peer-state"
 
 	claimScheme = "spiffe"
 	claimHost   = "twinet.dev"
@@ -47,7 +52,7 @@ func (i Identity) Allows(lab, action string) bool {
 // URIs creates the canonical certificate claim for an identity.
 func URIs(role string, labs, actions []string) ([]*url.URL, error) {
 	switch role {
-	case RoleController, RoleOperator, RoleDiagnostic:
+	case RoleController, RoleOperator, RoleDiagnostic, RolePeer:
 	default:
 		return nil, fmt.Errorf("unknown certificate role %q", role)
 	}
@@ -82,7 +87,7 @@ func validateScope(role string, labs, actions []string) error {
 	known := map[string]bool{
 		ActionObserve: true, ActionExec: true, ActionDeploy: true,
 		ActionDestroy: true, ActionLifecycle: true, ActionFault: true,
-		ActionState: true, ActionAdmin: true,
+		ActionState: true, ActionAdmin: true, ActionPeerState: true,
 	}
 	switch role {
 	case RoleController:
@@ -108,6 +113,11 @@ func validateScope(role string, labs, actions []string) error {
 		if len(actions) != 1 || actions[0] != ActionObserve {
 			return fmt.Errorf("a diagnostic certificate may only observe")
 		}
+	case RolePeer:
+		if len(labs) != 1 || labs[0] != "*" ||
+			len(actions) != 1 || actions[0] != ActionPeerState {
+			return fmt.Errorf("peer certificates may only carry the peer-state cluster scope")
+		}
 	}
 	return nil
 }
@@ -127,7 +137,7 @@ func FromCertificate(cert *x509.Certificate) (Identity, error) {
 		}
 		role := u.Path[len(prefix):]
 		switch role {
-		case RoleController, RoleOperator, RoleDiagnostic:
+		case RoleController, RoleOperator, RoleDiagnostic, RolePeer:
 		default:
 			return Identity{}, fmt.Errorf("client certificate has unknown Twinet role %q", role)
 		}

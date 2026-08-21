@@ -5,10 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log/slog"
 	"net/http"
+	"sort"
+	"time"
 
 	"github.com/HongyuHe/twinet/internal/deploy"
+	"github.com/HongyuHe/twinet/internal/render"
+	rt "github.com/HongyuHe/twinet/internal/runtime"
 	"github.com/HongyuHe/twinet/internal/state"
 )
 
@@ -35,10 +38,15 @@ import (
 
 // StateExportResponse carries a device's snapshots off the node holding them.
 type StateExportResponse struct {
-	Lab       string          `json:"lab"`
-	Snapshots []WireSnapshot  `json:"snapshots"`
-	Missing   []string        `json:"missing,omitempty"`
-	Extra     json.RawMessage `json:"extra,omitempty"`
+	Lab       string         `json:"lab"`
+	Snapshots []WireSnapshot `json:"snapshots"`
+	Records   []WireRecord   `json:"records,omitempty"`
+	Missing   []string       `json:"missing,omitempty"`
+	// FreshAt is set only after the source completed a capture and durable
+	// replication quorum. A migration must not treat an old store read as a
+	// fresh boundary capture.
+	FreshAt time.Time       `json:"fresh_at,omitempty"`
+	Extra   json.RawMessage `json:"extra,omitempty"`
 }
 
 // WireSnapshot is a snapshot with its body, which state.Snapshot omits from
@@ -54,11 +62,13 @@ type StateImportRequest struct {
 	Hold      string         `json:"hold,omitempty"`
 	Fence     Fence          `json:"fence"`
 	Snapshots []WireSnapshot `json:"snapshots"`
+	Records   []WireRecord   `json:"records,omitempty"`
 }
 
 // StateImportResponse says how many were new.
 type StateImportResponse struct {
-	Stored int `json:"stored"`
+	Stored int        `json:"stored"`
+	Acks   []StateAck `json:"acks,omitempty"`
 }
 
 func (s *Server) handleStateExport(w http.ResponseWriter, r *http.Request) {
@@ -90,7 +100,12 @@ func (s *Server) handleStateExport(w http.ResponseWriter, r *http.Request) {
 	// before. Exporting the store alone therefore handed over whatever was
 	// last written, which for a device nobody had removed yet was nothing at
 	// all, and the transfer succeeded while carrying an empty set.
-	s.captureBeforeExport(r.Context(), lab, devices)
+	if r.URL.Query().Get("fresh") != "false" {
+		if err := s.captureBeforeExport(r.Context(), lab, devices); err != nil {
+			httpError(w, http.StatusConflict, fmt.Errorf("fresh state capture: %w", err))
+			return
+		}
+	}
 
 	resp := StateExportResponse{Lab: lab}
 	for _, d := range devices {
@@ -110,6 +125,17 @@ func (s *Server) handleStateExport(w http.ResponseWriter, r *http.Request) {
 			// node was not asked", and only one of those is safe to ignore.
 			resp.Missing = append(resp.Missing, d)
 		}
+	}
+	records, err := s.store.CurrentRecords(lab)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, fmt.Errorf("reading durable records: %w", err))
+		return
+	}
+	for _, record := range records {
+		resp.Records = append(resp.Records, WireRecord{Record: record, Content: record.Content})
+	}
+	if r.URL.Query().Get("fresh") != "false" {
+		resp.FreshAt = time.Now().UTC()
 	}
 	writeJSON(w, resp)
 }
@@ -143,6 +169,7 @@ func (s *Server) handleStateImport(w http.ResponseWriter, r *http.Request) {
 	}
 	defer s.release(req.Lab)
 	stored := 0
+	acks := make([]StateAck, 0, len(req.Snapshots)+len(req.Records))
 	for _, ws := range req.Snapshots {
 		if err := s.requireMutationFence(req.Lab, req.Fence); err != nil {
 			httpError(w, http.StatusConflict, err)
@@ -165,44 +192,111 @@ func (s *Server) handleStateImport(w http.ResponseWriter, r *http.Request) {
 		if isNew {
 			stored++
 		}
+		acks = append(acks, StateAck{Key: snapshotStateKey(snap), Digest: snap.Digest})
 	}
-	writeJSON(w, StateImportResponse{Stored: stored})
+	for _, wire := range req.Records {
+		if err := s.requireMutationFence(req.Lab, req.Fence); err != nil {
+			httpError(w, http.StatusConflict, err)
+			return
+		}
+		record := wire.Record
+		record.Content = wire.Content
+		if record.Lab != req.Lab {
+			httpError(w, http.StatusBadRequest, fmt.Errorf("record %s belongs to lab %q, not %q",
+				record.Kind, record.Lab, req.Lab))
+			return
+		}
+		isNew, err := s.store.PutRecord(record)
+		if err != nil {
+			httpError(w, http.StatusBadRequest, fmt.Errorf("storing %s record: %w", record.Kind, err))
+			return
+		}
+		if isNew {
+			stored++
+		}
+		if err := s.installImportedRecord(record); err != nil {
+			httpError(w, http.StatusInternalServerError, err)
+			return
+		}
+		acks = append(acks, StateAck{Key: recordStateKey(record), Digest: record.Digest})
+	}
+
+	sort.Slice(acks, func(i, j int) bool { return acks[i].Key < acks[j].Key })
+	writeJSON(w, StateImportResponse{Stored: stored, Acks: acks})
+}
+
+// installImportedRecord restores the local repair metadata represented by a
+// durable record. Topology remains replica-only until the fenced apply commits
+// it, but exemptions and active holds must take effect before a repair loop can
+// undo a deliberately broken or externally managed lab.
+func (s *Server) installImportedRecord(record state.Record) error {
+	switch record.Kind {
+	case state.RecordExemptions:
+		if err := s.store.PutExemptions(record.Lab, record.Content); err != nil {
+			return fmt.Errorf("install imported exemptions: %w", err)
+		}
+		s.loadExemptions(record.Lab)
+	case state.RecordHolds:
+		if err := s.store.PutHolds(record.Lab, record.Content); err != nil {
+			return fmt.Errorf("install imported holds: %w", err)
+		}
+		s.loadHolds(record.Lab)
+	}
+	return nil
 }
 
 // captureBeforeExport snapshots any of the named devices this node is still
 // running, so that what is handed over is current rather than historical.
 //
-// Failures are not fatal: a device that cannot be captured falls back to
-// whatever the store already holds, which is the situation that existed before
-// this ran. Refusing the whole export because one container was mid-restart
-// would deny the caller the snapshots it could have had.
-func (s *Server) captureBeforeExport(ctx context.Context, lab string, devices []string) {
+// Failures are fatal for a fresh export. Falling back to an older store entry
+// while the source is reachable is precisely the stale-state migration failure
+// this boundary prevents; an explicit recovery path may request fresh=false
+// only after a source-loss decision is audited.
+func (s *Server) captureBeforeExport(ctx context.Context, lab string, devices []string) error {
 	if s.rt == nil || s.store == nil {
-		return
+		return errors.New("this node cannot capture durable state")
 	}
 	s.mu.Lock()
 	top := s.current[lab]
+	solved := s.modes[lab] == string(render.ModeSolve)
 	s.mu.Unlock()
 	if top == nil {
-		return
+		return fmt.Errorf("this node has no topology record for %q", lab)
+	}
+	if solved {
+		return fmt.Errorf("lab %q is currently solved, so a fresh export would capture the reference answer", lab)
 	}
 	want := map[string]bool{}
 	for _, d := range devices {
 		want[d] = true
 	}
-	for _, d := range top.Devices {
-		if !want[d.ID] || d.Node != s.cfg.Node {
-			continue
+	for id := range want {
+		d, ok := top.Device(id)
+		if !ok {
+			return fmt.Errorf("source topology has no device %q", id)
+		}
+		if d.Node != s.cfg.Node {
+			return fmt.Errorf("device %s is placed on %s, not source %s", id, d.Node, s.cfg.Node)
+		}
+		current, err := s.rt.Inspect(ctx, d.Container)
+		if err != nil {
+			return fmt.Errorf("inspect %s before fresh capture: %w", d.ID, err)
+		}
+		if current.State == rt.StateAbsent {
+			return fmt.Errorf("device %s is absent, so its state cannot be freshly captured", d.ID)
 		}
 		snaps, err := deploy.Capture(ctx, s.rt, d, lab, top.Hash)
 		if err != nil {
-			slog.Debug("capturing before export", "device", d.ID, "err", err)
-			continue
+			return fmt.Errorf("capture %s: %w", d.ID, err)
 		}
 		for _, sn := range snaps {
 			if _, err := s.store.Put(sn); err != nil {
-				slog.Warn("storing a snapshot taken for export", "device", d.ID, "err", err)
+				return fmt.Errorf("store %s/%s: %w", d.ID, sn.Kind, err)
 			}
 		}
 	}
+	if err := s.replicateDurableState(ctx, top); err != nil {
+		return err
+	}
+	return nil
 }

@@ -167,6 +167,10 @@ type Lab struct {
 	// Placement configures how ASes are distributed across cluster nodes.
 	Placement Placement `yaml:"placement,omitempty" json:"placement,omitempty"`
 
+	// State controls durable preservation of student-owned configuration and
+	// the agent records needed to repair a lab after a node loss.
+	State StatePolicy `yaml:"state,omitempty" json:"state,omitempty"`
+
 	// Egress optionally allows named devices to reach the outside world.
 	Egress []EgressRule `yaml:"egress,omitempty" json:"egress,omitempty"`
 
@@ -824,6 +828,10 @@ type Placement struct {
 	Nodes    []NodeSpec        `yaml:"nodes,omitempty" json:"nodes,omitempty"`
 	Pin      []PlacementPin    `yaml:"pin,omitempty" json:"pin,omitempty"`
 	Reserve  map[string]Budget `yaml:"reserve,omitempty" json:"reserve,omitempty"`
+	// OnNodeLoss decides whether a clustered deployment may move work away
+	// from an unavailable node. Rescheduling still requires verified durable
+	// replicas; it is never permission to rebuild from an empty image.
+	OnNodeLoss string `yaml:"on_node_loss,omitempty" json:"on_node_loss,omitempty" jsonschema:"enum=fail,enum=reschedule"`
 }
 
 // NodeSpec declares one cluster node.
@@ -837,6 +845,43 @@ type NodeSpec struct {
 	Capacity *Budget `yaml:"capacity,omitempty" json:"capacity,omitempty"`
 	// Front marks the node that publishes the web UI, gateway and VPN.
 	Front bool `yaml:"front,omitempty" json:"front,omitempty"`
+	// FailureDomain names the independently failing unit containing this
+	// node, such as a rack, availability zone, or host. An omitted value is
+	// the node itself, which is conservative for ordinary teaching clusters.
+	FailureDomain string `yaml:"failure_domain,omitempty" json:"failure_domain,omitempty"`
+}
+
+// Domain returns the failure domain used for durable-copy placement.
+func (n NodeSpec) Domain() string {
+	if n.FailureDomain != "" {
+		return n.FailureDomain
+	}
+	return n.Name
+}
+
+// StatePolicy is the manifest contract for durable student state.
+//
+// FailClosed is a pointer so omitted means the safe default (true), while an
+// operator who deliberately accepts possible data loss can still state that
+// exceptional choice explicitly and receive an audit warning.
+type StatePolicy struct {
+	// ReplicationFactor counts the source copy. Clustered labs default to two
+	// copies in distinct failure domains; a local lab defaults to one.
+	ReplicationFactor int `yaml:"replication_factor,omitempty" json:"replication_factor,omitempty"`
+	// CaptureInterval is a Go duration such as 5m. Agents capture on this
+	// cadence even when no controller or CLI process remains alive.
+	CaptureInterval string `yaml:"capture_interval,omitempty" json:"capture_interval,omitempty"`
+	// FailClosed refuses a destructive operation when a fresh capture or its
+	// replica quorum cannot be confirmed.
+	FailClosed *bool `yaml:"fail_closed,omitempty" json:"fail_closed,omitempty"`
+	// ReplicaRetention bounds how long non-current durable history remains
+	// available after a verified replication quorum makes it unnecessary.
+	ReplicaRetention string `yaml:"replica_retention,omitempty" json:"replica_retention,omitempty"`
+}
+
+// FailClosedEnabled returns the safe effective policy value.
+func (p StatePolicy) FailClosedEnabled() bool {
+	return p.FailClosed == nil || *p.FailClosed
 }
 
 // Budget is a resource allowance.
@@ -919,6 +964,24 @@ func (l *Lab) Normalize() {
 	if l.LinkDefaults.MTU == nil {
 		mtu := 1500
 		l.LinkDefaults.MTU = &mtu
+	}
+	clustered := l.Placement.Strategy != "single-node" && len(l.Placement.Nodes) > 1
+	if l.State.ReplicationFactor == 0 {
+		if clustered {
+			l.State.ReplicationFactor = 2
+		} else {
+			l.State.ReplicationFactor = 1
+		}
+	}
+	if l.State.CaptureInterval == "" {
+		l.State.CaptureInterval = "5m"
+	}
+	if l.State.FailClosed == nil {
+		enabled := true
+		l.State.FailClosed = &enabled
+	}
+	if l.State.ReplicaRetention == "" {
+		l.State.ReplicaRetention = "168h"
 	}
 }
 

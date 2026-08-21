@@ -158,3 +158,30 @@ func TestAtomicRecordEncodingDoesNotGainGroupFields(t *testing.T) {
 		t.Errorf("ordinary placement record changed wire format: %s", raw)
 	}
 }
+
+func TestStagedRecordDoesNotChangePlacementUntilCommit(t *testing.T) {
+	dir := t.TempDir()
+	old := &Record{Lab: "t", Strategy: "pack-by-as", ByAS: map[int]string{1: "a"},
+		ByGroup: map[string]string{}, ByService: map[string]string{}}
+	if err := SaveRecord(dir, old); err != nil {
+		t.Fatal(err)
+	}
+	next := &Record{Lab: "t", Strategy: "pack-by-as", ByAS: map[int]string{1: "b"},
+		ByGroup: map[string]string{}, ByService: map[string]string{}}
+	if err := StageRecord(dir, next); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadRecord(dir, "t"); err == nil {
+		t.Fatal("an unfinalized placement transaction was silently treated as the old active record")
+	}
+	if err := CommitStagedRecord(dir); err != nil {
+		t.Fatal(err)
+	}
+	active, err := LoadRecord(dir, "t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active.ByAS[1] != "b" {
+		t.Fatalf("committed staged placement was not promoted: %+v", active)
+	}
+}

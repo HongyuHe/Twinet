@@ -56,6 +56,22 @@ func (s *Server) handleApplyPrepare(w http.ResponseWriter, r *http.Request, req 
 		httpError(w, http.StatusBadRequest, errors.New("apply lab does not match its topology"))
 		return
 	}
+	var durableStoreErr error
+	if s.store == nil {
+		durableStoreErr = errors.New("node has no state store")
+	} else if err := s.store.Healthy(); err != nil {
+		durableStoreErr = fmt.Errorf("node state store is unavailable: %w", err)
+	}
+	if top.Lab.State.ReplicationFactor > 1 && durableStoreErr != nil {
+		if top.Lab.State.FailClosedEnabled() {
+			httpError(w, http.StatusServiceUnavailable, errors.New(
+				"clustered durable state requires a healthy node state store; refusing an apply that could acknowledge only one copy: "+
+					durableStoreErr.Error()))
+			return
+		}
+		slog.Error("AUDIT: applying clustered lab without a durable node state store because fail_closed=false",
+			"lab", top.Name, "node", s.cfg.Node, "err", durableStoreErr)
+	}
 	if why := s.refuseMutationIfHeld(top.Name, req.Hold, "this deployment"); why != "" {
 		httpError(w, http.StatusConflict, errors.New(why))
 		return
@@ -70,7 +86,7 @@ func (s *Server) handleApplyPrepare(w http.ResponseWriter, r *http.Request, req 
 		return
 	}
 	if err := s.prepareGeneration(top.Name, req.Fence, req.ExpectedGeneration, req.Generation,
-		raw, req.Mode, req.Ungraded, req.PeerUnderlay, req.Prune, req.OnlySteps); err != nil {
+		raw, req.Mode, req.Ungraded, req.PeerUnderlay, req.Prune, req.OnlySteps, req.StateProofs); err != nil {
 		httpError(w, http.StatusConflict, err)
 		return
 	}
@@ -185,6 +201,19 @@ func (s *Server) commitAppliedTopology(ctx context.Context, top *model.Topology,
 
 	resp := ApplyResponse{Node: s.cfg.Node, Generation: tx.Generation, Phase: "commit"}
 	eng := s.transactionEngine(top, tx)
+	// Capture and replicate before any prune. A commit that removes the old
+	// placement before its current state and topology record have a verified
+	// failure-domain-separated quorum is not a successful migration.
+	if s.store != nil {
+		n, captureErr := s.captureAndReplicate(ctx, top)
+		if captureErr != nil {
+			if err := s.durableBoundary(top, "committing this deployment", captureErr); err != nil {
+				return ApplyResponse{}, err
+			}
+		} else {
+			resp.Snapshots = n
+		}
+	}
 	if tx.Prune {
 		gone, err := eng.PruneOrphans(ctx, top)
 		if err != nil {
@@ -209,13 +238,6 @@ func (s *Server) commitAppliedTopology(ctx context.Context, top *model.Topology,
 	}
 	if err := s.finishCommittedGeneration(top.Name, fence, tx.Generation); err != nil {
 		return ApplyResponse{}, err
-	}
-	if s.store != nil && tx.Mode != string(render.ModeSolve) {
-		if n, err := eng.CaptureAll(ctx, top, s.store); err != nil {
-			slog.Warn("capturing student configuration after commit", "err", err, "saved", n)
-		} else {
-			resp.Snapshots = n
-		}
 	}
 	return resp, nil
 }

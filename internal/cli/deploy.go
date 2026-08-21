@@ -40,6 +40,8 @@ func newDeployCmd(opts *Options) *cobra.Command {
 		prune      bool
 		rebalance  bool
 		overcommit bool
+		allowStale bool
+		allowLoss  bool
 	)
 	cmd := &cobra.Command{
 		Use:   "deploy",
@@ -66,6 +68,7 @@ after a partial failure, a reboot, or a topology edit.`,
 			if err != nil {
 				return err
 			}
+			warnSingleNodeDurability(cmd.ErrOrStderr(), top)
 			rec, err := place.LoadRecord(labPrivateDir(top), top.Name)
 			if err != nil {
 				return err
@@ -92,7 +95,32 @@ after a partial failure, a reboot, or a topology edit.`,
 				if err != nil {
 					return err
 				}
-				inventory, err = client.NewCluster(top.Lab, tok).Inventories(cmd.Context())
+				cluster := client.NewCluster(top.Lab, tok)
+				lost := unavailableClusterNodes(cluster.Status(cmd.Context()))
+				if len(lost) > 0 {
+					if top.Lab.Placement.OnNodeLoss != "reschedule" {
+						return fmt.Errorf("cluster health check failed before placement; %s is unavailable and placement.on_node_loss is %q",
+							strings.Join(lost, ", "), effectiveNodeLossPolicy(top.Lab))
+					}
+					if rec == nil {
+						return fmt.Errorf("cannot reschedule unavailable node(s) %s without a committed placement record; "+
+							"refusing to guess which student state must be recovered", strings.Join(lost, ", "))
+					}
+					if err := removeUnavailableNodes(top.Lab, lost); err != nil {
+						return err
+					}
+					if err := ensureSurvivingDurability(top.Lab); err != nil {
+						return err
+					}
+					fmt.Fprintf(cmd.ErrOrStderr(),
+						"AUDIT: placement.on_node_loss=reschedule removes unavailable node(s) %s; restoring only verified replicas\n",
+						strings.Join(lost, ", "))
+					cluster = client.NewCluster(top.Lab, tok)
+				}
+				if err := cluster.HealthCheck(cmd.Context()); err != nil {
+					return err
+				}
+				inventory, err = cluster.Inventories(cmd.Context())
 				if err != nil {
 					if !overcommit {
 						return fmt.Errorf("strict admission requires live inventory before placement: %w", err)
@@ -148,14 +176,9 @@ after a partial failure, a reboot, or a topology edit.`,
 			if err := resolveImageIDs(cmd.Context(), top, token); err != nil {
 				return err
 			}
-			// Written before anything is created, so that a deploy which
-			// fails half way leaves a record matching the containers that
-			// did come up. Writing it afterwards would mean a crash left the
-			// lab placed one way and the record saying another, which is the
-			// drift the record exists to prevent.
-			if !dryRun {
-				record := a.Record(top.Name, strategyOf(top, rebalance, adopted))
-				record.Overcommit = overcommit
+			record := a.Record(top.Name, strategyOf(top, rebalance, adopted))
+			record.Overcommit = overcommit
+			if !dryRun && !clustered(top) {
 				if err := place.SaveRecord(labPrivateDir(top), record); err != nil {
 					return fmt.Errorf("recording where the lab was placed: %w", err)
 				}
@@ -170,7 +193,15 @@ after a partial failure, a reboot, or a topology edit.`,
 				if err != nil {
 					return err
 				}
-				return deployCluster(cmd.Context(), top, tok, agent.ApplyRequest{
+				// Stage immediately before the fenced operation, after every
+				// local validation that can still fail without touching a node.
+				if !dryRun {
+					if err := place.StageRecord(labPrivateDir(top), record); err != nil {
+						return fmt.Errorf("staging where the lab will be placed: %w", err)
+					}
+				}
+				moved := placementRecordMoved(rec, record)
+				deployErr := deployCluster(cmd.Context(), top, tok, agent.ApplyRequest{
 					Mode:            modeName(solve),
 					PullPolicy:      pull,
 					Workers:         workers,
@@ -186,10 +217,26 @@ after a partial failure, a reboot, or a topology edit.`,
 					// fault nobody would think to look for because both halves
 					// look correct. A move is exactly when it matters, so a
 					// move now prunes whether it was asked for or not.
-					Prune:      (prune || rebalance) && only == "",
+					Prune:      (prune || rebalance || moved) && only == "",
 					Generation: time.Now().UTC().Format("20060102T150405"),
 					OnlySteps:  scope,
+				}, client.DurabilityOptions{
+					Previous: rec, AllowStaleState: allowStale, AllowDataLoss: allowLoss,
 				}, cmd.OutOrStdout(), cmd.ErrOrStderr())
+				if deployErr != nil {
+					if !dryRun {
+						if discardErr := place.DiscardStagedRecord(labPrivateDir(top)); discardErr != nil {
+							return fmt.Errorf("%w; also could not discard uncommitted placement: %v", deployErr, discardErr)
+						}
+					}
+					return deployErr
+				}
+				if !dryRun {
+					if err := place.CommitStagedRecord(labPrivateDir(top)); err != nil {
+						return fmt.Errorf("deployment committed but placement record could not be committed: %w", err)
+					}
+				}
+				return nil
 			}
 
 			rt := runtime.NewDocker()
@@ -302,6 +349,10 @@ after a partial failure, a reboot, or a topology edit.`,
 	cmd.Flags().BoolVar(&rebalance, "rebalance", false,
 		"recompute placement from scratch; every AS that moves has its containers rebuilt "+
 			"and removed from the node it left")
+	cmd.Flags().BoolVar(&allowStale, "allow-stale-state", false,
+		"AUDIT: permit migration from stored state after fresh capture cannot be proved")
+	cmd.Flags().BoolVar(&allowLoss, "allow-data-loss", false,
+		"AUDIT: permit migration when no verified durable replica can be found")
 	return cmd
 }
 
@@ -1047,6 +1098,7 @@ func strategyOf(top *model.Topology, rebalance, adopted bool) string {
 	if s == "" {
 		s = "pack-by-as"
 	}
+
 	switch {
 	case rebalance:
 		return s + " (rebalanced)"
@@ -1057,6 +1109,97 @@ func strategyOf(top *model.Topology, rebalance, adopted bool) string {
 		return s + " (adopted from the running lab)"
 	}
 	return s
+}
+
+// warnSingleNodeDurability keeps the loss boundary visible at the command that
+// starts a lab. Manifest validation also warns, but deploy output is commonly
+// the only log an operator retains.
+func warnSingleNodeDurability(w io.Writer, top *model.Topology) {
+	if top == nil || top.Lab == nil || clustered(top) {
+		return
+	}
+	fmt.Fprintf(w,
+		"WARNING: %s is single-node; student state has one local durable copy and cannot survive this node or disk loss\n",
+		top.Name)
+}
+
+func placementRecordMoved(previous, next *place.Record) bool {
+	if previous == nil || next == nil {
+		return false
+	}
+	changed := func(before, after map[string]string) bool {
+		for key, old := range before {
+			if now, ok := after[key]; ok && now != old {
+				return true
+			}
+		}
+		return false
+	}
+	beforeAS, afterAS := map[string]string{}, map[string]string{}
+	for asn, node := range previous.ByAS {
+		beforeAS[strconv.Itoa(asn)] = node
+	}
+	for asn, node := range next.ByAS {
+		afterAS[strconv.Itoa(asn)] = node
+	}
+	return changed(beforeAS, afterAS) ||
+		changed(previous.ByGroup, next.ByGroup) ||
+		changed(previous.ByService, next.ByService)
+}
+
+func unavailableClusterNodes(results []client.NodeResult[agent.StatusResponse]) []string {
+	var out []string
+	for _, result := range results {
+		if result.Err != nil || (result.Value.StateStoreHealthy != nil && !*result.Value.StateStoreHealthy) {
+			out = append(out, result.Node)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func effectiveNodeLossPolicy(lab *model.Lab) string {
+	if lab == nil || lab.Placement.OnNodeLoss == "" {
+		return "fail"
+	}
+	return lab.Placement.OnNodeLoss
+}
+
+func removeUnavailableNodes(lab *model.Lab, unavailable []string) error {
+	if lab == nil {
+		return fmt.Errorf("cannot remove unavailable nodes from a nil lab")
+	}
+	skip := map[string]bool{}
+	for _, name := range unavailable {
+		skip[name] = true
+	}
+	kept := make([]model.NodeSpec, 0, len(lab.Placement.Nodes))
+	for _, node := range lab.Placement.Nodes {
+		if !skip[node.Name] {
+			kept = append(kept, node)
+		}
+	}
+	if len(kept) == 0 {
+		return fmt.Errorf("all placement nodes are unavailable")
+	}
+	lab.Placement.Nodes = kept
+	lab.Normalize()
+	return nil
+}
+
+func ensureSurvivingDurability(lab *model.Lab) error {
+	if lab == nil {
+		return fmt.Errorf("durability needs a lab")
+	}
+	domains := map[string]bool{}
+	for _, node := range lab.Placement.Nodes {
+		domains[node.Domain()] = true
+	}
+	if need := lab.State.ReplicationFactor; need > len(domains) {
+		return fmt.Errorf("cannot reschedule safely: durable replication factor %d needs %d surviving failure domains, but only %d remain",
+			need, need, len(domains))
+	}
+	return nil
 }
 
 // warnAboutMoves says out loud when an AS is not where it was.

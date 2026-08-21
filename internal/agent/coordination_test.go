@@ -183,9 +183,10 @@ func TestPreparedGenerationFailsClosedAfterControllerLoss(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	raw, _ := json.Marshal(&Wire{Lab: "cos461"})
 	if err := s.prepareGeneration("cos461", first.Fence, "", "generation-a", raw,
-		"platform", 0, nil, false, nil); err != nil {
+		"platform", 0, nil, false, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	s.mu.Lock()
@@ -196,7 +197,42 @@ func TestPreparedGenerationFailsClosedAfterControllerLoss(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := s.prepareGeneration("cos461", second.Fence, "", "generation-b", raw,
-		"platform", 0, nil, false, nil); err == nil {
+		"platform", 0, nil, false, nil, nil); err == nil {
 		t.Fatal("a new controller replaced an unfinished generation instead of failing closed")
+	}
+}
+
+// Source pruning is only reachable from commit. A migration transaction with
+// imported state but no verified destination restore must therefore remain
+// unable to commit across controller interruption at every earlier phase.
+func TestInterruptedMigrationCannotPruneBeforeVerifiedRestore(t *testing.T) {
+	s := coordinationTestServer(t, nil)
+	lease, err := s.acquireMutationLease(LeaseAcquireRequest{Lab: "cos461"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(&Wire{Lab: "cos461"})
+	proofs := []StateProof{{Device: "as3/MSP", Snapshots: []WireSnapshot{{
+		Snapshot: state.Snapshot{Lab: "cos461", Device: "as3/MSP", Kind: state.KindFRR, Digest: "digest"},
+		Content:  []byte("router bgp 3\n"),
+	}}}}
+	if err := s.prepareGeneration("cos461", lease.Fence, "", "generation-state", raw,
+		"platform", 0, nil, true, nil, proofs); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.transactionForCommit("cos461", lease.Fence, "generation-state"); err == nil {
+		t.Fatal("an unapplied migration was allowed to commit")
+	}
+	if err := s.markGenerationApplied("cos461", lease.Fence, "generation-state"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.transactionForCommit("cos461", lease.Fence, "generation-state"); err == nil {
+		t.Fatal("source prune was permitted before destination restore verification")
+	}
+	if err := s.markStateVerified("cos461", lease.Fence, "generation-state"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.transactionForCommit("cos461", lease.Fence, "generation-state"); err != nil {
+		t.Fatalf("verified restore still could not commit: %v", err)
 	}
 }

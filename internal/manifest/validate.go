@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/netip"
 	"regexp"
+	"time"
 
 	"gopkg.in/yaml.v3"
 	"sort"
@@ -37,6 +38,7 @@ func (l *Loaded) Validate() *Diagnostics {
 	l.validateEgress(d, file)
 	l.validateResources(d, file)
 	l.validatePlacement(d, file)
+	l.validateStatePolicy(d, file)
 	l.validateAccess(d, file)
 	_ = lab
 	return d
@@ -690,6 +692,87 @@ func (l *Loaded) validatePlacement(d *Diagnostics, file string) {
 		}
 		validateBudget(d, file, "placement.reserve."+name, p.Reserve[name],
 			nodeAt(root, "placement.reserve."+name))
+	}
+	switch p.OnNodeLoss {
+	case "", "fail", "reschedule":
+	default:
+		d.Addf(file, "placement.on_node_loss", nodeAt(root, "placement"),
+			"unknown on_node_loss policy %q (fail, reschedule)", p.OnNodeLoss)
+	}
+}
+
+// validateStatePolicy rejects a durability declaration that cannot deliver
+// its promised number of independent copies. A replica on another process in
+// the same failure domain does not survive the node or disk loss this policy
+// exists to cover.
+func (l *Loaded) validateStatePolicy(d *Diagnostics, file string) {
+	root := l.Nodes[file]
+	p := l.Lab.State
+	path := "state"
+	clustered := l.Lab.Placement.Strategy != "single-node" && len(l.Lab.Placement.Nodes) > 1
+
+	if p.ReplicationFactor < 1 {
+		d.Addf(file, path+".replication_factor", nodeAt(root, path),
+			"replication_factor must be at least one, got %d", p.ReplicationFactor)
+	}
+	if interval, err := time.ParseDuration(p.CaptureInterval); err != nil || interval <= 0 {
+		msg := "capture_interval must be a positive Go duration such as 5m"
+		if err != nil {
+			msg = fmt.Sprintf("capture_interval %q is invalid: %v", p.CaptureInterval, err)
+		}
+		d.Add(file, path+".capture_interval", msg, nodeAt(root, path))
+	}
+	retention, retentionErr := time.ParseDuration(p.ReplicaRetention)
+	if retentionErr != nil || retention <= 0 {
+		msg := "replica_retention must be a positive Go duration such as 168h"
+		if retentionErr != nil {
+			msg = fmt.Sprintf("replica_retention %q is invalid: %v", p.ReplicaRetention, retentionErr)
+		}
+		d.Add(file, path+".replica_retention", msg, nodeAt(root, path))
+	} else if interval, err := time.ParseDuration(p.CaptureInterval); err == nil && retention < interval {
+		d.AddHint(file, path+".replica_retention", nodeAt(root, path),
+			"replica_retention is shorter than capture_interval",
+			"retain at least one full capture interval so a verified replica remains available")
+	}
+
+	domains := map[string]bool{}
+	for _, n := range l.Lab.Placement.Nodes {
+		if n.Name == "" {
+			continue
+		}
+		domains[n.Domain()] = true
+	}
+	if clustered {
+		if p.ReplicationFactor > len(domains) {
+			d.AddHint(file, path+".replication_factor", nodeAt(root, path),
+				fmt.Sprintf("replication_factor %d needs %d failure domains, but this cluster has %d",
+					p.ReplicationFactor, p.ReplicationFactor, len(domains)),
+				"add independently failing nodes, reduce replication_factor, or use single-node placement explicitly")
+		}
+		if p.ReplicationFactor < 2 {
+			d.Warn(file, path+".replication_factor",
+				"clustered student state has fewer than two copies and cannot survive one node or disk loss",
+				nodeAt(root, path))
+		}
+	} else {
+		if p.ReplicationFactor > 1 {
+			d.AddHint(file, path+".replication_factor", nodeAt(root, path),
+				"single-node placement cannot place replicas in separate failure domains",
+				"add clustered placement nodes or use replication_factor: 1")
+		}
+		d.Warn(file, path,
+			"single-node durability stores one local copy only; loss of this node or its disk can lose student state",
+			nodeAt(root, path))
+	}
+	if !p.FailClosedEnabled() {
+		d.Warn(file, path+".fail_closed",
+			"fail_closed: false permits destructive work without a verified fresh replica quorum and is an audited data-loss exception",
+			nodeAt(root, path))
+	}
+	if l.Lab.Placement.OnNodeLoss == "reschedule" && len(domains) < 2 {
+		d.AddHint(file, "placement.on_node_loss", nodeAt(root, "placement"),
+			"reschedule needs another failure domain containing a verified replica",
+			"add an independent node or use on_node_loss: fail")
 	}
 }
 

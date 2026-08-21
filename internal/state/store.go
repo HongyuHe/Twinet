@@ -74,6 +74,20 @@ func Open(dir string) (*Store, error) {
 // Root returns the store's directory.
 func (s *Store) Root() string { return s.root }
 
+// Healthy verifies the state root still exists and is a directory. It is a
+// lightweight health signal for placement: a node with a running agent but a
+// missing state disk must be treated as unavailable for durable rescheduling.
+func (s *Store) Healthy() error {
+	info, err := os.Stat(s.root)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("state root %s is not a directory", s.root)
+	}
+	return nil
+}
+
 func (s *Store) deviceDir(lab, device string) string {
 	return filepath.Join(s.root, safe(lab), safe(device))
 }
@@ -91,7 +105,16 @@ func (s *Store) Put(snap Snapshot) (bool, error) {
 		return false, errors.New("state: a snapshot needs a lab, device and kind")
 	}
 	sum := sha256.Sum256(snap.Content)
-	snap.Digest = hex.EncodeToString(sum[:])
+	digest := hex.EncodeToString(sum[:])
+	if snap.Digest != "" && snap.Digest != digest {
+		return false, fmt.Errorf("state: snapshot %s/%s claims digest %s but its content is %s",
+			snap.Device, snap.Kind, snap.Digest, digest)
+	}
+	if snap.Bytes != 0 && snap.Bytes != len(snap.Content) {
+		return false, fmt.Errorf("state: snapshot %s/%s says it has %d bytes but has %d",
+			snap.Device, snap.Kind, snap.Bytes, len(snap.Content))
+	}
+	snap.Digest = digest
 	snap.Bytes = len(snap.Content)
 	if snap.TakenAt.IsZero() {
 		snap.TakenAt = time.Now().UTC()
@@ -143,6 +166,17 @@ func (s *Store) Current(lab, device string, kind Kind) (Snapshot, error) {
 	if err != nil {
 		return Snapshot{}, err
 	}
+	sum := sha256.Sum256(body)
+	got := hex.EncodeToString(sum[:])
+	if snap.Digest == "" || snap.Digest != got {
+		return Snapshot{}, fmt.Errorf("state: snapshot %s/%s digest does not match its body",
+			device, kind)
+	}
+	if snap.Bytes != 0 && snap.Bytes != len(body) {
+		return Snapshot{}, fmt.Errorf("state: snapshot %s/%s byte count does not match its body",
+			device, kind)
+	}
+	snap.Bytes = len(body)
 	snap.Content = body
 	return snap, nil
 }
@@ -245,10 +279,19 @@ func (s *Store) Prune(lab string, keep int) (int, error) {
 }
 
 func writeAtomic(path string, data []byte, mode os.FileMode) error {
-	tmp := path + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
+	dir, base := filepath.Dir(path), filepath.Base(path)
+	// A fixed ".tmp" name turns two periodic captures into one writer
+	// truncating the other's body before either rename. Keep temporary files
+	// beside their target for atomic rename, but make each writer unique.
+	f, err := os.CreateTemp(dir, "."+base+".tmp-*")
 	if err != nil {
-		return fmt.Errorf("state: open %s: %w", tmp, err)
+		return fmt.Errorf("state: open %s: %w", path, err)
+	}
+	tmp := f.Name()
+	if err := f.Chmod(mode); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return fmt.Errorf("state: chmod %s: %w", tmp, err)
 	}
 	if _, err := f.Write(data); err != nil {
 		_ = f.Close()
@@ -299,7 +342,14 @@ func (s *Store) PutTopology(lab string, raw []byte) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	return writeAtomic(filepath.Join(dir, "topology.json"), raw, 0o600)
+	if err := writeAtomic(filepath.Join(dir, "topology.json"), raw, 0o600); err != nil {
+		return err
+	}
+	// topology.json remains the local-hosting marker read on restart. The
+	// immutable record is the replica payload: it survives removal of the
+	// local marker after migration and can be recovered from another node.
+	_, err := s.PutRecord(Record{Lab: lab, Kind: RecordTopology, Content: raw})
+	return err
 }
 
 // Topology returns the recorded topology for a lab, if there is one.
@@ -318,12 +368,37 @@ func (s *Store) PutExemptions(lab string, raw []byte) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	return writeAtomic(filepath.Join(dir, "exempt.json"), raw, 0o600)
+	if err := writeAtomic(filepath.Join(dir, "exempt.json"), raw, 0o600); err != nil {
+		return err
+	}
+	_, err := s.PutRecord(Record{Lab: lab, Kind: RecordExemptions, Content: raw})
+	return err
 }
 
 // Exemptions returns the recorded exemptions for a lab, if there are any.
 func (s *Store) Exemptions(lab string) ([]byte, error) {
 	return os.ReadFile(filepath.Join(s.root, safe(lab), "exempt.json"))
+}
+
+// PutHolds persists active repair holds. It deliberately uses a separate
+// local marker from the immutable record so an agent only rehydrates a hold
+// while it still hosts the lab, while replicas can retain the safe-repair
+// evidence after migration.
+func (s *Store) PutHolds(lab string, raw []byte) error {
+	dir := filepath.Join(s.root, safe(lab))
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	if err := writeAtomic(filepath.Join(dir, "holds.json"), raw, 0o600); err != nil {
+		return err
+	}
+	_, err := s.PutRecord(Record{Lab: lab, Kind: RecordHolds, Content: raw})
+	return err
+}
+
+// Holds returns persisted repair holds.
+func (s *Store) Holds(lab string) ([]byte, error) {
+	return os.ReadFile(filepath.Join(s.root, safe(lab), "holds.json"))
 }
 
 // Labs lists every lab the store knows about, which after a restart is how the

@@ -151,6 +151,7 @@ var skipped = map[string]string{
 	// same lab must hash identically on a laptop and on a twelve-node cluster,
 	// or a submission could only ever be graded on the machine it was made on.
 	"Placement": "which machines run the lab, and how many; not part of the exercise",
+	"State":     "durability and retention policy, not the network students configured",
 	"Dir":       "the directory the manifest was read from",
 	"Access":    "how students reach their devices: ports and keys, not topology",
 }

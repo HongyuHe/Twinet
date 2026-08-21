@@ -96,6 +96,11 @@ type Options struct {
 	// Overcommit permits an explicit audited escape from Strict. Callers must
 	// persist and report this choice; it is never inferred from a warning.
 	Overcommit bool
+	// Unavailable removes declared nodes from candidate placement without
+	// editing the manifest. Node drain uses it while the source remains
+	// reachable for a fenced capture; node-loss recovery normally removes the
+	// failed node from the active topology before calling Place.
+	Unavailable map[string]bool
 }
 
 // Record is a placement as it was actually deployed.
@@ -132,6 +137,14 @@ func Place(top *model.Topology, opts Options) (*Assignment, error) {
 	}
 
 	front := lab.FrontNode()
+	if opts.Unavailable[front] {
+		for _, node := range lab.Placement.Nodes {
+			if !opts.Unavailable[node.Name] {
+				front = node.Name
+				break
+			}
+		}
+	}
 	a := &Assignment{
 		ByAS:      map[int]string{},
 		ByGroup:   map[string]string{},

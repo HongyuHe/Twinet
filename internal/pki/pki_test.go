@@ -125,6 +125,20 @@ func TestIssuedIdentitiesCarryAuthorizationBoundaries(t *testing.T) {
 	if operator.Allows("advnet", "deploy") || operator.Allows("cos461", "destroy") {
 		t.Fatal("the scoped operator escaped its lab or action boundary")
 	}
+
+	peer, err := authz.FromCertificate(parseLeaf(t, b.Nodes["node-0"].CertPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if peer.Role != authz.RolePeer || !peer.Allows("*", authz.ActionPeerState) {
+		t.Fatal("node certificate does not carry the peer-only replication scope")
+	}
+	if peer.Allows("cos461", authz.ActionDeploy) || peer.Role == authz.RoleController {
+		t.Fatal("node certificate can impersonate a controller")
+	}
+	if got := parseLeaf(t, b.Nodes["node-0"].CertPath).Subject.CommonName; got != "node-0" {
+		t.Fatalf("node peer identity is %q, want manifest node name", got)
+	}
 }
 
 func parseLeaf(t *testing.T, path string) *x509.Certificate {

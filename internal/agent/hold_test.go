@@ -5,6 +5,7 @@ import (
 
 	"context"
 	"github.com/HongyuHe/twinet/internal/model"
+	"github.com/HongyuHe/twinet/internal/state"
 	"testing"
 	"time"
 )
@@ -135,5 +136,24 @@ func TestAHarnessIsNotMistakenForTheClassLab(t *testing.T) {
 	}
 	if got := s.labOfContainer("twinet-cos461-as3-atl"); got != "cos461" {
 		t.Errorf("the container was attributed to lab %q", got)
+	}
+}
+
+func TestHoldSurvivesDurableRecordRoundTrip(t *testing.T) {
+	store, err := state.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := &Server{holds: map[string]*hold{}, store: store}
+	if err := before.applyHold(HoldRequest{Lab: "cos461", Holder: "grading", Token: "hold-token", Seconds: 60}); err != nil {
+		t.Fatal(err)
+	}
+	after := &Server{holds: map[string]*hold{}, store: store}
+	after.loadHolds("cos461")
+	if got := after.heldBy("cos461"); got != "grading" {
+		t.Fatalf("durable hold did not restore: %q", got)
+	}
+	if after.holds["cos461"].token != "hold-token" {
+		t.Fatal("restored hold lost its ownership token")
 	}
 }

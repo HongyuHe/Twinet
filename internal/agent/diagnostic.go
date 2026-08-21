@@ -66,6 +66,11 @@ func (s *Server) authDiag(h http.HandlerFunc) http.HandlerFunc {
 	full := []byte("Bearer " + s.cfg.Token)
 	return func(w http.ResponseWriter, r *http.Request) {
 		r.Header.Del(scopeHeader)
+		if peerClient(r) {
+			http.Error(w, "a node peer certificate may only use the peer replication API",
+				http.StatusForbidden)
+			return
+		}
 		got := r.Header.Get("Authorization")
 		if subtle.ConstantTimeCompare([]byte(got), full) == 1 && !diagnosticClient(r) {
 			h(w, r)

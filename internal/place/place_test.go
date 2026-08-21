@@ -70,6 +70,30 @@ func TestAFittingLabIsNotReportedAsOverloaded(t *testing.T) {
 	}
 }
 
+func TestDrainExcludesSourceButPreservesRecordedGroupsElsewhere(t *testing.T) {
+	lab := &model.Lab{Placement: model.Placement{
+		Strategy: "pack-by-as",
+		Nodes:    []model.NodeSpec{{Name: "a", Front: true}, {Name: "b"}, {Name: "c"}},
+	}}
+	lab.Normalize()
+	top := labOf(lab, 2, 1, 0.1, "64Mi")
+	record := &Record{Lab: top.Name, ByAS: map[int]string{1: "a", 2: "b"},
+		ByGroup: map[string]string{}, ByService: map[string]string{}}
+	assignment, err := Place(top, Options{Fixed: record, Unavailable: map[string]bool{"a": true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if assignment.ByAS[1] == "a" {
+		t.Fatal("drain left AS 1 on its unavailable source node")
+	}
+	if assignment.ByAS[2] != "b" {
+		t.Fatalf("drain moved an unrelated recorded AS from b to %s", assignment.ByAS[2])
+	}
+	if len(assignment.Moved) != 1 {
+		t.Fatalf("drain did not record exactly its source move: %v", assignment.Moved)
+	}
+}
+
 // overloadedLab builds a lab that cannot fit on the machines it declares.
 func overloadedLab(strategy string, pin bool) *model.Topology {
 	lab := &model.Lab{}

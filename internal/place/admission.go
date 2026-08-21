@@ -33,6 +33,12 @@ func buildCapacityState(top *model.Topology, opts Options) capacityState {
 		}
 	}
 	for _, node := range top.Lab.Placement.Nodes {
+		if opts.Unavailable[node.Name] {
+			// Retain no candidate capacity for a node being drained. Fixed
+			// placement below observes it as absent and records an explicit
+			// move instead of silently retaining work on the source.
+			continue
+		}
 		out.allNodeName[node.Name] = true
 		inv, hasInventory := inventories[node.Name]
 		var ptr *NodeInventory

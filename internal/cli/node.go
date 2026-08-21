@@ -17,6 +17,7 @@ import (
 	"github.com/HongyuHe/twinet/internal/alloc"
 	"github.com/HongyuHe/twinet/internal/client"
 	"github.com/HongyuHe/twinet/internal/model"
+	"github.com/HongyuHe/twinet/internal/place"
 )
 
 // tokenFor resolves the shared secret the control plane presents to agents.
@@ -222,7 +223,109 @@ It refuses to generate a remotely reachable bearer-token-only agent.`,
 	bootstrap.Flags().StringVar(&bootstrapPKI, "pki", "",
 		"directory produced by `twinet node pki`")
 
-	cmd.AddCommand(status, check, bootstrap, newNodePKICmd(opts), newNodeSweepCmd(opts))
+	cmd.AddCommand(status, check, bootstrap, newNodePKICmd(opts), newNodeSweepCmd(opts), newNodeDrainCmd(opts, &token))
+	return cmd
+}
+
+// newNodeDrainCmd moves placement groups away from a healthy node. The source
+// remains in the fenced cluster until fresh capture, replica quorum,
+// destination restore, and verification finish; it is not a best-effort
+// "delete then hope the next deploy fixes it" operation.
+func newNodeDrainCmd(opts *Options, token *string) *cobra.Command {
+	var (
+		allowStale bool
+		allowLoss  bool
+		dryRun     bool
+	)
+	cmd := &cobra.Command{
+		Use:   "drain <node>",
+		Short: "Fenced-migrate placement groups off a healthy node",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			source := args[0]
+			top, err := load(opts)
+			if err != nil {
+				return err
+			}
+			if !clustered(top) {
+				return fmt.Errorf("node drain requires clustered placement")
+			}
+			if _, ok := top.Lab.NodeByName(source); !ok {
+				return fmt.Errorf("node %q is not declared in placement.nodes", source)
+			}
+			record, err := place.LoadRecord(labPrivateDir(top), top.Name)
+			if err != nil {
+				return err
+			}
+			if record == nil {
+				return fmt.Errorf("node drain requires a committed placement record; deploy the lab before draining it")
+			}
+			tok, err := tokenFor(*token)
+			if err != nil {
+				return err
+			}
+			cluster := client.NewCluster(top.Lab, tok)
+			if err := cluster.HealthCheck(cmd.Context()); err != nil {
+				return fmt.Errorf("refusing to drain %s because every source and destination must be healthy: %w", source, err)
+			}
+			survivors := cluster.Without(source)
+			if len(survivors.Nodes) == 0 {
+				return fmt.Errorf("cannot drain the only node")
+			}
+			inventory, err := survivors.Inventories(cmd.Context())
+			if err != nil {
+				return fmt.Errorf("cannot place drained groups without survivor inventory: %w", err)
+			}
+			assignment, err := place.Place(top, place.Options{
+				Fixed:       record,
+				Inventory:   inventory,
+				Strict:      true,
+				Unavailable: map[string]bool{source: true},
+			})
+			if err != nil {
+				return fmt.Errorf("cannot drain %s: %w", source, err)
+			}
+			next := assignment.Record(top.Name, top.Lab.Placement.Strategy+" (drained "+source+")")
+			if !placementRecordMoved(record, next) {
+				fmt.Fprintf(cmd.OutOrStdout(), "%s hosts no movable placement groups for %s\n", source, top.Name)
+				return nil
+			}
+			if !dryRun {
+				if err := place.StageRecord(labPrivateDir(top), next); err != nil {
+					return fmt.Errorf("stage drained placement: %w", err)
+				}
+			}
+			deployErr := deployCluster(cmd.Context(), top, tok, agent.ApplyRequest{
+				Mode:            "platform",
+				PullPolicy:      "if-missing",
+				Workers:         0,
+				DryRun:          dryRun,
+				StrictAdmission: true,
+				Prune:           true,
+				Generation:      time.Now().UTC().Format("20060102T150405.000"),
+			}, client.DurabilityOptions{
+				Previous: record, AllowStaleState: allowStale, AllowDataLoss: allowLoss,
+			}, cmd.OutOrStdout(), cmd.ErrOrStderr())
+			if deployErr != nil {
+				if !dryRun {
+					_ = place.DiscardStagedRecord(labPrivateDir(top))
+				}
+				return deployErr
+			}
+			if !dryRun {
+				if err := place.CommitStagedRecord(labPrivateDir(top)); err != nil {
+					return fmt.Errorf("drain committed but placement record was not committed: %w", err)
+				}
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "drained %s from %s under a verified durable migration\n", source, top.Name)
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "plan the drain without mutation")
+	cmd.Flags().BoolVar(&allowStale, "allow-stale-state", false,
+		"AUDIT: permit non-fresh state only when recovery is otherwise impossible")
+	cmd.Flags().BoolVar(&allowLoss, "allow-data-loss", false,
+		"AUDIT: permit drain without a verified durable replica")
 	return cmd
 }
 
@@ -415,9 +518,10 @@ func redeployScopes(ctx context.Context, top *model.Topology, token string, scop
 	return nil
 }
 
-func deployCluster(ctx context.Context, top *model.Topology, tok string, req agent.ApplyRequest, out, errOut interface {
-	Write([]byte) (int, error)
-}) error {
+func deployCluster(ctx context.Context, top *model.Topology, tok string, req agent.ApplyRequest,
+	durability client.DurabilityOptions, out, errOut interface {
+		Write([]byte) (int, error)
+	}) error {
 	c := client.NewCluster(top.Lab, tok)
 
 	// Admission must precede overlay deconfliction, state migration, record
@@ -454,24 +558,14 @@ func deployCluster(ctx context.Context, top *model.Topology, tok string, req age
 		fmt.Fprintf(errOut, "  warning (skew allowed): %v\n", err)
 	}
 
-	// Work preserved on a node that is losing a device is carried to the node
-	// that will run it, before that node builds anything. Without this a
-	// rebalance leaves a class's configuration stranded on a machine that no
-	// longer runs the device: not deleted, but indistinguishable from deleted
-	// to anyone who does not know to go looking.
-	if !req.DryRun {
-		moved, problems := c.MigrateState(ctx, top)
-		if moved > 0 {
-			fmt.Fprintf(errOut, "  carried %d preserved snapshot(s) to the nodes now "+
-				"holding their devices\n", moved)
-		}
-		for _, p := range problems {
-			fmt.Fprintln(errOut, "  warning: "+p)
-		}
-	}
-
 	start := time.Now()
-	results := c.Apply(ctx, top, req)
+	results, durable := c.ApplyDurable(ctx, top, req, durability)
+	if durable.Moved > 0 {
+		fmt.Fprintf(errOut, "  moved %d device(s) through fresh durable state transfer\n", durable.Moved)
+	}
+	for _, audit := range durable.Audit {
+		fmt.Fprintln(errOut, "  AUDIT: "+audit)
+	}
 
 	w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(w, "NODE\tSTEPS\tDURATION\tSTATUS")

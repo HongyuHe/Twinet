@@ -191,6 +191,15 @@ type Server struct {
 	// partial counts consecutive surveys in which a device has been missing
 	// some, but not all, of its interfaces.
 	partial map[string]int
+
+	// durability serialises periodic and destructive-boundary captures per
+	// lab. It is separate from ops: a capture may run while the ordinary
+	// repair survey reads another lab, but two captures of the same lab must
+	// not race their current pointers or replica acknowledgements.
+	durabilityMu   sync.Mutex
+	lastCapture    map[string]time.Time
+	durabilityBusy map[string]bool
+	peerDial       peerDialer
 }
 
 func (s *Server) workLimiter() *limiter.Limiter {
@@ -226,9 +235,11 @@ func New(cfg Config) (*Server, error) {
 		tools:     integrity.NewChecker(engine).Verify,
 		toolsSeen: map[string]toolsVerdict{},
 
-		repairFails: map[string]int{},
-		exempt:      map[string]*exemptions{},
-		partial:     map[string]int{},
+		repairFails:    map[string]int{},
+		exempt:         map[string]*exemptions{},
+		partial:        map[string]int{},
+		lastCapture:    map[string]time.Time{},
+		durabilityBusy: map[string]bool{},
 	}
 	srv.initCoordination()
 	if cfg.StateDir != "" {
@@ -291,6 +302,7 @@ func (s *Server) rehydrate() {
 		s.generations[top.Name] = state
 		s.rememberHow(top.Name, wt.Mode, wt.Ungraded)
 		s.loadExemptions(top.Name)
+		s.loadHolds(top.Name)
 		if wt.PeerUnderlay != nil {
 			if s.peers == nil {
 				s.peers = map[string]map[string]string{}
@@ -410,6 +422,12 @@ func (s *Server) Serve(ctx context.Context) error {
 	mux.HandleFunc("GET /v1/underlay", s.auth(s.handleUnderlay))
 	mux.HandleFunc("GET /v1/state", s.auth(s.handleStateExport))
 	mux.HandleFunc("POST /v1/state", s.auth(s.handleStateImport))
+	mux.HandleFunc("POST /v1/state/verify", s.auth(s.handleStateVerify))
+	// The peer routes are intentionally separate from controller routes and
+	// accept only a node certificate with peer-state scope. A node key is not
+	// a controller key.
+	mux.HandleFunc("GET /v1/peer/state/inventory", s.peerAuth(s.handlePeerStateInventory))
+	mux.HandleFunc("POST /v1/peer/state", s.peerAuth(s.handlePeerStateImport))
 	mux.HandleFunc("POST /v1/sweep", s.auth(s.handleSweep))
 
 	srv := &http.Server{
@@ -488,6 +506,9 @@ func (s *Server) Serve(ctx context.Context) error {
 	// container that restarts on its own is running, healthy and connected to
 	// nothing until somebody happens to redeploy.
 	go s.reconcileLoop(ctx)
+	// Capturing and replicating state belongs to the long-running agent, not
+	// the CLI invocation that happened to deploy the lab.
+	go s.durabilityLoop(ctx)
 
 	errc := make(chan error, 1)
 	go func() {
@@ -520,6 +541,11 @@ func (s *Server) auth(h http.HandlerFunc) http.HandlerFunc {
 		got := []byte(r.Header.Get("Authorization"))
 		if subtle.ConstantTimeCompare(got, want) != 1 {
 			http.Error(w, "unauthorised", http.StatusUnauthorized)
+			return
+		}
+		if peerClient(r) {
+			http.Error(w, "a node peer certificate may only use the peer replication API",
+				http.StatusForbidden)
 			return
 		}
 		// The certificate issued to an evaluated agent is a limit as well as a
@@ -565,6 +591,10 @@ type StatusResponse struct {
 	Inventory HostInventory `json:"inventory"`
 	// Backpressure exposes node-wide queue depth and wait time by work class.
 	Backpressure map[string]limiter.Stats `json:"backpressure"`
+	// StateStoreHealthy is nil for an older agent that cannot report it.
+	// Explicit false lets a controller treat a surviving runtime with a lost
+	// state disk as unavailable for durable placement.
+	StateStoreHealthy *bool `json:"state_store_healthy,omitempty"`
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -587,6 +617,11 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	resp.Inventory = s.observeHostInventory(cs, listErr)
 	resp.Backpressure = s.workLimiter().Snapshot()
+	stateHealthy := s.store != nil
+	if stateHealthy && s.store.Healthy() != nil {
+		stateHealthy = false
+	}
+	resp.StateStoreHealthy = &stateHealthy
 	s.mu.Lock()
 	labs := make([]string, 0, len(s.current))
 	for name := range s.current {
@@ -701,6 +736,9 @@ type ApplyRequest struct {
 	// how a scoped repair is expressed: the topology stays whole so every
 	// cross-reference still resolves, and only the work is narrowed.
 	OnlySteps []string `json:"only_steps,omitempty"`
+	// StateProofs are freshly captured source snapshots that a destination
+	// must verify after restore and before any source placement is pruned.
+	StateProofs []StateProof `json:"state_proofs,omitempty"`
 }
 
 // ApplyResponse reports the outcome.
@@ -812,6 +850,23 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		State:         s.store,
 		Prune:         req.Prune,
 		Generation:    req.Generation,
+	}
+	// The plan may replace a container before its own capture hook returns.
+	// Establish a fresh durable quorum from the *currently hosted* topology
+	// before any create step can make that boundary destructive. Commit later
+	// captures again for the post-apply state and topology record.
+	if !req.DryRun && req.Phase == "apply" && s.store != nil {
+		s.mu.Lock()
+		previous := s.current[top.Name]
+		s.mu.Unlock()
+		if previous != nil {
+			if _, captureErr := s.captureAndReplicate(r.Context(), previous); captureErr != nil {
+				if boundaryErr := s.durableBoundary(previous, "replacing containers in this deployment", captureErr); boundaryErr != nil {
+					httpError(w, http.StatusConflict, boundaryErr)
+					return
+				}
+			}
+		}
 	}
 	p, err := eng.Build(top)
 	if err != nil {
@@ -977,23 +1032,20 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Snapshot student work at the end of every successful apply, so the most
-	// recent copy is never older than the last time anyone touched the lab.
-	//
-	// Except when the apply *wrote* the reference solution. What is on those
-	// routers is then the answer, not anybody's work, and capturing it files
-	// the answer as the student's own saved configuration -- to be replayed
-	// onto their router the next time a container is recreated, or handed back
-	// when the lab is redeployed for teaching. Measured on this cluster: a
-	// snapshot of as5/CHI held the complete reference iBGP, OSPF, exchange and
-	// policy configuration.
-	//
-	// A grading run solves the lab constantly, so this is not a corner case;
-	// it is what every class run would do to every student.
-	if s.store != nil && !req.DryRun && req.Mode != string(render.ModeSolve) {
-		if n, err := eng.CaptureAll(r.Context(), top, s.store); err != nil {
-			slog.Warn("capturing student configuration", "err", err, "saved", n)
-		} else if n > 0 {
+	// A completed apply is a destructive boundary too: it may have replaced
+	// containers or made a new topology/mode record current. Capture and
+	// replicate before reporting it as healthy. Solve mode is handled inside
+	// captureAndReplicate, which still copies the repair records but never
+	// files the reference answer as student work.
+	if s.store != nil && !req.DryRun && !rep.Failed() {
+		if n, err := s.captureAndReplicate(r.Context(), top); err != nil {
+			if boundaryErr := s.durableBoundary(top, "completing this deployment", err); boundaryErr != nil {
+				if resp.Failures == nil {
+					resp.Failures = map[string][]string{}
+				}
+				resp.Failures["durability"] = append(resp.Failures["durability"], boundaryErr.Error())
+			}
+		} else {
 			resp.Snapshots = n
 		}
 	}
@@ -1122,12 +1174,14 @@ func (s *Server) captureBeforeDestroy(ctx context.Context, eng *deploy.Engine, l
 					lab, len(cs))
 			}
 		default:
-			if n, err := eng.CaptureAll(ctx, top, s.store); err != nil {
-				return fmt.Errorf(
-					"refusing to destroy %s: student configuration could not be captured (%w); "+
-						"pass force to override", lab, err)
+			if n, err := s.captureAndReplicate(ctx, top); err != nil {
+				if boundaryErr := s.durableBoundary(top, "destroy", err); boundaryErr != nil {
+					return fmt.Errorf(
+						"refusing to destroy %s: student configuration could not be captured and durably replicated (%w); "+
+							"pass force to override", lab, boundaryErr)
+				}
 			} else if n > 0 {
-				slog.Info("captured before destroy", "lab", lab, "snapshots", n)
+				slog.Info("captured before destroy with durable replicas", "lab", lab, "snapshots", n)
 			}
 		}
 	}

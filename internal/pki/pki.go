@@ -100,8 +100,16 @@ func Generate(dir string, nodes map[string][]string) (*Bundle, error) {
 	}
 
 	for name, sans := range nodes {
-		m, err := issue(dir, name+"_server", caCert, caKey, sans,
-			[]x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth})
+		// A node uses its own certificate as a TLS client only on the
+		// peer-replication API. The embedded peer role is deliberately
+		// narrower than a controller identity, so possession of a node key
+		// cannot mutate a lab or acquire a controller fence.
+		claims, err := authz.URIs(authz.RolePeer, []string{"*"}, []string{authz.ActionPeerState})
+		if err != nil {
+			return nil, err
+		}
+		m, err := issueForClaimsSubject(dir, name+"_server", name, caCert, caKey, sans, claims,
+			[]x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth}, leafValidity)
 		if err != nil {
 			return nil, fmt.Errorf("node %s: %w", name, err)
 		}
@@ -137,13 +145,21 @@ func issueFor(dir, name string, caCert *x509.Certificate, caKey *ecdsa.PrivateKe
 
 func issueForClaims(dir, name string, caCert *x509.Certificate, caKey *ecdsa.PrivateKey,
 	sans []string, uris []*url.URL, usage []x509.ExtKeyUsage, valid time.Duration) (Material, error) {
+	return issueForClaimsSubject(dir, name, name, caCert, caKey, sans, uris, usage, valid)
+}
+
+// issueForClaimsSubject keeps the on-disk filename distinct from the
+// authenticated common name. Node certificate files retain the historical
+// "_server" suffix while the peer API binds requests to the manifest node name.
+func issueForClaimsSubject(dir, name, subject string, caCert *x509.Certificate, caKey *ecdsa.PrivateKey,
+	sans []string, uris []*url.URL, usage []x509.ExtKeyUsage, valid time.Duration) (Material, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return Material{}, err
 	}
 	tmpl := &x509.Certificate{
 		SerialNumber: serial(),
-		Subject:      pkix.Name{CommonName: name},
+		Subject:      pkix.Name{CommonName: subject},
 		NotBefore:    time.Now().Add(-time.Hour),
 		NotAfter:     time.Now().Add(valid),
 		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,

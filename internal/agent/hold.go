@@ -40,6 +40,15 @@ type hold struct {
 	until time.Time
 }
 
+// persistedHold is deliberately separate from hold: the in-memory fields are
+// unexported, so marshaling hold directly would write `{}` and a replicated
+// restart would silently forget the repair pause it was meant to preserve.
+type persistedHold struct {
+	Holder string    `json:"holder"`
+	Token  string    `json:"token"`
+	Until  time.Time `json:"until"`
+}
+
 // HoldRequest asks for, renews, or drops a hold.
 type HoldRequest struct {
 	Lab string `json:"lab"`
@@ -70,6 +79,17 @@ func (s *Server) handleHold(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusConflict, err)
 		return
 	}
+	if top, _, ok := s.durabilityTopology(req.Lab); ok && s.store != nil {
+		if err := s.ensureDurableState(r.Context(), top); err != nil {
+			if boundaryErr := s.durableBoundary(top, "recording a repair hold", err); boundaryErr != nil {
+				// The local hold remains active. Returning an error rather than
+				// claiming cluster-wide safety tells the caller to retry, while
+				// retaining the safer local state instead of reopening repair.
+				httpError(w, http.StatusServiceUnavailable, boundaryErr)
+				return
+			}
+		}
+	}
 	writeJSON(w, struct{}{})
 }
 
@@ -83,6 +103,10 @@ func (s *Server) applyHold(req HoldRequest) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.holds == nil {
+		s.holds = map[string]*hold{}
+	}
+	previous := cloneHold(s.holds[req.Lab])
 
 	if cur, ok := s.holds[req.Lab]; ok && time.Now().Before(cur.until) &&
 		cur.token != "" && cur.token != req.Token {
@@ -92,14 +116,79 @@ func (s *Server) applyHold(req HoldRequest) error {
 	}
 	if req.Seconds <= 0 {
 		delete(s.holds, req.Lab)
-		return nil
+	} else {
+		s.holds[req.Lab] = &hold{
+			holder: req.Holder,
+			token:  req.Token,
+			until:  time.Now().Add(time.Duration(req.Seconds) * time.Second),
+		}
 	}
-	s.holds[req.Lab] = &hold{
-		holder: req.Holder,
-		token:  req.Token,
-		until:  time.Now().Add(time.Duration(req.Seconds) * time.Second),
+	if err := s.saveHoldsLocked(req.Lab); err != nil {
+		if previous == nil {
+			delete(s.holds, req.Lab)
+		} else {
+			s.holds[req.Lab] = previous
+		}
+		return err
 	}
 	return nil
+}
+
+func cloneHold(in *hold) *hold {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	return &out
+}
+
+// saveHoldsLocked persists active holds so a restart or a node repair does not
+// mistake a deliberately paused lab for an abandoned one. The caller holds
+// s.mu.
+func (s *Server) saveHoldsLocked(lab string) error {
+	if s.store == nil {
+		return nil
+	}
+	now := time.Now()
+	if h := s.holds[lab]; h != nil && !now.Before(h.until) {
+		delete(s.holds, lab)
+	}
+	var saved *persistedHold
+	if h := s.holds[lab]; h != nil {
+		saved = &persistedHold{Holder: h.holder, Token: h.token, Until: h.until}
+	}
+	raw, err := json.Marshal(saved)
+	if err != nil {
+		return err
+	}
+	return s.store.PutHolds(lab, raw)
+}
+
+// loadHolds restores an unexpired hold after the agent restarts. An expired
+// hold is deliberately discarded: a dead grader must never stop repair
+// forever merely because its state was replicated.
+func (s *Server) loadHolds(lab string) {
+	if s.store == nil {
+		return
+	}
+	raw, err := s.store.Holds(lab)
+	if err != nil {
+		return
+	}
+	var saved *persistedHold
+	if err := json.Unmarshal(raw, &saved); err != nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.holds == nil {
+		s.holds = map[string]*hold{}
+	}
+	if saved == nil || !time.Now().Before(saved.Until) {
+		delete(s.holds, lab)
+		return
+	}
+	s.holds[lab] = &hold{holder: saved.Holder, token: saved.Token, until: saved.Until}
 }
 
 // heldBy names what is holding a lab, or "" if the repair loop may proceed.

@@ -112,6 +112,8 @@ type applyTransaction struct {
 	PeerUnderlay    map[string]string `json:"peer_underlay,omitempty"`
 	Prune           bool              `json:"prune,omitempty"`
 	OnlySteps       []string          `json:"only_steps,omitempty"`
+	StateProofs     []StateProof      `json:"state_proofs,omitempty"`
+	StateVerified   bool              `json:"state_verified,omitempty"`
 	Applied         bool              `json:"applied"`
 	Committed       bool              `json:"committed"`
 }
@@ -544,7 +546,7 @@ func (s *Server) releaseOverlayClaims(lab string, vnis []uint32) error {
 
 func (s *Server) prepareGeneration(lab string, fence Fence, expected, generation string,
 	requested json.RawMessage, mode string, ungraded int, peers map[string]string, prune bool,
-	onlySteps []string,
+	onlySteps []string, stateProofs []StateProof,
 ) error {
 	if generation == "" {
 		return errors.New("a deployment generation is required")
@@ -590,6 +592,7 @@ func (s *Server) prepareGeneration(lab string, fence Fence, expected, generation
 		Requested: append(json.RawMessage(nil), requested...), Previous: previous,
 		PreviousGen: state.Committed, Mode: mode, Ungraded: ungraded,
 		PeerUnderlay: peers, Prune: prune, OnlySteps: append([]string(nil), onlySteps...),
+		StateProofs: append([]StateProof(nil), stateProofs...),
 	}
 	state.Prepared = generation
 	s.generations[lab] = state
@@ -647,7 +650,49 @@ func (s *Server) transactionForCommit(lab string, fence Fence, generation string
 		return applyTransaction{}, fmt.Errorf("generation %q of lab %q was not fully applied by this fence",
 			generation, lab)
 	}
+	if len(tx.StateProofs) > 0 && !tx.StateVerified {
+		return applyTransaction{}, fmt.Errorf("generation %q of lab %q has restored state that was not verified; refusing source prune",
+			generation, lab)
+	}
 	return tx, nil
+}
+
+// transactionForStateVerify reads an applied transaction before it is
+// committed. It intentionally does not require StateVerified yet; this is the
+// only transition allowed to establish that fact.
+func (s *Server) transactionForStateVerify(lab string, fence Fence, generation string) (applyTransaction, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initCoordination()
+	if err := s.fenceErrorLocked(lab, fence, s.nowTime()); err != nil {
+		return applyTransaction{}, err
+	}
+	tx, ok := s.transactions[lab]
+	if !ok || tx.Generation != generation || tx.FenceGeneration != fence.Generation || !tx.Applied {
+		return applyTransaction{}, fmt.Errorf("generation %q of lab %q was not fully applied by this fence",
+			generation, lab)
+	}
+	return tx, nil
+}
+
+func (s *Server) markStateVerified(lab string, fence Fence, generation string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initCoordination()
+	if err := s.fenceErrorLocked(lab, fence, s.nowTime()); err != nil {
+		return err
+	}
+	tx, ok := s.transactions[lab]
+	if !ok || tx.Generation != generation || tx.FenceGeneration != fence.Generation || !tx.Applied {
+		return fmt.Errorf("generation %q of lab %q was not fully applied by this fence",
+			generation, lab)
+	}
+	tx.StateVerified = true
+	s.transactions[lab] = tx
+	if err := s.saveCoordinationLocked(); err != nil {
+		return fmt.Errorf("persisting state restore verification: %w", err)
+	}
+	return nil
 }
 
 func (s *Server) finishCommittedGeneration(lab string, fence Fence, generation string) error {

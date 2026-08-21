@@ -1,9 +1,12 @@
 package cli
 
 import (
+	"bytes"
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/HongyuHe/twinet/internal/model"
 )
 
 // A version warning was the wrong shape for this failure.
@@ -72,6 +75,7 @@ func TestDestroyingAHarnessKeepsTheClassPlacementRecord(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	body := string(src)
 	i := strings.Index(body, "os.Remove(filepath.Join(labPrivateDir(top), place.RecordName))")
 	if i < 0 {
@@ -81,5 +85,39 @@ func TestDestroyingAHarnessKeepsTheClassPlacementRecord(t *testing.T) {
 	if !strings.Contains(before[strings.LastIndex(before, "RunE:"):], "name != top.Name") {
 		t.Error("the placement record is removed whatever lab was destroyed, so cleaning up " +
 			"a grading harness deletes the class's own record")
+	}
+}
+
+func TestSingleNodeDeployPrintsDurabilityWarning(t *testing.T) {
+	lab := &model.Lab{Metadata: model.Meta{Name: "one"},
+		Placement: model.Placement{Nodes: []model.NodeSpec{{Name: "local", Front: true}}}}
+	lab.Normalize()
+	top := &model.Topology{Lab: lab, Name: "one"}
+	var out bytes.Buffer
+	warnSingleNodeDurability(&out, top)
+	if !strings.Contains(out.String(), "one local durable copy") {
+		t.Fatalf("single-node deployment did not make data-loss risk explicit: %q", out.String())
+	}
+}
+
+func TestRescheduleDropsLostNodeOnlyWhenReplicaDomainsRemain(t *testing.T) {
+	lab := &model.Lab{Placement: model.Placement{Nodes: []model.NodeSpec{
+		{Name: "n0", FailureDomain: "rack-a", Front: true},
+		{Name: "n1", FailureDomain: "rack-b"},
+		{Name: "n2", FailureDomain: "rack-c"},
+	}}, State: model.StatePolicy{ReplicationFactor: 2}}
+	lab.Normalize()
+	if err := removeUnavailableNodes(lab, []string{"n0"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(lab.Placement.Nodes) != 2 || lab.Placement.Nodes[0].Name != "n1" {
+		t.Fatalf("lost node was not removed from active reschedule placement: %+v", lab.Placement.Nodes)
+	}
+	if err := ensureSurvivingDurability(lab); err != nil {
+		t.Fatalf("two surviving failure domains were rejected: %v", err)
+	}
+	lab.Placement.Nodes[1].FailureDomain = "rack-b"
+	if err := ensureSurvivingDurability(lab); err == nil {
+		t.Fatal("reschedule accepted replicas in one surviving failure domain")
 	}
 }

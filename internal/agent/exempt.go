@@ -78,6 +78,14 @@ func (s *Server) handleExempt(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusInternalServerError, err)
 		return
 	}
+	if top, _, ok := s.durabilityTopology(req.Lab); ok && s.store != nil {
+		if err := s.ensureDurableState(r.Context(), top); err != nil {
+			if boundaryErr := s.durableBoundary(top, "recording a repair exemption", err); boundaryErr != nil {
+				httpError(w, http.StatusServiceUnavailable, boundaryErr)
+				return
+			}
+		}
+	}
 	writeJSON(w, struct{}{})
 }
 

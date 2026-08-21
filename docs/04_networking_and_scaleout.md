@@ -283,10 +283,38 @@ node from a local tarball for air-gapped or slow-link environments.
 
 ## 6. Failure handling
 
+### Durable student state
+
+`state:` is a typed lab policy. Clustered labs default to
+`replication_factor: 2`, `capture_interval: 5m`, `fail_closed: true`, and
+seven-day replica history; a missing node `failure_domain` defaults to that
+node's name. Two copies are therefore placed on separate failure domains, not
+merely separate processes. A single-node lab remains supported with one local
+copy and an explicit deployment warning.
+
+Agents capture bounded student-owned state periodically and before any
+container replacement, prune, destroy, or migration boundary. Snapshots and
+topology/mode, exemption, and active-hold records are content-addressed.
+Agents exchange an inventory first, transfer only changed digests, and persist
+receiver acknowledgements. Peer transfer uses each node's mTLS certificate
+with the `peer-state` scope; that certificate cannot call controller routes.
+
+Migration is fenced and ordered: fresh source capture, durable replica quorum,
+destination import, destination restore/digest-and-semantic verification, then
+source pruning. A fresh-capture failure or missing quorum stops the operation.
+`--allow-stale-state` and `--allow-data-loss` are deliberately loud audited
+escapes, not defaults. If a source has already failed,
+`placement.on_node_loss: reschedule` finds a verified replica on surviving
+nodes; `fail` is the default policy.
+
+Use `twinet node drain NODE` to move a healthy node's placement groups through
+the same protocol. Its placement record is staged before mutation and promoted
+only after every node commits.
+
 | Failure | Behaviour |
 |---|---|
 | Agent restarts | Containers keep running (they are not children of the agent). On reconnect the agent re-inventories from labels and repairs missing wiring. |
-| Node reboots | `twinet deploy` recreates that node's ASes; other nodes untouched. Optionally `placement.on_node_loss: reschedule` moves the ASes elsewhere. |
+| Node reboots or disk loss | The default policy fails closed. With `placement.on_node_loss: reschedule`, a deploy restores only verified replicas onto healthy nodes and preserves the placement record transactionally. |
 | Container dies | Docker `restart: unless-stopped` brings it back; the agent notices the new netns and re-wires its links (this is what `restart_container.sh`'s 1,011 lines do today, done automatically). |
 | Underlay link flap | VXLAN is stateless; links recover with the underlay. Agents export a `twinet_underlay_up` metric per peer. |
 | Partial deploy failure | Per-AS status; re-running converges only the gap. |

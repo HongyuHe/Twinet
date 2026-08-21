@@ -575,6 +575,7 @@ func (s *Server) forgetLab(name string) {
 	delete(s.ungraded, name)
 	delete(s.peers, name)
 	delete(s.exempt, name)
+	delete(s.holds, name)
 	for k := range s.repairFails {
 		if strings.HasPrefix(k, name+"|") {
 			delete(s.repairFails, k)

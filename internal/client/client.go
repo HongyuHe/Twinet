@@ -26,7 +26,6 @@ import (
 	"time"
 
 	"github.com/HongyuHe/twinet/internal/agent"
-	"github.com/HongyuHe/twinet/internal/deploy"
 	"github.com/HongyuHe/twinet/internal/model"
 	"github.com/HongyuHe/twinet/internal/place"
 	rt "github.com/HongyuHe/twinet/internal/runtime"
@@ -445,6 +444,24 @@ func (c *Cluster) Node(name string) (*Node, bool) {
 	return nil, false
 }
 
+// Without returns a shallow cluster view excluding named nodes. It is used to
+// obtain placement inventory from survivors during a drain or node-loss
+// recovery; mutation of a live drain still uses the full cluster so the source
+// remains fenced until restore verification succeeds.
+func (c *Cluster) Without(names ...string) *Cluster {
+	skip := map[string]bool{}
+	for _, name := range names {
+		skip[name] = true
+	}
+	out := &Cluster{RequireVersion: c.RequireVersion}
+	for _, node := range c.Nodes {
+		if !skip[node.Name] {
+			out.Nodes = append(out.Nodes, node)
+		}
+	}
+	return out
+}
+
 // NodeResult pairs a node with the outcome of an operation on it.
 type NodeResult[T any] struct {
 	Node  string
@@ -475,6 +492,27 @@ func (c *Cluster) Status(ctx context.Context) []NodeResult[agent.StatusResponse]
 	return fanOut(ctx, c.Nodes, func(ctx context.Context, n *Node) (agent.StatusResponse, error) {
 		return n.Status(ctx)
 	})
+}
+
+// HealthCheck proves every declared agent responds before placement or a
+// migration changes any record. A partial survey is not a healthy cluster:
+// the missing node may be the only owner of state about to be moved.
+func (c *Cluster) HealthCheck(ctx context.Context) error {
+	var problems []string
+	for _, result := range c.Status(ctx) {
+		if result.Err != nil {
+			problems = append(problems, fmt.Sprintf("%s: %v", result.Node, result.Err))
+			continue
+		}
+		if result.Value.StateStoreHealthy != nil && !*result.Value.StateStoreHealthy {
+			problems = append(problems, fmt.Sprintf("%s: durable state store is unavailable", result.Node))
+		}
+	}
+	if len(problems) == 0 {
+		return nil
+	}
+	sort.Strings(problems)
+	return fmt.Errorf("cluster health check failed before placement: %s", strings.Join(problems, "; "))
 }
 
 // Inventories obtains a complete live reservation view from every node. A
@@ -860,8 +898,23 @@ func (c *Cluster) CheckUnderlay(ctx context.Context, top *model.Topology) []stri
 
 // ExportState fetches a node's preserved snapshots for the named devices.
 func (n *Node) ExportState(ctx context.Context, lab string, devices []string) (agent.StateExportResponse, error) {
+	return n.exportState(ctx, lab, devices, true)
+}
+
+// ExportStoredState reads verified stored replicas without asking the remote
+// node to capture a running container. It is used only after a source is
+// unavailable; normal migration always calls ExportState and requires a fresh
+// capture boundary.
+func (n *Node) ExportStoredState(ctx context.Context, lab string, devices []string) (agent.StateExportResponse, error) {
+	return n.exportState(ctx, lab, devices, false)
+}
+
+func (n *Node) exportState(ctx context.Context, lab string, devices []string, fresh bool) (agent.StateExportResponse, error) {
 	q := url.Values{}
 	q.Set("lab", lab)
+	if !fresh {
+		q.Set("fresh", "false")
+	}
 	for _, d := range devices {
 		q.Add("device", d)
 	}
@@ -872,157 +925,38 @@ func (n *Node) ExportState(ctx context.Context, lab string, devices []string) (a
 
 // ImportState installs snapshots taken on another node.
 func (n *Node) ImportState(ctx context.Context, req agent.StateImportRequest) (int, error) {
-	var resp agent.StateImportResponse
-	err := n.do(ctx, http.MethodPost, "/v1/state", req, &resp)
+	resp, err := n.ImportStateDetailed(ctx, req)
 	return resp.Stored, err
 }
 
-// MigrateState carries preserved work to the nodes that will run each device.
-//
-// Placement is not fixed. Adding a machine, or a manifest that grows,
-// re-partitions the lab and moves autonomous systems between nodes. The node
-// losing a device captures its configuration before removing it, which is
-// right; the node gaining it then builds from the manifest, because the
-// snapshot is in a directory on a machine it never asks. Both report success,
-// and a class's work is stranded on a node that no longer runs it -- which is
-// indistinguishable from lost to anyone who does not know to go looking.
-//
-// This runs before apply, so the work is already on the destination when the
-// device is built and the ordinary restore path picks it up.
-//
-// It is deliberately not fatal. A node that cannot be reached for an export
-// leaves that device's work where it is rather than stopping the deployment:
-// the snapshot is still safe on the source node, and refusing to deploy would
-// turn a recoverable situation into an outage for every other student in the
-// lab. What it must not do is proceed quietly, so every device it could not
-// carry is named in the returned report.
-func (c *Cluster) MigrateState(ctx context.Context, top *model.Topology) (moved int, problems []string) {
-	if len(c.Nodes) == 0 {
-		return c.migrateStateWithLease(ctx, top, nil)
-	}
-	err := c.withMutationLease(ctx, top.Name, func(lease *MutationLease) error {
-		moved, problems = c.migrateStateWithLease(lease.Context(), top, lease)
-		return nil
-	})
-	if err != nil {
-		problems = append(problems, err.Error())
-	}
-	return moved, problems
+// ImportStateDetailed returns the receiver's digest acknowledgements as well
+// as its count. Durable migration must check those acknowledgements before it
+// can regard replication or destination import as complete.
+func (n *Node) ImportStateDetailed(ctx context.Context, req agent.StateImportRequest) (agent.StateImportResponse, error) {
+	var resp agent.StateImportResponse
+	err := n.do(ctx, http.MethodPost, "/v1/state", req, &resp)
+	return resp, err
 }
 
-func (c *Cluster) migrateStateWithLease(ctx context.Context, top *model.Topology,
-	lease *MutationLease,
-) (moved int, problems []string) {
-	// Where each device is *now*, asked of the cluster rather than read from
-	// the placement record.
-	//
-	// The record says where the last deploy intended to put things, which is
-	// the same as where they are in the ordinary case and therefore detects
-	// nothing. A device moves precisely when those two disagree -- after
-	// --rebalance, after a record was lost and re-adopted, after a node was
-	// added. Asking the containers is the only source that is right in all of
-	// those, and it is the same authority adoptRunningPlacement uses for the
-	// same reason.
-	cs, errs := c.Containers(ctx, top.Name)
-	if len(errs) > 0 {
-		// A node that cannot be asked may be the one holding the work. Moving
-		// what the reachable nodes have while believing the rest is absent
-		// would be worse than not moving anything.
-		return 0, []string{fmt.Sprintf(
-			"could not read the running placement from every node (%v), so preserved "+
-				"work was not moved; a device that changes node in this deploy will be "+
-				"rebuilt from the manifest", errs[0])}
-	}
-	previous := map[string]string{}
-	for _, ct := range cs {
-		if id := ct.Label(deploy.LabelDeviceID); id != "" {
-			if node := ct.Label(deploy.LabelNode); node != "" {
-				previous[id] = node
-			}
-		}
-	}
+// VerifyStateRestore proves the destination restored every fresh source
+// snapshot persisted in its prepared transaction before source placement may
+// be pruned.
+func (n *Node) VerifyStateRestore(ctx context.Context, req agent.StateVerifyRequest) (agent.StateVerifyResponse, error) {
+	var resp agent.StateVerifyResponse
+	err := n.do(ctx, http.MethodPost, "/v1/state/verify", req, &resp)
+	return resp, err
+}
 
-	// device -> node it is moving from
-	from := map[string][]string{}
-	for _, d := range top.SortedDevices() {
-		was, ok := previous[d.ID]
-		if !ok || was == "" || was == d.Node {
-			continue
-		}
-		from[was] = append(from[was], d.ID)
+// MigrateState is retained for source compatibility but intentionally refuses
+// to move data by itself. A standalone transfer cannot prove destination
+// restore before source pruning; callers must use ApplyDurable, which keeps
+// capture, quorum, restore verification, and pruning under one fence.
+func (c *Cluster) MigrateState(ctx context.Context, top *model.Topology) (moved int, problems []string) {
+	_ = ctx
+	if top == nil {
+		return 0, []string{"refusing standalone state migration without a topology"}
 	}
-	if len(from) == 0 {
-		return 0, nil
-	}
-
-	for src, devices := range from {
-		srcNode := c.node(src)
-		if srcNode == nil {
-			problems = append(problems, fmt.Sprintf(
-				"%d device(s) moved off %s, which is not in this cluster; their saved work "+
-					"is still on that machine", len(devices), src))
-			continue
-		}
-		exp, err := srcNode.ExportState(ctx, top.Name, devices)
-		if err != nil {
-			problems = append(problems, fmt.Sprintf(
-				"could not collect saved work from %s (%v); %d device(s) will be rebuilt "+
-					"from the manifest and their configuration is still on %s",
-				src, err, len(devices), src))
-			continue
-		}
-		// A device the source had nothing for is reported, not ignored. Most
-		// of the time it means what it says -- an untouched device, a staff
-		// machine, a lab that was only just deployed -- but it is also exactly
-		// what a failed capture looks like from here, and the two are worth
-		// distinguishing before a container is rebuilt from the manifest.
-		if len(exp.Missing) > 0 {
-			sort.Strings(exp.Missing)
-			problems = append(problems, fmt.Sprintf(
-				"%s had no saved work for %s; if those devices were configured, that "+
-					"configuration is not being carried and will be lost when they are "+
-					"rebuilt from the manifest",
-				src, strings.Join(exp.Missing, ", ")))
-		}
-
-		// Group by destination, because devices leaving one node need not all
-		// arrive at the same one.
-		byDest := map[string][]agent.WireSnapshot{}
-		for _, s := range exp.Snapshots {
-			d, ok := top.Device(s.Device)
-			if !ok {
-				problems = append(problems, fmt.Sprintf(
-					"%s sent saved work for %s, which is not in this lab; it is being "+
-						"dropped rather than placed somewhere it does not belong",
-					src, s.Device))
-				continue
-			}
-			byDest[d.Node] = append(byDest[d.Node], s)
-		}
-		for dest, snaps := range byDest {
-			destNode := c.node(dest)
-			if destNode == nil {
-				problems = append(problems, fmt.Sprintf(
-					"%s is not in this cluster, so work for %d device(s) cannot be placed there",
-					dest, len(snaps)))
-				continue
-			}
-			req := agent.StateImportRequest{Lab: top.Name, Snapshots: snaps}
-			if lease != nil {
-				req.Fence, _ = lease.Fence(dest)
-			}
-			n, err := destNode.ImportState(ctx, req)
-			if err != nil {
-				problems = append(problems, fmt.Sprintf(
-					"could not place saved work on %s (%v); those devices will be rebuilt "+
-						"from the manifest", dest, err))
-				continue
-			}
-			moved += n
-		}
-	}
-	sort.Strings(problems)
-	return moved, problems
+	return 0, []string{"refusing standalone state migration; use ApplyDurable so source state is verified after destination restore before any prune"}
 }
 
 // node returns the client for a named node, or nil.

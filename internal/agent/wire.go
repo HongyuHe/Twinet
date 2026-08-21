@@ -323,6 +323,10 @@ func (w *Wire) Rehydrate() (*model.Topology, error) {
 		}
 	}
 	lab.Metadata.Name = w.Lab
+	// Older wires predate the state policy. Normalising here gives a
+	// rehydrated agent the same fail-closed two-copy defaults as a freshly
+	// loaded manifest instead of silently treating zero values as no policy.
+	lab.Normalize()
 	if lab.LinkDefaults.MTU == nil {
 		lab.LinkDefaults.MTU = &mtu
 	}

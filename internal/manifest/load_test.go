@@ -136,6 +136,7 @@ func TestEveryProblemIsReportedAtOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if d := l.Validate(); d.HasErrors() {
 		t.Errorf("the course lab reports errors: %v", d)
 	}
@@ -154,5 +155,42 @@ func TestEveryProblemIsReportedAtOnce(t *testing.T) {
 	if n := len(d.Errors()); n < 2 {
 		t.Errorf("two independent mistakes produced %d diagnostic(s); an author would "+
 			"have to rerun after each fix:\n%v", n, d)
+	}
+}
+
+func TestStatePolicyDefaultsToSeparatedClusterCopies(t *testing.T) {
+	body := minimal + `
+placement:
+  nodes:
+    - {name: n0, failure_domain: rack-a, front: true}
+    - {name: n1, failure_domain: rack-a}
+`
+	l, err := Load(writeLab(t, body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := l.Validate()
+	if !d.HasErrors() || !strings.Contains(d.String(), "failure domains") {
+		t.Fatalf("cluster state policy accepted two copies in one failure domain:\n%s", d.String())
+	}
+	if l.Lab.State.ReplicationFactor != 2 || !l.Lab.State.FailClosedEnabled() {
+		t.Fatalf("cluster durability defaults are not fail-closed two-copy state: %+v", l.Lab.State)
+	}
+}
+
+func TestSingleNodeStatePolicyIsAnExplicitWarning(t *testing.T) {
+	l, err := Load(writeLab(t, minimal))
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := l.Validate()
+	if d.HasErrors() {
+		t.Fatal(d)
+	}
+	if l.Lab.State.ReplicationFactor != 1 {
+		t.Fatalf("single node default replication factor is %d, want 1", l.Lab.State.ReplicationFactor)
+	}
+	if !strings.Contains(d.String(), "single-node durability") {
+		t.Fatalf("single-node data-loss warning is absent:\n%s", d.String())
 	}
 }
