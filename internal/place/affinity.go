@@ -19,12 +19,17 @@ import (
 type affinityGraph struct {
 	// peers[a][b] is the number of links between AS a and AS b.
 	peers map[int]map[int]int
-	// svc[a] is the number of links between AS a and a service.
-	svc map[int]int
+	// svc[a][node] is the number of service links AS a can keep local by
+	// joining a replica on node. legacySvc retains the historic front-node
+	// pull for a singleton whose placement has not yet been assigned.
+	svc       map[int]map[string]int
+	legacySvc map[int]int
 }
 
 func buildAffinity(top *model.Topology) *affinityGraph {
-	g := &affinityGraph{peers: map[int]map[int]int{}, svc: map[int]int{}}
+	g := &affinityGraph{
+		peers: map[int]map[int]int{}, svc: map[int]map[string]int{}, legacySvc: map[int]int{},
+	}
 	for _, l := range top.Links {
 		a, b := l.A, l.B
 		if a == nil || b == nil || a.Device == nil || b.Device == nil {
@@ -35,12 +40,30 @@ func buildAffinity(top *model.Topology) *affinityGraph {
 			continue
 		}
 		if x == 0 || y == 0 {
-			// A service link. Which AS it touches still matters, because
-			// services are pinned to the front node.
+			// A service link. A scalable replica already carries its preferred
+			// node during expansion, so its pull rewards local attachment
+			// rather than concentrating every AS on FrontNode.
+			var service *model.Device
 			if x == 0 && y != 0 {
-				g.svc[y]++
+				service = a.Device
+				if service.Node != "" {
+					if g.svc[y] == nil {
+						g.svc[y] = map[string]int{}
+					}
+					g.svc[y][service.Node]++
+				} else {
+					g.legacySvc[y]++
+				}
 			} else if y == 0 && x != 0 {
-				g.svc[x]++
+				service = b.Device
+				if service.Node != "" {
+					if g.svc[x] == nil {
+						g.svc[x] = map[string]int{}
+					}
+					g.svc[x][service.Node]++
+				} else {
+					g.legacySvc[x]++
+				}
 			}
 			continue
 		}
@@ -74,10 +97,9 @@ func (g *affinityGraph) pull(asn int, n string, byAS map[int]string, front strin
 			score += count
 		}
 	}
+	score += g.svc[asn][n]
 	if n == front {
-		// Services live on the front node unless pinned elsewhere, so an AS
-		// that talks to them is cheaper there.
-		score += g.svc[asn]
+		score += g.legacySvc[asn]
 	}
 	return score
 }
@@ -212,8 +234,9 @@ func refine(names []string, byAS map[int]string, g *affinityGraph, weight map[in
 				score += c
 			}
 		}
+		score += g.svc[asn][n]
 		if n == front {
-			score += g.svc[asn]
+			score += g.legacySvc[asn]
 		}
 		return score
 	}

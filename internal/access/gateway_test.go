@@ -5,8 +5,11 @@ import (
 	"encoding/base64"
 	"errors"
 	"io"
+	"net"
 	"strings"
 	"testing"
+
+	"golang.org/x/crypto/ssh"
 )
 
 // The roster is a file that can be copied. Storing what a student types would
@@ -82,6 +85,7 @@ func TestADeviceNameResolvesOnlyWithinTheSessionsOwnAS(t *testing.T) {
 	if got, err := s.resolve(Session{AS: 3}, "MSP"); err != nil || got != "as3/MSP" {
 		t.Errorf("a student could not reach their own router: %q %v", got, err)
 	}
+
 	// Case should not matter to a person typing it.
 	if got, err := s.resolve(Session{AS: 3}, "msp"); err != nil || got != "as3/MSP" {
 		t.Errorf("device names are case-sensitive to a student: %q %v", got, err)
@@ -98,6 +102,43 @@ func TestADeviceNameResolvesOnlyWithinTheSessionsOwnAS(t *testing.T) {
 		t.Error("an unbound session resolved a device")
 	}
 }
+
+// Every active gateway endpoint receives the same roster and the same
+// topology-scoped resolver. This is the boundary that matters during failover:
+// changing endpoints must not change which group a credential represents or
+// make another group's device name valid.
+func TestGatewayAuthorizationIsIdenticalOnTwoEndpoints(t *testing.T) {
+	group := &Group{AS: 3}
+	if err := group.SetPassword("replicated-gateway-password"); err != nil {
+		t.Fatal(err)
+	}
+	roster := &Roster{Groups: map[string]*Group{"group3": group}}
+	metadata := endpointConnMetadata{user: "group3"}
+	for _, endpoint := range []string{"node-0", "node-1"} {
+		server := &Server{cfg: Config{Topology: twoASTopology(), Roster: roster}}
+		permissions, err := server.authPassword(metadata, []byte("replicated-gateway-password"))
+		if err != nil {
+			t.Fatalf("%s rejected the valid group credential: %v", endpoint, err)
+		}
+		if permissions.Extensions["group"] != "group3" || permissions.Extensions["as"] != "3" {
+			t.Fatalf("%s produced different session scope: %#v", endpoint, permissions.Extensions)
+		}
+		if _, err := server.resolve(Session{Group: "group3", AS: 3}, "NYC"); err == nil {
+			t.Fatalf("%s allowed a group3 credential to resolve AS 4's router", endpoint)
+		}
+	}
+}
+
+type endpointConnMetadata struct{ user string }
+
+func (m endpointConnMetadata) User() string        { return m.user }
+func (endpointConnMetadata) SessionID() []byte     { return nil }
+func (endpointConnMetadata) ClientVersion() []byte { return []byte("SSH-2.0-test") }
+func (endpointConnMetadata) ServerVersion() []byte { return []byte("SSH-2.0-test") }
+func (endpointConnMetadata) RemoteAddr() net.Addr  { return &net.TCPAddr{} }
+func (endpointConnMetadata) LocalAddr() net.Addr   { return &net.TCPAddr{} }
+
+var _ ssh.ConnMetadata = endpointConnMetadata{}
 
 // The interactive menu lists the session's own devices, so it cannot become a
 // directory of the whole class.

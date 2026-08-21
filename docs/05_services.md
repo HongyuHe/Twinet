@@ -27,6 +27,59 @@ server). Anything that is really "poll things and render a page" moves into the
 control plane where it can be tested, is not duplicated 800 times, and does not
 need its own supervisord.
 
+### Replica policy and endpoint availability
+
+Services may declare a typed `replication` policy:
+
+```yaml
+services:
+  dns:
+    kind: builtin.dns
+    attach: {template: student_as, router: MSP, iface: dns}
+    replication: {mode: per-node}
+  measurement:
+    kind: builtin.measurement
+    attach: {template: student_as, router: HOU, iface: measurement}
+    replication: {mode: sharded, shard_size: 16, selector: region}
+```
+
+`singleton`, `per-node`, `replicas` (with `replicas: N`), and `sharded` are
+supported. Replica IDs, containers, anycast/shard identities, and placement
+record keys are deterministic. Placement retains recorded replica locations
+when nodes are added; moving them requires `--rebalance` or node-loss
+rescheduling. Each attached AS takes a local replica whenever one is available.
+
+An absent policy remains the v1 singleton compatibility behavior, preserving
+old manifests and topology hashes. `service_policy_version: v2` is the explicit
+default migration for attach-to-every-AS DNS, RTR, matrix, and measurement
+services. The scale fixture declares `per-node` directly, reducing its service
+cross-links from the old 64% front-node star to zero.
+
+DNS zones and RTR payloads are rendered from one declared state document on
+every replica. DNS and RTR clients receive deterministic fallback addresses;
+runtime health reconciliation refuses to select an unknown or unhealthy
+replica. Matrix/measurement batches execute on the node that hosts their
+source/replica and publish bounded collection events for the web collector.
+
+Gateway and web use a multi-endpoint baseline rather than a front-node
+dependency:
+
+```yaml
+access:
+  endpoints: {mode: active-active}
+```
+
+`active-active` and `active-standby` support an ordered node list and optional
+`vip`; `builtin.web` accepts the same `endpoints:` block under its service
+declaration. A VIP is an environment-gated convenience only; `twinet gateway
+endpoints` and `twinet web endpoints` always publish deterministic endpoint
+lists and conservative health. Set `TWINET_ENABLE_VIP=1` only on an underlay
+that has supplied and health-checked the VIP; otherwise the commands mark it
+disabled and clients use the endpoint list. Run the same gateway/web service on every
+listed node with the shared roster, host key, and scoped mTLS material; failover
+therefore does not change group authorization, device placement, or
+credentials.
+
 ## 2. Access model
 
 Today: one privileged SSH container per group (100 groups = 100 containers),

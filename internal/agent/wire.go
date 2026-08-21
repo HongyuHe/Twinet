@@ -94,6 +94,9 @@ type WireDev struct {
 	Command           []string              `json:"command,omitempty"`
 	Labels            map[string]string     `json:"labels,omitempty"`
 	ServiceKind       string                `json:"service_kind,omitempty"`
+	ServiceName       string                `json:"service_name,omitempty"`
+	ServiceReplica    string                `json:"service_replica,omitempty"`
+	ServiceIdentity   string                `json:"service_identity,omitempty"`
 	L2Gateway         string                `json:"l2_gateway,omitempty"`
 	L2Domain          string                `json:"l2_domain,omitempty"`
 	VLANs             []int                 `json:"vlans,omitempty"`
@@ -190,12 +193,27 @@ type WirePlacementGroup struct {
 
 // WireSvc is one auxiliary service.
 type WireSvc struct {
-	Name   string            `json:"name"`
-	Kind   string            `json:"kind"`
-	Device string            `json:"device,omitempty"`
-	Node   string            `json:"node,omitempty"`
-	Listen string            `json:"listen,omitempty"`
-	Config map[string]string `json:"config,omitempty"`
+	Name        string                          `json:"name"`
+	Kind        string                          `json:"kind"`
+	Device      string                          `json:"device,omitempty"`
+	Node        string                          `json:"node,omitempty"`
+	Listen      string                          `json:"listen,omitempty"`
+	Config      map[string]string               `json:"config,omitempty"`
+	Policy      *model.ServiceReplicationPolicy `json:"policy,omitempty"`
+	Replicas    []WireServiceReplica            `json:"replicas,omitempty"`
+	Attachments map[int]string                  `json:"attachments,omitempty"`
+}
+
+// WireServiceReplica projects the stable replica identity without serialising
+// a graph pointer.
+type WireServiceReplica struct {
+	ID       string `json:"id"`
+	Index    int    `json:"index,omitempty"`
+	Shard    string `json:"shard,omitempty"`
+	Identity string `json:"identity,omitempty"`
+	HomeNode string `json:"home_node,omitempty"`
+	Node     string `json:"node,omitempty"`
+	Device   string `json:"device"`
 }
 
 // WireDefault carries lab-wide settings the agent needs.
@@ -229,7 +247,8 @@ func Serialise(top *model.Topology) *Wire {
 			Privileged: d.Privileged, Env: d.Env, Sysctls: d.Sysctls,
 			Capabilities: d.Capabilities, Binds: d.Binds, Command: d.Command,
 			Labels: d.Labels, L2Gateway: d.L2Gateway, L2Domain: d.L2Domain,
-			VLANs: d.VLANs,
+			VLANs: d.VLANs, ServiceName: d.ServiceName,
+			ServiceReplica: d.ServiceReplica, ServiceIdentity: d.ServiceIdentity,
 		}
 		for _, i := range d.Ifaces {
 			wi := WireIface{
@@ -299,6 +318,26 @@ func Serialise(top *model.Topology) *Wire {
 		if s.Device != nil {
 			ws.Device = s.Device.ID
 		}
+		if len(s.Replicas) > 0 || s.Spec != nil && s.Spec.Replication.Declared() {
+			policy := s.Policy
+			ws.Policy = &policy
+		}
+		if len(s.Attachments) > 0 {
+			ws.Attachments = make(map[int]string, len(s.Attachments))
+			for asn, replica := range s.Attachments {
+				ws.Attachments[asn] = replica
+			}
+		}
+		for _, replica := range s.SortedReplicas() {
+			if replica == nil || replica.Device == nil {
+				continue
+			}
+			ws.Replicas = append(ws.Replicas, WireServiceReplica{
+				ID: replica.ID, Index: replica.Index, Shard: replica.Shard,
+				Identity: replica.Identity, HomeNode: replica.HomeNode,
+				Node: replica.Node, Device: replica.Device.ID,
+			})
+		}
 		w.Services = append(w.Services, ws)
 	}
 	return w
@@ -361,8 +400,9 @@ func (w *Wire) Rehydrate() (*model.Topology, error) {
 			Privileged: wd.Privileged, Env: wd.Env, Sysctls: wd.Sysctls,
 			Capabilities: wd.Capabilities, Binds: wd.Binds, Command: wd.Command,
 			Labels: wd.Labels, L2Gateway: wd.L2Gateway, L2Domain: wd.L2Domain,
-			ServiceKind: wd.ServiceKind,
-			VLANs:       wd.VLANs,
+			ServiceKind: wd.ServiceKind, ServiceName: wd.ServiceName,
+			ServiceReplica: wd.ServiceReplica, ServiceIdentity: wd.ServiceIdentity,
+			VLANs: wd.VLANs,
 		}
 		for _, wi := range wd.Ifaces {
 			ifc := &model.Iface{
@@ -454,12 +494,40 @@ func (w *Wire) Rehydrate() (*model.Topology, error) {
 	for _, ws := range w.Services {
 		s := &model.Service{Name: ws.Name, Kind: ws.Kind, Node: ws.Node,
 			Listen: ws.Listen, Config: ws.Config}
+		if spec := lab.Services[ws.Name]; spec != nil {
+			s.Spec, s.Attach = spec, spec.Attach
+			s.PerAS = spec.Attach != nil && (spec.Attach.PerAS == nil || *spec.Attach.PerAS)
+			s.Policy = lab.EffectiveReplication(spec)
+		}
+		if ws.Policy != nil {
+			s.Policy = *ws.Policy
+		}
 		if ws.Device != "" {
 			d, ok := top.Devices[ws.Device]
 			if !ok {
 				return nil, fmt.Errorf("service %s references unknown device %s", ws.Name, ws.Device)
 			}
 			s.Device = d
+		}
+		if len(ws.Attachments) > 0 {
+			s.Attachments = make(map[int]string, len(ws.Attachments))
+			for asn, replica := range ws.Attachments {
+				s.Attachments[asn] = replica
+			}
+		}
+		for _, wr := range ws.Replicas {
+			d, ok := top.Devices[wr.Device]
+			if !ok {
+				return nil, fmt.Errorf("service %s replica %s references unknown device %s",
+					ws.Name, wr.ID, wr.Device)
+			}
+			s.Replicas = append(s.Replicas, &model.ServiceReplica{
+				ID: wr.ID, Index: wr.Index, Shard: wr.Shard, Identity: wr.Identity,
+				HomeNode: wr.HomeNode, Node: wr.Node, Device: d,
+			})
+		}
+		if s.Device == nil && len(s.Replicas) > 0 {
+			s.Device = s.SortedReplicas()[0].Device
 		}
 		top.Services[s.Name] = s
 	}

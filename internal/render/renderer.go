@@ -126,7 +126,11 @@ func (r *Renderer) Files(d *model.Device) (map[string]deploy.FileSpec, error) {
 	case model.KindSwitch:
 		out["/etc/twinet/vlans"] = deploy.FileSpec{Content: []byte(vlanList(d)), Mode: 0o644}
 	case model.KindService:
-		for path, spec := range r.serviceFiles(d) {
+		serviceFiles, err := r.serviceFiles(d)
+		if err != nil {
+			return nil, err
+		}
+		for path, spec := range serviceFiles {
 			out[path] = spec
 		}
 	}
@@ -834,6 +838,41 @@ func (r *Renderer) Ready(d *model.Device, rt runtime.Runtime) *plan.Waiter {
 
 				if res.ExitCode != 0 {
 					return false, fmt.Errorf("ovs-vsctl exited %d: %s", res.ExitCode, firstLine(res.Stderr))
+				}
+				return true, nil
+			},
+		}
+	case model.KindService:
+		var (
+			describe string
+			command  []string
+		)
+		switch {
+		case isDNS(d):
+			describe = "DNS replica " + d.ID + " to answer"
+			probe := "localhost"
+			if plan := svc.BuildDNS(r.Top, dnsSerial(r.Top)); len(plan.Forward) > 0 {
+				probe = strings.TrimSuffix(plan.Forward[0].Origin, ".")
+			}
+			command = []string{"sh", "-c", fmt.Sprintf(
+				"dig +time=1 +tries=1 @127.0.0.1 %s SOA | grep -q 'status: NOERROR'", probe)}
+		case isRPKI(d):
+			describe = "RTR replica " + d.ID + " to accept connections"
+			command = []string{"sh", "-c", "socat -u /dev/null TCP:127.0.0.1:3323"}
+		default:
+			return nil
+		}
+		container := d.Container
+		return &plan.Waiter{
+			Describe: describe, Interval: 200 * time.Millisecond, Timeout: 30 * time.Second,
+			StableFor: 2,
+			Check: func(ctx context.Context) (bool, error) {
+				result, err := rt.Exec(ctx, container, runtime.ExecCmd{Cmd: command})
+				if err != nil {
+					return false, err
+				}
+				if result.ExitCode != 0 {
+					return false, fmt.Errorf("%s exited %d", describe, result.ExitCode)
 				}
 				return true, nil
 			},

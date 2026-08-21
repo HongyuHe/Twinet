@@ -19,6 +19,7 @@ import (
 	"github.com/HongyuHe/twinet/internal/alloc"
 	"github.com/HongyuHe/twinet/internal/ipam"
 	"github.com/HongyuHe/twinet/internal/model"
+	serviceplan "github.com/HongyuHe/twinet/internal/service"
 )
 
 // Result carries the expanded topology plus any non-fatal notes.
@@ -789,9 +790,14 @@ func (e *expander) resolveEndpoint(as *model.AS, port, router string) (*model.De
 // ---------------------------------------------------------------------------
 
 func (e *expander) expandServices() error {
+	scalable := false
 	for _, name := range sortedKeys(e.lab.Services) {
 		spec := e.lab.Services[name]
-		svc := &model.Service{
+		if spec == nil {
+			return fmt.Errorf("service %s has no specification", name)
+		}
+		policy := e.lab.EffectiveReplication(spec)
+		service := &model.Service{
 			Name:   name,
 			Kind:   spec.Kind,
 			Spec:   spec,
@@ -799,14 +805,22 @@ func (e *expander) expandServices() error {
 			Listen: spec.Listen,
 			Config: spec.Config,
 			Node:   spec.Node,
+			Policy: policy,
 		}
 		if spec.Attach != nil && (spec.Attach.PerAS == nil || *spec.Attach.PerAS) {
-			svc.PerAS = true
+			service.PerAS = true
 		}
-		e.top.Services[name] = svc
+		e.top.Services[name] = service
 
 		if spec.Attach == nil {
 			continue // a control-plane-only service such as the web UI
+		}
+		if policy.Mode != model.ServiceSingleton {
+			if err := e.expandServiceReplicas(name, spec, service); err != nil {
+				return err
+			}
+			scalable = true
+			continue
 		}
 
 		// One service container, with one interface into each AS that has the
@@ -814,7 +828,7 @@ func (e *expander) expandServices() error {
 		// MEASUREMENT model, which the course text depends on.
 		dev := e.newGlobalDevice(name, model.KindService, spec.DeviceDefaults)
 		dev.ServiceKind = spec.Kind
-		svc.Device = dev
+		service.Device = dev
 
 		field := "svc_" + name
 		for _, asn := range e.top.SortedASNs() {
@@ -851,7 +865,103 @@ func (e *expander) expandServices() error {
 		}
 		e.top.Devices[dev.ID] = dev
 	}
+	if scalable {
+		// Place recomputes these attachments after AS placement. Expansion must
+		// still emit a complete graph for inspection and hashing, so use the
+		// deterministic provisional node mapping until a committed placement
+		// record is available.
+		if err := serviceplan.ReconcileAttachments(e.top, serviceplan.InitialAttachmentNodes(e.top)); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// expandServiceReplicas materialises the stable containers for a declared
+// scalable policy. Cables are added only after every replica exists, because
+// attachment choice is locality-aware and depends on the complete replica set.
+func (e *expander) expandServiceReplicas(name string, spec *model.ServiceSpec, service *model.Service) error {
+	count := e.serviceReplicaCount(service)
+	if count < 1 {
+		count = 1
+	}
+	nodes := e.lab.Placement.Nodes
+	for index := 0; index < count; index++ {
+		home := ""
+		switch {
+		case service.Policy.Mode == model.ServicePerNode && index < len(nodes):
+			home = nodes[index].Name
+		case len(nodes) > 0:
+			// Replica and shard names are independent of the current node. This
+			// initial preferred node only seeds a new, record-less deployment;
+			// a committed record is always honoured unless --rebalance is used.
+			home = nodes[index%len(nodes)].Name
+		default:
+			home = e.lab.FrontNode()
+		}
+		deviceName := serviceplan.ReplicaName(name, service.Policy, index, home)
+		replica := &model.ServiceReplica{
+			ID:       serviceplan.ReplicaID(name, service.Policy, index, home),
+			Index:    index,
+			Identity: serviceplan.ReplicaIdentity(name, service.Policy, index),
+			HomeNode: home,
+			Node:     home,
+		}
+		if service.Policy.Mode == model.ServiceSharded {
+			replica.Shard = fmt.Sprintf("shard-%03d", index+1)
+		}
+		dev := e.newGlobalDevice(deviceName, model.KindService, spec.DeviceDefaults)
+		dev.ServiceKind = spec.Kind
+		dev.ServiceName = name
+		dev.ServiceReplica = replica.ID
+		dev.ServiceIdentity = replica.Identity
+		dev.Node = home
+		dev.Labels["twinet.service"] = name
+		dev.Labels["twinet.service-replica"] = replica.ID
+		dev.Labels["twinet.service-identity"] = replica.Identity
+		replica.Device = dev
+		service.Replicas = append(service.Replicas, replica)
+		if service.Device == nil {
+			service.Device = dev
+		}
+		e.top.Devices[dev.ID] = dev
+	}
+	return nil
+}
+
+func (e *expander) serviceReplicaCount(service *model.Service) int {
+	if service == nil {
+		return 0
+	}
+	switch service.Policy.Mode {
+	case model.ServicePerNode:
+		return len(e.lab.Placement.Nodes)
+	case model.ServiceReplicas:
+		return service.Policy.Replicas
+	case model.ServiceSharded:
+		size := service.Policy.ShardSize
+		if size <= 0 {
+			if service.Policy.Replicas > 0 {
+				return service.Policy.Replicas
+			}
+			return 1
+		}
+		attached := 0
+		for _, asn := range e.top.SortedASNs() {
+			as := e.top.ASes[asn]
+			if as == nil || as.Role == model.RoleIXP {
+				continue
+			}
+			if service.Attach.Template != "" && as.Template != service.Attach.Template {
+				continue
+			}
+			if _, ok := e.top.DeviceInAS(asn, service.Attach.Router); ok {
+				attached++
+			}
+		}
+		return (attached + size - 1) / size
+	}
+	return 1
 }
 
 // ---------------------------------------------------------------------------

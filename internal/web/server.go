@@ -55,6 +55,10 @@ type Server struct {
 	// Nodes reports what the cluster is doing. Optional: a lab on one machine
 	// has nothing to report.
 	Nodes func(ctx context.Context) []NodeStatus
+	// Collector exposes bounded local matrix/measurement work to the web
+	// surface. Source-side batches still run through the agent that owns each
+	// AS; this records their aggregate without a hidden service-container loop.
+	Collector *svc.ServiceCollector
 
 	tpl *template.Template
 
@@ -81,7 +85,10 @@ func New(top *model.Topology, exec Exec) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Server{Top: top, Exec: exec, Refresh: 2 * time.Minute, tpl: tpl}, nil
+	return &Server{
+		Top: top, Exec: exec, Refresh: 2 * time.Minute, tpl: tpl,
+		Collector: svc.NewServiceCollector(256),
+	}, nil
 }
 
 // Handler returns the routes.
@@ -90,11 +97,21 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/", s.overview)
 	mux.HandleFunc("/matrix", s.matrixPage)
 	mux.HandleFunc("/matrix.json", s.matrixJSON)
+	mux.HandleFunc("/collections.json", s.collectionsJSON)
 	mux.HandleFunc("/lg", s.lookingGlass)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		fmt.Fprintln(w, "ok")
 	})
 	return mux
+}
+
+func (s *Server) collectionsJSON(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if s.Collector == nil {
+		_ = json.NewEncoder(w).Encode([]svc.Collection{})
+		return
+	}
+	_ = json.NewEncoder(w).Encode(s.Collector.Events())
 }
 
 type asRow struct {
@@ -279,6 +296,11 @@ func (s *Server) takeMatrix() {
 	s.mu.Lock()
 	s.matrix, s.matrixAt = m, time.Now()
 	s.mu.Unlock()
+	if s.Collector != nil {
+		s.Collector.Publish(svc.Collection{
+			Service: "builtin.matrix", Node: "collector", Result: "success",
+		})
+	}
 }
 
 // InvalidateMatrix makes the next request refresh the cache. Runtime and

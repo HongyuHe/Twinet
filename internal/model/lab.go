@@ -148,6 +148,12 @@ type Lab struct {
 
 	// Services declares the auxiliary services attached to the lab.
 	Services map[string]*ServiceSpec `yaml:"services,omitempty" json:"services,omitempty"`
+	// ServicePolicyVersion opts a manifest into a deliberately versioned set of
+	// service defaults. Empty retains the historic singleton expansion so an
+	// existing manifest and its topology hash do not change merely by loading
+	// it with a newer controller. Version "v2" makes attach-to-every-AS
+	// built-ins per-node unless they declare replication explicitly.
+	ServicePolicyVersion string `yaml:"service_policy_version,omitempty" json:"service_policy_version,omitempty"`
 
 	// Behaviours declares scripted misconfigurations (hijacks, failures).
 	Behaviours map[string]*Behaviour `yaml:"behaviours,omitempty" json:"behaviours,omitempty"`
@@ -761,13 +767,112 @@ func firstNonEmpty(vals ...string) string {
 	return ""
 }
 
+// ServiceReplicationMode determines how a service is expanded.
+//
+// The spelling is intentionally about the service's desired availability, not
+// its container implementation. A DNS or RTR cache can consequently move from
+// one replica to another without changing the course-facing identity or
+// requiring a different service kind.
+type ServiceReplicationMode string
+
+const (
+	// ServiceSingleton retains the original one-container service contract.
+	// It is the compatibility default for manifests that predate O6.
+	ServiceSingleton ServiceReplicationMode = "singleton"
+	// ServicePerNode creates one replica for every declared placement node.
+	ServicePerNode ServiceReplicationMode = "per-node"
+	// ServiceReplicas creates the requested fixed number of replicas.
+	ServiceReplicas ServiceReplicationMode = "replicas"
+	// ServiceSharded creates deterministic shards of the attached ASes.
+	ServiceSharded ServiceReplicationMode = "sharded"
+)
+
+// ServiceShardSelector determines how a sharded service assigns ASes before
+// locality is considered. A local healthy replica always wins over this
+// fallback, so a selector never turns a local service link into a cross-node
+// link merely to preserve a hash bucket.
+type ServiceShardSelector string
+
+const (
+	ServiceShardByAS     ServiceShardSelector = "as"
+	ServiceShardByHash   ServiceShardSelector = "hash"
+	ServiceShardByNode   ServiceShardSelector = "node"
+	ServiceShardByRegion ServiceShardSelector = "region"
+)
+
+// ServiceReplicationPolicy is the typed availability declaration for an
+// auxiliary service.
+//
+// Exactly one of the mode-specific dimensions is normally useful:
+//
+//   - singleton: no additional fields;
+//   - per-node: one replica per declared placement node;
+//   - replicas: replicas is the requested count;
+//   - sharded: shard_size groups attached ASes, using selector.
+//
+// Selector is deliberately kept independent from placement. It gives a stable
+// fallback when no local replica is available; it never authorises an
+// automatic rebalance of an already recorded placement.
+type ServiceReplicationPolicy struct {
+	Mode      ServiceReplicationMode `yaml:"mode,omitempty" json:"mode,omitempty"`
+	Replicas  int                    `yaml:"replicas,omitempty" json:"replicas,omitempty"`
+	ShardSize int                    `yaml:"shard_size,omitempty" json:"shard_size,omitempty"`
+	Selector  ServiceShardSelector   `yaml:"selector,omitempty" json:"selector,omitempty"`
+}
+
+// Declared reports whether the manifest explicitly opted into a replication
+// policy. Keeping this distinction is what lets old manifests retain their
+// original graph and topology hash.
+func (p ServiceReplicationPolicy) Declared() bool {
+	return p.Mode != "" || p.Replicas != 0 || p.ShardSize != 0 || p.Selector != ""
+}
+
+// Effective returns a fully specified policy. The v1 compatibility default is
+// singleton. A lab can deliberately opt into the versioned scalable defaults
+// with service_policy_version: v2; examples that need the new behaviour
+// declare the policy directly so their migration is visible in review.
+func (p ServiceReplicationPolicy) Effective(kind string, attached bool, scalableDefaults bool) ServiceReplicationPolicy {
+	out := p
+	if out.Mode == "" {
+		switch {
+		case out.Replicas > 0:
+			out.Mode = ServiceReplicas
+		case out.ShardSize > 0 || out.Selector != "":
+			out.Mode = ServiceSharded
+		case scalableDefaults && attached && scalableBuiltinService(kind):
+			out.Mode = ServicePerNode
+		default:
+			out.Mode = ServiceSingleton
+		}
+	}
+	if out.Selector == "" {
+		out.Selector = ServiceShardByAS
+	}
+	return out
+}
+
+// scalableBuiltinService identifies services where a local read-equivalent
+// replica removes an otherwise artificial front-node cross-link. Web and
+// gateway use endpoint policy rather than a data-plane attachment.
+func scalableBuiltinService(kind string) bool {
+	switch kind {
+	case "builtin.dns", "builtin.rpki", "builtin.matrix", "builtin.measurement":
+		return true
+	}
+	return false
+}
+
 // ServiceSpec declares an auxiliary service (DNS, matrix, RPKI, ...).
 type ServiceSpec struct {
-	Kind           string            `yaml:"kind" json:"kind" jsonschema:"required"`
-	Attach         *ServiceAttach    `yaml:"attach,omitempty" json:"attach,omitempty"`
-	Listen         string            `yaml:"listen,omitempty" json:"listen,omitempty"`
-	Config         map[string]string `yaml:"config,omitempty" json:"config,omitempty"`
-	Node           string            `yaml:"node,omitempty" json:"node,omitempty"`
+	Kind        string                   `yaml:"kind" json:"kind" jsonschema:"required"`
+	Attach      *ServiceAttach           `yaml:"attach,omitempty" json:"attach,omitempty"`
+	Listen      string                   `yaml:"listen,omitempty" json:"listen,omitempty"`
+	Config      map[string]string        `yaml:"config,omitempty" json:"config,omitempty"`
+	Node        string                   `yaml:"node,omitempty" json:"node,omitempty"`
+	Replication ServiceReplicationPolicy `yaml:"replication,omitempty" json:"replication,omitempty"`
+	// Endpoints applies to control-plane services such as builtin.web. Data
+	// plane services use Replication for their service identities instead.
+	Endpoints      EndpointPolicy `yaml:"endpoints,omitempty" json:"endpoints,omitempty"`
 	DeviceDefaults `yaml:",inline" json:",inline"`
 }
 
@@ -818,12 +923,34 @@ type RPKISpec struct {
 	Invalid map[int]string `yaml:"invalid,omitempty" json:"invalid,omitempty"`
 }
 
+// EndpointMode determines whether every healthy endpoint accepts traffic or
+// whether only the deterministic primary does. Standby endpoints are still
+// fully configured and publish health, so failover changes no group
+// credentials, device placement, or agent trust material.
+type EndpointMode string
+
+const (
+	EndpointActiveActive  EndpointMode = "active-active"
+	EndpointActiveStandby EndpointMode = "active-standby"
+)
+
+// EndpointPolicy describes control-plane entry points such as the SSH gateway
+// and web overview. VIP is optional: a deterministic multi-endpoint list is
+// always available and is the portable baseline when the underlay cannot host
+// a real virtual IP.
+type EndpointPolicy struct {
+	Mode  EndpointMode `yaml:"mode,omitempty" json:"mode,omitempty"`
+	Nodes []string     `yaml:"nodes,omitempty" json:"nodes,omitempty"`
+	VIP   string       `yaml:"vip,omitempty" json:"vip,omitempty"`
+}
+
 // Access configures student access to the lab.
 type Access struct {
-	Mode        string       `yaml:"mode,omitempty" json:"mode,omitempty" jsonschema:"enum=gateway,enum=none"`
-	Listen      string       `yaml:"listen,omitempty" json:"listen,omitempty"`
-	LegacyPorts *LegacyPorts `yaml:"legacy_ports,omitempty" json:"legacy_ports,omitempty"`
-	Node        string       `yaml:"node,omitempty" json:"node,omitempty"`
+	Mode        string         `yaml:"mode,omitempty" json:"mode,omitempty" jsonschema:"enum=gateway,enum=none"`
+	Listen      string         `yaml:"listen,omitempty" json:"listen,omitempty"`
+	LegacyPorts *LegacyPorts   `yaml:"legacy_ports,omitempty" json:"legacy_ports,omitempty"`
+	Node        string         `yaml:"node,omitempty" json:"node,omitempty"`
+	Endpoints   EndpointPolicy `yaml:"endpoints,omitempty" json:"endpoints,omitempty"`
 }
 
 // LegacyPorts reproduces the mini-Internet's "ssh -p 2000+ASN" entry point.

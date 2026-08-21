@@ -47,6 +47,9 @@ func canonicalise(w io.Writer, top *model.Topology) {
 			writeString(w, "\n")
 		}
 		for _, i := range d.Ifaces {
+			if placementServiceIface(i) {
+				continue
+			}
 			writeString(w, "  iface ")
 			writeBlob(w, i.Name)
 			writeString(w, "\n")
@@ -56,11 +59,15 @@ func canonicalise(w io.Writer, top *model.Topology) {
 	links := append([]*model.Link(nil), top.Links...)
 	sort.Slice(links, func(a, b int) bool { return links[a].ID < links[b].ID })
 	for _, l := range links {
+		if placementServiceLink(l) {
+			continue
+		}
 		writeString(w, "link ")
 		writeBlob(w, l.ID)
 		writeString(w, "\n")
 		writeStruct(w, "  ", reflect.ValueOf(*l))
 	}
+
 	for _, asn := range top.SortedASNs() {
 		as := top.ASes[asn]
 		fmt.Fprintf(w, "as %d\n", asn)
@@ -112,6 +119,27 @@ func canonicalise(w io.Writer, top *model.Topology) {
 	}
 }
 
+// placementServiceIface and placementServiceLink exclude the physical cable
+// selected for a scalable replica. That cable changes under an explicit
+// placement rebalance or health failover while the course topology and
+// declared service data do not; hashing it would make a student's archive
+// depend on which healthy node answered at deployment time. Legacy singleton
+// service links retain their historic hash representation.
+func placementServiceIface(i *model.Iface) bool {
+	if i == nil || i.Link == nil {
+		return false
+	}
+	return placementServiceLink(i.Link)
+}
+
+func placementServiceLink(l *model.Link) bool {
+	if l == nil || l.Kind != model.LinkService || l.A == nil || l.B == nil ||
+		l.A.Device == nil || l.B.Device == nil {
+		return false
+	}
+	return l.A.Device.ServiceReplica != "" || l.B.Device.ServiceReplica != ""
+}
+
 // skipped names fields that must not contribute to the hash.
 //
 // Every entry is either a back-pointer, which would make the walk infinite, or
@@ -148,6 +176,24 @@ var skipped = map[string]string{
 	// A legacy router has an implicit FRR NOS. It is written explicitly by
 	// canonicalise only when authored, preserving hashes for old manifests.
 	"NOS": "empty is the legacy implicit FRR choice; explicit values are written separately",
+	// O6 service availability declarations are deployment policy. Empty
+	// declarations must not alter historic hashes, and a replica rebalance
+	// must not invalidate student work against an unchanged course graph.
+	// A declared scalable policy still changes the hash through the concrete
+	// replica devices and selected service links it expands.
+	"ServicePolicyVersion": "versioned service placement default, not course topology",
+	"Replication":          "service placement policy is represented by the expanded graph",
+	"Endpoints":            "control-plane endpoint availability policy",
+	"Policy":               "expanded service policy is placement metadata",
+	"Replicas":             "replica metadata is represented by concrete devices",
+	"Attachments":          "selected service attachment is placement-dependent",
+	"ServiceName":          "service ownership metadata",
+	"ServiceReplica":       "replica ownership metadata",
+	"ServiceIdentity":      "published service identity metadata",
+	"HomeNode":             "preferred replica placement",
+	"Identity":             "replica identity metadata",
+	"Shard":                "replica shard metadata",
+	"Index":                "replica ordinal metadata",
 
 	// Deployment facts, not topology. Two clusters running the same lab must
 	// agree on the hash, or a submission could never be graded anywhere but

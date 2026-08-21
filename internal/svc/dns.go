@@ -128,33 +128,156 @@ func BuildDNS(top *model.Topology, serial uint32) *DNSPlan {
 // service link, which is the address that AS's devices can reach it at.
 func resolverAddrs(top *model.Topology) map[int]string {
 	out := map[int]string{}
-	for _, d := range top.Devices {
-		if d.Kind != model.KindService {
-			continue
-		}
-		// What it was declared to be, not what it is called.
-		if d.ServiceKind != "" && d.ServiceKind != "builtin.dns" {
-			continue
-		}
-		if d.ServiceKind == "" && !strings.Contains(strings.ToLower(d.Name), "dns") {
-			continue
-		}
-		for _, i := range d.Ifaces {
-			if i.Addr4 == "" {
-				continue
-			}
-			a, err := netip.ParsePrefix(i.Addr4)
-			if err != nil {
-				continue
-			}
-			// The interface is named after the AS it faces.
-			var asn int
-			if _, err := fmt.Sscanf(i.Name, "as%d", &asn); err == nil && asn > 0 {
-				out[asn] = a.Addr().String()
-			}
+	if top == nil {
+		return out
+	}
+	for _, asn := range top.SortedASNs() {
+		if addr := ServiceAddressFor(top, "builtin.dns", asn); addr != "" {
+			out[asn] = addr
 		}
 	}
 	return out
+}
+
+// ServiceAddressFor returns the address an AS uses to reach one declared
+// service kind. For a replicated service it follows the topology's selected
+// attachment rather than ranging over a map of replicas. That makes resolver
+// and RTR selection deterministic and gives a local replica priority whenever
+// placement produced one.
+func ServiceAddressFor(top *model.Topology, kind string, asn int) string {
+	if top == nil {
+		return ""
+	}
+	for _, name := range top.SortedServiceNames() {
+		service := top.Services[name]
+		if service == nil || !matchesServiceKind(service, kind) {
+			continue
+		}
+		if replica, ok := service.ReplicaForAS(asn); ok && replica != nil && replica.Device != nil {
+			if addr := addressFacingAS(replica.Device, asn); addr != "" {
+				return addr
+			}
+		}
+		if service.Device != nil {
+			if addr := addressFacingAS(service.Device, asn); addr != "" {
+				return addr
+			}
+		}
+	}
+	// Old wire payloads can lack the Service projection. Retain the legacy
+	// declared-kind/name fallback, but in deterministic device order.
+	for _, device := range top.SortedDevices() {
+		if device.Kind == model.KindService && deviceMatchesServiceKind(device, kind) {
+			if addr := addressFacingAS(device, asn); addr != "" {
+				return addr
+			}
+		}
+	}
+	return ""
+}
+
+// ServiceAddressesFor returns the preferred AS-local address followed by one
+// deterministic address for every other replica. Consumers can keep the
+// preferred local path fast while retaining an explicit, topology-declared
+// failover path; no mutable replica-to-replica coordination is assumed.
+func ServiceAddressesFor(top *model.Topology, kind string, asn int) []string {
+	preferred := ServiceAddressFor(top, kind, asn)
+	if top == nil {
+		return nil
+	}
+	var fallback []string
+	for _, name := range top.SortedServiceNames() {
+		service := top.Services[name]
+		if service == nil || !matchesServiceKind(service, kind) {
+			continue
+		}
+		for _, replica := range service.SortedReplicas() {
+			if replica != nil && replica.Device != nil {
+				if address := firstServiceAddress(replica.Device); address != "" {
+					fallback = append(fallback, address)
+				}
+			}
+		}
+		if len(service.Replicas) == 0 && service.Device != nil {
+			if address := firstServiceAddress(service.Device); address != "" {
+				fallback = append(fallback, address)
+			}
+		}
+	}
+	sort.Strings(fallback)
+	seen := map[string]bool{}
+	out := make([]string, 0, len(fallback)+1)
+	add := func(address string) {
+		if address != "" && !seen[address] {
+			seen[address] = true
+			out = append(out, address)
+		}
+	}
+	add(preferred)
+	for _, address := range fallback {
+		add(address)
+	}
+	return out
+}
+
+func addressFacingAS(device *model.Device, asn int) string {
+	if device == nil {
+		return ""
+	}
+	for _, iface := range device.Ifaces {
+		if iface.Addr4 == "" {
+			continue
+		}
+		var facing int
+		if _, err := fmt.Sscanf(iface.Name, "as%d", &facing); err != nil || facing != asn {
+			continue
+		}
+		if address, err := netip.ParsePrefix(iface.Addr4); err == nil {
+			return address.Addr().String()
+		}
+	}
+	return ""
+}
+
+func firstServiceAddress(device *model.Device) string {
+	if device == nil {
+		return ""
+	}
+	var addresses []string
+	for _, iface := range device.Ifaces {
+		if address, err := netip.ParsePrefix(iface.Addr4); err == nil {
+			addresses = append(addresses, address.Addr().String())
+		}
+	}
+	sort.Strings(addresses)
+	if len(addresses) == 0 {
+		return ""
+	}
+	return addresses[0]
+}
+
+func matchesServiceKind(service *model.Service, kind string) bool {
+	if service == nil {
+		return false
+	}
+	if service.Kind != "" {
+		return service.Kind == kind
+	}
+	if service.Device != nil {
+		return deviceMatchesServiceKind(service.Device, kind)
+	}
+	return false
+}
+
+func deviceMatchesServiceKind(device *model.Device, kind string) bool {
+	if device == nil || device.Kind != model.KindService {
+		return false
+	}
+	if device.ServiceKind != "" {
+		return device.ServiceKind == kind
+	}
+	needle := strings.TrimPrefix(kind, "builtin.")
+	return strings.Contains(strings.ToLower(device.Name), needle)
 }
 
 // ResolverFor returns the address devices in an AS should use as their

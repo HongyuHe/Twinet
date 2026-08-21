@@ -1144,7 +1144,8 @@ func placementRecordMoved(previous, next *place.Record) bool {
 	}
 	return changed(beforeAS, afterAS) ||
 		changed(previous.ByGroup, next.ByGroup) ||
-		changed(previous.ByService, next.ByService)
+		changed(previous.ByService, next.ByService) ||
+		changed(previous.ByServiceReplica, next.ByServiceReplica)
 }
 
 func unavailableClusterNodes(results []client.NodeResult[agent.StatusResponse]) []string {
@@ -1257,7 +1258,8 @@ func adoptRunningPlacement(ctx context.Context, top *model.Topology, token strin
 	if len(cs) == 0 {
 		return nil, nil
 	}
-	r := &place.Record{Lab: top.Name, Strategy: "adopted", ByAS: map[int]string{}, ByService: map[string]string{}}
+	r := &place.Record{Lab: top.Name, Strategy: "adopted", ByAS: map[int]string{},
+		ByService: map[string]string{}, ByServiceReplica: map[string]string{}}
 	conflict := map[int]string{}
 	for _, c := range cs {
 		node := c.Label(deploy.LabelNode)
@@ -1267,7 +1269,15 @@ func adoptRunningPlacement(ctx context.Context, top *model.Topology, token strin
 		}
 		if asn == 0 {
 			if d := c.Label(deploy.LabelDevice); d != "" {
-				r.ByService[serviceNameOf(top, d)] = node
+				service, replica := serviceRecordKeyOf(top, d)
+				if replica != "" {
+					r.ByServiceReplica[replica] = node
+					if r.ByService[service] == "" {
+						r.ByService[service] = node
+					}
+				} else {
+					r.ByService[service] = node
+				}
 			}
 			continue
 		}
@@ -1292,12 +1302,28 @@ func adoptRunningPlacement(ctx context.Context, top *model.Topology, token strin
 
 // serviceNameOf maps a service device name back to the service that owns it.
 func serviceNameOf(top *model.Topology, device string) string {
+	service, _ := serviceRecordKeyOf(top, device)
+	return service
+}
+
+// serviceRecordKeyOf maps a service container name to its service and stable
+// replica record key. Legacy singleton callers receive an empty replica key.
+func serviceRecordKeyOf(top *model.Topology, device string) (string, string) {
 	for _, n := range top.SortedServiceNames() {
-		if svc := top.Services[n]; svc != nil && svc.Device != nil && svc.Device.Name == device {
-			return n
+		service := top.Services[n]
+		if service == nil {
+			continue
+		}
+		for _, replica := range service.SortedReplicas() {
+			if replica != nil && replica.Device != nil && replica.Device.Name == device {
+				return n, replica.ID
+			}
+		}
+		if service.Device != nil && service.Device.Name == device {
+			return n, ""
 		}
 	}
-	return device
+	return device, ""
 }
 
 // destroyStore opens the snapshot store to capture into before a destroy.

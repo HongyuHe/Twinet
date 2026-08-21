@@ -601,16 +601,22 @@ func ixpPolicy(top *model.Topology, as *model.AS, exts []ext, rpki bool) string 
 // valid would black-hole most of the real internet, and a check that tested
 // only for rejection would award full marks for exactly that mistake.
 func rpkiCache(top *model.Topology, as *model.AS) string {
-	addr := svc.RPKIAddrFor(top, as.ASN)
-	if addr == "" {
+	// An AS that was never attached to the validator keeps the legacy
+	// contract: do not infer RPKI merely because another AS has a replica.
+	// Once it has its declared local address, the remaining configured
+	// addresses are deterministic failover caches.
+	if svc.RPKIAddrFor(top, as.ASN) == "" {
 		return ""
 	}
+	addrs := svc.ServiceAddressesFor(top, "builtin.rpki", as.ASN)
 	var b strings.Builder
 	b.WriteString("rpki\n")
 	// FRR 10 spells this without a transport keyword. The version that
 	// takes "tcp" is newer, and using it here fails as an unknown command --
 	// which a student would read as their own syntax error.
-	fmt.Fprintf(&b, " rpki cache %s 3323 preference 1\n", addr)
+	for index, addr := range addrs {
+		fmt.Fprintf(&b, " rpki cache %s 3323 preference %d\n", addr, index+1)
+	}
 	// A short retry interval matters more than it looks. The validator lives
 	// behind the routing the deployment is still installing, so a router that
 	// configures its cache first finds it unreachable -- and without a retry

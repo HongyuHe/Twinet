@@ -36,8 +36,34 @@ and there is no rule left to get wrong.`,
 	}
 	cmd.AddCommand(
 		newGatewayRunCmd(opts),
+		newGatewayEndpointsCmd(opts),
 		newGatewayRosterCmd(opts),
 	)
+	return cmd
+}
+
+// newGatewayEndpointsCmd publishes the portable multi-endpoint baseline. A
+// real VIP may be layered over this list by the environment, but no gateway
+// client needs to depend on a front node or a VIP to fail over.
+func newGatewayEndpointsCmd(opts *Options) *cobra.Command {
+	var token string
+	cmd := &cobra.Command{
+		Use:   "endpoints",
+		Short: "List deterministic gateway endpoints and their health",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			top, err := loadAndPlace(opts)
+			if err != nil {
+				return err
+			}
+			health, err := endpointHealth(cmd.Context(), top, token)
+			if err != nil {
+				return err
+			}
+			writeEndpointList(cmd.OutOrStdout(), top.Lab.GatewayEndpoints(), health)
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&token, "token", "", "agent token for cluster labs (or set TWINET_TOKEN)")
 	return cmd
 }
 

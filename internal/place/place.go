@@ -19,6 +19,7 @@ import (
 	"strings"
 
 	"github.com/HongyuHe/twinet/internal/model"
+	serviceplan "github.com/HongyuHe/twinet/internal/service"
 )
 
 // Assignment is the computed placement.
@@ -30,7 +31,12 @@ type Assignment struct {
 	// fully compatible.
 	ByGroup map[string]string
 	// ByService maps service name to node name.
+	//
+	// It remains the primary/legacy singleton location. ByServiceReplica is
+	// authoritative for a service expanded into multiple replicas.
 	ByService map[string]string
+	// ByServiceReplica maps a stable logical replica ID to its node.
+	ByServiceReplica map[string]string
 	// Load is the per-node container count.
 	Load map[string]int
 	// CrossNodeLinks counts links whose endpoints landed on different nodes.
@@ -55,7 +61,8 @@ type LinkLocality struct {
 // Record is the assignment in the form it is written down in.
 func (a *Assignment) Record(lab, strategy string) *Record {
 	r := &Record{Lab: lab, Strategy: strategy,
-		ByAS: map[int]string{}, ByGroup: map[string]string{}, ByService: map[string]string{}}
+		ByAS: map[int]string{}, ByGroup: map[string]string{}, ByService: map[string]string{},
+		ByServiceReplica: map[string]string{}}
 	for k, v := range a.ByAS {
 		r.ByAS[k] = v
 	}
@@ -64,6 +71,9 @@ func (a *Assignment) Record(lab, strategy string) *Record {
 	}
 	for k, v := range a.ByService {
 		r.ByService[k] = v
+	}
+	for k, v := range a.ByServiceReplica {
+		r.ByServiceReplica[k] = v
 	}
 	return r
 }
@@ -110,6 +120,9 @@ type Record struct {
 	ByAS      map[int]string    `json:"by_as"`
 	ByGroup   map[string]string `json:"by_group,omitempty"`
 	ByService map[string]string `json:"by_service"`
+	// ByServiceReplica was added after the singleton service record. Omit it
+	// for old graphs so their durable record wire format remains unchanged.
+	ByServiceReplica map[string]string `json:"by_service_replica,omitempty"`
 	// Overcommit records an operator's explicit admission override so a
 	// capacity incident can be traced back to the deployment that accepted it.
 	Overcommit bool `json:"overcommit,omitempty"`
@@ -146,10 +159,11 @@ func Place(top *model.Topology, opts Options) (*Assignment, error) {
 		}
 	}
 	a := &Assignment{
-		ByAS:      map[int]string{},
-		ByGroup:   map[string]string{},
-		ByService: map[string]string{},
-		Load:      map[string]int{},
+		ByAS:             map[int]string{},
+		ByGroup:          map[string]string{},
+		ByService:        map[string]string{},
+		ByServiceReplica: map[string]string{},
+		Load:             map[string]int{},
 	}
 	capacity := buildCapacityState(top, opts)
 	names, caps, hasCap := capacity.names, capacity.caps, capacity.hasCap
@@ -162,8 +176,17 @@ func Place(top *model.Topology, opts Options) (*Assignment, error) {
 		for _, asn := range top.SortedASNs() {
 			a.ByAS[asn] = front
 		}
-		for _, s := range top.SortedServiceNames() {
-			a.ByService[s] = front
+		for _, name := range top.SortedServiceNames() {
+			service := top.Services[name]
+			if service == nil {
+				continue
+			}
+			for _, replica := range service.SortedReplicas() {
+				if replica != nil {
+					a.ByServiceReplica[replica.ID] = front
+				}
+			}
+			a.ByService[name] = front
 		}
 		if opts.Strict && !opts.Overcommit {
 			if err := strictAssignmentError(top, a, capacity); err != nil {
@@ -238,40 +261,33 @@ func Place(top *model.Topology, opts Options) (*Assignment, error) {
 			}
 			pinned[asn] = n
 		}
-		for _, s := range top.SortedServiceNames() {
-			if n, ok := opts.Fixed.ByService[s]; ok {
-				if capacity.allNodeName[n] {
-					pinnedSvc[s] = n
-				}
-				if opts.Strict && !opts.Overcommit {
-					groups := make([]string, 0, len(opts.Fixed.ByGroup))
-					for group := range opts.Fixed.ByGroup {
-						groups = append(groups, group)
-					}
-					sort.Strings(groups)
-					for _, group := range groups {
-						node := opts.Fixed.ByGroup[group]
-						if capacity.allNodeName[node] && len(capacity.unknown[node]) > 0 {
-							return nil, fmt.Errorf(
-								"strict admission refuses recorded placement group %s on %s because allocatable %s is unknown; "+
-									"use the audited --overcommit escape hatch only when this is intentional",
-								group, node, strings.Join(capacity.unknown[node], ", "))
-						}
-					}
+		if opts.Strict && !opts.Overcommit {
+			groups := make([]string, 0, len(opts.Fixed.ByGroup))
+			for group := range opts.Fixed.ByGroup {
+				groups = append(groups, group)
+			}
+			sort.Strings(groups)
+			for _, group := range groups {
+				node := opts.Fixed.ByGroup[group]
+				if capacity.allNodeName[node] && len(capacity.unknown[node]) > 0 {
+					return nil, fmt.Errorf(
+						"strict admission refuses recorded placement group %s on %s because allocatable %s is unknown; "+
+							"use the audited --overcommit escape hatch only when this is intentional",
+						group, node, strings.Join(capacity.unknown[node], ", "))
 				}
 			}
 		}
 	}
 
-	// Services default to the front node: they publish externally reachable
-	// endpoints and are the natural neighbours of the web UI and gateway.
-	for _, s := range top.SortedServiceNames() {
-		if n, ok := pinnedSvc[s]; ok {
-			a.ByService[s] = n
-		} else {
-			a.ByService[s] = front
-		}
+	// Singleton services retain their historic front-node default. Scalable
+	// services instead keep a recorded replica placement (or their stable
+	// home) and are attached locally after AS placement below.
+	serviceMoves, err := placeServices(top, a, names, caps, hasCap, loads, pinnedSvc,
+		opts.Fixed, opts.Rebalance, front)
+	if err != nil {
+		return nil, err
 	}
+	moved = append(moved, serviceMoves...)
 
 	// What each AS costs, in every dimension a node can run out of. Counting
 	// containers alone treats eight small routers and eight four-core ones as
@@ -291,14 +307,6 @@ func Place(top *model.Topology, opts Options) (*Assignment, error) {
 		}
 		weight[asn] = d
 	}
-	for _, s := range top.SortedServiceNames() {
-		if svc := top.Services[s]; svc != nil && svc.Device != nil {
-			n := a.ByService[s]
-			loads[n] = loads[n].add(deviceDemand(svc.Device))
-			a.Load[n]++
-		}
-	}
-
 	// Honour pins first so their weight is reflected before packing the rest.
 	var free []int
 	for _, asn := range top.SortedASNs() {
@@ -413,19 +421,29 @@ func finish(top *model.Topology, a *Assignment) (*Assignment, error) {
 			d.Node = n
 			continue
 		}
-		// A service device: find the service that owns it.
-		placed := false
-		for _, sn := range top.SortedServiceNames() {
-			svc := top.Services[sn]
-			if svc.Device == d {
-				d.Node = a.ByService[sn]
-				placed = true
-				break
-			}
-		}
-		if !placed {
+		// A service device can be a legacy singleton or one of several
+		// stable replicas. The replica record, not FrontNode, is the
+		// authority for scalable services.
+		if node := serviceReplicaNode(top, a, d); node != "" {
+			d.Node = node
+		} else {
 			d.Node = top.Lab.FrontNode()
 		}
+	}
+	for _, name := range top.SortedServiceNames() {
+		service := top.Services[name]
+		if service == nil {
+			continue
+		}
+		for _, replica := range service.Replicas {
+			if replica == nil || replica.Device == nil {
+				continue
+			}
+			replica.Node = replica.Device.Node
+		}
+	}
+	if err := serviceplan.ReconcileAttachments(top, a.ByAS); err != nil {
+		return nil, err
 	}
 
 	a.Load = map[string]int{}

@@ -17,13 +17,12 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"net"
 	"net/netip"
 	"sort"
-	"strings"
 	"sync"
-	"time"
 
 	"github.com/HongyuHe/twinet/internal/model"
 )
@@ -60,8 +59,8 @@ type Payload struct {
 // scores full marks for a router that would black-hole most of the internet.
 func BuildRPKI(top *model.Topology, notFound []int, invalid map[int]string) *Payload {
 	p := &Payload{}
-	p.Metadata.Generated = time.Now().Unix()
-	p.Metadata.Valid = time.Now().Add(24 * time.Hour).Unix()
+	p.Metadata.Generated = rpkiEpoch(top)
+	p.Metadata.Valid = p.Metadata.Generated + 24*60*60
 
 	skip := map[int]bool{}
 	for _, asn := range notFound {
@@ -116,6 +115,26 @@ func BuildRPKI(top *model.Topology, notFound []int, invalid map[int]string) *Pay
 		return p.Roas[i].Prefix < p.Roas[j].Prefix
 	})
 	return p
+}
+
+// rpkiEpoch is deterministic so every independently rendered replica serves
+// byte-identical declared state. Wall-clock metadata made otherwise identical
+// RTR payloads differ solely because one node rendered a second later, which
+// turns replica equivalence into an accident of deployment timing.
+func rpkiEpoch(top *model.Topology) int64 {
+	h := fnv.New64a()
+	if top != nil {
+		_, _ = h.Write([]byte(top.Name))
+		_, _ = h.Write([]byte{0})
+		_, _ = h.Write([]byte(top.Hash))
+		for _, asn := range top.SortedASNs() {
+			as := top.ASes[asn]
+			_, _ = fmt.Fprintf(h, "%d=%s\x00", asn, as.Block)
+		}
+	}
+	// A stable, plausible epoch avoids a zero timestamp while making it clear
+	// this metadata identifies declared content rather than render time.
+	return 1_700_000_000 + int64(h.Sum64()%31_536_000)
 }
 
 // JSON renders the payload in the format validators publish.
@@ -306,28 +325,7 @@ func writePDU(w io.Writer, kind byte, session uint16, body []byte) error {
 
 // RPKIAddrFor returns the address devices in an AS reach the validator at.
 func RPKIAddrFor(top *model.Topology, asn int) string {
-	for _, d := range top.Devices {
-		if d.Kind != model.KindService {
-			continue
-		}
-		// What it was declared to be, not what it is called.
-		if d.ServiceKind != "" && d.ServiceKind != "builtin.rpki" {
-			continue
-		}
-		if d.ServiceKind == "" && !strings.Contains(strings.ToLower(d.Name), "rpki") {
-			continue
-		}
-		for _, i := range d.Ifaces {
-			var n int
-			if _, err := fmt.Sscanf(i.Name, "as%d", &n); err != nil || n != asn {
-				continue
-			}
-			if a, err := netip.ParsePrefix(i.Addr4); err == nil {
-				return a.Addr().String()
-			}
-		}
-	}
-	return ""
+	return ServiceAddressFor(top, "builtin.rpki", asn)
 }
 
 // HijackOrigin returns the AS that deliberately announces a mis-ROA'd prefix,

@@ -114,12 +114,15 @@ services:
   dns:
     kind: builtin.dns
     attach: {template: student_as, router: MSP, iface: dns}
+    replication: {mode: per-node}
   matrix:
     kind: builtin.matrix
     attach: {template: student_as, router: ATL, iface: matrix}
+    replication: {mode: per-node}
   measurement:
     kind: builtin.measurement
     attach: {template: student_as, router: HOU, iface: measurement}
+    replication: {mode: per-node}
   # The lab is its own trust anchor. A public validator would make an exercise's
   # answer depend on what somebody else publishes; a pinned snapshot of real
   # data is enormous and still arbitrary. Deriving the payload from the topology
@@ -128,9 +131,12 @@ services:
   rpki:
     kind: builtin.rpki
     attach: {template: student_as, router: BOS, iface: rpki}
+    replication: {mode: per-node}
   web:
     kind: builtin.web
     listen: ":9000"
+    replication: {mode: per-node}
+    endpoints: {mode: active-active}
 
 # The trust anchor's deliberate discrepancies. Declared, so an exercise can say
 # exactly which announcement is meant to be invalid rather than hoping one is.
@@ -148,6 +154,7 @@ access:
   mode: gateway
   listen: ":2022"
   legacy_ports: {enabled: true, base: 2000}
+  endpoints: {mode: active-active}
 
 placement:
   strategy: pack-by-as

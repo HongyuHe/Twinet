@@ -18,8 +18,15 @@ import (
 // tests that check them pass, and inside the lab no name resolves. A service
 // that is deployed, wired, addressed and running `sleep infinity` looks
 // healthy from every angle except the only one that matters.
-func (r *Renderer) serviceFiles(d *model.Device) map[string]deploy.FileSpec {
+func (r *Renderer) serviceFiles(d *model.Device) (map[string]deploy.FileSpec, error) {
 	out := map[string]deploy.FileSpec{}
+	if d.ServiceReplica != "" {
+		state, err := svc.BuildDeclaredReplicaState(r.Top, d)
+		if err != nil {
+			return nil, err
+		}
+		out["/etc/twinet/service-state.json"] = deploy.FileSpec{Content: state, Mode: 0o644}
+	}
 	if isRPKI(d) {
 		p := svc.BuildRPKI(r.Top, r.Top.Lab.RPKI.NotFound, r.Top.Lab.RPKI.Invalid)
 		out["/etc/twinet/rpki.json"] = deploy.FileSpec{Content: p.JSON(), Mode: 0o644}
@@ -34,17 +41,17 @@ func (r *Renderer) serviceFiles(d *model.Device) map[string]deploy.FileSpec {
 		if raw, err := json.MarshalIndent(svc.AuthorityFor(r.Top), "", "  "); err == nil {
 			out["/etc/twinet/rpki_authority.json"] = deploy.FileSpec{Content: append(raw, '\n'), Mode: 0o644}
 		}
-		return out
+		return out, nil
 	}
 	if !isDNS(d) {
-		return out
+		return out, nil
 	}
 	plan := svc.BuildDNS(r.Top, dnsSerial(r.Top))
 	for path, body := range plan.Files() {
 		out[path] = deploy.FileSpec{Content: body, Mode: 0o644}
 	}
 	out["/etc/twinet/hosts"] = deploy.FileSpec{Content: []byte(plan.HostsFile()), Mode: 0o644}
-	return out
+	return out, nil
 }
 
 // serviceCommands starts the daemon a service device exists to run.
@@ -116,23 +123,29 @@ func (r *Renderer) resolverCommands(d *model.Device) []deploy.Command {
 	if d.Kind == model.KindService || d.ASN == 0 {
 		return nil
 	}
-	addr := svc.ResolverFor(r.Top, d.ASN)
-	if addr == "" {
+	if svc.ResolverFor(r.Top, d.ASN) == "" {
 		return nil
+	}
+	addrs := svc.ServiceAddressesFor(r.Top, "builtin.dns", d.ASN)
+	if len(addrs) == 0 {
+		return nil
+	}
+	var nameservers strings.Builder
+	for _, addr := range addrs {
+		fmt.Fprintf(&nameservers, "nameserver %s\\n", addr)
 	}
 	// Docker bind-mounts /etc/resolv.conf, so it is truncated and rewritten in
 	// place rather than replaced: removing it fails with "resource busy".
 	return []deploy.Command{{
 		Describe: "point the resolver at the lab's own DNS",
 		Args: []string{"sh", "-c", fmt.Sprintf(
-			": > /etc/resolv.conf; printf 'nameserver %s\\nsearch group%d\\noptions timeout:1 attempts:1\\n' > /etc/resolv.conf",
-			addr, d.ASN)},
+			": > /etc/resolv.conf; printf '%ssearch group%d\\noptions timeout:1 attempts:1\\n' > /etc/resolv.conf",
+			nameservers.String(), d.ASN)},
 		IgnoreError: true,
 	}}
 }
 
-// serviceRoutes gives a service container a route to each AS it serves,
-// through that AS's own link.
+// serviceRoutes gives a service container a route to every AS it serves.
 //
 // Without them a service has only its directly-connected subnets and a default
 // route out whichever AS happened to be last, so a reply to any device that is
@@ -147,18 +160,43 @@ func (r *Renderer) serviceRoutes(d *model.Device) []deploy.Command {
 		return nil
 	}
 	var cmds []deploy.Command
+	byAS := map[int]*model.Iface{}
 	for _, i := range d.Ifaces {
 		var asn int
 		if _, err := fmt.Sscanf(i.Name, "as%d", &asn); err != nil || asn == 0 {
 			continue
 		}
-		as, ok := r.Top.ASes[asn]
-		if !ok || as.Block == "" || i.Peer == nil || i.Peer.Addr4 == "" {
+		byAS[asn] = i
+	}
+	// A replica normally has a direct cable only to the ASes placed on its
+	// node. It still serves equivalent data for the whole lab, so traffic for
+	// an AS it does not directly face goes through a deterministic attached
+	// ingress AS instead of relying on whichever default route happened to be
+	// installed last.
+	var ingress *model.Iface
+	var attached []int
+	for asn := range byAS {
+		attached = append(attached, asn)
+	}
+	sort.Ints(attached)
+	if len(attached) > 0 {
+		ingress = byAS[attached[0]]
+	}
+	for _, targetASN := range r.Top.SortedASNs() {
+		as, ok := r.Top.ASes[targetASN]
+		if !ok || as.Block == "" {
+			continue
+		}
+		i := byAS[targetASN]
+		if i == nil {
+			i = ingress
+		}
+		if i == nil || i.Peer == nil || i.Peer.Addr4 == "" {
 			continue
 		}
 		gw := addrOf(i.Peer.Addr4)
 		cmds = append(cmds, deploy.Command{
-			Describe: fmt.Sprintf("route to AS %d through its own link", asn),
+			Describe: fmt.Sprintf("route to AS %d through service ingress", targetASN),
 			Args: []string{"sh", "-c", fmt.Sprintf(
 				"ip route replace %s via %s dev %s", as.Block, gw, i.Name)},
 		})

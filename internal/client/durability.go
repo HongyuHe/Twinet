@@ -203,10 +203,11 @@ func (c *Cluster) runningPlacement(ctx context.Context, top *model.Topology,
 				}
 				continue
 			}
-			for name, service := range top.Services {
-				if service != nil && service.Device == device {
-					out[device.ID] = record.ByService[name]
-					break
+			if service, replica, ok := top.ServiceByDevice(device); ok {
+				if replica != nil {
+					out[device.ID] = record.ByServiceReplica[replica.ID]
+				} else {
+					out[device.ID] = record.ByService[service.Name]
 				}
 			}
 		}

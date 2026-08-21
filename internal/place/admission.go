@@ -112,11 +112,8 @@ func nodeForAssignment(top *model.Topology, a *Assignment, d *model.Device) stri
 		}
 		return a.ByAS[d.ASN]
 	}
-	for _, name := range top.SortedServiceNames() {
-		svc := top.Services[name]
-		if svc != nil && svc.Device == d {
-			return a.ByService[name]
-		}
+	if node := serviceReplicaNode(top, a, d); node != "" {
+		return node
 	}
 	return top.Lab.FrontNode()
 }
@@ -237,7 +234,8 @@ func AdmitPlaced(top *model.Topology, inventory []NodeInventory, strict, overcom
 	if top == nil || top.Lab == nil {
 		return fmt.Errorf("admission needs a topology with a lab")
 	}
-	a := &Assignment{ByAS: map[int]string{}, ByGroup: map[string]string{}, ByService: map[string]string{}}
+	a := &Assignment{ByAS: map[int]string{}, ByGroup: map[string]string{},
+		ByService: map[string]string{}, ByServiceReplica: map[string]string{}}
 	for _, d := range top.SortedDevices() {
 		if d.Node == "" {
 			continue
@@ -251,9 +249,14 @@ func AdmitPlaced(top *model.Topology, inventory []NodeInventory, strict, overcom
 			}
 			continue
 		}
-		for _, name := range top.SortedServiceNames() {
-			if svc := top.Services[name]; svc != nil && svc.Device == d {
-				a.ByService[name] = d.Node
+		if service, replica, ok := top.ServiceByDevice(d); ok {
+			if replica != nil {
+				a.ByServiceReplica[replica.ID] = d.Node
+				if a.ByService[service.Name] == "" {
+					a.ByService[service.Name] = d.Node
+				}
+			} else {
+				a.ByService[service.Name] = d.Node
 			}
 		}
 	}

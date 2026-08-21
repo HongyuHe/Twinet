@@ -529,6 +529,12 @@ func (l *Loaded) validateBehaviours(d *Diagnostics, file string) {
 
 func (l *Loaded) validateServices(d *Diagnostics, file string) {
 	root := l.Nodes[file]
+	switch l.Lab.ServicePolicyVersion {
+	case "", "v2":
+	default:
+		d.Addf(file, "service_policy_version", nodeAt(root, "service_policy_version"),
+			"unknown service policy version %q (supported: v2)", l.Lab.ServicePolicyVersion)
+	}
 	known := map[string]bool{
 		"builtin.dns": true, "builtin.matrix": true, "builtin.measurement": true,
 		"builtin.web": true, "builtin.wireguard": true, "builtin.krill": true,
@@ -544,6 +550,8 @@ func (l *Loaded) validateServices(d *Diagnostics, file string) {
 				fmt.Sprintf("unknown service kind %q", s.Kind),
 				"known kinds: "+strings.Join(sortedMapKeys(known), ", "))
 		}
+		validateServiceReplication(d, file, path+".replication", node, s.Replication)
+		validateEndpointPolicy(d, file, path+".endpoints", node, s.Endpoints, l.Lab)
 		if s.Attach != nil {
 			if s.Attach.Router == "" {
 				d.Add(file, path+".attach.router", "attach.router is required", node)
@@ -570,6 +578,7 @@ func (l *Loaded) validateServices(d *Diagnostics, file string) {
 							"template %q has no router %q", tplName, s.Attach.Router)
 					}
 				}
+
 			}
 			// A per-AS service needs an addressing entry to derive its subnets.
 			if _, ok := l.Lab.Addressing.Services[name]; !ok {
@@ -577,6 +586,74 @@ func (l *Loaded) validateServices(d *Diagnostics, file string) {
 					fmt.Sprintf("service %q is attached per-AS but addressing.services.%s is not defined", name, name),
 					"add an entry under addressing.services so each AS gets a subnet for it")
 			}
+		}
+	}
+}
+
+func validateServiceReplication(d *Diagnostics, file, path string, node *yaml.Node,
+	p model.ServiceReplicationPolicy) {
+
+	switch p.Mode {
+	case "", model.ServiceSingleton:
+		if p.Mode == model.ServiceSingleton && (p.Replicas != 0 || p.ShardSize != 0 || p.Selector != "") {
+			d.Add(file, path, "singleton replication must not set replicas, shard_size, or selector", node)
+		}
+	case model.ServicePerNode:
+		if p.Replicas != 0 || p.ShardSize != 0 {
+			d.Add(file, path, "per-node replication must not set replicas or shard_size", node)
+		}
+	case model.ServiceReplicas:
+		if p.Replicas < 1 {
+			d.Add(file, path+".replicas", "replicas mode requires replicas >= 1", node)
+		}
+		if p.ShardSize != 0 {
+			d.Add(file, path+".shard_size", "replicas mode must not set shard_size", node)
+		}
+	case model.ServiceSharded:
+		if p.ShardSize < 1 {
+			d.Add(file, path+".shard_size", "sharded mode requires shard_size >= 1", node)
+		}
+	default:
+		d.Addf(file, path+".mode", node,
+			"unknown replication mode %q (singleton, per-node, replicas, sharded)", p.Mode)
+	}
+	if p.Mode == "" {
+		if p.Replicas < 0 {
+			d.Add(file, path+".replicas", "replicas must not be negative", node)
+		}
+		if p.ShardSize < 0 {
+			d.Add(file, path+".shard_size", "shard_size must not be negative", node)
+		}
+	}
+
+	switch p.Selector {
+	case "", model.ServiceShardByAS, model.ServiceShardByHash, model.ServiceShardByNode, model.ServiceShardByRegion:
+	default:
+		d.Addf(file, path+".selector", node,
+			"unknown shard selector %q (as, hash, node, region)", p.Selector)
+	}
+}
+
+func validateEndpointPolicy(d *Diagnostics, file, path string, node *yaml.Node,
+	p model.EndpointPolicy, lab *model.Lab) {
+
+	switch p.Mode {
+	case "", model.EndpointActiveActive, model.EndpointActiveStandby:
+	default:
+		d.Addf(file, path+".mode", node,
+			"unknown endpoint mode %q (active-active, active-standby)", p.Mode)
+	}
+	seen := map[string]bool{}
+	for _, endpoint := range p.Nodes {
+		if seen[endpoint] {
+			d.Addf(file, path+".nodes", node, "endpoint node %q appears more than once", endpoint)
+		}
+		seen[endpoint] = true
+		if lab == nil {
+			continue
+		}
+		if _, ok := lab.NodeByName(endpoint); !ok {
+			d.Addf(file, path+".nodes", node, "unknown endpoint node %q", endpoint)
 		}
 	}
 }
@@ -904,6 +981,7 @@ func (l *Loaded) validateAccess(d *Diagnostics, file string) {
 			d.Addf(file, "access.node", nodeAt(root, "access"), "unknown node %q", a.Node)
 		}
 	}
+	validateEndpointPolicy(d, file, "access.endpoints", nodeAt(root, "access.endpoints"), a.Endpoints, l.Lab)
 	if lp := a.LegacyPorts; lp != nil && lp.Enabled {
 		maxASN := 0
 		for _, g := range l.Lab.AutonomousSystems {

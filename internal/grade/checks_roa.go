@@ -189,14 +189,21 @@ func publishedROAs(ctx context.Context, env *Env) ([]publishedVRP, error) {
 
 // rpkiServiceDevice finds the trust anchor in the lab.
 func rpkiServiceDevice(env *Env) string {
-	for _, s := range env.Topology.Services {
-		if strings.Contains(strings.ToLower(s.Kind), "rpki") && s.Device != nil {
-			return s.Device.ID
+	for _, name := range env.Topology.SortedServiceNames() {
+		service := env.Topology.Services[name]
+		if service == nil || !strings.Contains(strings.ToLower(service.Kind), "rpki") {
+			continue
+		}
+		if replica, ok := service.ReplicaForAS(env.AS); ok && replica != nil && replica.Device != nil {
+			return replica.Device.ID
+		}
+		if service.Device != nil {
+			return service.Device.ID
 		}
 	}
-	for id, d := range env.Topology.Devices {
-		if d.Kind == model.KindService && strings.Contains(strings.ToLower(id), "rpki") {
-			return id
+	for _, d := range env.Topology.SortedDevices() {
+		if d.Kind == model.KindService && strings.Contains(strings.ToLower(d.ID), "rpki") {
+			return d.ID
 		}
 	}
 	return ""

@@ -133,6 +133,7 @@ func TestTheWholeManifestSurvivesTheWire(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	res, err := expand.Expand(l.Lab)
 	if err != nil {
 		t.Fatal(err)
@@ -165,5 +166,42 @@ func TestTheWholeManifestSurvivesTheWire(t *testing.T) {
 	}
 	if got.Lab.Addressing.InterAS != want.Addressing.InterAS {
 		t.Errorf("addressing did not survive: %q vs %q", got.Lab.Addressing.InterAS, want.Addressing.InterAS)
+	}
+}
+
+func TestReplicatedServicePlacementSurvivesTheWire(t *testing.T) {
+	l, err := manifest.Load("../../examples/scale")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := expand.Expand(l.Lab)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := place.Place(res.Topology, place.Options{}); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(Serialise(res.Topology))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire Wire
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		t.Fatal(err)
+	}
+	got, err := wire.Rehydrate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"dns", "rpki", "matrix", "measurement"} {
+		wantService, gotService := res.Topology.Services[name], got.Services[name]
+		if gotService == nil || len(gotService.Replicas) != len(wantService.Replicas) {
+			t.Fatalf("%s replicas lost across wire: want %#v got %#v", name, wantService, gotService)
+		}
+		for asn, replica := range wantService.Attachments {
+			if gotService.Attachments[asn] != replica {
+				t.Errorf("%s AS %d attachment = %q, want %q", name, asn, gotService.Attachments[asn], replica)
+			}
+		}
 	}
 }

@@ -185,6 +185,12 @@ type Device struct {
 	// `dns_probe: {kind: container}` had a resolver started inside it. What a
 	// service is is declared; it does not have to be guessed.
 	ServiceKind string
+	// ServiceName, ServiceReplica, and ServiceIdentity describe a replica of
+	// an auxiliary service. They stay empty for every legacy singleton so
+	// existing container identities remain byte-for-byte compatible.
+	ServiceName     string
+	ServiceReplica  string
+	ServiceIdentity string
 	// L2Gateway is the L2 domain this router is gateway for, if any.
 	L2Gateway string
 	// VLANs is populated for switches: the set of VLAN ids in their domain.
@@ -473,17 +479,104 @@ func MakeLinkID(devA, ifA, devB, ifB string) string {
 	return a + "|" + b
 }
 
+// ServiceReplica is one deterministic instance of an auxiliary service.
+//
+// ID is a logical, stable identity (for example "dns/node-1" or
+// "dns/shard-002"), while Device is the concrete container. Identity is the
+// service-facing anycast or shard identity; it deliberately does not change
+// when a replica is moved under an explicit rebalance or node-loss recovery.
+type ServiceReplica struct {
+	ID       string
+	Index    int
+	Shard    string
+	Identity string
+	// HomeNode is the deterministic preferred placement selected by expansion.
+	// Node is the current recorded placement and may differ after an explicit
+	// rebalance or node-loss recovery.
+	HomeNode string
+	Node     string
+	Device   *Device
+}
+
 // Service is an expanded auxiliary service.
 type Service struct {
-	Name   string
-	Kind   string
+	Name string
+	Kind string
+	// Device is retained as the canonical singleton (or first replica) for
+	// backwards-compatible callers. New placement code uses Replicas.
 	Device *Device
-	Spec   *ServiceSpec
-	PerAS  bool
-	Attach *ServiceAttach
-	Listen string
-	Config map[string]string
-	Node   string
+	// Replicas is empty for a legacy singleton. A declared scalable policy
+	// fills it in stable ID order.
+	Replicas []*ServiceReplica
+	// Attachments maps each attached AS to the selected replica ID. It is
+	// regenerated deterministically after placement, so a local replica is
+	// selected whenever one exists.
+	Attachments map[int]string
+	Policy      ServiceReplicationPolicy
+	Spec        *ServiceSpec
+	PerAS       bool
+	Attach      *ServiceAttach
+	Listen      string
+	Config      map[string]string
+	Node        string
+}
+
+// SortedReplicas returns replicas in their stable logical identity order.
+func (s *Service) SortedReplicas() []*ServiceReplica {
+	if s == nil || len(s.Replicas) == 0 {
+		return nil
+	}
+	out := append([]*ServiceReplica(nil), s.Replicas...)
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+// Replica returns the replica with the logical ID.
+func (s *Service) Replica(id string) (*ServiceReplica, bool) {
+	if s == nil {
+		return nil, false
+	}
+	for _, r := range s.Replicas {
+		if r != nil && r.ID == id {
+			return r, true
+		}
+	}
+	return nil, false
+}
+
+// ReplicaForAS returns the declared attachment target for one AS.
+func (s *Service) ReplicaForAS(asn int) (*ServiceReplica, bool) {
+	if s == nil {
+		return nil, false
+	}
+	id := s.Attachments[asn]
+	if id == "" {
+		return nil, false
+	}
+	return s.Replica(id)
+}
+
+// ServiceByDevice returns the service and replica that own a device. It also
+// understands pre-O6 singleton services whose Replicas slice is empty.
+func (t *Topology) ServiceByDevice(device *Device) (*Service, *ServiceReplica, bool) {
+	if t == nil || device == nil {
+		return nil, nil, false
+	}
+	for _, name := range t.SortedServiceNames() {
+		s := t.Services[name]
+		if s == nil {
+			continue
+		}
+		for _, r := range s.Replicas {
+			if r != nil && r.Device == device {
+				return s, r, true
+			}
+		}
+		if s.Device == device {
+			return s, nil, true
+		}
+	}
+	return nil, nil, false
 }
 
 // FRRConfig holds the rendered routing configuration for a router, split by

@@ -73,6 +73,9 @@ func LoadRecord(dir, lab string) (*Record, error) {
 	if r.ByService == nil {
 		r.ByService = map[string]string{}
 	}
+	if r.ByServiceReplica == nil {
+		r.ByServiceReplica = map[string]string{}
+	}
 	return &r, nil
 }
 

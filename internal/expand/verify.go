@@ -139,6 +139,33 @@ func (e *expander) verify() error {
 		}
 	}
 
+	// Service identities are deliberately generated, but their concrete
+	// attachment addresses must still be globally unambiguous. Two replicas
+	// answering for the same address on separate point-to-point cables make
+	// health failover nondeterministic: a client can reconnect to either
+	// service without any record saying which state it read.
+	serviceAddresses := map[string]string{}
+	for _, d := range e.top.SortedDevices() {
+		if d.Kind != model.KindService {
+			continue
+		}
+		for _, iface := range d.Ifaces {
+			if iface.Addr4 == "" {
+				continue
+			}
+			address, err := netip.ParsePrefix(iface.Addr4)
+			if err != nil {
+				continue
+			}
+			key := address.Addr().String()
+			owner := d.ID + ":" + iface.Name
+			if previous, duplicate := serviceAddresses[key]; duplicate && previous != owner {
+				add("service addresses %s and %s both claim %s", previous, owner, key)
+			}
+			serviceAddresses[key] = owner
+		}
+	}
+
 	// Every interface address must be inside its link's subnet, or the two
 	// ends of a cable are on different networks and nothing will ever work.
 	for _, l := range e.top.Links {

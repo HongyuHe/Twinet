@@ -73,4 +73,8 @@ func TestWebMatrixUsesTwoSourceSideExecsPerAS(t *testing.T) {
 	if !invalidated {
 		t.Fatal("runtime event invalidation left the matrix cache fresh")
 	}
+	if events := server.Collector.Events(); len(events) != 1 ||
+		events[0].Service != "builtin.matrix" || events[0].Result != "success" {
+		t.Fatalf("matrix batch did not publish a bounded collector event: %#v", events)
+	}
 }

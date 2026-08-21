@@ -159,8 +159,9 @@ func placementDemands(top *model.Topology, a *Assignment, baseline map[string]de
 	}
 	for _, name := range top.SortedServiceNames() {
 		s := top.Services[name]
-		if s != nil && s.Device != nil {
-			out[a.ByService[name]] = out[a.ByService[name]].add(deviceDemand(s.Device))
+		for _, device := range serviceDevices(s) {
+			node := serviceReplicaNode(top, a, device)
+			out[node] = out[node].add(deviceDemand(device))
 		}
 	}
 	return out

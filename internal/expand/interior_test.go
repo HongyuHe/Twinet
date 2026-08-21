@@ -255,7 +255,9 @@ func TestBundledExampleHashesStayByteCompatible(t *testing.T) {
 		"../../examples/cos461":    "67512321120953a4",
 		"../../examples/demo":      "b2c6f717337aaddd",
 		"../../examples/multicast": "26322a0da9ae995f",
-		"../../examples/scale":     "8efe54b2d0781376",
+		// Scale explicitly opts into O6 per-node service replicas. Its graph
+		// and hash intentionally change; legacy manifests remain unchanged.
+		"../../examples/scale": "acc8093d2242f073",
 	}
 	for dir, hash := range want {
 		t.Run(strings.TrimPrefix(dir, "../../examples/"), func(t *testing.T) {

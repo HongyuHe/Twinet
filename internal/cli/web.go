@@ -125,6 +125,29 @@ The listen address defaults to whatever the manifest's web service declares.`,
 	cmd.Flags().StringVar(&token, "token", "", "agent token")
 	cmd.Flags().DurationVar(&refresh, "refresh", 2*time.Minute,
 		"how often to recompute the connectivity matrix")
+	cmd.AddCommand(newWebEndpointsCmd(opts))
+	return cmd
+}
+
+func newWebEndpointsCmd(opts *Options) *cobra.Command {
+	var token string
+	cmd := &cobra.Command{
+		Use:   "endpoints",
+		Short: "List deterministic web endpoints and their health",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			top, err := loadAndPlace(opts)
+			if err != nil {
+				return err
+			}
+			health, err := endpointHealth(cmd.Context(), top, token)
+			if err != nil {
+				return err
+			}
+			writeEndpointList(cmd.OutOrStdout(), top.WebEndpoints(), health)
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&token, "token", "", "agent token for cluster labs (or set TWINET_TOKEN)")
 	return cmd
 }
 
