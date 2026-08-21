@@ -16,7 +16,7 @@ import (
 // tcpdump filters and NIC offloads work without configuration.
 const VXLANPort = 4789
 
-// OverlaySpec describes one end of a cross-node link.
+// OverlaySpec describes one end of a legacy per-link cross-node tunnel.
 //
 // Twinet's overlay is deliberately the simplest thing that can work: every link
 // has exactly two endpoints, so each tunnel is a point-to-point unicast VXLAN
@@ -52,8 +52,11 @@ type OverlaySpec struct {
 	Lab string
 }
 
-// EnsureOverlay creates the bridge and VXLAN netdev for a cross-node link and
-// returns the bridge name, ready for a veth to be attached as a port.
+// EnsureOverlay creates the legacy bridge and VXLAN netdev for a cross-node
+// link and returns the bridge name, ready for a veth to be attached as a port.
+//
+// New deployments use EnsureMultiplexOverlay. This remains for safe cleanup
+// and convergence of labs created by older agents.
 //
 // The topology on each node is:
 //
@@ -364,19 +367,20 @@ func AttachToBridgeByName(iface, bridge string) error {
 	return nil
 }
 
-// RemoveOverlay tears down the bridge and tunnel for a link.
+// RemoveOverlay tears down a link's multiplex binding and any legacy
+// per-link bridge/tunnel. It is intentionally VNI-based so older callers can
+// clean up a mixed-version lab without knowing which representation created it.
 func RemoveOverlay(vni uint32) error {
-	for _, name := range []string{VxlanName(vni), BridgeName(vni)} {
-		l, err := netlink.LinkByName(name)
-		if err != nil {
-			if IsNotFound(err) {
-				continue
-			}
-			return fmt.Errorf("look up %s: %w", name, err)
-		}
-		if err := netlink.LinkDel(l); err != nil {
-			return fmt.Errorf("delete %s: %w", name, err)
-		}
+	var problems []string
+	if err := removeMultiplexVNI(vni); err != nil {
+		problems = append(problems, err.Error())
+	}
+	if err := RemoveLegacyOverlay(vni); err != nil {
+		problems = append(problems, err.Error())
+	}
+	if len(problems) > 0 {
+		sort.Strings(problems)
+		return fmt.Errorf("%s", strings.Join(problems, "; "))
 	}
 	return nil
 }
@@ -405,7 +409,8 @@ func UnderlayMTU(remote string) (int, string, error) {
 	return l.Attrs().MTU, l.Attrs().Name, nil
 }
 
-// ListOverlays returns the VNIs of every Twinet-owned VXLAN device on this host.
+// ListOverlays returns every active Twinet VNI on this host, including legacy
+// per-link tunnels and bindings on shared multiplex tunnels.
 //
 // Cleanup must work from what is actually on the machine, not from a list the
 // caller happens to remember: a lab destroyed without its manifest, or an AS
@@ -414,9 +419,8 @@ func ListOverlays() ([]uint32, error) {
 	return listOverlays("")
 }
 
-// ListOverlaysOfLab returns only the overlays a lab owns. Cleaning up one lab
-// must not remove another's fabric, which is what an unqualified sweep of every
-// twvx device on the host does.
+// ListOverlaysOfLab returns only the active VNIs a lab owns, across legacy and
+// multiplexed overlays. Cleaning up one lab must not remove another's fabric.
 func ListOverlaysOfLab(lab string) ([]uint32, error) {
 	return listOverlays(lab)
 }
@@ -435,6 +439,16 @@ func OverlayOwners() (map[uint32]string, error) {
 		}
 		out[uint32(vx.VxlanId)] = ownerFromAlias(vx.Attrs().Alias)
 	}
+	multiplex, err := multiplexOwners()
+	if err != nil {
+		return nil, err
+	}
+	for vni, owner := range multiplex {
+		if previous, exists := out[vni]; exists && previous != "" && owner != "" && previous != owner {
+			return nil, fmt.Errorf("VNI %d is owned by both labs %q and %q", vni, previous, owner)
+		}
+		out[vni] = owner
+	}
 	return out, nil
 }
 
@@ -443,7 +457,7 @@ func listOverlays(lab string) ([]uint32, error) {
 	if err != nil {
 		return nil, fmt.Errorf("list host interfaces: %w", err)
 	}
-	var out []uint32
+	seen := map[uint32]bool{}
 	for _, l := range links {
 		vx, ok := l.(*netlink.Vxlan)
 		if !ok || !strings.HasPrefix(vx.Name, "twvx") {
@@ -452,8 +466,20 @@ func listOverlays(lab string) ([]uint32, error) {
 		if lab != "" && ownerFromAlias(vx.Attrs().Alias) != lab {
 			continue
 		}
-		out = append(out, uint32(vx.VxlanId))
+		seen[uint32(vx.VxlanId)] = true
 	}
+	multiplex, err := listMultiplexVNIs(lab)
+	if err != nil {
+		return nil, err
+	}
+	for _, vni := range multiplex {
+		seen[vni] = true
+	}
+	out := make([]uint32, 0, len(seen))
+	for vni := range seen {
+		out = append(out, vni)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
 	return out, nil
 }
 
@@ -465,6 +491,9 @@ const aliasPrefix = "twinet:"
 func ownerAlias(lab string) string { return aliasPrefix + lab }
 
 func ownerFromAlias(alias string) string {
+	if key, ok := pairKeyFromAlias(alias); ok {
+		return key.lab
+	}
 	if !strings.HasPrefix(alias, aliasPrefix) {
 		return ""
 	}

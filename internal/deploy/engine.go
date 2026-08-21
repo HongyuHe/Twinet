@@ -21,6 +21,7 @@ import (
 	"sync"
 
 	"github.com/HongyuHe/twinet/internal/alloc"
+	"github.com/HongyuHe/twinet/internal/limiter"
 	"github.com/HongyuHe/twinet/internal/model"
 	"github.com/HongyuHe/twinet/internal/netx"
 	"github.com/HongyuHe/twinet/internal/plan"
@@ -50,6 +51,14 @@ const (
 	LabelRegion   = "twinet.region"
 	LabelManaged  = "twinet.managed"
 	LabelDeviceID = "twinet.device-id"
+	// Request labels let agents reconstruct reservations for every lab after
+	// restart, including a lab whose controller is no longer connected.
+	LabelRequestCPU     = "twinet.request.cpu"
+	LabelRequestMemory  = "twinet.request.memory"
+	LabelRequestPids    = "twinet.request.pids"
+	LabelRequestDisk    = "twinet.request.ephemeral-storage"
+	LabelRequestFDs     = "twinet.request.file-descriptors"
+	LabelRequestNetDevs = "twinet.request.netdevs"
 )
 
 // DefaultStopTimeout bounds how long a container is given to exit cleanly.
@@ -64,6 +73,10 @@ const DefaultStopTimeout = 10 * time.Second
 type Engine struct {
 	Runtime runtime.Runtime
 	Node    string
+	// Limiter is shared by every Engine on an agent, so simultaneous labs do
+	// not turn their individually bounded worker pools into an unbounded
+	// node-wide burst.
+	Limiter *limiter.Limiter
 	// Workers bounds capture, pruning, and teardown fan-out. Zero uses a
 	// conservative default so a large lab cannot turn cleanup into an
 	// unbounded burst of runtime or netlink requests.
@@ -107,6 +120,13 @@ type Engine struct {
 	// pendingRestore records devices whose captured configuration must be
 	// replayed once their interfaces exist.
 	pendingRestore sync.Map
+}
+
+func (e *Engine) limited(ctx context.Context, kinds []limiter.Kind, fn func() error) error {
+	if e.Limiter == nil {
+		return fn()
+	}
+	return e.Limiter.Run(ctx, kinds, fn)
 }
 
 // Renderer produces the files and commands that configure a device.
@@ -159,7 +179,9 @@ func (e *Engine) Build(top *model.Topology) (*plan.Plan, error) {
 		p.Add(&plan.Step{
 			ID: id, Stage: plan.StageImage, Describe: "pull " + image,
 			Run: func(ctx context.Context) error {
-				return e.Runtime.PullImage(ctx, image, e.pullPolicy())
+				return e.limited(ctx, []limiter.Kind{limiter.Apply, limiter.ImagePull}, func() error {
+					return e.Runtime.PullImage(ctx, image, e.pullPolicy())
+				})
 			},
 		})
 	}
@@ -174,7 +196,9 @@ func (e *Engine) Build(top *model.Topology) (*plan.Plan, error) {
 			Describe: "create " + dev.ID,
 			Needs:    []string{imageStep[dev.Image]},
 			Run: func(ctx context.Context) error {
-				return e.ensureContainer(ctx, top, dev)
+				return e.limited(ctx, []limiter.Kind{limiter.Apply, limiter.Lifecycle}, func() error {
+					return e.ensureContainer(ctx, top, dev)
+				})
 			},
 		})
 	}
@@ -201,7 +225,9 @@ func (e *Engine) Build(top *model.Topology) (*plan.Plan, error) {
 			Describe: "wire " + link.ID,
 			Needs:    needs,
 			Run: func(ctx context.Context) error {
-				return e.wire(ctx, top, link)
+				return e.limited(ctx, []limiter.Kind{limiter.Apply, limiter.Netlink}, func() error {
+					return e.wire(ctx, top, link)
+				})
 			},
 		})
 	}
@@ -223,13 +249,15 @@ func (e *Engine) Build(top *model.Topology) (*plan.Plan, error) {
 			Describe: "configure " + dev.ID,
 			Needs:    dedup(needs),
 			Run: func(ctx context.Context) error {
-				if err := e.configure(ctx, dev); err != nil {
-					return err
-				}
-				// Whatever the student had is replayed *after* the platform's
-				// own configuration and after the interfaces exist, so it wins
-				// over the defaults and lands on devices that are present.
-				return e.replayPending(ctx, top, dev)
+				return e.limited(ctx, []limiter.Kind{limiter.Apply, limiter.ExecProbe}, func() error {
+					if err := e.configure(ctx, dev); err != nil {
+						return err
+					}
+					// Whatever the student had is replayed *after* the platform's
+					// own configuration and after the interfaces exist, so it wins
+					// over the defaults and lands on devices that are present.
+					return e.replayPending(ctx, top, dev)
+				})
 			},
 		})
 	}
@@ -250,7 +278,9 @@ func (e *Engine) Build(top *model.Topology) (*plan.Plan, error) {
 				Describe: "wait for " + dev.ID,
 				Needs:    []string{"configure:" + dev.ID},
 				Run: func(ctx context.Context) error {
-					return plan.Wait(ctx, waiter)
+					return e.limited(ctx, []limiter.Kind{limiter.Apply, limiter.ExecProbe}, func() error {
+						return plan.Wait(ctx, waiter)
+					})
 				},
 			})
 		}
@@ -358,7 +388,15 @@ func (e *Engine) captureBeforeReplace(ctx context.Context, top *model.Topology, 
 	if e.WritesReference {
 		return nil
 	}
-	snaps, err := Capture(ctx, e.Runtime, d, top.Name, top.Hash)
+	var (
+		snaps []state.Snapshot
+		err   error
+	)
+	err = e.limited(ctx, []limiter.Kind{limiter.Capture}, func() error {
+		var captureErr error
+		snaps, captureErr = Capture(ctx, e.Runtime, d, top.Name, top.Hash)
+		return captureErr
+	})
 	if errors.Is(err, ErrNotRunning) {
 		// A stopped container still holds the student's work on its
 		// filesystem. Start it, read it, and only then allow the replacement.
@@ -368,7 +406,11 @@ func (e *Engine) captureBeforeReplace(ctx context.Context, top *model.Topology, 
 			return fmt.Errorf("refusing to replace %s: it is not running and could not be "+
 				"started to read its configuration: %w", d.ID, serr)
 		}
-		snaps, err = Capture(ctx, e.Runtime, d, top.Name, top.Hash)
+		err = e.limited(ctx, []limiter.Kind{limiter.Capture}, func() error {
+			var captureErr error
+			snaps, captureErr = Capture(ctx, e.Runtime, d, top.Name, top.Hash)
+			return captureErr
+		})
 	}
 	if err != nil {
 		return fmt.Errorf("refusing to replace %s: its configuration could not be captured: %w", d.ID, err)
@@ -527,9 +569,11 @@ func (e *Engine) PruneOrphans(ctx context.Context, top *model.Topology) ([]strin
 	// has already destroyed an unrelated student's only copy.
 	captures := make([][]state.Snapshot, len(candidates))
 	_, captureErrs, ctxErr := e.runBounded(ctx, len(candidates), func(i int) error {
-		snaps, err := e.orphanSnapshots(ctx, top, candidates[i])
-		captures[i] = snaps
-		return err
+		return e.limited(ctx, []limiter.Kind{limiter.Capture}, func() error {
+			snaps, err := e.orphanSnapshots(ctx, top, candidates[i])
+			captures[i] = snaps
+			return err
+		})
 	})
 	var problems []string
 	for i, c := range candidates {
@@ -561,7 +605,9 @@ func (e *Engine) PruneOrphans(ctx context.Context, top *model.Topology) ([]strin
 	}
 
 	started, removeErrs, ctxErr := e.runBounded(ctx, len(candidates), func(i int) error {
-		return e.Runtime.Remove(ctx, candidates[i].Name, true)
+		return e.limited(ctx, []limiter.Kind{limiter.Lifecycle}, func() error {
+			return e.Runtime.Remove(ctx, candidates[i].Name, true)
+		})
 	})
 	var removed []string
 	for i, c := range candidates {
@@ -637,7 +683,8 @@ func (e *Engine) orphanSnapshots(ctx context.Context, top *model.Topology, c run
 	return snaps, nil
 }
 
-// PruneOverlays removes VXLAN bridges and tunnels this node no longer needs.
+// PruneOverlays removes stale VNI bindings and any now-empty shared
+// bridge/VXLAN pair this node no longer needs.
 func (e *Engine) PruneOverlays(top *model.Topology) ([]string, error) {
 	return e.PruneOverlaysContext(context.Background(), top)
 }
@@ -668,10 +715,12 @@ func (e *Engine) PruneOverlaysContext(ctx context.Context, top *model.Topology) 
 	sort.Slice(stale, func(i, j int) bool { return stale[i] < stale[j] })
 	started, errs, ctxErr := e.runBounded(ctx, len(stale), func(i int) error {
 		vni := stale[i]
-		if err := netx.DeleteHostLink(hostSideName(vni)); err != nil {
-			return err
-		}
-		return netx.RemoveOverlay(vni)
+		return e.limited(ctx, []limiter.Kind{limiter.Netlink}, func() error {
+			if err := netx.DeleteHostLink(hostSideName(vni)); err != nil {
+				return err
+			}
+			return netx.RemoveOverlay(vni)
+		})
 	})
 	var removed []string
 	var problems []string
@@ -685,6 +734,20 @@ func (e *Engine) PruneOverlaysContext(ctx context.Context, top *model.Topology) 
 		}
 		removed = append(removed, netx.VxlanName(vni))
 	}
+	if ctxErr == nil {
+		var empty []string
+		err = e.limited(ctx, []limiter.Kind{limiter.Netlink}, func() error {
+			var removeErr error
+			empty, removeErr = netx.RemoveEmptyMultiplexOverlays(top.Name)
+			return removeErr
+		})
+		if err != nil {
+			problems = append(problems, fmt.Sprintf("remove empty multiplex overlays: %v", err))
+		} else {
+			removed = append(removed, empty...)
+		}
+	}
+	sort.Strings(removed)
 	return removed, deterministicError(ctxErr, problems)
 }
 
@@ -728,15 +791,25 @@ func sortedCopy(in []string) []string {
 }
 
 func (e *Engine) labels(top *model.Topology, d *model.Device) map[string]string {
+	request := d.Requests
+	if request.Empty() {
+		request = model.DefaultResourceRequest(d.Kind)
+	}
 	out := map[string]string{
-		LabelManaged:  "true",
-		LabelLab:      top.Name,
-		LabelDevice:   d.Name,
-		LabelDeviceID: d.ID,
-		LabelKind:     string(d.Kind),
-		LabelNode:     e.Node,
-		LabelHash:     top.Hash,
-		LabelSpec:     SpecHash(d),
+		LabelManaged:        "true",
+		LabelLab:            top.Name,
+		LabelDevice:         d.Name,
+		LabelDeviceID:       d.ID,
+		LabelKind:           string(d.Kind),
+		LabelNode:           e.Node,
+		LabelHash:           top.Hash,
+		LabelSpec:           SpecHash(d),
+		LabelRequestCPU:     strconv.FormatFloat(request.CPUs, 'f', -1, 64),
+		LabelRequestMemory:  request.Memory,
+		LabelRequestPids:    strconv.FormatInt(request.Pids, 10),
+		LabelRequestDisk:    request.Storage(),
+		LabelRequestFDs:     strconv.FormatInt(request.FileDescriptors, 10),
+		LabelRequestNetDevs: strconv.FormatInt(request.NetDevices, 10),
 	}
 	if e.Generation != "" {
 		out[LabelGen] = e.Generation
@@ -781,11 +854,9 @@ func (e *Engine) wire(ctx context.Context, top *model.Topology, l *model.Link) e
 	return nil
 }
 
-// wireCrossNode attaches this node's half of the link to a VXLAN tunnel.
-//
-// Each node runs this independently for its own side. Because the VNI is
-// derived from the link identity, the two sides agree without coordination,
-// which is what makes cluster deployment need no distributed allocation.
+// wireCrossNode attaches this node's half of the link to a shared external
+// VXLAN for the lab/node pair. Each link retains its own VNI on the wire; a
+// deterministic bridge VLAN maps that VNI through the shared tunnel.
 func (e *Engine) wireCrossNode(ctx context.Context, top *model.Topology, l *model.Link) error {
 	var local, remote *model.Iface
 	switch e.Node {
@@ -801,14 +872,20 @@ func (e *Engine) wireCrossNode(ctx context.Context, top *model.Topology, l *mode
 	if remoteIP == "" {
 		return fmt.Errorf("link %s: no underlay address known for node %s", l.ID, remote.Device.Node)
 	}
-	mtu := linkMTU(l)
-	bridge, err := netx.EnsureOverlay(netx.OverlaySpec{
-		VNI:         l.VNI,
+	vlan, mtu, err := multiplexParameters(top, e.Node, remote.Device.Node, l.VNI)
+	if err != nil {
+		return fmt.Errorf("link %s: %w", l.ID, err)
+	}
+	bridge, err := netx.EnsureMultiplexOverlay(netx.MultiplexOverlaySpec{
+		Lab:         top.Name,
+		LocalNode:   e.Node,
+		RemoteNode:  remote.Device.Node,
 		LocalIP:     e.UnderlayIP,
 		RemoteIP:    remoteIP,
 		UnderlayDev: e.UnderlayDev,
 		MTU:         mtu,
-		Lab:         top.Name,
+		VNI:         l.VNI,
+		VLAN:        vlan,
 	})
 	if err != nil {
 		return fmt.Errorf("link %s: %w", l.ID, err)
@@ -834,12 +911,68 @@ func (e *Engine) wireCrossNode(ctx context.Context, top *model.Topology, l *mode
 	if err := netx.CreateVeth(spec); err != nil {
 		return fmt.Errorf("link %s: %w", l.ID, err)
 	}
-	return netx.AttachToBridgeByName(hostSide, bridge)
+	if err := netx.AttachToMultiplexOverlay(hostSide, bridge, vlan); err != nil {
+		return fmt.Errorf("link %s: attach multiplex port: %w", l.ID, err)
+	}
+	// A successful attach has moved the only host-side veth away from the old
+	// bridge, so the legacy per-link pair is now safe to remove. If this step
+	// failed, the old path remains intact for a retry instead of cutting a
+	// running lab over half way through migration.
+	if err := netx.RemoveLegacyOverlayForLab(l.VNI, top.Name); err != nil {
+		return fmt.Errorf("link %s: remove legacy overlay: %w", l.ID, err)
+	}
+	return nil
 }
 
 // hostSideName derives the root-namespace veth name for a cross-node link.
 // It must fit IFNAMSIZ-1 and be unique per VNI, which it is because the VNI is.
 func hostSideName(vni uint32) string { return fmt.Sprintf("twp%d", vni) }
+
+// multiplexParameters computes the one bridge VLAN for a link and the one
+// outer MTU for all links between a pair of nodes. Both endpoint agents run
+// this against the same topology, so collision resolution stays symmetric.
+func multiplexParameters(top *model.Topology, first, second string, target uint32) (uint16, int, error) {
+	var vnis []uint32
+	mtu := 1500
+	found := false
+	for _, link := range top.Links {
+		if link == nil || !link.CrossNode() || link.A == nil || link.B == nil ||
+			link.A.Device == nil || link.B.Device == nil {
+			continue
+		}
+		a, b := link.A.Device.Node, link.B.Device.Node
+		if !sameNodePair(a, b, first, second) {
+			continue
+		}
+		if link.VNI == 0 {
+			return 0, 0, fmt.Errorf("cross-node link %s has no VNI", link.ID)
+		}
+		vnis = append(vnis, link.VNI)
+		if linkMTU(link) > mtu {
+			mtu = linkMTU(link)
+		}
+		if link.VNI == target {
+			found = true
+		}
+	}
+	if !found {
+		return 0, 0, fmt.Errorf("VNI %d is not a cross-node link between %s and %s",
+			target, first, second)
+	}
+	vlans, err := netx.AssignOverlayVLANs(vnis)
+	if err != nil {
+		return 0, 0, err
+	}
+	vlan := vlans[target]
+	if vlan == 0 {
+		return 0, 0, fmt.Errorf("no VLAN assigned to VNI %d", target)
+	}
+	return vlan, mtu, nil
+}
+
+func sameNodePair(a, b, first, second string) bool {
+	return (a == first && b == second) || (a == second && b == first)
+}
 
 // endpoint builds the netx specification for one side of a link.
 func (e *Engine) endpoint(top *model.Topology, i *model.Iface, nsPath string, l *model.Link) netx.EndpointSpec {
@@ -1122,7 +1255,9 @@ func (e *Engine) Destroy(ctx context.Context, lab string) error {
 	}
 	sort.Slice(cs, func(i, j int) bool { return cs[i].Name < cs[j].Name })
 	started, errs, ctxErr := e.runBounded(ctx, len(cs), func(i int) error {
-		return e.Runtime.Remove(ctx, cs[i].Name, true)
+		return e.limited(ctx, []limiter.Kind{limiter.Lifecycle}, func() error {
+			return e.Runtime.Remove(ctx, cs[i].Name, true)
+		})
 	})
 	var problems []string
 	for i, c := range cs {
@@ -1133,18 +1268,26 @@ func (e *Engine) Destroy(ctx context.Context, lab string) error {
 			problems = append(problems, fmt.Sprintf("remove %s: %v", c.Name, err))
 		}
 	}
+	if ctxErr == nil {
+		if err := e.limited(ctx, []limiter.Kind{limiter.Netlink}, func() error {
+			_, removeErr := netx.RemoveEmptyMultiplexOverlays(lab)
+			return removeErr
+		}); err != nil {
+			problems = append(problems, fmt.Sprintf("remove empty multiplex overlays: %v", err))
+		}
+	}
 	return deterministicError(ctxErr, problems)
 }
 
-// DestroyOverlays removes the bridges, tunnels and host-side veths for the
-// given VNIs.
+// DestroyOverlays removes host-side veths and VNI bindings for the given
+// links, deleting a shared bridge/VXLAN pair only after its final VNI is gone.
 func (e *Engine) DestroyOverlays(vnis []uint32) error {
 	return e.DestroyOverlaysContext(context.Background(), vnis)
 }
 
 // DestroyOverlaysContext removes overlays in bounded parallel while retaining
 // deterministic errors. A VNI is deduplicated before fan-out so two workers
-// never race to delete the same bridge and tunnel.
+// never race to remove the same multiplex binding.
 func (e *Engine) DestroyOverlaysContext(ctx context.Context, vnis []uint32) error {
 	seen := map[uint32]bool{}
 	unique := make([]uint32, 0, len(vnis))
@@ -1157,14 +1300,16 @@ func (e *Engine) DestroyOverlaysContext(ctx context.Context, vnis []uint32) erro
 	sort.Slice(unique, func(i, j int) bool { return unique[i] < unique[j] })
 	started, errs, ctxErr := e.runBounded(ctx, len(unique), func(i int) error {
 		vni := unique[i]
-		var problems []string
-		if err := netx.DeleteHostLink(hostSideName(vni)); err != nil {
-			problems = append(problems, err.Error())
-		}
-		if err := netx.RemoveOverlay(vni); err != nil {
-			problems = append(problems, err.Error())
-		}
-		return deterministicError(nil, problems)
+		return e.limited(ctx, []limiter.Kind{limiter.Netlink}, func() error {
+			var problems []string
+			if err := netx.DeleteHostLink(hostSideName(vni)); err != nil {
+				problems = append(problems, err.Error())
+			}
+			if err := netx.RemoveOverlay(vni); err != nil {
+				problems = append(problems, err.Error())
+			}
+			return deterministicError(nil, problems)
+		})
 	})
 	var problems []string
 	for i, vni := range unique {
@@ -1254,7 +1399,9 @@ func (e *Engine) RewireDevice(ctx context.Context, top *model.Topology, d *model
 		if l.A.Device.Node != e.Node && l.B.Device.Node != e.Node {
 			continue
 		}
-		if err := e.wire(ctx, top, l); err != nil {
+		if err := e.limited(ctx, []limiter.Kind{limiter.Netlink}, func() error {
+			return e.wire(ctx, top, l)
+		}); err != nil {
 			failed = append(failed, fmt.Sprintf("%s: %v", l.ID, err))
 		}
 	}
@@ -1263,5 +1410,7 @@ func (e *Engine) RewireDevice(ctx context.Context, top *model.Topology, d *model
 	}
 	// Interfaces are only half the device. The daemons were started against a
 	// namespace that no longer exists, so they are pointed at the new one.
-	return e.configure(ctx, d)
+	return e.limited(ctx, []limiter.Kind{limiter.ExecProbe}, func() error {
+		return e.configure(ctx, d)
+	})
 }
