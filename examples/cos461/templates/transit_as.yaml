@@ -9,7 +9,14 @@ metadata:
     mini-Internet's l3_routers_tier1_and_stub.txt simplification.
 
 routers:
-  ALL: {id: 1}
+  # COS-461 submissions are FRR command files, so BIRD is intentionally used
+  # only on the two staff-operated transit references (AS 1 and AS 2). This
+  # exercises mixed-NOS peering without asking a student submission to use
+  # syntax the archive format cannot represent.
+  ALL:
+    id: 1
+    nos: bird
+    image: hyhe/twinet-bird:0.1
 
 hosts:
   per_router: true

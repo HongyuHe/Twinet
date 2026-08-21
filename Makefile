@@ -13,7 +13,7 @@ LDFLAGS := -s -w \
 # Docker may need privilege depending on how the host is set up; overriding one
 # variable is better than every recipe guessing.
 DOCKER  ?= docker
-IMAGES  := router host switch svc
+IMAGES  := router host switch svc bird
 REGISTRY?= hyhe
 TAG     ?= 0.1
 # Every image is also published under the commit it was built from. The moving
@@ -26,7 +26,7 @@ BUILD_TAG ?= $(TAG)-$(COMMIT)
 GOLANGCI_VERSION ?= v2.5.0
 
 .PHONY: all build test lint fmt vet images push digests clean install e2e ci ci-tools tidy-check naming \
-	script-tests benchmark chaos soak-short soak-24h
+	script-tests benchmark chaos soak-short soak-24h nos-images
 
 all: build
 
@@ -202,6 +202,17 @@ soak-24h:
 	@$(MAKE) --no-print-directory build
 	@TWINET_SOAK_ALLOW_DESTRUCTIVE=1 ./scripts/scale_soak.sh --allow-destructive \
 		--binary ./bin/twinet --manifest "$${TWINET_SCALE_MANIFEST:-examples/scale}"
+
+# This is deliberately not a skip-on-missing-Docker target. A dedicated image
+# acceptance command that reports green without starting both NOSes proves
+# nothing, so it fails clearly when its required engine is unavailable.
+nos-images: images
+	@command -v $(DOCKER) >/dev/null 2>&1 || \
+		{ echo "make nos-images requires $(DOCKER)"; exit 2; }
+	@$(DOCKER) info >/dev/null 2>&1 || \
+		{ echo "make nos-images requires a reachable Docker daemon"; exit 2; }
+	REGISTRY="$(REGISTRY)" TAG="$(TAG)" DOCKER="$(DOCKER)" \
+		$(GO) test -count=1 -tags nosimages ./test/integration/...
 
 clean:
 	rm -rf $(BIN)

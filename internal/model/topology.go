@@ -136,6 +136,10 @@ type Device struct {
 	ASN  int // 0 for lab-global services
 
 	Image string
+	// NOS is the explicitly selected router NOS. Empty means the compatibility
+	// default (FRR), which keeps manifests authored before NOS declarations
+	// byte-for-byte topology compatible.
+	NOS string
 	// ImageID is the digest the reference resolved to when the lab was
 	// planned. It is part of a container's identity: a tag rebuilt in place is
 	// different software under an unchanged name.
@@ -197,7 +201,24 @@ type Device struct {
 	FRR *FRRConfig
 }
 
-// IsRouter reports whether the device runs FRR.
+// DefaultNOS is used for router devices whose manifest predates explicit NOS
+// declarations. Keep the default in the model so every caller resolves the
+// same legacy behaviour without importing a provider implementation.
+const DefaultNOS = "frr"
+
+// EffectiveNOS returns the selected router NOS, retaining FRR for legacy
+// router declarations. Non-router devices return the empty string.
+func (d *Device) EffectiveNOS() string {
+	if d == nil || d.Kind != KindRouter {
+		return ""
+	}
+	if d.NOS == "" {
+		return DefaultNOS
+	}
+	return d.NOS
+}
+
+// IsRouter reports whether the device is a router.
 func (d *Device) IsRouter() bool { return d.Kind == KindRouter }
 
 // IfaceByName returns the named interface.

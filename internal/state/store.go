@@ -33,6 +33,10 @@ type Kind string
 const (
 	// KindFRR is a router's running configuration.
 	KindFRR Kind = "frr"
+	// KindBIRD is a BIRD router configuration. It is separate from KindFRR
+	// because replaying one vendor's syntax through the other is destructive,
+	// not a compatibility fallback.
+	KindBIRD Kind = "bird"
 	// KindAddrs is a host's interface addressing and routes.
 	KindAddrs Kind = "addrs"
 	// KindOVS is a switch's port and VLAN configuration.
@@ -42,7 +46,7 @@ const (
 )
 
 // AllKinds is every artefact kind, for iteration.
-var AllKinds = []Kind{KindFRR, KindAddrs, KindOVS, KindTunnels}
+var AllKinds = []Kind{KindFRR, KindBIRD, KindAddrs, KindOVS, KindTunnels}
 
 // Snapshot is one captured artefact.
 type Snapshot struct {
@@ -448,4 +452,96 @@ func (s *Store) PutCoordination(raw []byte) error {
 // Coordination returns the node-local coordination metadata.
 func (s *Store) Coordination() ([]byte, error) {
 	return os.ReadFile(filepath.Join(s.root, "coordination.json"))
+}
+
+// PutEventJournal persists the bounded agent event journal. The journal is
+// node-local operational history, not a replicated lab artefact: it must
+// survive an agent restart so an operator can trace a failure across that
+// restart, but copying another node's events into this node would make a
+// merged stream report the same event twice.
+func (s *Store) PutEventJournal(raw []byte) error {
+	if len(raw) == 0 {
+		raw = []byte("[]")
+	}
+	return writeAtomic(filepath.Join(s.root, "events.json"), raw, 0o600)
+}
+
+// EventJournal returns the last persisted bounded agent event journal.
+func (s *Store) EventJournal() ([]byte, error) {
+	return os.ReadFile(filepath.Join(s.root, "events.json"))
+}
+
+// KnownLabs returns every lab directory, including one whose topology marker
+// was removed after destroy but whose retained snapshots or replica journal
+// still need a grace-period cleanup.
+func (s *Store) KnownLabs() ([]string, error) {
+	entries, err := os.ReadDir(s.root)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	out := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() {
+			out = append(out, entry.Name())
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// GarbageCollectLabRecords removes stale hosting and replication records only
+// after its caller has independently proved that the lab is no longer active
+// and its generation cannot be resumed. Student snapshots are deliberately
+// retained: a lab record is reconstructable control-plane state, while a
+// student's configuration is not.
+func (s *Store) GarbageCollectLabRecords(lab string, before time.Time, generationProven bool) (int, error) {
+	if lab == "" || before.IsZero() {
+		return 0, nil
+	}
+	if !generationProven {
+		return 0, errors.New("state: refusing to garbage-collect lab records without generation proof")
+	}
+	dir := filepath.Join(s.root, safe(lab))
+	info, err := os.Stat(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	if !info.ModTime().Before(before) {
+		return 0, nil
+	}
+	removed := 0
+	for _, name := range []string{"topology.json", "holds.json", "exempt.json", "replication.json"} {
+		path := filepath.Join(dir, name)
+		if info, err := os.Stat(path); err == nil && info.ModTime().Before(before) {
+			if err := os.Remove(path); err == nil {
+				removed++
+			}
+		} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return removed, err
+		}
+	}
+	records := filepath.Join(dir, "_records")
+	if info, err := os.Stat(records); err == nil && info.ModTime().Before(before) {
+		if err := os.RemoveAll(records); err != nil {
+			return removed, err
+		}
+		removed++
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return removed, err
+	}
+	// An entirely empty lab directory carries no retained student state, so it
+	// is safe to remove. Do not remove a directory merely because it holds
+	// snapshots: those are intentionally durable after an abandoned lab.
+	if entries, err := os.ReadDir(dir); err == nil && len(entries) == 0 {
+		if err := os.Remove(dir); err == nil {
+			removed++
+		}
+	}
+	return removed, nil
 }

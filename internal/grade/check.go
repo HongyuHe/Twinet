@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/HongyuHe/twinet/internal/model"
+	"github.com/HongyuHe/twinet/internal/netstate"
+	"github.com/HongyuHe/twinet/internal/nos"
 	rt "github.com/HongyuHe/twinet/internal/runtime"
 )
 
@@ -27,6 +29,10 @@ type Env struct {
 
 	// Exec runs a command inside a device of the grading lab.
 	Exec func(ctx context.Context, deviceID string, cmd []string) (rt.ExecResult, error)
+	// StateReader is an optional injected vendor-neutral state source. The
+	// default resolves the device NOS from the topology and calls its provider.
+	// Tests and non-container runtimes can inject the same typed interface.
+	StateReader netstate.Reader
 	// Args are the check's parameters from the rubric.
 	Args map[string]any
 
@@ -35,6 +41,79 @@ type Env struct {
 	// this struct and they must share one cache -- and because a mutex inside
 	// a struct that is copied is a mutex that protects nothing.
 	peers *peerCache
+}
+
+// DeviceState reads vendor-neutral operational state from a named device.
+// Unsupported provider state is recorded as infrastructure unsupported, never
+// translated into an empty FRR table or a student deduction.
+func (e *Env) DeviceState(ctx context.Context, deviceID string, query netstate.Query) (netstate.State, error) {
+	if e.Topology == nil {
+		return netstate.State{}, e.infra(deviceID, "read network state", fmt.Errorf("no topology is available"))
+	}
+	d, ok := e.deviceForID(deviceID)
+	if !ok {
+		return netstate.State{}, e.infra(deviceID, "read network state", fmt.Errorf("device is not in the topology"))
+	}
+	// Small test and library callers sometimes supply an expanded AS without
+	// populating Topology.Devices. Give a provider the canonical identity it
+	// would receive from a fully expanded topology; this is not a NOS fallback.
+	if d.ID == "" || !d.Kind.Valid() {
+		copy := *d
+		if copy.ID == "" {
+			copy.ID = deviceID
+		}
+		if !copy.Kind.Valid() {
+			copy.Kind = model.KindRouter
+		}
+		d = &copy
+	}
+	if e.Exec == nil {
+		return netstate.State{}, e.infra(deviceID, "read network state", fmt.Errorf("no device executor is available"))
+	}
+
+	reader := e.StateReader
+	if reader == nil {
+		provider, err := nos.Resolve(d)
+		if err != nil {
+			return netstate.State{}, e.infra(deviceID, "resolve NOS state provider", err)
+		}
+		if err := nos.ValidateStateQuery(provider, d.ID, query); err != nil {
+			return netstate.State{}, e.infra(deviceID, "validate NOS state provider", err)
+		}
+		reader = provider
+	}
+	state, err := reader.ReadState(ctx, d, netstate.ExecFunc(e.Exec), query)
+	if err != nil {
+		op := "read network state " + query.String()
+		return netstate.State{}, e.infra(deviceID, op, err)
+	}
+	return state, nil
+}
+
+func (e *Env) deviceForID(deviceID string) (*model.Device, bool) {
+	if d, ok := e.Topology.Device(deviceID); ok {
+		return d, true
+	}
+	for _, as := range e.Topology.ASes {
+		for _, d := range append(append([]*model.Device{}, as.Routers...), as.Devices...) {
+			if d == nil {
+				continue
+			}
+			id := d.ID
+			if id == "" && d.Name != "" {
+				id = model.DeviceID(d.ASN, d.Name)
+			}
+			if id == deviceID {
+				return d, true
+			}
+		}
+	}
+	return nil, false
+}
+
+// RouterState reads one router in the AS under assessment.
+func (e *Env) RouterState(ctx context.Context, router string, query netstate.Query) (netstate.State, error) {
+	return e.DeviceState(ctx, model.DeviceID(e.AS, router), query)
 }
 
 // peerCache remembers the address on the far end of each link.
@@ -58,6 +137,14 @@ func (e *Env) Routers() []*model.Device {
 
 // Vtysh runs a vtysh command on a router and returns its output.
 func (e *Env) Vtysh(ctx context.Context, device, command string) (string, error) {
+	if e.Topology != nil {
+		if d, ok := e.Device(device); ok && d.EffectiveNOS() != model.DefaultNOS {
+			return "", e.infra(d.ID, command, &netstate.UnsupportedError{
+				Device: d.ID, NOS: d.EffectiveNOS(), Query: netstate.QueryBGP,
+				Reason: "FRR vtysh is not a vendor-neutral state API",
+			})
+		}
+	}
 	res, err := e.Exec(ctx, model.DeviceID(e.AS, device), []string{"vtysh", "-c", command})
 	if err != nil {
 		return "", e.infra(device, command, err)
@@ -371,15 +458,22 @@ func (e *Env) PeerAddr(ctx context.Context, i *model.Iface) string {
 
 // ifaceAddrs reads the addresses a device has on an interface.
 func ifaceAddrs(ctx context.Context, e *Env, deviceID, iface string) []netip.Prefix {
-	res, err := e.Exec(ctx, deviceID, []string{"sh", "-c",
-		"ip -o -4 addr show dev " + iface + " scope global 2>/dev/null | awk '{print $4}'"})
-	if err != nil || res.ExitCode != 0 {
+	state, err := e.DeviceState(ctx, deviceID, netstate.QueryInterfaces)
+	if err != nil {
 		return nil
 	}
 	var out []netip.Prefix
-	for _, f := range strings.Fields(res.Stdout) {
-		if p, err := netip.ParsePrefix(f); err == nil {
-			out = append(out, p)
+	for _, observed := range state.Interfaces {
+		if observed.Name != iface {
+			continue
+		}
+		for _, address := range observed.Addresses {
+			if address.Family != "ipv4" {
+				continue
+			}
+			if p, err := netip.ParsePrefix(address.Prefix); err == nil {
+				out = append(out, p)
+			}
 		}
 	}
 	return out

@@ -1,0 +1,4 @@
+Twinet BIRD 2 reference router
+
+This staff/reference router runs BIRD 2. Student-owned COS-461 routers remain
+FRR because submissions are FRR configuration commands.

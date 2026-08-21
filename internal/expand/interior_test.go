@@ -246,10 +246,13 @@ func TestGeneratedInteriorValidationRejectsImpossibleOrDuplicateParameters(t *te
 	}
 }
 
-func TestLegacyBundledExampleHashesStayByteCompatible(t *testing.T) {
+func TestBundledExampleHashesStayByteCompatible(t *testing.T) {
 	want := map[string]string{
-		"../../examples/advnet":    "33d42ba4e2334efb",
-		"../../examples/cos461":    "1dcf5ce2c044fbef",
+		"../../examples/advnet": "33d42ba4e2334efb",
+		// COS-461 explicitly selects BIRD for its two staff references as
+		// O10's mixed-NOS acceptance fixture. Its changed hash is intentional;
+		// the other legacy all-FRR examples retain their historic identity.
+		"../../examples/cos461":    "67512321120953a4",
 		"../../examples/demo":      "b2c6f717337aaddd",
 		"../../examples/multicast": "26322a0da9ae995f",
 		"../../examples/scale":     "8efe54b2d0781376",
@@ -268,7 +271,7 @@ func TestLegacyBundledExampleHashesStayByteCompatible(t *testing.T) {
 				t.Fatal(err)
 			}
 			if res.Topology.Hash != hash {
-				t.Errorf("%s hash = %s, want legacy %s", dir, res.Topology.Hash, hash)
+				t.Errorf("%s hash = %s, want %s", dir, res.Topology.Hash, hash)
 			}
 		})
 	}

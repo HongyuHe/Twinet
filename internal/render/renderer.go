@@ -10,6 +10,7 @@ import (
 
 	"github.com/HongyuHe/twinet/internal/deploy"
 	"github.com/HongyuHe/twinet/internal/model"
+	"github.com/HongyuHe/twinet/internal/nos"
 	"github.com/HongyuHe/twinet/internal/plan"
 	"github.com/HongyuHe/twinet/internal/runtime"
 	"github.com/HongyuHe/twinet/internal/svc"
@@ -69,17 +70,36 @@ func (r *Renderer) Files(d *model.Device) (map[string]deploy.FileSpec, error) {
 	out := map[string]deploy.FileSpec{}
 	switch d.Kind {
 	case model.KindRouter:
-		cfg, err := Router(r.Top, d)
+		provider, err := nos.Resolve(d)
 		if err != nil {
 			return nil, err
 		}
-		body := cfg.Platform
-		if r.modeFor(d) == ModeSolve {
-			body = cfg.Platform + cfg.Expected
+		var cfg RouterConfig
+		switch provider.Name() {
+		case model.DefaultNOS:
+			cfg, err = Router(r.Top, d)
+		case "bird":
+			cfg, err = BirdRouter(r.Top, d)
+		default:
+			return nil, fmt.Errorf("router %s selects NOS %q with no renderer", d.ID, provider.Name())
 		}
-		out["/etc/frr/daemons"] = deploy.FileSpec{
-			Content: []byte(DaemonsFor(r.Top.ASes[d.ASN])), Mode: 0o640}
-		out["/etc/frr/frr.conf"] = deploy.FileSpec{Content: []byte(body), Mode: 0o640}
+		if err != nil {
+			return nil, err
+		}
+		mode := nos.ModePlatform
+		if r.modeFor(d) == ModeSolve {
+			mode = nos.ModeSolve
+		}
+		rendered, err := provider.Render(nos.RenderRequest{
+			Topology: r.Top, Device: d, Mode: mode,
+			Platform: cfg.Platform, Expected: cfg.Expected, Daemons: DaemonsFor(r.Top.ASes[d.ASN]),
+		})
+		if err != nil {
+			return nil, err
+		}
+		for path, spec := range rendered.Files {
+			out[path] = deploy.FileSpec{Content: spec.Content, Mode: spec.Mode}
+		}
 		// A router that has hosts on a segment of its own serves them DHCP.
 		//
 		// On the gateway rather than in a service container of its own,
@@ -118,6 +138,13 @@ func (r *Renderer) Files(d *model.Device) (map[string]deploy.FileSpec, error) {
 func (r *Renderer) Commands(d *model.Device) ([]deploy.Command, error) {
 	switch d.Kind {
 	case model.KindRouter:
+		provider, err := nos.Resolve(d)
+		if err != nil {
+			return nil, err
+		}
+		if provider.Name() == "bird" {
+			return r.birdRouterCommands(d, provider)
+		}
 		cmds := append(r.routerCommands(d), r.dhcpCommands(d)...)
 		return append(cmds, r.rpkiReadyCommands(d)...), nil
 	case model.KindSwitch:
@@ -278,9 +305,27 @@ func (r *Renderer) routerCommands(d *model.Device) []deploy.Command {
 	cmds = append(cmds, []deploy.Command{
 		{Args: []string{"sh", "-c", "chown -R frr:frr /etc/frr 2>/dev/null || true"},
 			Describe: "fix FRR file ownership", IgnoreError: true},
-		{Args: []string{"sh", "-c", "/usr/lib/frr/frrinit.sh start || /etc/init.d/frr start"},
-			Describe: "start FRR"},
 	}...)
+	provider, err := nos.Resolve(d)
+	if err != nil {
+		// Renderer.Commands cannot change its established signature, so the
+		// deployment receives the concrete provider failure rather than an
+		// implicit FRR fallback.
+		cmds = append(cmds, deploy.Command{
+			Describe: "reject an unknown routing NOS",
+			Args:     []string{"sh", "-c", "echo " + shellQuote(err.Error()) + " >&2; exit 1"},
+		})
+	} else {
+		apply, applyErr := provider.Apply(nos.RenderRequest{Topology: r.Top, Device: d})
+		if applyErr != nil {
+			cmds = append(cmds, deploy.Command{
+				Describe: "apply " + provider.Name(),
+				Args:     []string{"sh", "-c", "echo " + shellQuote(applyErr.Error()) + " >&2; exit 1"},
+			})
+		} else {
+			cmds = append(cmds, deployCommands(apply)...)
+		}
+	}
 	// Loopback addresses are configured on the interface rather than through
 	// FRR when the platform owns them, so the address exists even if FRR is
 	// still starting.
@@ -761,22 +806,16 @@ func (r *Renderer) hostCommands(d *model.Device) []deploy.Command {
 func (r *Renderer) Ready(d *model.Device, rt runtime.Runtime) *plan.Waiter {
 	switch d.Kind {
 	case model.KindRouter:
-		container := d.Container
+		provider, err := nos.Resolve(d)
+		if err == nil {
+			return provider.Ready(d, rt)
+		}
 		return &plan.Waiter{
-			Describe:  "FRR on " + d.ID + " to answer",
-			Interval:  200 * time.Millisecond,
-			Timeout:   90 * time.Second,
-			StableFor: 2,
-			Check: func(ctx context.Context) (bool, error) {
-				res, err := rt.Exec(ctx, container, runtime.ExecCmd{
-					Cmd: []string{"vtysh", "-c", "show version"}})
-				if err != nil {
-					return false, err
-				}
-				if res.ExitCode != 0 {
-					return false, fmt.Errorf("vtysh exited %d: %s", res.ExitCode, firstLine(res.Stderr))
-				}
-				return true, nil
+			Describe: "known NOS for " + d.ID,
+			Interval: 200 * time.Millisecond,
+			Timeout:  time.Second,
+			Check: func(context.Context) (bool, error) {
+				return false, err
 			},
 		}
 	case model.KindSwitch:
@@ -792,6 +831,7 @@ func (r *Renderer) Ready(d *model.Device, rt runtime.Runtime) *plan.Waiter {
 				if err != nil {
 					return false, err
 				}
+
 				if res.ExitCode != 0 {
 					return false, fmt.Errorf("ovs-vsctl exited %d: %s", res.ExitCode, firstLine(res.Stderr))
 				}
@@ -800,6 +840,59 @@ func (r *Renderer) Ready(d *model.Device, rt runtime.Runtime) *plan.Waiter {
 		}
 	}
 	return nil
+}
+
+// birdRouterCommands configures kernel-owned interfaces, then lets the BIRD
+// provider own its daemon lifecycle. BIRD intentionally does not use FRR's
+// vtysh or daemon file paths.
+func (r *Renderer) birdRouterCommands(d *model.Device, provider nos.Provider) ([]deploy.Command, error) {
+	cmds := r.resolverCommands(d)
+	for _, iface := range d.Ifaces {
+		if iface.Owner != model.OwnerPlatform && r.modeFor(d) != ModeSolve {
+			continue
+		}
+		if iface.Role == model.RoleL2SubIface && iface.Parent != "" {
+			cmds = append(cmds, deploy.Command{
+				Describe: "create VLAN sub-interface " + iface.Name,
+				Args: []string{"sh", "-c", fmt.Sprintf(
+					"ip link show %s >/dev/null 2>&1 || ip link add link %s name %s type vlan id %d; ip link set %s up",
+					iface.Name, iface.Parent, iface.Name, iface.VLAN, iface.Name)},
+			})
+		}
+		if iface.Addr4 != "" {
+			cmds = append(cmds, deploy.Command{
+				Describe: "address " + iface.Name,
+				Args: []string{"sh", "-c", fmt.Sprintf(
+					"ip addr replace %s brd + dev %s && ip link set %s up", iface.Addr4, iface.Name, iface.Name)},
+			})
+		}
+		if iface.Addr6 != "" {
+			cmds = append(cmds, deploy.Command{
+				Describe: "address " + iface.Name + " (v6)",
+				Args: []string{"sh", "-c", fmt.Sprintf(
+					"ip -6 addr replace %s dev %s && ip link set %s up", iface.Addr6, iface.Name, iface.Name)},
+			})
+		}
+	}
+	apply, err := provider.Apply(nos.RenderRequest{Topology: r.Top, Device: d})
+	if err != nil {
+		return nil, err
+	}
+	return append(cmds, deployCommands(apply)...), nil
+}
+
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
+}
+
+func deployCommands(commands []nos.Command) []deploy.Command {
+	out := make([]deploy.Command, 0, len(commands))
+	for _, command := range commands {
+		out = append(out, deploy.Command{
+			Args: command.Args, IgnoreError: command.IgnoreError, Describe: command.Describe,
+		})
+	}
+	return out
 }
 
 // l2Gateway finds the addresses of the gateway serving a host's VLAN.

@@ -309,6 +309,22 @@ Kathara cleanly separates Docker and Kubernetes managers.
 The unchanged rubric must award the unchanged reference score, while an
 unsupported MPLS request is refused before deployment.
 
+#### O10 implementation boundary
+
+`examples/cos461/templates/transit_as.yaml` explicitly selects BIRD 2 for the
+two staff-operated transit routers (AS 1 and AS 2). Student-owned routers
+remain FRR: the COS-461 submission archive currently carries FRR command files,
+so accepting BIRD for a student device would silently leave its submitted
+configuration unapplied. Manifest validation rejects that combination before
+deployment. The unchanged `examples/cos461/rubric/cos461.yaml` therefore
+continues to assess FRR student work against BIRD reference peers.
+
+The `bird` image pins Alpine by digest and BIRD to `2.15.1-r0`. It declares
+IPv4/IPv6, OSPF, BGP, policy/community, and VLAN support; it does not declare
+tunnels, RPKI, MPLS/LDP, VRF, multicast, or DHCP. `make nos-images`
+builds both router images and starts both daemons; it fails when Docker is
+unavailable instead of reporting a vacuous success.
+
 ### O11 - Generate and distribute intra-AS topology types
 
 **Problem.** Inter-AS topology is generated, but AS interiors remain explicit

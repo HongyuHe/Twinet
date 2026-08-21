@@ -891,6 +891,12 @@ func (e *expander) materialize(name string, kind model.DeviceKind, over model.De
 		Hostname:     hostnameFor(asn, name),
 		Labels:       map[string]string{},
 	}
+	// Keep NOS empty for legacy manifests. Topology hashing treats an empty
+	// declaration as the historic implicit FRR selection; an authored NOS is
+	// retained and becomes part of the device identity.
+	if kind == model.KindRouter {
+		d.NOS = dd.NOS
+	}
 	if dd.CPUs != nil {
 		d.CPUs = *dd.CPUs
 	}

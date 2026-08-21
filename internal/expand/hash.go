@@ -37,6 +37,15 @@ func canonicalise(w io.Writer, top *model.Topology) {
 		writeBlob(w, d.ID)
 		writeString(w, "\n")
 		writeStruct(w, "  ", reflect.ValueOf(*d))
+		// NOS was implicit in every topology written before O10. Writing an
+		// empty field would invalidate every saved submission despite the
+		// deployed network being unchanged. An explicit selection, however,
+		// changes the routing implementation and must be part of the identity.
+		if d.NOS != "" {
+			writeString(w, "  nos=")
+			writeBlob(w, d.NOS)
+			writeString(w, "\n")
+		}
 		for _, i := range d.Ifaces {
 			writeString(w, "  iface ")
 			writeBlob(w, i.Name)
@@ -136,6 +145,9 @@ var skipped = map[string]string{
 	"Class":             "link locality reporting metadata",
 	"AddressingField":   "diagnostic metadata; resulting subnet is hashed",
 	"RouterRouterRole":  "resulting generated subnets are hashed",
+	// A legacy router has an implicit FRR NOS. It is written explicitly by
+	// canonicalise only when authored, preserving hashes for old manifests.
+	"NOS": "empty is the legacy implicit FRR choice; explicit values are written separately",
 
 	// Deployment facts, not topology. Two clusters running the same lab must
 	// agree on the hash, or a submission could never be graded anywhere but

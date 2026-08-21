@@ -11,6 +11,7 @@ import (
 
 	"github.com/HongyuHe/twinet/internal/limiter"
 	"github.com/HongyuHe/twinet/internal/model"
+	"github.com/HongyuHe/twinet/internal/nos"
 	rt "github.com/HongyuHe/twinet/internal/runtime"
 	"github.com/HongyuHe/twinet/internal/state"
 )
@@ -57,6 +58,14 @@ done`
 // device most likely to be replaced, the one that had crashed, was the one
 // whose work was thrown away.
 var ErrNotRunning = errors.New("the container is not running")
+
+// preserveExecutor adapts the existing Runtime to the NOS save contract
+// without making preservation depend on a particular container backend.
+type preserveExecutor struct{ runtime rt.Runtime }
+
+func (e preserveExecutor) Exec(ctx context.Context, deviceID string, command []string) (rt.ExecResult, error) {
+	return e.runtime.Exec(ctx, deviceID, rt.ExecCmd{Cmd: command})
+}
 
 func Capture(ctx context.Context, r rt.Runtime, d *model.Device, lab, topoHash string) ([]state.Snapshot, error) {
 	c, err := r.Inspect(ctx, d.Container)
@@ -153,8 +162,21 @@ func Capture(ctx context.Context, r rt.Runtime, d *model.Device, lab, topoHash s
 
 	switch d.Kind {
 	case model.KindRouter:
-		if body, ok := readFRRConfig(); ok {
-			add(state.KindFRR, cleanRunningConfig(body))
+		provider, providerErr := nos.Resolve(d)
+		if providerErr != nil {
+			missed = append(missed, fmt.Sprintf("the NOS configuration of %s could not be read: %v", d.ID, providerErr))
+		} else if provider.Name() == model.DefaultNOS {
+			if body, ok := readFRRConfig(); ok {
+				add(state.KindFRR, cleanRunningConfig(body))
+			}
+		} else {
+			snaps, saveErr := provider.Save(ctx, d, preserveExecutor{runtime: r}, lab, topoHash)
+			if saveErr != nil {
+				missed = append(missed, fmt.Sprintf("the %s configuration of %s could not be read: %v",
+					provider.Name(), d.ID, saveErr))
+			} else {
+				out = append(out, snaps...)
+			}
 		}
 		// Tunnels are configured with ip(8) rather than through FRR, so they
 		// are captured separately or the 6in4 exercise would be lost.
@@ -319,6 +341,32 @@ func Restore(ctx context.Context, r rt.Runtime, d *model.Device, lab string, sto
 
 	switch d.Kind {
 	case model.KindRouter:
+		provider, providerErr := nos.Resolve(d)
+		if providerErr != nil {
+			return false, fmt.Errorf("resolve NOS for saved configuration of %s: %w", d.ID, providerErr)
+		}
+		if provider.Name() != model.DefaultNOS {
+			snap, err := store.Current(lab, d.ID, provider.StateKind())
+			switch {
+			case os.IsNotExist(err):
+				// No provider-owned configuration was ever saved.
+			case err != nil:
+				return false, fmt.Errorf("reading the saved %s configuration of %s: %w",
+					provider.Name(), d.ID, err)
+			case len(snap.Content) > 0:
+				if err := provider.Restore(ctx, d, r, snap); err != nil {
+					return false, err
+				}
+				restored = true
+			}
+			if err := replay(state.KindTunnels, tunnelReplay); err != nil {
+				return restored, err
+			}
+			if err := replay(state.KindAddrs, addrReplay); err != nil {
+				return restored, err
+			}
+			return restored, nil
+		}
 		snap, err := store.Current(lab, d.ID, state.KindFRR)
 		if err != nil && !os.IsNotExist(err) {
 			return false, fmt.Errorf("reading the saved configuration of %s: %w", d.ID, err)

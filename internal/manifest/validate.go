@@ -12,6 +12,7 @@ import (
 
 	"github.com/HongyuHe/twinet/internal/ipam"
 	"github.com/HongyuHe/twinet/internal/model"
+	"github.com/HongyuHe/twinet/internal/nos"
 	"github.com/HongyuHe/twinet/internal/runtime"
 )
 
@@ -31,6 +32,7 @@ func (l *Loaded) Validate() *Diagnostics {
 	l.validateHeader(d, file)
 	l.validateAddressing(d, file)
 	l.validateTemplates(d)
+	l.validateNOS(d)
 	l.validateASes(d, file)
 	l.validatePeerings(d, file)
 	l.validateServices(d, file)
@@ -42,6 +44,95 @@ func (l *Loaded) Validate() *Diagnostics {
 	l.validateAccess(d, file)
 	_ = lab
 	return d
+}
+
+// validateNOS resolves every router's inherited NOS declaration before a
+// deployment can pull or mutate anything. A provider capability mismatch is an
+// author/infrastructure error, not an empty route table that later looks like
+// a student's mistake.
+func (l *Loaded) validateNOS(d *Diagnostics) {
+	for _, templateName := range l.Lab.SortedTemplateNames() {
+		tpl := l.Lab.Templates[templateName]
+		if tpl == nil {
+			continue
+		}
+		file := l.Files["template:"+templateName]
+		if file == "" {
+			file = l.Files["lab"]
+		}
+		root := l.Nodes[file]
+		routers, err := tpl.EffectiveRouterSpecs()
+		if err != nil {
+			// validateTemplates reports the interior error with a better
+			// source location. NOS validation cannot infer generated devices.
+			continue
+		}
+		for _, routerName := range sortedMapKeys(routers) {
+			spec := routers[routerName]
+			if spec == nil {
+				continue
+			}
+			defaults := spec.DeviceDefaults.Merge(l.Lab.Kinds[model.KindRouter]).Merge(l.Lab.Defaults)
+			name := defaults.NOS
+			if name == "" {
+				name = model.DefaultNOS
+			}
+			provider, ok := nos.Lookup(name)
+			path := "routers." + routerName + ".nos"
+			node := nodeAt(root, path)
+			device := fmt.Sprintf("template %q router %q", templateName, routerName)
+			if !ok {
+				d.AddHint(file, path, node,
+					fmt.Sprintf("device %s declares unknown NOS %q", device, name),
+					"registered NOS implementations: "+strings.Join(nos.Names(), ", "))
+				continue
+			}
+			for _, feature := range nos.RequiredFeatures(l.Lab, tpl, routerName) {
+				if provider.Capabilities().Supports(feature) {
+					continue
+				}
+				d.AddHint(file, path, node,
+					fmt.Sprintf("device %s uses NOS %q, which does not support feature %q",
+						device, provider.Name(), feature),
+					"select a NOS that declares the feature or remove the unsupported topology request")
+			}
+		}
+	}
+
+	// The current submission format is an FRR configuration file. Accepting a
+	// student-owned BIRD router would silently load that syntax nowhere and
+	// grade an empty control plane. BIRD is therefore intentionally limited to
+	// staff/reference routers until submissions carry provider-specific typed
+	// configuration.
+	for groupIndex, group := range l.Lab.AutonomousSystems {
+		spec := group.Merge(l.Lab.ASDefaults)
+		if spec.Role != "" && spec.Role != model.RoleStudent {
+			continue
+		}
+		tpl := l.Lab.Templates[spec.Template]
+		if tpl == nil {
+			continue
+		}
+		routers, err := tpl.EffectiveRouterSpecs()
+		if err != nil {
+			continue
+		}
+		for _, asn := range group.ASNs() {
+			for _, routerName := range sortedMapKeys(routers) {
+				router := routers[routerName]
+				if router == nil {
+					continue
+				}
+				defaults := router.DeviceDefaults.Merge(l.Lab.Kinds[model.KindRouter]).Merge(l.Lab.Defaults)
+				if strings.EqualFold(defaults.NOS, "bird") {
+					d.AddHint(l.Files["lab"], fmt.Sprintf("autonomous_systems[%d]", groupIndex),
+						nodeAt(l.Nodes[l.Files["lab"]], fmt.Sprintf("autonomous_systems[%d]", groupIndex)),
+						fmt.Sprintf("device as%d/%s uses NOS %q in a student-owned AS", asn, routerName, defaults.NOS),
+						"student submissions currently carry FRR commands; use BIRD only for staff/reference routers")
+				}
+			}
+		}
+	}
 }
 
 func (l *Loaded) validateHeader(d *Diagnostics, file string) {

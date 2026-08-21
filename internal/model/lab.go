@@ -183,6 +183,13 @@ type Lab struct {
 // "unset" (inherit) from "explicitly set to the zero value".
 type DeviceDefaults struct {
 	Image string `yaml:"image,omitempty" json:"image,omitempty"`
+	// NOS selects the network operating system for router devices. An omitted
+	// value deliberately retains the legacy FRR default; it is not expanded
+	// into the topology so existing topology identities remain unchanged.
+	//
+	// It is accepted in defaults, kinds.router, and an individual RouterSpec.
+	// Non-router devices use the normal image/runtime contract and ignore it.
+	NOS string `yaml:"nos,omitempty" json:"nos,omitempty" jsonschema:"description=router NOS implementation, e.g. frr or bird"`
 	// CPUs, Memory, and Pids are hard runtime limits. They retain the original
 	// manifest spelling for backwards compatibility; placement uses Requests,
 	// never these limits.
@@ -309,6 +316,9 @@ func (d DeviceDefaults) Merge(base DeviceDefaults) DeviceDefaults {
 	out := d
 	if out.Image == "" {
 		out.Image = base.Image
+	}
+	if out.NOS == "" {
+		out.NOS = base.NOS
 	}
 	if out.CPUs == nil {
 		out.CPUs = base.CPUs

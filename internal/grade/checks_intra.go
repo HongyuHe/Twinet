@@ -17,6 +17,7 @@ import (
 
 	"github.com/HongyuHe/twinet/internal/alloc"
 	"github.com/HongyuHe/twinet/internal/model"
+	"github.com/HongyuHe/twinet/internal/netstate"
 )
 
 // This file registers the checks that grade the intra-domain half of the
@@ -98,21 +99,18 @@ func checkAddressing(ctx context.Context, env *Env) Result {
 		// not look at: `ip addr add X/32 dev lo scope link` is live, answers
 		// for X, and was invisible here. The kernel's own -- 127.0.0.0/8 and
 		// link-local -- are exempt because nobody configured them.
-		out, err := env.Probe(ctx, r.ID, []string{"ip", "-o", "-4", "addr", "show"})
+		state, err := env.RouterState(ctx, r.Name, netstate.QueryInterfaces)
 		if err != nil {
 			return Errored("l3.addressing_matches_plan", err)
 		}
-		// A table that could not be read is not a router with no addresses.
-		// Probe reports a non-zero exit in the result, not as an error, so a
-		// failed `ip addr show` arrived here as empty output: every planned
-		// address was then reported missing -- a correct submission failed for
-		// addresses it does have -- and every counterfeit one was invisible.
-		if out.ExitCode != 0 {
-			return Errored("l3.addressing_matches_plan", fmt.Errorf(
-				"the addresses of %s could not be read (ip exited %d: %s), so whether they "+
-					"match the plan could not be established", r.Name, out.ExitCode, firstLine(out.Stderr)))
+		have := map[string][]string{}
+		for _, observed := range state.Interfaces {
+			for _, address := range observed.Addresses {
+				if address.Family == "ipv4" {
+					have[observed.Name] = append(have[observed.Name], address.Prefix)
+				}
+			}
 		}
-		have := parseIPAddrOutput(out.Stdout)
 		known := map[string]bool{}
 		for _, i := range r.Ifaces {
 			if i.Addr4 != "" {
@@ -680,8 +678,8 @@ func checkOSPFAdjacency(ctx context.Context, env *Env) Result {
 	state := map[string]map[string]string{} // router -> iface -> worst state seen
 	var extra []string
 	for _, r := range env.Routers() {
-		var out ospfNeighborJSON
-		if err := env.VtyshJSON(ctx, r.Name, "show ip ospf neighbor json", &out); err != nil {
+		observed, err := env.RouterState(ctx, r.Name, netstate.QueryOSPF)
+		if err != nil {
 			// A router with OSPF entirely unconfigured is a legitimate student
 			// failure, not a grader failure, so it counts as no adjacencies.
 			continue
@@ -694,21 +692,19 @@ func checkOSPFAdjacency(ctx context.Context, env *Env) Result {
 				planned[w.iface] = true
 			}
 		}
-		for id, ns := range out.Neighbors {
-			for _, n := range ns {
-				iface := n.IfaceName
-				if i := strings.IndexByte(iface, ':'); i >= 0 {
-					iface = iface[:i]
-				}
-				if strings.HasPrefix(n.NbrState, "Full") {
-					full[r.Name][iface] = true
-				} else if state[r.Name][iface] == "" {
-					state[r.Name][iface] = n.NbrState
-				}
-				if !planned[iface] {
-					extra = append(extra, fmt.Sprintf("%s is adjacent to %s over %s, which is "+
-						"not an interior link of this AS", r.Name, id, iface))
-				}
+		for _, neighbor := range observed.OSPF {
+			iface := neighbor.Interface
+			if i := strings.IndexByte(iface, ':'); i >= 0 {
+				iface = iface[:i]
+			}
+			if strings.HasPrefix(neighbor.State, "Full") {
+				full[r.Name][iface] = true
+			} else if state[r.Name][iface] == "" {
+				state[r.Name][iface] = neighbor.State
+			}
+			if !planned[iface] {
+				extra = append(extra, fmt.Sprintf("%s is adjacent to %s over %s, which is "+
+					"not an interior link of this AS", r.Name, neighbor.RouterID, iface))
 			}
 		}
 	}

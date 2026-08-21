@@ -124,6 +124,23 @@ func TestTheHashIgnoresWhereTheLabHappensToRun(t *testing.T) {
 	}
 }
 
+func TestNOSChangesHashOnlyWhenExplicit(t *testing.T) {
+	legacy := oneDeviceTopology(func(*model.Device) {})
+	base := TopologyHash(legacy)
+
+	// The empty field is the historic implicit FRR selection, so it must not
+	// invalidate archived submissions merely because the model gained NOS.
+	implicit := oneDeviceTopology(func(d *model.Device) { d.NOS = "" })
+	if got := TopologyHash(implicit); got != base {
+		t.Fatalf("implicit legacy NOS changed topology hash: %s -> %s", base, got)
+	}
+
+	explicit := oneDeviceTopology(func(d *model.Device) { d.NOS = "bird" })
+	if got := TopologyHash(explicit); got == base {
+		t.Fatal("explicit BIRD selection did not change topology hash")
+	}
+}
+
 // The hash has to be the same on every run of the same input. Go randomises map
 // iteration, so a walk that reads a map in native order produces a different
 // hash each time and rejects every archive, including correct ones.

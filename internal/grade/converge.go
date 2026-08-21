@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/HongyuHe/twinet/internal/netstate"
 	"github.com/HongyuHe/twinet/internal/plan"
 )
 
@@ -32,17 +33,15 @@ func WaitOSPF(ctx context.Context, env *Env, timeout time.Duration) error {
 			var notFull []string
 			seen, queried := 0, 0
 			for _, r := range env.Routers() {
-				var out ospfNeighborJSON
-				if err := env.VtyshJSON(ctx, r.Name, "show ip ospf neighbor json", &out); err != nil {
+				state, err := env.RouterState(ctx, r.Name, netstate.QueryOSPF)
+				if err != nil {
 					continue
 				}
 				queried++
-				for id, ns := range out.Neighbors {
-					for _, n := range ns {
-						seen++
-						if !strings.HasPrefix(n.NbrState, "Full") {
-							notFull = append(notFull, fmt.Sprintf("%s->%s %s", r.Name, id, n.NbrState))
-						}
+				for _, peer := range state.OSPF {
+					seen++
+					if !strings.HasPrefix(peer.State, "Full") {
+						notFull = append(notFull, fmt.Sprintf("%s->%s %s", r.Name, peer.RouterID, peer.State))
 					}
 				}
 			}

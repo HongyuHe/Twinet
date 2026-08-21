@@ -51,6 +51,9 @@ const (
 	LabelRegion   = "twinet.region"
 	LabelManaged  = "twinet.managed"
 	LabelDeviceID = "twinet.device-id"
+	// LabelNOS records an explicitly selected router NOS. Legacy routers omit
+	// it so their historic container/spec identity remains unchanged.
+	LabelNOS = "twinet.nos"
 	// Request labels let agents reconstruct reservations for every lab after
 	// restart, including a lab whose controller is no longer connected.
 	LabelRequestCPU     = "twinet.request.cpu"
@@ -769,6 +772,9 @@ func SpecHash(d *model.Device) string {
 	h := sha256.New()
 	fmt.Fprintf(h, "id=%s\nkind=%s\nimage=%s\nimageid=%s\nhost=%s\nnode=%s\n",
 		d.ID, d.Kind, d.Image, d.ImageID, d.Hostname, d.Node)
+	if d.NOS != "" {
+		fmt.Fprintf(h, "nos=%s\n", d.NOS)
+	}
 	fmt.Fprintf(h, "cpus=%v\nmem=%s\npids=%d\nrestart=%s\npriv=%v\n",
 		d.CPUs, d.Memory, d.Pids, d.Restart, d.Privileged)
 	fmt.Fprintf(h, "cmd=%s\ncaps=%s\nbinds=%s\n",
@@ -816,6 +822,9 @@ func (e *Engine) labels(top *model.Topology, d *model.Device) map[string]string 
 	}
 	if d.ASN > 0 {
 		out[LabelAS] = strconv.Itoa(d.ASN)
+	}
+	if d.NOS != "" {
+		out[LabelNOS] = d.NOS
 	}
 	if d.Owner != "" {
 		out[LabelOwner] = d.Owner

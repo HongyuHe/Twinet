@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/HongyuHe/twinet/internal/model"
+	"github.com/HongyuHe/twinet/internal/netstate"
 )
 
 // This file registers the checks that grade the inter-domain half of the
@@ -98,9 +99,47 @@ func advertisedTo(sums map[string]bgpSummaryJSON, from, addr string) (int, bool)
 
 // summary fetches a router's BGP summary, tolerating a router with no BGP.
 func bgpSummary(ctx context.Context, env *Env, router string) (bgpSummaryJSON, error) {
+	// A few package-level unit helpers intentionally exercise parsers without
+	// constructing a topology. There is no device/NOS to resolve in that
+	// narrow compatibility case; real grading always has one and uses
+	// RouterState below.
+	if env.Topology == nil {
+		var out bgpSummaryJSON
+		err := env.VtyshJSON(ctx, router, "show ip bgp summary json", &out)
+		return out, err
+	}
+	state, err := env.RouterState(ctx, router, netstate.QueryBGPSessions)
+	if err != nil {
+		return bgpSummaryJSON{}, err
+	}
 	var out bgpSummaryJSON
-	err := env.VtyshJSON(ctx, router, "show ip bgp summary json", &out)
-	return out, err
+	out.IPv4Unicast.Peers = map[string]struct {
+		RemoteAs      int    `json:"remoteAs"`
+		State         string `json:"state"`
+		PfxRcd        int    `json:"pfxRcd"`
+		PfxSnt        int    `json:"pfxSnt"`
+		PeerUptimeMs  int64  `json:"peerUptimeMsec"`
+		ConnectionsEs int    `json:"connectionsEstablished"`
+		MsgRcvd       int64  `json:"msgRcvd"`
+		MsgSent       int64  `json:"msgSent"`
+	}{}
+	for _, session := range state.BGP.Sessions {
+		out.IPv4Unicast.Peers[session.Neighbor] = struct {
+			RemoteAs      int    `json:"remoteAs"`
+			State         string `json:"state"`
+			PfxRcd        int    `json:"pfxRcd"`
+			PfxSnt        int    `json:"pfxSnt"`
+			PeerUptimeMs  int64  `json:"peerUptimeMsec"`
+			ConnectionsEs int    `json:"connectionsEstablished"`
+			MsgRcvd       int64  `json:"msgRcvd"`
+			MsgSent       int64  `json:"msgSent"`
+		}{
+			RemoteAs: int(session.RemoteAS), State: session.State,
+			PfxRcd: session.PrefixesIn, PfxSnt: session.PrefixesOut,
+			MsgRcvd: int64(session.UpdatesReceived), MsgSent: int64(session.UpdatesSent),
+		}
+	}
+	return out, nil
 }
 
 // bgpUpdatesReceived reads, per router and per neighbour, how many UPDATE
@@ -120,21 +159,13 @@ func bgpUpdatesReceived(ctx context.Context, env *Env, routers []*model.Device) 
 		wg.Add(1)
 		go func(r *model.Device) {
 			defer wg.Done()
-			res, err := env.Probe(ctx, r.ID, []string{"vtysh", "-c", "show bgp neighbors json"})
-			if err != nil || res.ExitCode != 0 {
-				return
-			}
-			var doc map[string]struct {
-				MessageStats struct {
-					UpdatesRecv int `json:"updatesRecv"`
-				} `json:"messageStats"`
-			}
-			if json.Unmarshal([]byte(res.Stdout), &doc) != nil {
+			state, err := env.RouterState(ctx, r.Name, netstate.QueryBGPSessions)
+			if err != nil {
 				return
 			}
 			byPeer := map[string]int{}
-			for addr, n := range doc {
-				byPeer[addr] = n.MessageStats.UpdatesRecv
+			for _, session := range state.BGP.Sessions {
+				byPeer[session.Neighbor] = session.UpdatesReceived
 			}
 			mu.Lock()
 			out[r.Name] = byPeer
@@ -467,31 +498,86 @@ func peerAgrees(ctx context.Context, env *Env, peerDevice, ourAddr string, ourAS
 	if peerDevice == "" || ourAddr == "" {
 		return "", 0, false
 	}
-	res, err := env.Probe(ctx, peerDevice, []string{"vtysh", "-c", "show ip bgp summary json"})
+	if env.Topology == nil {
+		res, err := env.Probe(ctx, peerDevice, []string{"vtysh", "-c", "show ip bgp summary json"})
+		if err != nil {
+			return fmt.Sprintf("%s could not be asked whether it sees one (%v)", peerDevice, err), 0, false
+		}
+		var summary bgpSummaryJSON
+		if decodeErr := jsonUnmarshalLoose(res.Stdout, &summary); decodeErr != nil {
+			return fmt.Sprintf("%s's own view could not be read (%v)", peerDevice, decodeErr), 0, false
+		}
+		peer, ok := summary.IPv4Unicast.Peers[ourAddr]
+		switch {
+		case !ok:
+			return fmt.Sprintf("%s has no session with %s at all, so the session is with "+
+				"something else answering at that address", peerDevice, ourAddr), 0, false
+		case peer.RemoteAs != ourAS:
+			return fmt.Sprintf("%s sees %s as AS %d, not AS %d", peerDevice, ourAddr, peer.RemoteAs, ourAS), 0, false
+		case !strings.EqualFold(peer.State, "Established"):
+			return fmt.Sprintf("%s sees that session as %s", peerDevice, peer.State), 0, false
+		}
+		return "", peer.PfxSnt, true
+	}
+	state, err := env.DeviceState(ctx, peerDevice, netstate.QueryBGPSessions)
 	if err != nil {
 		return fmt.Sprintf("%s could not be asked whether it sees one (%v)", peerDevice, err), 0, false
 	}
-	var sum bgpSummaryJSON
-	if jerr := jsonUnmarshalLoose(res.Stdout, &sum); jerr != nil {
-		return fmt.Sprintf("%s's own view could not be read (%v)", peerDevice, jerr), 0, false
+	var session *netstate.BGPSession
+	for i := range state.BGP.Sessions {
+		if state.BGP.Sessions[i].Neighbor == ourAddr {
+			session = &state.BGP.Sessions[i]
+			break
+		}
 	}
-	p, ok := sum.IPv4Unicast.Peers[ourAddr]
 	switch {
-	case !ok:
+	case session == nil:
 		return fmt.Sprintf("%s has no session with %s at all, so the session is with "+
 			"something else answering at that address", peerDevice, ourAddr), 0, false
-	case p.RemoteAs != ourAS:
-		return fmt.Sprintf("%s sees %s as AS %d, not AS %d", peerDevice, ourAddr, p.RemoteAs, ourAS), 0, false
-	case !strings.EqualFold(p.State, "Established"):
-		return fmt.Sprintf("%s sees that session as %s", peerDevice, p.State), 0, false
+	case int(session.RemoteAS) != ourAS:
+		return fmt.Sprintf("%s sees %s as AS %d, not AS %d", peerDevice, ourAddr, session.RemoteAS, ourAS), 0, false
+	case !strings.EqualFold(session.State, "Established"):
+		return fmt.Sprintf("%s sees that session as %s", peerDevice, session.State), 0, false
 	}
-	return "", p.PfxSnt, true
+	return "", session.PrefixesOut, true
 }
 
 func bgpTable(ctx context.Context, env *Env, router string) (bgpRouteJSON, error) {
-	var out bgpRouteJSON
-	err := env.VtyshJSON(ctx, router, "show ip bgp json", &out)
-	return out, err
+	if env.Topology == nil {
+		var out bgpRouteJSON
+		err := env.VtyshJSON(ctx, router, "show ip bgp json", &out)
+		return out, err
+	}
+	state, err := env.RouterState(ctx, router, netstate.QueryBGPRIB)
+	if err != nil {
+		return bgpRouteJSON{}, err
+	}
+	return bgpRouteJSONFromState(state), nil
+}
+
+func bgpRouteJSONFromState(state netstate.State) bgpRouteJSON {
+	out := bgpRouteJSON{Routes: routeSet{}}
+	for _, path := range state.BGP.Paths {
+		entry := bgpRoute{
+			Valid: path.Valid, BestPath: path.Best, LocalPref: path.LocalPref,
+			Origin: path.Origin, Path: path.ASPath, PeerID: path.Peer, PathFrom: path.Source,
+		}
+		if entry.PeerID == "" && path.Source == "local" {
+			entry.PeerID = unspecifiedPeer
+		}
+		for _, next := range path.NextHops {
+			entry.Nexthops = append(entry.Nexthops, struct {
+				IP string `json:"ip"`
+			}{IP: next.Address})
+		}
+		if len(path.Communities) > 0 {
+			entry.Community = &struct {
+				String string `json:"string"`
+			}{String: strings.Join(path.Communities, " ")}
+		}
+		out.Routes[path.Prefix] = append(out.Routes[path.Prefix], entry)
+	}
+	return out
 }
 
 func checkOwnPrefix(ctx context.Context, env *Env) Result {
