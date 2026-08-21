@@ -12,8 +12,10 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strings"
 	"time"
 
+	"github.com/HongyuHe/twinet/internal/model"
 	"github.com/HongyuHe/twinet/internal/netx"
 )
 
@@ -90,6 +92,16 @@ type overlayClaim struct {
 	Generation uint64    `json:"generation"`
 	Until      time.Time `json:"until,omitempty"`
 	Live       bool      `json:"live"`
+}
+
+type overlayClaimBefore struct {
+	claim overlayClaim
+	have  bool
+}
+
+type legacyOverlayAdoption struct {
+	vni    uint32
+	revert func() error
 }
 
 type generationState struct {
@@ -405,6 +417,96 @@ func (s *Server) overlayOwnersNow() (map[uint32]string, error) {
 	return netx.OverlayOwners()
 }
 
+func (s *Server) adoptLegacyOverlayOwner(vni uint32, lab string) (func() error, error) {
+	if s.overlayAdopter != nil {
+		if err := s.overlayAdopter(vni, lab); err != nil {
+			return nil, err
+		}
+		return func() error {
+			if s.overlayReverter == nil {
+				return errors.New("no legacy overlay adoption reverter is configured")
+			}
+			return s.overlayReverter(vni, lab)
+		}, nil
+	}
+	adoption, err := netx.AdoptLegacyOverlayOwner(vni, lab)
+	if err != nil {
+		return nil, err
+	}
+	return adoption.Revert, nil
+}
+
+// legacyOwnerlessOverlayProofLocked permits adoption only for the exact
+// cross-node VNI the agent still records as active for this lab. The caller
+// holds s.mu, which makes this proof and the reservation claim one decision.
+func (s *Server) legacyOwnerlessOverlayProofLocked(lab string, vni uint32) error {
+	top := s.current[lab]
+	if top == nil {
+		if s.store == nil {
+			return fmt.Errorf("VNI %d is ownerless and lab %q has no current or persisted topology",
+				vni, lab)
+		}
+		raw, err := s.store.Topology(lab)
+		if err != nil {
+			return fmt.Errorf("VNI %d is ownerless and lab %q has no persisted topology: %w",
+				vni, lab, err)
+		}
+		var wire Wire
+		if err := json.Unmarshal(raw, &wire); err != nil {
+			return fmt.Errorf("VNI %d is ownerless and lab %q has unreadable persisted topology: %w",
+				vni, lab, err)
+		}
+		top, err = wire.Rehydrate()
+		if err != nil {
+			return fmt.Errorf("VNI %d is ownerless and lab %q has invalid persisted topology: %w",
+				vni, lab, err)
+		}
+	}
+	if top.Name != lab {
+		return fmt.Errorf("VNI %d is ownerless and lab %q has a mismatched topology for %q",
+			vni, lab, top.Name)
+	}
+
+	if n := crossNodeVNIClaims(top, s.cfg.Node, vni); n != 1 {
+		switch n {
+		case 0:
+			return fmt.Errorf("VNI %d is ownerless but is not an active cross-node link of lab %q",
+				vni, lab)
+		default:
+			return fmt.Errorf("VNI %d is ownerless but lab %q has %d active cross-node claims",
+				vni, lab, n)
+		}
+	}
+	for otherLab, other := range s.current {
+		if otherLab == lab || other == nil {
+			continue
+		}
+		if n := crossNodeVNIClaims(other, s.cfg.Node, vni); n > 0 {
+			return fmt.Errorf("VNI %d is ownerless but current lab %q also claims it",
+				vni, otherLab)
+		}
+	}
+	return nil
+}
+
+func crossNodeVNIClaims(top *model.Topology, node string, vni uint32) int {
+	if top == nil {
+		return 0
+	}
+	count := 0
+	for _, link := range top.Links {
+		if link == nil || link.VNI != vni || link.A == nil || link.B == nil ||
+			link.A.Device == nil || link.B.Device == nil ||
+			link.A.Device.Node == link.B.Device.Node {
+			continue
+		}
+		if link.A.Device.Node == node || link.B.Device.Node == node {
+			count++
+		}
+	}
+	return count
+}
+
 func sortedVNIs(vnis []uint32) ([]uint32, error) {
 	seen := map[uint32]bool{}
 	out := make([]uint32, 0, len(vnis))
@@ -446,14 +548,18 @@ func (s *Server) reserveOverlays(req OverlayReservationRequest) (OverlayReservat
 		return OverlayReservationResponse{}, err
 	}
 	lease := s.mutations[req.Lab]
+	legacy := make([]uint32, 0, len(vnis))
 	for _, vni := range vnis {
 		if owner, exists := owners[vni]; exists && owner != req.Lab {
 			if owner == "" {
+				if err := s.legacyOwnerlessOverlayProofLocked(req.Lab, vni); err != nil {
+					return OverlayReservationResponse{}, err
+				}
+				legacy = append(legacy, vni)
+			} else {
 				return OverlayReservationResponse{}, fmt.Errorf(
-					"VNI %d is already present on this node without a Twinet owner; refusing to share it", vni)
+					"VNI %d is already owned by lab %q on this node", vni, owner)
 			}
-			return OverlayReservationResponse{}, fmt.Errorf(
-				"VNI %d is already owned by lab %q on this node", vni, owner)
 		}
 		if claim, exists := s.overlayClaims[vni]; exists {
 			switch {
@@ -467,6 +573,12 @@ func (s *Server) reserveOverlays(req OverlayReservationRequest) (OverlayReservat
 					"VNI %d is reserved by an older fence for lab %q", vni, req.Lab)
 			}
 		}
+	}
+
+	before := make(map[uint32]overlayClaimBefore, len(vnis))
+	for _, vni := range vnis {
+		claim, have := s.overlayClaims[vni]
+		before[vni] = overlayClaimBefore{claim: claim, have: have}
 	}
 	for _, vni := range vnis {
 		claim := s.overlayClaims[vni]
@@ -487,10 +599,89 @@ func (s *Server) reserveOverlays(req OverlayReservationRequest) (OverlayReservat
 	}
 	if changed {
 		if err := s.saveCoordinationLocked(); err != nil {
+			restoreOverlayClaimsLocked(s.overlayClaims, before)
 			return OverlayReservationResponse{}, fmt.Errorf("persisting overlay reservation: %w", err)
 		}
 	}
+
+	// A legacy per-link tunnel is already carrying live traffic. Once the
+	// persisted/current topology proves it belongs to this lab, stamp only its
+	// aliases; never replace the tunnel, bridge, FDB, or attached ports.
+	adopted := make([]legacyOverlayAdoption, 0, len(legacy))
+	for _, vni := range legacy {
+		revert, err := s.adoptLegacyOverlayOwner(vni, req.Lab)
+		if err != nil {
+			rollbackErrs := s.rollbackLegacyAdoptionsLocked(req.Lab, adopted, before)
+			if len(rollbackErrs) > 0 {
+				return OverlayReservationResponse{}, fmt.Errorf(
+					"adopting legacy VNI %d: %w; rollback: %s", vni, err,
+					strings.Join(rollbackErrs, "; "))
+			}
+			return OverlayReservationResponse{}, fmt.Errorf("adopting legacy VNI %d: %w", vni, err)
+		}
+		adopted = append(adopted, legacyOverlayAdoption{vni: vni, revert: revert})
+		claim := s.overlayClaims[vni]
+		claim.Lab = req.Lab
+		claim.Generation = req.Fence.Generation
+		claim.Live = true
+		claim.Until = time.Time{}
+		s.overlayClaims[vni] = claim
+	}
+	if len(adopted) > 0 {
+		if err := s.saveCoordinationLocked(); err != nil {
+			// The kernel aliases are now the safety boundary. Keep the live
+			// in-memory claims rather than rolling aliases back after a
+			// persistence failure; the caller sees failure and no other lab
+			// can reserve the VNI through either authority.
+			return OverlayReservationResponse{}, fmt.Errorf(
+				"persisting adopted legacy overlay ownership: %w", err)
+		}
+	}
 	return OverlayReservationResponse{Lab: req.Lab, VNIs: vnis, ExpiresAt: lease.until}, nil
+}
+
+func restoreOverlayClaimsLocked(claims map[uint32]overlayClaim, before map[uint32]overlayClaimBefore) {
+	for vni, prior := range before {
+		if prior.have {
+			claims[vni] = prior.claim
+			continue
+		}
+		delete(claims, vni)
+	}
+}
+
+func (s *Server) rollbackLegacyAdoptionsLocked(lab string, adopted []legacyOverlayAdoption,
+	before map[uint32]overlayClaimBefore,
+) []string {
+	var errs []string
+	kept := map[uint32]bool{}
+	for i := len(adopted) - 1; i >= 0; i-- {
+		adoption := adopted[i]
+		if err := adoption.revert(); err != nil {
+			vni := adoption.vni
+			errs = append(errs, fmt.Sprintf("VNI %d: %v", vni, err))
+			kept[vni] = true
+			// The alias still owns the live tunnel, so preserve its claim.
+			claim := s.overlayClaims[vni]
+			claim.Lab, claim.Live = lab, true
+			claim.Until = time.Time{}
+			s.overlayClaims[vni] = claim
+		}
+	}
+	for vni, prior := range before {
+		if kept[vni] {
+			continue
+		}
+		if prior.have {
+			s.overlayClaims[vni] = prior.claim
+		} else {
+			delete(s.overlayClaims, vni)
+		}
+	}
+	if err := s.saveCoordinationLocked(); err != nil {
+		errs = append(errs, fmt.Sprintf("persisting rollback: %v", err))
+	}
+	return errs
 }
 
 func (s *Server) promoteOverlayReservations(lab string, fence Fence, vnis []uint32) error {

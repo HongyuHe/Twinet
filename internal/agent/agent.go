@@ -208,13 +208,15 @@ type Server struct {
 	// mutations are fenced, cluster-scoped operation leases. Unlike ops,
 	// which only serialise work inside this process, these leases are issued
 	// to the controller and survive every handler boundary.
-	mutations      map[string]*clusterLease
-	fenceHighWater map[string]uint64
-	overlayClaims  map[uint32]overlayClaim
-	generations    map[string]generationState
-	transactions   map[string]applyTransaction
-	now            func() time.Time
-	overlayOwners  func() (map[uint32]string, error)
+	mutations       map[string]*clusterLease
+	fenceHighWater  map[string]uint64
+	overlayClaims   map[uint32]overlayClaim
+	generations     map[string]generationState
+	transactions    map[string]applyTransaction
+	now             func() time.Time
+	overlayOwners   func() (map[uint32]string, error)
+	overlayAdopter  func(uint32, string) error
+	overlayReverter func(uint32, string) error
 
 	// holds are labs an external operation has asked this node to leave alone.
 	holds map[string]*hold
@@ -468,6 +470,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	mux.HandleFunc("POST /v1/exempt", s.auth(s.observedHandler("exempt", s.handleExempt)))
 	mux.HandleFunc("POST /v1/lifecycle", s.auth(s.observedHandler("lifecycle", s.handleLifecycle)))
 	mux.HandleFunc("POST /v1/reshape", s.auth(s.observedHandler("reshape", s.handleReshape)))
+	mux.HandleFunc("POST /v1/mpls-label-space", s.auth(s.observedHandler("mpls_label_space", s.handleMPLSLabelSpace)))
 	mux.HandleFunc("GET /v1/images", s.auth(s.handleImages))
 	mux.HandleFunc("GET /v1/attach", s.auth(s.handleAttach))
 	mux.HandleFunc("GET /v1/underlay", s.auth(s.observedHandler("underlay", s.handleUnderlay)))
@@ -1433,6 +1436,112 @@ type ReshapeRequest struct {
 	Iface     string       `json:"iface"`
 	Shaping   netx.Shaping `json:"shaping"`
 	MTU       int          `json:"mtu,omitempty"`
+}
+
+// MPLSLabelSpaceRequest is the narrow privileged operation used by the
+// label-limit incident. The container itself never receives a writable sysctl:
+// net.mpls.platform_labels is namespace-owned kernel state and must be fenced
+// by the node agent.
+type MPLSLabelSpaceRequest struct {
+	Hold  string `json:"hold,omitempty"`
+	Fence Fence  `json:"fence"`
+
+	Container string `json:"container"`
+	Action    string `json:"action"`
+	Limit     int    `json:"limit,omitempty"`
+	Labels    []int  `json:"labels,omitempty"`
+}
+
+// MPLSLabelSpaceResponse reports the observed kernel allocator state.
+type MPLSLabelSpaceResponse struct {
+	Limit     int    `json:"limit"`
+	Allocated int    `json:"allocated"`
+	Labels    []int  `json:"labels,omitempty"`
+	Exhausted bool   `json:"exhausted"`
+	Detail    string `json:"detail,omitempty"`
+}
+
+func (s *Server) handleMPLSLabelSpace(w http.ResponseWriter, r *http.Request) {
+	var req MPLSLabelSpaceRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpError(w, http.StatusBadRequest, err)
+		return
+	}
+	if req.Container == "" || req.Action == "" {
+		httpError(w, http.StatusBadRequest, errors.New("container and action are both required"))
+		return
+	}
+	if why := s.refuseMutationIfHeld(s.labOfContainer(req.Container), req.Hold,
+		"changing MPLS label space"); why != "" {
+		httpError(w, http.StatusConflict, errors.New(why))
+		return
+	}
+	c, err := s.rt.Inspect(r.Context(), req.Container)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if c.State == rt.StateAbsent {
+		httpError(w, http.StatusNotFound, fmt.Errorf("no container %q on %s", req.Container, s.cfg.Node))
+		return
+	}
+	if c.Labels[deploy.LabelManaged] != "true" {
+		httpError(w, http.StatusForbidden, errors.New("that container is not managed by twinet"))
+		return
+	}
+	if req.Action != "snapshot" {
+		if err := s.requireMutationFence(c.Labels[deploy.LabelLab], req.Fence); err != nil {
+			httpError(w, http.StatusConflict, err)
+			return
+		}
+		if err := s.acquire(c.Labels[deploy.LabelLab], "mpls_label_space"); err != nil {
+			httpError(w, http.StatusConflict, err)
+			return
+		}
+		defer s.release(c.Labels[deploy.LabelLab])
+	}
+	ns, err := s.rt.NSPath(r.Context(), req.Container)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, err)
+		return
+	}
+	var (
+		snapshot netx.MPLSLabelSnapshot
+		labels   []int
+	)
+	err = s.workLimiter().Run(r.Context(), []limiter.Kind{limiter.Netlink}, func() error {
+		switch req.Action {
+		case "snapshot":
+			var inner error
+			snapshot, inner = netx.SnapshotMPLSLabelsInNS(ns)
+			return inner
+		case "probe":
+			var inner error
+			snapshot, inner = netx.ProbeMPLSLabelExhaustionInNS(ns)
+			return inner
+		case "exhaust":
+			var inner error
+			snapshot, labels, inner = netx.ExhaustMPLSLabelsInNS(ns, req.Limit)
+			return inner
+		case "restore":
+			if err := netx.RestoreMPLSLabelsInNS(ns, req.Limit, req.Labels); err != nil {
+				return err
+			}
+			var inner error
+			snapshot, inner = netx.SnapshotMPLSLabelsInNS(ns)
+			return inner
+		default:
+			return fmt.Errorf("unknown MPLS label-space action %q", req.Action)
+		}
+	})
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, MPLSLabelSpaceResponse{
+		Limit: snapshot.Limit, Allocated: snapshot.Allocated, Labels: labels,
+		Exhausted: snapshot.Exhausted, Detail: snapshot.Detail,
+	})
 }
 
 func (s *Server) handleReshape(w http.ResponseWriter, r *http.Request) {

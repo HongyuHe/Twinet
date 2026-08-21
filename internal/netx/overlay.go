@@ -452,6 +452,110 @@ func OverlayOwners() (map[uint32]string, error) {
 	return out, nil
 }
 
+// LegacyOverlayOwnerAdoption records alias values changed while repairing a
+// legacy per-link overlay. Revert restores precisely those values without
+// deleting or recreating the live networking objects.
+type LegacyOverlayOwnerAdoption struct {
+	vni                     uint32
+	lab                     string
+	vxlanAlias, bridgeAlias string
+	changed                 bool
+}
+
+// Revert restores the aliases that preceded AdoptLegacyOverlayOwner.
+func (a LegacyOverlayOwnerAdoption) Revert() error {
+	if !a.changed {
+		return nil
+	}
+	vx, br, err := legacyOverlayLinks(a.vni, a.lab)
+	if err != nil {
+		return err
+	}
+	want := ownerAlias(a.lab)
+	if vx.Attrs().Alias != want || br.Attrs().Alias != want {
+		return fmt.Errorf("VNI %d ownership changed while adoption was rolling back", a.vni)
+	}
+	if err := netlink.LinkSetAlias(vx, a.vxlanAlias); err != nil {
+		return fmt.Errorf("restore VNI %d VXLAN ownership: %w", a.vni, err)
+	}
+	if err := netlink.LinkSetAlias(br, a.bridgeAlias); err != nil {
+		_ = netlink.LinkSetAlias(vx, want)
+		return fmt.Errorf("restore VNI %d bridge ownership: %w", a.vni, err)
+	}
+	return nil
+}
+
+// AdoptLegacyOverlayOwner stamps the ownership aliases on an existing
+// per-link overlay without changing its tunnel, bridge, forwarding database,
+// ports, or link state.
+//
+// It is intentionally narrow: both objects must be Twinet's expected VXLAN
+// and bridge, and every pre-existing alias must either be empty or already
+// name lab. An arbitrary alias, a missing bridge, or another owner's alias is
+// ambiguous and is refused rather than overwritten. An already-correct alias
+// on one half may be completed on the other, and Revert preserves that prior
+// known ownership if a later reservation in the same batch fails.
+func AdoptLegacyOverlayOwner(vni uint32, lab string) (LegacyOverlayOwnerAdoption, error) {
+	vx, br, err := legacyOverlayLinks(vni, lab)
+	if err != nil {
+		return LegacyOverlayOwnerAdoption{}, err
+	}
+	want := ownerAlias(lab)
+	vxBefore, brBefore := vx.Attrs().Alias, br.Attrs().Alias
+	if vxBefore == want && brBefore == want {
+		return LegacyOverlayOwnerAdoption{vni: vni, lab: lab}, nil
+	}
+	if err := netlink.LinkSetAlias(vx, want); err != nil {
+		return LegacyOverlayOwnerAdoption{}, fmt.Errorf("stamp VNI %d VXLAN ownership: %w", vni, err)
+	}
+	if err := netlink.LinkSetAlias(br, want); err != nil {
+		_ = netlink.LinkSetAlias(vx, vxBefore)
+		return LegacyOverlayOwnerAdoption{}, fmt.Errorf("stamp VNI %d bridge ownership: %w", vni, err)
+	}
+	return LegacyOverlayOwnerAdoption{
+		vni: vni, lab: lab, vxlanAlias: vxBefore, bridgeAlias: brBefore, changed: true,
+	}, nil
+}
+
+func legacyOverlayLinks(vni uint32, lab string) (*netlink.Vxlan, *netlink.Bridge, error) {
+	if vni == 0 {
+		return nil, nil, fmt.Errorf("legacy overlay VNI must be non-zero")
+	}
+	if lab == "" {
+		return nil, nil, fmt.Errorf("legacy overlay adoption needs a lab owner")
+	}
+	vxLink, err := netlink.LinkByName(VxlanName(vni))
+	if err != nil {
+		return nil, nil, fmt.Errorf("find legacy VXLAN for VNI %d: %w", vni, err)
+	}
+	vx, ok := vxLink.(*netlink.Vxlan)
+	if !ok || uint32(vx.VxlanId) != vni {
+		return nil, nil, fmt.Errorf("VNI %d device %s is not the expected VXLAN",
+			vni, VxlanName(vni))
+	}
+	brLink, err := netlink.LinkByName(BridgeName(vni))
+	if err != nil {
+		return nil, nil, fmt.Errorf("find legacy bridge for VNI %d: %w", vni, err)
+	}
+	br, ok := brLink.(*netlink.Bridge)
+	if !ok {
+		return nil, nil, fmt.Errorf("VNI %d device %s is not the expected bridge",
+			vni, BridgeName(vni))
+	}
+	want := ownerAlias(lab)
+	vxAlias, brAlias := vx.Attrs().Alias, br.Attrs().Alias
+	switch {
+	case vxAlias == want && brAlias == want:
+		return vx, br, nil
+	case (vxAlias == "" || vxAlias == want) && (brAlias == "" || brAlias == want):
+		return vx, br, nil
+	default:
+		return nil, nil, fmt.Errorf(
+			"VNI %d has inconsistent or unknown ownership aliases %q and %q",
+			vni, vxAlias, brAlias)
+	}
+}
+
 func listOverlays(lab string) ([]uint32, error) {
 	links, err := netlink.LinkList()
 	if err != nil {
