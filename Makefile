@@ -23,6 +23,11 @@ TAG     ?= 0.1
 # with the first.
 BUILD_TAG ?= $(TAG)-$(COMMIT)
 IMAGE_LOCK ?= images/lock.json
+# The bundled manifests retain 0.1 development references. A release lock
+# maps those authored references to the remotely verified release digest; set
+# these when producing a lock for a differently authored manifest.
+IMAGE_LOCK_SOURCE_REGISTRY ?= hyhe
+IMAGE_LOCK_SOURCE_TAG ?= 0.1
 PODMAN_ROOT ?= sudo -n podman
 # Must match .github/workflows/ci.yml, or local lint and CI can disagree.
 GOLANGCI_VERSION ?= v2.5.0
@@ -136,13 +141,16 @@ images: build
 		$(DOCKER) tag $(REGISTRY)/twinet-$$i:$(TAG) $(REGISTRY)/twinet-$$i:$(BUILD_TAG) || exit 1; \
 	done
 
-push: images
-	@for i in $(IMAGES); do \
-		echo "pushing immutable $(REGISTRY)/twinet-$$i:$(BUILD_TAG) before moving :$(TAG)"; \
-		$(DOCKER) push -q $(REGISTRY)/twinet-$$i:$(BUILD_TAG) >/dev/null || exit 1; \
-		$(DOCKER) buildx imagetools inspect $(REGISTRY)/twinet-$$i:$(BUILD_TAG) --format '{{.Digest}}' | grep -Eq '^sha256:[0-9a-f]{64}$$' || exit 1; \
-		$(DOCKER) push -q $(REGISTRY)/twinet-$$i:$(TAG) >/dev/null || exit 1; \
-	done
+push:
+	@missing=""; \
+	for i in $(IMAGES); do \
+		$(DOCKER) image inspect "$(REGISTRY)/twinet-$$i:$(BUILD_TAG)" >/dev/null 2>&1 || missing="$$missing $$i"; \
+	done; \
+	if [ -n "$$missing" ]; then \
+		echo "building missing immutable image tag(s):$$missing"; \
+		$(MAKE) --no-print-directory REGISTRY="$(REGISTRY)" TAG="$(TAG)" DOCKER="$(DOCKER)" images; \
+	fi
+	bash scripts/push_images.sh "$(REGISTRY)" "$(TAG)" "$(BUILD_TAG)" $(IMAGES) -- $(DOCKER)
 	@$(MAKE) --no-print-directory image-lock
 
 # image-lock records only registry-inspected immutable manifests. A local
@@ -151,19 +159,19 @@ push: images
 image-lock: build
 	@args=""; \
 	for i in $(IMAGES); do \
-		source="$(REGISTRY)/twinet-$$i:$(TAG)"; \
+		authored="$(IMAGE_LOCK_SOURCE_REGISTRY)/twinet-$$i:$(IMAGE_LOCK_SOURCE_TAG)"; \
+		channel="$(REGISTRY)/twinet-$$i:$(TAG)"; \
 		immutable="$(REGISTRY)/twinet-$$i:$(BUILD_TAG)"; \
-		d=$$($(DOCKER) buildx imagetools inspect "$$immutable" --format '{{.Digest}}') || exit 1; \
-		echo "$$d" | grep -Eq '^sha256:[0-9a-f]{64}$$' || { echo "$$immutable did not resolve to a pushed manifest digest" >&2; exit 1; }; \
-		source_d=$$($(DOCKER) buildx imagetools inspect "$$source" --format '{{.Digest}}') || exit 1; \
-		test "$$source_d" = "$$d" || { echo "$$source does not match immutable $$immutable" >&2; exit 1; }; \
-		args="$$args --pin $$source=$$source@$$d"; \
+		d=$$(bash scripts/remote_image_digest.sh "$$immutable" $(DOCKER)) || exit 1; \
+		channel_d=$$(bash scripts/remote_image_digest.sh "$$channel" $(DOCKER)) || exit 1; \
+		test "$$channel_d" = "$$d" || { echo "$$channel does not match immutable $$immutable" >&2; exit 1; }; \
+		args="$$args --pin $$authored=$$authored@$$d"; \
 	done; \
-	./$(BIN)/twinet --manifest examples/mixed-substrate images lock --output "$(IMAGE_LOCK)" $$args
+	./$(BIN)/twinet --manifest examples/mixed-substrate images lock --output "$(CURDIR)/$(IMAGE_LOCK)" $$args
 
 image-verify: build
 	@test -f "$(IMAGE_LOCK)" || { echo "missing $(IMAGE_LOCK); run make push or make image-lock"; exit 2; }
-	./$(BIN)/twinet --manifest examples/mixed-substrate images verify --lock "$(IMAGE_LOCK)"
+	sudo -n env PATH="$$PATH" ./$(BIN)/twinet --manifest examples/mixed-substrate images verify --lock "$(CURDIR)/$(IMAGE_LOCK)"
 
 # Compatibility alias retained for release scripts that used the old target.
 digests: image-lock
@@ -224,6 +232,8 @@ e2e: build
 script-tests:
 	shellcheck scripts/*.sh
 	bash scripts/test_release_runners.sh
+	bash scripts/test_remote_image_digest.sh
+	bash scripts/test_push_images.sh
 
 # Cluster evidence is never part of ordinary CI: it mutates a real cluster and
 # must be run by an explicitly configured self-hosted runner. Every target

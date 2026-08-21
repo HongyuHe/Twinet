@@ -273,7 +273,12 @@ func verifyLockedNodes(ctx context.Context, top *model.Topology, token string, l
 		for _, device := range top.DevicesOnNode(node) {
 			for source, pinned := range lock.Images {
 				if device.Image == source || device.Image == pinned {
-					out[device.Image] = pinned
+					// Verify the immutable reference itself, not a mutable
+					// authored tag. This makes `images verify` meaningful for
+					// a development manifest being prepared for release as
+					// well as for a release manifest already rewritten by
+					// images.Apply.
+					out[pinned] = pinned
 				}
 			}
 		}
