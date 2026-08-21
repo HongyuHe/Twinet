@@ -68,6 +68,13 @@ type Config struct {
 	TLSCert  string
 	TLSKey   string
 	ClientCA string
+	// GCGrace and GCInterval bound automatic removal of abandoned host
+	// objects and stale local records. A zero value selects conservative
+	// defaults, which keeps callers written before automatic collection safe.
+	GCGrace    time.Duration
+	GCInterval time.Duration
+	// EventCapacity bounds in-memory and persisted node event history.
+	EventCapacity int
 }
 
 // Main is the agent entry point.
@@ -85,6 +92,12 @@ func Main(ctx context.Context, args []string) error {
 		cacert = fs.String("client-ca", os.Getenv("TWINET_CLIENT_CA"), "CA that signs permitted client certificates (enables mutual TLS)")
 		insec  = fs.Bool("insecure", os.Getenv("TWINET_INSECURE") == "1",
 			"serve without mutual TLS on a non-loopback address (development only)")
+		gcGrace = fs.Duration("gc-grace", 15*time.Minute,
+			"minimum age before automatic garbage collection removes an abandoned object")
+		gcInterval = fs.Duration("gc-interval", 5*time.Minute,
+			"how often to scan safely collectible abandoned objects")
+		eventCapacity = fs.Int("event-capacity", defaultEventCapacity,
+			"maximum structured events retained locally")
 		verbose = fs.Bool("verbose", false, "debug logging")
 		version = fs.Bool("version", false, "print the version and exit")
 	)
@@ -111,7 +124,8 @@ func Main(ctx context.Context, args []string) error {
 	s, err := New(Config{
 		Node: *node, Listen: *listen, Token: *token,
 		UnderlayIP: *uip, UnderlayDev: *udev, StateDir: *sdir, Insecure: *insec,
-		TLSCert: *cert, TLSKey: *key, ClientCA: *cacert,
+		TLSCert: *cert, TLSKey: *key, ClientCA: *cacert, GCGrace: *gcGrace,
+		GCInterval: *gcInterval, EventCapacity: *eventCapacity,
 	})
 	if err != nil {
 		return err
@@ -121,10 +135,33 @@ func Main(ctx context.Context, args []string) error {
 
 // Server is the agent.
 type Server struct {
-	cfg     Config
-	rt      rt.Runtime
-	store   *state.Store
-	started time.Time
+	cfg         Config
+	rt          rt.Runtime
+	eventSource rt.EventSource
+	store       *state.Store
+	started     time.Time
+
+	metrics *agentMetrics
+	eventMu sync.Mutex
+	events  *eventRing
+
+	reconcileMu          sync.Mutex
+	reconcileQueue       chan reconcileRequest
+	reconcilePending     map[string]bool
+	reconcileWorkersOnce sync.Once
+	reconcileContext     context.Context
+	health               map[string]deviceObservation
+	// repairHook is test-only seam for proving event delivery reaches a
+	// targeted repair without invoking host networking.
+	repairHook func(context.Context, *model.Topology, []*model.Device)
+
+	gcMu                   sync.Mutex
+	gcSeen                 map[string]time.Time
+	gcFindOrphans          func(map[string]bool) ([]netx.Orphan, error)
+	gcRemoveOverlay        func(uint32) error
+	gcDeleteHostLink       func(string) error
+	gcListMultiplex        func(string) ([]netx.MultiplexOverlay, error)
+	gcRemoveEmptyMultiplex func(string) ([]string, error)
 
 	// tools compares a container's programs against its image's, so that a
 	// mark never rests on a program the student under examination wrote. It is
@@ -184,6 +221,10 @@ type Server struct {
 
 	// repairFails counts consecutive failed repairs, keyed by lab and device.
 	repairFails map[string]int
+	// repairNext is the earliest time a failed repair may be retried. It keeps
+	// an abandoned device from consuming a permanent share of the node while
+	// still allowing a later healthy observation or bounded retry to recover.
+	repairNext map[string]time.Time
 
 	// exempt records, per lab, the devices that are broken on purpose.
 	exempt map[string]*exemptions
@@ -227,7 +268,7 @@ func New(cfg Config) (*Server, error) {
 		return nil, fmt.Errorf("cannot reach the container engine: %w", err)
 	}
 	srv := &Server{
-		cfg: cfg, rt: engine, started: time.Now(),
+		cfg: cfg, started: time.Now(), metrics: newAgentMetrics(),
 		current: map[string]*model.Topology{},
 		ops:     map[string]*lease{},
 		holds:   map[string]*hold{},
@@ -236,11 +277,16 @@ func New(cfg Config) (*Server, error) {
 		toolsSeen: map[string]toolsVerdict{},
 
 		repairFails:    map[string]int{},
+		repairNext:     map[string]time.Time{},
 		exempt:         map[string]*exemptions{},
 		partial:        map[string]int{},
 		lastCapture:    map[string]time.Time{},
 		durabilityBusy: map[string]bool{},
 	}
+	if source, ok := interface{}(engine).(rt.EventSource); ok {
+		srv.eventSource = source
+	}
+	srv.rt = &observedRuntime{runtime: engine, metrics: srv.metrics}
 	srv.initCoordination()
 	if cfg.StateDir != "" {
 		st, err := state.Open(cfg.StateDir)
@@ -404,31 +450,36 @@ func (s *Server) Serve(ctx context.Context) error {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/status", s.authDiag(s.handleStatus))
+	// Metrics intentionally carry only bounded labels and no tenant
+	// identifiers, so an ordinary Prometheus scraper can collect them without
+	// receiving a credential capable of mutating a node.
+	mux.HandleFunc("GET /metrics", s.observedHandler("metrics", s.handleMetrics))
+	mux.HandleFunc("GET /v1/status", s.authDiag(s.observedHandler("status", s.handleStatus)))
 	mux.HandleFunc("GET /v1/containers", s.authDiag(s.handleContainers))
-	mux.HandleFunc("POST /v1/apply", s.auth(s.handleApply))
-	mux.HandleFunc("POST /v1/destroy", s.auth(s.handleDestroy))
+	mux.HandleFunc("GET /v1/events", s.authDiag(s.observedHandler("events", s.handleEvents)))
+	mux.HandleFunc("POST /v1/apply", s.auth(s.observedHandler("apply", s.handleApply)))
+	mux.HandleFunc("POST /v1/destroy", s.auth(s.observedHandler("destroy", s.handleDestroy)))
 	mux.HandleFunc("POST /v1/lease/acquire", s.auth(s.handleLeaseAcquire))
 	mux.HandleFunc("POST /v1/lease/renew", s.auth(s.handleLeaseRenew))
 	mux.HandleFunc("POST /v1/lease/release", s.auth(s.handleLeaseRelease))
 	mux.HandleFunc("POST /v1/overlay/reserve", s.auth(s.handleOverlayReserve))
-	mux.HandleFunc("POST /v1/exec", s.authDiag(s.handleExec))
-	mux.HandleFunc("POST /v1/hold", s.auth(s.handleHold))
-	mux.HandleFunc("POST /v1/exempt", s.auth(s.handleExempt))
-	mux.HandleFunc("POST /v1/lifecycle", s.auth(s.handleLifecycle))
-	mux.HandleFunc("POST /v1/reshape", s.auth(s.handleReshape))
+	mux.HandleFunc("POST /v1/exec", s.authDiag(s.observedHandler("exec", s.handleExec)))
+	mux.HandleFunc("POST /v1/hold", s.auth(s.observedHandler("hold", s.handleHold)))
+	mux.HandleFunc("POST /v1/exempt", s.auth(s.observedHandler("exempt", s.handleExempt)))
+	mux.HandleFunc("POST /v1/lifecycle", s.auth(s.observedHandler("lifecycle", s.handleLifecycle)))
+	mux.HandleFunc("POST /v1/reshape", s.auth(s.observedHandler("reshape", s.handleReshape)))
 	mux.HandleFunc("GET /v1/images", s.auth(s.handleImages))
 	mux.HandleFunc("GET /v1/attach", s.auth(s.handleAttach))
-	mux.HandleFunc("GET /v1/underlay", s.auth(s.handleUnderlay))
-	mux.HandleFunc("GET /v1/state", s.auth(s.handleStateExport))
-	mux.HandleFunc("POST /v1/state", s.auth(s.handleStateImport))
-	mux.HandleFunc("POST /v1/state/verify", s.auth(s.handleStateVerify))
+	mux.HandleFunc("GET /v1/underlay", s.auth(s.observedHandler("underlay", s.handleUnderlay)))
+	mux.HandleFunc("GET /v1/state", s.auth(s.observedHandler("state", s.handleStateExport)))
+	mux.HandleFunc("POST /v1/state", s.auth(s.observedHandler("state", s.handleStateImport)))
+	mux.HandleFunc("POST /v1/state/verify", s.auth(s.observedHandler("state", s.handleStateVerify)))
 	// The peer routes are intentionally separate from controller routes and
 	// accept only a node certificate with peer-state scope. A node key is not
 	// a controller key.
 	mux.HandleFunc("GET /v1/peer/state/inventory", s.peerAuth(s.handlePeerStateInventory))
 	mux.HandleFunc("POST /v1/peer/state", s.peerAuth(s.handlePeerStateImport))
-	mux.HandleFunc("POST /v1/sweep", s.auth(s.handleSweep))
+	mux.HandleFunc("POST /v1/sweep", s.auth(s.observedHandler("sweep", s.handleSweep)))
 
 	srv := &http.Server{
 		Addr:    s.cfg.Listen,
@@ -506,6 +557,10 @@ func (s *Server) Serve(ctx context.Context) error {
 	// container that restarts on its own is running, healthy and connected to
 	// nothing until somebody happens to redeploy.
 	go s.reconcileLoop(ctx)
+	// Garbage collection is deliberately separate from repair: a runtime
+	// event needs a prompt response, whereas absence needs a grace window and
+	// a generation/operation safety proof before anything is removed.
+	go s.gcLoop(ctx)
 	// Capturing and replicating state belongs to the long-running agent, not
 	// the CLI invocation that happened to deploy the lab.
 	go s.durabilityLoop(ctx)
@@ -571,8 +626,12 @@ type StatusResponse struct {
 	UnderlayIP  string `json:"underlay_ip,omitempty"`
 	UnderlayDev string `json:"underlay_dev,omitempty"`
 	Containers  int    `json:"containers"`
-	Lab         string `json:"lab,omitempty"`
-	Hash        string `json:"topology_hash,omitempty"`
+	// ContainerCount is nil when the runtime list could not be read. Containers
+	// is retained for older clients, but must not make an unreadable runtime
+	// look like an empty node.
+	ContainerCount *int   `json:"container_count,omitempty"`
+	Lab            string `json:"lab,omitempty"`
+	Hash           string `json:"topology_hash,omitempty"`
 	// Labs is every lab this node currently hosts, and Busy every lab with an
 	// operation in flight. A node that hosts a class lab and a dozen grading
 	// harnesses at once cannot be described by a single name.
@@ -591,6 +650,15 @@ type StatusResponse struct {
 	Inventory HostInventory `json:"inventory"`
 	// Backpressure exposes node-wide queue depth and wait time by work class.
 	Backpressure map[string]limiter.Stats `json:"backpressure"`
+	// ActiveWork is the in-flight portion of each shared limiter. It is a
+	// concise status surface for schedulers; Backpressure keeps queue/wait
+	// detail for operators.
+	ActiveWork map[string]int `json:"active_work"`
+	// Convergence is the latest observed device-health classification. Unknown
+	// is explicitly distinct from healthy and never folded into zero.
+	Convergence map[string]int `json:"convergence"`
+	// Unknown names status dimensions that could not be observed.
+	Unknown []string `json:"unknown,omitempty"`
 	// StateStoreHealthy is nil for an older agent that cannot report it.
 	// Explicit false lets a controller treat a surviving runtime with a lost
 	// state disk as unavailable for durable placement.
@@ -617,6 +685,19 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	resp.Inventory = s.observeHostInventory(cs, listErr)
 	resp.Backpressure = s.workLimiter().Snapshot()
+	resp.ActiveWork = map[string]int{}
+	for kind, stats := range resp.Backpressure {
+		resp.ActiveWork[kind] = stats.InFlight
+	}
+	if listErr == nil {
+		count := len(cs)
+		resp.ContainerCount = &count
+	} else {
+		resp.Unknown = append(resp.Unknown, "containers")
+	}
+	for _, unknown := range resp.Inventory.Unknown {
+		resp.Unknown = append(resp.Unknown, "inventory."+unknown)
+	}
 	stateHealthy := s.store != nil
 	if stateHealthy && s.store.Healthy() != nil {
 		stateHealthy = false
@@ -639,6 +720,10 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	sort.Strings(busy)
 	resp.Busy = busy
+	resp.Convergence = map[string]int{}
+	for _, observation := range s.health {
+		resp.Convergence[string(observation.Health)]++
+	}
 	s.mu.Unlock()
 	resp.Generations = s.committedGenerations()
 
@@ -654,6 +739,8 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		resp.Hash = ""
 		resp.Lab = ""
 		resp.Generations = nil
+		// Aggregates carry no tenant identifiers and remain useful to a
+		// diagnostic caller, but a count of every active lab is not needed.
 		// Reservations name other labs, which is cluster business a
 		// diagnostic credential is not entitled to enumerate.
 		if own, found := resp.Inventory.Reservations[scope]; found {
@@ -669,6 +756,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	sort.Strings(resp.Unknown)
 	writeJSON(w, resp)
 }
 
@@ -798,6 +886,8 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, fmt.Errorf("rehydrate topology: %w", err))
 		return
 	}
+	s.recordEvent(top.Name, req.Generation, "deploy", s.requestCorrelation(r), "apply_requested", "scheduled",
+		"phase="+req.Phase)
 	if why := s.refuseMutationIfHeld(top.Name, req.Hold, "this deployment"); why != "" {
 		httpError(w, http.StatusConflict, errors.New(why))
 		return
@@ -891,6 +981,7 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		ContinueOnError: true,
 		DryRun:          req.DryRun,
 	})
+	s.recordPlanMetrics(rep)
 	if err != nil {
 		httpError(w, http.StatusInternalServerError, err)
 		return
@@ -906,6 +997,8 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		}
 		if rep.Failed() {
 			resp.Failures = reportFailures(rep)
+			s.recordEvent(top.Name, req.Generation, "deploy", s.requestCorrelation(r),
+				"apply", "error", fmt.Sprintf("%d degraded scope(s)", len(resp.Failures)))
 			writeJSON(w, resp)
 			return
 		}
@@ -913,6 +1006,8 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 			httpError(w, http.StatusConflict, err)
 			return
 		}
+		s.recordEvent(top.Name, req.Generation, "deploy", s.requestCorrelation(r),
+			"apply", "success", fmt.Sprintf("steps=%d", resp.Steps))
 		writeJSON(w, resp)
 		return
 	}
@@ -1098,6 +1193,7 @@ func (s *Server) handleDestroy(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, errors.New("a lab name is required"))
 		return
 	}
+	s.recordEvent(req.Lab, "", "deploy", s.requestCorrelation(r), "destroy_requested", "scheduled", "")
 	if err := s.requireMutationFence(req.Lab, req.Fence); err != nil {
 		httpError(w, http.StatusConflict, err)
 		return
@@ -1268,6 +1364,12 @@ func (s *Server) destroyLab(w http.ResponseWriter, r *http.Request,
 		problems = append(problems, fmt.Sprintf("%s: could not release overlay claims: %v",
 			s.cfg.Node, err))
 	}
+	result := "success"
+	if status != "destroyed" {
+		result = "error"
+	}
+	s.recordEvent(req.Lab, "", "deploy", s.requestCorrelation(r), "destroy", result,
+		strings.Join(problems, "; "))
 	writeJSON(w, DestroyResponse{Status: status, Lab: req.Lab, Problems: problems})
 }
 
@@ -1474,9 +1576,13 @@ func (s *Server) handleLifecycle(w http.ResponseWriter, r *http.Request) {
 		}
 	})
 	if err != nil {
+		s.recordEvent(c.Labels[deploy.LabelLab], "", "api", s.requestCorrelation(r),
+			"container_"+req.Action, "error", err.Error())
 		httpError(w, http.StatusInternalServerError, err)
 		return
 	}
+	s.recordEvent(c.Labels[deploy.LabelLab], "", "api", s.requestCorrelation(r),
+		"container_"+req.Action, "success", req.Container)
 	writeJSON(w, map[string]string{"status": "ok", "action": req.Action})
 }
 
@@ -1550,8 +1656,22 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 		return execErr
 	})
 	if err != nil {
+		if req.Grading {
+			s.metricRegistry().observeGrading(metricResult(err))
+			s.recordEvent(c.Labels[deploy.LabelLab], "", "grading", s.requestCorrelation(r),
+				"grading_exec", "error", err.Error())
+		}
 		httpError(w, http.StatusInternalServerError, err)
 		return
+	}
+	if req.Grading {
+		result := "success"
+		if res.ExitCode != 0 {
+			result = "error"
+		}
+		s.metricRegistry().observeGrading(result)
+		s.recordEvent(c.Labels[deploy.LabelLab], "", "grading", s.requestCorrelation(r),
+			"grading_exec", result, "")
 	}
 	writeJSON(w, ExecResponse{ExitCode: res.ExitCode, Stdout: res.Stdout, Stderr: res.Stderr})
 }
@@ -1629,11 +1749,15 @@ func (s *Server) handleUnderlay(w http.ResponseWriter, r *http.Request) {
 			return probeErr
 		})
 		if err != nil {
+			s.metricRegistry().observeUnderlay(metricResult(err))
+			s.recordEvent("", "", "underlay", s.requestCorrelation(r), "underlay_probe", "error", err.Error())
 			httpError(w, http.StatusBadRequest, err)
 			return
 		}
 		resp.MTU, resp.Dev, resp.Probed = mtu, dev, peer
 	}
+	s.metricRegistry().observeUnderlay("success")
+	s.recordEvent("", "", "underlay", s.requestCorrelation(r), "underlay_probe", "success", resp.Probed)
 	writeJSON(w, resp)
 }
 

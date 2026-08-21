@@ -76,6 +76,7 @@ type WireDev struct {
 	PlacementGroup    string                `json:"placement_group,omitempty"`
 	Node              string                `json:"node"`
 	Image             string                `json:"image"`
+	NOS               string                `json:"nos,omitempty"`
 	ImageID           string                `json:"image_id,omitempty"`
 	Container         string                `json:"container"`
 	Hostname          string                `json:"hostname"`
@@ -222,7 +223,7 @@ func Serialise(top *model.Topology) *Wire {
 			ID:          d.ID, Name: d.Name, Kind: string(d.Kind), AS: d.ASN,
 			RouterID: d.RouterID, InteriorRole: string(d.InteriorRole),
 			InteriorRoleIndex: d.InteriorRoleIndex, PlacementGroup: d.PlacementGroup,
-			Node: d.Node, Image: d.Image, ImageID: d.ImageID,
+			Node: d.Node, Image: d.Image, NOS: d.NOS, ImageID: d.ImageID,
 			Container: d.Container, Hostname: d.Hostname, Owner: d.Owner,
 			CPUs: d.CPUs, Memory: d.Memory, Pids: d.Pids, Requests: d.Requests, Restart: d.Restart,
 			Privileged: d.Privileged, Env: d.Env, Sysctls: d.Sysctls,
@@ -353,7 +354,7 @@ func (w *Wire) Rehydrate() (*model.Topology, error) {
 			ID: wd.ID, Name: wd.Name, Kind: model.DeviceKind(wd.Kind), ASN: wd.AS,
 			RouterID: wd.RouterID, InteriorRole: model.InteriorRole(wd.InteriorRole),
 			InteriorRoleIndex: wd.InteriorRoleIndex, PlacementGroup: wd.PlacementGroup,
-			Node: wd.Node, Image: wd.Image, ImageID: wd.ImageID,
+			Node: wd.Node, Image: wd.Image, NOS: wd.NOS, ImageID: wd.ImageID,
 			Container: wd.Container, Hostname: wd.Hostname, Owner: wd.Owner,
 			CPUs: wd.CPUs, Memory: wd.Memory, Pids: wd.Pids,
 			Requests: requests, Restart: wd.Restart,

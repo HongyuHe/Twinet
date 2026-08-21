@@ -7,6 +7,7 @@
 package client
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
@@ -21,8 +22,10 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/HongyuHe/twinet/internal/agent"
@@ -30,6 +33,31 @@ import (
 	"github.com/HongyuHe/twinet/internal/place"
 	rt "github.com/HongyuHe/twinet/internal/runtime"
 )
+
+type correlationContextKey struct{}
+
+var correlationSequence atomic.Uint64
+
+// WithCorrelation lets an outer controller retain one trace identifier across
+// every node request in a cluster operation.
+func WithCorrelation(ctx context.Context, correlation string) context.Context {
+	if strings.TrimSpace(correlation) == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, correlationContextKey{}, correlation)
+}
+
+func operationContext(ctx context.Context) context.Context {
+	if existing, ok := ctx.Value(correlationContextKey{}).(string); ok && existing != "" {
+		return ctx
+	}
+	return WithCorrelation(ctx, fmt.Sprintf("controller-%x", correlationSequence.Add(1)))
+}
+
+func correlationFromContext(ctx context.Context) string {
+	value, _ := ctx.Value(correlationContextKey{}).(string)
+	return value
+}
 
 // Node is a handle on one agent.
 type Node struct {
@@ -130,6 +158,9 @@ func (n *Node) do(ctx context.Context, method, path string, body, out any) error
 		return err
 	}
 	req.Header.Set("Authorization", "Bearer "+n.Token)
+	if correlation := correlationFromContext(ctx); correlation != "" {
+		req.Header.Set("X-Twinet-Correlation-ID", correlation)
+	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -173,6 +204,89 @@ func (n *Node) Containers(ctx context.Context, lab string) ([]rt.Container, erro
 	}
 	err := n.do(ctx, http.MethodGet, p, nil, &cs)
 	return cs, err
+}
+
+// Events reads a bounded page from the node's structured event ring. The
+// cursor is node-local; ClusterEvents merges pages deterministically.
+func (n *Node) Events(ctx context.Context, lab string, after uint64, limit int) (agent.EventsResponse, error) {
+	values := url.Values{}
+	if lab != "" {
+		values.Set("lab", lab)
+	}
+	if after > 0 {
+		values.Set("after", strconv.FormatUint(after, 10))
+	}
+	if limit > 0 {
+		values.Set("limit", strconv.Itoa(limit))
+	}
+	var out agent.EventsResponse
+	path := "/v1/events"
+	if encoded := values.Encode(); encoded != "" {
+		path += "?" + encoded
+	}
+	err := n.do(ctx, http.MethodGet, path, nil, &out)
+	return out, err
+}
+
+// WatchEvents follows one node's event stream. Closing ctx cancels the HTTP
+// request and closes both channels; the caller owns reconnection policy so it
+// can merge node streams without duplicating cursor decisions.
+func (n *Node) WatchEvents(ctx context.Context, lab string, after uint64) (<-chan agent.Event, <-chan error) {
+	events := make(chan agent.Event, 128)
+	errs := make(chan error, 1)
+	go func() {
+		defer close(events)
+		defer close(errs)
+		if n.cfgErr != nil {
+			errs <- fmt.Errorf("node %s: %w", n.Name, n.cfgErr)
+			return
+		}
+		values := url.Values{"follow": []string{"true"}}
+		if lab != "" {
+			values.Set("lab", lab)
+		}
+		if after > 0 {
+			values.Set("after", strconv.FormatUint(after, 10))
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+			n.Addr+"/v1/events?"+values.Encode(), nil)
+		if err != nil {
+			errs <- err
+			return
+		}
+		req.Header.Set("Authorization", "Bearer "+n.Token)
+		resp, err := n.http.Do(req)
+		if err != nil {
+			if ctx.Err() == nil {
+				errs <- fmt.Errorf("node %s: %w", n.Name, err)
+			}
+			return
+		}
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode >= http.StatusBadRequest {
+			raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+			errs <- fmt.Errorf("node %s: %s: %s", n.Name, resp.Status, strings.TrimSpace(string(raw)))
+			return
+		}
+		scanner := bufio.NewScanner(resp.Body)
+		scanner.Buffer(make([]byte, 64<<10), 4<<20)
+		for scanner.Scan() {
+			var event agent.Event
+			if err := json.Unmarshal(scanner.Bytes(), &event); err != nil {
+				errs <- fmt.Errorf("node %s: decode event stream: %w", n.Name, err)
+				return
+			}
+			select {
+			case events <- event:
+			case <-ctx.Done():
+				return
+			}
+		}
+		if err := scanner.Err(); err != nil && ctx.Err() == nil {
+			errs <- fmt.Errorf("node %s: read event stream: %w", n.Name, err)
+		}
+	}()
+	return events, errs
 }
 
 // Apply asks the node to converge its slice of the topology.
@@ -494,6 +608,28 @@ func (c *Cluster) Status(ctx context.Context) []NodeResult[agent.StatusResponse]
 	})
 }
 
+// Events obtains finite event pages from every node. Results remain paired
+// with errors so a caller cannot mistake an unreachable node for an empty
+// event history.
+func (c *Cluster) Events(ctx context.Context, lab string, after uint64, limit int) []NodeResult[agent.EventsResponse] {
+	return fanOut(ctx, c.Nodes, func(ctx context.Context, n *Node) (agent.EventsResponse, error) {
+		return n.Events(ctx, lab, after, limit)
+	})
+}
+
+// MergeEvents combines successful node pages into the stable order used by
+// both JSON and terminal output.
+func MergeEvents(results []NodeResult[agent.EventsResponse]) []agent.Event {
+	var events []agent.Event
+	for _, result := range results {
+		if result.Err == nil {
+			events = append(events, result.Value.Events...)
+		}
+	}
+	agent.SortEvents(events)
+	return events
+}
+
 // HealthCheck proves every declared agent responds before placement or a
 // migration changes any record. A partial survey is not a healthy cluster:
 // the missing node may be the only owner of state about to be moved.
@@ -621,6 +757,7 @@ func (c *Cluster) Admit(ctx context.Context, top *model.Topology, strict, overco
 // the same VXLAN identifier and address the right peer. It then acts only on
 // what is placed on itself.
 func (c *Cluster) Apply(ctx context.Context, top *model.Topology, req agent.ApplyRequest) []NodeResult[agent.ApplyResponse] {
+	ctx = operationContext(ctx)
 	if err := c.VersionSkew(ctx); err != nil && os.Getenv("TWINET_ALLOW_VERSION_SKEW") == "" {
 		out := make([]NodeResult[agent.ApplyResponse], 0, len(c.Nodes))
 		for _, n := range c.Nodes {

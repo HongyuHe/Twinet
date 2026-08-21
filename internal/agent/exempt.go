@@ -86,6 +86,11 @@ func (s *Server) handleExempt(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	action := "repair_exemption_removed"
+	if req.On {
+		action = "repair_exemption_set"
+	}
+	s.recordEvent(req.Lab, "", "coordination", s.requestCorrelation(r), action, "success", req.Device)
 	writeJSON(w, struct{}{})
 }
 

@@ -69,6 +69,32 @@ func (m *Matrix) Percent() float64 {
 // Prober runs a reachability probe from one device.
 type Prober func(ctx context.Context, deviceID string, target string) (bool, float64, error)
 
+// BatchProbeResult is one target result returned by a single source-side
+// container exec. Err means the target's probe could not run; Reachable=false
+// with no Err means the target did not answer.
+type BatchProbeResult struct {
+	Reachable bool
+	RTTms     float64
+	Err       error
+}
+
+// SourceBatchProber probes every supplied target from one source using at
+// most one container exec. The map keys are ASNs, not addresses, so an omitted
+// key is detectable as unknown rather than silently becoming down.
+type SourceBatchProber func(ctx context.Context, deviceID string,
+	targets map[int]string) (map[int]BatchProbeResult, error)
+
+// BatchPathResult is one source-side route-policy observation.
+type BatchPathResult struct {
+	Path []int
+	Err  error
+}
+
+// SourceBatchPathProbe obtains the path observations for every supplied
+// target using at most one additional container exec from that source.
+type SourceBatchPathProbe func(ctx context.Context, deviceID string,
+	targets map[int]string) (map[int]BatchPathResult, error)
+
 // MatrixTargets picks, for each AS, the address every other AS should be able
 // to reach: the host attached to its first router, which is inside the AS's own
 // advertised prefix and therefore only reachable if routing genuinely works.
@@ -207,6 +233,137 @@ func BuildMatrixWithPaths(ctx context.Context, top *model.Topology, probe Prober
 	}
 	for _, c := range cells {
 		if c.State == ReachOK {
+			m.Reachable++
+		}
+	}
+	return m
+}
+
+// BuildMatrixWithSourceBatches computes the same reachability and policy
+// verdicts as BuildMatrixWithPaths while asking each source AS for its entire
+// target set at once. A refresh of N ASes therefore uses at most two container
+// execs per source (one reachability batch and one route-policy batch), not
+// O(N²) execs. Errors remain unknown rather than becoming false down cells.
+func BuildMatrixWithSourceBatches(ctx context.Context, top *model.Topology,
+	probe SourceBatchProber, path SourceBatchPathProbe, parallel int,
+) *Matrix {
+	if parallel <= 0 {
+		parallel = 32
+	}
+	start := time.Now()
+	targets := MatrixTargets(top)
+	asns := make([]int, 0, len(targets))
+	for asn := range targets {
+		asns = append(asns, asn)
+	}
+	sort.Ints(asns)
+
+	type sourceResult struct {
+		cells []Cell
+	}
+	results := make([]sourceResult, len(asns))
+	sem := make(chan struct{}, parallel)
+	var wg sync.WaitGroup
+	for index, from := range asns {
+		wg.Add(1)
+		go func(index, from int) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			source := matrixSource(top, from)
+			want := make(map[int]string, len(asns)-1)
+			for _, to := range asns {
+				if to != from {
+					want[to] = targets[to]
+				}
+			}
+			result := sourceResult{cells: make([]Cell, 0, len(want))}
+			if source == "" {
+				for _, to := range asns {
+					if to != from {
+						result.cells = append(result.cells, Cell{
+							From: from, To: to, State: ReachUnknown,
+							Detail: "no probe source in this AS",
+						})
+					}
+				}
+				results[index] = result
+				return
+			}
+			if probe == nil {
+				for _, to := range asns {
+					if to != from {
+						result.cells = append(result.cells, Cell{
+							From: from, To: to, State: ReachUnknown,
+							Detail: "no source batch prober is configured",
+						})
+					}
+				}
+				results[index] = result
+				return
+			}
+			probes, probeErr := probe(ctx, source, want)
+			var paths map[int]BatchPathResult
+			var pathErr error
+			if path != nil && probeErr == nil {
+				paths, pathErr = path(ctx, source, want)
+			}
+			for _, to := range asns {
+				if to == from {
+					continue
+				}
+				cell := Cell{From: from, To: to, State: ReachUnknown}
+				switch {
+				case probeErr != nil:
+					cell.Detail = probeErr.Error()
+				case probes == nil:
+					cell.Detail = "source batch probe returned no results"
+				default:
+					observation, found := probes[to]
+					switch {
+					case !found:
+						cell.Detail = "source batch probe did not report this target"
+					case observation.Err != nil:
+						cell.Detail = observation.Err.Error()
+					case !observation.Reachable:
+						cell.State = ReachDown
+					default:
+						cell.State, cell.RTTms = ReachOK, observation.RTTms
+						if path != nil {
+							switch {
+							case pathErr != nil:
+								cell.Detail = "the path could not be read: " + pathErr.Error()
+							case paths == nil:
+								cell.Detail = "the path batch returned no results"
+							case paths[to].Err != nil:
+								cell.Detail = "the path could not be read: " + paths[to].Err.Error()
+							case len(paths[to].Path) > 0:
+								if why := violatesRelationships(top, from, paths[to].Path); why != "" {
+									cell.State, cell.Detail = ReachInvalid, why
+								}
+							}
+						}
+					}
+				}
+				result.cells = append(result.cells, cell)
+			}
+			results[index] = result
+		}(index, from)
+	}
+	wg.Wait()
+
+	cells := make([]Cell, 0, len(asns)*(len(asns)-1))
+	for _, result := range results {
+		cells = append(cells, result.cells...)
+	}
+	m := &Matrix{
+		Lab: top.Name, TakenAt: time.Now().UTC(),
+		Duration: time.Since(start).Round(time.Millisecond).String(),
+		ASNs:     asns, Cells: cells, Total: len(cells),
+	}
+	for _, cell := range cells {
+		if cell.State == ReachOK {
 			m.Reachable++
 		}
 	}

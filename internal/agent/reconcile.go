@@ -13,17 +13,37 @@ import (
 	"github.com/HongyuHe/twinet/internal/deploy"
 	"github.com/HongyuHe/twinet/internal/limiter"
 	"github.com/HongyuHe/twinet/internal/model"
+	"github.com/HongyuHe/twinet/internal/plan"
 	"github.com/HongyuHe/twinet/internal/render"
 	rt "github.com/HongyuHe/twinet/internal/runtime"
 )
 
-// reconcileEvery is how often the node checks that its containers still look
-// the way the lab says they should.
-//
-// A minute is short enough that a student who restarted a router sees it come
-// back before they have finished reading the error, and long enough that the
-// check costs nothing measurable next to the lab itself.
-const reconcileEvery = time.Minute
+// Reconciliation is event driven. Audits are deliberately much less frequent
+// than the old once-a-minute Docker-inspect-and-exec sweep: lifecycle events
+// repair the normal failure path promptly, while samples and full audits catch
+// a lost event stream or an out-of-band change.
+const (
+	reconcileEvery     = 5 * time.Minute
+	reconcileFullEvery = 10 * time.Minute
+	reconcileRetryMin  = 100 * time.Millisecond
+	reconcileRetryMax  = 5 * time.Second
+)
+
+type deviceHealth string
+
+const (
+	healthHealthy deviceHealth = "healthy"
+	healthBroken  deviceHealth = "broken"
+	healthUnknown deviceHealth = "unknown"
+	healthPartial deviceHealth = "partial"
+)
+
+type deviceObservation struct {
+	Health      deviceHealth
+	Reason      string
+	State       rt.State
+	SpecMatches bool
+}
 
 // reconcileLoop repairs devices that have lost their wiring.
 //
@@ -39,16 +59,296 @@ const reconcileEvery = time.Minute
 // is a black hole in the middle of somebody's assignment, and the most likely
 // conclusion they draw is that their own configuration is at fault.
 func (s *Server) reconcileLoop(ctx context.Context) {
-	t := time.NewTicker(reconcileEvery)
-	defer t.Stop()
+	s.startReconcileWorkers(ctx)
+	go s.runtimeEventLoop(ctx)
+
+	// A new agent has no event history before it subscribed. A sampled startup
+	// pass closes that gap without immediately turning a cold restart into one
+	// exec per device.
+	s.reconcileSample(ctx)
+	sample := time.NewTicker(reconcileEvery)
+	full := time.NewTicker(reconcileFullEvery)
+	defer sample.Stop()
+	defer full.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-t.C:
+		case <-sample.C:
+			s.reconcileSample(ctx)
+		case <-full.C:
 			s.reconcileOnce(ctx)
 		}
 	}
+}
+
+// runtimeEventSource returns the native event source when the runtime offers
+// one. Tests often inject a Runtime directly, so the fallback is intentional.
+func (s *Server) runtimeEventSource() rt.EventSource {
+	if s.eventSource != nil {
+		return s.eventSource
+	}
+	source, _ := s.rt.(rt.EventSource)
+	return source
+}
+
+// runtimeEventLoop reconnects after every terminal event-stream error. A
+// stream ending is not proof the host is healthy, so the sampled/full audits
+// remain active while reconnect is retried with a bounded delay.
+func (s *Server) runtimeEventLoop(ctx context.Context) {
+	source := s.runtimeEventSource()
+	if source == nil {
+		s.recordEvent("", "", "runtime", "", "event_subscription", "unknown",
+			"runtime does not expose lifecycle events; audit backstop is active")
+		return
+	}
+	retry := reconcileRetryMin
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		streamCtx, cancel := context.WithCancel(ctx)
+		start := time.Now()
+		subscription := source.Subscribe(streamCtx, rt.EventFilter{
+			Labels: map[string]string{deploy.LabelManaged: "true"},
+		})
+		s.metricRegistry().observeRuntime("subscribe", time.Since(start), nil)
+		s.recordEvent("", "", "runtime", "", "event_subscription", "success", "connected")
+		retry = reconcileRetryMin
+
+		events, errs := subscription.Events, subscription.Errors
+		terminal := error(nil)
+		for events != nil || errs != nil {
+			select {
+			case <-ctx.Done():
+				cancel()
+				return
+			case event, ok := <-events:
+				if !ok {
+					events = nil
+					continue
+				}
+				s.metricRegistry().observeRuntimeEvent(string(event.Action))
+				s.handleRuntimeEvent(ctx, event)
+			case err, ok := <-errs:
+				if !ok {
+					errs = nil
+					continue
+				}
+				terminal = err
+				cancel()
+			}
+		}
+		cancel()
+		if ctx.Err() != nil {
+			return
+		}
+		if terminal == nil {
+			terminal = rt.ErrEventStreamClosed
+		}
+		s.metricRegistry().observeRuntime("subscribe", 0, terminal)
+		s.recordEvent("", "", "runtime", "", "event_subscription", "error", terminal.Error())
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(retry):
+		}
+		retry *= 2
+		if retry > reconcileRetryMax {
+			retry = reconcileRetryMax
+		}
+	}
+}
+
+func (s *Server) handleRuntimeEvent(ctx context.Context, event rt.Event) {
+	lab := event.Labels[deploy.LabelLab]
+	if lab == "" {
+		lab = s.labOfContainer(event.Name)
+	}
+	if lab == "" {
+		return
+	}
+	device := event.Labels[deploy.LabelDeviceID]
+	if device == "" {
+		device = event.Name
+	}
+	s.recordEvent(lab, event.Labels[deploy.LabelGen], "runtime", "",
+		"container."+string(event.Action), "scheduled", device)
+	s.queueReconcile(ctx, lab, device)
+}
+
+type reconcileRequest struct {
+	lab    string
+	device string
+}
+
+// startReconcileWorkers bounds event-triggered repair fan-out independently
+// of the runtime limiter. A Docker reconnect can replay many events; it must
+// not create one goroutine per historical device.
+func (s *Server) startReconcileWorkers(ctx context.Context) {
+	s.reconcileWorkersOnce.Do(func() {
+		s.reconcileMu.Lock()
+		s.reconcileQueue = make(chan reconcileRequest, 1024)
+		s.reconcileContext = ctx
+		if s.reconcilePending == nil {
+			s.reconcilePending = map[string]bool{}
+		}
+		queue := s.reconcileQueue
+		s.reconcileMu.Unlock()
+		for range 4 {
+			go func() {
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case request := <-queue:
+						s.reconcileTarget(ctx, request)
+						s.reconcileMu.Lock()
+						delete(s.reconcilePending, repairKey(request.lab, request.device))
+						s.reconcileMu.Unlock()
+					}
+				}
+			}()
+		}
+	})
+}
+
+func (s *Server) queueReconcile(ctx context.Context, lab, device string) {
+	if lab == "" {
+		return
+	}
+	s.reconcileMu.Lock()
+	queue := s.reconcileQueue
+	if queue == nil {
+		s.reconcileMu.Unlock()
+		return
+	}
+	key := repairKey(lab, device)
+	if s.reconcilePending[key] {
+		s.reconcileMu.Unlock()
+		return
+	}
+	s.reconcilePending[key] = true
+	s.reconcileMu.Unlock()
+	request := reconcileRequest{lab: lab, device: device}
+	select {
+	case queue <- request:
+		s.metricRegistry().observeRepair("scheduled")
+	case <-ctx.Done():
+		s.reconcileMu.Lock()
+		delete(s.reconcilePending, key)
+		s.reconcileMu.Unlock()
+	default:
+		// The full audit is the recovery path for a queue overflow. Do not
+		// block Docker event intake behind a storm of duplicate deaths.
+		s.reconcileMu.Lock()
+		delete(s.reconcilePending, key)
+		s.reconcileMu.Unlock()
+		s.recordEvent(lab, "", "reconcile", "", "repair_queue", "backoff",
+			"event repair queue is full; audit backstop will retry")
+	}
+}
+
+func (s *Server) queueReconcileAfter(lab, device string, delay time.Duration) {
+	if delay <= 0 {
+		return
+	}
+	s.reconcileMu.Lock()
+	ctx := s.reconcileContext
+	queue := s.reconcileQueue
+	s.reconcileMu.Unlock()
+	if ctx == nil || queue == nil {
+		return
+	}
+	go func() {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			s.queueReconcile(ctx, lab, device)
+		}
+	}()
+}
+
+func (s *Server) reconcileTarget(ctx context.Context, request reconcileRequest) {
+	s.mu.Lock()
+	top := s.current[request.lab]
+	s.mu.Unlock()
+	if top == nil {
+		return
+	}
+	if who := s.heldBy(request.lab); who != "" {
+		s.metricRegistry().observeRepair("held")
+		s.recordEvent(request.lab, "", "reconcile", "", "repair_skipped", "held", who)
+		return
+	}
+	if who := s.mutationLeaseHolder(request.lab); who != "" {
+		s.metricRegistry().observeRepair("held")
+		s.recordEvent(request.lab, "", "reconcile", "", "repair_skipped", "held", who)
+		return
+	}
+	var devices []*model.Device
+	for _, device := range top.SortedDevices() {
+		if device.Node != s.cfg.Node {
+			continue
+		}
+		if request.device == "" || request.device == device.ID || request.device == device.Container {
+			devices = append(devices, device)
+		}
+	}
+	if len(devices) == 0 {
+		return
+	}
+	broken := make([]*model.Device, 0, len(devices))
+	for _, device := range devices {
+		if s.isExempt(request.lab, device.ID) {
+			s.metricRegistry().observeRepair("exempt")
+			continue
+		}
+		observation := s.observeDevice(ctx, request.lab, device, true)
+		s.rememberHealth(request.lab, device.ID, observation)
+		switch observation.Health {
+		case healthHealthy:
+			s.repairSucceeded(request.lab, device.ID)
+		case healthBroken:
+			broken = append(broken, device)
+		case healthUnknown:
+			s.metricRegistry().observeRepair("unknown")
+		}
+	}
+	if len(broken) == 0 {
+		return
+	}
+	if err := s.acquire(request.lab, "reconcile"); err != nil {
+		return
+	}
+	defer s.release(request.lab)
+	s.repairLab(ctx, top, broken)
+}
+
+// rememberHealth keeps only the last bounded state per device. It makes a
+// partial or unreadable observation visible in the event stream without
+// emitting an event on every sampled audit.
+func (s *Server) rememberHealth(lab, device string, observation deviceObservation) {
+	key := repairKey(lab, device)
+	s.mu.Lock()
+	if s.health == nil {
+		s.health = map[string]deviceObservation{}
+	}
+	previous, known := s.health[key]
+	s.health[key] = observation
+	s.mu.Unlock()
+	if known && previous.Health == observation.Health && previous.Reason == observation.Reason {
+		return
+	}
+	result := string(observation.Health)
+	if observation.Health == healthHealthy {
+		result = "success"
+	}
+	s.recordEvent(lab, "", "reconcile", "", "device_health", result,
+		device+": "+observation.Reason)
 }
 
 func (s *Server) reconcileOnce(ctx context.Context) {
@@ -82,21 +382,6 @@ func (s *Server) reconcileOnce(ctx context.Context) {
 		// running", for a sweep that in the normal case finds nothing to do.
 		// Reading a container's interface list changes nothing, so it does not
 		// need to exclude anyone.
-		// A lab whose containers have all gone is a lab that was removed, and
-		// this node was never told. Its record kept the repair loop trying to
-		// rewire devices whose peers no longer exist, once a minute, for as
-		// long as the node was up -- four such labs were found on one cluster,
-		// with 461 leftover overlay devices between them.
-		//
-		// Forgetting it is safe in the only direction that matters: if the lab
-		// is redeployed, the deployment sends the topology again.
-		if s.labIsGone(ctx, top) {
-			slog.Info("forgetting a lab whose containers have all been removed",
-				"lab", name)
-			s.forgetLab(name)
-			continue
-		}
-
 		broken := s.survey(ctx, top)
 		if len(broken) == 0 {
 			continue
@@ -112,6 +397,34 @@ func (s *Server) reconcileOnce(ctx context.Context) {
 	}
 }
 
+// reconcileSample checks one local device from each lab. It is cheap enough
+// to run while an event stream is reconnecting, while reconcileOnce remains
+// the low-frequency complete backstop.
+func (s *Server) reconcileSample(ctx context.Context) {
+	s.mu.Lock()
+	labs := make(map[string]*model.Topology, len(s.current))
+	for name, top := range s.current {
+		labs[name] = top
+	}
+	s.mu.Unlock()
+	for name, top := range labs {
+		if top == nil || s.heldBy(name) != "" || s.mutationLeaseHolder(name) != "" {
+			continue
+		}
+		var devices []*model.Device
+		for _, device := range top.SortedDevices() {
+			if device.Node == s.cfg.Node {
+				devices = append(devices, device)
+			}
+		}
+		if len(devices) == 0 {
+			continue
+		}
+		slot := int(time.Now().Unix()/int64(reconcileEvery/time.Second)) % len(devices)
+		s.queueReconcile(ctx, name, devices[slot].ID)
+	}
+}
+
 // survey reports which of this node's devices have lost their wiring.
 func (s *Server) survey(ctx context.Context, top *model.Topology) []*model.Device {
 	var broken []*model.Device
@@ -124,9 +437,22 @@ func (s *Server) survey(ctx context.Context, top *model.Topology) []*model.Devic
 		// marker inside the device under test tells an agent being evaluated
 		// on root-cause analysis that a fault was injected.
 		if s.isExempt(top.Name, d.ID) {
+			s.metricRegistry().observeRepair("exempt")
 			continue
 		}
-		if s.hasLostItsWiring(ctx, top.Name, d) {
+		observation := s.observeDevice(ctx, top.Name, d, true)
+		s.rememberHealth(top.Name, d.ID, observation)
+		switch observation.Health {
+		case healthHealthy:
+			// A device which comes back by itself must not retain the failure
+			// history accumulated while it was unavailable.
+			s.repairSucceeded(top.Name, d.ID)
+		case healthUnknown:
+			s.metricRegistry().observeRepair("unknown")
+		case healthPartial:
+			// Partial is explicit and is never called healthy. It receives a
+			// short deploy grace, then observeDevice upgrades it to broken.
+		case healthBroken:
 			broken = append(broken, d)
 		}
 	}
@@ -136,12 +462,41 @@ func (s *Server) survey(ctx context.Context, top *model.Topology) []*model.Devic
 // repairLab rewires the devices whose namespaces have been emptied, and puts
 // back the configuration they were holding.
 func (s *Server) repairLab(ctx context.Context, top *model.Topology, broken []*model.Device) {
+	// The hold and fence checks above the survey are intentionally repeated
+	// after acquiring the local repair lease. A grader or controller can take
+	// either lease in the gap; repairing beneath it would mutate a submission
+	// or mix deployment generations.
+	if who := s.heldBy(top.Name); who != "" {
+		s.metricRegistry().observeRepair("held")
+		s.recordEvent(top.Name, "", "reconcile", "", "repair_skipped", "held", who)
+		return
+	}
+	if who := s.mutationLeaseHolder(top.Name); who != "" {
+		s.metricRegistry().observeRepair("held")
+		s.recordEvent(top.Name, "", "reconcile", "", "repair_skipped", "held", who)
+		return
+	}
+	if s.repairHook != nil {
+		s.repairHook(ctx, top, broken)
+		return
+	}
+
 	// Re-checked under the lock: the survey ran without it, so a deploy may
 	// have repaired these already in the meantime, and rewiring a device that
 	// is now fine would undo work rather than restore it.
 	still := make([]*model.Device, 0, len(broken))
 	for _, d := range broken {
-		if s.hasLostItsWiring(ctx, top.Name, d) {
+		if s.isExempt(top.Name, d.ID) {
+			s.metricRegistry().observeRepair("exempt")
+			continue
+		}
+		observation := s.observeDevice(ctx, top.Name, d, false)
+		s.rememberHealth(top.Name, d.ID, observation)
+		if observation.Health == healthHealthy {
+			s.repairSucceeded(top.Name, d.ID)
+			continue
+		}
+		if observation.Health == healthBroken {
 			still = append(still, d)
 		}
 	}
@@ -154,9 +509,10 @@ func (s *Server) repairLab(ctx context.Context, top *model.Topology, broken []*m
 	for i, d := range broken {
 		names[i] = d.ID
 	}
+	reason := s.observeDevice(ctx, top.Name, broken[0], false).Reason
 	slog.Warn("devices are not as the lab says they should be; repairing",
 		"lab", top.Name, "devices", strings.Join(names, ","),
-		"reason", s.brokenBecause(ctx, top.Name, broken[0]))
+		"reason", reason)
 
 	// The engine needs a renderer.
 	//
@@ -196,15 +552,46 @@ func (s *Server) repairLab(ctx context.Context, top *model.Topology, broken []*m
 	}
 	for _, d := range broken {
 		if s.givingUpOn(top.Name, d.ID) {
+			s.metricRegistry().observeRepair("backoff")
+			s.recordEvent(top.Name, "", "reconcile", "", "repair_deferred", "backoff",
+				d.ID+" remains in bounded retry backoff")
 			continue
+		}
+		observation := s.observeDevice(ctx, top.Name, d, false)
+		if observation.Health != healthBroken {
+			if observation.Health == healthHealthy {
+				s.repairSucceeded(top.Name, d.ID)
+			}
+			continue
+		}
+		class := deviceChangeClass(observation)
+		s.recordEvent(top.Name, "", "reconcile", "", "change_plan", "scheduled",
+			d.ID+"="+string(class))
+		if err := s.reviveDevice(ctx, eng, top, d, observation); err != nil {
+			s.repairFailed(top.Name, d.ID, "container lifecycle repair failed", err)
+			s.recordEvent(top.Name, "", "reconcile", "", "repair", "error",
+				d.ID+": "+err.Error())
+			continue
+		}
+		if observation.State != rt.StateRunning || !observation.SpecMatches {
+			if err := s.waitForJoinable(ctx, d.Container); err != nil {
+				s.repairFailed(top.Name, d.ID, "container did not become joinable after lifecycle repair", err)
+				s.recordEvent(top.Name, "", "reconcile", "", "repair", "error",
+					d.ID+": "+err.Error())
+				continue
+			}
 		}
 		// A router whose cables are all present and whose daemons have died
 		// needs the daemons started, not the device rebuilt. Rewiring it would
 		// re-render its configuration in platform mode, which in a lab
 		// deployed at the reference throws the reference solution away -- a
 		// far worse outcome than the fault being repaired.
-		if why := s.brokenBecause(ctx, top.Name, d); strings.HasPrefix(why, daemonsDown) {
+		if why := observation.Reason; strings.HasPrefix(why, daemonsDown) {
 			if err := s.startDaemons(ctx, top.Name, d); err == nil {
+				s.repairSucceeded(top.Name, d.ID)
+				s.metricRegistry().observeRepair("success")
+				s.recordEvent(top.Name, "", "reconcile", "", "repair", "success",
+					d.ID+" routing daemons restarted")
 				slog.Info("routing daemons restarted", "device", d.ID)
 				continue
 			} else {
@@ -226,6 +613,8 @@ func (s *Server) repairLab(ctx context.Context, top *model.Topology, broken []*m
 		}
 		if err := eng.RewireDevice(ctx, top, d); err != nil {
 			s.repairFailed(top.Name, d.ID, "rewiring failed", err)
+			s.recordEvent(top.Name, "", "reconcile", "", "repair", "error",
+				d.ID+": "+err.Error())
 			continue
 		}
 		// Not while the lab is deployed at the reference.
@@ -240,20 +629,117 @@ func (s *Server) repairLab(ctx context.Context, top *model.Topology, broken []*m
 		if !eng.WritesReference {
 			if _, err := deploy.Restore(ctx, s.rt, d, top.Name, s.store); err != nil {
 				s.repairFailed(top.Name, d.ID, "configuration could not be put back after rewiring", err)
+				s.recordEvent(top.Name, "", "reconcile", "", "repair", "error",
+					d.ID+": "+err.Error())
 				continue
 			}
 		}
 		// Confirmed, not assumed. A repair that reports success without being
 		// checked is how the previous version of this loop claimed to have
 		// fixed routers it had left with no addresses and no routing daemon.
-		if why := s.brokenBecause(ctx, top.Name, d); why != "" {
+		after := s.observeDevice(ctx, top.Name, d, false)
+		s.rememberHealth(top.Name, d.ID, after)
+		if after.Health != healthHealthy {
+			reason := after.Reason
+			if reason == "" {
+				reason = string(after.Health)
+			}
 			s.repairFailed(top.Name, d.ID, "device is still not right after being repaired",
-				errors.New(why))
+				errors.New(reason))
+			s.recordEvent(top.Name, "", "reconcile", "", "repair", "error",
+				d.ID+": "+reason)
 			continue
 		}
 		s.repairSucceeded(top.Name, d.ID)
+		s.metricRegistry().observeRepair("success")
+		s.recordEvent(top.Name, "", "reconcile", "", "repair", "success", d.ID)
 		slog.Info("device repaired and its configuration put back", "device", d.ID)
 	}
+}
+
+// reviveDevice moves a non-joinable desired container back to a state where
+// wiring can be repaired. An absent container is recreated through the normal
+// desired-state engine; exited, dead, and restart-loop states are actively
+// restarted rather than being treated as healthy because an exec happened to
+// be unavailable.
+func (s *Server) reviveDevice(ctx context.Context, eng *deploy.Engine, top *model.Topology,
+	d *model.Device, observation deviceObservation,
+) error {
+	if !observation.SpecMatches || observation.State == rt.StateAbsent {
+		return s.recreateDesiredDevice(ctx, eng, top, d)
+	}
+	switch observation.State {
+	case rt.StateRunning:
+		return nil
+	case rt.StatePaused:
+		return s.workLimiter().Run(ctx, []limiter.Kind{limiter.Lifecycle}, func() error {
+			return s.rt.Unpause(ctx, d.Container)
+		})
+	case rt.StateRestarting:
+		// Stop breaks Docker's restart-policy loop before Start is asked to
+		// create a fresh namespace. A plain Start on a restarting container is
+		// often accepted but leaves the old loop in charge.
+		if err := s.workLimiter().Run(ctx, []limiter.Kind{limiter.Lifecycle}, func() error {
+			return s.rt.Stop(ctx, d.Container, 10*time.Second)
+		}); err != nil {
+			return err
+		}
+		fallthrough
+	case rt.StateCreated, rt.StateExited, rt.StateDead:
+		return s.workLimiter().Run(ctx, []limiter.Kind{limiter.Lifecycle}, func() error {
+			return s.rt.Start(ctx, d.Container)
+		})
+	default:
+		return fmt.Errorf("cannot revive container in unrecognised state %q", observation.State)
+	}
+}
+
+func (s *Server) recreateDesiredDevice(ctx context.Context, eng *deploy.Engine, top *model.Topology,
+	d *model.Device,
+) error {
+	p, err := eng.Build(top)
+	if err != nil {
+		return err
+	}
+	p = p.Restrict(func(step *plan.Step) bool {
+		return step.ID == "create:"+d.ID
+	})
+	report, err := p.Execute(ctx, plan.Options{
+		Workers: 1, ContinueOnError: false,
+	})
+	if err != nil {
+		return err
+	}
+	if report.Failed() {
+		return report.Err()
+	}
+	return nil
+}
+
+func (s *Server) waitForJoinable(ctx context.Context, container string) error {
+	var last string
+	for attempt := 0; attempt < 25; attempt++ {
+		observed, err := s.rt.Inspect(ctx, container)
+		if err == nil && observed.State == rt.StateRunning {
+			return nil
+		}
+		if err != nil {
+			last = err.Error()
+		} else {
+			last = string(observed.State)
+		}
+		timer := time.NewTimer(100 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	if last == "" {
+		last = "no runtime observation"
+	}
+	return fmt.Errorf("%s did not become joinable: %s", container, last)
 }
 
 // daemonsDown prefixes the reason a router is broken when the only thing wrong
@@ -274,15 +760,21 @@ func (s *Server) probeExec(ctx context.Context, container string, cmd rt.ExecCmd
 // missingDaemons names the routing processes a router should be running and is
 // not, or "" when they are all there.
 func (s *Server) missingDaemons(ctx context.Context, d *model.Device, as *model.AS) string {
+	missing, _ := s.missingDaemonsResult(ctx, d, as)
+	return missing
+}
+
+func (s *Server) missingDaemonsResult(ctx context.Context, d *model.Device, as *model.AS) (string, error) {
 	script := "miss=''; for p in " + strings.Join(render.EnabledDaemonsFor(as), " ") +
 		"; do pidof \"$p\" >/dev/null 2>&1 || miss=\"$miss $p\"; done; echo \"$miss\""
 	r, err := s.probeExec(ctx, d.Container, rt.ExecCmd{Cmd: []string{"sh", "-c", script}})
 	if err != nil || r.ExitCode != 0 {
-		// Not reachable is not the same as not running, and guessing here
-		// would have the loop rewiring devices because a node was busy.
-		return ""
+		if err != nil {
+			return "", err
+		}
+		return "", fmt.Errorf("daemon probe exited %d", r.ExitCode)
 	}
-	return strings.TrimRight(strings.TrimLeft(r.Stdout, " "), " \n")
+	return strings.TrimRight(strings.TrimLeft(r.Stdout, " "), " \n"), nil
 }
 
 // hasLostItsWiring reports whether a running container is missing something the
@@ -295,11 +787,26 @@ func (s *Server) missingDaemons(ctx context.Context, d *model.Device, as *model.
 // each thing separately and reports a device as broken if any of them is
 // missing.
 func (s *Server) hasLostItsWiring(ctx context.Context, lab string, d *model.Device) bool {
-	return s.brokenBecause(ctx, lab, d) != ""
+	return s.observeDevice(ctx, lab, d, true).Health == healthBroken
 }
 
 // brokenBecause names the first thing a device is missing, or "" if it is well.
 func (s *Server) brokenBecause(ctx context.Context, lab string, d *model.Device) string {
+	observation := s.observeDevice(ctx, lab, d, true)
+	if observation.Health != healthBroken {
+		return ""
+	}
+	return observation.Reason
+}
+
+// observeDevice classifies the desired device as healthy, broken, unknown, or
+// partially wired. Unknown is deliberately not healthy: an unreadable runtime
+// or failed exec supplies no evidence that a container is usable, but it also
+// does not justify destructive rewiring while the node itself may be busy.
+func (s *Server) observeDevice(ctx context.Context, lab string, d *model.Device, advancePartial bool) deviceObservation {
+	if d == nil {
+		return deviceObservation{Health: healthUnknown, Reason: "device declaration is unavailable"}
+	}
 	want := map[string]bool{}
 	for _, i := range d.Ifaces {
 		if i.Link != nil || i.VLAN > 0 {
@@ -307,17 +814,60 @@ func (s *Server) brokenBecause(ctx context.Context, lab string, d *model.Device)
 		}
 	}
 	if len(want) == 0 {
-		return ""
+		// A device without modelled wires is still required to have a readable,
+		// running runtime state. It is otherwise handled below.
 	}
 	c, err := s.rt.Inspect(ctx, d.Container)
-	if err != nil || !c.State.Joinable() {
-		return ""
+	if err != nil {
+		return deviceObservation{Health: healthUnknown, Reason: "runtime inspect unreadable: " + err.Error()}
+	}
+	specMatches := c.Label(deploy.LabelSpec) == "" || c.Label(deploy.LabelSpec) == deploy.SpecHash(d)
+	switch c.State {
+	case rt.StateAbsent:
+		return deviceObservation{Health: healthBroken, State: c.State, SpecMatches: specMatches, Reason: "container is absent"}
+	case rt.StateExited:
+		return deviceObservation{Health: healthBroken, State: c.State, SpecMatches: specMatches, Reason: "container is exited"}
+	case rt.StateDead:
+		return deviceObservation{Health: healthBroken, State: c.State, SpecMatches: specMatches, Reason: "container is dead"}
+	case rt.StateRestarting:
+		return deviceObservation{Health: healthBroken, State: c.State, SpecMatches: specMatches, Reason: "container is restart-looping"}
+	case rt.StateCreated:
+		return deviceObservation{Health: healthBroken, State: c.State, SpecMatches: specMatches, Reason: "container has not started"}
+	case rt.StatePaused:
+		return deviceObservation{Health: healthBroken, State: c.State, SpecMatches: specMatches, Reason: "container is paused"}
+	case rt.StateRunning:
+		// Continue below.
+	default:
+		return deviceObservation{Health: healthUnknown, State: c.State, SpecMatches: specMatches,
+			Reason: "runtime returned an unknown container state"}
+	}
+	switch strings.ToLower(strings.TrimSpace(c.Health)) {
+	case "", "healthy", "none":
+		// Images without a Docker healthcheck intentionally report empty.
+	case "unhealthy":
+		return deviceObservation{Health: healthBroken, State: c.State, SpecMatches: specMatches, Reason: "container healthcheck is unhealthy"}
+	case "starting":
+		return deviceObservation{Health: healthUnknown, State: c.State, SpecMatches: specMatches, Reason: "container healthcheck is still starting"}
+	default:
+		return deviceObservation{Health: healthUnknown, State: c.State, SpecMatches: specMatches, Reason: "container healthcheck is unreadable"}
+	}
+	if !specMatches {
+		return deviceObservation{Health: healthBroken, State: c.State, SpecMatches: false,
+			Reason: "container specification no longer matches desired state"}
+	}
+	if len(want) == 0 {
+		return deviceObservation{Health: healthHealthy, State: c.State, SpecMatches: specMatches}
 	}
 
 	res, err := s.probeExec(ctx, d.Container, rt.ExecCmd{
 		Cmd: []string{"sh", "-c", `ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1`}})
 	if err != nil || res.ExitCode != 0 {
-		return ""
+		if err != nil {
+			return deviceObservation{Health: healthUnknown, State: c.State, SpecMatches: specMatches,
+				Reason: "interface probe unreadable: " + err.Error()}
+		}
+		return deviceObservation{Health: healthUnknown, State: c.State, SpecMatches: specMatches,
+			Reason: fmt.Sprintf("interface probe exited %d", res.ExitCode)}
 	}
 	have := map[string]bool{}
 	for _, n := range strings.Fields(res.Stdout) {
@@ -334,7 +884,7 @@ func (s *Server) brokenBecause(ctx context.Context, lab string, d *model.Device)
 	}
 	switch {
 	case present == 0:
-		return "it has none of its interfaces"
+		return deviceObservation{Health: healthBroken, State: c.State, SpecMatches: specMatches, Reason: "it has none of its interfaces"}
 	case present < len(want):
 		// A device missing some of its interfaces is usually a deploy in
 		// progress, and rewiring underneath one would be worse than waiting.
@@ -345,9 +895,7 @@ func (s *Server) brokenBecause(ctx context.Context, lab string, d *model.Device)
 		//
 		// So it is given time to be a deploy, and repaired if it is not. The
 		// count is per device, and cleared as soon as the device is whole.
-		if s.partiallyWiredFor(lab, d.ID) < partialWiringGrace {
-			return ""
-		}
+		count := s.partialCount(lab, d.ID, advancePartial)
 		missing := make([]string, 0, len(want)-present)
 		for n := range want {
 			if !have[n] {
@@ -355,7 +903,11 @@ func (s *Server) brokenBecause(ctx context.Context, lab string, d *model.Device)
 			}
 		}
 		sort.Strings(missing)
-		return "it is missing " + strings.Join(missing, ", ")
+		reason := "it is missing " + strings.Join(missing, ", ")
+		if count < partialWiringGrace {
+			return deviceObservation{Health: healthPartial, State: c.State, SpecMatches: specMatches, Reason: reason}
+		}
+		return deviceObservation{Health: healthBroken, State: c.State, SpecMatches: specMatches, Reason: reason}
 	}
 	s.wholeAgain(lab, d.ID)
 
@@ -368,23 +920,38 @@ func (s *Server) brokenBecause(ctx context.Context, lab string, d *model.Device)
 	// looked at again. Thirty-odd routers were found in exactly that state,
 	// and the only symptom was students being marked down for neighbours that
 	// had no routing process.
-	if d.Kind == model.KindRouter {
+	// Daemon names are an FRR implementation detail. Other registered router
+	// NOSes still receive runtime/wiring health, but must not be declared
+	// broken merely because they do not run bgpd or ospfd binaries.
+	if d.Kind == model.KindRouter && d.EffectiveNOS() == model.DefaultNOS {
 		as := s.asOf(lab, d)
-		if missing := s.missingDaemons(ctx, d, as); missing != "" {
-			return daemonsDown + missing
+		if missing, probeErr := s.missingDaemonsResult(ctx, d, as); probeErr != nil {
+			return deviceObservation{Health: healthUnknown, State: c.State, SpecMatches: specMatches,
+				Reason: "routing-daemon probe unreadable: " + probeErr.Error()}
+		} else if missing != "" {
+			return deviceObservation{Health: healthBroken, State: c.State, SpecMatches: specMatches, Reason: daemonsDown + missing}
 		}
-		if dup := s.duplicateDaemons(ctx, d, as); dup != "" {
-			return daemonsDown + " duplicated: " + dup
+		if dup, probeErr := s.duplicateDaemonsResult(ctx, d, as); probeErr != nil {
+			return deviceObservation{Health: healthUnknown, State: c.State, SpecMatches: specMatches,
+				Reason: "routing-daemon duplicate probe unreadable: " + probeErr.Error()}
+		} else if dup != "" {
+			return deviceObservation{Health: healthBroken, State: c.State, SpecMatches: specMatches,
+				Reason: daemonsDown + " duplicated: " + dup}
 		}
 	}
 	if d.Kind == model.KindSwitch {
 		if r, err := s.probeExec(ctx, d.Container, rt.ExecCmd{
-			Cmd: []string{"sh", "-c", "ovs-vsctl list-br 2>/dev/null | grep -c ."}}); err == nil &&
-			strings.TrimSpace(r.Stdout) == "0" {
-			return "it has no bridge"
+			Cmd: []string{"sh", "-c", "ovs-vsctl list-br 2>/dev/null | grep -c ."}}); err != nil {
+			return deviceObservation{Health: healthUnknown, State: c.State, SpecMatches: specMatches,
+				Reason: "switch bridge probe unreadable: " + err.Error()}
+		} else if r.ExitCode != 0 {
+			return deviceObservation{Health: healthUnknown, State: c.State, SpecMatches: specMatches,
+				Reason: fmt.Sprintf("switch bridge probe exited %d", r.ExitCode)}
+		} else if strings.TrimSpace(r.Stdout) == "0" {
+			return deviceObservation{Health: healthBroken, State: c.State, SpecMatches: specMatches, Reason: "it has no bridge"}
 		}
 	}
-	return ""
+	return deviceObservation{Health: healthHealthy, State: c.State, SpecMatches: specMatches}
 }
 
 // peerUnderlay returns the VTEP addresses recorded for a lab.
@@ -457,6 +1024,11 @@ func (s *Server) startDaemons(ctx context.Context, lab string, d *model.Device) 
 // whose running-config are both correct and whose kernel is not, which is
 // indistinguishable from a student mistake and was being marked as one.
 func (s *Server) duplicateDaemons(ctx context.Context, d *model.Device, as *model.AS) string {
+	dup, _ := s.duplicateDaemonsResult(ctx, d, as)
+	return dup
+}
+
+func (s *Server) duplicateDaemonsResult(ctx context.Context, d *model.Device, as *model.AS) (string, error) {
 	var dup []string
 	for _, name := range render.EnabledDaemonsFor(as) {
 		// The daemon proper, which is the one started with -d.
@@ -470,39 +1042,36 @@ func (s *Server) duplicateDaemons(ctx context.Context, d *model.Device, as *mode
 		script := "ps -ef | awk '/usr\\/lib\\/frr\\/" + name + " -d/ && !/awk/' | wc -l"
 		r, err := s.probeExec(ctx, d.Container, rt.ExecCmd{Cmd: []string{"sh", "-c", script}})
 		if err != nil || r.ExitCode != 0 {
-			return ""
+			if err != nil {
+				return "", err
+			}
+			return "", fmt.Errorf("duplicate daemon probe exited %d", r.ExitCode)
 		}
 		n, err := strconv.Atoi(strings.TrimSpace(r.Stdout))
 		if err != nil {
-			return ""
+			return "", fmt.Errorf("parse duplicate daemon count: %w", err)
 		}
 		if n > 1 {
 			dup = append(dup, fmt.Sprintf("%s (%d)", name, n))
 		}
 	}
 	if len(dup) == 0 {
-		return ""
+		return "", nil
 	}
 	sort.Strings(dup)
-	return strings.Join(dup, " ")
+	return strings.Join(dup, " "), nil
 }
 
-// Repairs that cannot succeed are attempted a few times and then left alone.
-//
-// A lab that is half removed -- the routers gone, their attached hosts still
-// running -- cannot be rewired: the other end of every cable is a container
-// that no longer exists. The loop retried each of those devices every minute
-// for as long as the node was up, filling the log with identical failures and
-// doing the work of a full survey on a lab nobody was using. Four such labs
-// were found on one node, left behind by grading runs whose cleanup had not
-// finished, and the noise made the one lab that was genuinely broken hard to
-// see.
-//
-// Giving up is recorded once, loudly, naming the device. It is not silence:
-// somebody has to remove the remains, and the message says so. A later
-// successful repair clears the count, so a device that recovers by itself is
-// looked after again without anything having to be restarted.
+// Failed repairs are retried with bounded exponential backoff. The old
+// "three strikes forever" rule hid devices that became repairable later; a
+// full audit or a lifecycle event now retries them when their next bounded
+// window opens, and any healthy observation clears the history immediately.
 const repairAttemptsBeforeGivingUp = 3
+
+const (
+	repairBackoffBase = time.Second
+	repairBackoffMax  = 5 * time.Minute
+)
 
 // repairKey identifies a device within its lab.
 //
@@ -516,29 +1085,57 @@ func repairKey(lab, id string) string { return lab + "|" + id }
 func (s *Server) givingUpOn(lab, id string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.repairFails[repairKey(lab, id)] >= repairAttemptsBeforeGivingUp
+	if s.repairFails[repairKey(lab, id)] < repairAttemptsBeforeGivingUp {
+		return false
+	}
+	until := s.repairNext[repairKey(lab, id)]
+	return !until.IsZero() && s.nowTime().Before(until)
 }
 
 func (s *Server) repairFailed(lab, id, what string, err error) {
 	k := repairKey(lab, id)
 	s.mu.Lock()
+	if s.repairFails == nil {
+		s.repairFails = map[string]int{}
+	}
+	if s.repairNext == nil {
+		s.repairNext = map[string]time.Time{}
+	}
 	s.repairFails[k]++
 	n := s.repairFails[k]
+	delay := repairDelay(n)
+	s.repairNext[k] = s.nowTime().Add(delay)
 	s.mu.Unlock()
 
 	slog.Error(what, "lab", lab, "device", id, "err", err, "attempt", n)
-	if n == repairAttemptsBeforeGivingUp {
-		slog.Error("giving up on repairing this device; it will be left as it is until "+
-			"something deploys or removes it. A device whose peers no longer exist cannot "+
-			"be rewired, and a lab in that state needs removing rather than repairing",
-			"lab", lab, "device", id, "attempts", n)
+	s.metricRegistry().observeRepair("failed")
+	s.queueReconcileAfter(lab, id, delay)
+	if n >= repairAttemptsBeforeGivingUp {
+		slog.Warn("repair is entering bounded exponential backoff; a later event or audit will retry",
+			"lab", lab, "device", id, "attempts", n, "backoff", delay)
 	}
 }
 
 func (s *Server) repairSucceeded(lab, id string) {
 	s.mu.Lock()
 	delete(s.repairFails, repairKey(lab, id))
+	delete(s.repairNext, repairKey(lab, id))
 	s.mu.Unlock()
+}
+
+func repairDelay(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	shift := attempt - 1
+	if shift > 8 {
+		shift = 8
+	}
+	delay := repairBackoffBase << shift
+	if delay > repairBackoffMax {
+		return repairBackoffMax
+	}
+	return delay
 }
 
 // labIsGone reports whether none of a lab's devices on this node still exist.
@@ -580,6 +1177,16 @@ func (s *Server) forgetLab(name string) {
 		if strings.HasPrefix(k, name+"|") {
 			delete(s.repairFails, k)
 		}
+		for k := range s.repairNext {
+			if strings.HasPrefix(k, name+"|") {
+				delete(s.repairNext, k)
+			}
+		}
+		for k := range s.health {
+			if strings.HasPrefix(k, name+"|") {
+				delete(s.health, k)
+			}
+		}
 	}
 	for k := range s.partial {
 		if strings.HasPrefix(k, name+"|") {
@@ -614,13 +1221,19 @@ const partialWiringGrace = 3
 // device could be rewired during its own deployment or never repaired at all,
 // depending on what else the node happened to be running.
 func (s *Server) partiallyWiredFor(lab, id string) int {
+	return s.partialCount(lab, id, true)
+}
+
+func (s *Server) partialCount(lab, id string, advance bool) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.partial == nil {
 		s.partial = map[string]int{}
 	}
 	k := repairKey(lab, id)
-	s.partial[k]++
+	if advance {
+		s.partial[k]++
+	}
 	return s.partial[k]
 }
 

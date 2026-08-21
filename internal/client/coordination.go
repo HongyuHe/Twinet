@@ -189,6 +189,7 @@ func (l *MutationLease) renew() {
 func (c *Cluster) withMutationLease(ctx context.Context, lab string,
 	fn func(*MutationLease) error,
 ) error {
+	ctx = operationContext(ctx)
 	lease, err := c.AcquireMutationLease(ctx, lab)
 	if err != nil {
 		return err
@@ -581,6 +582,7 @@ func mutationFailure[T any](nodes []*Node, values map[string]T, cause error) []N
 func (c *Cluster) coordinatedDestroy(ctx context.Context, lab string, vnis []uint32,
 	ephemeral bool,
 ) []NodeResult[struct{}] {
+	ctx = operationContext(ctx)
 	nodes := c.sortedNodes()
 	if len(nodes) == 0 {
 		return nil
@@ -621,6 +623,7 @@ func (c *Cluster) coordinatedDestroy(ctx context.Context, lab string, vnis []uin
 func (c *Cluster) Lifecycle(ctx context.Context, lab, nodeName string,
 	req agent.LifecycleRequest,
 ) error {
+	ctx = operationContext(ctx)
 	return c.withMutationLease(ctx, lab, func(lease *MutationLease) error {
 		node := c.node(nodeName)
 		if node == nil {

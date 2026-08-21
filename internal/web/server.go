@@ -275,10 +275,140 @@ func (s *Server) takeMatrix() {
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	m := svc.BuildMatrixWithPaths(ctx, s.Top, s.prober(), s.pathProbe(), 32)
+	m := svc.BuildMatrixWithSourceBatches(ctx, s.Top, s.batchProber(), s.batchPathProbe(), 32)
 	s.mu.Lock()
 	s.matrix, s.matrixAt = m, time.Now()
 	s.mu.Unlock()
+}
+
+// InvalidateMatrix makes the next request refresh the cache. Runtime and
+// routing events can call this without forcing a refresh immediately; bursts
+// of events therefore coalesce into one bounded source-side batch.
+func (s *Server) InvalidateMatrix() {
+	s.mu.Lock()
+	s.matrixAt = time.Time{}
+	s.mu.Unlock()
+}
+
+// batchProber performs every ping from one AS in one container exec. It keeps
+// the exact ping arguments of the legacy per-cell path, so result semantics
+// (including RTT) stay equivalent while the execution budget falls from N² to
+// one per source.
+func (s *Server) batchProber() svc.SourceBatchProber {
+	return func(ctx context.Context, deviceID string, targets map[int]string) (map[int]svc.BatchProbeResult, error) {
+		var script strings.Builder
+		for _, asn := range sortedTargets(targets) {
+			target := targets[asn]
+			fmt.Fprintf(&script, "out=$(ping -c 2 -W 3 -i 0.3 %s 2>&1); rc=$?; ", shellQuote(target))
+			script.WriteString("avg=$(printf '%s\\n' \"$out\" | awk -F'=' '/min\\/avg\\/max/ {split($2,a,\"/\"); gsub(/ /,\"\",a[2]); print a[2]; exit}'); ")
+			fmt.Fprintf(&script, "printf '__TWINET_PING__%d\\t%%s\\t%%s\\n' \"$rc\" \"$avg\"; ", asn)
+		}
+		out, code, err := s.Exec(ctx, deviceID, []string{"sh", "-c", script.String()})
+		if err != nil {
+			return nil, err
+		}
+		if code != 0 {
+			return nil, fmt.Errorf("source ping batch exited %d", code)
+		}
+		result := map[int]svc.BatchProbeResult{}
+		for _, line := range strings.Split(out, "\n") {
+			if !strings.HasPrefix(line, "__TWINET_PING__") {
+				continue
+			}
+			parts := strings.Split(strings.TrimPrefix(line, "__TWINET_PING__"), "\t")
+			if len(parts) != 3 {
+				continue
+			}
+			asn, asnErr := strconv.Atoi(parts[0])
+			rc, rcErr := strconv.Atoi(parts[1])
+			if asnErr != nil || rcErr != nil {
+				continue
+			}
+			observation := svc.BatchProbeResult{}
+			switch rc {
+			case 0:
+				observation.Reachable = true
+				observation.RTTms, _ = strconv.ParseFloat(strings.TrimSpace(parts[2]), 64)
+			case 1:
+				// iputils ping uses one for a timeout/no reply.
+			default:
+				observation.Err = fmt.Errorf("ping exited %d", rc)
+			}
+			result[asn] = observation
+		}
+		return result, nil
+	}
+}
+
+// batchPathProbe fetches each selected route from one source in one container
+// exec. The payload is marker-framed rather than JSON-encoded so it works in
+// the small router images without a Python or jq dependency.
+func (s *Server) batchPathProbe() svc.SourceBatchPathProbe {
+	return func(ctx context.Context, deviceID string, targets map[int]string) (map[int]svc.BatchPathResult, error) {
+		var script strings.Builder
+		for _, asn := range sortedTargets(targets) {
+			fmt.Fprintf(&script, "out=$(vtysh -c %s 2>&1); rc=$?; ", shellQuote("show ip bgp "+targets[asn]))
+			fmt.Fprintf(&script, "printf '__TWINET_PATH_BEGIN__%d\\n'; printf '%%s\\n' \"$out\"; ", asn)
+			fmt.Fprintf(&script, "printf '__TWINET_PATH_END__%d\\t%%s\\n' \"$rc\"; ", asn)
+		}
+		out, code, err := s.Exec(ctx, deviceID, []string{"sh", "-c", script.String()})
+		if err != nil {
+			return nil, err
+		}
+		if code != 0 {
+			return nil, fmt.Errorf("source path batch exited %d", code)
+		}
+		result := map[int]svc.BatchPathResult{}
+		current := -1
+		var body strings.Builder
+		for _, line := range strings.Split(out, "\n") {
+			if strings.HasPrefix(line, "__TWINET_PATH_BEGIN__") {
+				current, _ = strconv.Atoi(strings.TrimPrefix(line, "__TWINET_PATH_BEGIN__"))
+				body.Reset()
+				continue
+			}
+			if strings.HasPrefix(line, "__TWINET_PATH_END__") {
+				parts := strings.Split(strings.TrimPrefix(line, "__TWINET_PATH_END__"), "\t")
+				if len(parts) != 2 {
+					current = -1
+					continue
+				}
+				asn, asnErr := strconv.Atoi(parts[0])
+				rc, rcErr := strconv.Atoi(parts[1])
+				if current != asn || asnErr != nil || rcErr != nil {
+					current = -1
+					continue
+				}
+				observation := svc.BatchPathResult{}
+				if rc != 0 {
+					observation.Err = fmt.Errorf("route query exited %d", rc)
+				} else {
+					observation.Path = firstASPath(body.String())
+				}
+				result[asn] = observation
+				current = -1
+				continue
+			}
+			if current >= 0 {
+				body.WriteString(line)
+				body.WriteByte('\n')
+			}
+		}
+		return result, nil
+	}
+}
+
+func sortedTargets(targets map[int]string) []int {
+	asns := make([]int, 0, len(targets))
+	for asn := range targets {
+		asns = append(asns, asn)
+	}
+	sort.Ints(asns)
+	return asns
+}
+
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", `'"'"'`) + "'"
 }
 
 // prober adapts the lab's exec to what the matrix builder wants.

@@ -9,8 +9,10 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/HongyuHe/twinet/internal/agent"
 	"github.com/HongyuHe/twinet/internal/client"
 	"github.com/HongyuHe/twinet/internal/model"
+	rt "github.com/HongyuHe/twinet/internal/runtime"
 	"github.com/HongyuHe/twinet/internal/web"
 )
 
@@ -54,7 +56,7 @@ The listen address defaults to whatever the manifest's web service declares.`,
 				listen = ":9000"
 			}
 
-			exec, err := execFunc(cmd.Context(), top, token)
+			exec, err := webExecFunc(cmd.Context(), top, token)
 			if err != nil {
 				return err
 			}
@@ -94,6 +96,11 @@ The listen address defaults to whatever the manifest's web service declares.`,
 					}
 					return out
 				}
+				// Runtime and repair events make a cached matrix stale. The
+				// watcher only invalidates; takeMatrix still coalesces a burst
+				// into one bounded two-exec-per-source refresh when somebody
+				// asks for it.
+				go invalidateMatrixOnEvents(cmd.Context(), cl, top.Name, srv.InvalidateMatrix)
 			}
 
 			fmt.Fprintf(cmd.OutOrStdout(), "serving %s on %s\n", top.Name, listen)
@@ -119,6 +126,82 @@ The listen address defaults to whatever the manifest's web service declares.`,
 	cmd.Flags().DurationVar(&refresh, "refresh", 2*time.Minute,
 		"how often to recompute the connectivity matrix")
 	return cmd
+}
+
+// webExecFunc is the read-only web collector's execution path. It must not
+// set Grading: otherwise matrix refreshes become grading-infrastructure
+// outcomes and hide the actual pressure/errors of a class mark.
+func webExecFunc(_ context.Context, top *model.Topology, token string) (
+	func(context.Context, string, []string) (rt.ExecResult, error), error,
+) {
+	if !clustered(top) {
+		runtime := rt.NewDocker()
+		return func(ctx context.Context, deviceID string, command []string) (rt.ExecResult, error) {
+			device, ok := top.Device(deviceID)
+			if !ok {
+				return rt.ExecResult{}, fmt.Errorf("no device %q", deviceID)
+			}
+			return runtime.Exec(ctx, device.Container, rt.ExecCmd{Cmd: command})
+		}, nil
+	}
+	tok, err := tokenFor(token)
+	if err != nil {
+		return nil, err
+	}
+	cluster := client.NewCluster(top.Lab, tok)
+	return func(ctx context.Context, deviceID string, command []string) (rt.ExecResult, error) {
+		device, ok := top.Device(deviceID)
+		if !ok {
+			return rt.ExecResult{}, fmt.Errorf("no device %q", deviceID)
+		}
+		node, ok := cluster.Node(device.Node)
+		if !ok {
+			return rt.ExecResult{}, fmt.Errorf("device %s is on unknown node %q", deviceID, device.Node)
+		}
+		result, err := node.Exec(ctx, agent.ExecRequest{
+			Container: device.Container, Cmd: command, Hold: currentHoldToken(),
+		})
+		return rt.ExecResult{ExitCode: result.ExitCode, Stdout: result.Stdout, Stderr: result.Stderr}, err
+	}, nil
+}
+
+func invalidateMatrixOnEvents(ctx context.Context, cluster *client.Cluster, lab string, invalidate func()) {
+	for _, node := range cluster.Nodes {
+		node := node
+		go func() {
+			var after uint64
+			for ctx.Err() == nil {
+				events, errs := node.WatchEvents(ctx, lab, after)
+				for events != nil || errs != nil {
+					select {
+					case <-ctx.Done():
+						return
+					case event, ok := <-events:
+						if !ok {
+							events = nil
+							continue
+						}
+						if event.Sequence > after {
+							after = event.Sequence
+						}
+						switch event.Scope {
+						case "runtime", "reconcile", "matrix":
+							invalidate()
+						}
+					case _, ok := <-errs:
+						if !ok {
+							errs = nil
+						}
+					}
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(250 * time.Millisecond):
+				}
+			}
+		}()
+	}
 }
 
 // webListenFrom finds the address the manifest's web service asks for.

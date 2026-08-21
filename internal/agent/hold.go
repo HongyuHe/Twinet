@@ -90,6 +90,12 @@ func (s *Server) handleHold(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	action, result := "hold_set", "success"
+	if req.Seconds <= 0 {
+		action = "hold_released"
+	}
+	s.recordEvent(req.Lab, "", "grading", s.requestCorrelation(r), action, result,
+		"holder="+boundedEventText(req.Holder, 96))
 	writeJSON(w, struct{}{})
 }
 

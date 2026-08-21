@@ -16,6 +16,7 @@ import (
 	"github.com/HongyuHe/twinet/internal/agent"
 	"github.com/HongyuHe/twinet/internal/alloc"
 	"github.com/HongyuHe/twinet/internal/client"
+	"github.com/HongyuHe/twinet/internal/limiter"
 	"github.com/HongyuHe/twinet/internal/model"
 	"github.com/HongyuHe/twinet/internal/place"
 )
@@ -97,7 +98,7 @@ func newNodeCmd(opts *Options) *cobra.Command {
 			// those is something the next command will refuse to do, and being
 			// told afterwards is not the same as being told.
 			w := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
-			fmt.Fprintln(w, "NODE\tSTATE\tVERSION\tRUNTIME\tALLOCATABLE\tRESERVED\tLOAD\tIMAGES\tUNDERLAY\tCONTAINERS\tLAB")
+			fmt.Fprintln(w, "NODE\tSTATE\tVERSION\tRUNTIME\tALLOCATABLE\tRESERVED\tLOAD\tPRESSURE\tIMAGES\tUNDERLAY\tCONTAINERS\tLAB")
 			bad, degraded := 0, 0
 			for _, r := range results {
 				if r.Err != nil {
@@ -114,10 +115,11 @@ func newNodeCmd(opts *Options) *cobra.Command {
 				if why != "" {
 					lab = why
 				}
-				fmt.Fprintf(w, "%s\t%s\t%s\t%s %s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\n",
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s %s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\n",
 					r.Node, state, v.Version, v.Runtime, v.RuntimeVer,
 					inventorySummary(v.Inventory.Allocatable), inventorySummary(v.Inventory.Reserved),
-					loadSummary(v.Inventory.Load), imageCacheSummary(v.Inventory.ImageCache),
+					loadSummary(v.Inventory.Load), limiterPressureSummary(v.Backpressure),
+					imageCacheSummary(v.Inventory.ImageCache),
 					dash(v.UnderlayIP), v.Containers, lab)
 			}
 			if err := w.Flush(); err != nil {
@@ -667,6 +669,8 @@ func nodeState(v agent.StatusResponse, controller string) (state, why string) {
 	switch {
 	case v.RuntimeVer == "":
 		return "no-runtime", "the container runtime did not answer"
+	case statusUnknown(v.Unknown, "containers"):
+		return "unknown", "managed container inventory could not be read"
 	case controller != "" && v.Version != "" && v.Version != controller:
 		return "skewed", fmt.Sprintf("agent %s, controller %s: they render configuration "+
 			"differently", v.Version, controller)
@@ -674,6 +678,15 @@ func nodeState(v agent.StatusResponse, controller string) (state, why string) {
 		return "busy", "operation in flight: " + strings.Join(v.Busy, ", ")
 	}
 	return "ok", ""
+}
+
+func statusUnknown(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func inventorySummary(v agent.ResourceInventory) string {
@@ -709,6 +722,21 @@ func imageCacheSummary(v agent.ImageCacheInventory) string {
 		return "unknown"
 	}
 	return fmt.Sprintf("%d", *v.Count)
+}
+
+func limiterPressureSummary(values map[string]limiter.Stats) string {
+	if len(values) == 0 {
+		return "unknown"
+	}
+	active, queued := 0, 0
+	for _, value := range values {
+		active += value.InFlight
+		queued += value.QueueDepth
+	}
+	if active == 0 && queued == 0 {
+		return "idle"
+	}
+	return fmt.Sprintf("%d active/%d queued", active, queued)
 }
 
 // newNodeSweepCmd finds and removes the overlays a node is carrying for nobody.
