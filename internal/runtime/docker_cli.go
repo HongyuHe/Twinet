@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"archive/tar"
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -10,6 +11,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -17,10 +19,28 @@ import (
 // where the Engine API cannot be used.
 type dockerCLI struct {
 	bin string
+
+	eventMu      sync.Mutex
+	eventCancels map[uint64]context.CancelFunc
+	nextEventID  uint64
+	eventsClosed bool
 }
 
-// Close is a no-op for the CLI backend.
-func (d *dockerCLI) Close() error { return nil }
+// Close stops active event streams.
+func (d *dockerCLI) Close() error {
+	d.eventMu.Lock()
+	d.eventsClosed = true
+	cancels := make([]context.CancelFunc, 0, len(d.eventCancels))
+	for _, cancel := range d.eventCancels {
+		cancels = append(cancels, cancel)
+	}
+	d.eventCancels = make(map[uint64]context.CancelFunc)
+	d.eventMu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
+	return nil
+}
 
 func (d *dockerCLI) run(ctx context.Context, stdin io.Reader, args ...string) (string, string, error) {
 	cmd := exec.CommandContext(ctx, d.bin, args...)
@@ -44,6 +64,148 @@ func (d *dockerCLI) mustRun(ctx context.Context, args ...string) (string, error)
 func (d *dockerCLI) Ping(ctx context.Context) (string, error) {
 	out, err := d.mustRun(ctx, "version", "--format", "{{.Server.Version}}")
 	return strings.TrimSpace(out), err
+}
+
+func (d *dockerCLI) Subscribe(ctx context.Context, filter EventFilter) EventSubscription {
+	filter = cloneEventFilter(filter)
+	streamCtx, cancel := context.WithCancel(ctx)
+	eventID, ok := d.registerEventStream(cancel)
+	if !ok {
+		cancel()
+		return failedEventSubscription(ErrEventStreamClosed)
+	}
+	subscription, out, errs := newEventSubscription()
+	go func() {
+		terminal := ErrEventStreamClosed
+		terminalSet := false
+		defer func() {
+			cancel()
+			d.unregisterEventStream(eventID)
+			finishEventSubscription(out, errs, terminal)
+		}()
+
+		cmd := exec.CommandContext(streamCtx, d.bin, dockerCLIEventArgs(filter)...)
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		stdout, err := cmd.StdoutPipe()
+		if err != nil {
+			terminal = fmt.Errorf("docker events stdout: %w", err)
+			return
+		}
+		if err := cmd.Start(); err != nil {
+			terminal = fmt.Errorf("docker events: %w", err)
+			return
+		}
+
+		scanner := bufio.NewScanner(stdout)
+		scanner.Buffer(make([]byte, 64<<10), 4<<20)
+	scan:
+		for scanner.Scan() {
+			var message dockerCLIEventMessage
+			if err := json.Unmarshal(scanner.Bytes(), &message); err != nil {
+				terminal = fmt.Errorf("parse docker event: %w", err)
+				terminalSet = true
+				cancel()
+				break
+			}
+			if message.Type != "" && message.Type != "container" {
+				continue
+			}
+			action := message.Action
+			if action == "" {
+				action = message.Status
+			}
+			containerID := message.Actor.ID
+			if containerID == "" {
+				containerID = message.ID
+			}
+			event, ok := normalizeContainerEvent(
+				containerID,
+				message.Actor.Attributes["name"],
+				action,
+				message.Actor.Attributes,
+				message.Time,
+				message.TimeNano,
+			)
+			if !ok || !eventMatches(filter, event) {
+				continue
+			}
+			select {
+			case out <- event:
+			case <-streamCtx.Done():
+				terminal = streamCtx.Err()
+				terminalSet = true
+				break scan
+			}
+		}
+
+		scanErr := scanner.Err()
+		if scanErr != nil && !terminalSet {
+			cancel()
+		}
+		waitErr := cmd.Wait()
+		if terminalSet {
+			return
+		}
+		switch {
+		case streamCtx.Err() != nil:
+			terminal = streamCtx.Err()
+		case scanErr != nil:
+			terminal = fmt.Errorf("read docker events: %w", scanErr)
+		case waitErr != nil:
+			terminal = fmt.Errorf("docker events: %w: %s", waitErr, strings.TrimSpace(stderr.String()))
+		default:
+			terminal = io.EOF
+		}
+	}()
+	return subscription
+}
+
+func (d *dockerCLI) registerEventStream(cancel context.CancelFunc) (uint64, bool) {
+	d.eventMu.Lock()
+	defer d.eventMu.Unlock()
+	if d.eventsClosed {
+		return 0, false
+	}
+	if d.eventCancels == nil {
+		d.eventCancels = make(map[uint64]context.CancelFunc)
+	}
+	d.nextEventID++
+	eventID := d.nextEventID
+	d.eventCancels[eventID] = cancel
+	return eventID, true
+}
+
+func (d *dockerCLI) unregisterEventStream(eventID uint64) {
+	d.eventMu.Lock()
+	delete(d.eventCancels, eventID)
+	d.eventMu.Unlock()
+}
+
+func dockerCLIEventArgs(filter EventFilter) []string {
+	args := []string{"events", "--format", "{{json .}}", "--filter", "type=container"}
+	for _, key := range sortedKeys(filter.Labels) {
+		value := filter.Labels[key]
+		if value == "" {
+			args = append(args, "--filter", "label="+key)
+		} else {
+			args = append(args, "--filter", "label="+key+"="+value)
+		}
+	}
+	return args
+}
+
+type dockerCLIEventMessage struct {
+	Type   string `json:"Type"`
+	Action string `json:"Action"`
+	Status string `json:"status"`
+	ID     string `json:"id"`
+	Actor  struct {
+		ID         string            `json:"ID"`
+		Attributes map[string]string `json:"Attributes"`
+	} `json:"Actor"`
+	Time     int64 `json:"time"`
+	TimeNano int64 `json:"timeNano"`
 }
 
 // ImageExists reports whether an image is present locally.

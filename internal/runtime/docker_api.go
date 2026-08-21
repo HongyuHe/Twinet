@@ -17,6 +17,7 @@ import (
 	cerrdefs "github.com/containerd/errdefs"
 	"github.com/moby/moby/api/pkg/stdcopy"
 	"github.com/moby/moby/api/types/container"
+	dockerevents "github.com/moby/moby/api/types/events"
 	"github.com/moby/moby/api/types/network"
 	mobyclient "github.com/moby/moby/client"
 )
@@ -28,6 +29,11 @@ const (
 
 type dockerAPI struct {
 	client *mobyclient.Client
+
+	eventMu      sync.Mutex
+	eventCancels map[uint64]context.CancelFunc
+	nextEventID  uint64
+	eventsClosed bool
 }
 
 func newDockerAPI() (*dockerAPI, error) {
@@ -37,10 +43,24 @@ func newDockerAPI() (*dockerAPI, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &dockerAPI{client: client}, nil
+	return &dockerAPI{
+		client:       client,
+		eventCancels: make(map[uint64]context.CancelFunc),
+	}, nil
 }
 
 func (d *dockerAPI) Close() error {
+	d.eventMu.Lock()
+	d.eventsClosed = true
+	cancels := make([]context.CancelFunc, 0, len(d.eventCancels))
+	for _, cancel := range d.eventCancels {
+		cancels = append(cancels, cancel)
+	}
+	d.eventCancels = make(map[uint64]context.CancelFunc)
+	d.eventMu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
 	return d.client.Close()
 }
 
@@ -50,6 +70,93 @@ func (d *dockerAPI) Ping(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("docker engine ping: %w", err)
 	}
 	return version.Version, nil
+}
+
+func (d *dockerAPI) Subscribe(ctx context.Context, filter EventFilter) EventSubscription {
+	filter = cloneEventFilter(filter)
+	streamCtx, cancel := context.WithCancel(ctx)
+	eventID, ok := d.registerEventStream(cancel)
+	if !ok {
+		cancel()
+		return failedEventSubscription(ErrEventStreamClosed)
+	}
+	subscription, out, errs := newEventSubscription()
+	filters := make(mobyclient.Filters)
+	filters.Add("type", string(dockerevents.ContainerEventType))
+	for _, key := range sortedKeys(filter.Labels) {
+		value := filter.Labels[key]
+		if value == "" {
+			filters.Add("label", key)
+		} else {
+			filters.Add("label", key+"="+value)
+		}
+	}
+	stream := d.client.Events(streamCtx, mobyclient.EventsListOptions{Filters: filters})
+	go func() {
+		terminal := ErrEventStreamClosed
+		defer func() {
+			cancel()
+			d.unregisterEventStream(eventID)
+			finishEventSubscription(out, errs, terminal)
+		}()
+
+		for {
+			select {
+			case <-streamCtx.Done():
+				terminal = streamCtx.Err()
+				return
+			case err, ok := <-stream.Err:
+				if !ok {
+					return
+				}
+				terminal = err
+				return
+			case message, ok := <-stream.Messages:
+				if !ok {
+					return
+				}
+				if message.Type != dockerevents.ContainerEventType {
+					continue
+				}
+				event, ok := normalizeContainerEvent(
+					message.Actor.ID,
+					message.Actor.Attributes["name"],
+					string(message.Action),
+					message.Actor.Attributes,
+					message.Time,
+					message.TimeNano,
+				)
+				if !ok || !eventMatches(filter, event) {
+					continue
+				}
+				select {
+				case out <- event:
+				case <-streamCtx.Done():
+					terminal = streamCtx.Err()
+					return
+				}
+			}
+		}
+	}()
+	return subscription
+}
+
+func (d *dockerAPI) registerEventStream(cancel context.CancelFunc) (uint64, bool) {
+	d.eventMu.Lock()
+	defer d.eventMu.Unlock()
+	if d.eventsClosed {
+		return 0, false
+	}
+	d.nextEventID++
+	eventID := d.nextEventID
+	d.eventCancels[eventID] = cancel
+	return eventID, true
+}
+
+func (d *dockerAPI) unregisterEventStream(eventID uint64) {
+	d.eventMu.Lock()
+	delete(d.eventCancels, eventID)
+	d.eventMu.Unlock()
 }
 
 func (d *dockerAPI) ImageExists(ctx context.Context, ref string) (bool, error) {

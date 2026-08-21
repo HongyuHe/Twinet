@@ -185,12 +185,50 @@ type Filter struct {
 	All bool
 }
 
-// Event is a container lifecycle event.
+// EventAction is the normalised action of a container lifecycle event.
+type EventAction string
+
+const (
+	EventCreate  EventAction = "create"
+	EventStart   EventAction = "start"
+	EventDie     EventAction = "die"
+	EventStop    EventAction = "stop"
+	EventDestroy EventAction = "destroy"
+	EventRestart EventAction = "restart"
+	EventOOM     EventAction = "oom"
+	EventHealth  EventAction = "health"
+)
+
+// EventFilter selects container events by label.
+type EventFilter struct {
+	Labels map[string]string
+}
+
+// EventSubscription is an asynchronous container event stream.
+//
+// Errors receives exactly one non-nil terminal error, including io.EOF when an
+// engine stream ends and a context error when its context is cancelled. It
+// then closes, so a caller can distinguish a reconnectable stream end from a
+// silently closed channel.
+type EventSubscription struct {
+	Events <-chan Event
+	Errors <-chan error
+}
+
+// EventSource subscribes to container lifecycle events.
+type EventSource interface {
+	Subscribe(ctx context.Context, filter EventFilter) EventSubscription
+}
+
+// Event is a normalised container lifecycle event.
 type Event struct {
+	// Container is the Engine container ID.
 	Container string
-	Action    string
-	Labels    map[string]string
-	At        time.Time
+	// Name is the Engine container name when the backend provides one.
+	Name   string
+	Action EventAction
+	Labels map[string]string
+	At     time.Time
 }
 
 // Runtime is the container engine abstraction.
@@ -234,6 +272,12 @@ type Runtime interface {
 	CopyFrom(ctx context.Context, nameOrID, srcPath string) ([]byte, error)
 	// Close releases any resources held by the client.
 	Close() error
+}
+
+// EventRuntime is a Runtime that can subscribe to container lifecycle events.
+type EventRuntime interface {
+	Runtime
+	EventSource
 }
 
 // SortContainers orders containers by name for deterministic output.

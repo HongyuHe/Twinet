@@ -30,6 +30,7 @@ type dockerBackend interface {
 	CopyTo(context.Context, string, string, int64, []byte) error
 	CopyFrom(context.Context, string, string) ([]byte, error)
 	CopyFromFollow(context.Context, string, string) ([]byte, error)
+	Subscribe(context.Context, EventFilter) EventSubscription
 }
 
 // Docker drives the Docker Engine API. Set TWINET_DOCKER_BACKEND=cli only to
@@ -41,6 +42,8 @@ type Docker struct {
 	backend dockerBackend
 	err     error
 }
+
+var _ EventRuntime = (*Docker)(nil)
 
 // NewDocker constructs a Docker runtime. The Engine API client is initialized
 // on the first operation so construction remains compatible with all callers.
@@ -239,4 +242,14 @@ func (d *Docker) CopyFromFollow(ctx context.Context, nameOrID, srcPath string) (
 		return nil, err
 	}
 	return backend.CopyFromFollow(ctx, nameOrID, srcPath)
+}
+
+// Subscribe receives container lifecycle events until ctx is cancelled or the
+// backend reports a terminal stream error.
+func (d *Docker) Subscribe(ctx context.Context, filter EventFilter) EventSubscription {
+	backend, err := d.backendFor()
+	if err != nil {
+		return failedEventSubscription(err)
+	}
+	return backend.Subscribe(ctx, filter)
 }
