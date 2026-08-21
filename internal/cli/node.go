@@ -2,9 +2,11 @@ package cli
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -41,7 +43,10 @@ func clustered(top *model.Topology) bool {
 }
 
 func newNodeCmd(opts *Options) *cobra.Command {
-	var token string
+	var (
+		token        string
+		bootstrapPKI string
+	)
 	cmd := &cobra.Command{
 		Use:   "node",
 		Short: "Inspect and manage the cluster's node agents",
@@ -165,15 +170,29 @@ network for no reason they could ever discover. This checks it up front.`,
 		Short: "Print the commands that install the agent on a node",
 		Long: `Emits an idempotent shell script that installs twinetd and a systemd unit
 on each node. It is printed rather than executed so an operator can read exactly
-what will run with root on their machines before it does.`,
+what will run with root on their machines before it does.
+
+The script requires node-specific mutual-TLS material from "twinet node pki".
+It refuses to generate a remotely reachable bearer-token-only agent.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			top, err := loadAndPlace(opts)
 			if err != nil {
 				return err
 			}
-			tok, _ := tokenFor(token)
-			if tok == "" {
-				tok = "REPLACE_WITH_A_SHARED_SECRET"
+			tok, err := tokenFor(token)
+			if err != nil {
+				return err
+			}
+			if bootstrapPKI == "" {
+				bootstrapPKI = filepath.Join(top.Lab.Dir, ".twinet", "pki")
+			}
+			for _, name := range []string{
+				"ca_cert.pem", "controller_cert.pem", "controller_key.pem",
+			} {
+				if _, err := os.Stat(filepath.Join(bootstrapPKI, name)); err != nil {
+					return fmt.Errorf("secure bootstrap needs %s: %w; run `twinet node pki` first",
+						filepath.Join(bootstrapPKI, name), err)
+				}
 			}
 			nodes := args
 			if len(nodes) == 0 {
@@ -186,26 +205,57 @@ what will run with root on their machines before it does.`,
 				if !ok {
 					return fmt.Errorf("node %q is not declared in placement.nodes", name)
 				}
-				fmt.Fprint(cmd.OutOrStdout(), bootstrapScript(n, tok))
+				for _, suffix := range []string{"_server_cert.pem", "_server_key.pem"} {
+					path := filepath.Join(bootstrapPKI, name+suffix)
+					if _, err := os.Stat(path); err != nil {
+						return fmt.Errorf("secure bootstrap needs %s: %w; rerun `twinet node pki`",
+							path, err)
+					}
+				}
+				fmt.Fprint(cmd.OutOrStdout(), bootstrapScript(n, tok, bootstrapPKI))
 			}
 			return nil
 		},
 	}
+	bootstrap.Flags().StringVar(&bootstrapPKI, "pki", "",
+		"directory produced by `twinet node pki`")
 
 	cmd.AddCommand(status, check, bootstrap, newNodePKICmd(opts), newNodeSweepCmd(opts))
 	return cmd
 }
 
-func bootstrapScript(n model.NodeSpec, token string) string {
-	listen := ":7200"
+func bootstrapScript(n model.NodeSpec, token, pkiDir string) string {
+	port := "7200"
 	if n.Addr != "" {
 		if i := strings.LastIndex(n.Addr, ":"); i > 0 {
-			listen = n.Addr[i:]
+			port = n.Addr[i+1:]
 		}
 	}
+	host := n.UnderlayIP
+	if host == "" && n.Addr != "" {
+		if i := strings.LastIndex(n.Addr, ":"); i > 0 {
+			host = n.Addr[:i]
+		}
+	}
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	listen := host + ":" + port
+	serverCert := filepath.Join(pkiDir, n.Name+"_server_cert.pem")
+	serverKey := filepath.Join(pkiDir, n.Name+"_server_key.pem")
+	caCert := filepath.Join(pkiDir, "ca_cert.pem")
+	controllerCert := filepath.Join(pkiDir, "controller_cert.pem")
+	controllerKey := filepath.Join(pkiDir, "controller_key.pem")
+	encodedToken := base64.StdEncoding.EncodeToString([]byte("TWINET_TOKEN=" + token))
+
 	var b strings.Builder
+	b.WriteString("set -euo pipefail\n")
 	fmt.Fprintf(&b, "# ---- %s ----\n", n.Name)
 	fmt.Fprintf(&b, "scp bin/twinetd root@%s:/usr/local/bin/twinetd\n", n.Name)
+	fmt.Fprintf(&b, "ssh root@%s 'install -d -m 0700 /etc/twinet/pki'\n", n.Name)
+	fmt.Fprintf(&b, "scp %q root@%s:/etc/twinet/pki/server_cert.pem\n", serverCert, n.Name)
+	fmt.Fprintf(&b, "scp %q root@%s:/etc/twinet/pki/server_key.pem\n", serverKey, n.Name)
+	fmt.Fprintf(&b, "scp %q root@%s:/etc/twinet/pki/ca_cert.pem\n", caCert, n.Name)
 	// The token goes in a file only root can read, not in the unit.
 	//
 	// A systemd unit is world-readable by default and `Environment=` puts the
@@ -213,10 +263,15 @@ func bootstrapScript(n model.NodeSpec, token string) string {
 	// account on the node, including the unprivileged one an evaluated RCA
 	// agent runs as. That agent could read it, discard its own read-only
 	// credential, and act as the controller across every lab on the cluster.
-	fmt.Fprintf(&b, "ssh root@%s 'install -d -m 0700 /etc/twinet\n", n.Name)
-	fmt.Fprintf(&b, "umask 077; printf %%s %q > /etc/twinet/agent.env\n",
-		"TWINET_TOKEN="+token)
+	fmt.Fprintf(&b, "ssh root@%s 'set -e\n", n.Name)
+	b.WriteString("command -v docker >/dev/null 2>&1 || { echo \"Docker is required on this node\" >&2; exit 1; }\n")
+	b.WriteString("docker version >/dev/null\n")
+	b.WriteString("install -d -m 0700 /etc/twinet /var/lib/twinet/state\n")
+	fmt.Fprintf(&b, "umask 077; printf %%s %s | base64 -d > /etc/twinet/agent.env\n",
+		encodedToken)
 	b.WriteString("chmod 0600 /etc/twinet/agent.env\n")
+	b.WriteString("chmod 0600 /etc/twinet/pki/server_key.pem\n")
+	b.WriteString("chmod 0644 /etc/twinet/pki/server_cert.pem /etc/twinet/pki/ca_cert.pem\n")
 	b.WriteString("cat > /etc/systemd/system/twinetd.service <<UNIT\n")
 	b.WriteString("[Unit]\nDescription=Twinet node agent\nAfter=docker.service\nRequires=docker.service\n\n")
 	b.WriteString("[Service]\nType=simple\n")
@@ -225,13 +280,25 @@ func bootstrapScript(n model.NodeSpec, token string) string {
 	if n.UnderlayIP != "" {
 		fmt.Fprintf(&b, " -underlay-ip %s", n.UnderlayIP)
 	}
+	b.WriteString(" -tls-cert /etc/twinet/pki/server_cert.pem")
+	b.WriteString(" -tls-key /etc/twinet/pki/server_key.pem")
+	b.WriteString(" -client-ca /etc/twinet/pki/ca_cert.pem")
 	b.WriteString("\nRestart=always\nRestartSec=2\n")
 	// The agent creates namespaces and rewires the host, so it needs the
 	// capabilities; it does not need the rest of root's authority.
 	b.WriteString("AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_NET_RAW\n")
+	b.WriteString("CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_NET_RAW CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER CAP_SETUID CAP_SETGID\n")
+	b.WriteString("NoNewPrivileges=true\nPrivateTmp=true\nProtectHome=true\n")
 	b.WriteString("LimitNOFILE=1048576\nTasksMax=infinity\n\n")
 	b.WriteString("[Install]\nWantedBy=multi-user.target\nUNIT\n")
-	b.WriteString("systemctl daemon-reload && systemctl enable --now twinetd'\n\n")
+	b.WriteString("systemctl daemon-reload && systemctl enable --now twinetd\n")
+	b.WriteString("systemctl is-active --quiet twinetd || { journalctl -u twinetd -n 50 --no-pager >&2; exit 1; }'\n")
+	fmt.Fprintf(&b, "twinet_token=$(printf %%s %s | base64 -d); twinet_token=${twinet_token#TWINET_TOKEN=}\n",
+		encodedToken)
+	fmt.Fprintf(&b, "curl --fail --silent --show-error --cacert %q --cert %q --key %q "+
+		"-H \"Authorization: Bearer $twinet_token\" https://%s/v1/status >/dev/null\n",
+		caCert, controllerCert, controllerKey, listen)
+	fmt.Fprintf(&b, "echo '%s: secure agent is healthy at https://%s'\n\n", n.Name, listen)
 	return b.String()
 }
 
