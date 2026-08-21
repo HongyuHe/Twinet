@@ -14,6 +14,15 @@ const (
 	RoleOperator   = "operator"
 	RoleDiagnostic = "diagnostic"
 
+	ActionObserve   = "observe"
+	ActionExec      = "exec"
+	ActionDeploy    = "deploy"
+	ActionDestroy   = "destroy"
+	ActionLifecycle = "lifecycle"
+	ActionFault     = "fault"
+	ActionState     = "state"
+	ActionAdmin     = "admin"
+
 	claimScheme = "spiffe"
 	claimHost   = "twinet.dev"
 	claimPath   = "/identity"
@@ -50,10 +59,14 @@ func URIs(role string, labs, actions []string) ([]*url.URL, error) {
 	if len(actions) == 0 {
 		return nil, fmt.Errorf("certificate role %s has no action scope", role)
 	}
+	if err := validateScope(role, labs, actions); err != nil {
+		return nil, err
+	}
 	q := url.Values{}
 	for _, lab := range labs {
 		q.Add("lab", lab)
 	}
+
 	for _, action := range actions {
 		q.Add("action", action)
 	}
@@ -63,6 +76,40 @@ func URIs(role string, labs, actions []string) ([]*url.URL, error) {
 		Path:     claimPath + "/" + role,
 		RawQuery: q.Encode(),
 	}}, nil
+}
+
+func validateScope(role string, labs, actions []string) error {
+	known := map[string]bool{
+		ActionObserve: true, ActionExec: true, ActionDeploy: true,
+		ActionDestroy: true, ActionLifecycle: true, ActionFault: true,
+		ActionState: true, ActionAdmin: true,
+	}
+	switch role {
+	case RoleController:
+		if len(labs) != 1 || labs[0] != "*" ||
+			len(actions) != 1 || actions[0] != "*" {
+			return fmt.Errorf("controller certificates must carry the cluster wildcard scope")
+		}
+	case RoleOperator:
+		for _, lab := range labs {
+			if lab == "*" {
+				return fmt.Errorf("an operator must name each lab; use a controller identity for the cluster")
+			}
+		}
+		for _, action := range actions {
+			if !known[action] {
+				return fmt.Errorf("unknown operator action %q", action)
+			}
+		}
+	case RoleDiagnostic:
+		if len(labs) != 1 || labs[0] == "*" {
+			return fmt.Errorf("a diagnostic certificate must name exactly one lab")
+		}
+		if len(actions) != 1 || actions[0] != ActionObserve {
+			return fmt.Errorf("a diagnostic certificate may only observe")
+		}
+	}
+	return nil
 }
 
 // FromCertificate reads a Twinet identity from a verified client certificate.

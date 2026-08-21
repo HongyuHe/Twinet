@@ -215,7 +215,7 @@ func serial() *big.Int {
 // but handing out the controller's private key to something under evaluation is
 // not a thing to do when issuing another key costs nothing. This one is valid
 // for hours, not months, and its subject says what it is.
-func IssueDiagnostic(pkiDir, outDir string, valid time.Duration) (Material, error) {
+func IssueDiagnostic(pkiDir, outDir, lab string, valid time.Duration) (Material, error) {
 	caCert, caKey, err := loadCA(pkiDir)
 	if err != nil {
 		return Material{}, err
@@ -223,7 +223,7 @@ func IssueDiagnostic(pkiDir, outDir string, valid time.Duration) (Material, erro
 	if err := os.MkdirAll(outDir, 0o700); err != nil {
 		return Material{}, err
 	}
-	claims, err := authz.URIs(authz.RoleDiagnostic, []string{"*"}, []string{"observe"})
+	claims, err := authz.URIs(authz.RoleDiagnostic, []string{lab}, []string{authz.ActionObserve})
 	if err != nil {
 		return Material{}, err
 	}

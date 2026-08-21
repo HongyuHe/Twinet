@@ -130,7 +130,7 @@ func newSandbox(top *model.Topology, manifest, name string, egress []string) (*s
 	// controller's private key to something under evaluation is not a thing to
 	// do when issuing another costs nothing.
 	if dir := labPKIDir(top); dir != "" {
-		m, err := pki.IssueDiagnostic(dir, filepath.Join(sb.Dir, "tls"), 6*time.Hour)
+		m, err := pki.IssueDiagnostic(dir, filepath.Join(sb.Dir, "tls"), top.Name, 6*time.Hour)
 		if err != nil {
 			sb.Remove()
 			return nil, fmt.Errorf("issuing the agent's client certificate: %w", err)

@@ -20,7 +20,7 @@ func TestScopedOperatorCredentialCannotEscapeItsGrant(t *testing.T) {
 	}
 	out := t.TempDir()
 	m, err := pki.IssueScoped(dir, out, "ta", authz.RoleOperator,
-		[]string{"cos461"}, []string{"inspect", "deploy"}, time.Hour)
+		[]string{"cos461"}, []string{authz.ActionObserve, authz.ActionDeploy}, time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}

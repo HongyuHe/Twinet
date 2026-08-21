@@ -8,7 +8,7 @@ import (
 func TestCertificateIdentityScopesLabsAndActions(t *testing.T) {
 	uris, err := URIs(RoleOperator,
 		[]string{"cos461", "advnet", "cos461"},
-		[]string{"inspect", "deploy", "inspect"})
+		[]string{ActionObserve, ActionDeploy, ActionObserve})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -16,10 +16,10 @@ func TestCertificateIdentityScopesLabsAndActions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !got.Allows("cos461", "deploy") || !got.Allows("advnet", "inspect") {
+	if !got.Allows("cos461", ActionDeploy) || !got.Allows("advnet", ActionObserve) {
 		t.Fatal("the declared scope was not admitted")
 	}
-	if got.Allows("multicast", "inspect") || got.Allows("cos461", "destroy") {
+	if got.Allows("multicast", ActionObserve) || got.Allows("cos461", ActionDestroy) {
 		t.Fatal("the certificate escaped its declared scope")
 	}
 }
@@ -44,6 +44,12 @@ func TestIncompleteOrUnknownClaimsAreRefused(t *testing.T) {
 	}
 	if _, err := URIs(RoleOperator, nil, []string{"inspect"}); err == nil {
 		t.Fatal("an identity with no lab boundary was issued")
+	}
+	if _, err := URIs(RoleOperator, []string{"cos461"}, []string{"deply"}); err == nil {
+		t.Fatal("a misspelled action was issued as a working credential")
+	}
+	if _, err := URIs(RoleDiagnostic, []string{"*"}, []string{ActionObserve}); err == nil {
+		t.Fatal("a diagnostic credential was issued for every lab")
 	}
 	if _, err := FromCertificate(&x509.Certificate{}); err == nil {
 		t.Fatal("a certificate with no identity was accepted")

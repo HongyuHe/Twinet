@@ -111,7 +111,7 @@ func TestIssuedIdentitiesCarryAuthorizationBoundaries(t *testing.T) {
 	}
 
 	scoped, err := IssueScoped(dir, t.TempDir(), "course-ta", authz.RoleOperator,
-		[]string{"cos461"}, []string{"inspect", "deploy"}, 8*time.Hour)
+		[]string{"cos461"}, []string{authz.ActionObserve, authz.ActionDeploy}, 8*time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
