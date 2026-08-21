@@ -86,4 +86,7 @@ func init() {
 	Register("docker", BackendCapabilities{
 		Lifecycle: true, Exec: true, Copy: true, NetworkNamespaces: true, Events: true,
 	}, func() Runtime { return NewDocker() })
+	Register("podman", BackendCapabilities{
+		Lifecycle: true, Exec: true, Copy: true, NetworkNamespaces: true, Events: true,
+	}, func() Runtime { return NewPodman() })
 }

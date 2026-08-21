@@ -11,7 +11,7 @@ import (
 
 const dockerBackendEnv = "TWINET_DOCKER_BACKEND"
 
-type dockerBackend interface {
+type engineBackend interface {
 	Close() error
 	Ping(context.Context) (string, error)
 	ImageExists(context.Context, string) (bool, error)
@@ -39,7 +39,7 @@ type Docker struct {
 	mode string
 
 	once    sync.Once
-	backend dockerBackend
+	backend engineBackend
 	err     error
 }
 
@@ -71,7 +71,7 @@ func (d *Docker) initialize() {
 	}
 }
 
-func (d *Docker) backendFor() (dockerBackend, error) {
+func (d *Docker) backendFor() (engineBackend, error) {
 	d.once.Do(d.initialize)
 	if d.err != nil {
 		return nil, d.err

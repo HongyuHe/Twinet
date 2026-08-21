@@ -53,11 +53,20 @@ func normalizeContainerEvent(container, name, action string, attributes map[stri
 }
 
 func normalizeEventAction(action string) (EventAction, bool) {
-	switch EventAction(strings.TrimSpace(action)) {
+	action = strings.TrimSpace(action)
+	switch EventAction(action) {
 	case EventCreate, EventStart, EventDie, EventStop, EventDestroy, EventRestart, EventOOM, EventHealth:
-		return EventAction(strings.TrimSpace(action)), true
+		return EventAction(action), true
 	}
-	if strings.HasPrefix(strings.TrimSpace(action), "health_status") {
+	// Podman's compatibility API can emit its native past-tense forms even
+	// through a Docker-compatible endpoint.
+	switch action {
+	case "died", "exited":
+		return EventDie, true
+	case "remove", "removed":
+		return EventDestroy, true
+	}
+	if strings.HasPrefix(action, "health_status") {
 		return EventHealth, true
 	}
 	return "", false

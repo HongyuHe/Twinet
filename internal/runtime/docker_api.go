@@ -29,6 +29,7 @@ const (
 
 type dockerAPI struct {
 	client *mobyclient.Client
+	engine string
 
 	eventMu      sync.Mutex
 	eventCancels map[uint64]context.CancelFunc
@@ -45,8 +46,16 @@ func newDockerAPI() (*dockerAPI, error) {
 	}
 	return &dockerAPI{
 		client:       client,
+		engine:       "docker",
 		eventCancels: make(map[uint64]context.CancelFunc),
 	}, nil
+}
+
+func (d *dockerAPI) engineName() string {
+	if d.engine == "" {
+		return "docker"
+	}
+	return d.engine
 }
 
 func (d *dockerAPI) Close() error {
@@ -67,7 +76,7 @@ func (d *dockerAPI) Close() error {
 func (d *dockerAPI) Ping(ctx context.Context) (string, error) {
 	version, err := d.client.ServerVersion(ctx, mobyclient.ServerVersionOptions{})
 	if err != nil {
-		return "", fmt.Errorf("docker engine ping: %w", err)
+		return "", fmt.Errorf("%s engine ping: %w", d.engineName(), err)
 	}
 	return version.Version, nil
 }
@@ -181,11 +190,11 @@ func (d *dockerAPI) PullImage(ctx context.Context, ref string, policy PullPolicy
 
 	stream, err := d.client.ImagePull(ctx, ref, mobyclient.ImagePullOptions{})
 	if err != nil {
-		return fmt.Errorf("docker pull %s: %w", ref, err)
+		return fmt.Errorf("%s pull %s: %w", d.engineName(), ref, err)
 	}
 	defer stream.Close()
 	if err := stream.Wait(ctx); err != nil {
-		return fmt.Errorf("docker pull %s: %w", ref, err)
+		return fmt.Errorf("%s pull %s: %w", d.engineName(), ref, err)
 	}
 	return nil
 }
@@ -201,7 +210,7 @@ func (d *dockerAPI) Create(ctx context.Context, spec *Spec) (string, error) {
 		Name:       spec.Name,
 	})
 	if err != nil {
-		return "", fmt.Errorf("docker create %s: %w", spec.Name, err)
+		return "", fmt.Errorf("%s create %s: %w", d.engineName(), spec.Name, err)
 	}
 	return created.ID, nil
 }
@@ -405,7 +414,7 @@ func dockerRestartPolicy(value string) (container.RestartPolicy, error) {
 func (d *dockerAPI) Start(ctx context.Context, name string) error {
 	_, err := d.client.ContainerStart(ctx, name, mobyclient.ContainerStartOptions{})
 	if err != nil {
-		return fmt.Errorf("docker start %s: %w", name, err)
+		return fmt.Errorf("%s start %s: %w", d.engineName(), name, err)
 	}
 	return nil
 }
@@ -424,7 +433,7 @@ func (d *dockerAPI) ImageDigest(ctx context.Context, ref string) (string, error)
 func (d *dockerAPI) Pause(ctx context.Context, name string) error {
 	_, err := d.client.ContainerPause(ctx, name, mobyclient.ContainerPauseOptions{})
 	if err != nil {
-		return fmt.Errorf("docker pause %s: %w", name, err)
+		return fmt.Errorf("%s pause %s: %w", d.engineName(), name, err)
 	}
 	return nil
 }
@@ -432,7 +441,7 @@ func (d *dockerAPI) Pause(ctx context.Context, name string) error {
 func (d *dockerAPI) Unpause(ctx context.Context, name string) error {
 	_, err := d.client.ContainerUnpause(ctx, name, mobyclient.ContainerUnpauseOptions{})
 	if err != nil {
-		return fmt.Errorf("docker unpause %s: %w", name, err)
+		return fmt.Errorf("%s unpause %s: %w", d.engineName(), name, err)
 	}
 	return nil
 }
@@ -444,7 +453,7 @@ func (d *dockerAPI) Stop(ctx context.Context, name string, timeout time.Duration
 	}
 	_, err := d.client.ContainerStop(ctx, name, mobyclient.ContainerStopOptions{Timeout: &seconds})
 	if err != nil {
-		return fmt.Errorf("docker stop %s: %w", name, err)
+		return fmt.Errorf("%s stop %s: %w", d.engineName(), name, err)
 	}
 	return nil
 }
@@ -458,7 +467,7 @@ func (d *dockerAPI) Remove(ctx context.Context, name string, force bool) error {
 		return nil
 	}
 	if err != nil {
-		return fmt.Errorf("docker rm %s: %w", name, err)
+		return fmt.Errorf("%s rm %s: %w", d.engineName(), name, err)
 	}
 	return nil
 }
@@ -469,7 +478,7 @@ func (d *dockerAPI) Inspect(ctx context.Context, name string) (Container, error)
 		return Container{Name: name, State: StateAbsent}, nil
 	}
 	if err != nil {
-		return Container{}, fmt.Errorf("docker inspect %s: %w", name, err)
+		return Container{}, fmt.Errorf("%s inspect %s: %w", d.engineName(), name, err)
 	}
 	return fromAPIInspect(inspected.Container), nil
 }
@@ -510,7 +519,7 @@ func (d *dockerAPI) List(ctx context.Context, filter Filter) ([]Container, error
 		Filters: filters,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("docker ps: %w", err)
+		return nil, fmt.Errorf("%s ps: %w", d.engineName(), err)
 	}
 	if len(listed.Items) == 0 {
 		return nil, nil
@@ -555,7 +564,7 @@ func (d *dockerAPI) List(ctx context.Context, filter Filter) ([]Container, error
 					}
 					inspected, err := d.client.ContainerInspect(batchCtx, listed.Items[i].ID, mobyclient.ContainerInspectOptions{})
 					if err != nil {
-						fail(fmt.Errorf("docker inspect %s: %w", listed.Items[i].ID, err))
+						fail(fmt.Errorf("%s inspect %s: %w", d.engineName(), listed.Items[i].ID, err))
 						return
 					}
 					containers[i] = fromAPIInspect(inspected.Container)
@@ -597,18 +606,18 @@ func (d *dockerAPI) Exec(ctx context.Context, name string, cmd ExecCmd) (ExecRes
 		Cmd:          append([]string(nil), cmd.Cmd...),
 	})
 	if err != nil {
-		return ExecResult{}, fmt.Errorf("docker exec %s: %w", name, err)
+		return ExecResult{}, fmt.Errorf("%s exec %s: %w", d.engineName(), name, err)
 	}
 	if cmd.Detach {
 		if _, err := d.client.ExecStart(ctx, created.ID, mobyclient.ExecStartOptions{Detach: true, TTY: cmd.TTY}); err != nil {
-			return ExecResult{}, fmt.Errorf("docker exec %s: %w", name, err)
+			return ExecResult{}, fmt.Errorf("%s exec %s: %w", d.engineName(), name, err)
 		}
 		return ExecResult{Stdout: created.ID + "\n"}, nil
 	}
 
 	attached, err := d.client.ExecAttach(ctx, created.ID, mobyclient.ExecAttachOptions{TTY: cmd.TTY})
 	if err != nil {
-		return ExecResult{}, fmt.Errorf("docker exec %s: %w", name, err)
+		return ExecResult{}, fmt.Errorf("%s exec %s: %w", d.engineName(), name, err)
 	}
 	defer attached.Close()
 
@@ -646,7 +655,7 @@ func (d *dockerAPI) Exec(ctx context.Context, name string, cmd ExecCmd) (ExecRes
 		if ctx.Err() != nil {
 			return result, ctx.Err()
 		}
-		return result, fmt.Errorf("docker exec %s: read output: %w", name, err)
+		return result, fmt.Errorf("%s exec %s: read output: %w", d.engineName(), name, err)
 	}
 	if ctx.Err() != nil {
 		return result, ctx.Err()
@@ -655,7 +664,7 @@ func (d *dockerAPI) Exec(ctx context.Context, name string, cmd ExecCmd) (ExecRes
 		select {
 		case err := <-stdinDone:
 			if err != nil {
-				return result, fmt.Errorf("docker exec %s: write stdin: %w", name, err)
+				return result, fmt.Errorf("%s exec %s: write stdin: %w", d.engineName(), name, err)
 			}
 		default:
 		}
@@ -663,7 +672,7 @@ func (d *dockerAPI) Exec(ctx context.Context, name string, cmd ExecCmd) (ExecRes
 
 	inspected, err := d.client.ExecInspect(ctx, created.ID, mobyclient.ExecInspectOptions{})
 	if err != nil {
-		return result, fmt.Errorf("docker exec %s: inspect: %w", name, err)
+		return result, fmt.Errorf("%s exec %s: inspect: %w", d.engineName(), name, err)
 	}
 	result.ExitCode = inspected.ExitCode
 	return result, nil
@@ -697,7 +706,7 @@ func (d *dockerAPI) CopyTo(ctx context.Context, name, dst string, mode int64, co
 		Content:         bytes.NewReader(archive.Bytes()),
 	})
 	if err != nil {
-		return fmt.Errorf("docker cp into %s:%s: %w", name, dir, err)
+		return fmt.Errorf("%s cp into %s:%s: %w", d.engineName(), name, dir, err)
 	}
 	return nil
 }
@@ -720,7 +729,7 @@ func (d *dockerAPI) copyFrom(ctx context.Context, name, src string, follow bool)
 	}
 	archive, err := d.client.CopyFromContainer(ctx, name, mobyclient.CopyFromContainerOptions{SourcePath: src})
 	if err != nil {
-		return nil, fmt.Errorf("docker cp from %s:%s: %w", name, src, err)
+		return nil, fmt.Errorf("%s cp from %s:%s: %w", d.engineName(), name, src, err)
 	}
 	defer drainAndClose(archive.Content)
 
@@ -748,13 +757,13 @@ func (d *dockerAPI) resolveFinalLink(ctx context.Context, name, src string) (str
 	seen := make(map[string]struct{}, maxFollowLinks)
 	for range maxFollowLinks {
 		if _, ok := seen[src]; ok {
-			return "", fmt.Errorf("docker cp from %s:%s: symbolic link cycle", name, src)
+			return "", fmt.Errorf("%s cp from %s:%s: symbolic link cycle", d.engineName(), name, src)
 		}
 		seen[src] = struct{}{}
 
 		stat, err := d.client.ContainerStatPath(ctx, name, mobyclient.ContainerStatPathOptions{Path: src})
 		if err != nil {
-			return "", fmt.Errorf("docker cp from %s:%s: %w", name, src, err)
+			return "", fmt.Errorf("%s cp from %s:%s: %w", d.engineName(), name, src, err)
 		}
 		if stat.Stat.LinkTarget == "" {
 			return src, nil
@@ -765,7 +774,7 @@ func (d *dockerAPI) resolveFinalLink(ctx context.Context, name, src string) (str
 			src = path.Clean(path.Join(path.Dir(src), stat.Stat.LinkTarget))
 		}
 	}
-	return "", fmt.Errorf("docker cp from %s:%s: too many symbolic links", name, src)
+	return "", fmt.Errorf("%s cp from %s:%s: too many symbolic links", d.engineName(), name, src)
 }
 
 func drainAndClose(stream io.ReadCloser) {
