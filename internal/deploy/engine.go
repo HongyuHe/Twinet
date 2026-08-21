@@ -23,6 +23,7 @@ import (
 	"sync"
 
 	"github.com/HongyuHe/twinet/internal/alloc"
+	"github.com/HongyuHe/twinet/internal/images"
 	"github.com/HongyuHe/twinet/internal/limiter"
 	"github.com/HongyuHe/twinet/internal/model"
 	"github.com/HongyuHe/twinet/internal/netx"
@@ -53,6 +54,10 @@ const (
 	LabelRegion   = "twinet.region"
 	LabelManaged  = "twinet.managed"
 	LabelDeviceID = "twinet.device-id"
+	// LabelImageLock records the exact checked image-lock document that
+	// produced this container. It ties runtime observation back to reports
+	// without trusting a mutable tag.
+	LabelImageLock = "twinet.image-lock"
 	// LabelFRRControl marks the privileged control-plane sidecar for an FRR
 	// router. It shares the router network namespace and FRR config/vty
 	// directories, but is a separate container that a student shell cannot
@@ -134,6 +139,10 @@ type Engine struct {
 	// unprivileged router shell and its privileged FRR control sidecar. Empty
 	// selects the node-local runtime path.
 	FRRControlRoot string
+	// RequireImmutableImages rejects a post-pull image that cannot be proven
+	// to match a registry manifest digest. It is set for release and grading
+	// image policies; development remains explicitly tag-capable.
+	RequireImmutableImages bool
 
 	// pendingRestore records devices whose captured configuration must be
 	// replayed once their interfaces exist.
@@ -197,7 +206,6 @@ func (e *Engine) Build(top *model.Topology) (*plan.Plan, error) {
 	imageStep := map[string]string{}
 	for _, img := range sortedKeys(images) {
 		id := "image:" + img
-		imageStep[img] = id
 		image := img
 		p.Add(&plan.Step{
 			ID: id, Stage: plan.StageImage, Describe: "pull " + image,
@@ -207,6 +215,17 @@ func (e *Engine) Build(top *model.Topology) (*plan.Plan, error) {
 				})
 			},
 		})
+		verifyID := "verify-image:" + img
+		p.Add(&plan.Step{
+			ID: verifyID, Stage: plan.StageImage, Describe: "verify " + image,
+			Needs: []string{id},
+			Run: func(ctx context.Context) error {
+				return e.limited(ctx, []limiter.Kind{limiter.Apply, limiter.ImagePull}, func() error {
+					return e.verifyPulledImage(ctx, image)
+				})
+			},
+		})
+		imageStep[img] = verifyID
 	}
 
 	// Create and start each container.
@@ -310,6 +329,31 @@ func (e *Engine) Build(top *model.Topology) (*plan.Plan, error) {
 	}
 
 	return p, p.Validate()
+}
+
+// verifyPulledImage runs after the pull and before any container is created.
+// Pre-pull agreement alone is insufficient: a moving tag can change between a
+// controller's survey and a node's pull.
+func (e *Engine) verifyPulledImage(ctx context.Context, ref string) error {
+	actual, err := e.Runtime.ImageDigest(ctx, ref)
+	if err != nil || strings.TrimSpace(actual) == "" {
+		if err == nil {
+			err = errors.New("runtime returned an empty image identity")
+		}
+		return fmt.Errorf("verify pulled image %s: %w", ref, err)
+	}
+	expected := images.Digest(ref)
+	if expected == "" {
+		if e.RequireImmutableImages {
+			return fmt.Errorf("verify pulled image %s: release/grading mode requires an immutable registry digest", ref)
+		}
+		return nil
+	}
+	if !images.SameDigest(ref, actual) {
+		return fmt.Errorf("verify pulled image %s: runtime reports %s, want %s",
+			ref, actual, expected)
+	}
+	return nil
 }
 
 func (e *Engine) pullPolicy() runtime.PullPolicy {
@@ -1078,6 +1122,9 @@ func (e *Engine) labels(top *model.Topology, d *model.Device) map[string]string 
 		LabelHash:     top.Hash,
 		LabelSpec:     SpecHash(d),
 	}
+	if top.Lab != nil && top.Lab.Images.LockDigest != "" {
+		out[LabelImageLock] = top.Lab.Images.LockDigest
+	}
 	setRequestLabels(out, request)
 	if e.Generation != "" {
 		out[LabelGen] = e.Generation
@@ -1551,18 +1598,32 @@ func (e *Engine) Destroy(ctx context.Context, lab string) error {
 		return err
 	}
 	sort.Slice(cs, func(i, j int) bool { return cs[i].Name < cs[j].Name })
-	started, errs, ctxErr := e.runBounded(ctx, len(cs), func(i int) error {
-		return e.limited(ctx, []limiter.Kind{limiter.Lifecycle}, func() error {
-			return e.Runtime.Remove(ctx, cs[i].Name, true)
-		})
-	})
 	var problems []string
-	for i, c := range cs {
-		if !started[i] {
-			continue
+	var ctxErr error
+	// Podman (correctly) refuses to remove a network-namespace parent while
+	// the private FRR control sidecar still joins it. Docker happened to
+	// remove dependent containers under force, which hid the ordering bug.
+	// Remove all internal dependants first, then retain bounded parallelism
+	// among independent topology containers.
+	for _, group := range removalGroups(cs) {
+		started, errs, groupCtxErr := e.runBounded(ctx, len(group), func(i int) error {
+			return e.limited(ctx, []limiter.Kind{limiter.Lifecycle}, func() error {
+				return e.Runtime.Remove(ctx, group[i].Name, true)
+			})
+		})
+		if ctxErr == nil {
+			ctxErr = groupCtxErr
 		}
-		if err := errs[i]; err != nil {
-			problems = append(problems, fmt.Sprintf("remove %s: %v", c.Name, err))
+		for i, c := range group {
+			if !started[i] {
+				continue
+			}
+			if err := errs[i]; err != nil {
+				problems = append(problems, fmt.Sprintf("remove %s: %v", c.Name, err))
+			}
+		}
+		if groupCtxErr != nil {
+			break
 		}
 	}
 	if ctxErr == nil {
@@ -1579,6 +1640,26 @@ func (e *Engine) Destroy(ctx context.Context, lab string) error {
 		}
 	}
 	return deterministicError(ctxErr, problems)
+}
+
+func removalGroups(containers []runtime.Container) [][]runtime.Container {
+	internal := make([]runtime.Container, 0, len(containers))
+	ordinary := make([]runtime.Container, 0, len(containers))
+	for _, container := range containers {
+		if container.Labels[LabelInternal] == "true" || container.Labels[LabelFRRControl] == "true" {
+			internal = append(internal, container)
+		} else {
+			ordinary = append(ordinary, container)
+		}
+	}
+	var groups [][]runtime.Container
+	if len(internal) > 0 {
+		groups = append(groups, internal)
+	}
+	if len(ordinary) > 0 {
+		groups = append(groups, ordinary)
+	}
+	return groups
 }
 
 // DestroyOverlays removes host-side veths and VNI bindings for the given

@@ -2,7 +2,6 @@ package cli
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -16,9 +15,11 @@ import (
 	"github.com/HongyuHe/twinet/internal/agent"
 	"github.com/HongyuHe/twinet/internal/alloc"
 	"github.com/HongyuHe/twinet/internal/client"
+	"github.com/HongyuHe/twinet/internal/contract"
 	"github.com/HongyuHe/twinet/internal/limiter"
 	"github.com/HongyuHe/twinet/internal/model"
 	"github.com/HongyuHe/twinet/internal/place"
+	"github.com/HongyuHe/twinet/internal/runtime"
 )
 
 // tokenFor resolves the shared secret the control plane presents to agents.
@@ -46,8 +47,9 @@ func clustered(top *model.Topology) bool {
 
 func newNodeCmd(opts *Options) *cobra.Command {
 	var (
-		token        string
-		bootstrapPKI string
+		token              string
+		bootstrapPKI       string
+		bootstrapTokenFile string
 	)
 	cmd := &cobra.Command{
 		Use:   "node",
@@ -98,7 +100,7 @@ func newNodeCmd(opts *Options) *cobra.Command {
 			// those is something the next command will refuse to do, and being
 			// told afterwards is not the same as being told.
 			w := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
-			fmt.Fprintln(w, "NODE\tSTATE\tVERSION\tRUNTIME\tALLOCATABLE\tRESERVED\tLOAD\tPRESSURE\tIMAGES\tUNDERLAY\tCONTAINERS\tLAB")
+			fmt.Fprintln(w, "NODE\tSTATE\tSOURCE\tRUNTIME\tCONTRACTS\tSOCKET\tALLOCATABLE\tRESERVED\tLOAD\tPRESSURE\tIMAGES\tUNDERLAY\tCONTAINERS\tLAB")
 			bad, degraded := 0, 0
 			for _, r := range results {
 				if r.Err != nil {
@@ -107,7 +109,7 @@ func newNodeCmd(opts *Options) *cobra.Command {
 					continue
 				}
 				v := r.Value
-				state, why := nodeState(v, Version)
+				state, why := nodeState(v, agent.Compatibility())
 				if state != "ok" {
 					degraded++
 				}
@@ -115,8 +117,9 @@ func newNodeCmd(opts *Options) *cobra.Command {
 				if why != "" {
 					lab = why
 				}
-				fmt.Fprintf(w, "%s\t%s\t%s\t%s %s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\n",
-					r.Node, state, v.Version, v.Runtime, v.RuntimeVer,
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s %s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\n",
+					r.Node, state, v.Version, v.Runtime, v.RuntimeVer, contractSummary(v.Compatibility),
+					dash(v.RuntimeSocket),
 					inventorySummary(v.Inventory.Allocatable), inventorySummary(v.Inventory.Reserved),
 					loadSummary(v.Inventory.Load), limiterPressureSummary(v.Backpressure),
 					imageCacheSummary(v.Inventory.ImageCache),
@@ -184,10 +187,6 @@ It refuses to generate a remotely reachable bearer-token-only agent.`,
 			if err != nil {
 				return err
 			}
-			tok, err := tokenFor(token)
-			if err != nil {
-				return err
-			}
 			if bootstrapPKI == "" {
 				bootstrapPKI = filepath.Join(top.Lab.Dir, ".twinet", "pki")
 			}
@@ -219,13 +218,27 @@ It refuses to generate a remotely reachable bearer-token-only agent.`,
 							path, err)
 					}
 				}
-				fmt.Fprint(cmd.OutOrStdout(), bootstrapScript(n, tok, bootstrapPKI))
+				selectedRuntime := top.Lab.RuntimeForNode(name)
+				socket := top.Lab.RuntimeSocketForNode(name)
+				if err := runtime.ValidateSelection(selectedRuntime, socket); err != nil {
+					return fmt.Errorf("cannot bootstrap node %q: %w", name, err)
+				}
+				var peers []string
+				for _, peer := range top.Lab.Placement.Nodes {
+					if peer.Name != name && peer.UnderlayIP != "" {
+						peers = append(peers, peer.UnderlayIP)
+					}
+				}
+				fmt.Fprint(cmd.OutOrStdout(),
+					bootstrapScriptForRuntime(n, selectedRuntime, socket, bootstrapPKI, bootstrapTokenFile, peers))
 			}
 			return nil
 		},
 	}
 	bootstrap.Flags().StringVar(&bootstrapPKI, "pki", "",
 		"directory produced by `twinet node pki`")
+	bootstrap.Flags().StringVar(&bootstrapTokenFile, "token-file", "",
+		"root-readable environment file containing TWINET_TOKEN (default $TWINET_TOKEN_FILE)")
 
 	cmd.AddCommand(status, check, bootstrap, newNodePKICmd(opts), newNodeSweepCmd(opts), newNodeDrainCmd(opts, &token))
 	return cmd
@@ -333,7 +346,20 @@ func newNodeDrainCmd(opts *Options, token *string) *cobra.Command {
 	return cmd
 }
 
-func bootstrapScript(n model.NodeSpec, token, pkiDir string) string {
+// bootstrapScript keeps direct unit callers on the Docker-compatible default.
+// The CLI resolves the lab default and node override through the runtime
+// registry before it calls bootstrapScriptForRuntime.
+func bootstrapScript(n model.NodeSpec, _ string, pkiDir string) string {
+	selected := n.Runtime
+	if selected == "" {
+		selected = model.DefaultRuntime
+	}
+	return bootstrapScriptForRuntime(n, selected, n.RuntimeSocket, pkiDir, "", nil)
+}
+
+func bootstrapScriptForRuntime(n model.NodeSpec, selectedRuntime, socket, pkiDir, tokenFile string,
+	peers []string,
+) string {
 	port := "7200"
 	if n.Addr != "" {
 		if i := strings.LastIndex(n.Addr, ":"); i > 0 {
@@ -350,6 +376,18 @@ func bootstrapScript(n model.NodeSpec, token, pkiDir string) string {
 		host = "127.0.0.1"
 	}
 	listen := host + ":" + port
+	selectedRuntime = strings.ToLower(strings.TrimSpace(selectedRuntime))
+	if selectedRuntime == "" {
+		selectedRuntime = model.DefaultRuntime
+	}
+	if socket == "" {
+		if selectedRuntime == "podman" {
+			socket = "unix:///run/podman/podman.sock"
+		} else {
+			socket = "unix:///var/run/docker.sock"
+		}
+	}
+
 	serverCert := filepath.Join(pkiDir, n.Name+"_server_cert.pem")
 	serverKey := filepath.Join(pkiDir, n.Name+"_server_key.pem")
 	peerCert := filepath.Join(pkiDir, n.Name+"_peer_cert.pem")
@@ -357,65 +395,89 @@ func bootstrapScript(n model.NodeSpec, token, pkiDir string) string {
 	caCert := filepath.Join(pkiDir, "ca_cert.pem")
 	controllerCert := filepath.Join(pkiDir, "controller_cert.pem")
 	controllerKey := filepath.Join(pkiDir, "controller_key.pem")
-	encodedToken := base64.StdEncoding.EncodeToString([]byte("TWINET_TOKEN=" + token))
 
 	var b strings.Builder
 	b.WriteString("set -euo pipefail\n")
 	fmt.Fprintf(&b, "# ---- %s ----\n", n.Name)
+	b.WriteString("command -v curl >/dev/null 2>&1 || { echo 'bootstrap needs curl on the controller' >&2; exit 1; }\n")
+	b.WriteString("command -v python3 >/dev/null 2>&1 || { echo 'bootstrap needs python3 on the controller' >&2; exit 1; }\n")
+	if tokenFile != "" {
+		fmt.Fprintf(&b, "export TWINET_TOKEN_FILE=%q\n", tokenFile)
+	}
+	b.WriteString(": \"${TWINET_TOKEN_FILE:?set TWINET_TOKEN_FILE to a file containing TWINET_TOKEN=...}\"\n")
+	b.WriteString("test -f \"$TWINET_TOKEN_FILE\" || { echo 'token file does not exist' >&2; exit 1; }\n")
+	b.WriteString("grep -Eq '^TWINET_TOKEN=[^[:space:]]+' \"$TWINET_TOKEN_FILE\" || { echo 'token file must contain TWINET_TOKEN=...' >&2; exit 1; }\n")
+	fmt.Fprintf(&b, "ssh root@%s 'install -d -m 0700 /etc/twinet/pki /var/lib/twinet/state'\n", n.Name)
 	fmt.Fprintf(&b, "scp bin/twinetd root@%s:/usr/local/bin/twinetd\n", n.Name)
-	fmt.Fprintf(&b, "ssh root@%s 'install -d -m 0700 /etc/twinet/pki'\n", n.Name)
 	fmt.Fprintf(&b, "scp %q root@%s:/etc/twinet/pki/server_cert.pem\n", serverCert, n.Name)
 	fmt.Fprintf(&b, "scp %q root@%s:/etc/twinet/pki/server_key.pem\n", serverKey, n.Name)
 	fmt.Fprintf(&b, "scp %q root@%s:/etc/twinet/pki/peer_cert.pem\n", peerCert, n.Name)
 	fmt.Fprintf(&b, "scp %q root@%s:/etc/twinet/pki/peer_key.pem\n", peerKey, n.Name)
 	fmt.Fprintf(&b, "scp %q root@%s:/etc/twinet/pki/ca_cert.pem\n", caCert, n.Name)
-	// The token goes in a file only root can read, not in the unit.
-	//
-	// A systemd unit is world-readable by default and `Environment=` puts the
-	// value in plain sight -- so the cluster secret was legible to every
-	// account on the node, including the unprivileged one an evaluated RCA
-	// agent runs as. That agent could read it, discard its own read-only
-	// credential, and act as the controller across every lab on the cluster.
-	fmt.Fprintf(&b, "ssh root@%s 'set -e\n", n.Name)
-	b.WriteString("command -v docker >/dev/null 2>&1 || { echo \"Docker is required on this node\" >&2; exit 1; }\n")
-	b.WriteString("docker version >/dev/null\n")
+	// The token is copied from a root-readable environment file. It is never
+	// embedded in the script or in the world-readable systemd unit.
+	fmt.Fprintf(&b, "scp \"$TWINET_TOKEN_FILE\" root@%s:/etc/twinet/agent.env\n", n.Name)
+	fmt.Fprintf(&b, "ssh root@%s 'bash -s' <<'TWINET_REMOTE'\n", n.Name)
+	b.WriteString("set -euo pipefail\n")
+	b.WriteString("install_package() {\n")
+	b.WriteString("  command -v \"$1\" >/dev/null 2>&1 && return 0\n")
+	b.WriteString("  command -v apt-get >/dev/null 2>&1 || { echo \"missing $1; automatic install needs apt-get\" >&2; exit 1; }\n")
+	b.WriteString("  export DEBIAN_FRONTEND=noninteractive\n  apt-get update\n  apt-get install -y \"$2\"\n}\n")
+	if selectedRuntime == "podman" {
+		b.WriteString("install_package podman podman\nsystemctl enable --now podman.socket\npodman info >/dev/null\n")
+		if socketPath := strings.TrimPrefix(socket, "unix://"); strings.HasPrefix(socket, "unix://") || strings.HasPrefix(socket, "/") {
+			fmt.Fprintf(&b, "test -S %q || { echo 'Podman API socket is unavailable' >&2; exit 1; }\n", socketPath)
+		}
+	} else {
+		b.WriteString("install_package docker docker.io\nsystemctl enable --now docker.service\ndocker info >/dev/null\n")
+	}
 	b.WriteString("install -d -m 0700 /etc/twinet /var/lib/twinet/state\n")
-	fmt.Fprintf(&b, "umask 077; printf %%s %s | base64 -d > /etc/twinet/agent.env\n",
-		encodedToken)
-	b.WriteString("chmod 0600 /etc/twinet/agent.env\n")
-	b.WriteString("chmod 0600 /etc/twinet/pki/server_key.pem\n")
-	b.WriteString("chmod 0600 /etc/twinet/pki/peer_key.pem\n")
-	b.WriteString("chmod 0644 /etc/twinet/pki/server_cert.pem /etc/twinet/pki/ca_cert.pem\n")
-	b.WriteString("chmod 0644 /etc/twinet/pki/peer_cert.pem\n")
-	b.WriteString("cat > /etc/systemd/system/twinetd.service <<UNIT\n")
-	b.WriteString("[Unit]\nDescription=Twinet node agent\nAfter=docker.service\nRequires=docker.service\n\n")
-	b.WriteString("[Service]\nType=simple\n")
-	b.WriteString("EnvironmentFile=/etc/twinet/agent.env\n")
-	fmt.Fprintf(&b, "ExecStart=/usr/local/bin/twinetd -node %s -listen %s", n.Name, listen)
+	b.WriteString("chmod 0755 /usr/local/bin/twinetd\n")
+	b.WriteString("chmod 0600 /etc/twinet/agent.env /etc/twinet/pki/server_key.pem /etc/twinet/pki/peer_key.pem\n")
+	b.WriteString("chmod 0644 /etc/twinet/pki/server_cert.pem /etc/twinet/pki/peer_cert.pem /etc/twinet/pki/ca_cert.pem\n")
+	b.WriteString("cat > /etc/systemd/system/twinetd.service <<'UNIT'\n[Unit]\nDescription=Twinet node agent\n")
+	if selectedRuntime == "podman" {
+		b.WriteString("After=podman.socket\nRequires=podman.socket\n\n")
+	} else {
+		b.WriteString("After=docker.service\nRequires=docker.service\n\n")
+	}
+	b.WriteString("[Service]\nType=simple\nEnvironmentFile=/etc/twinet/agent.env\n")
+	fmt.Fprintf(&b, "ExecStart=/usr/local/bin/twinetd -node %s -listen %s -runtime %s -runtime-socket %s",
+		n.Name, listen, selectedRuntime, socket)
 	if n.UnderlayIP != "" {
 		fmt.Fprintf(&b, " -underlay-ip %s", n.UnderlayIP)
 	}
-	b.WriteString(" -tls-cert /etc/twinet/pki/server_cert.pem")
-	b.WriteString(" -tls-key /etc/twinet/pki/server_key.pem")
-	b.WriteString(" -client-ca /etc/twinet/pki/ca_cert.pem")
-	b.WriteString(" -peer-tls-cert /etc/twinet/pki/peer_cert.pem")
-	b.WriteString(" -peer-tls-key /etc/twinet/pki/peer_key.pem")
-	b.WriteString("\nRestart=always\nRestartSec=2\n")
-	// The agent creates namespaces and rewires the host, so it needs the
-	// capabilities; it does not need the rest of root's authority.
+	if n.UnderlayDev != "" {
+		fmt.Fprintf(&b, " -underlay-dev %s", n.UnderlayDev)
+	}
+	b.WriteString(" -tls-cert /etc/twinet/pki/server_cert.pem -tls-key /etc/twinet/pki/server_key.pem")
+	b.WriteString(" -client-ca /etc/twinet/pki/ca_cert.pem -peer-tls-cert /etc/twinet/pki/peer_cert.pem -peer-tls-key /etc/twinet/pki/peer_key.pem\n")
+	b.WriteString("Restart=always\nRestartSec=2\n")
 	b.WriteString("AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_NET_RAW\n")
 	b.WriteString("CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_NET_RAW CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER CAP_SETUID CAP_SETGID\n")
-	b.WriteString("NoNewPrivileges=true\nPrivateTmp=true\nProtectHome=true\n")
-	b.WriteString("LimitNOFILE=1048576\nTasksMax=infinity\n\n")
+	b.WriteString("NoNewPrivileges=true\nPrivateTmp=true\nProtectHome=true\nLimitNOFILE=1048576\nTasksMax=infinity\n\n")
 	b.WriteString("[Install]\nWantedBy=multi-user.target\nUNIT\n")
 	b.WriteString("systemctl daemon-reload && systemctl enable --now twinetd\n")
-	b.WriteString("systemctl is-active --quiet twinetd || { journalctl -u twinetd -n 50 --no-pager >&2; exit 1; }'\n")
-	fmt.Fprintf(&b, "twinet_token=$(printf %%s %s | base64 -d); twinet_token=${twinet_token#TWINET_TOKEN=}\n",
-		encodedToken)
-	fmt.Fprintf(&b, "curl --fail --silent --show-error --cacert %q --cert %q --key %q "+
-		"-H \"Authorization: Bearer $twinet_token\" https://%s/v1/status >/dev/null\n",
+	b.WriteString("systemctl is-active --quiet twinetd || { journalctl -u twinetd -n 50 --no-pager >&2; exit 1; }\n")
+	for _, peer := range peers {
+		fmt.Fprintf(&b, "ping -c 1 -W 2 %s >/dev/null || { echo 'underlay peer unreachable: %s' >&2; exit 1; }\n", peer, peer)
+	}
+	b.WriteString("TWINET_REMOTE\n")
+	b.WriteString("TWINET_TOKEN=$(sed -n 's/^TWINET_TOKEN=//p' \"$TWINET_TOKEN_FILE\" | head -n 1)\n")
+	b.WriteString("test -n \"$TWINET_TOKEN\" || { echo 'token file did not yield TWINET_TOKEN' >&2; exit 1; }\n")
+	fmt.Fprintf(&b, "status_json=$(curl --fail --silent --show-error --cacert %q --cert %q --key %q --header @<(printf 'Authorization: Bearer %%s\\n' \"$TWINET_TOKEN\") https://%s/v1/status)\n",
 		caCert, controllerCert, controllerKey, listen)
-	fmt.Fprintf(&b, "echo '%s: secure agent is healthy at https://%s'\n\n", n.Name, listen)
+	underlay := n.UnderlayIP
+	if underlay == "" {
+		underlay = "-"
+	}
+	b.WriteString("printf '%s' \"$status_json\" | python3 -c 'import json,sys; s=json.load(sys.stdin); runtime,socket,underlay=sys.argv[1:]; ")
+	b.WriteString("assert s.get(\"runtime\")==runtime, s; assert s.get(\"runtime_version\"), s; assert s.get(\"runtime_socket\")==socket, s; ")
+	b.WriteString("c=s.get(\"compatibility\",{}); assert c.get(\"protocol\",{}).get(\"current\"), s; assert c.get(\"renderer\",{}).get(\"current\"), s; assert c.get(\"state\",{}).get(\"current\"), s; ")
+	b.WriteString("assert \"image_cache\" in s.get(\"inventory\",{}), s; assert s.get(\"state_store_healthy\") is True, s; ")
+	b.WriteString("assert underlay==\"-\" or (s.get(\"underlay_ip\")==underlay and s.get(\"underlay_mtu\",0)>0), s' ")
+	fmt.Fprintf(&b, "%q %q %q\n", selectedRuntime, socket, underlay)
+	fmt.Fprintf(&b, "echo '%s: secure %s agent is healthy at https://%s'\n\n", n.Name, selectedRuntime, listen)
 	return b.String()
 }
 
@@ -444,26 +506,9 @@ func deconflictOverlays(ctx context.Context, c *client.Cluster, top *model.Topol
 	return moved
 }
 
-// checkVersionSkew refuses to deploy when a node's agent is not this build.
-//
-// It used to print a warning and carry on, on the reasonable-sounding grounds
-// that a version difference is usually harmless. It is not harmless here,
-// because the agent renders the device configuration. A controller that has
-// learned to emit a route distinguisher, or a VRF, or a label-switching stanza
-// hands the node a topology, and the node's older renderer produces the
-// configuration it already knew how to produce. Both halves report success.
-// The deploy says it converged, the manifest is right, the controller's own
-// tests pass, and the routers are configured differently from what anybody
-// asked for.
-//
-// That is not hypothetical: it cost an afternoon during the MPLS work, where
-// the controller emitted the right distinguisher and every router came up with
-// none, because the agents were four commits behind.
-//
-// A warning is the wrong shape for this. It appears in a stream of ordinary
-// output, everything downstream still reports success, and the person reading
-// it has no reason to think the result is invalid. Refusing is the only
-// response that cannot be missed.
+// checkVersionSkew refuses an incompatible protocol, renderer, or state
+// contract before any deployment work. Exact source versions remain in status
+// and audit events but compatible bug-fix builds may roll one node at a time.
 func checkVersionSkew(ctx context.Context, c *client.Cluster) error {
 	// The check itself lives on the cluster, where Apply can enforce it for
 	// every caller. This wrapper remains so the deploy path can report it
@@ -536,6 +581,13 @@ func deployCluster(ctx context.Context, top *model.Topology, tok string, req age
 	}) error {
 	c := client.NewCluster(top.Lab, tok)
 
+	// The runtime is part of the substrate contract. Check it before admission
+	// reads, VNI deconfliction, state migration, or any fenced request so a
+	// Docker agent cannot mutate a lab that explicitly requested Podman.
+	if err := c.RuntimeCompatibility(ctx); err != nil {
+		return err
+	}
+
 	// Admission must precede overlay deconfliction, state migration, record
 	// writes by callers, and every node mutation. A capacity refusal after
 	// any of those has already changed the cluster it was meant to protect.
@@ -560,14 +612,11 @@ func deployCluster(ctx context.Context, top *model.Topology, tok string, req age
 		return fmt.Errorf("the underlay cannot carry this lab; fix the above or lower link_defaults.mtu")
 	}
 
-	// A cluster running mixed binaries produces results that cannot be
-	// attributed to any one version, and the mismatch is otherwise invisible:
-	// every node reports success while behaving differently.
+	// Source builds may differ during a safe rolling upgrade. The independent
+	// protocol, renderer, and state contracts are what determine whether the
+	// nodes can render and persist one lab safely.
 	if err := checkVersionSkew(ctx, c); err != nil {
-		if os.Getenv("TWINET_ALLOW_VERSION_SKEW") == "" {
-			return err
-		}
-		fmt.Fprintf(errOut, "  warning (skew allowed): %v\n", err)
+		return err
 	}
 
 	start := time.Now()
@@ -675,19 +724,30 @@ func restoreScopes(scopes []string) []string {
 // device configuration and a different build renders it differently; a lab
 // with an operation already in flight, because the next command will be
 // refused; and an agent that reports no runtime at all.
-func nodeState(v agent.StatusResponse, controller string) (state, why string) {
-	switch {
-	case v.RuntimeVer == "":
+func nodeState(v agent.StatusResponse, controller contract.Set) (state, why string) {
+	if v.RuntimeVer == "" {
 		return "no-runtime", "the container runtime did not answer"
-	case statusUnknown(v.Unknown, "containers"):
+	}
+	if statusUnknown(v.Unknown, "containers") {
 		return "unknown", "managed container inventory could not be read"
-	case controller != "" && v.Version != "" && v.Version != controller:
-		return "skewed", fmt.Sprintf("agent %s, controller %s: they render configuration "+
-			"differently", v.Version, controller)
-	case len(v.Busy) > 0:
+	}
+	if v.Compatibility.Empty() {
+		return "incompatible", "agent does not advertise protocol, renderer, and state contracts"
+	}
+	if !controller.Empty() {
+		if err := controller.Compatible(v.Compatibility); err != nil {
+			return "incompatible", err.Error()
+		}
+	}
+	if len(v.Busy) > 0 {
 		return "busy", "operation in flight: " + strings.Join(v.Busy, ", ")
 	}
 	return "ok", ""
+}
+
+func contractSummary(value contract.Set) string {
+	return fmt.Sprintf("p%s/r%s/s%s",
+		dash(value.Protocol.Current), dash(value.Renderer.Current), dash(value.State.Current))
 }
 
 func statusUnknown(values []string, want string) bool {

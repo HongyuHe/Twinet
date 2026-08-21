@@ -13,6 +13,9 @@ metadata:
     grader joins a group on one host, sends from another, and reads the
     multicast forwarding tables of the routers in between.
 
+images:
+  mode: development
+
 kinds:
   router:
     image: hyhe/twinet-router:0.1

@@ -178,8 +178,15 @@ type Report struct {
 	// differently with the manifest and the rubric unchanged. The digest is
 	// what makes a regrade comparable, and a dispute answerable.
 	Images map[string]string `json:"images,omitempty"`
+	// ImageLock is the content hash of the checked lock document that bound
+	// this run to immutable image manifests.
+	ImageLock string `json:"image_lock,omitempty"`
 	// Controller is the build of the grader that produced this report.
 	Controller string `json:"controller,omitempty"`
+	// Agents retains exact source builds for every node that participated.
+	// These are audit provenance; contract compatibility, not source equality,
+	// determines whether a rolling upgrade is safe.
+	Agents map[string]string `json:"agents,omitempty"`
 }
 
 // Percent returns the score as a percentage.

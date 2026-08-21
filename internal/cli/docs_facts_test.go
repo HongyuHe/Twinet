@@ -12,7 +12,9 @@ import (
 
 	"github.com/HongyuHe/twinet/internal/agent"
 	"github.com/HongyuHe/twinet/internal/client"
+	"github.com/HongyuHe/twinet/internal/contract"
 	"github.com/HongyuHe/twinet/internal/fault"
+	"github.com/HongyuHe/twinet/internal/images"
 	"github.com/HongyuHe/twinet/internal/model"
 	"github.com/HongyuHe/twinet/internal/netx"
 	"github.com/HongyuHe/twinet/internal/nos"
@@ -295,6 +297,42 @@ func proveDocumentedCapabilities(t *testing.T) []string {
 				if !ok || !caps.Lifecycle || !caps.Exec || !caps.NetworkNamespaces || !caps.Events {
 					t.Fatalf("docker runtime capabilities are incomplete: %#v, registered=%t", caps, ok)
 				}
+			},
+		},
+		{
+			name: "selectable runtime backends",
+			fact: "selectable-runtime-backends",
+			prove: func(t *testing.T) {
+				requireFields(t, reflect.TypeOf(model.Placement{}), "Runtime")
+				requireFields(t, reflect.TypeOf(model.NodeSpec{}), "Runtime", "RuntimeSocket")
+				requireFields(t, reflect.TypeOf(agent.Config{}), "Runtime", "RuntimeSocket")
+				if err := twinetruntime.RequireRoutedLabCapabilities("podman"); err != nil {
+					t.Fatalf("Podman is not a routed-lab runtime: %v", err)
+				}
+			},
+		},
+		{
+			name: "reproducible image locks",
+			fact: "reproducible-image-locks",
+			prove: func(t *testing.T) {
+				requireFields(t, reflect.TypeOf(model.ImagePolicy{}), "Mode", "Lock", "LockDigest")
+				_, err := images.NewLock("topology", "source", "commit", map[string]string{
+					"example/router:v1": "example/router@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+				})
+				if err != nil {
+					t.Fatalf("image lock contract is not usable: %v", err)
+				}
+			},
+		},
+		{
+			name: "rolling compatibility contracts",
+			fact: "rolling-contract-upgrades",
+			prove: func(t *testing.T) {
+				set := agent.Compatibility()
+				if err := set.Compatible(set); err != nil {
+					t.Fatalf("agent compatibility does not accept itself: %v", err)
+				}
+				requireFields(t, reflect.TypeOf(contract.Set{}), "Protocol", "Renderer", "State")
 			},
 		},
 		{

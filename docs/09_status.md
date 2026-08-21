@@ -59,6 +59,9 @@ complete: change the implementation or regenerate the facts through the test.
     "persistent-state",
     "fenced-mutation-leases",
     "docker-engine-api-runtime",
+    "selectable-runtime-backends",
+    "reproducible-image-locks",
+    "rolling-contract-upgrades",
     "shared-vxlan-overlays",
     "replicated-state-and-services",
     "generated-interiors",
@@ -124,7 +127,8 @@ claim.
 | Template expansion and generator registry | source-verified | `internal/expand` covers tiered peerings plus `explicit`, `ring`, `two-tier`, and `clos` interiors |
 | Netlink wiring and shared overlays | source-verified | `internal/netx` tests cover veths, shaping, and one external VXLAN/bridge per lab/node pair with VLAN-to-VNI bindings |
 | Docker Engine API runtime | source-verified | `internal/runtime` registers `docker`; API-client tests cover runtime operations and cancellation |
-| Podman API runtime contract | measured, bounded | Node-0 ran Podman 4.9.3 API integration with `TWINET_PODMAN_INTEGRATION=1 go test -tags=podman_integration -run TestPodmanIntegrationContract ./internal/runtime` in 13.7 s. Registration/testing does **not** imply manifest or agent runtime selection; that work remains pending. |
+| Docker/Podman runtime selection | source-verified; measured, bounded | Typed `placement.runtime` plus per-node overrides select registered backends before mutation; agents report backend/version/socket and controllers refuse a mismatch. Node-0 ran the source-built Podman 4.9.3 routed lifecycle gate (`make podman-integration`): agent status/events, deploy/wire/configure/exec/save/destroy, and cleanup all completed. |
+| Image locks and rolling contracts | source-verified | `twinet images lock|verify` records registry manifest digests; release/grading mode requires a checked lock and agents verify after pull before create. Status separates exact source build from protocol, renderer, and state ranges, allowing compatible rolling bug-fix upgrades while refusing incompatible render/state contracts. |
 | BIRD NOS provider and capability validation | source-verified | `internal/nos` registers FRR/BIRD and tests refuse unsupported requests; this is not a blanket live mixed-NOS acceptance claim |
 | Service/state replication and endpoint policy | source-verified | model, expansion, placement, and durability tests cover replica identity, failure domains, and endpoint selection |
 | Strict live-inventory admission | source-verified | `internal/place`, client, and CLI tests refuse unknown/overloaded capacity before mutation unless audited overcommit is requested |

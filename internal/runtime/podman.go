@@ -19,6 +19,8 @@ var ErrUnsupported = errors.New("runtime operation unsupported")
 
 // Podman drives Podman's Docker-compatible API.
 type Podman struct {
+	host string
+
 	once    sync.Once
 	backend engineBackend
 	err     error
@@ -33,11 +35,39 @@ func NewPodman() *Podman { return &Podman{} }
 // Name identifies the backend.
 func (p *Podman) Name() string { return "podman" }
 
-func (p *Podman) initialize() {
+// SetRuntimeEndpoint selects Podman's Docker-compatible API endpoint before
+// the first operation.
+func (p *Podman) SetRuntimeEndpoint(endpoint string) error {
+	normalized, err := normalizePodmanHost(endpoint)
+	if err != nil {
+		return err
+	}
+	p.host = normalized
+	return nil
+}
+
+// RuntimeEndpoint reports the selected API socket. Resolving the default here
+// keeps status useful before the first operation has initialized the client.
+func (p *Podman) RuntimeEndpoint() string {
+	if p.host != "" {
+		return p.host
+	}
 	host, err := podmanHost()
 	if err != nil {
-		p.err = fmt.Errorf("resolve Podman API host: %w", err)
-		return
+		return ""
+	}
+	return host
+}
+
+func (p *Podman) initialize() {
+	host := p.host
+	if host == "" {
+		var err error
+		host, err = podmanHost()
+		if err != nil {
+			p.err = fmt.Errorf("resolve Podman API host: %w", err)
+			return
+		}
 	}
 	backend, err := newPodmanAPI(host)
 	if err != nil {
@@ -255,7 +285,13 @@ func resolvePodmanHost(getenv func(string) string, euid, uid int) (string, error
 
 func normalizePodmanHost(host string) (string, error) {
 	if strings.HasPrefix(host, "/") {
+		if strings.ContainsAny(host, " \t\r\n") {
+			return "", fmt.Errorf("%s=%q contains whitespace", podmanBackendEnv, host)
+		}
 		return "unix://" + host, nil
+	}
+	if strings.ContainsAny(host, " \t\r\n") {
+		return "", fmt.Errorf("%s=%q contains whitespace", podmanBackendEnv, host)
 	}
 	switch {
 	case strings.HasPrefix(host, "unix://"), strings.HasPrefix(host, "tcp://"):

@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/HongyuHe/twinet/internal/images"
 	"github.com/HongyuHe/twinet/internal/ipam"
 	"github.com/HongyuHe/twinet/internal/model"
 	"github.com/HongyuHe/twinet/internal/nos"
@@ -46,10 +47,18 @@ func (l *Loaded) Validate() *Diagnostics {
 	l.validateEgress(d, file)
 	l.validateResources(d, file)
 	l.validatePlacement(d, file)
+	l.validateImages(d, file)
 	l.validateStatePolicy(d, file)
 	l.validateAccess(d, file)
 	_ = lab
 	return d
+}
+
+func (l *Loaded) validateImages(d *Diagnostics, file string) {
+	if err := images.ValidatePolicy(l.Lab.Images); err != nil {
+		d.AddHint(file, "images", nodeAt(l.Nodes[file], "images"), err.Error(),
+			"development tags require images.mode: development; release and grading use a generated images.lock")
+	}
 }
 
 // validateNOS resolves every router's inherited NOS declaration before a
@@ -1210,6 +1219,16 @@ func (l *Loaded) validatePlacement(d *Diagnostics, file string) {
 		d.Addf(file, "placement.strategy", nodeAt(root, "placement"),
 			"unknown strategy %q (pack-by-as, spread-by-as, single-node)", p.Strategy)
 	}
+	// Runtime selection is checked at author time rather than when an agent
+	// has already acquired a fence or pulled half the images. The registry is
+	// the source of truth: a manifest cannot claim a backend is usable merely
+	// because its name looks familiar.
+	if err := runtime.ValidateSelection(l.Lab.RuntimeForNode(""), ""); err != nil {
+		d.AddHint(file, "placement.runtime", nodeAt(root, "placement.runtime"),
+			fmt.Sprintf("placement.runtime %q is not a complete Twinet runtime: %v",
+				p.Runtime, err),
+			"registered runtimes: "+strings.Join(runtime.RuntimeNames(), ", "))
+	}
 	names := map[string]bool{}
 	pools := map[string]bool{}
 	fronts := 0
@@ -1218,6 +1237,12 @@ func (l *Loaded) validatePlacement(d *Diagnostics, file string) {
 		node := nodeAt(root, path)
 		if n.Name == "" {
 			d.Add(file, path+".name", "node name is required", node)
+		}
+		selectedRuntime := l.Lab.RuntimeForNode(n.Name)
+		if err := runtime.ValidateSelection(selectedRuntime, n.RuntimeSocket); err != nil {
+			d.AddHint(file, path+".runtime", nodeAt(root, path+".runtime"),
+				fmt.Sprintf("node %q selects runtime %q: %v", n.Name, selectedRuntime, err),
+				"select a registered runtime with lifecycle, exec, copy, namespace, and event support")
 		}
 		if names[n.Name] {
 			d.Addf(file, path+".name", node, "duplicate node %q", n.Name)
@@ -1228,9 +1253,13 @@ func (l *Loaded) validatePlacement(d *Diagnostics, file string) {
 		}
 		for field, value := range map[string]string{
 			"pool": n.Pool, "runtime_class": n.RuntimeClass, "userns_mode": n.UsernsMode,
+			"underlay_dev": n.UnderlayDev,
 		} {
 			if value != "" && !regexp.MustCompile(`^[A-Za-z0-9_.-]+$`).MatchString(value) {
 				d.Addf(file, path+"."+field, node, "%q contains unsafe characters", value)
+			}
+			if n.RuntimeSocket != "" && strings.ContainsAny(n.RuntimeSocket, "\r\n") {
+				d.Addf(file, path+".runtime_socket", node, "runtime socket must not contain a newline")
 			}
 		}
 		if strings.EqualFold(n.UsernsMode, "host") {

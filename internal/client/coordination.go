@@ -494,6 +494,15 @@ func (c *Cluster) coordinatedApplyWithLease(ctx context.Context, top *model.Topo
 		}
 		return transactionFailure(nodes, values, applyErr)
 	}
+	for _, node := range nodes {
+		if err := verifyAppliedImageDigests(top, node.Name, values[node.Name]); err != nil {
+			rollbackErrs := c.abortApply(context.WithoutCancel(ctx), lease, wire, peers, generation, req)
+			if len(rollbackErrs) > 0 {
+				err = fmt.Errorf("%w; rollback: %v", err, rollbackErrs[0])
+			}
+			return transactionFailure(nodes, values, fmt.Errorf("verify post-pull images on %s: %w", node.Name, err))
+		}
+	}
 
 	// Restore proof happens while the source placement is still running. A
 	// commit below is the first path that can prune it, and transactions with
@@ -533,6 +542,8 @@ func (c *Cluster) coordinatedApplyWithLease(ctx context.Context, top *model.Topo
 			return transactionFailure(nodes, values, fmt.Errorf("commit %s: %w", node.Name, err))
 		}
 		if applied, ok := values[node.Name]; ok {
+			resp.AgentVersion, resp.ControllerVersion = applied.AgentVersion, applied.ControllerVersion
+			resp.ImageDigests = applied.ImageDigests
 			resp.Steps, resp.Planned = applied.Steps, applied.Planned
 			resp.Devices, resp.Links = applied.Devices, applied.Links
 			resp.WantDevice, resp.WantLinks = applied.WantDevice, applied.WantLinks

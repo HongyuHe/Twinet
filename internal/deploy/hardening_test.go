@@ -12,6 +12,10 @@ type hardeningRuntime struct{ runtime.Runtime }
 
 func (hardeningRuntime) Name() string { return "docker" }
 
+type podmanHardeningRuntime struct{ runtime.Runtime }
+
+func (podmanHardeningRuntime) Name() string { return "podman" }
+
 func TestEveryDeviceSpecUsesTheLeastPrivilegeProfile(t *testing.T) {
 	device := &model.Device{
 		ID: "as1/R1", Kind: model.KindRouter, Image: "router",
@@ -81,5 +85,27 @@ func TestHardeningRejectsHostEscapeAndHashesPolicy(t *testing.T) {
 	if _, err := (&Engine{Runtime: hardeningRuntime{}}).hardenedRuntimeSpec(device, nil); err == nil ||
 		!strings.Contains(err.Error(), "SYS_ADMIN") {
 		t.Fatalf("SYS_ADMIN device capability = %v, want refusal", err)
+	}
+}
+
+func TestPodmanKeepsSystemPathHardeningAndUsesItsDefaultAppArmor(t *testing.T) {
+	device := &model.Device{
+		ID: "as1/R1", Kind: model.KindRouter, Image: "router",
+		Capabilities: []string{"NET_ADMIN", "NET_RAW"},
+		Requests:     model.DefaultResourceRequest(model.KindRouter),
+	}
+	spec, err := (&Engine{Runtime: podmanHardeningRuntime{}}).hardenedRuntimeSpec(device, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(spec.MaskedPaths) == 0 || len(spec.ReadonlyPaths) == 0 {
+		t.Fatalf("Podman lost OCI system-path hardening: %#v", spec)
+	}
+	if !containsString(spec.SecurityOpt, "no-new-privileges") ||
+		!containsString(spec.SecurityOpt, "seccomp=default") {
+		t.Fatalf("Podman lost portable security options: %#v", spec.SecurityOpt)
+	}
+	if containsString(spec.SecurityOpt, "apparmor=docker-default") {
+		t.Fatalf("Podman was given Docker's unloaded AppArmor profile: %#v", spec.SecurityOpt)
 	}
 }

@@ -313,8 +313,16 @@ func (c *Checker) readImage(ctx context.Context, image string) (map[string]resol
 	sum := sha256.Sum256([]byte(image))
 	name := "twinet-integrity-" + hex.EncodeToString(sum[:8])
 	_ = c.rt.Remove(ctx, name, true)
+	command := []string{"/bin/true"}
+	if c.rt.Name() == "podman" {
+		// Podman 4.x does not mount an unstarted created container for its
+		// archive API. Start an isolated, network-less pristine image long
+		// enough to read it; the command has no input, mounts, credentials, or
+		// route to a student container and is removed immediately afterwards.
+		command = []string{"sh", "-c", "sleep infinity"}
+	}
 	if _, err := c.rt.Create(ctx, &rt.Spec{Name: name, Image: image,
-		Command:     []string{"/bin/true"},
+		Command:     command,
 		NetworkMode: "none",
 		Labels:      map[string]string{"twinet.integrity": "true"}}); err != nil {
 		if strings.Contains(err.Error(), "No such image") {
@@ -331,11 +339,18 @@ func (c *Checker) readImage(ctx context.Context, image string) (map[string]resol
 			"against: %w", image, err)
 	}
 	defer func() { _ = c.rt.Remove(context.WithoutCancel(ctx), name, true) }()
+	if c.rt.Name() == "podman" {
+		if err := c.rt.Start(ctx, name); err != nil {
+			return nil, fmt.Errorf("a pristine Podman container of %s could not be started for integrity comparison: %w",
+				image, err)
+		}
+	}
 
 	m := resolveAll(ctx, copySource{rt: c.rt, name: name})
 	if len(m) == 0 {
+		_, probeErr := (copySource{rt: c.rt, name: name}).read(ctx, "/bin/sh")
 		return nil, fmt.Errorf("no program at all could be read out of %s, so no container "+
-			"built from it can be checked", image)
+			"built from it can be checked (probe /bin/sh: %v)", image, probeErr)
 	}
 	return m, nil
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"os/exec"
 	"strconv"
 
@@ -99,6 +100,11 @@ func (s *Server) handleAttach(w http.ResponseWriter, r *http.Request) {
 	}
 	args = append(args, container)
 	args = append(args, cmd...)
+	cli, cliArgs, cliEnv, err := s.attachCLI(args)
+	if err != nil {
+		httpError(w, http.StatusNotImplemented, err)
+		return
+	}
 
 	conn, buf, err := hj.Hijack()
 	if err != nil {
@@ -112,7 +118,10 @@ func (s *Server) handleAttach(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	proc := exec.CommandContext(r.Context(), "docker", args...)
+	proc := exec.CommandContext(r.Context(), cli, cliArgs...)
+	if len(cliEnv) > 0 {
+		proc.Env = append(os.Environ(), cliEnv...)
+	}
 	stdin, err := proc.StdinPipe()
 	if err != nil {
 		return
@@ -162,6 +171,26 @@ func (s *Server) handleAttach(w http.ResponseWriter, r *http.Request) {
 	}
 	if q.Get("status") == "1" {
 		fmt.Fprintf(conn, "%s%d\n", attachExitTrailer, code)
+	}
+}
+
+func (s *Server) attachCLI(args []string) (string, []string, []string, error) {
+	switch s.rt.Name() {
+	case "docker":
+		env := []string(nil)
+		if endpoint := rt.Endpoint(s.rt); endpoint != "" {
+			env = append(env, "DOCKER_HOST="+endpoint)
+		}
+		return "docker", args, env, nil
+	case "podman":
+		endpoint := rt.Endpoint(s.rt)
+		if endpoint == "" {
+			return "", nil, nil, errors.New("Podman attach needs a runtime socket")
+		}
+		podmanArgs := append([]string{"--remote", "--url", endpoint}, args...)
+		return "podman", podmanArgs, nil, nil
+	default:
+		return "", nil, nil, fmt.Errorf("runtime %q does not provide an interactive attach command", s.rt.Name())
 	}
 }
 

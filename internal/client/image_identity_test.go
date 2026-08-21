@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/HongyuHe/twinet/internal/agent"
 	"github.com/HongyuHe/twinet/internal/deploy"
 	"github.com/HongyuHe/twinet/internal/model"
 )
@@ -107,5 +108,24 @@ func TestAnIdentityTheCallerEstablishedIsKept(t *testing.T) {
 	if got := deploy.SpecHash(top.Devices["as3/ATL"]); got != before {
 		t.Error("the spec hash moved for a device nothing changed about, so every " +
 			"container would be destroyed and recreated")
+	}
+}
+
+func TestPostPullDigestMismatchIsRefused(t *testing.T) {
+	ref := "registry.example/router@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	top := &model.Topology{
+		Name: "lab",
+		Lab:  &model.Lab{Images: model.ImagePolicy{Mode: model.ImageModeRelease}},
+		Devices: map[string]*model.Device{
+			"as1/R1": {ID: "as1/R1", Node: "node-0", Image: ref},
+		},
+	}
+	err := verifyAppliedImageDigests(top, "node-0", agent.ApplyResponse{
+		ImageDigests: map[string]string{
+			ref: "registry.example/router@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "not locked digest") {
+		t.Fatalf("post-pull mismatch = %v", err)
 	}
 }

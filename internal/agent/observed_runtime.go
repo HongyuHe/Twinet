@@ -31,6 +31,15 @@ func observeRuntimeError(m *agentMetrics, method string, fn func() error) error 
 
 func (r *observedRuntime) Name() string { return r.runtime.Name() }
 
+// RuntimeEndpoint preserves the selected backend socket through the metrics
+// wrapper. Status must report the actual socket, not lose it merely because
+// runtime calls are being observed.
+func (r *observedRuntime) RuntimeEndpoint() string { return rt.Endpoint(r.runtime) }
+
+func (r *observedRuntime) SetRuntimeEndpoint(endpoint string) error {
+	return rt.ConfigureEndpoint(r.runtime, endpoint)
+}
+
 func (r *observedRuntime) Ping(ctx context.Context) (string, error) {
 	return observeRuntimeCall(r.metrics, "ping", func() (string, error) { return r.runtime.Ping(ctx) })
 }
@@ -104,3 +113,4 @@ func (r *observedRuntime) Close() error {
 }
 
 var _ rt.Runtime = (*observedRuntime)(nil)
+var _ rt.EndpointRuntime = (*observedRuntime)(nil)

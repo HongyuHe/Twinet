@@ -1,0 +1,93 @@
+package images
+
+import (
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"testing"
+
+	"github.com/HongyuHe/twinet/internal/model"
+)
+
+const digestA = "registry.example/twinet-router@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+func TestLockRejectsLocalImageID(t *testing.T) {
+	_, err := NewLock("topology", "v1", "abc", map[string]string{
+		"registry.example/twinet-router:v1": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+	})
+	if err == nil || !strings.Contains(err.Error(), "immutable registry digest") {
+		t.Fatalf("local image ID lock error = %v", err)
+	}
+}
+
+func TestReleaseLockRewritesTopologyToImmutableReferences(t *testing.T) {
+	top := &model.Topology{
+		Name: "lab", Hash: "topology",
+		Lab: &model.Lab{Images: model.ImagePolicy{
+			Mode: model.ImageModeRelease, Lock: "missing.json",
+		}},
+		Devices: map[string]*model.Device{
+			"as1/R1": {ID: "as1/R1", Image: "registry.example/twinet-router:v1"},
+		},
+	}
+	if _, err := Apply(top); err == nil || !strings.Contains(err.Error(), "read image lock") {
+		t.Fatalf("release policy without a lock file = %v", err)
+	}
+}
+
+func TestDevelopmentTagsNeedAnExplicitMode(t *testing.T) {
+	top := &model.Topology{
+		Name: "lab", Hash: "topology", Lab: &model.Lab{},
+		Devices: map[string]*model.Device{
+			"as1/R1": {ID: "as1/R1", Image: "registry.example/twinet-router:v1"},
+		},
+	}
+	if _, err := Apply(top); err == nil || !strings.Contains(err.Error(), "explicit images.mode") {
+		t.Fatalf("implicit mutable development tag = %v", err)
+	}
+	if !IsImmutable(digestA) || Digest(digestA) == "" {
+		t.Fatal("valid immutable digest was not recognized")
+	}
+}
+
+func TestLockRoundTripBindsReleaseTopology(t *testing.T) {
+	dir, err := os.MkdirTemp(".", ".test-lock-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	lock, err := NewLock("topology", "v1.2.3", "abcdef", map[string]string{
+		"registry.example/twinet-router:v1": digestA,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "images.lock.json")
+	if err := Write(path, lock); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(loaded.Images, lock.Images) || loaded.ManifestHash != lock.ManifestHash {
+		t.Fatalf("lock round trip = %#v, want %#v", loaded, lock)
+	}
+	top := &model.Topology{
+		Name: "lab", Hash: "topology",
+		Lab: &model.Lab{Dir: dir, Images: model.ImagePolicy{
+			Mode: model.ImageModeRelease, Lock: "images.lock.json",
+		}},
+		Devices: map[string]*model.Device{
+			"as1/R1": {ID: "as1/R1", Image: "registry.example/twinet-router:v1"},
+		},
+	}
+	if _, err := Apply(top); err != nil {
+		t.Fatal(err)
+	}
+	device := top.Devices["as1/R1"]
+	if device.Image != digestA || device.ImageID != Digest(digestA) || top.Lab.Images.LockDigest == "" {
+		t.Fatalf("release lock was not applied to topology: %#v / %#v", device, top.Lab.Images)
+	}
+}

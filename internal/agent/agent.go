@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"github.com/HongyuHe/twinet/internal/authz"
+	"github.com/HongyuHe/twinet/internal/contract"
 	"github.com/HongyuHe/twinet/internal/deploy"
 	"github.com/HongyuHe/twinet/internal/integrity"
 	"github.com/HongyuHe/twinet/internal/limiter"
@@ -51,11 +52,17 @@ const maxRequestBytes = 128 << 20
 
 // Config is the agent's runtime configuration.
 type Config struct {
-	Node        string
-	Listen      string
-	Token       string
-	UnderlayIP  string
-	UnderlayDev string
+	Node   string
+	Listen string
+	Token  string
+	// Runtime is the registered container backend this agent owns. Empty is
+	// Docker for compatibility with agents configured before runtime selection.
+	Runtime string
+	// RuntimeSocket optionally binds the selected backend to a particular
+	// local Engine API endpoint rather than relying on process environment.
+	RuntimeSocket string
+	UnderlayIP    string
+	UnderlayDev   string
 	// StateDir holds student-owned configuration snapshots. It must survive
 	// container replacement and node reboots, because it is the only copy of
 	// work a class cannot recreate.
@@ -91,9 +98,13 @@ type Config struct {
 func Main(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("twinetd", flag.ContinueOnError)
 	var (
-		node     = fs.String("node", hostShortName(), "this node's name, as used in the manifest")
-		listen   = fs.String("listen", ":7200", "address to serve the agent API on")
-		token    = fs.String("token", os.Getenv("TWINET_TOKEN"), "shared secret the control plane must present")
+		node        = fs.String("node", hostShortName(), "this node's name, as used in the manifest")
+		listen      = fs.String("listen", ":7200", "address to serve the agent API on")
+		token       = fs.String("token", os.Getenv("TWINET_TOKEN"), "shared secret the control plane must present")
+		runtimeName = fs.String("runtime", os.Getenv("TWINET_RUNTIME"),
+			"registered container runtime (docker or podman; default docker)")
+		runtimeSocket = fs.String("runtime-socket", os.Getenv("TWINET_RUNTIME_SOCKET"),
+			"optional Unix socket or TCP endpoint for the selected runtime")
 		uip      = fs.String("underlay-ip", "", "VTEP source address for cross-node links")
 		udev     = fs.String("underlay-dev", "", "interface to source tunnels from")
 		sdir     = fs.String("state-dir", "/var/lib/twinet/state", "where student configuration snapshots are kept")
@@ -147,6 +158,7 @@ func Main(ctx context.Context, args []string) error {
 
 	s, err := New(Config{
 		Node: *node, Listen: *listen, Token: *token,
+		Runtime: *runtimeName, RuntimeSocket: *runtimeSocket,
 		UnderlayIP: *uip, UnderlayDev: *udev, StateDir: *sdir, Insecure: *insec,
 		TLSCert: *cert, TLSKey: *key, ClientCA: *cacert, GCGrace: *gcGrace,
 		PeerTLSCert: *peerCert, PeerTLSKey: *peerKey, LegacyPeerCertUntil: peerMigrationUntil,
@@ -290,9 +302,22 @@ func New(cfg Config) (*Server, error) {
 	if cfg.Node == "" {
 		return nil, errors.New("the node name must not be empty")
 	}
-	engine := rt.NewDocker()
+	runtimeName := strings.TrimSpace(cfg.Runtime)
+	if runtimeName == "" {
+		runtimeName = model.DefaultRuntime
+	}
+	if err := rt.RequireRoutedLabCapabilities(runtimeName); err != nil {
+		return nil, fmt.Errorf("validate selected runtime before starting agent: %w", err)
+	}
+	engine, err := rt.NewRuntime(runtimeName)
+	if err != nil {
+		return nil, fmt.Errorf("select runtime %q: %w", runtimeName, err)
+	}
+	if err := rt.ConfigureEndpoint(engine, cfg.RuntimeSocket); err != nil {
+		return nil, fmt.Errorf("configure %s runtime socket: %w", runtimeName, err)
+	}
 	if _, err := engine.Ping(context.Background()); err != nil {
-		return nil, fmt.Errorf("cannot reach the container engine: %w", err)
+		return nil, fmt.Errorf("cannot reach selected %s container engine: %w", runtimeName, err)
 	}
 	srv := &Server{
 		cfg: cfg, started: time.Now(), metrics: newAgentMetrics(),
@@ -703,15 +728,24 @@ func (s *Server) auth(h http.HandlerFunc) http.HandlerFunc {
 
 // StatusResponse describes the agent and its host.
 type StatusResponse struct {
-	Node        string `json:"node"`
-	Version     string `json:"version"`
-	Uptime      string `json:"uptime"`
-	Runtime     string `json:"runtime"`
-	RuntimeVer  string `json:"runtime_version"`
-	CPUs        int    `json:"cpus"`
-	UnderlayIP  string `json:"underlay_ip,omitempty"`
-	UnderlayDev string `json:"underlay_dev,omitempty"`
-	Containers  int    `json:"containers"`
+	Node string `json:"node"`
+	// Version is the exact source build. It is audit evidence, not a rolling
+	// upgrade gate; Compatibility below names the contracts that can block a
+	// mutation safely.
+	Version       string       `json:"version"`
+	Compatibility contract.Set `json:"compatibility"`
+	Uptime        string       `json:"uptime"`
+	Runtime       string       `json:"runtime"`
+	RuntimeVer    string       `json:"runtime_version"`
+	// RuntimeSocket is the endpoint actually bound by this agent, allowing a
+	// controller to distinguish a Podman selection from a Docker-compatible
+	// socket accidentally pointed at a different daemon.
+	RuntimeSocket string `json:"runtime_socket,omitempty"`
+	CPUs          int    `json:"cpus"`
+	UnderlayIP    string `json:"underlay_ip,omitempty"`
+	UnderlayDev   string `json:"underlay_dev,omitempty"`
+	UnderlayMTU   int    `json:"underlay_mtu,omitempty"`
+	Containers    int    `json:"containers"`
 	// ContainerCount is nil when the runtime list could not be read. Containers
 	// is retained for older clients, but must not make an unreadable runtime
 	// look like an empty node.
@@ -767,12 +801,13 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := StatusResponse{
-		Node: s.cfg.Node, Version: Version,
+		Node: s.cfg.Node, Version: Version, Compatibility: Compatibility(),
 		Uptime:  time.Since(s.started).Round(time.Second).String(),
-		Runtime: s.rt.Name(), RuntimeVer: ver,
+		Runtime: s.rt.Name(), RuntimeVer: ver, RuntimeSocket: rt.Endpoint(s.rt),
 		CPUs:        runtime.NumCPU(),
 		UnderlayIP:  s.cfg.UnderlayIP,
 		UnderlayDev: s.cfg.UnderlayDev,
+		UnderlayMTU: s.configuredUnderlayMTU(),
 		Containers:  visibleCount,
 	}
 	resp.Inventory = s.observeHostInventory(cs, listErr)
@@ -870,6 +905,51 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, resp)
 }
 
+func (s *Server) configuredUnderlayMTU() int {
+	if s.cfg.UnderlayDev != "" {
+		if iface, err := net.InterfaceByName(s.cfg.UnderlayDev); err == nil {
+			return iface.MTU
+		}
+	}
+	if s.cfg.UnderlayIP == "" {
+		return 0
+	}
+	for _, iface := range rangeInterfaces() {
+		for _, address := range iface.addrs {
+			host, _, err := net.ParseCIDR(address)
+			if err == nil && host.String() == s.cfg.UnderlayIP {
+				return iface.mtu
+			}
+		}
+	}
+	return 0
+}
+
+type interfaceMTU struct {
+	mtu   int
+	addrs []string
+}
+
+func rangeInterfaces() []interfaceMTU {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+	out := make([]interfaceMTU, 0, len(interfaces))
+	for _, iface := range interfaces {
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		values := make([]string, 0, len(addrs))
+		for _, address := range addrs {
+			values = append(values, address.String())
+		}
+		out = append(out, interfaceMTU{mtu: iface.MTU, addrs: values})
+	}
+	return out
+}
+
 func (s *Server) handleContainers(w http.ResponseWriter, r *http.Request) {
 	lab := r.URL.Query().Get("lab")
 	// A scoped certificate sees its own lab and no other, whatever query was
@@ -900,6 +980,10 @@ func (s *Server) handleContainers(w http.ResponseWriter, r *http.Request) {
 
 // ApplyRequest carries the slice of a topology this node is responsible for.
 type ApplyRequest struct {
+	// ControllerVersion is the exact source build that requested the mutation.
+	// It is audit provenance only; Compatibility is checked by the client
+	// before any node mutates.
+	ControllerVersion string `json:"controller_version,omitempty"`
 	// Hold is the caller's grading-hold token, if it has one. A lab that is
 	// held refuses changes from anybody else.
 	Hold string `json:"hold,omitempty"`
@@ -949,9 +1033,15 @@ type ApplyRequest struct {
 
 // ApplyResponse reports the outcome.
 type ApplyResponse struct {
-	Node       string `json:"node"`
-	Generation string `json:"generation,omitempty"`
-	Phase      string `json:"phase,omitempty"`
+	Node              string `json:"node"`
+	AgentVersion      string `json:"agent_version,omitempty"`
+	ControllerVersion string `json:"controller_version,omitempty"`
+	// ImageDigests is observed after image pulls and before this response
+	// allows a cluster transaction to commit. Keys are pull references and
+	// values are runtime-reported identities.
+	ImageDigests map[string]string `json:"image_digests,omitempty"`
+	Generation   string            `json:"generation,omitempty"`
+	Phase        string            `json:"phase,omitempty"`
 	// Steps is how many steps ran and succeeded, and Planned how many the
 	// plan held. They differ on a dry run, on an --only, and on a deploy that
 	// failed part way, which are exactly the runs whose summary must not read
@@ -1008,7 +1098,7 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		s.auditDevelopmentHardeningOverrides(r, top, req.Generation, req.Fence.Generation)
 	}
 	s.recordEvent(top.Name, req.Generation, "deploy", s.requestCorrelation(r), "apply_requested", "scheduled",
-		"phase="+req.Phase)
+		"phase="+req.Phase+" controller_source="+req.ControllerVersion)
 	if why := s.refuseMutationIfHeld(top.Name, req.Hold, "this deployment"); why != "" {
 		httpError(w, http.StatusConflict, errors.New(why))
 		return
@@ -1058,13 +1148,14 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		WritesReference: mode == render.ModeSolve,
 		// Solve mode installs the reference solution, which is the one case
 		// where the rendered configuration must overwrite what is there.
-		Authoritative: mode == render.ModeSolve && req.Ungraded == 0,
-		UnderlayIP:    s.cfg.UnderlayIP,
-		UnderlayDev:   s.cfg.UnderlayDev,
-		PeerUnderlay:  req.PeerUnderlay,
-		State:         s.store,
-		Prune:         req.Prune,
-		Generation:    req.Generation,
+		Authoritative:          mode == render.ModeSolve && req.Ungraded == 0,
+		UnderlayIP:             s.cfg.UnderlayIP,
+		UnderlayDev:            s.cfg.UnderlayDev,
+		PeerUnderlay:           req.PeerUnderlay,
+		State:                  s.store,
+		Prune:                  req.Prune,
+		Generation:             req.Generation,
+		RequireImmutableImages: top.Lab.Images.RequiresImmutableImages(),
 	}
 	// The plan may replace a container before its own capture hook returns.
 	// Establish a fresh durable quorum from the *currently hosted* topology
@@ -1111,9 +1202,19 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusInternalServerError, err)
 		return
 	}
+	imageDigests := map[string]string(nil)
+	if !req.DryRun {
+		imageDigests, err = s.pulledImageDigests(r.Context(), top)
+		if err != nil {
+			httpError(w, http.StatusInternalServerError, err)
+			return
+		}
+	}
 	if req.Phase == "apply" {
 		resp := ApplyResponse{
-			Node: s.cfg.Node, Steps: rep.Done(), Planned: p.Len(),
+			Node: s.cfg.Node, AgentVersion: Version, ControllerVersion: req.ControllerVersion,
+			ImageDigests: imageDigests,
+			Steps:        rep.Done(), Planned: p.Len(),
 			Devices:    rep.Completed(plan.StageCreate),
 			Links:      rep.Completed(plan.StageWire),
 			WantDevice: rep.Planned(plan.StageCreate),
@@ -1211,7 +1312,9 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := ApplyResponse{
-		Node: s.cfg.Node, Steps: rep.Done(), Planned: p.Len(),
+		Node: s.cfg.Node, AgentVersion: Version, ControllerVersion: req.ControllerVersion,
+		ImageDigests: imageDigests,
+		Steps:        rep.Done(), Planned: p.Len(),
 		Devices:    rep.Completed(plan.StageCreate),
 		Links:      rep.Completed(plan.StageWire),
 		WantDevice: rep.Planned(plan.StageCreate),
@@ -1273,6 +1376,30 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		resp.Failures = reportFailures(rep)
 	}
 	writeJSON(w, resp)
+}
+
+func (s *Server) pulledImageDigests(ctx context.Context, top *model.Topology) (map[string]string, error) {
+	refs := map[string]bool{}
+	for _, device := range top.DevicesOnNode(s.cfg.Node) {
+		if device.Image != "" {
+			refs[device.Image] = true
+		}
+	}
+	if len(refs) == 0 {
+		return nil, nil
+	}
+	out := make(map[string]string, len(refs))
+	for _, ref := range sortedSetKeys(refs) {
+		digest, err := s.rt.ImageDigest(ctx, ref)
+		if err != nil || strings.TrimSpace(digest) == "" {
+			if err == nil {
+				err = errors.New("runtime returned an empty image identity")
+			}
+			return nil, fmt.Errorf("verify pulled image %s: %w", ref, err)
+		}
+		out[ref] = digest
+	}
+	return out, nil
 }
 
 func (s *Server) auditDevelopmentHardeningOverrides(r *http.Request, top *model.Topology,

@@ -148,6 +148,7 @@ The lab must already be deployed with --solve.`,
 			// is not an identity, and a mark that cannot be traced to the
 			// software that produced it cannot be defended on appeal.
 			classImages := labImages(cmd.Context(), top, token)
+			classAgents := labAgentVersions(cmd.Context(), top, token)
 			if bad := imageDisagreements(cmd.Context(), top, token); len(bad) > 0 {
 				return fmt.Errorf("the nodes of this cluster do not agree on what these "+
 					"images are:\n  %s\nA mark would then depend on which machine a "+
@@ -363,7 +364,7 @@ The lab must already be deployed with --solve.`,
 				waitWave(cmd.Context(), top, exec, loaded, converge)
 
 				got := gradeWave(cmd.Context(), top, rubric, loaded, exec, converge, parallel,
-					classImages, cmd.ErrOrStderr())
+					classImages, classAgents, cmd.ErrOrStderr())
 
 				// Checked again, after the wave rather than only before it.
 				//
@@ -658,7 +659,7 @@ func waitWave(ctx context.Context, top *model.Topology, exec execFn,
 
 func gradeWave(ctx context.Context, top *model.Topology, rubric *grade.Rubric,
 	wave []submission, exec execFn, converge time.Duration, parallel int,
-	classImages map[string]string,
+	classImages, classAgents map[string]string,
 	progress interface{ Write([]byte) (int, error) }) []*grade.Report {
 
 	out := make([]*grade.Report, len(wave))
@@ -679,6 +680,8 @@ func gradeWave(ctx context.Context, top *model.Topology, rubric *grade.Rubric,
 			rep.Lab = top.Name
 			rep.Controller = Version
 			rep.Images = classImages
+			rep.ImageLock = top.Lab.Images.LockDigest
+			rep.Agents = classAgents
 			out[i] = rep
 
 			mu.Lock()

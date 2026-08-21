@@ -6,71 +6,79 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/HongyuHe/twinet/internal/agent"
 	"github.com/HongyuHe/twinet/internal/model"
 )
 
-// The node agent renders device configuration. A node on a different build
-// therefore produces different configuration from the same manifest, and
-// nothing downstream reports it: every node returns success, and the lab is
-// quietly not the lab anybody described.
-//
-// Deployment checked for this. Grading did not -- it called Apply directly --
-// which is the worst way round, because grading's output is somebody's mark
-// and a mark that cannot be attributed to a particular build of the software
-// is not evidence of anything.
-//
-// So the check belongs to Apply, which is the one thing every caller goes
-// through.
-func TestApplyRefusesAClusterOfMixedBuilds(t *testing.T) {
+func TestApplyAllowsCompatibleRollingSourceBuilds(t *testing.T) {
+	var (
+		mu      sync.Mutex
+		applied bool
+	)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/status") {
 			_ = json.NewEncoder(w).Encode(agent.StatusResponse{
-				Node: "node-1", Version: "an-older-build",
+				Node: "node-1", Version: "bugfix-build-b", Compatibility: agent.Compatibility(),
 			})
 			return
 		}
-		// Reaching this is the failure: the request should never be sent.
+		mu.Lock()
+		applied = true
+		mu.Unlock()
 		_ = json.NewEncoder(w).Encode(agent.ApplyResponse{})
 	}))
 	defer srv.Close()
 
 	c := &Cluster{
-		Nodes:          []*Node{NewNode("node-1", strings.TrimPrefix(srv.URL, "http://"), "")},
-		RequireVersion: "the-build-this-controller-is",
+		Nodes:                []*Node{NewNode("node-1", strings.TrimPrefix(srv.URL, "http://"), "")},
+		RequireVersion:       "bugfix-build-a",
+		RequireCompatibility: agent.Compatibility(),
 	}
-	top := &model.Topology{
-		Name: "cos461",
-		Lab:  &model.Lab{},
-	}
-
-	t.Setenv("TWINET_ALLOW_VERSION_SKEW", "")
-	results := c.Apply(context.Background(), top, agent.ApplyRequest{})
-	if len(results) != 1 {
-		t.Fatalf("expected one result per node, got %d", len(results))
-	}
-	if results[0].Err == nil {
-		t.Fatal("Apply proceeded against a node running a different build.\n" +
-			"The agent renders the configuration, so the lab that gets built is not " +
-			"the lab the manifest describes -- and every node still reports success. " +
-			"Grading calls this directly, so a mark could be produced by software " +
-			"nobody can identify.")
-	}
-	if !strings.Contains(results[0].Err.Error(), "an-older-build") {
-		t.Fatalf("the refusal does not say which node is wrong: %v", results[0].Err)
+	c.Apply(context.Background(), &model.Topology{Name: "cos461", Lab: &model.Lab{}}, agent.ApplyRequest{})
+	mu.Lock()
+	defer mu.Unlock()
+	if !applied {
+		t.Fatal("compatible source builds were blocked instead of allowing a rolling upgrade")
 	}
 }
 
-// An operator who knows the difference does not matter must have a way through,
-// or the check gets patched out instead.
-func TestApplyCanBeToldToProceedAnyway(t *testing.T) {
+func TestCompatibilityAllowsDeclaredRendererRollingRange(t *testing.T) {
+	controller := agent.Compatibility()
+	controller.Renderer.MaxCompatible = "1.1.0"
+	nodeContracts := controller
+	nodeContracts.Renderer.Current = "1.1.0"
+	nodeContracts.Renderer.MinCompatible = "1.0.0"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(agent.StatusResponse{
+			Node: "node-1", Version: "renderer-1.1-source", Compatibility: nodeContracts,
+		})
+	}))
+	defer srv.Close()
+	c := &Cluster{
+		Nodes:                []*Node{NewNode("node-1", strings.TrimPrefix(srv.URL, "http://"), "")},
+		RequireVersion:       "renderer-1.0-source",
+		RequireCompatibility: controller,
+	}
+	if err := c.VersionSkew(context.Background()); err != nil {
+		t.Fatalf("declared-compatible renderer rolling upgrade was refused: %v", err)
+	}
+}
+
+func TestApplyRefusesAnIncompatibleRendererBeforeMutation(t *testing.T) {
+	incompatible := agent.Compatibility()
+	incompatible.Renderer.Current = "2.0.0"
+	incompatible.Renderer.MinCompatible = "2.0.0"
+	incompatible.Renderer.MaxCompatible = "2.0.0"
+
 	var applied bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/status") {
 			_ = json.NewEncoder(w).Encode(agent.StatusResponse{
-				Node: "node-1", Version: "an-older-build",
+				Node: "node-1", Version: "renderer-v2", Compatibility: incompatible,
 			})
 			return
 		}
@@ -80,20 +88,24 @@ func TestApplyCanBeToldToProceedAnyway(t *testing.T) {
 	defer srv.Close()
 
 	c := &Cluster{
-		Nodes:          []*Node{NewNode("node-1", strings.TrimPrefix(srv.URL, "http://"), "")},
-		RequireVersion: "the-build-this-controller-is",
+		Nodes:                []*Node{NewNode("node-1", strings.TrimPrefix(srv.URL, "http://"), "")},
+		RequireVersion:       "renderer-v1",
+		RequireCompatibility: agent.Compatibility(),
 	}
-	t.Setenv("TWINET_ALLOW_VERSION_SKEW", "1")
-	c.Apply(context.Background(), &model.Topology{Name: "cos461", Lab: &model.Lab{}}, agent.ApplyRequest{})
-	if !applied {
-		t.Error("TWINET_ALLOW_VERSION_SKEW did not let a deliberate operator through; " +
-			"a check with no escape hatch gets deleted rather than respected")
+	results := c.Apply(context.Background(), &model.Topology{Name: "cos461", Lab: &model.Lab{}},
+		agent.ApplyRequest{})
+	if len(results) != 1 || results[0].Err == nil {
+		t.Fatal("Apply reached an incompatible renderer")
+	}
+	if !strings.Contains(results[0].Err.Error(), "renderer contract") {
+		t.Fatalf("renderer refusal does not name the contract: %v", results[0].Err)
+	}
+	if applied {
+		t.Fatal("an incompatible renderer received a mutation request")
 	}
 }
 
-// A cluster with no expectation must not start refusing everything: tests and
-// single-node use build one without a version.
-func TestAClusterWithNoExpectedVersionIsNotBlocked(t *testing.T) {
+func TestAClusterWithNoExpectedCompatibilityIsNotBlocked(t *testing.T) {
 	var applied bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/status") {
@@ -108,6 +120,6 @@ func TestAClusterWithNoExpectedVersionIsNotBlocked(t *testing.T) {
 	c := &Cluster{Nodes: []*Node{NewNode("node-1", strings.TrimPrefix(srv.URL, "http://"), "")}}
 	c.Apply(context.Background(), &model.Topology{Name: "cos461", Lab: &model.Lab{}}, agent.ApplyRequest{})
 	if !applied {
-		t.Error("a cluster with no expected version refused to do anything")
+		t.Error("a narrow test cluster with no compatibility expectation refused to do anything")
 	}
 }

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
 	"sort"
 	"strings"
 	"time"
@@ -49,7 +48,13 @@ func (c *Cluster) ApplyDurable(ctx context.Context, top *model.Topology,
 		return transactionFailure(nodes, nil, errors.New("durable apply needs a topology with a lab")), DurabilityReport{}
 	}
 	top.Lab.Normalize()
-	if err := c.VersionSkew(ctx); err != nil && os.Getenv("TWINET_ALLOW_VERSION_SKEW") == "" {
+	if req.ControllerVersion == "" {
+		req.ControllerVersion = c.RequireVersion
+	}
+	if err := c.RuntimeCompatibility(ctx); err != nil {
+		return transactionFailure(nodes, nil, err), DurabilityReport{}
+	}
+	if err := c.VersionSkew(ctx); err != nil {
 		return transactionFailure(nodes, nil, err), DurabilityReport{}
 	}
 	if req.StrictAdmission {

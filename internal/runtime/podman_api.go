@@ -121,12 +121,10 @@ func validatePodmanSpec(spec *Spec) error {
 	if spec == nil {
 		return fmt.Errorf("container spec is nil")
 	}
-	// Podman's Docker-compatible API does not expose Docker's per-container
-	// OCI system-path lists. Sending them risks a silently ignored hardening
-	// request, so refuse it until native bindings provide an equivalent.
-	if spec.MaskedPaths != nil || spec.ReadonlyPaths != nil {
-		return podmanUnsupported("MaskedPaths or ReadonlyPaths")
-	}
+	// Podman 4.9's Docker-compatible create API accepts the OCI system-path
+	// lists. Keep them on the common Spec rather than dropping hardening for a
+	// second backend; a backend that silently weakens /proc or /sys protection
+	// is not a Twinet substrate.
 	return nil
 }
 
@@ -283,6 +281,13 @@ func (p *podmanAPI) NSPath(ctx context.Context, name string) (string, error) {
 
 func (p *podmanAPI) CopyFromFollow(ctx context.Context, name, src string) ([]byte, error) {
 	content, err := p.dockerAPI.CopyFromFollow(ctx, name, src)
+	if err != nil && strings.Contains(err.Error(), "symbolic link cycle") {
+		// Podman 4.9's Docker-compat stat endpoint reports LinkTarget equal
+		// to the path itself for some regular BusyBox hardlinks. Its archive
+		// endpoint already follows that link and returns the regular file, so
+		// retrying without client-side link walking is both safe and faithful.
+		content, err = p.dockerAPI.copyFrom(ctx, name, src, false)
+	}
 	if err != nil && cerrdefs.IsNotImplemented(err) {
 		return nil, fmt.Errorf("%w: Podman archive API does not expose symlink metadata: %w", ErrUnsupported, err)
 	}

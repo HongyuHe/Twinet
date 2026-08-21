@@ -9,6 +9,9 @@ metadata:
   course: Advanced Topics in Computer Networks, ETH Zurich
   term: fall25
 
+images:
+  mode: development
+
 defaults:
   cpus: 1
   memory: 384Mi

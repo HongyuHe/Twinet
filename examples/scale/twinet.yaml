@@ -6,6 +6,9 @@ metadata:
   course: COS 461 - Computer Networks, Princeton
   term: fall25
 
+images:
+  mode: development
+
 defaults:
   cpus: 2
   memory: 512Mi

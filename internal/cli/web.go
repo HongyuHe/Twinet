@@ -158,7 +158,10 @@ func webExecFunc(_ context.Context, top *model.Topology, token string) (
 	func(context.Context, string, []string) (rt.ExecResult, error), error,
 ) {
 	if !clustered(top) {
-		runtime := rt.NewDocker()
+		runtime, err := localRuntime(top)
+		if err != nil {
+			return nil, err
+		}
 		return func(ctx context.Context, deviceID string, command []string) (rt.ExecResult, error) {
 			device, ok := top.Device(deviceID)
 			if !ok {

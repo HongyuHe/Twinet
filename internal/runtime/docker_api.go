@@ -37,10 +37,14 @@ type dockerAPI struct {
 	eventsClosed bool
 }
 
-func newDockerAPI() (*dockerAPI, error) {
+func newDockerAPI(endpoint string) (*dockerAPI, error) {
 	// The Moby client negotiates its API version on the first request unless
 	// DOCKER_API_VERSION explicitly pins one.
-	client, err := mobyclient.New(mobyclient.FromEnv)
+	options := []mobyclient.Opt{mobyclient.FromEnv}
+	if endpoint != "" {
+		options = []mobyclient.Opt{mobyclient.WithHost(endpoint)}
+	}
+	client, err := mobyclient.New(options...)
 	if err != nil {
 		return nil, err
 	}

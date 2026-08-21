@@ -38,6 +38,8 @@ type Bundle struct {
 	Group      string            `json:"group"`
 	Topology   string            `json:"topology_hash"`
 	Controller string            `json:"controller"`
+	ImageLock  string            `json:"image_lock,omitempty"`
+	Images     map[string]string `json:"images,omitempty"`
 	TakenAt    time.Time         `json:"taken_at"`
 	Files      map[string]string `json:"files"` // path inside the bundle -> sha256
 }
@@ -154,10 +156,19 @@ func saveAS(ctx context.Context, top *model.Topology, asn int, outDir string,
 		group = fmt.Sprintf("as%d", asn)
 	}
 
+	imageLock := ""
+	if top.Lab != nil {
+		imageLock = top.Lab.Images.LockDigest
+	}
 	b := Bundle{
 		Lab: top.Name, AS: asn, Group: group, Topology: top.Hash,
 		Controller: Version, TakenAt: time.Now().UTC(),
-		Files: map[string]string{},
+		ImageLock: imageLock, Files: map[string]string{}, Images: map[string]string{},
+	}
+	for _, device := range top.SortedDevices() {
+		if device.Image != "" && device.ImageID != "" {
+			b.Images[device.Image] = device.ImageID
+		}
 	}
 	contents := map[string][]byte{}
 

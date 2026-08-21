@@ -239,14 +239,17 @@ after a partial failure, a reboot, or a topology edit.`,
 				return nil
 			}
 
-			rt := runtime.NewDocker()
+			rt, err := localRuntime(top)
+			if err != nil {
+				return err
+			}
 			ver, err := rt.Ping(cmd.Context())
 			if err != nil {
 				return fmt.Errorf("cannot reach the container engine: %w", err)
 			}
 			if !quiet {
-				fmt.Fprintf(cmd.OutOrStdout(), "twinet: docker %s, lab %s (topology %s)\n",
-					ver, top.Name, top.Hash)
+				fmt.Fprintf(cmd.OutOrStdout(), "twinet: %s %s, lab %s (topology %s)\n",
+					rt.Name(), ver, top.Name, top.Hash)
 			}
 
 			mode := render.ModePlatform
@@ -269,15 +272,16 @@ after a partial failure, a reboot, or a topology edit.`,
 				recordLabMode(top, string(mode))
 			}
 			eng := &deploy.Engine{
-				Runtime:         rt,
-				Node:            node,
-				State:           store,
-				PullPolicy:      runtime.PullPolicy(pull),
-				Renderer:        render.New(top, mode),
-				Authoritative:   mode == render.ModeSolve,
-				WritesReference: mode == render.ModeSolve,
-				UnderlayIP:      underlayOf(top, node),
-				PeerUnderlay:    peerUnderlays(top),
+				Runtime:                rt,
+				Node:                   node,
+				State:                  store,
+				PullPolicy:             runtime.PullPolicy(pull),
+				Renderer:               render.New(top, mode),
+				Authoritative:          mode == render.ModeSolve,
+				WritesReference:        mode == render.ModeSolve,
+				UnderlayIP:             underlayOf(top, node),
+				PeerUnderlay:           peerUnderlays(top),
+				RequireImmutableImages: top.Lab.Images.RequiresImmutableImages(),
 			}
 
 			p, err := eng.Build(top)
@@ -452,7 +456,10 @@ if the manifest that created it is no longer available.`,
 				return nil
 			}
 
-			rt := runtime.NewDocker()
+			rt, err := localRuntime(top)
+			if err != nil {
+				return err
+			}
 			cs, err := rt.List(cmd.Context(), runtime.Filter{
 				All: true, Labels: map[string]string{deploy.LabelLab: name}})
 			if err != nil {
@@ -659,7 +666,10 @@ func newExecCmd(opts *Options) *cobra.Command {
 				}
 				cluster = client.NewCluster(top.Lab, tok)
 			} else {
-				local = runtime.NewDocker()
+				local, err = localRuntime(top)
+				if err != nil {
+					return err
+				}
 			}
 
 			runOne := func(ctx context.Context, d *model.Device) (runtime.ExecResult, error) {
@@ -788,7 +798,10 @@ func resolveImageIDs(ctx context.Context, top *model.Topology, token string) err
 			}
 		}
 	} else {
-		rt := runtime.NewDocker()
+		rt, err := localRuntime(top)
+		if err != nil {
+			return err
+		}
 		for _, ref := range list {
 			// An image that is not here yet will be pulled, and the deployment
 			// that pulls it stamps the identity next time; refusing here would
@@ -800,7 +813,12 @@ func resolveImageIDs(ctx context.Context, top *model.Topology, token string) err
 	}
 
 	for _, d := range top.SortedDevices() {
-		d.ImageID = seen[d.Image]
+		// A release/grading lock has already stamped the required manifest
+		// digest. Do not erase it merely because this is the first pull and
+		// no node had an image to report during the preflight survey.
+		if resolved := seen[d.Image]; resolved != "" {
+			d.ImageID = resolved
+		}
 	}
 	return nil
 }

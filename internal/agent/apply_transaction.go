@@ -90,7 +90,10 @@ func (s *Server) handleApplyPrepare(w http.ResponseWriter, r *http.Request, req 
 		httpError(w, http.StatusConflict, err)
 		return
 	}
-	writeJSON(w, ApplyResponse{Node: s.cfg.Node, Generation: req.Generation, Phase: "prepare"})
+	writeJSON(w, ApplyResponse{
+		Node: s.cfg.Node, AgentVersion: Version, ControllerVersion: req.ControllerVersion,
+		Generation: req.Generation, Phase: "prepare",
+	})
 }
 
 func (s *Server) handleApplyCommit(w http.ResponseWriter, r *http.Request, req ApplyRequest) {
@@ -132,7 +135,10 @@ func (s *Server) handleApplyCommit(w http.ResponseWriter, r *http.Request, req A
 	}
 	defer s.release(lab)
 	if tx.Committed {
-		writeJSON(w, ApplyResponse{Node: s.cfg.Node, Generation: tx.Generation, Phase: "commit"})
+		writeJSON(w, ApplyResponse{
+			Node: s.cfg.Node, AgentVersion: Version, ControllerVersion: req.ControllerVersion,
+			Generation: tx.Generation, Phase: "commit",
+		})
 		return
 	}
 	fenced, stopFence := s.fencedContext(r.Context(), lab, req.Fence)
@@ -199,7 +205,10 @@ func (s *Server) commitAppliedTopology(ctx context.Context, top *model.Topology,
 	s.peers[top.Name] = tx.PeerUnderlay
 	s.mu.Unlock()
 
-	resp := ApplyResponse{Node: s.cfg.Node, Generation: tx.Generation, Phase: "commit"}
+	resp := ApplyResponse{
+		Node: s.cfg.Node, AgentVersion: Version,
+		Generation: tx.Generation, Phase: "commit",
+	}
 	eng := s.transactionEngine(top, tx)
 	// Capture and replicate before any prune. A commit that removes the old
 	// placement before its current state and topology record have a verified
@@ -255,18 +264,19 @@ func (s *Server) transactionEngine(top *model.Topology, tx applyTransaction) *de
 		mode = render.ModePlatform
 	}
 	return &deploy.Engine{
-		Runtime:         s.rt,
-		Node:            s.cfg.Node,
-		Limiter:         s.workLimiter(),
-		Renderer:        renderer(top, mode, tx.Ungraded),
-		WritesReference: mode == render.ModeSolve,
-		Authoritative:   mode == render.ModeSolve && tx.Ungraded == 0,
-		UnderlayIP:      s.cfg.UnderlayIP,
-		UnderlayDev:     s.cfg.UnderlayDev,
-		PeerUnderlay:    tx.PeerUnderlay,
-		State:           s.store,
-		Prune:           tx.Prune,
-		Generation:      tx.Generation,
+		Runtime:                s.rt,
+		Node:                   s.cfg.Node,
+		Limiter:                s.workLimiter(),
+		Renderer:               renderer(top, mode, tx.Ungraded),
+		WritesReference:        mode == render.ModeSolve,
+		Authoritative:          mode == render.ModeSolve && tx.Ungraded == 0,
+		UnderlayIP:             s.cfg.UnderlayIP,
+		UnderlayDev:            s.cfg.UnderlayDev,
+		PeerUnderlay:           tx.PeerUnderlay,
+		State:                  s.store,
+		Prune:                  tx.Prune,
+		Generation:             tx.Generation,
+		RequireImmutableImages: top.Lab.Images.RequiresImmutableImages(),
 	}
 }
 

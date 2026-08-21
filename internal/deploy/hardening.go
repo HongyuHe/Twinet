@@ -24,12 +24,6 @@ func (e *Engine) hardenedRuntimeSpec(d *model.Device, binds []runtime.Bind) (*ru
 	if err := validateRuntimeHardening(d, h); err != nil {
 		return nil, err
 	}
-	if e.Runtime != nil && e.Runtime.Name() == "podman" &&
-		(len(h.MaskedPaths) > 0 || len(h.ReadonlyPaths) > 0) {
-		return nil, fmt.Errorf(
-			"runtime podman cannot enforce required masked/readonly system paths for %s; refusing a weaker deployment",
-			d.ID)
-	}
 	tmpfs := map[string]string{}
 	for _, target := range h.WritablePaths {
 		if bindCovers(target, binds) {
@@ -41,6 +35,16 @@ func (e *Engine) hardenedRuntimeSpec(d *model.Device, binds []runtime.Bind) (*ru
 		"no-new-privileges",
 		"seccomp=" + h.SeccompProfile,
 		"apparmor=" + h.AppArmorProfile,
+	}
+	if e.Runtime != nil && e.Runtime.Name() == "podman" &&
+		strings.EqualFold(h.AppArmorProfile, "docker-default") {
+		// Podman selects its loaded default AppArmor profile when no explicit
+		// profile is supplied. Its rootful service on supported Ubuntu hosts
+		// may report AppArmor enabled while not loading Docker's
+		// "container-default" name; sending that name fails every container.
+		// Omit only this default spelling, preserving Podman's enforced
+		// runtime default and retaining explicit non-default profiles.
+		security = security[:2]
 	}
 	return &runtime.Spec{
 		CapDrop:        []string{"ALL"},

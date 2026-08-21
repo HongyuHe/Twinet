@@ -398,13 +398,13 @@ func TestPodmanCompatibilityContract(t *testing.T) {
 		t.Errorf("Podman event = %#v", events[0])
 	}
 
-	_, err = podman.Create(ctx, &Spec{
-		Name:        "unsupported",
-		Image:       "present",
-		MaskedPaths: []string{"/proc/kcore"},
-	})
-	if !errors.Is(err, ErrUnsupported) || !strings.Contains(err.Error(), "MaskedPaths") {
-		t.Fatalf("Podman unsupported path hardening error = %v", err)
+	if _, err = podman.Create(ctx, &Spec{
+		Name:          "pod",
+		Image:         "present",
+		MaskedPaths:   []string{"/proc/kcore"},
+		ReadonlyPaths: []string{"/proc/sys"},
+	}); err != nil {
+		t.Fatalf("Podman rejected OCI system-path hardening: %v", err)
 	}
 	if fake.requestCount("/_ping") != 0 {
 		t.Fatal("Podman compatibility client unexpectedly negotiated through Docker _ping")

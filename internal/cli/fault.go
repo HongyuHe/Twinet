@@ -622,8 +622,11 @@ func frrExecFunc(top *model.Topology, token string,
 	regular func(context.Context, string, []string) (runtime.ExecResult, error),
 ) func(context.Context, string, []string) (runtime.ExecResult, error) {
 	if !clustered(top) {
-		rt := runtime.NewDocker()
+		rt, runtimeErr := localRuntime(top)
 		return func(ctx context.Context, deviceID string, cmd []string) (runtime.ExecResult, error) {
+			if runtimeErr != nil {
+				return runtime.ExecResult{}, runtimeErr
+			}
 			d, ok := top.Device(deviceID)
 			if !ok {
 				return runtime.ExecResult{}, fmt.Errorf("no device %q", deviceID)
@@ -673,13 +676,20 @@ func frrExecFunc(top *model.Topology, token string,
 func labelSpaceFunc(top *model.Topology, token string) (
 	func(context.Context, string, fault.LabelSpaceRequest) (fault.LabelSpaceResult, error), error) {
 
+	var localBackend runtime.Runtime
+	if !clustered(top) {
+		var err error
+		localBackend, err = localRuntime(top)
+		if err != nil {
+			return nil, err
+		}
+	}
 	local := func(ctx context.Context, deviceID string, req fault.LabelSpaceRequest) (fault.LabelSpaceResult, error) {
 		d, ok := top.Device(deviceID)
 		if !ok {
 			return fault.LabelSpaceResult{}, fmt.Errorf("no device %q", deviceID)
 		}
-		rt := runtime.NewDocker()
-		ns, err := rt.NSPath(ctx, d.Container)
+		ns, err := localBackend.NSPath(ctx, d.Container)
 		if err != nil {
 			return fault.LabelSpaceResult{}, err
 		}

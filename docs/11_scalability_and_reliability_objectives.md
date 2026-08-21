@@ -329,6 +329,18 @@ tunnels, RPKI, MPLS/LDP, VRF, multicast, or DHCP. `make nos-images`
 builds both router images and starts both daemons; it fails when Docker is
 unavailable instead of reporting a vacuous success.
 
+**Runtime selection contract.** `placement.runtime` selects the lab default
+(`docker` when omitted) and `placement.nodes[].runtime` may override it with
+`docker` or `podman`; `runtime_socket` is an optional node-local API endpoint.
+Manifest validation checks the registered lifecycle/exec/copy/netns/event
+capabilities before deployment, agents select through `runtime.NewRuntime`,
+and status reports backend, engine version, and socket. The controller refuses
+to mutate when a node reports a backend different from its requested runtime.
+`make podman-integration` is an explicit rootful Podman gate: it source-builds
+the images, starts a Podman agent, runs a routed deploy/wire/configure/exec/
+save/destroy lifecycle, consumes events, and fails instead of skipping when
+the acknowledgement or prerequisite is absent.
+
 ### O11 - Generate and distribute intra-AS topology types
 
 **Problem.** Inter-AS topology is generated, but AS interiors remain explicit
@@ -444,6 +456,18 @@ rolling upgrades.
 **Acceptance.** Bootstrap fresh supported nodes without manual repair, deploy a
 lab during a one-node-at-a-time compatible upgrade, and reproduce a grade using
 only its recorded source revision and image digests.
+
+**Shipped reproducibility contract.** `images.mode: development` is the
+explicit opt-in for mutable tags. `release` and `grading` require
+`images.lock`, a generated JSON lock whose entries are registry
+`repository@sha256:...` manifests and whose topology hash must match the lab.
+Each node checks the pulled digest before container creation and the
+coordinator checks the node's post-pull evidence before commit. `twinet images
+lock|verify` and `make image-lock`/`make image-verify` operate on that format;
+the push target publishes and remotely inspects immutable
+version/commit tags before writing it. `Version` remains exact source audit
+data, while protocol, renderer, and state-schema version ranges gate rolling
+upgrades.
 
 ### O15 - Continuously test scale and failure behavior
 

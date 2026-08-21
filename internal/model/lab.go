@@ -186,6 +186,11 @@ type Lab struct {
 	// Placement configures how ASes are distributed across cluster nodes.
 	Placement Placement `yaml:"placement,omitempty" json:"placement,omitempty"`
 
+	// Images selects the reproducibility contract for this lab. Development
+	// labs may explicitly use tags; released and grading labs resolve every
+	// device through a checked image lock.
+	Images ImagePolicy `yaml:"images,omitempty" json:"images,omitempty"`
+
 	// State controls durable preservation of student-owned configuration and
 	// the agent records needed to repair a lab after a node loss.
 	State StatePolicy `yaml:"state,omitempty" json:"state,omitempty"`
@@ -1231,6 +1236,10 @@ type LegacyPorts struct {
 type Placement struct {
 	Strategy string     `yaml:"strategy,omitempty" json:"strategy,omitempty" jsonschema:"enum=pack-by-as,enum=spread-by-as,enum=single-node"`
 	Nodes    []NodeSpec `yaml:"nodes,omitempty" json:"nodes,omitempty"`
+	// Runtime is the lab-wide container runtime default. A node can override
+	// it when a mixed Docker/Podman cluster is deliberate. Empty retains the
+	// historic Docker default.
+	Runtime string `yaml:"runtime,omitempty" json:"runtime,omitempty" jsonschema:"enum=docker,enum=podman"`
 	// NodePool restricts this lab to nodes carrying the named hardened worker
 	// pool. It is a placement constraint, not a label that merely appears in a
 	// report after an unsafe assignment was already made.
@@ -1253,6 +1262,15 @@ type NodeSpec struct {
 	Addr string `yaml:"addr,omitempty" json:"addr,omitempty"`
 	// UnderlayIP is the VTEP source address for cross-node VXLAN links.
 	UnderlayIP string `yaml:"underlay_ip,omitempty" json:"underlay_ip,omitempty"`
+	// UnderlayDev pins VXLAN source selection to this host interface.
+	UnderlayDev string `yaml:"underlay_dev,omitempty" json:"underlay_dev,omitempty"`
+	// Runtime overrides placement.runtime for this node. It is intentionally a
+	// backend name, not a free-form command, so validation can compare it with
+	// the runtime registry before a deployment acquires a mutation lease.
+	Runtime string `yaml:"runtime,omitempty" json:"runtime,omitempty" jsonschema:"enum=docker,enum=podman"`
+	// RuntimeSocket is an optional Unix socket or TCP endpoint for the selected
+	// engine. It is a node-local transport address, never a container mount.
+	RuntimeSocket string `yaml:"runtime_socket,omitempty" json:"runtime_socket,omitempty"`
 	// Capacity optionally caps what may be scheduled here.
 	Capacity *Budget `yaml:"capacity,omitempty" json:"capacity,omitempty"`
 	// Front marks the node that publishes the web UI, gateway and VPN.
@@ -1265,6 +1283,84 @@ type NodeSpec struct {
 	// device has not selected a more specific hardened runtime profile.
 	RuntimeClass string `yaml:"runtime_class,omitempty" json:"runtime_class,omitempty"`
 	UsernsMode   string `yaml:"userns_mode,omitempty" json:"userns_mode,omitempty"`
+}
+
+// DefaultRuntime is the compatibility selection for manifests written before
+// runtime selection was exposed.
+const DefaultRuntime = "docker"
+
+// RuntimeForNode returns the requested backend for one placement node. A
+// node-specific selection wins over the lab default; an omitted selection keeps
+// Docker as it was before the runtime registry existed.
+func (l *Lab) RuntimeForNode(name string) string {
+	if l != nil {
+		if node, ok := l.NodeByName(name); ok && strings.TrimSpace(node.Runtime) != "" {
+			return strings.ToLower(strings.TrimSpace(node.Runtime))
+		}
+		if strings.TrimSpace(l.Placement.Runtime) != "" {
+			return strings.ToLower(strings.TrimSpace(l.Placement.Runtime))
+		}
+	}
+	return DefaultRuntime
+}
+
+// RuntimeSocketForNode returns the explicit endpoint configured for a node.
+// Empty leaves the selected backend's normal secure local socket in use.
+func (l *Lab) RuntimeSocketForNode(name string) string {
+	if l != nil {
+		if node, ok := l.NodeByName(name); ok {
+			return strings.TrimSpace(node.RuntimeSocket)
+		}
+	}
+	return ""
+}
+
+// ImageMode describes the reproducibility policy that governs image
+// references. The aliases accepted by validation keep course configuration
+// readable while the canonical values remain stable in reports and locks.
+type ImageMode string
+
+const (
+	ImageModeDevelopment ImageMode = "development"
+	ImageModeRelease     ImageMode = "release"
+	ImageModeGrading     ImageMode = "grading"
+)
+
+// ImagePolicy binds a manifest to a generated image lock. LockDigest is set
+// only after the lock has been checked and is carried to deployment reports;
+// it is never authored YAML.
+type ImagePolicy struct {
+	Mode       ImageMode `yaml:"mode,omitempty" json:"mode,omitempty" jsonschema:"enum=development,enum=release,enum=grading,enum=grade"`
+	Lock       string    `yaml:"lock,omitempty" json:"lock,omitempty"`
+	LockDigest string    `yaml:"-" json:"lock_digest,omitempty"`
+}
+
+// EffectiveMode returns the policy's canonical mode. Empty intentionally stays
+// empty so validation can require an explicit development opt-in for mutable
+// image tags rather than silently treating every legacy manifest as one.
+func (p ImagePolicy) EffectiveMode() ImageMode {
+	switch strings.ToLower(strings.TrimSpace(string(p.Mode))) {
+	case "grade":
+		return ImageModeGrading
+	case string(ImageModeDevelopment):
+		return ImageModeDevelopment
+	case string(ImageModeRelease):
+		return ImageModeRelease
+	case string(ImageModeGrading):
+		return ImageModeGrading
+	default:
+		return ImageMode(strings.ToLower(strings.TrimSpace(string(p.Mode))))
+	}
+}
+
+// RequiresImmutableImages reports whether a deployment must use a verified
+// digest lock.
+func (p ImagePolicy) RequiresImmutableImages() bool {
+	switch p.EffectiveMode() {
+	case ImageModeRelease, ImageModeGrading:
+		return true
+	}
+	return false
 }
 
 // Domain returns the failure domain used for durable-copy placement.

@@ -4,6 +4,9 @@ metadata:
   name: mixed-substrate
   description: Typed BMv2, OpenFlow, traffic, MPLS, and delegated-Kubernetes incident substrate.
 
+images:
+  mode: development
+
 defaults:
   restart: unless-stopped
 

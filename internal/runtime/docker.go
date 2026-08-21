@@ -36,7 +36,8 @@ type engineBackend interface {
 // Docker drives the Docker Engine API. Set TWINET_DOCKER_BACKEND=cli only to
 // select the compatibility CLI backend explicitly.
 type Docker struct {
-	mode string
+	mode     string
+	endpoint string
 
 	once    sync.Once
 	backend engineBackend
@@ -48,16 +49,39 @@ var _ EventRuntime = (*Docker)(nil)
 // NewDocker constructs a Docker runtime. The Engine API client is initialized
 // on the first operation so construction remains compatible with all callers.
 func NewDocker() *Docker {
-	return &Docker{mode: strings.ToLower(strings.TrimSpace(os.Getenv(dockerBackendEnv)))}
+	return &Docker{
+		mode:     strings.ToLower(strings.TrimSpace(os.Getenv(dockerBackendEnv))),
+		endpoint: strings.TrimSpace(os.Getenv("DOCKER_HOST")),
+	}
 }
 
 // Name identifies the backend.
 func (d *Docker) Name() string { return "docker" }
 
+// SetRuntimeEndpoint selects the Engine API endpoint before the first runtime
+// operation. It is intentionally a backend method rather than a process
+// environment mutation: one in-process test agent must not redirect another.
+func (d *Docker) SetRuntimeEndpoint(endpoint string) error {
+	normalized, err := normalizeDockerHost(endpoint)
+	if err != nil {
+		return err
+	}
+	d.endpoint = normalized
+	return nil
+}
+
+// RuntimeEndpoint reports the Engine API endpoint selected for this runtime.
+func (d *Docker) RuntimeEndpoint() string {
+	if d.endpoint != "" {
+		return d.endpoint
+	}
+	return "unix:///var/run/docker.sock"
+}
+
 func (d *Docker) initialize() {
 	switch d.mode {
 	case "", "api", "engine":
-		backend, err := newDockerAPI()
+		backend, err := newDockerAPI(d.endpoint)
 		if err != nil {
 			d.err = fmt.Errorf("initialize Docker Engine API client: %w", err)
 			return
@@ -68,6 +92,25 @@ func (d *Docker) initialize() {
 	default:
 		d.err = fmt.Errorf("invalid %s=%q; use %q (the default) or %q",
 			dockerBackendEnv, d.mode, "api", "cli")
+	}
+}
+
+func normalizeDockerHost(host string) (string, error) {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return "", fmt.Errorf("Docker runtime socket is empty")
+	}
+	if strings.ContainsAny(host, " \t\r\n") {
+		return "", fmt.Errorf("Docker runtime socket %q contains whitespace", host)
+	}
+	if strings.HasPrefix(host, "/") {
+		return "unix://" + host, nil
+	}
+	switch {
+	case strings.HasPrefix(host, "unix://"), strings.HasPrefix(host, "tcp://"):
+		return host, nil
+	default:
+		return "", fmt.Errorf("Docker runtime socket %q must be an absolute Unix socket path, unix:// URI, or tcp:// URI", host)
 	}
 }
 

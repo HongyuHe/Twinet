@@ -6,6 +6,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/HongyuHe/twinet/internal/agent"
 	"github.com/HongyuHe/twinet/internal/client"
 )
 
@@ -25,10 +26,12 @@ type Options struct {
 
 // Root builds the top-level command tree.
 func Root() *cobra.Command {
-	// Every cluster this process builds carries the version it expects its
-	// agents to be running. Set here, once, so that no command can construct
-	// one without it.
+	// Every cluster carries the exact source build for audit and the separate
+	// compatibility contracts that safely gate rolling upgrades. Set them once
+	// so a new command cannot accidentally compare source SHAs or skip the
+	// renderer/state gate.
 	client.ExpectVersion = Version
+	client.ExpectCompatibility = agent.Compatibility()
 
 	opts := &Options{}
 
@@ -66,6 +69,7 @@ across a cluster and graded automatically.`,
 		newBehaviourCmd(opts),
 		newIncidentCmd(opts),
 		newWebCmd(opts),
+		newImagesCmd(opts),
 		newVersionCmd(),
 	)
 	return root

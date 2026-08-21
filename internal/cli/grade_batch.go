@@ -486,6 +486,8 @@ func gradeOneHarness(ctx context.Context, class *model.Topology, rubric *grade.R
 	// against it is not comparable with the first.
 	rep.Images = imageDigests(ctx, c, h)
 	rep.Controller = Version
+	rep.ImageLock = h.Lab.Images.LockDigest
+	rep.Agents = agentVersions(ctx, c)
 
 	// Nodes that disagree about what an image is means this mark was produced
 	// by whichever build happened to be on whichever node this AS landed on.
@@ -534,6 +536,7 @@ func imageDigests(ctx context.Context, c *client.Cluster, top *model.Topology) m
 			seen[d.Image] = true
 			refs = append(refs, d.Image)
 		}
+
 	}
 	sort.Strings(refs)
 
@@ -584,6 +587,19 @@ func missingASes(class, h *model.Topology) []int {
 		}
 	}
 	sort.Ints(out)
+	return out
+}
+
+func agentVersions(ctx context.Context, c *client.Cluster) map[string]string {
+	out := map[string]string{}
+	if c == nil {
+		return out
+	}
+	for _, result := range c.Status(ctx) {
+		if result.Err == nil && result.Value.Version != "" {
+			out[result.Node] = result.Value.Version
+		}
+	}
 	return out
 }
 
@@ -1880,13 +1896,30 @@ func TeardownFailed() bool { return teardownFailed.Load() }
 // recorded beside a mark.
 func labImages(ctx context.Context, top *model.Topology, token string) map[string]string {
 	if !clustered(top) {
-		return nil
+		out := map[string]string{}
+		for _, device := range top.Devices {
+			if device.Image != "" && device.ImageID != "" {
+				out[device.Image] = device.ImageID
+			}
+		}
+		return out
 	}
 	tok, err := tokenFor(token)
 	if err != nil {
 		return nil
 	}
 	return imageDigests(ctx, client.NewCluster(top.Lab, tok), top)
+}
+
+func labAgentVersions(ctx context.Context, top *model.Topology, token string) map[string]string {
+	if !clustered(top) {
+		return nil
+	}
+	tok, err := tokenFor(token)
+	if err != nil {
+		return nil
+	}
+	return agentVersions(ctx, client.NewCluster(top.Lab, tok))
 }
 
 // clearStaleHarness removes any earlier deployment of a harness before it is

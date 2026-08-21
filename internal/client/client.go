@@ -29,6 +29,8 @@ import (
 	"time"
 
 	"github.com/HongyuHe/twinet/internal/agent"
+	"github.com/HongyuHe/twinet/internal/contract"
+	"github.com/HongyuHe/twinet/internal/images"
 	"github.com/HongyuHe/twinet/internal/model"
 	"github.com/HongyuHe/twinet/internal/place"
 	rt "github.com/HongyuHe/twinet/internal/runtime"
@@ -425,64 +427,73 @@ func (n *Node) Underlay(ctx context.Context, peer string) (agent.UnderlayRespons
 type Cluster struct {
 	Nodes []*Node
 
-	// RequireVersion is the build every node must be running.
-	//
-	// It is checked inside Apply rather than by the callers, because it was
-	// checked by one caller and there turned out to be three. Grading called
-	// Apply directly and so ran happily against a cluster of mixed binaries --
-	// which is the one place it matters most, since the output is somebody's
-	// mark and cannot be attributed to any particular version of the software
-	// that produced it.
-	//
-	// Empty means unchecked, which is what tests and single-node use want.
+	// RequestedRuntimes maps each placement node to the backend the manifest
+	// selected for it. It is intentionally carried by the client, not inferred
+	// from a status response: a daemon answering from the wrong socket must not
+	// get to choose what the lab means.
+	RequestedRuntimes map[string]string
+
+	// RequireVersion is the exact controller source build retained in audit
+	// messages. It deliberately does not gate a rolling upgrade: source SHAs
+	// can differ while the protocol, renderer, and state contracts remain
+	// compatible.
 	RequireVersion string
+	// RequireCompatibility is the controller contract accepted for a rolling
+	// deployment. Empty keeps narrow tests and deliberately local callers
+	// unchecked; normal CLI construction always supplies it.
+	RequireCompatibility contract.Set
 }
 
-// VersionSkew reports the nodes not running the expected build.
+// VersionSkew reports a protocol, renderer, or state incompatibility. The
+// historical name remains for callers, but source build IDs are evidence only:
+// compatible bug-fix agents may roll one node at a time.
 func (c *Cluster) VersionSkew(ctx context.Context) error {
-	if c.RequireVersion == "" {
+	expected := c.RequireCompatibility
+	if expected.Empty() && c.RequireVersion != "" {
+		// Compatibility for callers compiled before RequireCompatibility was
+		// added. It intentionally does not compare the supplied source build.
+		expected = agent.Compatibility()
+	}
+	if expected.Empty() {
 		return nil
 	}
-	// A node that cannot be asked, and a node that answers without naming a
-	// build, both used to pass. Both are exactly the node this check exists to
-	// catch: an agent too old to report its version is by definition not the
-	// version this controller is, and a node that is unreachable now is a node
-	// whose configuration nobody has checked. Failing open here means the
-	// check reports agreement it never established.
 	var odd []string
 	for _, r := range c.Status(ctx) {
 		switch {
 		case r.Err != nil:
-			odd = append(odd, fmt.Sprintf("%s could not be asked which build it runs (%v)",
-				r.Node, r.Err))
-		case r.Value.Version == "":
-			odd = append(odd, fmt.Sprintf("%s does not report a build, so it is older "+
-				"than the agent that started reporting one", r.Node))
-		case r.Value.Version != c.RequireVersion:
-			odd = append(odd, fmt.Sprintf("%s runs %s", r.Node, r.Value.Version))
+			odd = append(odd, fmt.Sprintf("%s could not report compatibility (%v)", r.Node, r.Err))
+		case r.Value.Compatibility.Empty():
+			odd = append(odd, fmt.Sprintf("%s (%s) does not advertise protocol, renderer, and state contracts",
+				r.Node, sourceVersion(r.Value.Version)))
+		default:
+			if err := expected.Compatible(r.Value.Compatibility); err != nil {
+				odd = append(odd, fmt.Sprintf("%s (%s): %v", r.Node, sourceVersion(r.Value.Version), err))
+			}
 		}
 	}
 	if len(odd) == 0 {
 		return nil
 	}
 	sort.Strings(odd)
-	return fmt.Errorf("this controller is %s but %s.\n"+
-		"The node agent renders the device configuration, so a node running a "+
-		"different build produces different configuration from the same manifest, "+
-		"and nothing downstream reports it.\n"+
-		"Run scripts/deploy_agents.sh, or set TWINET_ALLOW_VERSION_SKEW=1 if you "+
-		"are certain the difference does not matter",
-		c.RequireVersion, strings.Join(odd, ", "))
+	return fmt.Errorf("rolling upgrade contracts are incompatible before mutation: controller source %s; %s.\n"+
+		"Exact source builds are retained for audit, but a renderer or state contract "+
+		"mismatch can make the same manifest produce different configuration or unreadable state.",
+		sourceVersion(c.RequireVersion), strings.Join(odd, ", "))
 }
 
-// ExpectVersion is the build every agent is expected to be running.
-//
-// It is a package variable set once at start-up rather than a parameter,
-// because every cluster must carry it and there are eight places that build
-// one. A parameter is a thing the ninth caller forgets, and forgetting it
-// yields a cluster that silently accepts mixed builds -- which is how grading
-// came to run without the check while deployment had it.
-var ExpectVersion string
+func sourceVersion(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return "unknown-source"
+	}
+	return value
+}
+
+// ExpectVersion is retained as the exact source build stamped into controller
+// audit records. ExpectCompatibility is the independent rolling-upgrade gate.
+var (
+	ExpectVersion       string
+	ExpectCompatibility contract.Set
+)
 
 // NewCluster builds a cluster client from a lab's placement configuration.
 func NewCluster(lab *model.Lab, token string) *Cluster {
@@ -544,13 +555,20 @@ func fileExists(p string) bool {
 
 // NewClusterTLS builds a cluster client with explicit TLS material.
 func NewClusterTLS(lab *model.Lab, token string, t TLS) *Cluster {
-	c := &Cluster{RequireVersion: ExpectVersion}
+	c := &Cluster{RequireVersion: ExpectVersion, RequireCompatibility: ExpectCompatibility}
+	if lab != nil {
+		c.RequestedRuntimes = make(map[string]string, len(lab.Placement.Nodes))
+	}
+	if lab == nil {
+		return c
+	}
 	for _, n := range lab.Placement.Nodes {
 		addr := n.Addr
 		if addr == "" {
 			addr = n.Name + ":7200"
 		}
 		c.Nodes = append(c.Nodes, NewNodeTLS(n.Name, addr, token, t))
+		c.RequestedRuntimes[n.Name] = lab.RuntimeForNode(n.Name)
 	}
 	return c
 }
@@ -574,10 +592,19 @@ func (c *Cluster) Without(names ...string) *Cluster {
 	for _, name := range names {
 		skip[name] = true
 	}
-	out := &Cluster{RequireVersion: c.RequireVersion}
+	out := &Cluster{
+		RequireVersion:       c.RequireVersion,
+		RequireCompatibility: c.RequireCompatibility,
+	}
+	if len(c.RequestedRuntimes) > 0 {
+		out.RequestedRuntimes = make(map[string]string, len(c.RequestedRuntimes))
+	}
 	for _, node := range c.Nodes {
 		if !skip[node.Name] {
 			out.Nodes = append(out.Nodes, node)
+			if c.RequestedRuntimes != nil {
+				out.RequestedRuntimes[node.Name] = c.RequestedRuntimes[node.Name]
+			}
 		}
 	}
 	return out
@@ -652,10 +679,47 @@ func (c *Cluster) HealthCheck(ctx context.Context) error {
 		}
 	}
 	if len(problems) == 0 {
+		if err := c.RuntimeCompatibility(ctx); err != nil {
+			return err
+		}
 		return nil
 	}
 	sort.Strings(problems)
 	return fmt.Errorf("cluster health check failed before placement: %s", strings.Join(problems, "; "))
+}
+
+// RuntimeCompatibility proves every responding agent is attached to the
+// backend requested by the manifest. It deliberately runs before a mutation
+// lease, image pull, overlay reservation, or placement record write: an agent
+// pointed at Docker when the lab requests Podman is a different substrate, not
+// a harmless status detail.
+func (c *Cluster) RuntimeCompatibility(ctx context.Context) error {
+	if len(c.RequestedRuntimes) == 0 {
+		return nil
+	}
+	var problems []string
+	for _, result := range c.Status(ctx) {
+		want, configured := c.RequestedRuntimes[result.Node]
+		if !configured {
+			continue
+		}
+		switch {
+		case result.Err != nil:
+			problems = append(problems, fmt.Sprintf("%s could not report its selected runtime (%v)",
+				result.Node, result.Err))
+		case result.Value.Runtime == "":
+			problems = append(problems, fmt.Sprintf("%s does not report a runtime backend", result.Node))
+		case !strings.EqualFold(strings.TrimSpace(result.Value.Runtime), strings.TrimSpace(want)):
+			problems = append(problems, fmt.Sprintf("%s runs %s but the manifest requests %s",
+				result.Node, result.Value.Runtime, want))
+		}
+	}
+	if len(problems) == 0 {
+		return nil
+	}
+	sort.Strings(problems)
+	return fmt.Errorf("runtime selection does not match the lab before mutation: %s",
+		strings.Join(problems, "; "))
 }
 
 // Inventories obtains a complete live reservation view from every node. A
@@ -765,7 +829,17 @@ func (c *Cluster) Admit(ctx context.Context, top *model.Topology, strict, overco
 // what is placed on itself.
 func (c *Cluster) Apply(ctx context.Context, top *model.Topology, req agent.ApplyRequest) []NodeResult[agent.ApplyResponse] {
 	ctx = operationContext(ctx)
-	if err := c.VersionSkew(ctx); err != nil && os.Getenv("TWINET_ALLOW_VERSION_SKEW") == "" {
+	if req.ControllerVersion == "" {
+		req.ControllerVersion = c.RequireVersion
+	}
+	if err := c.RuntimeCompatibility(ctx); err != nil {
+		out := make([]NodeResult[agent.ApplyResponse], 0, len(c.Nodes))
+		for _, n := range c.Nodes {
+			out = append(out, NodeResult[agent.ApplyResponse]{Node: n.Name, Err: err})
+		}
+		return out
+	}
+	if err := c.VersionSkew(ctx); err != nil {
 		out := make([]NodeResult[agent.ApplyResponse], 0, len(c.Nodes))
 		for _, n := range c.Nodes {
 			out = append(out, NodeResult[agent.ApplyResponse]{Node: n.Name, Err: err})
@@ -803,6 +877,28 @@ func (c *Cluster) Apply(ctx context.Context, top *model.Topology, req agent.Appl
 	// through, which is the same reason the version check lives here.
 	c.stampImageIDs(ctx, top)
 	return c.coordinatedApply(ctx, top, req)
+}
+
+func verifyAppliedImageDigests(top *model.Topology, node string, response agent.ApplyResponse) error {
+	if top == nil || top.Lab == nil || !top.Lab.Images.RequiresImmutableImages() {
+		return nil
+	}
+	refs := map[string]bool{}
+	for _, device := range top.DevicesOnNode(node) {
+		if device.Image != "" {
+			refs[device.Image] = true
+		}
+	}
+	for ref := range refs {
+		actual := response.ImageDigests[ref]
+		if actual == "" {
+			return fmt.Errorf("%s did not report a post-pull digest for %s", node, ref)
+		}
+		if !images.SameDigest(ref, actual) {
+			return fmt.Errorf("%s pulled %s as %s, not locked digest %s", node, ref, actual, images.Digest(ref))
+		}
+	}
+	return nil
 }
 
 // unfencedApply is only for a dry run or an empty local cluster. All
@@ -870,14 +966,16 @@ func (c *Cluster) stampImageIDs(ctx context.Context, top *model.Topology) {
 		// container of a single-node lab on the next deploy, which is the bug
 		// this exists to stop, just on one machine instead of a cluster.
 		local := map[string]string{}
-		d := rt.NewDocker()
-		for _, ref := range list {
-			if id, err := d.ImageDigest(ctx, ref); err == nil {
-				local[ref] = id
+		if d, err := localTopologyRuntime(top); err == nil {
+			for _, ref := range list {
+				if id, err := d.ImageDigest(ctx, ref); err == nil {
+					local[ref] = id
+				}
 			}
 		}
 		answers["local"] = local
 	}
+
 	for _, n := range c.Nodes {
 		got, err := n.ImageDigests(ctx, list)
 		if err != nil {
@@ -897,6 +995,32 @@ func (c *Cluster) stampImageIDs(ctx context.Context, top *model.Topology) {
 			d.ImageID = seen[d.Image]
 		}
 	}
+}
+
+func localTopologyRuntime(top *model.Topology) (rt.Runtime, error) {
+	name, socket := model.DefaultRuntime, ""
+	if top != nil && top.Lab != nil {
+		node := top.Lab.FrontNode()
+		for _, device := range top.Devices {
+			if device != nil && device.Node != "" {
+				node = device.Node
+				break
+			}
+		}
+		name = top.Lab.RuntimeForNode(node)
+		socket = top.Lab.RuntimeSocketForNode(node)
+	}
+	if err := rt.ValidateSelection(name, socket); err != nil {
+		return nil, err
+	}
+	selected, err := rt.NewRuntime(name)
+	if err != nil {
+		return nil, err
+	}
+	if err := rt.ConfigureEndpoint(selected, socket); err != nil {
+		return nil, err
+	}
+	return selected, nil
 }
 
 // agreedDigests reduces each node's answer to the identity they all give, and

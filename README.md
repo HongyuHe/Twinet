@@ -20,11 +20,12 @@ routers, and switches.
   agent. The source-generated list, runtime/NOS registries, interior generators,
   fault count, and bundled-example statistics are checked in
   [`docs/09_status.md`](docs/09_status.md).
-- Docker and Podman are registered runtimes; Docker uses the Docker Engine API.
-  Podman's API contract has a bounded live integration result in the status
-  ledger, but manifest/agent runtime selection is still pending. Twinet
-  therefore has host and image dependencies; it is not a one-binary,
-  dependency-free deployment.
+- Docker and Podman are registered, selectable runtimes. `placement.runtime`
+  and per-node overrides are validated against runtime capabilities before
+  mutation; agent status exposes backend/version/socket and deployment rejects
+  a mismatch. `make podman-integration` is the explicit real-Podman lifecycle
+  gate. Twinet therefore has host and image dependencies; it is not a
+  one-binary, dependency-free deployment.
 - Deterministic allocation still derives names, addresses, and link identifiers
   from a manifest. Student-owned configuration, topology/coordination records,
   event journals, and replica acknowledgements are instead persisted in the

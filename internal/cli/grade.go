@@ -277,7 +277,10 @@ func execFunc(ctx context.Context, top *model.Topology, token string) (
 	func(context.Context, string, []string) (runtime.ExecResult, error), error) {
 
 	if !clustered(top) {
-		rt := runtime.NewDocker()
+		rt, err := localRuntime(top)
+		if err != nil {
+			return nil, err
+		}
 		tools := integrity.NewChecker(rt)
 		return func(ctx context.Context, deviceID string, cmd []string) (runtime.ExecResult, error) {
 			d, ok := top.Device(deviceID)
@@ -334,7 +337,10 @@ func lifecycleFunc(top *model.Topology, token string) (
 	func(context.Context, string, string) error, error) {
 
 	if !clustered(top) {
-		rt := runtime.NewDocker()
+		rt, err := localRuntime(top)
+		if err != nil {
+			return nil, err
+		}
 		return func(ctx context.Context, deviceID, action string) error {
 			d, ok := top.Device(deviceID)
 			if !ok {
@@ -428,7 +434,10 @@ func nodeStateFunc(top *model.Topology, token string) (
 	func(context.Context, string) (string, error), error) {
 
 	if !clustered(top) {
-		rt := runtime.NewDocker()
+		rt, err := localRuntime(top)
+		if err != nil {
+			return nil, err
+		}
 		return func(ctx context.Context, deviceID string) (string, error) {
 			d, ok := top.Device(deviceID)
 			if !ok {
@@ -486,7 +495,10 @@ func reshapeFunc(top *model.Topology, token string) (
 	}
 
 	if !clustered(top) {
-		rt := runtime.NewDocker()
+		rt, err := localRuntime(top)
+		if err != nil {
+			return nil, err
+		}
 		return func(ctx context.Context, deviceID, iface string) error {
 			d, ok := top.Device(deviceID)
 			if !ok {

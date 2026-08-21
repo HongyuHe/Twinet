@@ -12,6 +12,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/HongyuHe/twinet/internal/expand"
+	"github.com/HongyuHe/twinet/internal/images"
 	"github.com/HongyuHe/twinet/internal/manifest"
 	"github.com/HongyuHe/twinet/internal/model"
 	"github.com/HongyuHe/twinet/internal/render"
@@ -41,6 +42,9 @@ func load(opts *Options) (*model.Topology, error) { //nolint:revive
 	for _, w := range res.Warnings {
 		fmt.Fprintln(os.Stderr, "warning: "+w)
 	}
+	if _, err := images.Apply(res.Topology); err != nil {
+		return nil, err
+	}
 	return res.Topology, nil
 }
 
@@ -64,6 +68,9 @@ func newValidateCmd(opts *Options) *cobra.Command {
 			// only resolve once templates are instantiated.
 			res, err := expand.Expand(l.Lab)
 			if err != nil {
+				return err
+			}
+			if _, err := images.Apply(res.Topology); err != nil {
 				return err
 			}
 			s := res.Topology.Stats()

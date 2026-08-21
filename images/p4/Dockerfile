@@ -3,9 +3,9 @@
 # The upstream BMv2 image is pinned by digest. A tag is retained solely as a
 # human-readable release hint; the digest is what makes a program load and CLI
 # behaviour reproducible.
-FROM p4lang/p4c:1.2.5.16@sha256:25d2e5366f8a7ce22c6578b264ba8b25c7a95fb3dc0690b79e4a89fbec37cc85 AS compiler
+FROM docker.io/p4lang/p4c:1.2.5.16@sha256:25d2e5366f8a7ce22c6578b264ba8b25c7a95fb3dc0690b79e4a89fbec37cc85 AS compiler
 
-FROM p4lang/behavioral-model:latest-24@sha256:3751094ec499b6f9227fd02db89b49a05419e39aaa4078bcb99937308d69e64a
+FROM docker.io/p4lang/behavioral-model:latest-24@sha256:3751094ec499b6f9227fd02db89b49a05419e39aaa4078bcb99937308d69e64a
 
 USER root
 RUN mkdir -p /etc/twinet/p4 /var/log/twinet \

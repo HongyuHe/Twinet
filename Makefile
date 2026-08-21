@@ -22,10 +22,12 @@ TAG     ?= 0.1
 # software under an unchanged name and a regrade against it is not comparable
 # with the first.
 BUILD_TAG ?= $(TAG)-$(COMMIT)
+IMAGE_LOCK ?= images/lock.json
+PODMAN_ROOT ?= sudo -n podman
 # Must match .github/workflows/ci.yml, or local lint and CI can disagree.
 GOLANGCI_VERSION ?= v2.5.0
 
-.PHONY: all build test lint fmt vet images push digests clean install e2e ci ci-tools tidy-check naming \
+.PHONY: all build test lint fmt vet images push digests image-lock image-verify podman-images podman-integration clean install e2e ci ci-tools tidy-check naming \
 	script-tests benchmark chaos soak-short soak-24h nos-images substrate-images substrate-integration \
 	fault-integration k8s-fault-integration fault-stress fault-stress-release o12-integration
 
@@ -120,6 +122,8 @@ tidy-check:
 # rather than downloaded, so the lab's trust anchor is the code in this
 # repository and not a binary from somewhere else.
 images: build
+	@rm -f images/svc/twinet-rtr images/router/twinet-dhcpd images/host/twinet-mcast \
+		images/router/twinet-mcast images/svc/twinet-traffic images/controller/twinet-openflow-controller
 	@cp $(BIN)/twinet-rtr images/svc/twinet-rtr
 	@cp $(BIN)/twinet-dhcpd images/router/twinet-dhcpd
 	@cp $(BIN)/twinet-mcast images/host/twinet-mcast
@@ -127,28 +131,77 @@ images: build
 	@cp $(BIN)/twinet-traffic images/svc/twinet-traffic
 	@cp $(BIN)/twinet-openflow-controller images/controller/twinet-openflow-controller
 	@for i in $(IMAGES); do \
-		echo "building $(REGISTRY)/twinet-$$i:$(TAG)"; \
+		echo "building $(REGISTRY)/twinet-$$i:$(TAG) and :$(BUILD_TAG)"; \
 		$(DOCKER) build -q -t $(REGISTRY)/twinet-$$i:$(TAG) images/$$i || exit 1; \
+		$(DOCKER) tag $(REGISTRY)/twinet-$$i:$(TAG) $(REGISTRY)/twinet-$$i:$(BUILD_TAG) || exit 1; \
 	done
 
 push: images
 	@for i in $(IMAGES); do \
-		$(DOCKER) tag $(REGISTRY)/twinet-$$i:$(TAG) $(REGISTRY)/twinet-$$i:$(BUILD_TAG); \
-		echo "pushing $(REGISTRY)/twinet-$$i:$(TAG) and :$(BUILD_TAG)"; \
-		$(DOCKER) push -q $(REGISTRY)/twinet-$$i:$(TAG) >/dev/null || exit 1; \
+		echo "pushing immutable $(REGISTRY)/twinet-$$i:$(BUILD_TAG) before moving :$(TAG)"; \
 		$(DOCKER) push -q $(REGISTRY)/twinet-$$i:$(BUILD_TAG) >/dev/null || exit 1; \
+		$(DOCKER) buildx imagetools inspect $(REGISTRY)/twinet-$$i:$(BUILD_TAG) --format '{{.Digest}}' | grep -Eq '^sha256:[0-9a-f]{64}$$' || exit 1; \
+		$(DOCKER) push -q $(REGISTRY)/twinet-$$i:$(TAG) >/dev/null || exit 1; \
 	done
-	@$(MAKE) --no-print-directory digests
+	@$(MAKE) --no-print-directory image-lock
 
-# digests records what was actually published, so a report naming an image can
-# be traced to the exact bytes rather than to a tag that has since moved.
-digests:
-	@echo "# published $(shell date -u +%Y-%m-%dT%H:%M:%SZ) from $(COMMIT)" > images/published.txt
+# image-lock records only registry-inspected immutable manifests. A local
+# image config ID is deliberately rejected by `twinet images lock`: it cannot
+# prove the bytes were pushed and another node can pull them.
+image-lock: build
+	@args=""; \
+	for i in $(IMAGES); do \
+		source="$(REGISTRY)/twinet-$$i:$(TAG)"; \
+		immutable="$(REGISTRY)/twinet-$$i:$(BUILD_TAG)"; \
+		d=$$($(DOCKER) buildx imagetools inspect "$$immutable" --format '{{.Digest}}') || exit 1; \
+		echo "$$d" | grep -Eq '^sha256:[0-9a-f]{64}$$' || { echo "$$immutable did not resolve to a pushed manifest digest" >&2; exit 1; }; \
+		source_d=$$($(DOCKER) buildx imagetools inspect "$$source" --format '{{.Digest}}') || exit 1; \
+		test "$$source_d" = "$$d" || { echo "$$source does not match immutable $$immutable" >&2; exit 1; }; \
+		args="$$args --pin $$source=$$source@$$d"; \
+	done; \
+	./$(BIN)/twinet --manifest examples/mixed-substrate images lock --output "$(IMAGE_LOCK)" $$args
+
+image-verify: build
+	@test -f "$(IMAGE_LOCK)" || { echo "missing $(IMAGE_LOCK); run make push or make image-lock"; exit 2; }
+	./$(BIN)/twinet --manifest examples/mixed-substrate images verify --lock "$(IMAGE_LOCK)"
+
+# Compatibility alias retained for release scripts that used the old target.
+digests: image-lock
+
+# Build the exact same source images with Podman so the real-Podman lifecycle
+# gate cannot claim success from Docker-built artifacts. PODMAN_ROOT defaults
+# to a non-interactive rootful service because host netlink wiring needs that
+# substrate; set it explicitly for another supported rootful installation.
+podman-images: build
+	@rm -f images/svc/twinet-rtr images/router/twinet-dhcpd images/host/twinet-mcast \
+		images/router/twinet-mcast images/svc/twinet-traffic images/controller/twinet-openflow-controller
+	@cp $(BIN)/twinet-rtr images/svc/twinet-rtr
+	@cp $(BIN)/twinet-dhcpd images/router/twinet-dhcpd
+	@cp $(BIN)/twinet-mcast images/host/twinet-mcast
+	@cp $(BIN)/twinet-mcast images/router/twinet-mcast
+	@cp $(BIN)/twinet-traffic images/svc/twinet-traffic
+	@cp $(BIN)/twinet-openflow-controller images/controller/twinet-openflow-controller
 	@for i in $(IMAGES); do \
-		d=$$($(DOCKER) image inspect $(REGISTRY)/twinet-$$i:$(TAG) --format '{{if .RepoDigests}}{{index .RepoDigests 0}}{{else}}{{.Id}}{{end}}'); \
-		echo "$(REGISTRY)/twinet-$$i:$(TAG) $$d" >> images/published.txt; \
+		echo "building $(REGISTRY)/twinet-$$i:$(TAG) with Podman"; \
+		$(PODMAN_ROOT) build -q -t $(REGISTRY)/twinet-$$i:$(TAG) images/$$i || exit 1; \
 	done
-	@cat images/published.txt
+
+# This is intentionally an explicit, non-vacuous rootful Podman gate. The
+# test deploys, wires, configures, executes, saves, consumes agent events, and
+# destroys a source-built routed lab; it fails rather than skips if prerequisites
+# or the acknowledgement are absent.
+podman-integration:
+	@test "$${TWINET_PODMAN_INTEGRATION_ALLOW_DESTRUCTIVE:-}" = "1" || \
+		{ echo "make podman-integration requires TWINET_PODMAN_INTEGRATION_ALLOW_DESTRUCTIVE=1"; exit 2; }
+	@$(PODMAN_ROOT) info >/dev/null 2>&1 || \
+		{ echo "make podman-integration requires a reachable rootful Podman service"; exit 2; }
+	@$(MAKE) --no-print-directory PODMAN_ROOT="$(PODMAN_ROOT)" podman-images
+	sudo -n env PATH="$$PATH" \
+	TWINET_BIN="$(CURDIR)/bin/twinet" \
+	TWINET_PODMAN_INTEGRATION=1 \
+	TWINET_PODMAN_HOST="$${TWINET_PODMAN_HOST:-unix:///run/podman/podman.sock}" \
+	REGISTRY="$(REGISTRY)" TAG="$(TAG)" \
+	$(GO) test -count=1 -tags=podman_integration -timeout 15m ./test/integration/ -run '^TestPodmanRoutedLabLifecycle$$'
 
 install: build
 	install -m 0755 $(BIN)/twinet /usr/local/bin/twinet

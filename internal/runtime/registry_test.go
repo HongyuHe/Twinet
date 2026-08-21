@@ -18,3 +18,20 @@ func TestDockerRuntimeIsExplicitlyRegistered(t *testing.T) {
 		t.Fatalf("docker capabilities = %#v", capabilities)
 	}
 }
+
+func TestRoutedLabCapabilityValidationRejectsUnknownBackend(t *testing.T) {
+	err := RequireRoutedLabCapabilities("not-a-runtime")
+	if err == nil {
+		t.Fatal("unknown runtime passed routed-lab capability validation")
+	}
+}
+
+func TestEndpointConfigurationIsValidatedBeforeAnyOperation(t *testing.T) {
+	runtime, err := NewRuntime("podman")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ConfigureEndpoint(runtime, "http://not-a-socket"); err == nil {
+		t.Fatal("unsafe Podman HTTP endpoint was accepted before runtime startup")
+	}
+}

@@ -24,6 +24,14 @@ type BackendCapabilities struct {
 	Events            bool
 }
 
+// SupportsRoutedLab reports whether a backend can run the complete Twinet
+// substrate. A backend with only lifecycle support is useful for a narrow unit
+// test, but it must never get far enough into a deployment to create half a
+// lab and discover that it cannot wire or configure it.
+func (c BackendCapabilities) SupportsRoutedLab() bool {
+	return c.Lifecycle && c.Exec && c.Copy && c.NetworkNamespaces && c.Events
+}
+
 var runtimeRegistry = struct {
 	sync.RWMutex
 	backends map[string]runtimeBackend
@@ -80,6 +88,84 @@ func CapabilitiesFor(name string) (BackendCapabilities, bool) {
 	defer runtimeRegistry.RUnlock()
 	backend, ok := runtimeRegistry.backends[strings.ToLower(strings.TrimSpace(name))]
 	return backend.capabilities, ok
+}
+
+// RequireRoutedLabCapabilities validates a runtime selection before a caller
+// mutates containers or host networking.
+func RequireRoutedLabCapabilities(name string) error {
+	capabilities, ok := CapabilitiesFor(name)
+	if !ok {
+		return fmt.Errorf("runtime backend %q is not registered (available: %s)",
+			name, strings.Join(RuntimeNames(), ", "))
+	}
+	if capabilities.SupportsRoutedLab() {
+		return nil
+	}
+	var missing []string
+	if !capabilities.Lifecycle {
+		missing = append(missing, "lifecycle")
+	}
+	if !capabilities.Exec {
+		missing = append(missing, "exec")
+	}
+	if !capabilities.Copy {
+		missing = append(missing, "copy")
+	}
+	if !capabilities.NetworkNamespaces {
+		missing = append(missing, "network namespaces")
+	}
+	if !capabilities.Events {
+		missing = append(missing, "events")
+	}
+	return fmt.Errorf("runtime backend %q cannot run a routed Twinet lab; missing %s",
+		name, strings.Join(missing, ", "))
+}
+
+// EndpointRuntime is implemented by backends that can be bound to one
+// explicit API socket. Agent configuration uses it instead of changing
+// process-global environment variables, which would let two agents in one
+// process accidentally select each other's engine.
+type EndpointRuntime interface {
+	Runtime
+	SetRuntimeEndpoint(string) error
+	RuntimeEndpoint() string
+}
+
+// ConfigureEndpoint binds a selected runtime to an explicit Unix socket or
+// TCP endpoint. An empty endpoint retains the backend's ordinary default.
+func ConfigureEndpoint(r Runtime, endpoint string) error {
+	if strings.TrimSpace(endpoint) == "" {
+		return nil
+	}
+	configurable, ok := r.(EndpointRuntime)
+	if !ok {
+		return fmt.Errorf("runtime backend %q does not support an explicit socket", r.Name())
+	}
+	return configurable.SetRuntimeEndpoint(endpoint)
+}
+
+// ValidateSelection checks both a registered routed-lab backend and its
+// optional endpoint without opening a daemon connection or mutating anything.
+// Manifest validation and bootstrap generation use it before they produce work
+// that would otherwise fail halfway through a deployment.
+func ValidateSelection(name, endpoint string) error {
+	if err := RequireRoutedLabCapabilities(name); err != nil {
+		return err
+	}
+	r, err := NewRuntime(name)
+	if err != nil {
+		return err
+	}
+	return ConfigureEndpoint(r, endpoint)
+}
+
+// Endpoint returns the API socket or endpoint a backend reports. It is kept
+// separate from Name so status can prove which daemon an agent actually uses.
+func Endpoint(r Runtime) string {
+	if configurable, ok := r.(EndpointRuntime); ok {
+		return configurable.RuntimeEndpoint()
+	}
+	return ""
 }
 
 func init() {

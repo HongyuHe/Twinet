@@ -28,11 +28,14 @@ var eventCorrelationSequence atomic.Uint64
 // identifiers in the event body rather than as Prometheus labels: events are
 // bounded and queryable, while metric cardinality must remain bounded.
 type Event struct {
-	Sequence   uint64    `json:"sequence"`
-	Timestamp  time.Time `json:"timestamp"`
-	Node       string    `json:"node"`
-	Lab        string    `json:"lab,omitempty"`
-	Generation string    `json:"generation,omitempty"`
+	Sequence  uint64    `json:"sequence"`
+	Timestamp time.Time `json:"timestamp"`
+	Node      string    `json:"node"`
+	// AgentVersion is the exact source build that recorded this event. It is
+	// provenance, never a compatibility decision.
+	AgentVersion string `json:"agent_version,omitempty"`
+	Lab          string `json:"lab,omitempty"`
+	Generation   string `json:"generation,omitempty"`
 	// FenceGeneration identifies the fenced controller mutation that caused
 	// this event. It is separate from Generation: a deployment generation is
 	// content addressed, while a fence generation orders competing writers.
@@ -320,7 +323,7 @@ func (s *Server) recordEvent(lab, generation, scope, correlation, action, result
 		s.mu.Unlock()
 	}
 	return s.eventLog().append(Event{
-		Node: s.cfg.Node, Lab: lab, Generation: generation, Scope: scope,
+		Node: s.cfg.Node, AgentVersion: Version, Lab: lab, Generation: generation, Scope: scope,
 		CorrelationID: correlation, Action: action, Result: result, Detail: detail,
 	})
 }
