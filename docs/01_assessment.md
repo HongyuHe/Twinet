@@ -3,6 +3,11 @@
 Reviewed at `/users/hy/mini-internet` @ `c2e8827` ("Modify topo for typonet poc").
 This is the Princeton COS-461 fork of the ETH `nsg-ethz/mini_internet_project`.
 
+> **Documentation status: historical assessment.** This page describes the
+> predecessor platform at the reviewed revision. Its proposed Twinet direction
+> is not a statement of current implementation; use
+> [09 — Implementation status](09_status.md) for shipped and measured facts.
+
 ## 1. What the platform does (and does very well)
 
 The mini-Internet gives every student group a full Autonomous System — 8 FRR

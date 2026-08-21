@@ -1,93 +1,47 @@
-# Twinet
+# Twinet documentation
 
-**Twinet** is a ground-up redesign and reimplementation of the
-[mini-Internet project](https://github.com/nsg-ethz/mini_internet_project):
-a container-based network *twin* for teaching, at class scale, how the Internet
-practically works.
+This directory is intentionally a mixed record: the early design documents
+explain why Twinet was built, while [`09_status.md`](09_status.md) records what
+the checked source and named cluster runs actually support.
 
-> **Twin** + **net**: every student group operates a real AS — real FRR, real
-> BGP, real OSPF, real RPKI — inside a faithful, reproducible, horizontally
-> scalable digital twin of the Internet.
->
-> The same twin, deliberately broken in a known way, is a benchmark for whether
-> an AI agent can find the fault.
+## Reading status labels
 
----
+| Label | Meaning |
+|---|---|
+| **Shipped / source-verified** | Present in this repository and covered by an automated test or source-derived documentation gate. |
+| **Measured** | Observed in the named environment and recorded in [09](09_status.md); not a general performance promise. |
+| **Target / planned** | An acceptance criterion or desired capability that has not been claimed as measured. |
+| **Historical** | An assessment, original design, or decision record retained for context. It is not an implementation claim. |
 
-## Why a redesign?
-
-The current platform works and has taught thousands of students, but it has
-accumulated ~35,000 lines of ad-hoc bash and Python with no schema, no tests,
-no state model, and a hard single-machine ceiling. See
-[01_assessment.md](01_assessment.md) for the full critique.
-
-Twinet keeps everything that makes the mini-Internet pedagogically excellent
-and replaces the machinery underneath it.
-
-| | mini-Internet | Twinet |
-|---|---|---|
-| Implementation | ~17.8k lines bash + ~17.4k lines Python, 20 top-level scripts run serially | One statically-linked Go binary + one node agent |
-| Topology input | 8 positional whitespace-separated `.txt` files with `N/A` sentinels | One validated, schema-checked, templated YAML manifest |
-| Addressing | `subnet_config.sh`: hardcoded bash functions with magic offsets | Declarative, expression-based IPAM plan; deterministic and inspectable |
-| State | `groups/` dir + `docker_pid.map` sourced as bash (stale after reboot) | Derived from container labels + deterministic allocation; no database to corrupt |
-| Deploy | `startup.sh` → 20 scripts, two hardcoded `sleep 60`s | Dependency DAG, parallel workers, active convergence detection |
-| Scale | Single beefy server, ~1.5–2k containers | Scales out across a cluster; AS-granular placement over a VXLAN fabric |
-| Restart one device | `restart_container.sh` (1,011 lines of bash) | `twinet deploy --only <device>`, diff-and-converge |
-| Grading | Serial, `sleep(20)`-driven, mutates the live class network, hours per class | Parallel ephemeral per-student labs, convergence-triggered, minutes per class |
-| Tests | none | Unit + integration + e2e in CI |
-
----
+The source facts block in [09](09_status.md) is machine-checked against
+`cmd/*`, the runtime/NOS/interior/fault registries, and statistics emitted by a
+CLI built from this source tree.
 
 ## Documents
 
-| # | Document | Contents |
+| # | Document | Status and purpose |
 |---|---|---|
-| 01 | [Assessment](01_assessment.md) | Critical review of the current implementation; what to keep, what to kill |
-| 02 | [Architecture](02_architecture.md) | Components, control/data plane split, state model, runtime abstraction |
-| 03 | [Topology model](03_topology_model.md) | The Twinet manifest, AS templates, IPAM, the provisioned/student config split |
-| 04 | [Networking & scale-out](04_networking_and_scaleout.md) | Link realization, VXLAN fabric, placement, shaping, MTU, measured results |
-| 05 | [Services](05_services.md) | DNS, matrix, looking glass, RPKI, IXP, measurement, VPN, web, access/SSH |
-| 06 | [Grading](06_grading.md) | The autograding engine: ephemeral labs, probes, rubrics, parallelism |
-| 07 | [Roadmap](07_roadmap.md) | Milestones, deliverables, acceptance criteria, risks |
-| 08 | [Resources needed](08_resources_needed.md) | What I need from you to execute this plan |
-| 09 | [Implementation status](09_status.md) | What is built and verified, with measurements |
-| 10 | [Fault injection and RCA](10_fault_injection.md) | Injecting the NIKA fault taxonomy, for assessing AI agents at root-cause analysis |
-| 11 | [Scalability and reliability objectives](11_scalability_and_reliability_objectives.md) | Comparative audit, critical issues, measurable remediation objectives, and review gate |
+| 01 | [Assessment](01_assessment.md) | Historical review of the predecessor platform |
+| 02 | [Architecture](02_architecture.md) | Shipped architecture, with explicit non-claims |
+| 03 | [Topology model](03_topology_model.md) | Shipped model capabilities and compatibility limits |
+| 04 | [Networking and scale-out](04_networking_and_scaleout.md) | Shipped overlay/placement/durability model; measurements link to 09 |
+| 05 | [Services and access](05_services.md) | Shipped service, endpoint, access, and observability behavior |
+| 06 | [Grading](06_grading.md) | Shipped grading modes and measured evidence boundary |
+| 07 | [Roadmap](07_roadmap.md) | Historical targets and remaining acceptance work |
+| 08 | [Resources and decisions](08_resources_needed.md) | Historical environment/decision record |
+| 09 | [Implementation status](09_status.md) | Canonical source facts, measurements, and remaining work |
+| 10 | [Fault injection and RCA](10_fault_injection.md) | Separately maintained NIKA work |
+| 11 | [Scalability and reliability objectives](11_scalability_and_reliability_objectives.md) | Separately maintained objectives and review gate |
 
-## Repository conventions
+## Documentation checks
 
-| Thing | Convention | Example |
-|---|---|---|
-| File names | `snake_case` | `bgp_json.go`, `04_networking_and_scaleout.md`, `twinet_motd` |
-| Folder names | `this-kind-of-format` | `internal/grade`, `.github/workflows` |
-| Exceptions | Names a tool requires | `README.md`, `Makefile`, `Dockerfile`, `go.mod`, Go's `testdata/` |
+Run both gates before changing documentation:
 
-`scripts/check_naming.sh` enforces this and runs in CI, because a convention
-that is only written down decays. The exemption list lives in that script.
+```sh
+go test ./internal/cli -run 'Test(EveryDocumentedCommandExists|Documentation)'
+python3 scripts/check_docs.py
+```
 
-## Design principles
-
-1. **One binary, no runtime dependencies.** `twinet` is a static Go binary.
-   Deploying Twinet on a fresh machine is: install Docker, drop two binaries,
-   `twinet deploy`. No pip, no venv, no OVS on the host, no sourcing bash libraries.
-2. **The manifest is the truth; everything else is derived.** Addressing, VNIs,
-   ports, container names, DNS zones, IXP configs, the website, and the grading
-   topology are all *computed* from one validated document. Nothing is
-   hand-maintained in two places.
-3. **Deterministic allocation, so there is no state to lose.** Every allocated
-   resource (subnet, VNI, port, MAC) is a pure function of the manifest. A
-   controller restart, a node reboot, or a partial failure changes nothing.
-4. **Incomplete-by-design is a first-class concept.** A teaching network is
-   *deliberately* unfinished. Twinet distinguishes operator-provisioned config
-   from student-owned config at the model level, rather than by convention.
-5. **Everything is parallel.** Deployment, probing, and grading are all
-   embarrassingly parallel; nothing may be serialized by a `sleep`.
-6. **Scale out, not up.** The unit of placement is an AS. Adding a machine adds
-   capacity; no single node is special except by choice.
-7. **Grading is a first-class product, not a script.** Reproducible, isolated,
-   parallel, rubric-driven, with structured output and a re-runnable artifact.
-8. **A fault is as first-class as a configuration.** Twinet must be able to
-   break a network as precisely as it can build one: injectably, verifiably,
-   reversibly, and with machine-readable ground truth. That is what lets the
-   same platform teach students and measure whether an AI agent can actually
-   diagnose an incident. See [10](10_fault_injection.md).
+The Go test rejects stale command names and stale generated capability facts.
+The Python checker validates local Markdown links, referenced paths, and
+benchmark labels.

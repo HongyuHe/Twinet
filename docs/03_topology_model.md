@@ -1,527 +1,111 @@
-# 03 — The topology model
+# 03 — Topology model
 
-## 1. Requirements the format must satisfy
+> **Documentation status: shipped model surface.** Examples in this document
+> describe fields validated and expanded by the current source. They are not a
+> claim that every example has passed a live-cluster acceptance run; measured
+> evidence is limited to [09](09_status.md).
 
-1. Express ~100 ASes that are **structurally identical** without 5,000 lines of
-   repetition, while allowing per-AS overrides (TA ASes, Tier-1s, stubs).
-2. Express **inter-AS topology** with business relationships and per-link
-   bandwidth/delay/queue.
-3. Express **L2 fabrics** with VLANs, trunks, and gateway sub-interfaces.
-4. Express **which parts are pre-provisioned and which the student must
-   configure** — the defining requirement of a teaching platform.
-5. Be **validated as a whole**, reporting *every* error at once with file/line.
-6. Be **diffable** in version control, and **generatable** by a tool.
-7. Be **stable across years**: changing the class from 30 to 80 ASes, or from a
-   US map to a European map, should be a small diff.
+## One authored model, expanded graph
 
-The current 8-file positional format fails 1–6. A single flat YAML file fails 1
-and 6. Twinet uses a **manifest + templates** model.
+A lab is authored as YAML (`Lab` plus `ASTemplate` documents) and expanded into
+concrete devices, interfaces, links, service replicas, placement groups, and
+rendering inputs. `twinet validate --json` validates a lab and reports the
+expanded statistics; the documentation gate runs that source-built command for
+every bundled example.
 
-## 2. Shape of a lab
+The model owns:
 
-```
-cos461-f25/
-  twinet.yaml            # the lab manifest — the only entry point
-  templates/
-    student_as.yaml      # internal topology of a full student AS
-    tier1-as.yaml        # reduced TA-operated AS
-    stub-as.yaml
-    ixp.yaml
-  configs/
-    student-as/          # files overlaid into devices at boot
-      ATL/etc/frr/frr.conf.tmpl
-      A_EUH/etc/hosts
-    _shared/
-  rubric/
-    cos461.yaml          # grading rubric (see doc 06)
-```
+- defaults, kinds, resource **requests**, and runtime limits;
+- deterministic addressing and link identifiers;
+- AS templates, peerings, services, access, placement, and state policy;
+- the provisioning contract that distinguishes platform-owned configuration
+  from student-owned configuration; and
+- the expected/reference configuration used by rendering and grading.
 
-## 3. The manifest
+Deterministic derivation avoids duplicate allocation ledgers. It does not erase
+durable state: student snapshots, topology records, lease/fence data, event
+journals, and replica acknowledgements are persisted by the node state store.
 
-```yaml
-apiVersion: twinet.dev/v1
-kind: Lab
-metadata:
-  name: cos461-f25
-  course: COS 461 — Computer Networks, Princeton
-  term: fall25
+## Interior generators
 
-defaults:                       # inherited by every device; lowest precedence
-  cpus: 2
-  memory: 512Mi
-  pids: 256
-  # cpus/memory/pids above are hard container limits. Requests are what the
-  # scheduler reserves from a node; omitting a dimension gets a conservative
-  # per-kind default.
-  requests:
-    cpus: 0.25
-    memory: 128Mi
-    pids: 64
-    ephemeral_storage: 256Mi
-    file_descriptors: 1024
-    netdevs: 8
-  dns: auto                     # point hosts at the lab DNS service
-  restart: unless-stopped
+The model's shared generator registry contains:
 
-kinds:                          # per-kind defaults; middle precedence
-  router:
-    image: hyhe/twinet-router:1.0     # Alpine + FRR + iproute2 + wireguard
-    sysctls:
-      net.ipv4.ip_forward: 1
-      net.ipv4.fib_multipath_hash_policy: 1
-      net.ipv4.conf.all.rp_filter: 0
-      net.ipv4.icmp_ratelimit: 0
-    capabilities: [NET_ADMIN, NET_RAW, SYS_MODULE]
-  host:
-    image: hyhe/twinet-host:1.0       # iproute2, iputils, traceroute, tcpdump, curl
-  switch:
-    image: hyhe/twinet-switch:1.0     # Open vSwitch, self-contained in-container
+| Kind | Meaning |
+|---|---|
+| `explicit` | Legacy routers and links written in the template |
+| `ring` | Generated ring, optionally with a hub |
+| `two-tier` | Generated core/edge graph |
+| `clos` | Generated spine/leaf graph, optionally with leaf hosts |
 
-link_defaults:
-  bandwidth: 10mbit
-  delay: 10ms
-  queue: 50ms
-  mtu: 1500
+An omitted `interior:` is `explicit` for compatibility. Generated interiors
+become ordinary devices and links after expansion. A `distributable: true`
+Clos can expose a spine group and leaf-with-host groups to placement; ordinary
+ASes remain atomic. Rubrics can declare supported interior kinds and reject a
+mismatch before grading.
 
-# ── Addressing plan ────────────────────────────────────────────────────────
-# Replaces platform/config/subnet_config.sh. Expressions are Go templates with
-# CIDR helpers; `.AS`, `.RouterID`, `.PeerAS`, `.LinkIndex`, `.VLAN` are bound.
-addressing:
-  as_block:            "{{ .AS }}.0.0.0/8"
-  as_block_v6:         "{{ printf \"%d\" .AS }}::/32"
-  router_loopback:     "{{ .AS }}.{{ add 150 .RouterID }}.0.1/24"
-  router_router:       "{{ .AS }}.0.{{ add 1 .LinkIndex }}.0/24"
-  router_host:         "{{ .AS }}.{{ add 100 .RouterID }}.0.0/24"
-  l2_domain:           "{{ .AS }}.{{ add 200 .L2ID }}.0.0/16"
-  l2_vlan:             "{{ .AS }}.{{ add 200 .L2ID }}.{{ .VLAN }}.0/24"
-  inter_as:            "{{ cidrHost \"179.0.0.0/8\" .LinkIndex 24 }}"   # 179.a.b.0/24
-  ixp_peering:         "180.{{ .IXP }}.0.0/24"
-  svc_dns:             "198.{{ .AS }}.0.0/24"
-  svc_matrix:          "{{ .AS }}.0.198.0/24"
-  svc_measurement:     "{{ .AS }}.0.199.0/24"
+The exact registry values are source-generated in [09](09_status.md). A
+generated interior being available in the model is **not** a measured
+three-node deployment acceptance claim.
 
-# ── Autonomous systems ─────────────────────────────────────────────────────
-as_defaults:
-  template: student-as
-  region_of: "{{ div (sub .AS 1) 10 }}"     # zone/region assignment rule
+## Network operating systems
 
-autonomous_systems:
-  - range: [3, 6]      # AS 3..6      — students, full topology
-    role: student
-  - range: [9, 10]
-    role: student
-    owner_group: "group{{ .AS }}"
-  - range: [1, 2]
-    template: tier1-as
-    role: staff
-    services: [krill, routinator]
-  - range: [7, 8]
-    template: stub-as
-    role: staff
-    behaviours: [hijacker]                  # see §7
-  - range: [140, 143]
-    template: ixp
-    role: ixp
+Routers default to FRR when no `nos:` is selected. FRR and BIRD are registered
+providers, and a provider owns rendering, apply/readiness, state collection,
+save, and restore for its syntax.
 
-# ── Inter-AS topology ──────────────────────────────────────────────────────
-# Either enumerated, or generated by a rule. Both forms compile to the same
-# internal representation.
-peerings:
-  generator:
-    kind: tiered-internet         # built-in generator, see §6
-    tiers: [[1,2], [3,4,5,6], [9,10]]
-    ixps: [140, 141, 142, 143]
-    slow_link:                    # the Q2.5 pedagogy: one slow provider+customer
-      per_as: 1
-      delay: 25ms
-  overrides:
-    - {a: 1, a_router: PHY, b: 3, b_router: MSP, rel: provider, delay: 2.5ms}
+Validation derives requested capabilities from the topology and refuses a
+provider that does not declare them. The BIRD provider deliberately supports a
+smaller feature set than FRR: it does not claim Twinet support for BIRD
+MPLS/LDP, VRF, multicast, DHCP, RPKI, or tunnels. Treat a manifest using BIRD
+as source-supported only unless a specific measured result is recorded in
+[09](09_status.md).
 
-services:
-  dns:         {kind: builtin.dns,        attach: {template: student-as, router: MSP, iface: dns}}
-  matrix:      {kind: builtin.matrix,     attach: {template: student-as, router: ATL, iface: matrix}}
-  measurement: {kind: builtin.measurement,attach: {template: student-as, router: HOU, iface: measurement}}
-  web:         {kind: builtin.web,        listen: ":9000"}
-  vpn:         {kind: builtin.wireguard,  listen: ":51820"}
+## Services, endpoints, and state policy
 
-access:
-  mode: gateway                  # single SSH entry point; see doc 05
-  listen: ":2022"
-  legacy_ports: {enabled: true, base: 2000}   # ssh -p 2000+X compatibility
+Services can declare a replication policy. The current model supports
+`singleton`, `per-node`, fixed `replicas`, and `sharded` modes; replica identity
+and attachment selection are deterministic. Endpoint policies support
+multi-endpoint access/web arrangements rather than treating a front node as a
+required singleton.
 
-placement:
-  strategy: pack-by-as           # see doc 04
-  nodes: [node-0, node-1, node-2]
-  pin:
-    - {match: {service: "*"}, node: node-0}   # services on the front node
+`state:` controls durable capture, replication factor, failure domains, and
+fail-closed behavior. Clustered defaults and validation make a one-copy
+configuration explicit rather than silently equating it with replicated state.
+The runtime verifies state/replica evidence at destructive and migration
+boundaries; operational acceptance remains scoped by the evidence in
+[09](09_status.md).
+
+## Behaviours, hijacks, and multicast
+
+`behaviours:` is an implemented, reversible teaching-perturbation surface.
+The model maps `bgp-hijack` to the `bgp_hijacking` fault implementation and
+`link-down` to `link_down`. An instructor can inspect and control declarations
+with:
+
+```sh
+twinet behaviour list
+twinet behaviour start NAME
+twinet behaviour stop NAME
+twinet behaviour status
 ```
 
-### Resource requests and limits
+The RPKI/hijack path is therefore not described as an unimplemented scripted
+scenario. Its actual exercise and fault coverage are separately documented in
+[09](09_status.md) and [10](10_fault_injection.md).
 
-`cpus`, `memory`, and `pids` remain Docker hard limits for compatibility.
-They are not placement demand. `requests:` reserves CPU, memory, PIDs,
-ephemeral storage, file descriptors, and a host-netdev estimate. Requests
-inherit through `defaults → kinds → device`; omitted dimensions use
-conservative defaults for router, host, switch, and service devices. A request
-may not exceed its corresponding CPU, memory, or PID limit.
+Multicast is also modeled explicitly: an AS can request the PIM sparse-mode
+exercise, and the FRR renderer/check registry has multicast support. The
+bundled `examples/multicast` fixture is source-validated by the documentation
+gate. Only the measured discrimination evidence stated in [09](09_status.md)
+is a live result.
 
-## 4. An AS template
+## Compatibility boundary
 
-`templates/student_as.yaml` — this is where the eight positional `.txt` files
-collapse into one coherent, readable document.
+`twinet save` and `twinet restore` use Twinet's archive format: configuration
+and replayable device scripts plus integrity/topology metadata. A legacy
+`save_configs.sh` directory-layout exporter is not claimed as shipped.
 
-```yaml
-apiVersion: twinet.dev/v1
-kind: ASTemplate
-metadata: {name: student-as}
-
-routers:
-  MSP: {id: 1, services: [dns]}
-  NYC: {id: 2}
-  BOS: {id: 3, l2_gateway: DCN}
-  PHY: {id: 4, services: [routinator]}
-  CHI: {id: 5}
-  ATL: {id: 6, l2_gateway: DCS, services: [matrix]}
-  SFO: {id: 7}
-  HOU: {id: 8, services: [measurement]}
-
-# Each router gets one directly attached L3 host unless disabled.
-hosts:
-  per_router: {enabled: true, name: "host", iface: "{{ .Router }}router"}
-
-internal_links:                 # bandwidth/delay inherited from link_defaults
-  - [MSP, SFO]
-  - [MSP, CHI]
-  - [MSP, NYC]
-  - [NYC, PHY]
-  - [NYC, BOS]
-  - [CHI, HOU]
-  - [CHI, PHY]
-  - [PHY, ATL]
-  - [PHY, BOS]
-  - [BOS, ATL]
-  - [ATL, HOU]
-  - [SFO, HOU]
-
-l2_domains:
-  DCN:
-    id: 1
-    gateway: BOS
-    vlans: {10: admin, 20: patient}
-    switches:
-      S1: {mac: "11:11:11:11:11:11"}
-    hosts:
-      A_MGH: {switch: S1, vlan: 10, bandwidth: 10mbit, delay: 1ms}
-      P_MGH: {switch: S1, vlan: 20, bandwidth: 10mbit, delay: 1ms}
-  DCS:
-    id: 2
-    gateway: ATL
-    vlans: {10: admin, 20: patient}
-    switches:
-      S2: {mac: "22:22:22:22:22:22"}
-      S3: {mac: "33:33:33:33:33:33"}
-    switch_links:
-      - [S2, S3]
-    hosts:
-      A_EUH: {switch: S2, vlan: 10}
-      P_EUH: {switch: S2, vlan: 20}
-      A_CHA: {switch: S3, vlan: 10}
-      P_CHA: {switch: S3, vlan: 20}
-
-# Named attachment points that `peerings:` refers to. This decouples the
-# inter-AS graph from the intra-AS topology.
-external_ports:
-  provider_a: {router: MSP}
-  provider_b: {router: NYC}
-  customer_a: {router: SFO}
-  customer_b: {router: HOU}
-  peer_a:     {router: BOS}
-  ixp:        {router: CHI}
-
-# ── The provisioning contract: what is given vs. what the student must do ──
-provisioning:
-  provisioned:                  # Twinet configures these; students must not
-    - iface: {router: MSP, name: dns}
-    - iface: {router: ATL, name: matrix}
-    - iface: {router: HOU, name: measurement}
-    - iface: {router: PHY, name: routinator}
-    - device_kind: switch       # OVS bridges exist; VLANs are the student's job
-      scope: bridge-only
-  student:                      # deliberately left unconfigured
-    - all_router_interfaces
-    - all_loopbacks
-    - all_host_addressing
-    - ospf
-    - bgp
-    - l2_vlans
-    - ipv6
-  expected:                     # the reference answer, used by IPAM + grading
-    router_iface_addr: "{{ addressing.router_router }}"
-    loopback:          "{{ addressing.router_loopback }}"
-```
-
-### Why `provisioning:` matters
-
-This block is the conceptual core of Twinet and has no equivalent in
-containerlab or Kathará. It declares, per object, whether the address/config is:
-
-- `provisioned` — Twinet renders and pushes it (service links, OVS bridge
-  existence, the pre-set IXP peering IPs);
-- `student` — Twinet deliberately leaves it empty; and
-- `expected` — Twinet *knows* the correct value but does not apply it.
-
-`expected` gives three things for free:
-1. **The grader** knows the right answer without a second hand-maintained
-   source (today `mnet_utils.py` re-derives it, and the wiki states it a third
-   time).
-2. **`twinet deploy --solve`** renders a complete reference solution — replacing
-   the hand-captured `golden-configs/` snapshot with a generated, always-correct
-   one. This is what the end-to-end tests grade, and it scores 10/10.
-3. **The assignment text** can be generated from the model (addressing tables,
-   the per-group "your neighbours" page), so the wiki and the platform cannot
-   disagree.
-
-## 5. Validation
-
-`twinet validate` runs, and reports **all** failures at once with
-`file:line:col`:
-
-- schema conformance (`twinet schema` emits a JSON Schema reflected from the Go structs the manifest decodes into, so it
-  cannot drift — a defect called out in the containerlab review);
-- referential integrity (every `switch:` referenced by an L2 host exists; every
-  `peerings` endpoint names a real `external_ports` entry; every service
-  `attach` names a real router/iface);
-- IPAM: every expression evaluates, all resulting prefixes are well-formed, and
-  **no two prefixes overlap** across the whole lab (the current platform has no
-  such check);
-- interface-name uniqueness per device, and length ≤ `IFNAMSIZ-1`;
-- resource feasibility: total requested CPU/memory vs. the declared nodes;
-- port and VNI collisions after allocation;
-- policy warnings: an AS with no provider and no peer, an IXP with one member,
-  a link with `delay` but no `queue`, etc.
-
-## 6. Generators
-
-Generation is **declarative and inside the manifest**, not a separate
-code-generation step, replacing `utils/build_configs/generate_connections.py`:
-
-```yaml
-peerings:
-  generator:
-    kind: tiered-internet          # Tier-1 clique + provider/customer trees
-    tiers:  [[1, 2], [3, 4, 5, 6], [7, 8, 9, 10]]
-    ixps:   [140, 141]
-    slow_link: {per_as: 1, delay: 25ms}
-```
-
-Scaling the class is editing `tiers`. There is no generated artefact to keep in
-step with the manifest, and no "compiled" format: the manifest *is* the source,
-and `twinet validate` checks it whole.
-
-Credentials work the same way. `twinet gateway roster init` assigns groups to
-ASNs and mints one credential per student AS from the manifest, writing both the
-roster and the per-group hand-out; `twinet gateway roster list` shows who is
-enrolled, and `twinet gateway roster add-key` authorises a student's own key.
-
-## 7. Behaviours and faults (scripted misconfiguration)
-
-The RPKI exercise requires stub ASes to hijack each other. Today that is
-`utils/hijacks/hijack.sh` plus three `question_3_*.sh` scripts driving
-`docker exec … vtysh`. In Twinet a behaviour is declarative and part of the lab:
-
-```yaml
-behaviours:
-  hijacker:
-    kind: bgp-hijack
-    schedule: {at: "2025-11-03T09:00:00Z"}        # or `on: deploy`
-    victims: {rel: same-region, kind: student}
-    prefix: "{{ .Victim.as_block }}"
-    type: origin-hijack          # or subprefix, path-forgery
-    via: [ixp]
-```
-
-A declared behaviour would be applied and reverted idempotently, and the grader
-could assert the hijack was live during a check. **This is not built**: the
-RPKI machinery and the checks exist, the scripted scenarios do not — see
-[09](09_status.md). What *is* built is the general mechanism it generalises
-into, below.
-
-**This generalises into fault injection.** A behaviour is a fault whose purpose
-happens to be pedagogical; the same declaration, lifecycle
-(`inject → verify → resolve`) and ground-truth emission serve an incident used to
-measure whether an AI agent can diagnose a network. A BGP hijack is
-simultaneously question 2.6 of the assignment and NIKA's `bgp_hijacking` fault
-type. The two must therefore share one implementation, not two.
-
-The full taxonomy, the coverage of NIKA's 48 fault types, and the constraints
-this places on the rest of the design are in
-[10 — Fault injection and RCA](10_fault_injection.md). The most important
-constraint to keep in mind while reading the rest of this document: **every
-fault must be reversible**, which means a fault may never be applied by
-rewriting configuration wholesale, only as a delta that records how to undo
-itself.
-
-## 8. Compatibility with existing course material
-
-- *(Planned, see [07](07_roadmap.md))* `twinet import mini-internet --dir /path/to/platform/config` would read the eight
-  legacy `.txt` files plus `subnet_config.sh` and emits an equivalent Twinet
-  manifest. This lets us diff old vs. new behaviour and migrate the ETH advanced
-  course exercises mechanically.
-- `twinet save` writes an archive per group containing, for each device, its
-  routing configuration (`<DEVICE>.conf`) and the commands that recreate
-  everything FRR does not hold — VLANs, addresses, routes and tunnels
-  (`<DEVICE>.sh`) — plus the ROAs the group published and a `manifest.json`
-  with checksums and timestamps.
-
-  This is **not** the legacy `save_configs.sh` layout of per-device directories
-  (`<DEVICE>/router.conf`, `router.rib.json`, `router.tunnels`, `host.ip`,
-  `switch.db`, …), and an earlier revision of this document claimed it was. The
-  difference matters for one purpose only: diffing a Twinet archive against one
-  produced by the old platform. Everything else — restore, regrading, the
-  submission flow — reads Twinet's own format, and the `.sh` half exists
-  because a dump of state cannot be replayed and the legacy layout is a dump.
-  A legacy exporter is listed as unimplemented in
-  [09 — Status](09_status.md).
-
-## 9. Heterogeneous vendors
-
-FRR is one implementation of the protocols, not the protocols. A lab in which
-every router is FRR teaches students that BGP is what FRR's syntax says it is,
-and it cannot pose the question that dominates real operations: two vendors
-that read the same standard differently, and a network that must work anyway.
-
-**Objective.** A device declares which network operating system it runs, and
-everything downstream — the image, the configuration Twinet renders, the way a
-command is run inside it, the way its state is read for grading, and the way a
-fault is applied to it — follows from that declaration rather than from an
-assumption baked into the renderer.
-
-```yaml
-kinds:
-  router:
-    nos: frr                       # the default, and what every lab uses today
-routers:
-  MSP: {id: 1}
-  NYC: {id: 2, nos: bird}          # a second control plane on one router
-  BOS: {id: 3, nos: openbsd_bgpd}
-  EDGE: {id: 4, nos: sonic}
-```
-
-**What this requires, and where each piece belongs.**
-
-1. **A NOS interface** (`internal/nos`). Four operations, each of which the FRR
-   code already performs and none of which it names: *render* a configuration
-   for a device from the model; *apply* it to a running container; *read* the
-   protocol state a check needs, in a form independent of the vendor; and
-   *describe* which features it supports. FRR becomes the first implementation
-   of that interface rather than the only path through the code.
-
-2. **A vendor-neutral state model** (`internal/netstate`). The grading checks
-   must stop reading FRR's JSON directly. What a check needs is "the routes this
-   router selected, with their next hops, local preference, AS path and
-   communities" and "the sessions it has, with their state and their peer" —
-   both of which every implementation can produce, and neither of which is
-   FRR-shaped. This is the largest piece of work and the one that decides
-   whether the rest is honest: a check that still parses `show ip bgp json`
-   silently fails every non-FRR device, and a grader that fails silently is
-   worse than one that refuses.
-
-3. **Capability declaration and refusal.** A manifest that asks for RPKI origin
-   validation on a NOS that does not implement it must be refused at validation
-   time, naming the device, the feature and the implementation — not deployed
-   and marked wrong later. This is the same rule the fault registry already
-   follows with its `Needs []Capability`, applied to configuration.
-
-4. **Images.** One image per NOS, pinned by digest, built in `images/` from the
-   same reproducibility rules as the current ones. BIRD and OpenBGPD are small;
-   SONiC is large and belongs behind an opt-in.
-
-5. **Grading that is about the network, not the vendor.** Every check that
-   exists today asserts a property of the routing table or the data plane, and
-   those properties do not change with the implementation. Once the state model
-   is in place, the same rubric grades a mixed-vendor AS unchanged — which is
-   the acceptance test for this work: take `examples/cos461`, change two
-   routers' `nos:`, and require the reference to score identically.
-
-**Why this shape.** The alternative — a template per vendor, selected by a
-`switch` in the renderer — reproduces the mini-Internet's original defect at a
-larger scale: behaviour that depends on where in a chain of scripts a decision
-happened to be made. An interface with one implementation is a small cost today
-and the only structure that makes a second implementation a contained change.
-
-## 10. Topology types within an AS
-
-An AS in the current model is a set of routers, an optional layer-2 domain per
-gateway, and one host per router. That is the shape the two courses use, and it
-is written into the expander rather than declared: an author who wants a
-different interior has to write every link out by hand, and an author who wants
-a *generated* interior of a different shape cannot express it at all.
-
-**Objective.** The interior of an AS is declared by naming its type and its
-parameters, exactly as the inter-AS graph already is with
-`peerings.generator`. The generated result is an ordinary set of routers and
-links — nothing downstream needs to know how it was produced.
-
-```yaml
-# One of several shapes, all compiling to the same internal representation.
-interior:
-  kind: clos                # a datacentre fabric
-  spines: 4
-  leaves: 8
-  hosts_per_leaf: 2
-
-interior:
-  kind: ring                # the multicast exercise's shape
-  routers: [TOP, RIGHT, BOTTOMR, BOTTOML, LEFT]
-  hub: CENTER               # optional: one router connected to all of them
-
-interior:
-  kind: two-tier            # a small provider: core and edge
-  core: 2
-  edge: 6
-  edge_uplinks: 2
-
-interior:
-  kind: explicit            # what every template does today, named
-  links: [[MSP, SFO], [MSP, CHI]]
-```
-
-**What this requires.**
-
-1. **A generator registry mirroring `peerings.generator`** (`internal/expand`),
-   so the two kinds of generator share one mechanism, one validation path and
-   one set of error messages.
-2. **Addressing that scales with the shape.** A Clos fabric of 32 leaves needs
-   more router-to-router subnets than the current `{{ .LinkIndex }}` template
-   comfortably yields; the addressing plan must be able to derive a subnet from
-   the *role* of a link (spine-leaf, leaf-host) and not only from its index.
-3. **Placement that understands the shape.** `pack-by-as` is right for a
-   teaching AS of eight routers and wrong for a fabric of forty: a Clos fabric
-   should be cut across nodes along the spine-leaf boundary, because that is
-   where the traffic is least sensitive to the underlay. The placer already
-   takes a strategy; this adds one that reads the declared interior.
-4. **Checks that are shape-aware.** "Every router reaches every other" holds for
-   any interior. "The interior is a full iBGP mesh" does not: a fabric uses
-   route reflectors, and a rubric written for one shape must not be silently
-   applied to another. A rubric therefore declares which interior kinds it
-   grades, and grading a lab whose interior it does not name is refused.
-
-**Shipped declaration and placement contract.** Omitted `interior:` remains
-`explicit`, including the legacy `routers:` and `internal_links:` syntax.
-Generated router-to-router and Clos leaf-host links use the optional
-`addressing.router_router_role` expression, whose context includes `.Role`,
-`.PeerRole`, `.RoleIndex`, `.PeerRoleIndex`, `.RoleLinkIndex`, and
-`.LinkClass`; `cidrSubnet` avoids the old dotted-octet link-index limit.
-
-A `distributable: true` Clos is scheduled as one spine group and one
-leaf-with-hosts group per leaf. All other ASes remain atomic. Placement records
-retain `by_as` and add optional `by_group`, so records from before interior
-groups remain valid. Rubrics may set
-`metadata.supported_interior_kinds: [clos]`; a mismatch is rejected as a
-rubric/topology author error before any student mark is calculated. See
-`examples/clos` for a compact validated fixture.
-
-**Acceptance.** A manifest declaring a Clos interior deploys, converges, is
-graded by a rubric written for it, and places sensibly across three nodes; the
-existing course labs, expressed as `kind: explicit`, produce byte-identical
-topology hashes to the ones they produce today.
+Likewise, no importer from the predecessor platform's positional text files is
+claimed here. Historical proposals for an importer, a third NOS, or additional
+topology forms are targets only when labelled as such in
+[07 — Roadmap](07_roadmap.md).

@@ -1,88 +1,95 @@
 # Twinet
 
-A container-based network **twin** for teaching how the Internet practically
-works — at class scale, across a cluster.
+Twinet is a Go implementation of a container-based teaching network twin. It
+builds, places, operates, and grades labs made of real Linux containers,
+routers, and switches.
 
-Twinet is a ground-up redesign and reimplementation of the
-[mini-Internet project](https://github.com/nsg-ethz/mini_internet_project).
-Every student group operates a real Autonomous System — real FRR, real OSPF,
-real BGP, real RPKI, real Open vSwitch — and must cooperate with every other
-group for the Internet to work.
+> **Documentation status.** “Shipped” below means a capability exists in this
+> source tree and is covered by automated checks. “Measured” means a result was
+> observed on the named cluster run in
+> [the status ledger](docs/09_status.md); it is not a release or capacity
+> promise. “Target” and “historical” claims are explicitly labelled in the
+> supporting documents.
 
-> **Status: under construction.** The design is in [`docs/`](docs/); what is
-> built and measured so far is in [`docs/09_status.md`](docs/09_status.md).
->
-> A twelve-AS lab of 212 containers and 299 links currently deploys across three
-> machines in 58 seconds. Grading a system that is already converged takes about
-> ten seconds of checks; grading a *submission* takes about five minutes, almost
-> all of it waiting for the network to settle after the submission is loaded and
-> again after the reference is put back.
+## Shipped implementation
 
-## What it is for
+- The controller talks to node agents through an HTTP/JSON API. A non-loopback
+  agent requires TLS 1.3 mutual authentication (plus its controller token);
+  this is **not gRPC**.
+- The build contains several command entry points, not just a controller and
+  agent. The source-generated list, runtime/NOS registries, interior generators,
+  fault count, and bundled-example statistics are checked in
+  [`docs/09_status.md`](docs/09_status.md).
+- Docker and Podman are registered runtimes; Docker uses the Docker Engine API.
+  Podman's API contract has a bounded live integration result in the status
+  ledger, but manifest/agent runtime selection is still pending. Twinet
+  therefore has host and image dependencies; it is not a one-binary,
+  dependency-free deployment.
+- Deterministic allocation still derives names, addresses, and link identifiers
+  from a manifest. Student-owned configuration, topology/coordination records,
+  event journals, and replica acknowledgements are instead persisted in the
+  state store.
+- Cluster mutation uses fenced leases and transactional agent phases. Cross-node
+  links share one external VXLAN device per lab/node pair; bridge VLAN-to-VNI
+  bindings isolate logical links.
+- State and services have replication policies, strict live-inventory admission
+  runs before cluster mutation, and agents expose bounded Prometheus metrics and
+  a durable, scoped event stream.
+- FRR and BIRD are registered NOS providers. `explicit`, `ring`, `two-tier`,
+  and `clos` are registered interior generators. Capability validation refuses
+  unsupported NOS/topology combinations before deployment.
 
-- **Courses.** The Princeton [COS-461 routing project](https://github.com/cos-461/routing/wiki)
-  is deployed and graded end to end. The ETH advanced-networks exercises are
-  covered for MPLS/LDP, the BGP-free core and BGP/MPLS VPN with VRFs; multicast
-  has neither an exercise nor a check. The COS-461 hijack scenarios (Q2.6) are
-  not scripted. See [`docs/09_status.md`](docs/09_status.md) for the ledger.
-- **Autograding.** A class of eight, each graded against the reference network
-  with nobody else's work loaded, takes 39 minutes -- about five minutes per
-  submission, nearly all of it waiting for BGP to settle twice. That is the
-  honest figure for the fair mode, and it does not yet suit a hundred students
-  in an evening; `--per-wave` trades isolation for time and is off by default,
-  and a per-submission harness with synthetic neighbours, which would remove
-  the convergence wait, is designed and not built.
-- **Scale-out.** The unit of placement is an AS; adding a machine adds capacity.
-- **Agent evaluation.** The same twin, broken in a known and reversible way, is
-  a reproducible benchmark for whether an AI agent can perform root-cause
-  analysis. Twinet targets the [NIKA](https://github.com/sands-lab/nika) fault
-  taxonomy and aims to serve as a NIKA backend.
+The precise scope and evidence for these features are deliberately kept out of
+marketing language: see [Implementation status](docs/09_status.md).
 
-## Design in one page
+## Evidence, not promises
 
-| | |
-|---|---|
-| **One binary to deploy** | `twinet` (control plane, stateless) + `twinetd` (node agent). No Python, no OVS on the host, no bash libraries to source. |
-| **One document to edit** | A validated, templated YAML manifest. Addressing, VNIs, DNS zones, IXP configs, the website and the grading topology are all derived from it. |
-| **No state to corrupt** | Every allocated resource is a pure function of the manifest; observed state comes from container labels. |
-| **Incomplete by design** | The model distinguishes operator-*provisioned* config, *student*-owned config, and the *expected* answer — so the grader and the assignment text come from the same source. |
-| **No sleeps** | Readiness and convergence are predicates, not `sleep 60`. |
-| **Scales out** | veth for same-node links, point-to-point VXLAN for cross-node links (measured 0.16 ms on 10 GbE — invisible under a 2.5 ms emulated delay). |
+The current measured reference deployment is a 12-AS lab. Its timing range,
+the class-scale result, and grading measurements are recorded only in
+[`docs/09_status.md#measurements`](docs/09_status.md#measurements). They are
+measurements from a specific three-node environment, not claims that every
+machine or course will obtain the same result.
+
+Multicast and the RPKI hijack exercise are implemented examples with grading
+checks and behaviour/fault support. Their source coverage does not imply that
+every course acceptance scenario has been run live; the distinction is recorded
+in the status ledger.
 
 ## Documentation
 
-| Document | Contents |
+| Document | Scope |
 |---|---|
-| [Assessment](docs/01_assessment.md) | Critical review of the current mini-Internet implementation |
-| [Architecture](docs/02_architecture.md) | Components, state model, runtime abstraction, deployment pipeline |
-| [Topology model](docs/03_topology_model.md) | Manifest, AS templates, IPAM, the provisioning contract |
-| [Networking & scale-out](docs/04_networking_and_scaleout.md) | Link realization, VXLAN fabric, placement, capacity |
-| [Services](docs/05_services.md) | DNS, matrix, looking glass, RPKI, IXP, VPN, web, SSH access |
-| [Grading](docs/06_grading.md) | Ephemeral labs, test doubles, checks, rubrics, reports |
-| [Roadmap](docs/07_roadmap.md) | Milestones, acceptance criteria, risks |
-| [Resources needed](docs/08_resources_needed.md) | Open decisions and required resources |
-| [Implementation status](docs/09_status.md) | What is built and verified, with measurements |
-| [Fault injection and RCA](docs/10_fault_injection.md) | Injecting the NIKA fault taxonomy to assess AI agents at root-cause analysis |
+| [Assessment](docs/01_assessment.md) | Historical assessment of the predecessor platform |
+| [Architecture](docs/02_architecture.md) | Source-verified control-plane and persistence architecture |
+| [Topology model](docs/03_topology_model.md) | Manifest, NOS, interior, and behaviour model |
+| [Networking and scale-out](docs/04_networking_and_scaleout.md) | Shared overlay, placement, durability, and admission design |
+| [Services and access](docs/05_services.md) | Services, replicas, access, metrics, and events |
+| [Grading](docs/06_grading.md) | Shipped grading modes and evidence boundaries |
+| [Roadmap](docs/07_roadmap.md) | Historical targets and remaining acceptance work |
+| [Resources and decisions](docs/08_resources_needed.md) | Historical decision record and current evidence boundary |
+| [Implementation status](docs/09_status.md) | Canonical shipped/target/measured ledger |
+| [Fault injection and RCA](docs/10_fault_injection.md) | NIKA fault work (maintained separately) |
+| [Scalability and reliability objectives](docs/11_scalability_and_reliability_objectives.md) | Objectives and review gate (maintained separately) |
 
-## Which branch to use
+## Validation
 
-`main` carries released versions and moves only when something has been built,
-tested and run on a real cluster. If you are teaching a course from Twinet, use
-a tag on `main` and nothing else.
-
-`dev` is where the work happens, and it will be broken from time to time. It is
-merged into `main` when a body of work is finished rather than commit by
-commit, so that nobody's class is disrupted by a change made in the middle of
-someone else's afternoon.
+Documentation gates are executable:
 
 ```sh
-git clone --branch v0.1.0 https://github.com/HongyuHe/Twinet
+go test ./internal/cli -run 'Test(EveryDocumentedCommandExists|Documentation)'
+python3 scripts/check_docs.py
+```
+
+The first command checks documented commands and source-derived capability
+facts. The second checks Markdown local links, referenced paths, and benchmark
+labels. Full source validation remains:
+
+```sh
+go test ./...
 ```
 
 ## Credits
 
-Twinet builds on the ideas of the
+Twinet builds on the teaching ideas of the
 [mini-Internet project](https://github.com/nsg-ethz/mini_internet_project) by
-the Networked Systems Group at ETH Zürich, and takes design inspiration from
-[containerlab](https://containerlab.dev) and
-[Kathará](https://www.kathara.org). It shares no code with any of them.
+the Networked Systems Group at ETH Zürich. It shares no code with that project.

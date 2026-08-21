@@ -1,47 +1,159 @@
 # 09 — Implementation status
 
-This records what is built and verified, so the plan and the code cannot drift.
-Measurements are from the three-node cluster (node-0/1/2, 56 cores and 251 GiB
-each, 10 GbE private fabric).
+This is the canonical ledger for implementation truthfulness.
 
-Last updated after the sixth external code review.
+| Label | Meaning |
+|---|---|
+| **Source-verified** | Implemented in this source tree and covered by an automated check. |
+| **Measured** | Observed in the named environment/run. It is evidence, not a portability or release promise. |
+| **Target** | A desired acceptance threshold; it is not evidence of completion. |
+| **Historical** | Retained design or predecessor context, not a current implementation claim. |
 
-Rows are written from evidence produced by a run, not from intent. Where a
-number appears it came from the command named beside it; where a target was
-missed it is recorded as a miss.
+Measurements below are from the named three-node cluster when stated. They must
+not be generalized to another environment. A source capability with no named
+live run is marked source-verified rather than “measured.”
+
+## Source-generated capability facts
+
+The JSON below is a machine-readable documentation surface. The
+`TestDocumentationFactsMatchSource` gate derives it from `cmd/*`, the runtime,
+NOS, interior, and fault registries, and `twinet validate --json` executed from
+source for every bundled example. Do not edit a value to make prose look
+complete: change the implementation or regenerate the facts through the test.
+
+<!-- BEGIN SOURCE-GENERATED CAPABILITY FACTS -->
+```json
+{
+  "binaries": [
+    "twinet",
+    "twinet-dhcpd",
+    "twinet-mcast",
+    "twinet-openflow-controller",
+    "twinet-rtr",
+    "twinet-traffic",
+    "twinetd"
+  ],
+  "runtime_backends": [
+    "docker",
+    "podman"
+  ],
+  "runtime_backend_count": 2,
+  "network_operating_systems": [
+    "bird",
+    "frr"
+  ],
+  "network_operating_system_count": 2,
+  "interior_generators": [
+    "clos",
+    "explicit",
+    "ring",
+    "two-tier"
+  ],
+  "interior_generator_count": 4,
+  "faults": {
+    "total": 62,
+    "nika": 60
+  },
+  "shipped_capabilities": [
+    "agent-http-json-mtls",
+    "persistent-state",
+    "fenced-mutation-leases",
+    "docker-engine-api-runtime",
+    "shared-vxlan-overlays",
+    "replicated-state-and-services",
+    "generated-interiors",
+    "bird-nos",
+    "metrics-and-events",
+    "strict-admission"
+  ],
+  "bundled_examples": {
+    "advnet": {
+      "ases": 5,
+      "devices": 13,
+      "links": 17
+    },
+    "clos": {
+      "ases": 1,
+      "devices": 11,
+      "links": 12
+    },
+    "cos461": {
+      "ases": 12,
+      "devices": 212,
+      "links": 299
+    },
+    "demo": {
+      "ases": 4,
+      "devices": 57,
+      "links": 74
+    },
+    "mixed-substrate": {
+      "ases": 1,
+      "devices": 9,
+      "links": 8
+    },
+    "multicast": {
+      "ases": 1,
+      "devices": 12,
+      "links": 16
+    },
+    "scale": {
+      "ases": 84,
+      "devices": 2020,
+      "links": 2927
+    }
+  }
+}
+```
+<!-- END SOURCE-GENERATED CAPABILITY FACTS -->
+
+The executable list is intentionally generated from the current tree rather
+than summarized as “two binaries.” The source facts are not a live acceptance
+claim.
 
 ## Built and verified
 
 | Area | State | Evidence |
 |---|---|---|
-| Typed model, manifest loading, aggregated positional validation | done | `internal/model`, `internal/manifest`; `twinet validate` reports every problem in one pass |
-| Expression-based addressing plan | done | `internal/ipam`; tests assert the plan reproduces the COS-461 assignment text exactly |
-| Deterministic allocation (VNI, MAC, interface names) | done | `internal/alloc`; tests assert order-independence, uniqueness across 5,000 links, and that names fit `IFNAMSIZ` |
-| Template expansion, tiered-internet generator, post-expansion verifier | done | `internal/expand`; the verifier caught two real modelling defects (see below) |
-| Netlink wiring: veth, netns, shaping, VXLAN | done | `internal/netx`; rate/time parsing tested against bit-vs-byte and binary-vs-decimal confusion |
-| Container runtime abstraction | done | `internal/runtime` (docker) |
-| Staged deployment DAG with per-scope failure isolation | done | `internal/plan`; tests assert stage ordering, real concurrency, and that one broken AS does not stop a class |
-| Convergence predicates in place of sleeps | done | `internal/plan.Wait`, `internal/grade/converge.go` |
-| Single-node deployment | done | 4-AS demo: 57 devices, 74 links, 64 s |
-| Node agent and cluster fabric | done | 12-AS lab: 212 devices, 299 links across 3 nodes in **58 s**, zero failures |
-| Cross-node VXLAN | done | 50.22 ms measured for a 25 ms configured delay, 9 µs jitter, no duplicates |
-| AS-granular placement | done | 13.4 % of links cross the fabric; `twinet inspect --placement` |
-| Underlay MTU verification | done | `twinet node check` refuses a lab that would not fit and names the MTU to use |
-| Grading engine: rubric, 23 registered checks, structured reports | done | the COS-461 rubric uses 20 of them; 8 systems graded in **79 s**; JSON, text and CSV output |
+| Typed model, manifest loading, aggregated positional validation | source-verified | `internal/model`, `internal/manifest`; `twinet validate` reports every problem in one pass |
+| Expression-based addressing plan | source-verified | `internal/ipam`; tests assert the plan reproduces the COS-461 assignment text exactly |
+| Deterministic allocation (VNI, MAC, interface names) | source-verified | `internal/alloc`; tests assert order-independence, uniqueness across 5,000 links, and that names fit `IFNAMSIZ` |
+| HTTP/JSON agent API with mTLS | source-verified | `internal/agent.Server.Serve` requires TLS 1.3 client verification for non-loopback listeners; agent/client tests cover the authenticated API |
+| Persistent state and replicated records | source-verified | `internal/state`, agent durability, and replica tests cover snapshots, topology/coordination records, acknowledgements, and fail-closed policy |
+| Fenced mutation leases and transactions | source-verified | agent/client coordination tests cover fence generations, expiry, reservations, and prepare/commit/finalize recovery |
+| Template expansion and generator registry | source-verified | `internal/expand` covers tiered peerings plus `explicit`, `ring`, `two-tier`, and `clos` interiors |
+| Netlink wiring and shared overlays | source-verified | `internal/netx` tests cover veths, shaping, and one external VXLAN/bridge per lab/node pair with VLAN-to-VNI bindings |
+| Docker Engine API runtime | source-verified | `internal/runtime` registers `docker`; API-client tests cover runtime operations and cancellation |
+| Podman API runtime contract | measured, bounded | Node-0 ran Podman 4.9.3 API integration with `TWINET_PODMAN_INTEGRATION=1 go test -tags=podman_integration -run TestPodmanIntegrationContract ./internal/runtime` in 13.7 s. Registration/testing does **not** imply manifest or agent runtime selection; that work remains pending. |
+| BIRD NOS provider and capability validation | source-verified | `internal/nos` registers FRR/BIRD and tests refuse unsupported requests; this is not a blanket live mixed-NOS acceptance claim |
+| Service/state replication and endpoint policy | source-verified | model, expansion, placement, and durability tests cover replica identity, failure domains, and endpoint selection |
+| Strict live-inventory admission | source-verified | `internal/place`, client, and CLI tests refuse unknown/overloaded capacity before mutation unless audited overcommit is requested |
+| Staged deployment DAG with per-scope failure isolation | source-verified | `internal/plan`; tests assert stage ordering, real concurrency, and that one broken AS does not stop a class |
+| Convergence predicates in place of sleeps | source-verified | `internal/plan.Wait`, `internal/grade/converge.go` |
+| Single-node deployment | measured | 4-AS demo: 57 devices, 74 links, 64 s |
+| Node agent and cluster fabric | measured | 12-AS lab: 212 devices, 299 links across 3 nodes in 44–58 s; see [Measurements](#measurements) |
+| Cross-node shared VXLAN | measured | 50.22 ms for a 25 ms configured delay, 9 µs jitter; see [Measurements](#measurements) |
+| AS-granular placement | measured | Current class-scale locality figures are recorded in [Measurements](#measurements), not as a timeless percentage |
+| Underlay MTU verification | source-verified | `twinet node check` refuses a lab that would not fit and names the MTU to use |
+| Grading engine, rubrics, checks, structured reports | source-verified; measured runs qualified below | `twinet grade checks`, JSON/text/CSV reports, and the named runs in [Measurements](#measurements) |
 | Reference solution (`--solve`) | done | scores **10.00 / 10.00** against its own rubric, verified end to end and re-checked by `make e2e` |
-| Container images | done | `hyhe/twinet-{router,host,switch,svc}` |
+| Buildable binaries and image inputs | source-verified | generated `cmd/*` facts above and the repository build manifest; no fixed two-binary or five-image claim |
 | Reference solution | **10.00 / 10.00** | verified end to end on the live cluster; a rubric whose reference cannot score full marks is unfalsifiable, and every student who loses that mark loses it to the platform |
 | RPKI | done | the lab is its own trust anchor: an RTR validator serves a payload derived from the topology, with declared discrepancies so an exercise can state exactly which announcement is invalid and which has no ROA |
+| RPKI hijack behaviour | source-verified | `bgp-hijack` maps to the registered reversible `bgp_hijacking` fault; `twinet behaviour` controls declared teaching perturbations |
+| Advanced MPLS/VRF example | measured, bounded | `examples/advnet` reference scored 6/6 in the recorded cluster discrimination run; this is example evidence, not course-wide acceptance |
+| Multicast example | measured, bounded | `examples/multicast` reference scored 4/4 in the recorded cluster discrimination run; this is example evidence, not a claim about all multicast deployments |
 | Mutual TLS | done | `twinet node pki` issues a cluster CA, a key per node and a controller certificate; the cluster now refuses plaintext and refuses TLS without a client certificate, verified against the live agents |
 | SSH gateway | done | one credential per group, authenticated at the edge; device names resolve within the student own AS so another group router cannot be named at all. Legacy per-AS ports are served but do not authorise. Verified across the cluster |
 | Save and restore | done | `twinet save` archives every group work with the topology hash and per-file checksums; restore refuses an archive from a different topology or one edited after it was taken |
 | Per-submission grading harnesses | done | `twinet grade batch` gives each submission a private lab in which every AS but one is solved; verified with two submissions graded concurrently across three nodes |
 | NIKA LabRuntime adapter | done, with one caveat | `TwinetRuntime` subclasses NIKA's `LabRuntime` and implements all ten abstract methods, so the ~50 semantic operations of `ExecSemanticOpsMixin` work; verified live on the three-node cluster, including driving an unmodified `LinkFailure` problem through inject and verify. The caveat: NIKA's problem classes select behaviour with a literal `match` on the backend name and refuse anything that is not `kathara` or `containerlab`, so the runtime must be constructed with `dialect="kathara"` — the arm that is correct for Linux/FRR/eth0 devices. Without it, every problem raises `RuntimeCapabilityError`. See `contrib/nika/README.md`. |
-| Fault injection engine | partial | **47 registered, of which 45 are NIKA's** (NIKA publishes 60). The 15 not implemented each need a substrate Twinet does not emulate — 6 P4/BMv2, 4 Kubernetes, 3 SDN-southbound, 2 others. 45 of the 47 inject, verify, resolve, and are then checked to have left the device exactly as they found it, in about 88 s of `make e2e`; the other two are skipped by name with reasons (one needs a lab with VRFs, one cannot measurably overwhelm the resolver from a single container). The DHCP family was the last applicable gap and is now built, with each fault checked against a real client asking for a lease rather than against the server's configuration file. See [10](10_fault_injection.md) |
+| Fault injection engine | source-verified; separately maintained coverage | The source-generated fault count above and the registry-backed coverage gate in [10](10_fault_injection.md) are authoritative; do not copy a stale count into this row |
 | Faults are reversible, and proved to be | done | The engine fingerprints a device before and after injecting and requires resolving to leave neither what it added nor a hole where something it removed used to be. Introducing the check immediately found five faults that satisfied their own predicate while leaving the device broken |
 | Fault secrecy | verified | No fault writes a self-identifying path into the device under test. A test reads the fault sources and fails on any such path; it found one on its first run |
 | Event-driven self-healing | done | Agents subscribe to managed runtime lifecycle events and target only the affected device; sampled and low-frequency full audits are the backstop. Exited/dead/restart-loop states are broken, unreadable runtime/exec state is explicit unknown, and failed repairs use bounded exponential retry while holds, exemptions, and mutation fences win races |
 | Automatic abandoned-object collection | done | The agent applies a configurable grace period and generation/active-lab proof before collecting legacy or multiplexed overlays, stale host veths, expired reservations, and stale local control/replica records. Active, busy, held, and fenced labs are never candidates; focused tests include node-0 with no managed containers and stale overlays |
+| Authenticated node sweep and overlay classification | measured, bounded | Upgraded agents returned zero orphans. The 28/24/14 observed overlays were active COS-461 links, correcting the earlier shell-only misclassification. |
 | Incident runner | done | `twinet incident run`; a two-fault scenario injects, holds and unwinds in 798 ms. It also runs an agent and scores what it says against the ground truth: four parts (detection, devices as a Jaccard overlap, category, root-cause names), and the agent is given the brief and never the answer, which the end-to-end suite asserts. Measured with a small agent that greps for a router with too few OSPF adjacencies: 0.70 of 1.00, blaming the router that lost an adjacency as a consequence rather than the one the fault was injected at |
 | Ground-truth isolation | verified | audited: 0 hits for the fault name, root cause or ground truth anywhere in a target container's files, environment or labels |
 | DNS | done | zones are generated from the model, served by BIND in the service container, and every device points at the lab own resolver; verified end to end for forward and reverse lookups |
@@ -1278,11 +1390,11 @@ someone has checked.
 | Krill as a live RPKI publication point | M2 | The lab serves an RTR feed derived from the topology, which is what the exercise needs; a real publication point with per-AS validators is the fuller version |
 | Real Krill certificate authority | M7 | ROAs are published through an interface of our own on the lab's trust anchor, not a Krill CA hierarchy. The exercise's observable behaviour is the same -- a student publishes a ROA for their own prefix and only their own -- and the lab stays self-contained |
 | Diff-and-converge `apply` | M4 | Deploy is idempotent and now self-healing, but does not compute a minimal change plan |
-| Advanced-course exercises | M7 | Both are done. MPLS and VRF -- `examples/advnet` is the ETH BGP-free-core and BGP/MPLS L3VPN exercise, verified end to end on the cluster: the two sites of each bank reach each other over a two-label stack, neither bank reaches the other, and the core router has no BGP instance and four operational LDP neighbours. It is graded: `examples/advnet/rubric/advnet.yaml` is worth 6 points across the BGP-free core, carrying each customer between its sites, and keeping the customers apart. Verified to discriminate on the cluster, not merely to be satisfiable -- the reference scores 6/6; putting BGP on the core scores 0.8/2 on that question alone; making both tables import both route targets scores 0/2 on isolation while reachability still passes; shutting LDP on one edge scores 3.95/6 and the label-switching check names the prefix that stopped being carried. Multicast is `examples/multicast`, the course's own six-router topology with PIM sparse mode and IGMP left to the student, graded out of 4 by `examples/multicast/rubric/multicast.yaml`: two marks for configuration that can be read back and two for a packet that a host actually received while a host that did not join heard nothing. Verified to discriminate: the reference scores 4/4, and making one router passive on its three transit interfaces scores 3.30 -- the configuration check naming all six interfaces on both ends of the three links, and the delivery check naming the site that received nothing |
-| The 15 unimplemented NIKA fault types | M8 | Each needs a substrate Twinet does not emulate (6 P4/BMv2, 4 Kubernetes, 3 SDN-southbound, 2 others); adding them means adding that substrate. The DHCP family is now implemented: 45 of NIKA's 60 types are covered, verified by asking real clients for leases rather than by reading configuration back. See [10](10_fault_injection.md) |
+| Course-wide acceptance beyond recorded advanced examples | M7 | MPLS/VRF and multicast examples have source support and the named measured discrimination evidence below this table. That is not an assertion that every course question, migration path, or live classroom workflow has completed acceptance. |
+| NIKA coverage acceptance | M8 | This work is maintained in [10](10_fault_injection.md). Its registry-backed table, rather than a duplicated count here, states the current supported/gap set and any substrate limitations. |
 | Load-balancer service, traffic generation | M8 | Prerequisites for two of those |
-| Heterogeneous vendors: a second network operating system | M9 | Designed in [03 §9](03_topology_model.md), built no further. Four device kinds exist -- `router`, `host`, `switch`, `service` -- and every router is FRR, so a lab cannot pose the question that dominates real operations: two vendors reading one standard differently. What is already right is that the grader gates `vtysh` behind a router-kind check rather than assuming it everywhere, so the checks do not silently mis-parse a non-FRR device; what is missing is `internal/nos`, the vendor-neutral state model the checks would read, capability declaration so a manifest asking a NOS for what it cannot do is refused at validation, and a second image. Acceptance is in the roadmap: change two of `examples/cos461`'s routers to a second NOS and the reference scores identically under the unchanged rubric |
-| Topology types within an AS | M10 | Designed in [03 §10](03_topology_model.md), built no further. The inter-AS graph is generated from a declared shape; the interior of an AS is not, and is written out device by device in every template. `peerings.generator` has no interior counterpart, so `ring`, `two-tier` and `clos` cannot be asked for. Acceptance is that a Clos interior deploys, converges, grades and places across three nodes, and that today's labs re-expressed as `kind: explicit` produce identical topology hashes |
+| Mixed-NOS live acceptance | M9 | FRR and BIRD providers, a vendor-neutral state path, and capability validation are source-verified. A mixed-NOS reference run that scores identically under an unchanged rubric has not been recorded as measured evidence. |
+| Generated-interior live acceptance | M10 | `explicit`, `ring`, `two-tier`, and `clos` are source-verified generator kinds. A live three-node Clos deployment/convergence/grading acceptance run is not recorded here. |
 
 ### Addresses the assignment lets students choose
 
