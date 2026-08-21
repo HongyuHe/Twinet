@@ -18,8 +18,9 @@ import (
 	"time"
 )
 
-// Stage names the phase a step belongs to. Steps in a later stage never start
-// before every step they depend on has finished.
+// Stage names the phase a step belongs to. Stages describe progress for people
+// and reports; dependencies, rather than stage-wide barriers, control when
+// work starts.
 type Stage string
 
 const (
@@ -322,7 +323,12 @@ type Options struct {
 	DryRun bool
 }
 
-// Execute runs the plan, honouring dependencies and stage ordering.
+// Execute runs the plan with a bounded dependency scheduler.
+//
+// A stage is not a barrier: a wire can start as soon as its endpoints exist,
+// and a device can configure as soon as its own links are ready. This lets a
+// large deployment pipeline independent ASes instead of waiting for every
+// create or wire operation in the class to settle first.
 func (p *Plan) Execute(ctx context.Context, opts Options) (*Report, error) {
 	if err := p.Validate(); err != nil {
 		return nil, err
@@ -337,7 +343,6 @@ func (p *Plan) Execute(ctx context.Context, opts Options) (*Report, error) {
 	}
 
 	start := time.Now()
-	rep := &Report{ScopeErrors: map[string][]error{}}
 
 	// Dependency bookkeeping.
 	remaining := map[string]int{}
@@ -352,164 +357,71 @@ func (p *Plan) Execute(ctx context.Context, opts Options) (*Report, error) {
 	// A scope that has failed causes its not-yet-started steps to be skipped,
 	// so one broken AS does not spew a cascade of derived errors.
 	failedScopes := map[string]bool{}
-	// A step whose own prerequisite failed must also be skipped, even when the
-	// prerequisite belongs to a different scope. An inter-AS wire step is
-	// scoped to "peering" while the router that depends on it is scoped to its
-	// AS, so scope isolation alone would happily configure and start a router
-	// whose links were never created.
+	// A step whose own prerequisite failed or was skipped because its scope
+	// failed must also be skipped, even when the prerequisite belongs to a
+	// different scope. An inter-AS wire step is scoped to "peering" while the
+	// router that depends on it is scoped to its AS, so scope isolation alone
+	// would happily configure and start a router whose links were never made.
 	failedSteps := map[string]bool{}
 
-	var (
-		mu      sync.Mutex
-		results []Result
-	)
-
-	// Ready queues, one per stage, so a step never starts before every step of
-	// every earlier stage has settled.
-	for _, stage := range StageOrder {
-		var batch []*Step
-		for _, id := range p.order {
-			if p.steps[id].Stage == stage {
-				batch = append(batch, p.steps[id])
-			}
-		}
-		if len(batch) == 0 {
-			continue
-		}
-
-		if err := runStage(ctx, batch, remaining, dependents, workers, opts, obs,
-			&mu, &results, rep, failedScopes, failedSteps, p); err != nil {
-			rep.Results = results
-			rep.Duration = time.Since(start)
-			return rep, err
+	results := make(map[string]Result, p.Len())
+	order := make(map[string]int, p.Len())
+	for i, id := range p.order {
+		order[id] = i
+	}
+	ready := make([]*Step, 0, p.Len())
+	for _, id := range p.order {
+		if remaining[id] == 0 {
+			ready = append(ready, p.steps[id])
 		}
 	}
 
-	mu.Lock()
-	rep.Results = results
-	mu.Unlock()
-	rep.Duration = time.Since(start)
-	return rep, nil
-}
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
-// runStage executes every step of one stage, respecting intra-stage
-// dependencies, with a bounded worker pool.
-func runStage(
-	ctx context.Context,
-	batch []*Step,
-	remaining map[string]int,
-	dependents map[string][]string,
-	workers int,
-	opts Options,
-	obs Observer,
-	mu *sync.Mutex,
-	results *[]Result,
-	rep *Report,
-	failedScopes map[string]bool,
-	failedSteps map[string]bool,
-	p *Plan,
-) error {
-	inStage := map[string]bool{}
-	for _, s := range batch {
-		inStage[s.ID] = true
-	}
-
-	ready := make([]*Step, 0, len(batch))
-	pending := map[string]*Step{}
-	for _, s := range batch {
-		if remaining[s.ID] == 0 {
-			ready = append(ready, s)
-		} else {
-			pending[s.ID] = s
-		}
-	}
-
-	sem := make(chan struct{}, workers)
+	work := make(chan *Step)
+	done := make(chan Result, workers)
 	var wg sync.WaitGroup
-	done := make(chan Result, len(batch))
-	launched := 0
-
-	launch := func(s *Step) {
-		launched++
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-
-			mu.Lock()
-			skip := s.Scope != "" && failedScopes[s.Scope]
-			var because string
-			if !skip {
-				for _, need := range s.Needs {
-					if failedSteps[need] {
-						skip, because = true, need
-						break
+	if !opts.DryRun {
+		for range workers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for s := range work {
+					// Dispatch and cancellation can race as a worker becomes
+					// free. A queued step must not begin mutating after its
+					// execution context has been cancelled.
+					if err := runCtx.Err(); err != nil {
+						done <- Result{Step: s, Skipped: true, Err: err}
+						continue
 					}
+					obs.StepStarted(s)
+					t0 := time.Now()
+					var err error
+					if s.Run != nil {
+						err = s.Run(runCtx)
+					}
+					r := Result{Step: s, Err: err, Duration: time.Since(t0)}
+					obs.StepFinished(r)
+					done <- r
 				}
-			}
-			mu.Unlock()
-			if skip {
-				r := Result{Step: s, Skipped: true}
-				if because != "" {
-					r.Err = fmt.Errorf("skipped: its prerequisite %q failed", because)
-				}
-				done <- r
-				return
-			}
-			if opts.DryRun {
-				done <- Result{Step: s, Skipped: true}
-				return
-			}
-
-			obs.StepStarted(s)
-			t0 := time.Now()
-			var err error
-			if s.Run != nil {
-				err = s.Run(ctx)
-			}
-			r := Result{Step: s, Err: err, Duration: time.Since(t0)}
-			obs.StepFinished(r)
-			done <- r
-		}()
+			}()
+		}
+	}
+	closeWorkers := func() {
+		if opts.DryRun {
+			return
+		}
+		close(work)
+		wg.Wait()
 	}
 
-	for _, s := range ready {
-		launch(s)
-	}
-
-	settled := 0
-	total := len(batch)
-	for settled < total {
-		if launched == settled && len(pending) > 0 {
-			// Nothing running and nothing runnable: an intra-stage cycle that
-			// Validate should have caught. Fail loudly rather than hang.
-			ids := make([]string, 0, len(pending))
-			for id := range pending {
-				ids = append(ids, id)
-			}
-			sort.Strings(ids)
-			return fmt.Errorf("plan deadlocked in stage %s; unrunnable steps: %s",
-				batch[0].Stage, strings.Join(ids, ", "))
-		}
-
-		var r Result
-		select {
-		case r = <-done:
-		case <-ctx.Done():
-			wg.Wait()
-			return ctx.Err()
-		}
-		settled++
-
-		mu.Lock()
-		*results = append(*results, r)
-		if r.Skipped && r.Err != nil {
-			// A skip caused by a failed prerequisite propagates, so anything
-			// downstream is skipped too rather than running half-wired.
-			failedSteps[r.Step.ID] = true
-		}
-		if r.Err != nil && !r.Skipped && !r.Step.Optional {
+	// Settle releases dependent work. It is deliberately owned by the
+	// scheduler goroutine: result order and failure aggregation therefore do
+	// not depend on which worker happened to finish first.
+	settle := func(r Result, skippedByFailure bool) {
+		results[r.Step.ID] = r
+		if skippedByFailure || (r.Err != nil && !r.Skipped && !r.Step.Optional) {
 			failedSteps[r.Step.ID] = true
 		}
 		if r.Err != nil && !r.Skipped && !r.Step.Optional {
@@ -517,30 +429,156 @@ func runStage(
 			if scope == "" {
 				scope = "lab"
 			}
-			rep.ScopeErrors[scope] = append(rep.ScopeErrors[scope],
-				fmt.Errorf("%s: %w", r.Step.Describe, r.Err))
 			failedScopes[scope] = true
 		}
-		mu.Unlock()
-
-		if r.Err != nil && !r.Step.Optional && !opts.ContinueOnError {
-			wg.Wait()
-			return fmt.Errorf("%s: %w", r.Step.Describe, r.Err)
-		}
-
-		// Release anything that was waiting on this step.
 		for _, dep := range dependents[r.Step.ID] {
 			remaining[dep]--
-			if remaining[dep] == 0 && inStage[dep] {
-				s := pending[dep]
-				delete(pending, dep)
-				launch(s)
+			if remaining[dep] == 0 {
+				ready = append(ready, p.steps[dep])
 			}
+		}
+		sort.SliceStable(ready, func(i, j int) bool {
+			return order[ready[i].ID] < order[ready[j].ID]
+		})
+	}
+
+	skip := func(s *Step) (Result, bool) {
+		if opts.DryRun {
+			return Result{Step: s, Skipped: true}, false
+		}
+		if s.Scope != "" && failedScopes[s.Scope] {
+			return Result{Step: s, Skipped: true}, true
+		}
+		for _, need := range s.Needs {
+			if failedSteps[need] {
+				return Result{
+					Step:    s,
+					Skipped: true,
+					Err:     fmt.Errorf("skipped: its prerequisite %q failed", need),
+				}, true
+			}
+		}
+		return Result{}, false
+	}
+
+	running := 0
+	stopScheduling := false
+	var stopErr error
+	for len(results) < p.Len() && !stopScheduling {
+		if err := ctx.Err(); err != nil {
+			stopScheduling = true
+			stopErr = err
+			cancel()
+			break
+		}
+
+		// Resolve all skips before consuming a worker. A scope failure can
+		// release a long downstream chain, and none of it should occupy the
+		// bounded pool merely to report that it cannot run.
+		progressed := false
+		for len(ready) > 0 {
+			s := ready[0]
+			r, blocked := skip(s)
+			if r.Step == nil {
+				break
+			}
+			ready = ready[1:]
+			settle(r, blocked)
+			progressed = true
+		}
+		if progressed {
+			continue
+		}
+
+		if len(ready) > 0 && running < workers {
+			s := ready[0]
+			select {
+			case work <- s:
+				ready = ready[1:]
+				running++
+				continue
+			case <-ctx.Done():
+				stopScheduling = true
+				stopErr = ctx.Err()
+				cancel()
+				break
+			}
+		}
+		if stopScheduling {
+			break
+		}
+		if running == 0 {
+			// Validate rules out cycles, so getting here would be an internal
+			// scheduler bug. Naming the unresolved IDs is much more useful
+			// than blocking forever in a deployment.
+			var pending []string
+			for _, id := range p.order {
+				if _, ok := results[id]; !ok {
+					pending = append(pending, id)
+				}
+			}
+			stopErr = fmt.Errorf("plan deadlocked; unrunnable steps: %s", strings.Join(pending, ", "))
+			stopScheduling = true
+			cancel()
+			break
+		}
+
+		select {
+		case r := <-done:
+			running--
+			settle(r, false)
+			if r.Err != nil && !r.Step.Optional && !opts.ContinueOnError {
+				stopScheduling = true
+				stopErr = fmt.Errorf("%s: %w", r.Step.Describe, r.Err)
+				cancel()
+			}
+		case <-ctx.Done():
+			stopScheduling = true
+			stopErr = ctx.Err()
+			cancel()
 		}
 	}
 
-	wg.Wait()
-	return nil
+	// A stopped scheduler must still collect each in-flight worker result
+	// before closing the pool. They are deliberately not added to the report:
+	// they began before cancellation and may only be reporting the executor's
+	// cancellation, not an independently settled plan outcome. The buffered
+	// channel is sized to the worker count, so no worker can be stranded.
+	for running > 0 {
+		<-done
+		running--
+	}
+	closeWorkers()
+
+	rep := reportFromResults(p, results, start)
+	if stopErr != nil {
+		return rep, stopErr
+	}
+	return rep, nil
+}
+
+// reportFromResults rebuilds reports in plan insertion order rather than
+// worker completion order. Concurrent execution must not make user-facing
+// errors or summaries flap from one invocation to the next.
+func reportFromResults(p *Plan, results map[string]Result, start time.Time) *Report {
+	rep := &Report{ScopeErrors: map[string][]error{}, Duration: time.Since(start)}
+	for _, id := range p.order {
+		r, ok := results[id]
+		if !ok {
+			continue
+		}
+		rep.Results = append(rep.Results, r)
+		if r.Err == nil || r.Skipped || r.Step.Optional {
+			continue
+		}
+		scope := r.Step.Scope
+		if scope == "" {
+			scope = "lab"
+		}
+		rep.ScopeErrors[scope] = append(rep.ScopeErrors[scope],
+			fmt.Errorf("%s: %w", r.Step.Describe, r.Err))
+	}
+	return rep
 }
 
 func defaultWorkers() int {

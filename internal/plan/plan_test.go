@@ -342,3 +342,177 @@ func TestUnrelatedScopesStillRunAfterAFailure(t *testing.T) {
 		t.Error("as2 should have completed despite as1 failing")
 	}
 }
+
+// Stages are progress labels, not global barriers. A slow unrelated create
+// must not hold back a link and configuration whose own dependencies are done.
+func TestExecutePipelinesAcrossStages(t *testing.T) {
+	slowStarted := make(chan struct{})
+	releaseSlow := make(chan struct{})
+	wireStarted := make(chan struct{})
+	configured := make(chan struct{})
+
+	p := New()
+	p.Add(&Step{ID: "create:slow", Stage: StageCreate, Describe: "slow create",
+		Run: func(context.Context) error {
+			close(slowStarted)
+			<-releaseSlow
+			return nil
+		}})
+	p.Add(&Step{ID: "create:fast", Stage: StageCreate, Describe: "fast create",
+		Run: func(context.Context) error { return nil }})
+	p.Add(&Step{ID: "wire:fast", Stage: StageWire, Describe: "fast wire",
+		Needs: []string{"create:fast"},
+		Run: func(context.Context) error {
+			close(wireStarted)
+			return nil
+		}})
+	p.Add(&Step{ID: "configure:fast", Stage: StageConfigure, Describe: "fast configure",
+		Needs: []string{"wire:fast"},
+		Run: func(context.Context) error {
+			close(configured)
+			return nil
+		}})
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := p.Execute(context.Background(), Options{Workers: 2})
+		done <- err
+	}()
+	<-slowStarted
+	select {
+	case <-wireStarted:
+	case <-time.After(time.Second):
+		t.Fatal("wire waited for an unrelated create stage to finish")
+	}
+	select {
+	case <-configured:
+	case <-time.After(time.Second):
+		t.Fatal("configure waited for an unrelated wire or create stage to finish")
+	}
+	close(releaseSlow)
+	if err := <-done; err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+}
+
+func TestExecuteNeverExceedsWorkerBound(t *testing.T) {
+	const workers = 3
+	release := make(chan struct{})
+	var running, peak int64
+	p := New()
+	for i := 0; i < 12; i++ {
+		p.Add(&Step{ID: fmt.Sprintf("s%d", i), Stage: StageCreate, Describe: "bounded",
+			Run: func(context.Context) error {
+				n := atomic.AddInt64(&running, 1)
+				for {
+					old := atomic.LoadInt64(&peak)
+					if n <= old || atomic.CompareAndSwapInt64(&peak, old, n) {
+						break
+					}
+				}
+				<-release
+				atomic.AddInt64(&running, -1)
+				return nil
+			}})
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := p.Execute(context.Background(), Options{Workers: workers})
+		done <- err
+	}()
+	deadline := time.After(time.Second)
+	for atomic.LoadInt64(&peak) < workers {
+		select {
+		case <-deadline:
+			t.Fatalf("only %d workers started, want %d", peak, workers)
+		case <-time.After(time.Millisecond):
+		}
+	}
+	if got := atomic.LoadInt64(&peak); got != workers {
+		t.Fatalf("peak workers = %d, want exactly %d", got, workers)
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+}
+
+func TestExecuteCancellationDoesNotStartQueuedWork(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	started := make(chan struct{})
+	var queued atomic.Bool
+	p := New()
+	p.Add(&Step{ID: "running", Stage: StageCreate, Describe: "running",
+		Run: func(ctx context.Context) error {
+			close(started)
+			<-ctx.Done()
+			return ctx.Err()
+		}})
+	p.Add(&Step{ID: "queued", Stage: StageCreate, Describe: "queued",
+		Run: func(context.Context) error {
+			queued.Store(true)
+			return nil
+		}})
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := p.Execute(ctx, Options{Workers: 1})
+		done <- err
+	}()
+	<-started
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("execute error = %v, want context cancellation", err)
+	}
+	if queued.Load() {
+		t.Fatal("a queued step ran after cancellation")
+	}
+}
+
+func TestExecuteReportsResultsInPlanOrder(t *testing.T) {
+	release := make(chan struct{})
+	firstStarted := make(chan struct{})
+	secondDone := make(chan struct{})
+	p := New()
+	p.Add(&Step{ID: "first", Stage: StageCreate, Describe: "first",
+		Run: func(context.Context) error {
+			close(firstStarted)
+			<-release
+			return nil
+		}})
+	p.Add(&Step{ID: "second", Stage: StageCreate, Describe: "second",
+		Run: func(context.Context) error {
+			close(secondDone)
+			return nil
+		}})
+
+	type outcome struct {
+		rep *Report
+		err error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		rep, err := p.Execute(context.Background(), Options{Workers: 2})
+		done <- outcome{rep: rep, err: err}
+	}()
+	select {
+	case <-firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first step did not start")
+	}
+	select {
+	case <-secondDone:
+	case <-time.After(time.Second):
+		t.Fatal("second step did not complete while first was blocked")
+	}
+	close(release)
+	out := <-done
+	if out.err != nil {
+		t.Fatalf("execute: %v", out.err)
+	}
+	rep := out.rep
+	if len(rep.Results) != 2 || rep.Results[0].Step.ID != "first" || rep.Results[1].Step.ID != "second" {
+		t.Fatalf("results are not insertion ordered: %#v", rep.Results)
+	}
+}

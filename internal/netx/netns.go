@@ -14,7 +14,6 @@ import (
 	"fmt"
 	"os"
 	"runtime"
-	"sync"
 
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
@@ -25,6 +24,13 @@ type NS struct {
 	handle netns.NsHandle
 	path   string
 }
+
+// These indirections keep namespace switching testable without requiring
+// CAP_SYS_ADMIN. Production always uses the netns package functions.
+var (
+	getNetNS = netns.Get
+	setNetNS = netns.Set
+)
 
 // OpenNS opens a namespace by path, typically /proc/<pid>/ns/net.
 func OpenNS(path string) (*NS, error) {
@@ -58,47 +64,69 @@ func (n *NS) Path() string { return n.path }
 // Fd returns the raw file descriptor, for netlink calls that need it.
 func (n *NS) Fd() int { return int(n.handle) }
 
-// nsMu serialises namespace switching. Entering a namespace is a per-thread
-// operation, so we lock the goroutine to its OS thread for the duration; the
-// mutex additionally prevents two goroutines from fighting over the same
-// thread-local state through the netlink library's package-level handles.
-var nsMu sync.Mutex
-
 // Do runs fn inside the namespace, restoring the caller's namespace afterwards.
 //
-// The goroutine is pinned to its OS thread for the duration. If restoring
-// fails the thread is deliberately left locked and the process is marked
-// unhealthy, because an unpinned thread in the wrong namespace would silently
-// corrupt every later operation scheduled onto it.
+// Namespace membership is per OS thread. Each call therefore uses a short
+// lived pinned worker instead of serialising all callers behind a process-wide
+// mutex. On a restore failure the worker exits while still pinned; Go then
+// terminates that OS thread rather than returning a thread in the wrong
+// namespace to the scheduler.
 func (n *NS) Do(fn func() error) error {
-	nsMu.Lock()
-	defer nsMu.Unlock()
+	if n == nil {
+		return fmt.Errorf("enter nil netns")
+	}
+	result := make(chan error, 1)
+	go func() {
+		runtime.LockOSThread()
+		origin, err := getNetNS()
+		if err != nil {
+			runtime.UnlockOSThread()
+			result <- fmt.Errorf("save current netns: %w", err)
+			return
+		}
+		if err := setNetNS(n.handle); err != nil {
+			_ = origin.Close()
+			runtime.UnlockOSThread()
+			result <- fmt.Errorf("enter netns %s: %w", n.path, err)
+			return
+		}
 
-	runtime.LockOSThread()
-	origin, err := netns.Get()
+		fnErr := fn()
+		if err := setNetNS(origin); err != nil {
+			_ = origin.Close()
+			result <- fmt.Errorf("restore netns after %v: %w", fnErr, err)
+			// Per runtime.LockOSThread's contract, exiting without unlocking
+			// terminates this thread. Never let it re-enter Go's thread pool
+			// while it is still in the target namespace.
+			runtime.Goexit()
+		}
+		_ = origin.Close()
+		runtime.UnlockOSThread()
+		result <- fnErr
+	}()
+	return <-result
+}
+
+// Handle returns a netlink handle whose sockets are bound to this namespace.
+//
+// Operations through the returned handle do not switch the calling thread.
+// This is the normal path for concurrent endpoint operations; Do is needed
+// only while creating the sockets (and for the few /proc operations that are
+// inherently namespace-relative).
+func (n *NS) Handle() (*netlink.Handle, error) {
+	var h *netlink.Handle
+	err := n.Do(func() error {
+		var err error
+		h, err = netlink.NewHandle()
+		return err
+	})
 	if err != nil {
-		runtime.UnlockOSThread()
-		return fmt.Errorf("save current netns: %w", err)
+		if h != nil {
+			h.Close()
+		}
+		return nil, fmt.Errorf("open netlink handle for %s: %w", n.path, err)
 	}
-
-	if err := netns.Set(n.handle); err != nil {
-		_ = origin.Close()
-		runtime.UnlockOSThread()
-		return fmt.Errorf("enter netns %s: %w", n.path, err)
-	}
-
-	fnErr := fn()
-
-	if err := netns.Set(origin); err != nil {
-		// Do not unlock the thread: it is in the wrong namespace and must not
-		// be reused. Leaking one thread is far cheaper than corrupting the
-		// namespace of unrelated work.
-		_ = origin.Close()
-		return fmt.Errorf("restore netns after %v: %w", fnErr, err)
-	}
-	_ = origin.Close()
-	runtime.UnlockOSThread()
-	return fnErr
+	return h, nil
 }
 
 // NSFromPID returns the namespace path for a process.

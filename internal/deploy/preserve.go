@@ -196,13 +196,25 @@ func (e *Engine) CaptureAll(ctx context.Context, top *model.Topology, store *sta
 	if e.WritesReference {
 		return 0, nil
 	}
+	var devices []*model.Device
+	for _, d := range top.DevicesOnNode(e.Node) {
+		if studentOwned(top, d) {
+			devices = append(devices, d)
+		}
+	}
+	sort.Slice(devices, func(i, j int) bool { return devices[i].ID < devices[j].ID })
+
+	captures := make([][]state.Snapshot, len(devices))
+	_, captureErrs, ctxErr := e.runBounded(ctx, len(devices), func(i int) error {
+		snaps, err := Capture(ctx, e.Runtime, devices[i], top.Name, top.Hash)
+		captures[i] = snaps
+		return err
+	})
+
 	saved := 0
 	var problems []string
-	for _, d := range top.DevicesOnNode(e.Node) {
-		if !studentOwned(top, d) {
-			continue
-		}
-		snaps, err := Capture(ctx, e.Runtime, d, top.Name, top.Hash)
+	for i, d := range devices {
+		err := captureErrs[i]
 		if err != nil && !errors.Is(err, ErrNotRunning) {
 			// A stopped device is not a problem for a periodic backup: the
 			// snapshot already in the store is still the last thing that was
@@ -213,7 +225,7 @@ func (e *Engine) CaptureAll(ctx context.Context, top *model.Topology, store *sta
 			// Whatever was read is still stored: a partial snapshot is worth
 			// more than none, and the failure is reported either way.
 		}
-		for _, s := range snaps {
+		for _, s := range captures[i] {
 			changed, err := store.Put(s)
 			if err != nil {
 				problems = append(problems, fmt.Sprintf("%s/%s: %v", d.ID, s.Kind, err))
@@ -225,10 +237,9 @@ func (e *Engine) CaptureAll(ctx context.Context, top *model.Topology, store *sta
 		}
 	}
 	if len(problems) > 0 {
-		sort.Strings(problems)
-		return saved, fmt.Errorf("%s", strings.Join(problems, "; "))
+		return saved, deterministicError(ctxErr, problems)
 	}
-	return saved, nil
+	return saved, ctxErr
 }
 
 // cleanRunningConfig strips the preamble vtysh prints before a configuration.

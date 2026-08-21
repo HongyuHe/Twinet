@@ -7,7 +7,10 @@
 package deploy
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"sort"
@@ -15,8 +18,6 @@ import (
 	"strings"
 	"time"
 
-	"crypto/sha256"
-	"encoding/hex"
 	"sync"
 
 	"github.com/HongyuHe/twinet/internal/alloc"
@@ -63,6 +64,10 @@ const DefaultStopTimeout = 10 * time.Second
 type Engine struct {
 	Runtime runtime.Runtime
 	Node    string
+	// Workers bounds capture, pruning, and teardown fan-out. Zero uses a
+	// conservative default so a large lab cannot turn cleanup into an
+	// unbounded burst of runtime or netlink requests.
+	Workers int
 	// PullPolicy controls image fetching.
 	PullPolicy runtime.PullPolicy
 	// Renderer produces per-device configuration. Optional.
@@ -503,7 +508,7 @@ func (e *Engine) PruneOrphans(ctx context.Context, top *model.Topology) ([]strin
 	if err != nil {
 		return nil, err
 	}
-	var removed []string
+	var candidates []runtime.Container
 	for _, c := range cs {
 		if want[c.Name] {
 			continue
@@ -513,6 +518,21 @@ func (e *Engine) PruneOrphans(ctx context.Context, top *model.Topology) ([]strin
 		if c.Labels[LabelNode] != "" && c.Labels[LabelNode] != e.Node && !elsewhere[c.Name] {
 			continue
 		}
+		candidates = append(candidates, c)
+	}
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].Name < candidates[j].Name })
+
+	// Capture every candidate before removing any one of them. A parallel
+	// prune must not turn a capture failure into a race where another worker
+	// has already destroyed an unrelated student's only copy.
+	captures := make([][]state.Snapshot, len(candidates))
+	_, captureErrs, ctxErr := e.runBounded(ctx, len(candidates), func(i int) error {
+		snaps, err := e.orphanSnapshots(ctx, top, candidates[i])
+		captures[i] = snaps
+		return err
+	})
+	var problems []string
+	for i, c := range candidates {
 		// Capture before removing. An orphan is usually a device that moved to
 		// another node or left the manifest, and in both cases it may hold a
 		// student's work -- the only copy of it. Removing first and asking
@@ -523,18 +543,38 @@ func (e *Engine) PruneOrphans(ctx context.Context, top *model.Topology) ([]strin
 		// Refusing is the right failure. A lab with one stale container is a
 		// nuisance; a lab that has quietly eaten a group's configuration is
 		// not something an apology fixes.
-		if err := e.captureOrphan(ctx, top, c); err != nil {
-			return removed, fmt.Errorf(
-				"refusing to remove %s: its configuration could not be captured (%w). "+
-					"Destroy the lab explicitly if it is genuinely disposable", c.Name, err)
+		if err := captureErrs[i]; err != nil {
+			problems = append(problems, fmt.Sprintf(
+				"refusing to remove %s: its configuration could not be captured (%v). "+
+					"Destroy the lab explicitly if it is genuinely disposable", c.Name, err))
 		}
-		if err := e.Runtime.Remove(ctx, c.Name, true); err != nil {
-			return removed, fmt.Errorf("remove orphan %s: %w", c.Name, err)
+		for _, snap := range captures[i] {
+			if _, err := e.State.Put(snap); err != nil {
+				problems = append(problems, fmt.Sprintf(
+					"refusing to remove %s: its configuration could not be saved (%v). "+
+						"Destroy the lab explicitly if it is genuinely disposable", c.Name, err))
+			}
+		}
+	}
+	if err := deterministicError(ctxErr, problems); err != nil {
+		return nil, err
+	}
+
+	started, removeErrs, ctxErr := e.runBounded(ctx, len(candidates), func(i int) error {
+		return e.Runtime.Remove(ctx, candidates[i].Name, true)
+	})
+	var removed []string
+	for i, c := range candidates {
+		if !started[i] {
+			continue
+		}
+		if err := removeErrs[i]; err != nil {
+			problems = append(problems, fmt.Sprintf("remove orphan %s: %v", c.Name, err))
+			continue
 		}
 		removed = append(removed, c.Name)
 	}
-	sort.Strings(removed)
-	return removed, nil
+	return removed, deterministicError(ctxErr, problems)
 }
 
 // captureOrphan snapshots a container that is about to be removed.
@@ -544,13 +584,26 @@ func (e *Engine) PruneOrphans(ctx context.Context, top *model.Topology) ([]strin
 // store nobody configured would make the platform unusable. That is a
 // deliberate trade and it is recorded here rather than left implicit.
 func (e *Engine) captureOrphan(ctx context.Context, top *model.Topology, c runtime.Container) error {
+	snaps, err := e.orphanSnapshots(ctx, top, c)
+	if err != nil {
+		return err
+	}
+	for _, snap := range snaps {
+		if _, err := e.State.Put(snap); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (e *Engine) orphanSnapshots(ctx context.Context, top *model.Topology, c runtime.Container) ([]state.Snapshot, error) {
 	if e.State == nil {
-		return nil
+		return nil, nil
 	}
 	// Nothing is captured while the reference solution is what is on the
 	// device: the snapshot would be the answer filed as the student's work.
 	if e.WritesReference {
-		return nil
+		return nil, nil
 	}
 	// The device is gone from the topology, so its identity comes from the
 	// labels the deployment stamped on it.
@@ -565,7 +618,7 @@ func (e *Engine) captureOrphan(ctx context.Context, top *model.Topology, c runti
 		id = c.Labels[LabelDevice]
 	}
 	if id == "" {
-		return nil
+		return nil, nil
 	}
 	d, ok := top.Device(id)
 	if !ok {
@@ -579,18 +632,19 @@ func (e *Engine) captureOrphan(ctx context.Context, top *model.Topology, c runti
 	}
 	snaps, err := Capture(ctx, e.Runtime, d, top.Name, top.Hash)
 	if err != nil {
-		return err
+		return snaps, err
 	}
-	for _, snap := range snaps {
-		if _, err := e.State.Put(snap); err != nil {
-			return err
-		}
-	}
-	return nil
+	return snaps, nil
 }
 
 // PruneOverlays removes VXLAN bridges and tunnels this node no longer needs.
 func (e *Engine) PruneOverlays(top *model.Topology) ([]string, error) {
+	return e.PruneOverlaysContext(context.Background(), top)
+}
+
+// PruneOverlaysContext is PruneOverlays with cancellation for callers that
+// already have a deployment request context.
+func (e *Engine) PruneOverlaysContext(ctx context.Context, top *model.Topology) ([]string, error) {
 	want := map[uint32]bool{}
 	for _, l := range top.LinksTouchingNode(e.Node) {
 		if l.CrossNode() {
@@ -604,21 +658,34 @@ func (e *Engine) PruneOverlays(top *model.Topology) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	var removed []string
+	var stale []uint32
 	for _, vni := range live {
 		if want[vni] {
 			continue
 		}
+		stale = append(stale, vni)
+	}
+	sort.Slice(stale, func(i, j int) bool { return stale[i] < stale[j] })
+	started, errs, ctxErr := e.runBounded(ctx, len(stale), func(i int) error {
+		vni := stale[i]
 		if err := netx.DeleteHostLink(hostSideName(vni)); err != nil {
-			return removed, err
+			return err
 		}
-		if err := netx.RemoveOverlay(vni); err != nil {
-			return removed, err
+		return netx.RemoveOverlay(vni)
+	})
+	var removed []string
+	var problems []string
+	for i, vni := range stale {
+		if !started[i] {
+			continue
+		}
+		if err := errs[i]; err != nil {
+			problems = append(problems, fmt.Sprintf("remove overlay %d: %v", vni, err))
+			continue
 		}
 		removed = append(removed, netx.VxlanName(vni))
 	}
-	sort.Strings(removed)
-	return removed, nil
+	return removed, deterministicError(ctxErr, problems)
 }
 
 // SpecHash is a digest of everything about a container that would require it to
@@ -849,13 +916,14 @@ func (e *Engine) endpoint(top *model.Topology, i *model.Iface, nsPath string, l 
 			ep.Addrs = append(ep.Addrs, i.Addr6)
 		}
 	}
-	if !l.Props.Empty() {
-		ep.Shaping = &netx.Shaping{
-			Bandwidth: l.Props.Bandwidth,
-			Delay:     l.Props.Delay,
-			Queue:     l.Props.Queue,
-			Loss:      l.Props.Loss,
-		}
+	// Every managed link owns its qdisc state, including the empty state. That
+	// lets a redeploy remove a delay that was deleted from the manifest while
+	// netx's observation avoids touching qdiscs whose declaration is unchanged.
+	ep.Shaping = &netx.Shaping{
+		Bandwidth: l.Props.Bandwidth,
+		Delay:     l.Props.Delay,
+		Queue:     l.Props.Queue,
+		Loss:      l.Props.Loss,
 	}
 	return ep
 }
@@ -868,6 +936,14 @@ func (e *Engine) configure(ctx context.Context, d *model.Device) error {
 	files, err := e.Renderer.Files(d)
 	if err != nil {
 		return fmt.Errorf("render files for %s: %w", d.ID, err)
+	}
+	cmds, err := e.Renderer.Commands(d)
+	if err != nil {
+		return fmt.Errorf("render commands for %s: %w", d.ID, err)
+	}
+	hash := ConfigHash(files, cmds)
+	if e.configurationCurrent(ctx, d, files, hash) {
+		return nil
 	}
 	for _, path := range sortedKeys(files) {
 		f := files[path]
@@ -885,13 +961,12 @@ func (e *Engine) configure(ctx context.Context, d *model.Device) error {
 			// business rewriting the part it deliberately left to someone else.
 			continue
 		}
+		if e.fileContentMatches(ctx, d, path, f.Content) {
+			continue
+		}
 		if err := e.Runtime.CopyTo(ctx, d.Container, path, f.Mode, f.Content); err != nil {
 			return fmt.Errorf("write %s to %s: %w", path, d.ID, err)
 		}
-	}
-	cmds, err := e.Renderer.Commands(d)
-	if err != nil {
-		return fmt.Errorf("render commands for %s: %w", d.ID, err)
 	}
 	for _, c := range cmds {
 		res, err := e.Runtime.Exec(ctx, d.Container, runtime.ExecCmd{Cmd: c.Args})
@@ -901,6 +976,91 @@ func (e *Engine) configure(ctx context.Context, d *model.Device) error {
 		if err := res.Err(); err != nil && !c.IgnoreError {
 			return fmt.Errorf("%s: %s: %w", d.ID, c.Describe, err)
 		}
+	}
+	if err := e.writeConfigurationMarker(ctx, d, hash); err != nil {
+		return err
+	}
+	return nil
+}
+
+// configurationMarker records the content hash of the platform files and
+// commands that have been applied to a container. It contains no configuration
+// itself, so it cannot expose a reference solution to a student shell.
+const configurationMarker = "/etc/twinet/config-hash"
+
+// ConfigHash is a deterministic digest of rendered platform files and
+// daemon-affecting commands. It intentionally excludes student-owned state:
+// a student's edit must not be turned into a platform mutation on redeploy.
+func ConfigHash(files map[string]FileSpec, cmds []Command) string {
+	h := sha256.New()
+	write := func(s string) {
+		fmt.Fprintf(h, "%d:", len(s))
+		_, _ = h.Write([]byte(s))
+	}
+	for _, path := range sortedKeys(files) {
+		f := files[path]
+		write("file")
+		write(path)
+		write(strconv.FormatInt(f.Mode, 10))
+		fmt.Fprintf(h, "%d:", len(f.Content))
+		_, _ = h.Write(f.Content)
+	}
+	for _, c := range cmds {
+		write("command")
+		if c.IgnoreError {
+			write("ignore-error")
+		} else {
+			write("required")
+		}
+		for _, arg := range c.Args {
+			write(arg)
+		}
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func (e *Engine) configurationCurrent(ctx context.Context, d *model.Device,
+	files map[string]FileSpec, want string) bool {
+
+	res, err := e.Runtime.Exec(ctx, d.Container, runtime.ExecCmd{
+		Cmd: []string{"sh", "-c", "cat " + configurationMarker + " 2>/dev/null"},
+	})
+	if err != nil || res.ExitCode != 0 || strings.TrimSpace(res.Stdout) != want {
+		return false
+	}
+	for _, path := range sortedKeys(files) {
+		// This path is controlled by the student once it has content. Do not
+		// turn a comparison into an excuse to load or overwrite it.
+		if studentOwnedPaths[path] && hasStudentConfig(d) && !e.Authoritative {
+			continue
+		}
+		if !e.fileContentMatches(ctx, d, path, files[path].Content) {
+			return false
+		}
+	}
+	return true
+}
+
+func (e *Engine) fileContentMatches(ctx context.Context, d *model.Device, path string, want []byte) bool {
+	got, err := e.Runtime.CopyFrom(ctx, d.Container, path)
+	if err != nil {
+		// A missing or unreadable platform file is observed as drift. CopyTo
+		// will provide the authoritative error if it cannot repair it.
+		return false
+	}
+	return bytes.Equal(got, want)
+}
+
+func (e *Engine) writeConfigurationMarker(ctx context.Context, d *model.Device, hash string) error {
+	res, err := e.Runtime.Exec(ctx, d.Container, runtime.ExecCmd{Cmd: []string{
+		"sh", "-c", "umask 077; mkdir -p /etc/twinet && printf '%s\\n' " + hash +
+			" > " + configurationMarker,
+	}})
+	if err != nil {
+		return fmt.Errorf("record applied configuration for %s: %w", d.ID, err)
+	}
+	if err := res.Err(); err != nil {
+		return fmt.Errorf("record applied configuration for %s: %w", d.ID, err)
 	}
 	return nil
 }
@@ -960,34 +1120,60 @@ func (e *Engine) Destroy(ctx context.Context, lab string) error {
 	if err != nil {
 		return err
 	}
-	var errs []string
-	for _, c := range cs {
-		if err := e.Runtime.Remove(ctx, c.Name, true); err != nil {
-			errs = append(errs, fmt.Sprintf("remove %s: %v", c.Name, err))
+	sort.Slice(cs, func(i, j int) bool { return cs[i].Name < cs[j].Name })
+	started, errs, ctxErr := e.runBounded(ctx, len(cs), func(i int) error {
+		return e.Runtime.Remove(ctx, cs[i].Name, true)
+	})
+	var problems []string
+	for i, c := range cs {
+		if !started[i] {
+			continue
+		}
+		if err := errs[i]; err != nil {
+			problems = append(problems, fmt.Sprintf("remove %s: %v", c.Name, err))
 		}
 	}
-	if len(errs) > 0 {
-		return fmt.Errorf("%s", strings.Join(errs, "; "))
-	}
-	return nil
+	return deterministicError(ctxErr, problems)
 }
 
 // DestroyOverlays removes the bridges, tunnels and host-side veths for the
 // given VNIs.
 func (e *Engine) DestroyOverlays(vnis []uint32) error {
-	var errs []string
-	for _, v := range vnis {
-		if err := netx.DeleteHostLink(hostSideName(v)); err != nil {
-			errs = append(errs, err.Error())
-		}
-		if err := netx.RemoveOverlay(v); err != nil {
-			errs = append(errs, err.Error())
+	return e.DestroyOverlaysContext(context.Background(), vnis)
+}
+
+// DestroyOverlaysContext removes overlays in bounded parallel while retaining
+// deterministic errors. A VNI is deduplicated before fan-out so two workers
+// never race to delete the same bridge and tunnel.
+func (e *Engine) DestroyOverlaysContext(ctx context.Context, vnis []uint32) error {
+	seen := map[uint32]bool{}
+	unique := make([]uint32, 0, len(vnis))
+	for _, vni := range vnis {
+		if !seen[vni] {
+			seen[vni] = true
+			unique = append(unique, vni)
 		}
 	}
-	if len(errs) > 0 {
-		return fmt.Errorf("%s", strings.Join(errs, "; "))
+	sort.Slice(unique, func(i, j int) bool { return unique[i] < unique[j] })
+	started, errs, ctxErr := e.runBounded(ctx, len(unique), func(i int) error {
+		vni := unique[i]
+		var problems []string
+		if err := netx.DeleteHostLink(hostSideName(vni)); err != nil {
+			problems = append(problems, err.Error())
+		}
+		if err := netx.RemoveOverlay(vni); err != nil {
+			problems = append(problems, err.Error())
+		}
+		return deterministicError(nil, problems)
+	})
+	var problems []string
+	for i, vni := range unique {
+		if !started[i] || errs[i] == nil {
+			continue
+		}
+		problems = append(problems, fmt.Sprintf("remove overlay %d: %v", vni, errs[i]))
 	}
-	return nil
+	return deterministicError(ctxErr, problems)
 }
 
 // mplsLabelHeadroom is the number of bytes reserved on a label-switching

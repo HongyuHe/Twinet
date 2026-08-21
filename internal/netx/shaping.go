@@ -43,43 +43,34 @@ func (s Shaping) Empty() bool {
 // converges rather than stacking. That is what lets a link's delay be edited in
 // the manifest and pushed with a redeploy that touches nothing else.
 func ApplyShaping(link netlink.Link, s Shaping) error {
-	if err := clearRootQdisc(link); err != nil {
+	h, err := netlink.NewHandle()
+	if err != nil {
+		return fmt.Errorf("open netlink handle: %w", err)
+	}
+	defer h.Close()
+	return applyShaping(h, link, s)
+}
+
+// applyShaping is ApplyShaping for a namespace-scoped netlink handle.
+func applyShaping(h *netlink.Handle, link netlink.Link, s Shaping) error {
+	matches, err := shapingMatches(h, link, s)
+	if err != nil {
+		return err
+	}
+	if matches {
+		return nil
+	}
+	if err := clearRootQdisc(h, link); err != nil {
 		return err
 	}
 	if s.Empty() {
 		return nil
 	}
 
-	name := link.Attrs().Name
-	idx := link.Attrs().Index
-	mtu := link.Attrs().MTU
-	if mtu <= 0 {
-		mtu = 1500
+	netem, tbf, err := desiredShaping(link, s)
+	if err != nil {
+		return err
 	}
-
-	// netem at the root handles delay and loss.
-	attrs := netlink.NetemQdiscAttrs{}
-	if s.Delay != "" {
-		us, err := ParseTime(s.Delay)
-		if err != nil {
-			return fmt.Errorf("interface %s: delay: %w", name, err)
-		}
-		attrs.Latency = uint32(us)
-	}
-	if s.Loss != "" {
-		pct, err := ParsePercent(s.Loss)
-		if err != nil {
-			return fmt.Errorf("interface %s: loss: %w", name, err)
-		}
-		attrs.Loss = float32(pct)
-	}
-
-	// netem's default queue is 1000 packets. On a delayed, rate-limited link
-	// that is easily smaller than the bandwidth-delay product, so packets are
-	// dropped for reasons the student cannot see or explain. Size the queue
-	// from the actual BDP instead, with a generous floor.
-	attrs.Limit = netemLimit(s, mtu)
-
 	// Replace, not add. clearRootQdisc deliberately leaves a pfifo_fast in
 	// place, so adding at the root fails with EEXIST whenever one is there --
 	// and one is there as soon as anybody runs the ordinary way of taking
@@ -89,34 +80,73 @@ func ApplyShaping(link netlink.Link, s Shaping) error {
 	// rate back: every later episode on that link ran with different physics
 	// than the manifest describes, silently. Replace installs at the root
 	// whatever is already sitting there.
-	if err := netlink.QdiscReplace(netlink.NewNetem(
-		netlink.QdiscAttrs{
-			LinkIndex: idx,
-			Handle:    netlink.MakeHandle(1, 0),
-			Parent:    netlink.HANDLE_ROOT,
-		}, attrs)); err != nil {
-		return fmt.Errorf("interface %s: add netem: %w", name, err)
+	if err := h.QdiscReplace(netem); err != nil {
+		return fmt.Errorf("interface %s: add netem: %w", link.Attrs().Name, err)
 	}
-
-	if s.Bandwidth == "" {
+	if tbf == nil {
 		return nil
 	}
+	if err := h.QdiscReplace(tbf); err != nil {
+		return fmt.Errorf("interface %s: add tbf: %w", link.Attrs().Name, err)
+	}
+	return nil
+}
 
+// desiredShaping constructs the exact qdiscs the declared shaping requires.
+// It is shared by application and observation so a no-change deployment does
+// not churn qdiscs merely because the two paths did arithmetic differently.
+func desiredShaping(link netlink.Link, s Shaping) (*netlink.Netem, *netlink.Tbf, error) {
+	name := link.Attrs().Name
+	idx := link.Attrs().Index
+	mtu := link.Attrs().MTU
+	if mtu <= 0 {
+		mtu = 1500
+	}
+
+	attrs := netlink.NetemQdiscAttrs{}
+	if s.Delay != "" {
+		us, err := ParseTime(s.Delay)
+		if err != nil {
+			return nil, nil, fmt.Errorf("interface %s: delay: %w", name, err)
+		}
+		attrs.Latency = uint32(us)
+	}
+	if s.Loss != "" {
+		pct, err := ParsePercent(s.Loss)
+		if err != nil {
+			return nil, nil, fmt.Errorf("interface %s: loss: %w", name, err)
+		}
+		attrs.Loss = float32(pct)
+	}
+
+	// netem's default queue is 1000 packets. On a delayed, rate-limited link
+	// that is easily smaller than the bandwidth-delay product, so packets are
+	// dropped for reasons the student cannot see or explain. Size the queue
+	// from the actual BDP instead, with a generous floor.
+	attrs.Limit = netemLimit(s, mtu)
+	netem := netlink.NewNetem(netlink.QdiscAttrs{
+		LinkIndex: idx,
+		Handle:    netlink.MakeHandle(1, 0),
+		Parent:    netlink.HANDLE_ROOT,
+	}, attrs)
+
+	if s.Bandwidth == "" {
+		return netem, nil, nil
+	}
 	rate, err := ParseRate(s.Bandwidth)
 	if err != nil {
-		return fmt.Errorf("interface %s: bandwidth: %w", name, err)
+		return nil, nil, fmt.Errorf("interface %s: bandwidth: %w", name, err)
 	}
 	latencyUS := uint32(50_000) // 50ms default, matching the legacy platform
 	if s.Queue != "" {
 		v, err := ParseTime(s.Queue)
 		if err != nil {
-			return fmt.Errorf("interface %s: queue: %w", name, err)
+			return nil, nil, fmt.Errorf("interface %s: queue: %w", name, err)
 		}
 		latencyUS = uint32(v)
 	}
 	burst := BurstSize(rate, mtu)
-
-	tbf := &netlink.Tbf{
+	return netem, &netlink.Tbf{
 		QdiscAttrs: netlink.QdiscAttrs{
 			LinkIndex: idx,
 			Handle:    netlink.MakeHandle(10, 0),
@@ -129,17 +159,116 @@ func ApplyShaping(link netlink.Link, s Shaping) error {
 		// behaviour students measure. tc's own conversion is xmittime.
 		Buffer: netlink.Xmittime(rate, uint32(burst)),
 		Limit:  tbfLimit(rate, latencyUS, burst),
+	}, nil
+}
+
+// shapingMatches observes the qdiscs rather than blindly replacing them.
+// This makes a no-change deployment a read-only operation while still
+// repairing qdiscs that were changed by a fault or by hand.
+func shapingMatches(h *netlink.Handle, link netlink.Link, s Shaping) (bool, error) {
+	qs, err := h.QdiscList(link)
+	if err != nil {
+		return false, fmt.Errorf("list qdiscs on %s: %w", link.Attrs().Name, err)
 	}
-	if err := netlink.QdiscReplace(tbf); err != nil {
-		return fmt.Errorf("interface %s: add tbf: %w", name, err)
+	return qdiscStateMatches(qs, link, s)
+}
+
+func qdiscStateMatches(qs []netlink.Qdisc, link netlink.Link, s Shaping) (bool, error) {
+	if s.Empty() {
+		for _, q := range qs {
+			if q.Attrs().Parent == netlink.HANDLE_ROOT && !defaultRootQdisc(q) {
+				return false, nil
+			}
+		}
+		return true, nil
 	}
-	return nil
+	wantNetem, wantTBF, err := desiredShaping(link, s)
+	if err != nil {
+		return false, err
+	}
+	var gotNetem *netlink.Netem
+	var gotTBF *netlink.Tbf
+	for _, q := range qs {
+		switch {
+		case q.Attrs().Parent == netlink.HANDLE_ROOT:
+			n, ok := q.(*netlink.Netem)
+			if !ok || gotNetem != nil {
+				return false, nil
+			}
+			gotNetem = n
+		case q.Attrs().Parent == netlink.MakeHandle(1, 1):
+			t, ok := q.(*netlink.Tbf)
+			if !ok || gotTBF != nil {
+				return false, nil
+			}
+			gotTBF = t
+		default:
+			if q.Attrs().Parent == netlink.HANDLE_INGRESS {
+				// Ingress filters are orthogonal to the root egress qdisc.
+				continue
+			}
+			// An unexpected child means the observed shaping is not the
+			// declaration. Replacing the root qdisc will remove it.
+			return false, nil
+		}
+	}
+	if !sameNetem(gotNetem, wantNetem) {
+		return false, nil
+	}
+	if wantTBF == nil {
+		return gotTBF == nil, nil
+	}
+	return sameTBF(gotTBF, wantTBF), nil
+}
+
+func defaultRootQdisc(q netlink.Qdisc) bool {
+	switch q.Type() {
+	case "pfifo_fast", "noqueue", "mq", "fq_codel", "fq":
+		return true
+	default:
+		return false
+	}
+}
+
+func sameNetem(got, want *netlink.Netem) bool {
+	if got == nil || want == nil {
+		return got == want
+	}
+	return got.Attrs().Handle == want.Attrs().Handle &&
+		got.Attrs().Parent == want.Attrs().Parent &&
+		got.Latency == want.Latency &&
+		got.Limit == want.Limit &&
+		got.Loss == want.Loss &&
+		got.DelayCorr == want.DelayCorr &&
+		got.LossCorr == want.LossCorr &&
+		got.Gap == want.Gap &&
+		got.Duplicate == want.Duplicate &&
+		got.DuplicateCorr == want.DuplicateCorr &&
+		got.Jitter == want.Jitter &&
+		got.ReorderProb == want.ReorderProb &&
+		got.ReorderCorr == want.ReorderCorr &&
+		got.CorruptProb == want.CorruptProb &&
+		got.CorruptCorr == want.CorruptCorr &&
+		got.Rate64 == want.Rate64
+}
+
+func sameTBF(got, want *netlink.Tbf) bool {
+	if got == nil || want == nil {
+		return got == want
+	}
+	return got.Attrs().Handle == want.Attrs().Handle &&
+		got.Attrs().Parent == want.Attrs().Parent &&
+		got.Rate == want.Rate &&
+		got.Limit == want.Limit &&
+		got.Buffer == want.Buffer &&
+		got.Peakrate == want.Peakrate &&
+		got.Minburst == want.Minburst
 }
 
 // clearRootQdisc removes any existing root qdisc, ignoring the pfifo_fast the
 // kernel installs by default (which cannot be deleted, only replaced).
-func clearRootQdisc(link netlink.Link) error {
-	qs, err := netlink.QdiscList(link)
+func clearRootQdisc(h *netlink.Handle, link netlink.Link) error {
+	qs, err := h.QdiscList(link)
 	if err != nil {
 		return fmt.Errorf("list qdiscs on %s: %w", link.Attrs().Name, err)
 	}
@@ -147,11 +276,10 @@ func clearRootQdisc(link netlink.Link) error {
 		if q.Attrs().Parent != netlink.HANDLE_ROOT {
 			continue
 		}
-		switch q.Type() {
-		case "pfifo_fast", "noqueue", "mq":
+		if defaultRootQdisc(q) {
 			continue
 		}
-		if err := netlink.QdiscDel(q); err != nil && !errors.Is(err, syscall.ENOENT) {
+		if err := h.QdiscDel(q); err != nil && !errors.Is(err, syscall.ENOENT) {
 			return fmt.Errorf("remove %s qdisc from %s: %w", q.Type(), link.Attrs().Name, err)
 		}
 	}
@@ -333,11 +461,14 @@ func ReshapeInNS(nsPath, iface string, s Shaping, mtu int) error {
 	}
 	defer func() { _ = ns.Close() }()
 
-	return ns.Do(func() error {
-		link, err := netlink.LinkByName(iface)
-		if err != nil {
-			return fmt.Errorf("interface %s: %w", iface, err)
-		}
-		return ApplyShaping(link, s)
-	})
+	h, err := ns.Handle()
+	if err != nil {
+		return err
+	}
+	defer h.Close()
+	link, err := h.LinkByName(iface)
+	if err != nil {
+		return fmt.Errorf("interface %s: %w", iface, err)
+	}
+	return applyShaping(h, link, s)
 }

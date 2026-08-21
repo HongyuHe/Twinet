@@ -1,6 +1,10 @@
 package netx
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/vishvananda/netlink"
+)
 
 // Rate parsing must not be off by a factor of eight. tc accepts both
 // bit-per-second and byte-per-second suffixes, and confusing them is a classic
@@ -128,7 +132,34 @@ func TestTbfLimitIsMonotonic(t *testing.T) {
 		if got < prev {
 			t.Fatalf("tbfLimit is not monotonic: %d us gave %d after %d", us, got, prev)
 		}
+
 		prev = got
+	}
+}
+
+// A no-change deploy observes the qdisc tree and leaves it alone. Editing one
+// link delay changes the desired tree only for that link's endpoints; other
+// links with the old declaration still compare equal and receive no qdisc
+// replace.
+func TestQdiscObservationTargetsOnlyChangedDelay(t *testing.T) {
+	link := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "port_a", Index: 42, MTU: 1500}}
+	before := Shaping{Delay: "10ms"}
+	netem, tbf, err := desiredShaping(link, before)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tbf != nil {
+		t.Fatal("delay-only shaping unexpectedly created a token bucket")
+	}
+	observed := []netlink.Qdisc{netem}
+	if equal, err := qdiscStateMatches(observed, link, before); err != nil || !equal {
+		t.Fatalf("unchanged qdisc was not recognized as current: equal=%v err=%v", equal, err)
+	}
+	if equal, err := qdiscStateMatches(observed, link, Shaping{Delay: "25ms"}); err != nil || equal {
+		t.Fatalf("changed delay was not recognized as drift: equal=%v err=%v", equal, err)
+	}
+	if equal, err := qdiscStateMatches(observed, link, before); err != nil || !equal {
+		t.Fatalf("an unrelated link with the old delay would be rewritten: equal=%v err=%v", equal, err)
 	}
 }
 

@@ -140,8 +140,10 @@ func EnsureOverlay(spec OverlaySpec) (string, error) {
 			if err := attachToBridge(existing, br); err != nil {
 				return "", err
 			}
-			if err := netlink.LinkSetUp(existing); err != nil {
-				return "", fmt.Errorf("overlay VNI %d: set %s up: %w", spec.VNI, vxName, err)
+			if existing.Attrs().Flags&net.FlagUp == 0 {
+				if err := netlink.LinkSetUp(existing); err != nil {
+					return "", fmt.Errorf("overlay VNI %d: set %s up: %w", spec.VNI, vxName, err)
+				}
 			}
 			if err := reconcileDefaultFDB(vx, remote); err != nil {
 				return "", err
@@ -287,8 +289,10 @@ func ensureBridge(name string, mtu int) (*netlink.Bridge, error) {
 		if !ok {
 			return nil, fmt.Errorf("%s exists but is a %s, not a bridge", name, l.Type())
 		}
-		if err := netlink.LinkSetUp(br); err != nil {
-			return nil, fmt.Errorf("set bridge %s up: %w", name, err)
+		if br.Attrs().Flags&net.FlagUp == 0 {
+			if err := netlink.LinkSetUp(br); err != nil {
+				return nil, fmt.Errorf("set bridge %s up: %w", name, err)
+			}
 		}
 		return br, nil
 	} else if !IsNotFound(err) {
@@ -354,7 +358,10 @@ func AttachToBridgeByName(iface, bridge string) error {
 	if err := attachToBridge(l, br); err != nil {
 		return err
 	}
-	return netlink.LinkSetUp(l)
+	if l.Attrs().Flags&net.FlagUp == 0 {
+		return netlink.LinkSetUp(l)
+	}
+	return nil
 }
 
 // RemoveOverlay tears down the bridge and tunnel for a link.
