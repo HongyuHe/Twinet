@@ -42,11 +42,24 @@ type Identity struct {
 
 // Allows reports whether the identity may perform action in lab.
 func (i Identity) Allows(lab, action string) bool {
-	if i.Role == "" {
+	if i.Role == "" || lab == "" || action == "" {
 		return false
 	}
 	return (i.Labs["*"] || i.Labs[lab]) &&
 		(i.Actions["*"] || i.Actions[action])
+}
+
+// KnownAction reports whether action is part of the agent's public
+// authorization vocabulary. Endpoint middleware uses this before considering
+// a certificate wildcard, so a newly added route cannot accidentally inherit
+// controller authority until it deliberately chooses an action.
+func KnownAction(action string) bool {
+	switch action {
+	case ActionObserve, ActionExec, ActionDeploy, ActionDestroy, ActionLifecycle,
+		ActionFault, ActionState, ActionAdmin, ActionPeerState:
+		return true
+	}
+	return false
 }
 
 // URIs creates the canonical certificate claim for an identity.
@@ -84,11 +97,6 @@ func URIs(role string, labs, actions []string) ([]*url.URL, error) {
 }
 
 func validateScope(role string, labs, actions []string) error {
-	known := map[string]bool{
-		ActionObserve: true, ActionExec: true, ActionDeploy: true,
-		ActionDestroy: true, ActionLifecycle: true, ActionFault: true,
-		ActionState: true, ActionAdmin: true, ActionPeerState: true,
-	}
 	switch role {
 	case RoleController:
 		if len(labs) != 1 || labs[0] != "*" ||
@@ -102,7 +110,7 @@ func validateScope(role string, labs, actions []string) error {
 			}
 		}
 		for _, action := range actions {
-			if !known[action] {
+			if !KnownAction(action) || action == ActionPeerState {
 				return fmt.Errorf("unknown operator action %q", action)
 			}
 		}
@@ -118,6 +126,8 @@ func validateScope(role string, labs, actions []string) error {
 			len(actions) != 1 || actions[0] != ActionPeerState {
 			return fmt.Errorf("peer certificates may only carry the peer-state cluster scope")
 		}
+	default:
+		return fmt.Errorf("unknown certificate role %q", role)
 	}
 	return nil
 }
@@ -127,6 +137,7 @@ func FromCertificate(cert *x509.Certificate) (Identity, error) {
 	if cert == nil {
 		return Identity{}, fmt.Errorf("no client certificate")
 	}
+	var found *Identity
 	for _, u := range cert.URIs {
 		if u == nil || u.Scheme != claimScheme || u.Host != claimHost {
 			continue
@@ -157,9 +168,48 @@ func FromCertificate(cert *x509.Certificate) (Identity, error) {
 		if len(out.Labs) == 0 || len(out.Actions) == 0 {
 			return Identity{}, fmt.Errorf("client certificate role %s has incomplete scope", role)
 		}
-		return out, nil
+		if err := out.Validate(); err != nil {
+			return Identity{}, err
+		}
+		if found != nil {
+			return Identity{}, fmt.Errorf("client certificate carries more than one Twinet identity")
+		}
+		copy := out
+		found = &copy
+	}
+	if found != nil {
+		return *found, nil
 	}
 	return Identity{}, fmt.Errorf("client certificate carries no Twinet identity")
+}
+
+// Validate checks an identity after it has been decoded from an untrusted
+// certificate claim. URIs is used by the issuer, but agents must not assume
+// every certificate from a trusted CA was minted by the current issuer: a
+// malformed or legacy broad claim must not become a permanent full-access
+// compatibility path.
+func (i Identity) Validate() error {
+	if i.Role == "" {
+		return fmt.Errorf("client certificate has no Twinet role")
+	}
+	labs := make([]string, 0, len(i.Labs))
+	for lab := range i.Labs {
+		if lab != "" {
+			labs = append(labs, lab)
+		}
+	}
+	actions := make([]string, 0, len(i.Actions))
+	for action := range i.Actions {
+		if action != "" {
+			actions = append(actions, action)
+		}
+	}
+	labs = canonical(labs)
+	actions = canonical(actions)
+	if len(labs) == 0 || len(actions) == 0 {
+		return fmt.Errorf("client certificate role %s has incomplete scope", i.Role)
+	}
+	return validateScope(i.Role, labs, actions)
 }
 
 func canonical(in []string) []string {

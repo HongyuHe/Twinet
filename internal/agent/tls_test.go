@@ -3,6 +3,7 @@ package agent
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 // -tls-cert and -tls-key without -client-ca gives server-only TLS: the
@@ -44,6 +45,30 @@ func TestPartialMutualTLSIsRefused(t *testing.T) {
 				t.Error("the message names nothing that was supplied")
 			}
 		})
+	}
+}
+
+func TestLegacyPeerCertificateMigrationExpires(t *testing.T) {
+	server := &Server{cfg: Config{
+		TLSCert: "legacy-server-cert", TLSKey: "legacy-server-key", ClientCA: "cluster-ca",
+		LegacyPeerCertUntil: time.Now().Add(-time.Minute),
+	}}
+	if _, _, _, err := server.peerTLSPaths(time.Now()); err == nil ||
+		!strings.Contains(err.Error(), "expired") {
+		t.Fatalf("expired legacy peer certificate migration = %v, want explicit refusal", err)
+	}
+
+	server.cfg.LegacyPeerCertUntil = time.Now().Add(time.Minute)
+	cert, key, legacy, err := server.peerTLSPaths(time.Now())
+	if err != nil || !legacy || cert != server.cfg.TLSCert || key != server.cfg.TLSKey {
+		t.Fatalf("explicit unexpired migration = cert=%q key=%q legacy=%v err=%v",
+			cert, key, legacy, err)
+	}
+	server.cfg.PeerTLSCert, server.cfg.PeerTLSKey = "peer-cert", "peer-key"
+	cert, key, legacy, err = server.peerTLSPaths(time.Now().Add(24 * time.Hour))
+	if err != nil || legacy || cert != "peer-cert" || key != "peer-key" {
+		t.Fatalf("dedicated peer identity was not preferred after migration: cert=%q key=%q legacy=%v err=%v",
+			cert, key, legacy, err)
 	}
 }
 

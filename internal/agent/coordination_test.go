@@ -172,6 +172,26 @@ func TestExpiredLeaseReleasesItsOverlayReservation(t *testing.T) {
 	}
 }
 
+func TestApplyRefusesAnUnreservedCrossLabVNI(t *testing.T) {
+	server := coordinationTestServer(t, nil)
+	top := crossNodeTopology("lab-a", 901)
+	lease, err := server.acquireMutationLease(LeaseAcquireRequest{Lab: top.Name})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := server.requireOverlayReservations(top, lease.Fence); err == nil {
+		t.Fatal("cross-node topology reached apply without a fenced VNI reservation")
+	}
+	if _, err := server.reserveOverlays(OverlayReservationRequest{
+		Lab: top.Name, Fence: lease.Fence, VNIs: []uint32{901},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.requireOverlayReservations(top, lease.Fence); err != nil {
+		t.Fatalf("owned reservation was not accepted: %v", err)
+	}
+}
+
 func TestLegacyActiveOverlayIsAdoptedOnlyForItsCurrentLab(t *testing.T) {
 	const (
 		lab = "cos461"

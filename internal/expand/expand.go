@@ -1132,6 +1132,7 @@ func (e *expander) materialize(name string, kind model.DeviceKind, over model.De
 		Capabilities: dd.Capabilities,
 		Binds:        dd.Binds,
 		Command:      dd.Command,
+		Hardening:    model.EffectiveRuntimeHardening(kind, dd.Hardening),
 		Container:    model.ContainerName(e.lab.Metadata.Name, asn, name),
 		Hostname:     hostnameFor(asn, name),
 		Labels:       map[string]string{},

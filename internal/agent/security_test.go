@@ -11,6 +11,21 @@ import "testing"
 // cluster: the warning scrolls past once, everything functions, and the
 // insecure configuration becomes permanent because nothing forces the question
 // again.
+func TestInsecureModeNeedsBothExplicitFlagAndLoopback(t *testing.T) {
+	for _, tc := range []struct {
+		cfg  Config
+		want bool
+	}{
+		{Config{Listen: "127.0.0.1:7200", Insecure: true}, true},
+		{Config{Listen: "127.0.0.1:7200"}, false},
+		{Config{Listen: "0.0.0.0:7200", Insecure: true}, false},
+	} {
+		if got := (&Server{cfg: tc.cfg}).insecureLoopbackMode(); got != tc.want {
+			t.Errorf("insecureLoopbackMode(%+v) = %v, want %v", tc.cfg, got, tc.want)
+		}
+	}
+}
+
 func TestOnlyLoopbackMayServeWithoutTLS(t *testing.T) {
 	cases := []struct {
 		addr string

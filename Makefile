@@ -27,7 +27,7 @@ GOLANGCI_VERSION ?= v2.5.0
 
 .PHONY: all build test lint fmt vet images push digests clean install e2e ci ci-tools tidy-check naming \
 	script-tests benchmark chaos soak-short soak-24h nos-images substrate-images substrate-integration \
-	fault-integration k8s-fault-integration fault-stress fault-stress-release
+	fault-integration k8s-fault-integration fault-stress fault-stress-release o12-integration
 
 all: build
 
@@ -218,6 +218,19 @@ nos-images: images
 		{ echo "make nos-images requires a reachable Docker daemon"; exit 2; }
 	REGISTRY="$(REGISTRY)" TAG="$(TAG)" DOCKER="$(DOCKER)" \
 		$(GO) test -count=1 -tags nosimages ./test/integration/...
+
+# O12 is intentionally a dedicated non-vacuous Docker/root gate. The test
+# fails rather than skips when its explicit acknowledgement or Docker daemon is
+# absent, so a release cannot claim sidecar/PID/capability isolation from a
+# unit-only run.
+o12-integration:
+	@test "$${TWINET_O12_INTEGRATION_ALLOW_DESTRUCTIVE:-}" = "1" || \
+		{ echo "make o12-integration requires TWINET_O12_INTEGRATION_ALLOW_DESTRUCTIVE=1"; exit 2; }
+	@$(DOCKER) info >/dev/null 2>&1 || \
+		{ echo "make o12-integration requires a reachable Docker daemon"; exit 2; }
+	@$(MAKE) --no-print-directory images
+	REGISTRY="$(REGISTRY)" TAG="$(TAG)" TWINET_O12_INTEGRATION_ALLOW_DESTRUCTIVE=1 \
+		$(GO) test -count=1 -tags o12integration ./test/integration/... -run '^TestO12Docker'
 
 # O16 images are explicit because they pull a large pinned BMv2 base and may
 # need a privileged Docker daemon. This target never reports a green result

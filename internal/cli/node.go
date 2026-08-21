@@ -210,7 +210,9 @@ It refuses to generate a remotely reachable bearer-token-only agent.`,
 				if !ok {
 					return fmt.Errorf("node %q is not declared in placement.nodes", name)
 				}
-				for _, suffix := range []string{"_server_cert.pem", "_server_key.pem"} {
+				for _, suffix := range []string{
+					"_server_cert.pem", "_server_key.pem", "_peer_cert.pem", "_peer_key.pem",
+				} {
 					path := filepath.Join(bootstrapPKI, name+suffix)
 					if _, err := os.Stat(path); err != nil {
 						return fmt.Errorf("secure bootstrap needs %s: %w; rerun `twinet node pki`",
@@ -350,6 +352,8 @@ func bootstrapScript(n model.NodeSpec, token, pkiDir string) string {
 	listen := host + ":" + port
 	serverCert := filepath.Join(pkiDir, n.Name+"_server_cert.pem")
 	serverKey := filepath.Join(pkiDir, n.Name+"_server_key.pem")
+	peerCert := filepath.Join(pkiDir, n.Name+"_peer_cert.pem")
+	peerKey := filepath.Join(pkiDir, n.Name+"_peer_key.pem")
 	caCert := filepath.Join(pkiDir, "ca_cert.pem")
 	controllerCert := filepath.Join(pkiDir, "controller_cert.pem")
 	controllerKey := filepath.Join(pkiDir, "controller_key.pem")
@@ -362,6 +366,8 @@ func bootstrapScript(n model.NodeSpec, token, pkiDir string) string {
 	fmt.Fprintf(&b, "ssh root@%s 'install -d -m 0700 /etc/twinet/pki'\n", n.Name)
 	fmt.Fprintf(&b, "scp %q root@%s:/etc/twinet/pki/server_cert.pem\n", serverCert, n.Name)
 	fmt.Fprintf(&b, "scp %q root@%s:/etc/twinet/pki/server_key.pem\n", serverKey, n.Name)
+	fmt.Fprintf(&b, "scp %q root@%s:/etc/twinet/pki/peer_cert.pem\n", peerCert, n.Name)
+	fmt.Fprintf(&b, "scp %q root@%s:/etc/twinet/pki/peer_key.pem\n", peerKey, n.Name)
 	fmt.Fprintf(&b, "scp %q root@%s:/etc/twinet/pki/ca_cert.pem\n", caCert, n.Name)
 	// The token goes in a file only root can read, not in the unit.
 	//
@@ -378,7 +384,9 @@ func bootstrapScript(n model.NodeSpec, token, pkiDir string) string {
 		encodedToken)
 	b.WriteString("chmod 0600 /etc/twinet/agent.env\n")
 	b.WriteString("chmod 0600 /etc/twinet/pki/server_key.pem\n")
+	b.WriteString("chmod 0600 /etc/twinet/pki/peer_key.pem\n")
 	b.WriteString("chmod 0644 /etc/twinet/pki/server_cert.pem /etc/twinet/pki/ca_cert.pem\n")
+	b.WriteString("chmod 0644 /etc/twinet/pki/peer_cert.pem\n")
 	b.WriteString("cat > /etc/systemd/system/twinetd.service <<UNIT\n")
 	b.WriteString("[Unit]\nDescription=Twinet node agent\nAfter=docker.service\nRequires=docker.service\n\n")
 	b.WriteString("[Service]\nType=simple\n")
@@ -390,6 +398,8 @@ func bootstrapScript(n model.NodeSpec, token, pkiDir string) string {
 	b.WriteString(" -tls-cert /etc/twinet/pki/server_cert.pem")
 	b.WriteString(" -tls-key /etc/twinet/pki/server_key.pem")
 	b.WriteString(" -client-ca /etc/twinet/pki/ca_cert.pem")
+	b.WriteString(" -peer-tls-cert /etc/twinet/pki/peer_cert.pem")
+	b.WriteString(" -peer-tls-key /etc/twinet/pki/peer_key.pem")
 	b.WriteString("\nRestart=always\nRestartSec=2\n")
 	// The agent creates namespaces and rewires the host, so it needs the
 	// capabilities; it does not need the rest of root's authority.

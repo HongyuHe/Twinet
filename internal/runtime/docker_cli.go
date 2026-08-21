@@ -255,6 +255,10 @@ func dockerCLICreateArgs(s *Spec) ([]string, error) {
 	if s == nil {
 		return nil, fmt.Errorf("container spec is nil")
 	}
+	pidMode, err := NormalizePIDMode(s.PidMode)
+	if err != nil {
+		return nil, fmt.Errorf("container %s: %w", s.Name, err)
+	}
 	args := []string{"create", "--name", s.Name}
 
 	if s.Hostname != "" {
@@ -297,7 +301,7 @@ func dockerCLICreateArgs(s *Spec) ([]string, error) {
 	if s.Privileged {
 		args = append(args, "--privileged")
 	}
-	for _, opt := range s.SecurityOpt {
+	for _, opt := range dockerSecurityOptions(s.SecurityOpt) {
 		args = append(args, "--security-opt", opt)
 	}
 	pathHardening, err := dockerCLIPathHardeningArgs(s)
@@ -313,6 +317,9 @@ func dockerCLICreateArgs(s *Spec) ([]string, error) {
 	}
 	if s.UsernsMode != "" {
 		args = append(args, "--userns", s.UsernsMode)
+	}
+	if pidMode != "" {
+		args = append(args, "--pid", pidMode)
 	}
 	if s.CPUs > 0 {
 		args = append(args, "--cpus", strconv.FormatFloat(s.CPUs, 'f', -1, 64))
@@ -670,6 +677,14 @@ func (d *dockerCLI) CopyTo(ctx context.Context, name, dst string, mode int64, co
 
 	_, errs, err := d.run(ctx, &buf, "cp", "-", name+":"+dir)
 	if err != nil {
+		if readonlyRootfsCopyError(errs) {
+			if fallbackErr := writeReadonlyRootfsFile(ctx, d, name, dst, mode, content); fallbackErr == nil {
+				return nil
+			} else {
+				return fmt.Errorf("docker cp into %s:%s: %w: %s; writable-mount fallback: %v",
+					name, dir, err, strings.TrimSpace(errs), fallbackErr)
+			}
+		}
 		return fmt.Errorf("docker cp into %s:%s: %w: %s", name, dir, err, strings.TrimSpace(errs))
 	}
 	return nil

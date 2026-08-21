@@ -103,7 +103,7 @@ func TestCurrentLabReservationIsSubtractedButOtherLabsAreCharged(t *testing.T) {
 	addAS(top, 1, d)
 	request := deviceDemand(d)
 	inventory := NodeInventory{
-		Name: "a", Allocatable: testCapacity(1, 1, 1<<30, 1<<30, 100, 1000, 10),
+		Name: "a", Allocatable: testCapacity(2, 1, 1<<30, 1<<30, 1000, 2000, 10),
 		Reserved:      resourcesToReservation(request),
 		ReservedByLab: map[string]Resources{"lab": resourcesToReservation(request)},
 	}
@@ -118,6 +118,20 @@ func TestCurrentLabReservationIsSubtractedButOtherLabsAreCharged(t *testing.T) {
 	addAS(top, 1, d)
 	if _, err := Place(top, Options{Strict: true, Inventory: []NodeInventory{other}}); err == nil {
 		t.Fatal("a reservation from another lab was ignored")
+	}
+}
+
+func TestPlacementHonorsDedicatedNodePool(t *testing.T) {
+	top := admissionTopology("shared", "sandbox")
+	top.Lab.Placement.NodePool = "sandbox"
+	top.Lab.Placement.Nodes[1].Pool = "sandbox"
+	device := requestedDevice(1, "as1/R", 0.25, 128<<20)
+	addAS(top, 1, device)
+	if _, err := Place(top, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if device.Node != "sandbox" {
+		t.Fatalf("device was placed on %q outside requested node pool", device.Node)
 	}
 }
 

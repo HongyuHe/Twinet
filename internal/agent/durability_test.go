@@ -252,8 +252,8 @@ func TestFreshExportRefusesStaleFallbackUnlessExplicitlyRequested(t *testing.T) 
 				MinVersion: tls.VersionTLS13, Certificates: []tls.Certificate{cert}, RootCAs: pool,
 			}}}
 		}
-		peerClient := clientFor(bundle.Nodes["n0"].CertPath, bundle.Nodes["n0"].KeyPath)
-		peerResponse, err := peerClient.Get(httpServer.URL + "/peer")
+		peerClient := clientFor(bundle.Peers["n0"].CertPath, bundle.Peers["n0"].KeyPath)
+		peerResponse, err := peerClient.Get(httpServer.URL + "/peer?lab=durable")
 		if err != nil {
 			t.Fatalf("peer certificate was not accepted by peer-only API: %v", err)
 		}

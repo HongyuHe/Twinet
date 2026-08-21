@@ -17,6 +17,8 @@ func TestBootstrapProducesOnlyASecureUnderlayBoundAgent(t *testing.T) {
 		"-tls-cert /etc/twinet/pki/server_cert.pem",
 		"-tls-key /etc/twinet/pki/server_key.pem",
 		"-client-ca /etc/twinet/pki/ca_cert.pem",
+		"-peer-tls-cert /etc/twinet/pki/peer_cert.pem",
+		"-peer-tls-key /etc/twinet/pki/peer_key.pem",
 		"command -v docker",
 		"systemctl is-active --quiet twinetd",
 		"curl --fail",

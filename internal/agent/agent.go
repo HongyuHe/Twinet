@@ -13,7 +13,6 @@ package agent
 
 import (
 	"context"
-	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -31,6 +30,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/HongyuHe/twinet/internal/authz"
 	"github.com/HongyuHe/twinet/internal/deploy"
 	"github.com/HongyuHe/twinet/internal/integrity"
 	"github.com/HongyuHe/twinet/internal/limiter"
@@ -68,6 +68,16 @@ type Config struct {
 	TLSCert  string
 	TLSKey   string
 	ClientCA string
+	// PeerTLSCert and PeerTLSKey are the node's replication-only client
+	// identity. They must not be the listener certificate in a new
+	// installation: server keys authenticate a node to callers, peer keys
+	// authenticate the node only to the peer-state API.
+	PeerTLSCert string
+	PeerTLSKey  string
+	// LegacyPeerCertUntil is a one-way, time-bounded migration window for
+	// clusters issued before peer keys were split from listener keys. A zero
+	// value never enables fallback.
+	LegacyPeerCertUntil time.Time
 	// GCGrace and GCInterval bound automatic removal of abandoned host
 	// objects and stale local records. A zero value selects conservative
 	// defaults, which keeps callers written before automatic collection safe.
@@ -81,16 +91,22 @@ type Config struct {
 func Main(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("twinetd", flag.ContinueOnError)
 	var (
-		node   = fs.String("node", hostShortName(), "this node's name, as used in the manifest")
-		listen = fs.String("listen", ":7200", "address to serve the agent API on")
-		token  = fs.String("token", os.Getenv("TWINET_TOKEN"), "shared secret the control plane must present")
-		uip    = fs.String("underlay-ip", "", "VTEP source address for cross-node links")
-		udev   = fs.String("underlay-dev", "", "interface to source tunnels from")
-		sdir   = fs.String("state-dir", "/var/lib/twinet/state", "where student configuration snapshots are kept")
-		cert   = fs.String("tls-cert", os.Getenv("TWINET_TLS_CERT"), "server certificate (enables TLS)")
-		key    = fs.String("tls-key", os.Getenv("TWINET_TLS_KEY"), "server private key")
-		cacert = fs.String("client-ca", os.Getenv("TWINET_CLIENT_CA"), "CA that signs permitted client certificates (enables mutual TLS)")
-		insec  = fs.Bool("insecure", os.Getenv("TWINET_INSECURE") == "1",
+		node     = fs.String("node", hostShortName(), "this node's name, as used in the manifest")
+		listen   = fs.String("listen", ":7200", "address to serve the agent API on")
+		token    = fs.String("token", os.Getenv("TWINET_TOKEN"), "shared secret the control plane must present")
+		uip      = fs.String("underlay-ip", "", "VTEP source address for cross-node links")
+		udev     = fs.String("underlay-dev", "", "interface to source tunnels from")
+		sdir     = fs.String("state-dir", "/var/lib/twinet/state", "where student configuration snapshots are kept")
+		cert     = fs.String("tls-cert", os.Getenv("TWINET_TLS_CERT"), "server certificate (enables TLS)")
+		key      = fs.String("tls-key", os.Getenv("TWINET_TLS_KEY"), "server private key")
+		cacert   = fs.String("client-ca", os.Getenv("TWINET_CLIENT_CA"), "CA that signs permitted client certificates (enables mutual TLS)")
+		peerCert = fs.String("peer-tls-cert", os.Getenv("TWINET_PEER_TLS_CERT"),
+			"peer-state-only client certificate for durable replication")
+		peerKey = fs.String("peer-tls-key", os.Getenv("TWINET_PEER_TLS_KEY"),
+			"peer-state-only private key for durable replication")
+		legacyPeerUntil = fs.String("legacy-peer-cert-until", os.Getenv("TWINET_LEGACY_PEER_CERT_UNTIL"),
+			"RFC3339 deadline for explicit legacy listener-certificate peer migration")
+		insec = fs.Bool("insecure", os.Getenv("TWINET_INSECURE") == "1",
 			"serve without mutual TLS on a non-loopback address (development only)")
 		gcGrace = fs.Duration("gc-grace", 15*time.Minute,
 			"minimum age before automatic garbage collection removes an abandoned object")
@@ -107,6 +123,14 @@ func Main(ctx context.Context, args []string) error {
 	if *version {
 		fmt.Printf("twinetd %s\n", Version)
 		return nil
+	}
+	var peerMigrationUntil time.Time
+	if *legacyPeerUntil != "" {
+		parsed, err := time.Parse(time.RFC3339, *legacyPeerUntil)
+		if err != nil {
+			return fmt.Errorf("parse -legacy-peer-cert-until: %w", err)
+		}
+		peerMigrationUntil = parsed.UTC()
 	}
 
 	level := slog.LevelInfo
@@ -125,6 +149,7 @@ func Main(ctx context.Context, args []string) error {
 		Node: *node, Listen: *listen, Token: *token,
 		UnderlayIP: *uip, UnderlayDev: *udev, StateDir: *sdir, Insecure: *insec,
 		TLSCert: *cert, TLSKey: *key, ClientCA: *cacert, GCGrace: *gcGrace,
+		PeerTLSCert: *peerCert, PeerTLSKey: *peerKey, LegacyPeerCertUntil: peerMigrationUntil,
 		GCInterval: *gcInterval, EventCapacity: *eventCapacity,
 	})
 	if err != nil {
@@ -452,37 +477,86 @@ func (s *Server) Serve(ctx context.Context) error {
 	}
 
 	mux := http.NewServeMux()
-	// Metrics intentionally carry only bounded labels and no tenant
-	// identifiers, so an ordinary Prometheus scraper can collect them without
-	// receiving a credential capable of mutating a node.
-	mux.HandleFunc("GET /metrics", s.observedHandler("metrics", s.handleMetrics))
-	mux.HandleFunc("GET /v1/status", s.authDiag(s.observedHandler("status", s.handleStatus)))
-	mux.HandleFunc("GET /v1/containers", s.authDiag(s.handleContainers))
-	mux.HandleFunc("GET /v1/events", s.authDiag(s.observedHandler("events", s.handleEvents)))
-	mux.HandleFunc("POST /v1/apply", s.auth(s.observedHandler("apply", s.handleApply)))
-	mux.HandleFunc("POST /v1/destroy", s.auth(s.observedHandler("destroy", s.handleDestroy)))
-	mux.HandleFunc("POST /v1/lease/acquire", s.auth(s.handleLeaseAcquire))
-	mux.HandleFunc("POST /v1/lease/renew", s.auth(s.handleLeaseRenew))
-	mux.HandleFunc("POST /v1/lease/release", s.auth(s.handleLeaseRelease))
-	mux.HandleFunc("POST /v1/overlay/reserve", s.auth(s.handleOverlayReserve))
-	mux.HandleFunc("POST /v1/exec", s.authDiag(s.observedHandler("exec", s.handleExec)))
-	mux.HandleFunc("POST /v1/hold", s.auth(s.observedHandler("hold", s.handleHold)))
-	mux.HandleFunc("POST /v1/exempt", s.auth(s.observedHandler("exempt", s.handleExempt)))
-	mux.HandleFunc("POST /v1/lifecycle", s.auth(s.observedHandler("lifecycle", s.handleLifecycle)))
-	mux.HandleFunc("POST /v1/reshape", s.auth(s.observedHandler("reshape", s.handleReshape)))
-	mux.HandleFunc("POST /v1/mpls-label-space", s.auth(s.observedHandler("mpls_label_space", s.handleMPLSLabelSpace)))
-	mux.HandleFunc("GET /v1/images", s.auth(s.handleImages))
-	mux.HandleFunc("GET /v1/attach", s.auth(s.handleAttach))
-	mux.HandleFunc("GET /v1/underlay", s.auth(s.observedHandler("underlay", s.handleUnderlay)))
-	mux.HandleFunc("GET /v1/state", s.auth(s.observedHandler("state", s.handleStateExport)))
-	mux.HandleFunc("POST /v1/state", s.auth(s.observedHandler("state", s.handleStateImport)))
-	mux.HandleFunc("POST /v1/state/verify", s.auth(s.observedHandler("state", s.handleStateVerify)))
+	// Every route names an action and resolves a lab before its handler runs.
+	// A future endpoint therefore cannot inherit controller access merely by
+	// being wrapped in a broad "authenticated" middleware.
+	mux.HandleFunc("GET /metrics", s.authorize(endpointPolicy{
+		Action: authz.ActionObserve, AllowCluster: true, ResolveRequest: scopeCluster(authz.ActionObserve),
+	}, s.observedHandler("metrics", s.handleMetrics)))
+	mux.HandleFunc("GET /v1/status", s.authorize(endpointPolicy{
+		Action: authz.ActionObserve, AllowCluster: true, ResolveRequest: scopeFromQuery(authz.ActionObserve, true),
+	}, s.observedHandler("status", s.handleStatus)))
+	mux.HandleFunc("GET /v1/containers", s.authorize(endpointPolicy{
+		Action: authz.ActionObserve, AllowCluster: true, ResolveRequest: scopeFromQuery(authz.ActionObserve, true),
+	}, s.handleContainers))
+	mux.HandleFunc("GET /v1/events", s.authorize(endpointPolicy{
+		Action: authz.ActionObserve, AllowCluster: true, ResolveRequest: scopeFromQuery(authz.ActionObserve, true),
+	}, s.observedHandler("events", s.handleEvents)))
+	mux.HandleFunc("POST /v1/apply", s.authorize(endpointPolicy{
+		Action: authz.ActionDeploy, Mutation: true, ResolveRequest: scopeForApply,
+	}, s.observedHandler("apply", s.handleApply)))
+	mux.HandleFunc("POST /v1/destroy", s.authorize(endpointPolicy{
+		Action: authz.ActionDestroy, Mutation: true, ResolveRequest: scopeFromJSONLab(authz.ActionDestroy),
+	}, s.observedHandler("destroy", s.handleDestroy)))
+	mux.HandleFunc("POST /v1/lease/acquire", s.authorize(endpointPolicy{
+		Action: authz.ActionDeploy, Mutation: true, ResolveRequest: scopeFromJSONLab(authz.ActionDeploy),
+	}, s.handleLeaseAcquire))
+	mux.HandleFunc("POST /v1/lease/renew", s.authorize(endpointPolicy{
+		Action: authz.ActionDeploy, Mutation: true, ResolveRequest: scopeFromJSONLab(authz.ActionDeploy),
+	}, s.handleLeaseRenew))
+	mux.HandleFunc("POST /v1/lease/release", s.authorize(endpointPolicy{
+		Action: authz.ActionDeploy, Mutation: true, ResolveRequest: scopeFromJSONLab(authz.ActionDeploy),
+	}, s.handleLeaseRelease))
+	mux.HandleFunc("POST /v1/overlay/reserve", s.authorize(endpointPolicy{
+		Action: authz.ActionDeploy, Mutation: true, ResolveRequest: scopeFromJSONLab(authz.ActionDeploy),
+	}, s.handleOverlayReserve))
+	mux.HandleFunc("POST /v1/exec", s.authorize(endpointPolicy{
+		Action: authz.ActionExec, Mutation: true, ResolveRequest: scopeForContainer(authz.ActionExec),
+	}, s.observedHandler("exec", s.handleExec)))
+	mux.HandleFunc("POST /v1/hold", s.authorize(endpointPolicy{
+		Action: authz.ActionLifecycle, Mutation: true, ResolveRequest: scopeFromJSONLab(authz.ActionLifecycle),
+	}, s.observedHandler("hold", s.handleHold)))
+	mux.HandleFunc("POST /v1/exempt", s.authorize(endpointPolicy{
+		Action: authz.ActionFault, Mutation: true, ResolveRequest: scopeFromJSONLab(authz.ActionFault),
+	}, s.observedHandler("exempt", s.handleExempt)))
+	mux.HandleFunc("POST /v1/lifecycle", s.authorize(endpointPolicy{
+		Action: authz.ActionLifecycle, Mutation: true, ResolveRequest: scopeForContainer(authz.ActionLifecycle),
+	}, s.observedHandler("lifecycle", s.handleLifecycle)))
+	mux.HandleFunc("POST /v1/reshape", s.authorize(endpointPolicy{
+		Action: authz.ActionFault, Mutation: true, ResolveRequest: scopeForContainer(authz.ActionFault),
+	}, s.observedHandler("reshape", s.handleReshape)))
+	mux.HandleFunc("POST /v1/mpls-label-space", s.authorize(endpointPolicy{
+		Action: authz.ActionFault, Mutation: true, ResolveRequest: scopeForContainer(authz.ActionFault),
+	}, s.observedHandler("mpls_label_space", s.handleMPLSLabelSpace)))
+	mux.HandleFunc("GET /v1/images", s.authorize(endpointPolicy{
+		Action: authz.ActionObserve, AllowCluster: true, ResolveRequest: scopeCluster(authz.ActionObserve),
+	}, s.handleImages))
+	mux.HandleFunc("GET /v1/attach", s.authorize(endpointPolicy{
+		Action: authz.ActionExec, Mutation: true, ResolveRequest: scopeForAttach,
+	}, s.handleAttach))
+	mux.HandleFunc("GET /v1/underlay", s.authorize(endpointPolicy{
+		Action: authz.ActionObserve, AllowCluster: true, ResolveRequest: scopeCluster(authz.ActionObserve),
+	}, s.observedHandler("underlay", s.handleUnderlay)))
+	mux.HandleFunc("GET /v1/state", s.authorize(endpointPolicy{
+		Action: authz.ActionState, Mutation: true, ResolveRequest: scopeFromQuery(authz.ActionState, false),
+	}, s.observedHandler("state", s.handleStateExport)))
+	mux.HandleFunc("POST /v1/state", s.authorize(endpointPolicy{
+		Action: authz.ActionState, Mutation: true, ResolveRequest: scopeFromJSONLab(authz.ActionState),
+	}, s.observedHandler("state", s.handleStateImport)))
+	mux.HandleFunc("POST /v1/state/verify", s.authorize(endpointPolicy{
+		Action: authz.ActionState, Mutation: true, ResolveRequest: scopeFromJSONLab(authz.ActionState),
+	}, s.observedHandler("state", s.handleStateVerify)))
 	// The peer routes are intentionally separate from controller routes and
 	// accept only a node certificate with peer-state scope. A node key is not
 	// a controller key.
 	mux.HandleFunc("GET /v1/peer/state/inventory", s.peerAuth(s.handlePeerStateInventory))
 	mux.HandleFunc("POST /v1/peer/state", s.peerAuth(s.handlePeerStateImport))
-	mux.HandleFunc("POST /v1/sweep", s.auth(s.observedHandler("sweep", s.handleSweep)))
+	mux.HandleFunc("POST /v1/sweep", s.authorize(endpointPolicy{
+		Action: authz.ActionAdmin, Mutation: true, AllowCluster: true,
+		ResolveRequest: func(_ *Server, _ *http.Request) (requestScope, error) {
+			return requestScope{Action: authz.ActionAdmin, Target: "overlays"}, nil
+		},
+	}, s.observedHandler("sweep", s.handleSweep)))
 
 	srv := &http.Server{
 		Addr:    s.cfg.Listen,
@@ -518,9 +592,31 @@ func (s *Server) Serve(ctx context.Context) error {
 				"to accept a bearer token over plain HTTP on a network you control",
 			describeTLSInputs(s.cfg))
 	}
+	peerGiven := 0
+	for _, v := range []string{s.cfg.PeerTLSCert, s.cfg.PeerTLSKey} {
+		if v != "" {
+			peerGiven++
+		}
+	}
+	if peerGiven == 1 {
+		return errors.New("peer replication needs -peer-tls-cert and -peer-tls-key together")
+	}
+	if given == 0 && peerGiven > 0 {
+		return errors.New("peer replication credentials require mutual TLS on the agent listener")
+	}
 
 	tlsMode := "disabled"
 	if given == 3 {
+		if peerGiven == 0 {
+			if s.cfg.LegacyPeerCertUntil.IsZero() || !time.Now().Before(s.cfg.LegacyPeerCertUntil) {
+				return errors.New(
+					"mutual TLS requires a separate -peer-tls-cert and -peer-tls-key for replication. " +
+						"Legacy listener certificates are accepted only with a future explicit " +
+						"-legacy-peer-cert-until migration deadline; issue replacement material with `twinet node pki`")
+			}
+			slog.Warn("AUDIT: using an expiring legacy listener certificate for peer replication",
+				"until", s.cfg.LegacyPeerCertUntil.Format(time.RFC3339))
+		}
 		cfg := &tls.Config{MinVersion: tls.VersionTLS13}
 		pool := x509.NewCertPool()
 		pem, err := os.ReadFile(s.cfg.ClientCA)
@@ -544,13 +640,13 @@ func (s *Server) Serve(ctx context.Context) error {
 		// A warning does not survive contact with a working cluster: it scrolls
 		// past once, everything functions, and the insecure configuration
 		// becomes permanent because nothing ever forces the question again.
-		if !s.cfg.Insecure && !loopbackOnly(s.cfg.Listen) {
+		if !s.insecureLoopbackMode() {
 			return fmt.Errorf(
 				"refusing to serve %s without mutual TLS.\n"+
 					"This API can create privileged containers and rewire hosts.\n"+
 					"Issue credentials with `twinet node pki` and pass -tls-cert, -tls-key\n"+
-					"and -client-ca, or pass -insecure to accept a bearer token over plain\n"+
-					"HTTP on a network you control", s.cfg.Listen)
+					"and -client-ca. Development HTTP is available only with -insecure on\n"+
+					"a loopback listener", s.cfg.Listen)
 		}
 		slog.Warn("serving plain HTTP with only a bearer token",
 			"listen", s.cfg.Listen, "reason", insecureReason(s.cfg))
@@ -592,30 +688,17 @@ func (s *Server) Serve(ctx context.Context) error {
 	}
 }
 
-// auth enforces the shared secret with a constant-time comparison.
+// auth remains for narrow internal compatibility call sites. New routes must
+// use authorize with their own action and resolver; treating this as a generic
+// authenticated wrapper would recreate the broad authority boundary O12
+// removes.
 func (s *Server) auth(h http.HandlerFunc) http.HandlerFunc {
-	want := []byte("Bearer " + s.cfg.Token)
-	return func(w http.ResponseWriter, r *http.Request) {
-		got := []byte(r.Header.Get("Authorization"))
-		if subtle.ConstantTimeCompare(got, want) != 1 {
-			http.Error(w, "unauthorised", http.StatusUnauthorized)
-			return
-		}
-		if peerClient(r) {
-			http.Error(w, "a node peer certificate may only use the peer replication API",
-				http.StatusForbidden)
-			return
-		}
-		// The certificate issued to an evaluated agent is a limit as well as a
-		// permission: whatever token it presents, it may not reach the routes
-		// that change the cluster.
-		if diagnosticClient(r) {
-			http.Error(w, "a diagnostic session may not use this route",
-				http.StatusForbidden)
-			return
-		}
-		h(w, r)
-	}
+	return s.authorize(endpointPolicy{
+		Action: authz.ActionAdmin, Mutation: true, AllowCluster: true,
+		ResolveRequest: func(_ *Server, _ *http.Request) (requestScope, error) {
+			return requestScope{Action: authz.ActionAdmin}, nil
+		},
+	}, h)
 }
 
 // StatusResponse describes the agent and its host.
@@ -676,6 +759,12 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	cs, listErr := s.rt.List(r.Context(), rt.Filter{All: true,
 		Labels: map[string]string{deploy.LabelManaged: "true"}})
+	visibleCount := 0
+	for _, container := range cs {
+		if !isInternalControlContainer(container) {
+			visibleCount++
+		}
+	}
 
 	resp := StatusResponse{
 		Node: s.cfg.Node, Version: Version,
@@ -684,7 +773,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		CPUs:        runtime.NumCPU(),
 		UnderlayIP:  s.cfg.UnderlayIP,
 		UnderlayDev: s.cfg.UnderlayDev,
-		Containers:  len(cs),
+		Containers:  visibleCount,
 	}
 	resp.Inventory = s.observeHostInventory(cs, listErr)
 	resp.Backpressure = s.workLimiter().Snapshot()
@@ -693,7 +782,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		resp.ActiveWork[kind] = stats.InFlight
 	}
 	if listErr == nil {
-		count := len(cs)
+		count := visibleCount
 		resp.ContainerCount = &count
 	} else {
 		resp.Unknown = append(resp.Unknown, "containers")
@@ -733,9 +822,17 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if owners, err := netx.OverlayOwners(); err == nil {
 		resp.Overlays = owners
 	}
-	// A diagnostic caller is told about the node it is looking at and nothing
-	// about the rest of the cluster's business.
-	if scope, ok := diagScopeOf(r); ok {
+	// A lab-scoped operator or diagnostic caller is told about the node it is
+	// looking at and nothing about the rest of the cluster's business. The
+	// request authorization context, not a query parameter the caller can
+	// rewrite later, is the authority for this filter.
+	scope, limited := scopedRequestOf(r)
+	if !limited {
+		if lab, diagnostic := diagScopeOf(r); diagnostic {
+			scope, limited = requestScope{Lab: lab}, true
+		}
+	}
+	if limited && scope.Lab != "" && scope.Lab != "*" {
 		resp.Overlays = nil
 		resp.Busy = nil
 		resp.Labs = nil
@@ -746,17 +843,27 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		// diagnostic caller, but a count of every active lab is not needed.
 		// Reservations name other labs, which is cluster business a
 		// diagnostic credential is not entitled to enumerate.
-		if own, found := resp.Inventory.Reservations[scope]; found {
-			resp.Inventory.Reservations = map[string]ResourceInventory{scope: own}
+		if own, found := resp.Inventory.Reservations[scope.Lab]; found {
+			resp.Inventory.Reservations = map[string]ResourceInventory{scope.Lab: own}
 			resp.Inventory.Reserved = own
 		} else {
 			resp.Inventory.Reservations = nil
 			resp.Inventory.Reserved = ResourceInventory{}
 		}
 		for _, l := range labs {
-			if l == scope {
-				resp.Lab, resp.Labs = scope, []string{scope}
+			if l == scope.Lab {
+				resp.Lab, resp.Labs = scope.Lab, []string{scope.Lab}
 			}
+		}
+		ownContainers := 0
+		for _, container := range cs {
+			if container.Labels[deploy.LabelLab] == scope.Lab && !isInternalControlContainer(container) {
+				ownContainers++
+			}
+		}
+		resp.Containers = ownContainers
+		if resp.ContainerCount != nil {
+			resp.ContainerCount = &ownContainers
 		}
 	}
 	sort.Strings(resp.Unknown)
@@ -765,10 +872,12 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleContainers(w http.ResponseWriter, r *http.Request) {
 	lab := r.URL.Query().Get("lab")
-	// A diagnostic caller sees its own lab and no other, whatever it asked
-	// for. Listing the cluster would tell it which other labs exist and, on a
-	// grading node, which harnesses are running.
-	if scope, ok := diagScopeOf(r); ok {
+	// A scoped certificate sees its own lab and no other, whatever query was
+	// supplied. Listing an entire node would reveal other students' labs and
+	// internal grading harnesses.
+	if scope, ok := scopedRequestOf(r); ok && scope.Lab != "" && scope.Lab != "*" {
+		lab = scope.Lab
+	} else if scope, diagnostic := diagScopeOf(r); diagnostic {
 		lab = scope
 	}
 	f := rt.Filter{All: true, Labels: map[string]string{deploy.LabelManaged: "true"}}
@@ -780,7 +889,13 @@ func (s *Server) handleContainers(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(w, cs)
+	visible := cs[:0]
+	for _, c := range cs {
+		if !isInternalControlContainer(c) {
+			visible = append(visible, c)
+		}
+	}
+	writeJSON(w, visible)
 }
 
 // ApplyRequest carries the slice of a topology this node is responsible for.
@@ -889,6 +1004,9 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, fmt.Errorf("rehydrate topology: %w", err))
 		return
 	}
+	if !req.DryRun && req.Phase == "apply" {
+		s.auditDevelopmentHardeningOverrides(r, top, req.Generation, req.Fence.Generation)
+	}
 	s.recordEvent(top.Name, req.Generation, "deploy", s.requestCorrelation(r), "apply_requested", "scheduled",
 		"phase="+req.Phase)
 	if why := s.refuseMutationIfHeld(top.Name, req.Hold, "this deployment"); why != "" {
@@ -906,6 +1024,10 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := s.checkPreparedGeneration(top.Name, req.Fence, req.Generation); err != nil {
+			httpError(w, http.StatusConflict, err)
+			return
+		}
+		if err := s.requireOverlayReservations(top, req.Fence); err != nil {
 			httpError(w, http.StatusConflict, err)
 			return
 		}
@@ -1151,6 +1273,24 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		resp.Failures = reportFailures(rep)
 	}
 	writeJSON(w, resp)
+}
+
+func (s *Server) auditDevelopmentHardeningOverrides(r *http.Request, top *model.Topology,
+	generation string, fence uint64,
+) {
+	if top == nil {
+		return
+	}
+	principal, _ := principalOf(r)
+	for _, device := range top.SortedDevices() {
+		if !device.Hardening.DevelopmentOverrideActive() {
+			continue
+		}
+		s.recordAuthorizationAudit(r, requestScope{
+			Lab: top.Name, Action: authz.ActionDeploy, Target: device.ID,
+			Generation: generation, FenceGeneration: fence,
+		}, principal, "scheduled", "development hardening override: "+device.Hardening.DevelopmentOverride)
+	}
 }
 
 // DestroyRequest asks the node to remove a lab.
@@ -1489,6 +1629,10 @@ func (s *Server) handleMPLSLabelSpace(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusForbidden, errors.New("that container is not managed by twinet"))
 		return
 	}
+	if isInternalControlContainer(c) {
+		httpError(w, http.StatusForbidden, errors.New("that container is an internal control sidecar"))
+		return
+	}
 	if req.Action != "snapshot" {
 		if err := s.requireMutationFence(c.Labels[deploy.LabelLab], req.Fence); err != nil {
 			httpError(w, http.StatusConflict, err)
@@ -1581,6 +1725,10 @@ func (s *Server) handleReshape(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusForbidden, errors.New("that container is not managed by twinet"))
 		return
 	}
+	if isInternalControlContainer(c) {
+		httpError(w, http.StatusForbidden, errors.New("that container is an internal control sidecar"))
+		return
+	}
 	if err := s.requireMutationFence(c.Labels[deploy.LabelLab], req.Fence); err != nil {
 		httpError(w, http.StatusConflict, err)
 		return
@@ -1648,6 +1796,10 @@ func (s *Server) handleLifecycle(w http.ResponseWriter, r *http.Request) {
 	// disruptive as running a command in it, so it cannot be the weaker door.
 	if c.Labels[deploy.LabelManaged] != "true" {
 		httpError(w, http.StatusForbidden, errors.New("that container is not managed by twinet"))
+		return
+	}
+	if isInternalControlContainer(c) {
+		httpError(w, http.StatusForbidden, errors.New("that container is an internal control sidecar"))
 		return
 	}
 	if req.Owner != "" && c.Labels[deploy.LabelOwner] != req.Owner {
@@ -1794,6 +1946,10 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusForbidden, errors.New("that container is not managed by twinet"))
 		return
 	}
+	if isInternalControlContainer(c) {
+		httpError(w, http.StatusForbidden, errors.New("that container is an internal control sidecar"))
+		return
+	}
 	if req.Owner != "" && c.Labels[deploy.LabelOwner] != req.Owner {
 		httpError(w, http.StatusForbidden,
 			fmt.Errorf("%s belongs to %q, not %q", req.Container, c.Labels[deploy.LabelOwner], req.Owner))
@@ -1803,11 +1959,6 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusForbidden,
 			fmt.Errorf("this diagnostic session is scoped to lab %q; %s belongs to %q",
 				diagLab, req.Container, c.Labels[deploy.LabelLab]))
-		return
-	}
-	if diagnostic && c.Labels[deploy.LabelFRRControl] == "true" {
-		httpError(w, http.StatusForbidden,
-			errors.New("a diagnostic session cannot exec the private FRR control sidecar"))
 		return
 	}
 	// Nothing a container says can be believed until the programs saying it

@@ -19,6 +19,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"math/big"
@@ -26,6 +27,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/HongyuHe/twinet/internal/authz"
@@ -43,7 +45,13 @@ type Bundle struct {
 	Dir    string
 	CA     Material
 	Client Material
-	Nodes  map[string]Material
+	// Nodes holds server-only material. A server certificate is never used to
+	// authorize a peer request, so leaking a node's TLS listener key cannot
+	// also create a replication client.
+	Nodes map[string]Material
+	// Peers holds the node-specific, peer-state-only client credentials used
+	// for durable replication.
+	Peers map[string]Material
 }
 
 const (
@@ -53,8 +61,8 @@ const (
 	leafValidity = 2 * 365 * 24 * time.Hour
 )
 
-// Generate issues a CA, one server certificate per node, and a client
-// certificate for the controller.
+// Generate issues a CA, one server certificate and one replication-only peer
+// certificate per node, and a client certificate for the controller.
 //
 // Each node gets its own key. One shared server certificate would be simpler
 // and would recreate the property that makes the bearer token unacceptable: a
@@ -87,7 +95,7 @@ func Generate(dir string, nodes map[string][]string) (*Bundle, error) {
 		return nil, err
 	}
 
-	b := &Bundle{Dir: dir, Nodes: map[string]Material{}}
+	b := &Bundle{Dir: dir, Nodes: map[string]Material{}, Peers: map[string]Material{}}
 	b.CA = Material{
 		CertPath: filepath.Join(dir, "ca_cert.pem"),
 		KeyPath:  filepath.Join(dir, "ca_key.pem"),
@@ -100,21 +108,31 @@ func Generate(dir string, nodes map[string][]string) (*Bundle, error) {
 	}
 
 	for name, sans := range nodes {
-		// A node uses its own certificate as a TLS client only on the
-		// peer-replication API. The embedded peer role is deliberately
-		// narrower than a controller identity, so possession of a node key
-		// cannot mutate a lab or acquire a controller fence.
-		claims, err := authz.URIs(authz.RolePeer, []string{"*"}, []string{authz.ActionPeerState})
-		if err != nil {
-			return nil, err
+		if err := validateMaterialName(name); err != nil {
+			return nil, fmt.Errorf("node %q: %w", name, err)
 		}
-		m, err := issueForClaimsSubject(dir, name+"_server", name, caCert, caKey, sans, claims,
-			[]x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth}, leafValidity)
+		// The listener key is server-only. Replication receives its own key
+		// below, so a node certificate used for state exchange cannot also be
+		// accidentally installed as a broadly trusted API client.
+		m, err := issueForClaimsSubject(dir, name+"_server", name, caCert, caKey, sans, nil,
+			[]x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, leafValidity)
 		if err != nil {
 			return nil, fmt.Errorf("node %s: %w", name, err)
 		}
 		m.CAPath = b.CA.CertPath
 		b.Nodes[name] = m
+
+		claims, err := authz.URIs(authz.RolePeer, []string{"*"}, []string{authz.ActionPeerState})
+		if err != nil {
+			return nil, err
+		}
+		peer, err := issueForClaimsSubject(dir, name+"_peer", name, caCert, caKey, nil, claims,
+			[]x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, leafValidity)
+		if err != nil {
+			return nil, fmt.Errorf("node peer %s: %w", name, err)
+		}
+		peer.CAPath = b.CA.CertPath
+		b.Peers[name] = peer
 	}
 
 	claims, err := authz.URIs(authz.RoleController, []string{"*"}, []string{"*"})
@@ -225,12 +243,12 @@ func serial() *big.Int {
 // the one failure worse than a benchmark that measures the wrong thing, because
 // it looks like the agent found nothing.
 //
-// A certificate of its own rather than the controller's. Transport identity is
-// not authorisation here -- the node agents decide what a caller may do from
-// its bearer token, and the agent's token is the read-only, single-lab one --
-// but handing out the controller's private key to something under evaluation is
-// not a thing to do when issuing another key costs nothing. This one is valid
-// for hours, not months, and its subject says what it is.
+// A certificate of its own rather than the controller's. Its URI claim is the
+// authorization boundary -- one lab and observe only -- while a bearer token
+// remains only defense in depth. Handing out the controller's private key to
+// something under evaluation is not a thing to do when issuing another key
+// costs nothing. This one is valid for hours, not months, and its subject says
+// what it is.
 func IssueDiagnostic(pkiDir, outDir, lab string, valid time.Duration) (Material, error) {
 	caCert, caKey, err := loadCA(pkiDir)
 	if err != nil {
@@ -264,6 +282,15 @@ func IssueDiagnostic(pkiDir, outDir, lab string, valid time.Duration) (Material,
 // and actions.
 func IssueScoped(pkiDir, outDir, name, role string, labs, actions []string,
 	valid time.Duration) (Material, error) {
+	if role != authz.RoleOperator {
+		return Material{}, fmt.Errorf("scoped credential issuance supports only the operator/TA role; use the dedicated diagnostic or node-peer issuer")
+	}
+	if err := validateMaterialName(name); err != nil {
+		return Material{}, err
+	}
+	if valid <= 0 {
+		return Material{}, fmt.Errorf("credential lifetime must be positive")
+	}
 	caCert, caKey, err := loadCA(pkiDir)
 	if err != nil {
 		return Material{}, err
@@ -289,6 +316,127 @@ func IssueScoped(pkiDir, outDir, name, role string, labs, actions []string,
 		return Material{}, err
 	}
 	return m, nil
+}
+
+// IssueNodePeer mints one node's replication-only client identity. It is
+// intentionally separate from IssueScoped: an operator/TA command must never
+// be able to mint a peer certificate, and a peer certificate cannot be used on
+// any controller route.
+func IssueNodePeer(pkiDir, outDir, node string, valid time.Duration) (Material, error) {
+	if err := validateMaterialName(node); err != nil {
+		return Material{}, err
+	}
+	if valid <= 0 {
+		return Material{}, fmt.Errorf("peer credential lifetime must be positive")
+	}
+	caCert, caKey, err := loadCA(pkiDir)
+	if err != nil {
+		return Material{}, err
+	}
+	if err := os.MkdirAll(outDir, 0o700); err != nil {
+		return Material{}, err
+	}
+	claims, err := authz.URIs(authz.RolePeer, []string{"*"}, []string{authz.ActionPeerState})
+	if err != nil {
+		return Material{}, err
+	}
+	m, err := issueForClaimsSubject(outDir, node+"_peer", node, caCert, caKey, nil, claims,
+		[]x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, valid)
+	if err != nil {
+		return Material{}, err
+	}
+	m.CAPath = filepath.Join(outDir, "ca_cert.pem")
+	ca, err := os.ReadFile(filepath.Join(pkiDir, "ca_cert.pem"))
+	if err != nil {
+		return Material{}, err
+	}
+	if err := os.WriteFile(m.CAPath, ca, 0o644); err != nil {
+		return Material{}, err
+	}
+	return m, nil
+}
+
+// Rotation records a credential replacement without retaining key material.
+// The serials are enough to correlate agent audit events during a rollout.
+type Rotation struct {
+	Name           string    `json:"name"`
+	Role           string    `json:"role"`
+	PreviousSerial string    `json:"previous_serial,omitempty"`
+	CurrentSerial  string    `json:"current_serial"`
+	RotatedAt      time.Time `json:"rotated_at"`
+	NotAfter       time.Time `json:"not_after"`
+}
+
+// RotateScoped replaces an existing operator/TA credential and writes a
+// non-secret audit record next to it. A caller must choose rotation explicitly;
+// ordinary issuance never silently converts a long-lived broad legacy key into
+// a replacement credential.
+func RotateScoped(pkiDir, outDir, name string, labs, actions []string,
+	valid time.Duration) (Material, Rotation, error) {
+	certPath := filepath.Join(outDir, name+"_cert.pem")
+	previous, err := leafSerial(certPath)
+	if err != nil && !os.IsNotExist(err) {
+		return Material{}, Rotation{}, err
+	}
+	if os.IsNotExist(err) {
+		return Material{}, Rotation{}, fmt.Errorf("cannot rotate %s: existing certificate %s is absent", name, certPath)
+	}
+	m, err := IssueScoped(pkiDir, outDir, name, authz.RoleOperator, labs, actions, valid)
+	if err != nil {
+		return Material{}, Rotation{}, err
+	}
+	cert, err := readCertificate(m.CertPath)
+	if err != nil {
+		return Material{}, Rotation{}, err
+	}
+	rotation := Rotation{
+		Name: name, Role: authz.RoleOperator, PreviousSerial: previous,
+		CurrentSerial: cert.SerialNumber.Text(16), RotatedAt: time.Now().UTC(), NotAfter: cert.NotAfter.UTC(),
+	}
+	raw, err := json.Marshal(rotation)
+	if err != nil {
+		return Material{}, Rotation{}, err
+	}
+	if err := os.WriteFile(filepath.Join(outDir, name+"_rotation.json"), append(raw, '\n'), 0o600); err != nil {
+		return Material{}, Rotation{}, err
+	}
+	return m, rotation, nil
+}
+
+func leafSerial(path string) (string, error) {
+	cert, err := readCertificate(path)
+	if err != nil {
+		return "", err
+	}
+	return cert.SerialNumber.Text(16), nil
+}
+
+func validateMaterialName(name string) error {
+	if name == "" || filepath.Base(name) != name {
+		return fmt.Errorf("credential name must be a single safe path component")
+	}
+	for _, r := range name {
+		if !(r >= 'a' && r <= 'z') && !(r >= 'A' && r <= 'Z') &&
+			!(r >= '0' && r <= '9') && r != '.' && r != '_' && r != '-' {
+			return fmt.Errorf("credential name %q contains unsafe characters", name)
+		}
+	}
+	if strings.Contains(name, "..") {
+		return fmt.Errorf("credential name %q contains a traversal sequence", name)
+	}
+	return nil
+}
+
+func readCertificate(path string) (*x509.Certificate, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	block, _ := pem.Decode(raw)
+	if block == nil {
+		return nil, fmt.Errorf("%s contains no certificate", path)
+	}
+	return x509.ParseCertificate(block.Bytes)
 }
 
 // loadCA reads the cluster authority from a PKI directory.

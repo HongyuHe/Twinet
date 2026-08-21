@@ -66,8 +66,10 @@ chmod 0644 "$u"'
     if [ -n "$PKI" ]; then
         cert="${PKI}/${n}_server_cert.pem"
         key="${PKI}/${n}_server_key.pem"
+        peer_cert="${PKI}/${n}_peer_cert.pem"
+        peer_key="${PKI}/${n}_peer_key.pem"
         ca="${PKI}/ca_cert.pem"
-        for f in "$cert" "$key" "$ca"; do
+        for f in "$cert" "$key" "$peer_cert" "$peer_key" "$ca"; do
             [ -f "$f" ] || { echo "missing $f; run 'twinet node pki' first" >&2; exit 1; }
         done
     fi
@@ -79,13 +81,17 @@ chmod 0644 "$u"'
             sudo install -d -m 0700 /etc/twinet/pki
             sudo install -m 0644 "$cert" /etc/twinet/pki/server_cert.pem
             sudo install -m 0600 "$key" /etc/twinet/pki/server_key.pem
+            sudo install -m 0644 "$peer_cert" /etc/twinet/pki/peer_cert.pem
+            sudo install -m 0600 "$peer_key" /etc/twinet/pki/peer_key.pem
             sudo install -m 0644 "$ca" /etc/twinet/pki/ca_cert.pem
         else
             sudo ssh -o BatchMode=yes "$n" 'install -d -m 0700 /etc/twinet/pki'
             sudo scp -q "$cert" "root@$n:/etc/twinet/pki/server_cert.pem"
             sudo scp -q "$key" "root@$n:/etc/twinet/pki/server_key.pem"
+            sudo scp -q "$peer_cert" "root@$n:/etc/twinet/pki/peer_cert.pem"
+            sudo scp -q "$peer_key" "root@$n:/etc/twinet/pki/peer_key.pem"
             sudo scp -q "$ca" "root@$n:/etc/twinet/pki/ca_cert.pem"
-            sudo ssh -o BatchMode=yes "$n" 'chmod 0600 /etc/twinet/pki/server_key.pem'
+            sudo ssh -o BatchMode=yes "$n" 'chmod 0600 /etc/twinet/pki/server_key.pem /etc/twinet/pki/peer_key.pem'
         fi
     }
 
@@ -120,8 +126,8 @@ fi
 chmod 0644 "$u"'
 
     if [ -n "$PKI" ]; then
-        strip_re='s# -tls-cert [^ ]*##; s# -tls-key [^ ]*##; s# -client-ca [^ ]*##'
-        add=' -tls-cert /etc/twinet/pki/server_cert.pem -tls-key /etc/twinet/pki/server_key.pem -client-ca /etc/twinet/pki/ca_cert.pem'
+        strip_re='s# -tls-cert [^ ]*##; s# -tls-key [^ ]*##; s# -client-ca [^ ]*##; s# -peer-tls-cert [^ ]*##; s# -peer-tls-key [^ ]*##; s# -legacy-peer-cert-until [^ ]*##'
+        add=' -tls-cert /etc/twinet/pki/server_cert.pem -tls-key /etc/twinet/pki/server_key.pem -client-ca /etc/twinet/pki/ca_cert.pem -peer-tls-cert /etc/twinet/pki/peer_cert.pem -peer-tls-key /etc/twinet/pki/peer_key.pem'
         unit_cmd="sed -i -e '${strip_re}' -e '\#^ExecStart=#s#\$#${add}#' /etc/systemd/system/twinetd.service"
     else
         unit_cmd="true"

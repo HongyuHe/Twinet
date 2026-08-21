@@ -144,6 +144,14 @@ func deviceDemand(d *model.Device) demand {
 			r.Memory = "64Mi"
 		}
 	}
+	dem := requestDemand(r)
+	if d.Kind == model.KindRouter && d.EffectiveNOS() == model.DefaultNOS {
+		dem = dem.add(requestDemand(model.FRRControlResourceRequest()))
+	}
+	return dem
+}
+
+func requestDemand(r model.ResourceRequest) demand {
 	dem := demand{
 		Containers:      1,
 		CPUs:            r.CPUs,

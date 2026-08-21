@@ -367,6 +367,44 @@ mutate every lab.
 student container cannot reach the Docker socket, host namespaces, underlay, or
 another lab; all course exercises still work without `CAP_SYS_ADMIN`.
 
+**Shipped O12 enforcement contract.**
+
+- Every agent route has a named action (`observe`, `exec`, `deploy`, `destroy`,
+  `lifecycle`, `fault`, `state`, or `admin`) and a resolved lab target before
+  its handler runs. TLS clients must present exactly one valid Twinet URI
+  claim: controller is cluster-wildcard, operator/TA is named-lab and
+  named-action, diagnostic is one-lab observe-only, and peer is
+  `peer-state` only. The shared bearer remains a second factor; it cannot
+  broaden a certificate claim. Plain HTTP is only `-insecure` on loopback.
+- `twinet node pki` now creates separate `*_server_*` and `*_peer_*` keys.
+  Peer keys are installed with `-peer-tls-cert`/`-peer-tls-key`, never used
+  for controller routes. Existing clusters must issue peer material with
+  `twinet node pki peer <node>` and roll it out. The only legacy bridge is an
+  explicit, future `-legacy-peer-cert-until` deadline; expiry refuses
+  replication rather than preserving broad fallback access. Scoped TA
+  credentials use `twinet node pki credential`; replacement requires
+  `--rotate` and records certificate serials without keys.
+- Every expanded device uses `cap-drop ALL`, a minimal add set,
+  no-new-privileges, named seccomp/AppArmor profiles, a read-only root
+  filesystem, explicit tmpfs scratch paths, masked/read-only OCI paths, and
+  no default Docker network. Runtime class, user namespace, and worker-pool
+  selection are typed manifest/placement fields. Unsafe values, host socket
+  mounts, agent credential environment, and `SYS_ADMIN` topology devices are
+  rejected; a named development override is auditable but never permits a
+  privileged topology device.
+- FRR runs in an internal, labelled control sidecar. The router keeps only its
+  network namespace plus its own config/vty mounts; the sidecar has a private
+  PID namespace, sidecar-only logs, and the sole `SYS_ADMIN` grant. API
+  listing, attach, exec, lifecycle, reshape, and MPLS routes reject internal
+  sidecars. Cross-node applies require fence-bound VNI reservations, and
+  multiplex pairs include lab ownership in their kernel alias.
+- Privileged API mutations append immutable structured events containing
+  identity, certificate serial, lab, action, deployment generation, fence,
+  target, and result. Event text redacts bearer/token/secret/PEM material.
+  The O12 unit suite covers certificate scope, stolen bearer resistance,
+  peer impersonation, migration expiry, sidecar invisibility, hardening
+  mapping, host-socket refusal, audit redaction, and two-lab overlay identity.
+
 ### O13 - Make documentation describe shipped behavior
 
 **Problem.** Architecture documents claim gRPC, two binaries, no state store,

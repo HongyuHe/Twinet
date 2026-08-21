@@ -158,6 +158,7 @@ type Device struct {
 	Privileged   bool
 	Command      []string
 	Labels       map[string]string
+	Hardening    RuntimeHardening
 
 	// RouterID is the stable per-AS router index used by the addressing plan.
 	RouterID int

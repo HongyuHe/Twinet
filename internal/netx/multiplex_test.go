@@ -39,6 +39,32 @@ func TestMultiplexNamesArePairStableAndBounded(t *testing.T) {
 	}
 }
 
+func TestTwoLabsNeverShareOverlayPairIdentity(t *testing.T) {
+	leftBridge, leftVXLAN, err := MultiplexOverlayNames("lab-a", "node-a", "node-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rightBridge, rightVXLAN, err := MultiplexOverlayNames("lab-b", "node-a", "node-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if leftBridge == rightBridge || leftVXLAN == rightVXLAN {
+		t.Fatalf("two labs share a multiplex overlay identity: %s/%s and %s/%s",
+			leftBridge, leftVXLAN, rightBridge, rightVXLAN)
+	}
+	left, err := newPairKey("lab-a", "node-a", "node-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	right, err := newPairKey("lab-b", "node-a", "node-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if left.identity() == right.identity() || left.lab == right.lab {
+		t.Fatalf("lab ownership is absent from the overlay isolation key: %#v %#v", left, right)
+	}
+}
+
 func TestMultiplexAliasCarriesFullOwnerIdentity(t *testing.T) {
 	key, err := newPairKey("cos461-g3", "node-b", "node-a")
 	if err != nil {

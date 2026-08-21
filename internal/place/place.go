@@ -113,6 +113,17 @@ type Options struct {
 	Unavailable map[string]bool
 }
 
+func nodeInPool(lab *model.Lab, name string) bool {
+	if lab == nil {
+		return false
+	}
+	node, ok := lab.NodeByName(name)
+	if !ok {
+		return false
+	}
+	return lab.Placement.NodePool == "" || node.Pool == lab.Placement.NodePool
+}
+
 // Record is a placement as it was actually deployed.
 type Record struct {
 	Lab       string            `json:"lab"`
@@ -150,13 +161,16 @@ func Place(top *model.Topology, opts Options) (*Assignment, error) {
 	}
 
 	front := lab.FrontNode()
-	if opts.Unavailable[front] {
+	if opts.Unavailable[front] || !nodeInPool(lab, front) {
 		for _, node := range lab.Placement.Nodes {
-			if !opts.Unavailable[node.Name] {
+			if !opts.Unavailable[node.Name] && nodeInPool(lab, node.Name) {
 				front = node.Name
 				break
 			}
 		}
+	}
+	if !nodeInPool(lab, front) || opts.Unavailable[front] {
+		return nil, fmt.Errorf("no available node exists in requested worker pool %q", lab.Placement.NodePool)
 	}
 	a := &Assignment{
 		ByAS:             map[int]string{},
@@ -165,6 +179,7 @@ func Place(top *model.Topology, opts Options) (*Assignment, error) {
 		ByServiceReplica: map[string]string{},
 		Load:             map[string]int{},
 	}
+
 	capacity := buildCapacityState(top, opts)
 	names, caps, hasCap := capacity.names, capacity.caps, capacity.hasCap
 	loads := map[string]demand{}
@@ -428,6 +443,18 @@ func finish(top *model.Topology, a *Assignment) (*Assignment, error) {
 			d.Node = node
 		} else {
 			d.Node = top.Lab.FrontNode()
+		}
+	}
+	for _, d := range top.SortedDevices() {
+		node, ok := top.Lab.NodeByName(d.Node)
+		if !ok {
+			return nil, fmt.Errorf("device %s was placed on unknown node %q", d.ID, d.Node)
+		}
+		if d.Hardening.RuntimeClass == "" {
+			d.Hardening.RuntimeClass = node.RuntimeClass
+		}
+		if d.Hardening.UsernsMode == "" {
+			d.Hardening.UsernsMode = node.UsernsMode
 		}
 	}
 	for _, name := range top.SortedServiceNames() {

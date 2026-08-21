@@ -33,6 +33,12 @@ func buildCapacityState(top *model.Topology, opts Options) capacityState {
 		}
 	}
 	for _, node := range top.Lab.Placement.Nodes {
+		if top.Lab.Placement.NodePool != "" && node.Pool != top.Lab.Placement.NodePool {
+			// A worker-pool request is a hard tenancy boundary. Excluding the
+			// node here makes every placement path (including pins and strict
+			// admission) reject it rather than merely report a wrong pool later.
+			continue
+		}
 		if opts.Unavailable[node.Name] {
 			// Retain no candidate capacity for a node being drained. Fixed
 			// placement below observes it as absent and records an explicit

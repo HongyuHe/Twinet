@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -126,7 +128,7 @@ func TestIssuedIdentitiesCarryAuthorizationBoundaries(t *testing.T) {
 		t.Fatal("the scoped operator escaped its lab or action boundary")
 	}
 
-	peer, err := authz.FromCertificate(parseLeaf(t, b.Nodes["node-0"].CertPath))
+	peer, err := authz.FromCertificate(parseLeaf(t, b.Peers["node-0"].CertPath))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,8 +138,46 @@ func TestIssuedIdentitiesCarryAuthorizationBoundaries(t *testing.T) {
 	if peer.Allows("cos461", authz.ActionDeploy) || peer.Role == authz.RoleController {
 		t.Fatal("node certificate can impersonate a controller")
 	}
-	if got := parseLeaf(t, b.Nodes["node-0"].CertPath).Subject.CommonName; got != "node-0" {
+	if _, err := authz.FromCertificate(parseLeaf(t, b.Nodes["node-0"].CertPath)); err == nil {
+		t.Fatal("listener certificate carried a client authorization identity")
+	}
+	if got := parseLeaf(t, b.Peers["node-0"].CertPath).Subject.CommonName; got != "node-0" {
 		t.Fatalf("node peer identity is %q, want manifest node name", got)
+	}
+}
+
+func TestRotateScopedCredentialRecordsSerialWithoutSecrets(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := Generate(dir, map[string][]string{"node-0": {"127.0.0.1"}}); err != nil {
+		t.Fatal(err)
+	}
+	out := t.TempDir()
+	first, err := IssueScoped(dir, out, "ta", authz.RoleOperator,
+		[]string{"lab-a"}, []string{authz.ActionDeploy}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := leafSerial(first.CertPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rotated, record, err := RotateScoped(dir, out, "ta",
+		[]string{"lab-a"}, []string{authz.ActionDeploy}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.PreviousSerial != before || record.CurrentSerial == before || record.CurrentSerial == "" {
+		t.Fatalf("rotation record = %#v, want old serial %q and a new serial", record, before)
+	}
+	if _, err := os.Stat(rotated.KeyPath); err != nil {
+		t.Fatalf("rotated private key was not written: %v", err)
+	}
+	raw, err := os.ReadFile(filepath.Join(out, "ta_rotation.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) == "" || strings.Contains(string(raw), "PRIVATE KEY") {
+		t.Fatal("rotation audit record is empty or contains private key material")
 	}
 }
 

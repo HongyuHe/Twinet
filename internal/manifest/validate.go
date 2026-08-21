@@ -952,15 +952,48 @@ func (l *Loaded) validateResources(d *Diagnostics, file string) {
 			validateDeviceResources(d, tf, "routers."+rn, tpl.Routers[rn].DeviceDefaults,
 				nodeAt(troot, "routers."+rn))
 		}
+		validateDeviceResources(d, tf, "hosts", tpl.Hosts.DeviceDefaults, nodeAt(troot, "hosts"))
+		for _, name := range sortedMapKeys(tpl.P4Devices) {
+			if device := tpl.P4Devices[name]; device != nil {
+				validateDeviceResources(d, tf, "p4_devices."+name, device.DeviceDefaults,
+					nodeAt(troot, "p4_devices."+name))
+			}
+		}
+		for _, domain := range sortedMapKeys(tpl.L2Domains) {
+			l2 := tpl.L2Domains[domain]
+			if l2 == nil {
+				continue
+			}
+			for _, name := range sortedMapKeys(l2.Switches) {
+				if device := l2.Switches[name]; device != nil {
+					validateDeviceResources(d, tf, "l2_domains."+domain+".switches."+name,
+						device.DeviceDefaults, nodeAt(troot, "l2_domains."+domain+".switches."+name))
+				}
+			}
+			for _, name := range sortedMapKeys(l2.Hosts) {
+				if device := l2.Hosts[name]; device != nil {
+					validateDeviceResources(d, tf, "l2_domains."+domain+".hosts."+name,
+						device.DeviceDefaults, nodeAt(troot, "l2_domains."+domain+".hosts."+name))
+				}
+			}
+		}
+	}
+	for _, name := range sortedMapKeys(l.Lab.Controllers) {
+		if controller := l.Lab.Controllers[name]; controller != nil {
+			validateDeviceResources(d, file, "controllers."+name, controller.DeviceDefaults,
+				nodeAt(root, "controllers."+name))
+		}
 	}
 }
 
 func validateDeviceResources(d *Diagnostics, file, path string, dd model.DeviceDefaults, node *yaml.Node) {
+	validateDeviceHardening(d, file, path, dd, node)
 	if dd.Memory != "" {
 		if _, err := runtime.ParseMemory(dd.Memory); err != nil {
 			d.AddHint(file, path+".memory", node, err.Error(),
 				"use Kubernetes-style quantities such as 512Mi or 2Gi")
 		}
+
 	}
 	if dd.CPUs != nil && *dd.CPUs <= 0 {
 		d.Addf(file, path+".cpus", node, "cpus must be positive, got %v", *dd.CPUs)
@@ -1037,6 +1070,101 @@ func validateDeviceResources(d *Diagnostics, file, path string, dd model.DeviceD
 	}
 }
 
+func validateDeviceHardening(d *Diagnostics, file, path string, dd model.DeviceDefaults, node *yaml.Node) {
+	h := dd.Hardening
+	development := h.DevelopmentOverrideActive()
+	if dd.Privileged != nil && *dd.Privileged {
+		d.Add(file, path+".privileged",
+			"privileged devices are never permitted; use the internal FRR control sidecar instead", node)
+	}
+	for _, capability := range dd.Capabilities {
+		normal := strings.TrimPrefix(strings.ToUpper(strings.TrimSpace(capability)), "CAP_")
+		switch normal {
+		case "NET_ADMIN", "NET_RAW", "NET_BIND_SERVICE", "SYS_NICE":
+		default:
+			d.Addf(file, path+".capabilities", node, "capability %q is not in Twinet's minimal device allowlist", capability)
+		}
+		if normal == "SYS_ADMIN" {
+			d.Add(file, path+".capabilities",
+				"SYS_ADMIN is forbidden on every topology device; FRR control uses an internal sidecar", node)
+		}
+	}
+	if h.NoNewPrivileges != nil && !*h.NoNewPrivileges && !development {
+		d.AddHint(file, path+".hardening.no_new_privileges", node,
+			"disabling no-new-privileges requires an explicit audited development_override",
+			"set hardening.development_override to a reviewable local-development reason")
+	}
+	if h.ReadOnlyRootfs != nil && !*h.ReadOnlyRootfs && !development {
+		d.AddHint(file, path+".hardening.read_only_rootfs", node,
+			"disabling the read-only root filesystem requires an explicit audited development_override",
+			"add required ephemeral paths under hardening.writable_paths instead")
+	}
+	if (h.SeccompProfile == "unconfined" || h.SeccompProfile == "none") && !development {
+		d.AddHint(file, path+".hardening.seccomp_profile", node,
+			"an unconfined seccomp profile requires an explicit audited development_override",
+			"use the default profile or a named reviewed profile")
+	}
+	if (h.AppArmorProfile == "unconfined" || h.AppArmorProfile == "none") && !development {
+		d.AddHint(file, path+".hardening.apparmor_profile", node,
+			"an unconfined AppArmor profile requires an explicit audited development_override",
+			"use docker-default or a named reviewed profile")
+	}
+	if strings.EqualFold(h.UsernsMode, "host") && !development {
+		d.AddHint(file, path+".hardening.userns_mode", node,
+			"host user namespaces require an explicit audited development_override",
+			"use an isolated daemon user namespace profile")
+	}
+	if pidMode, err := runtime.NormalizePIDMode(h.PIDMode); err != nil {
+		d.Addf(file, path+".hardening.pid_mode", node, "%v", err)
+	} else if pidMode != "" && !development {
+		d.AddHint(file, path+".hardening.pid_mode", node,
+			"shared PID namespaces require an explicit audited development_override",
+			"use private (the default) for topology devices")
+	}
+	if h.RuntimeClass != "" && !regexp.MustCompile(`^[A-Za-z0-9_.-]+$`).MatchString(h.RuntimeClass) {
+		d.Add(file, path+".hardening.runtime_class", "runtime_class contains unsafe characters", node)
+	}
+	for _, bind := range dd.Binds {
+		if unsafeDeviceBind(bind) {
+			d.Addf(file, path+".binds", node, "host-sensitive bind %q is forbidden", bind)
+		}
+	}
+	for key := range dd.Env {
+		upper := strings.ToUpper(key)
+		if strings.Contains(upper, "TWINET_TOKEN") || strings.Contains(upper, "TWINET_TLS") ||
+			upper == "DOCKER_HOST" || upper == "CONTAINER_HOST" {
+			d.Addf(file, path+".env", node,
+				"device environment may not carry agent or container-engine credential %q", key)
+		}
+	}
+	for _, writable := range h.WritablePaths {
+		clean := filepath.Clean(writable)
+		if writable == "" || !strings.HasPrefix(clean, "/") ||
+			clean == "/proc" || strings.HasPrefix(clean, "/proc/") ||
+			clean == "/sys" || strings.HasPrefix(clean, "/sys/") ||
+			clean == "/dev" || strings.HasPrefix(clean, "/dev/") {
+			d.Addf(file, path+".hardening.writable_paths", node,
+				"writable path %q is not an isolated container scratch path", writable)
+		}
+	}
+}
+
+func unsafeDeviceBind(bind string) bool {
+	source := strings.SplitN(bind, ":", 2)[0]
+	source = filepath.Clean(source)
+	lower := strings.ToLower(source)
+	if strings.Contains(lower, "docker.sock") || strings.Contains(lower, "containerd.sock") ||
+		strings.Contains(lower, "podman.sock") {
+		return true
+	}
+	for _, prefix := range []string{"/proc", "/sys", "/dev", "/run/docker", "/var/lib/docker", "/etc/twinet"} {
+		if source == prefix || strings.HasPrefix(source, prefix+"/") {
+			return true
+		}
+	}
+	return false
+}
+
 // requestField reports whether an authored requests mapping explicitly named a
 // dimension. Zero is otherwise the inheritance sentinel, so this preserves
 // partial requests while still rejecting `cpus: 0` as an invalid reservation.
@@ -1083,6 +1211,7 @@ func (l *Loaded) validatePlacement(d *Diagnostics, file string) {
 			"unknown strategy %q (pack-by-as, spread-by-as, single-node)", p.Strategy)
 	}
 	names := map[string]bool{}
+	pools := map[string]bool{}
 	fronts := 0
 	for i, n := range p.Nodes {
 		path := fmt.Sprintf("placement.nodes[%d]", i)
@@ -1094,6 +1223,19 @@ func (l *Loaded) validatePlacement(d *Diagnostics, file string) {
 			d.Addf(file, path+".name", node, "duplicate node %q", n.Name)
 		}
 		names[n.Name] = true
+		if n.Pool != "" {
+			pools[n.Pool] = true
+		}
+		for field, value := range map[string]string{
+			"pool": n.Pool, "runtime_class": n.RuntimeClass, "userns_mode": n.UsernsMode,
+		} {
+			if value != "" && !regexp.MustCompile(`^[A-Za-z0-9_.-]+$`).MatchString(value) {
+				d.Addf(file, path+"."+field, node, "%q contains unsafe characters", value)
+			}
+		}
+		if strings.EqualFold(n.UsernsMode, "host") {
+			d.Add(file, path+".userns_mode", "host user namespaces are not allowed for hardened worker nodes", node)
+		}
 		if n.Front {
 			fronts++
 		}
@@ -1115,6 +1257,10 @@ func (l *Loaded) validatePlacement(d *Diagnostics, file string) {
 	}
 	if p.Strategy == "single-node" && len(p.Nodes) > 1 {
 		d.Warn(file, "placement", "strategy is single-node but several nodes are declared; only the front node will be used", nodeAt(root, "placement"))
+	}
+	if p.NodePool != "" && !pools[p.NodePool] {
+		d.Addf(file, "placement.node_pool", nodeAt(root, "placement"),
+			"no placement node belongs to requested pool %q", p.NodePool)
 	}
 	for i, pin := range p.Pin {
 		path := fmt.Sprintf("placement.pin[%d]", i)

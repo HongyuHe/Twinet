@@ -63,6 +63,10 @@ type Spec struct {
 	RuntimeClass string
 	// UsernsMode is the Docker user namespace mode, for example "host".
 	UsernsMode string
+	// PidMode controls the process namespace. Empty and "private" both map to
+	// Docker's default private namespace; host and container:<name> are
+	// explicit sharing modes.
+	PidMode string
 	// MaskedPaths and ReadonlyPaths customize the Engine API's OCI system
 	// path restrictions. The CLI fallback can only represent the paired empty
 	// lists through security-opt=systempaths=unconfined.

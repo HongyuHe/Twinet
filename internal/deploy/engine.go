@@ -58,6 +58,10 @@ const (
 	// directories, but is a separate container that a student shell cannot
 	// exec into.
 	LabelFRRControl = "twinet.frr-control"
+	// LabelInternal marks a runtime implementation container that is not a
+	// topology device. Every user-facing API filters this label rather than
+	// relying on a naming convention for privileged sidecars.
+	LabelInternal = "twinet.internal"
 	// LabelNOS records an explicitly selected router NOS. Legacy routers omit
 	// it so their historic container/spec identity remains unchanged.
 	LabelNOS = "twinet.nos"
@@ -368,23 +372,7 @@ func (e *Engine) ensureContainer(ctx context.Context, top *model.Topology, d *mo
 		}
 	}
 
-	spec := &runtime.Spec{
-		Name:         d.Container,
-		Image:        d.Image,
-		Hostname:     shortHostname(d),
-		Command:      d.Command,
-		Env:          d.Env,
-		Labels:       e.labels(top, d),
-		Sysctls:      d.Sysctls,
-		Capabilities: d.Capabilities,
-		Privileged:   d.Privileged,
-		CPUs:         d.CPUs,
-		Memory:       d.Memory,
-		PidsLimit:    d.Pids,
-		Restart:      d.Restart,
-		NetworkMode:  "none",
-		Init:         true,
-	}
+	binds := make([]runtime.Bind, 0, len(d.Binds)+len(controlBinds))
 	for _, b := range d.Binds {
 		parts := strings.Split(b, ":")
 		bind := runtime.Bind{Source: parts[0]}
@@ -394,9 +382,41 @@ func (e *Engine) ensureContainer(ctx context.Context, top *model.Topology, d *mo
 		if len(parts) > 2 && parts[2] == "ro" {
 			bind.ReadOnly = true
 		}
-		spec.Binds = append(spec.Binds, bind)
+		binds = append(binds, bind)
 	}
-	spec.Binds = append(spec.Binds, controlBinds...)
+	binds = append(binds, controlBinds...)
+	hardening, err := e.hardenedRuntimeSpec(d, binds)
+	if err != nil {
+		return err
+	}
+	cpus, memory, pids := effectiveRuntimeLimits(d)
+	spec := &runtime.Spec{
+		Name:           d.Container,
+		Image:          d.Image,
+		Hostname:       shortHostname(d),
+		Command:        d.Command,
+		Env:            d.Env,
+		Labels:         e.labels(top, d),
+		Sysctls:        d.Sysctls,
+		Capabilities:   hardening.Capabilities,
+		CapDrop:        hardening.CapDrop,
+		SecurityOpt:    hardening.SecurityOpt,
+		ReadOnlyRootfs: hardening.ReadOnlyRootfs,
+		RuntimeClass:   hardening.RuntimeClass,
+		UsernsMode:     hardening.UsernsMode,
+		PidMode:        hardening.PidMode,
+		MaskedPaths:    hardening.MaskedPaths,
+		ReadonlyPaths:  hardening.ReadonlyPaths,
+		Privileged:     d.Privileged,
+		CPUs:           cpus,
+		Memory:         memory,
+		PidsLimit:      pids,
+		Restart:        d.Restart,
+		NetworkMode:    "none",
+		Init:           true,
+		Binds:          binds,
+		Tmpfs:          hardening.Tmpfs,
+	}
 
 	if _, err := e.Runtime.Create(ctx, spec); err != nil {
 		return err
@@ -445,7 +465,7 @@ func (e *Engine) usesFRRControl(d *model.Device) bool {
 	}
 }
 
-const frrControlContractVersion = "frr-control-v1"
+const frrControlContractVersion = "frr-control-v2"
 
 func (e *Engine) frrControlBinds(top *model.Topology, d *model.Device) ([]runtime.Bind, error) {
 	if !e.usesFRRControl(d) {
@@ -485,8 +505,25 @@ func (e *Engine) frrControlBinds(top *model.Topology, d *model.Device) ([]runtim
 	return []runtime.Bind{
 		{Source: etc, Target: "/etc/frr"},
 		{Source: run, Target: "/run/frr"},
-		{Source: log, Target: "/var/log/frr"},
 	}, nil
+}
+
+// frrControlLogBind is intentionally sidecar-only. Router shells receive the
+// configuration directory and vty sockets they need to configure and observe
+// their own routing daemon, but not the sidecar's log filesystem.
+func (e *Engine) frrControlLogBind(top *model.Topology, d *model.Device) (runtime.Bind, error) {
+	if top == nil || d == nil {
+		return runtime.Bind{}, fmt.Errorf("FRR control log bind needs a topology and device")
+	}
+	sum := sha256.Sum256([]byte(top.Name + "\x00" + d.ID))
+	log := filepath.Join(e.frrControlRoot(), top.Name, hex.EncodeToString(sum[:8]), "log")
+	if err := os.MkdirAll(log, 0o775); err != nil {
+		return runtime.Bind{}, fmt.Errorf("create FRR control log directory for %s: %w", d.ID, err)
+	}
+	if err := os.Chown(log, 100, 101); err != nil {
+		return runtime.Bind{}, fmt.Errorf("set FRR log ownership for %s: %w", d.ID, err)
+	}
+	return runtime.Bind{Source: log, Target: "/var/log/frr"}, nil
 }
 
 func (e *Engine) frrControlRoot() string {
@@ -516,14 +553,41 @@ func (e *Engine) ensureFRRControl(ctx context.Context, top *model.Topology, d *m
 	}
 	labels := e.labels(top, d)
 	labels[LabelFRRControl] = "true"
+	labels[LabelInternal] = "true"
 	labels[LabelSpec] = want
 	labels[LabelKind] = "frr-control"
+	sidecarRequest := model.FRRControlResourceRequest()
+	setRequestLabels(labels, sidecarRequest)
+	sidecarBinds := append([]runtime.Bind(nil), binds...)
+	logBind, err := e.frrControlLogBind(top, d)
+	if err != nil {
+		return err
+	}
+	sidecarBinds = append(sidecarBinds, logBind)
+	hardening, err := e.hardenedRuntimeSpec(d, sidecarBinds)
+	if err != nil {
+		return err
+	}
 	spec := &runtime.Spec{
 		Name: name, Image: d.Image,
 		Command: []string{"sleep", "infinity"},
-		Labels:  labels, Binds: append([]runtime.Bind(nil), binds...),
-		Capabilities: []string{"NET_ADMIN", "NET_RAW", "SYS_ADMIN"},
-		Restart:      d.Restart, NetworkMode: "container:" + d.Container, Init: true,
+		Labels:  labels, Binds: sidecarBinds,
+		Capabilities:   frrControlCapabilities(d),
+		CapDrop:        hardening.CapDrop,
+		SecurityOpt:    hardening.SecurityOpt,
+		ReadOnlyRootfs: hardening.ReadOnlyRootfs,
+		RuntimeClass:   hardening.RuntimeClass,
+		UsernsMode:     hardening.UsernsMode,
+		PidMode:        hardening.PidMode,
+		MaskedPaths:    hardening.MaskedPaths,
+		ReadonlyPaths:  hardening.ReadonlyPaths,
+		Tmpfs:          hardening.Tmpfs,
+		CPUs:           sidecarRequest.CPUs,
+		Memory:         sidecarRequest.Memory,
+		PidsLimit:      sidecarRequest.Pids,
+		Restart:        d.Restart,
+		NetworkMode:    "container:" + d.Container,
+		Init:           true,
 	}
 	if _, err := e.Runtime.Create(ctx, spec); err != nil {
 		return fmt.Errorf("create FRR control for %s: %w", d.ID, err)
@@ -553,6 +617,7 @@ func frrControlSpecHash(d *model.Device) string {
 	h := sha256.New()
 	fmt.Fprintf(h, "%s\n%s\n%s\n", frrControlContractVersion, d.ID, d.Image)
 	fmt.Fprintf(h, "imageid=%s\nrestart=%s\n", d.ImageID, d.Restart)
+	fmt.Fprintf(h, "device=%s\n", SpecHash(d))
 	return hex.EncodeToString(h.Sum(nil))[:24]
 }
 
@@ -966,11 +1031,12 @@ func SpecHash(d *model.Device) string {
 	if UsesFRRControl(d) {
 		fmt.Fprintf(h, "frr-control=%s\n", frrControlContractVersion)
 	}
+	cpus, memory, pids := effectiveRuntimeLimits(d)
 	fmt.Fprintf(h, "cpus=%v\nmem=%s\npids=%d\nrestart=%s\npriv=%v\n",
-		d.CPUs, d.Memory, d.Pids, d.Restart, d.Privileged)
+		cpus, memory, pids, d.Restart, d.Privileged)
 	fmt.Fprintf(h, "cmd=%s\ncaps=%s\nbinds=%s\n",
 		strings.Join(d.Command, ","),
-		strings.Join(sortedCopy(d.Capabilities), ","),
+		strings.Join(effectiveCapabilities(d), ","),
 		strings.Join(sortedCopy(d.Binds), ","))
 	for _, k := range sortedKeys(d.Env) {
 		fmt.Fprintf(h, "env:%s=%s\n", k, d.Env[k])
@@ -978,6 +1044,16 @@ func SpecHash(d *model.Device) string {
 	for _, k := range sortedKeys(d.Sysctls) {
 		fmt.Fprintf(h, "sysctl:%s=%s\n", k, d.Sysctls[k])
 	}
+	hardening := model.EffectiveRuntimeHardening(d.Kind, d.Hardening)
+	fmt.Fprintf(h, "hardening=nnp:%t,seccomp:%s,apparmor:%s,rootfs:%t,runtime:%s,userns:%s,pid:%s\n",
+		hardening.NoNewPrivileges != nil && *hardening.NoNewPrivileges,
+		hardening.SeccompProfile, hardening.AppArmorProfile,
+		hardening.ReadOnlyRootfs != nil && *hardening.ReadOnlyRootfs,
+		hardening.RuntimeClass, hardening.UsernsMode, hardening.PIDMode)
+	fmt.Fprintf(h, "hardening-writable=%s\nhardening-masked=%s\nhardening-readonly=%s\n",
+		strings.Join(sortedCopy(hardening.WritablePaths), ","),
+		strings.Join(sortedCopy(hardening.MaskedPaths), ","),
+		strings.Join(sortedCopy(hardening.ReadonlyPaths), ","))
 	return hex.EncodeToString(h.Sum(nil))[:16]
 }
 
@@ -993,21 +1069,16 @@ func (e *Engine) labels(top *model.Topology, d *model.Device) map[string]string 
 		request = model.DefaultResourceRequest(d.Kind)
 	}
 	out := map[string]string{
-		LabelManaged:        "true",
-		LabelLab:            top.Name,
-		LabelDevice:         d.Name,
-		LabelDeviceID:       d.ID,
-		LabelKind:           string(d.Kind),
-		LabelNode:           e.Node,
-		LabelHash:           top.Hash,
-		LabelSpec:           SpecHash(d),
-		LabelRequestCPU:     strconv.FormatFloat(request.CPUs, 'f', -1, 64),
-		LabelRequestMemory:  request.Memory,
-		LabelRequestPids:    strconv.FormatInt(request.Pids, 10),
-		LabelRequestDisk:    request.Storage(),
-		LabelRequestFDs:     strconv.FormatInt(request.FileDescriptors, 10),
-		LabelRequestNetDevs: strconv.FormatInt(request.NetDevices, 10),
+		LabelManaged:  "true",
+		LabelLab:      top.Name,
+		LabelDevice:   d.Name,
+		LabelDeviceID: d.ID,
+		LabelKind:     string(d.Kind),
+		LabelNode:     e.Node,
+		LabelHash:     top.Hash,
+		LabelSpec:     SpecHash(d),
 	}
+	setRequestLabels(out, request)
 	if e.Generation != "" {
 		out[LabelGen] = e.Generation
 	}
@@ -1026,6 +1097,15 @@ func (e *Engine) labels(top *model.Topology, d *model.Device) map[string]string 
 		}
 	}
 	return out
+}
+
+func setRequestLabels(labels map[string]string, request model.ResourceRequest) {
+	labels[LabelRequestCPU] = strconv.FormatFloat(request.CPUs, 'f', -1, 64)
+	labels[LabelRequestMemory] = request.Memory
+	labels[LabelRequestPids] = strconv.FormatInt(request.Pids, 10)
+	labels[LabelRequestDisk] = request.Storage()
+	labels[LabelRequestFDs] = strconv.FormatInt(request.FileDescriptors, 10)
+	labels[LabelRequestNetDevs] = strconv.FormatInt(request.NetDevices, 10)
 }
 
 // wire realises one link.

@@ -2,6 +2,7 @@ package expand
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/HongyuHe/twinet/internal/manifest"
@@ -83,6 +84,43 @@ func TestBundledRouterShellsNeverReceiveSysAdmin(t *testing.T) {
 			}
 			if containsCapability(d.Capabilities, "SYS_ADMIN") {
 				t.Errorf("%s: router shell %s has SYS_ADMIN; FRR must use the private control sidecar", path, d.ID)
+			}
+		}
+	}
+}
+
+// O12's capability boundary is not router-only: one accidentally privileged
+// host, switch, service, controller, or P4 device is still a host escape
+// surface. Scan fully inherited bundled devices rather than only literal YAML
+// kind defaults.
+func TestBundledExpandedDevicesUseOnlyMinimalCapabilities(t *testing.T) {
+	manifests, err := filepath.Glob("../../examples/*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range manifests {
+		loaded, err := manifest.Load(path)
+		if err != nil {
+			t.Fatalf("%s: %v", path, err)
+		}
+		if err := loaded.Validate().Err(); err != nil {
+			t.Fatalf("%s: %v", path, err)
+		}
+		result, err := Expand(loaded.Lab)
+		if err != nil {
+			t.Fatalf("%s: %v", path, err)
+		}
+		for _, device := range result.Topology.Devices {
+			for _, capability := range device.Capabilities {
+				normalized := strings.TrimPrefix(strings.ToUpper(capability), "CAP_")
+				switch normalized {
+				case "NET_ADMIN", "NET_RAW", "NET_BIND_SERVICE", "SYS_NICE":
+				default:
+					t.Errorf("%s: %s receives non-minimal capability %q", path, device.ID, capability)
+				}
+				if normalized == "SYS_ADMIN" {
+					t.Errorf("%s: %s receives SYS_ADMIN", path, device.ID)
+				}
 			}
 		}
 	}

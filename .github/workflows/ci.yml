@@ -104,6 +104,20 @@ jobs:
       - name: Build container images
         run: make images
 
+  o12-runtime-isolation:
+    name: O12 Docker isolation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: Prove router and FRR sidecar isolation
+        env:
+          TWINET_O12_INTEGRATION_ALLOW_DESTRUCTIVE: "1"
+        run: make o12-integration
+
   shell:
     name: Shell scripts and conventions
     runs-on: ubuntu-latest

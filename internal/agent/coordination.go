@@ -285,6 +285,41 @@ func (s *Server) requireMutationFence(lab string, fence Fence) error {
 	return s.fenceErrorLocked(lab, fence, s.nowTime())
 }
 
+// requireOverlayReservations proves that every cross-node VNI this node is
+// about to attach was atomically reserved by the same fenced controller. The
+// bridge/VXLAN names include the lab, but VXLAN demultiplexing uses the VNI on
+// the wire: accepting an unreserved collision would still let two labs receive
+// one another's frames.
+func (s *Server) requireOverlayReservations(top *model.Topology, fence Fence) error {
+	if top == nil {
+		return errors.New("overlay reservation needs a topology")
+	}
+	vnis := overlayVNIsOnNode(top, s.cfg.Node)
+	if len(vnis) == 0 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initCoordination()
+	now := s.nowTime()
+	changed := s.expireCoordinationLocked(now)
+	if changed {
+		if err := s.saveCoordinationLocked(); err != nil {
+			return fmt.Errorf("persist expired overlay reservations: %w", err)
+		}
+	}
+	for _, vni := range vnis {
+		claim, ok := s.overlayClaims[vni]
+		if !ok || claim.Lab != top.Name || claim.Generation != fence.Generation {
+			return fmt.Errorf("cross-node VNI %d for lab %q is not reserved by this mutation fence", vni, top.Name)
+		}
+		if !claim.Live && !claim.Until.IsZero() && !now.Before(claim.Until) {
+			return fmt.Errorf("cross-node VNI %d reservation for lab %q expired", vni, top.Name)
+		}
+	}
+	return nil
+}
+
 // fencedContext stops an in-flight plan as soon as its fence expires or is
 // superseded. Plan steps receive this context, so no not-yet-started Docker or
 // netlink mutation can run under a stale controller.

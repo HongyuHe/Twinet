@@ -93,6 +93,7 @@ type WireDev struct {
 	Binds              []string               `json:"binds,omitempty"`
 	Command            []string               `json:"command,omitempty"`
 	Labels             map[string]string      `json:"labels,omitempty"`
+	Hardening          model.RuntimeHardening `json:"hardening,omitempty"`
 	ServiceKind        string                 `json:"service_kind,omitempty"`
 	ServiceName        string                 `json:"service_name,omitempty"`
 	ServiceReplica     string                 `json:"service_replica,omitempty"`
@@ -249,7 +250,7 @@ func Serialise(top *model.Topology) *Wire {
 			CPUs: d.CPUs, Memory: d.Memory, Pids: d.Pids, Requests: d.Requests, Restart: d.Restart,
 			Privileged: d.Privileged, Env: d.Env, Sysctls: d.Sysctls,
 			Capabilities: d.Capabilities, Binds: d.Binds, Command: d.Command,
-			Labels: d.Labels, L2Gateway: d.L2Gateway, L2Domain: d.L2Domain,
+			Labels: d.Labels, Hardening: d.Hardening, L2Gateway: d.L2Gateway, L2Domain: d.L2Domain,
 			VLANs: d.VLANs, ServiceName: d.ServiceName,
 			ServiceReplica: d.ServiceReplica, ServiceIdentity: d.ServiceIdentity,
 			P4: d.P4, OpenFlow: d.OpenFlow, OpenFlowController: d.OpenFlowController,
@@ -403,7 +404,8 @@ func (w *Wire) Rehydrate() (*model.Topology, error) {
 			Requests: requests, Restart: wd.Restart,
 			Privileged: wd.Privileged, Env: wd.Env, Sysctls: wd.Sysctls,
 			Capabilities: wd.Capabilities, Binds: wd.Binds, Command: wd.Command,
-			Labels: wd.Labels, L2Gateway: wd.L2Gateway, L2Domain: wd.L2Domain,
+			Labels: wd.Labels, Hardening: model.EffectiveRuntimeHardening(model.DeviceKind(wd.Kind), wd.Hardening),
+			L2Gateway: wd.L2Gateway, L2Domain: wd.L2Domain,
 			ServiceKind: wd.ServiceKind, ServiceName: wd.ServiceName,
 			ServiceReplica: wd.ServiceReplica, ServiceIdentity: wd.ServiceIdentity,
 			P4: wd.P4, OpenFlow: wd.OpenFlow, OpenFlowController: wd.OpenFlowController,

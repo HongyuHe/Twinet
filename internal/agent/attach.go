@@ -66,6 +66,10 @@ func (s *Server) handleAttach(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusForbidden, errors.New("that container is not managed by twinet"))
 		return
 	}
+	if isInternalControlContainer(c) {
+		httpError(w, http.StatusForbidden, errors.New("that container is an internal control sidecar"))
+		return
+	}
 	if owner := q.Get("owner"); owner != "" && c.Labels[deploy.LabelOwner] != owner {
 		httpError(w, http.StatusForbidden,
 			fmt.Errorf("%s belongs to %q, not %q", container, c.Labels[deploy.LabelOwner], owner))

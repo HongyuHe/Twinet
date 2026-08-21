@@ -224,6 +224,10 @@ func dockerCreateConfig(spec *Spec) (*container.Config, *container.HostConfig, e
 	if networkMode == "" {
 		networkMode = "none"
 	}
+	pidMode, err := NormalizePIDMode(spec.PidMode)
+	if err != nil {
+		return nil, nil, fmt.Errorf("container %s: %w", spec.Name, err)
+	}
 	config := &container.Config{
 		Hostname:   spec.Hostname,
 		Image:      spec.Image,
@@ -236,10 +240,11 @@ func dockerCreateConfig(spec *Spec) (*container.Config, *container.HostConfig, e
 		NetworkMode:    container.NetworkMode(networkMode),
 		CapAdd:         append([]string(nil), spec.Capabilities...),
 		CapDrop:        cloneStrings(spec.CapDrop),
-		SecurityOpt:    cloneStrings(spec.SecurityOpt),
+		SecurityOpt:    cloneStrings(dockerSecurityOptions(spec.SecurityOpt)),
 		ReadonlyRootfs: spec.ReadOnlyRootfs,
 		Runtime:        spec.RuntimeClass,
 		UsernsMode:     container.UsernsMode(spec.UsernsMode),
+		PidMode:        container.PidMode(pidMode),
 		MaskedPaths:    cloneStrings(spec.MaskedPaths),
 		ReadonlyPaths:  cloneStrings(spec.ReadonlyPaths),
 		Privileged:     spec.Privileged,
@@ -706,6 +711,14 @@ func (d *dockerAPI) CopyTo(ctx context.Context, name, dst string, mode int64, co
 		Content:         bytes.NewReader(archive.Bytes()),
 	})
 	if err != nil {
+		if readonlyRootfsCopyError(err.Error()) {
+			if fallbackErr := writeReadonlyRootfsFile(ctx, d, name, dst, mode, content); fallbackErr == nil {
+				return nil
+			} else {
+				return fmt.Errorf("%s cp into %s:%s: %w; writable-mount fallback: %v",
+					d.engineName(), name, dir, err, fallbackErr)
+			}
+		}
 		return fmt.Errorf("%s cp into %s:%s: %w", d.engineName(), name, dir, err)
 	}
 	return nil

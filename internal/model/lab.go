@@ -227,6 +227,114 @@ type DeviceDefaults struct {
 	Binds        []string          `yaml:"binds,omitempty" json:"binds,omitempty"`
 	Privileged   *bool             `yaml:"privileged,omitempty" json:"privileged,omitempty"`
 	Command      []string          `yaml:"command,omitempty" json:"command,omitempty"`
+	// Hardening is inherited with the rest of the device runtime contract.
+	// Empty authored values receive the safe Twinet profile for the expanded
+	// kind; weakening it requires a named, audited development override.
+	Hardening RuntimeHardening `yaml:"hardening,omitempty" json:"hardening,omitempty"`
+}
+
+// RuntimeHardening is the portable subset of OCI runtime protections Twinet
+// can enforce on every device. It deliberately models policy rather than
+// exposing arbitrary Docker security options: a typo in a free-form option is
+// indistinguishable from no protection at all.
+type RuntimeHardening struct {
+	// DevelopmentOverride is an auditable reason for an exceptional local
+	// development setting. It is never a production compatibility fallback.
+	DevelopmentOverride string `yaml:"development_override,omitempty" json:"development_override,omitempty"`
+	NoNewPrivileges     *bool  `yaml:"no_new_privileges,omitempty" json:"no_new_privileges,omitempty"`
+	SeccompProfile      string `yaml:"seccomp_profile,omitempty" json:"seccomp_profile,omitempty"`
+	AppArmorProfile     string `yaml:"apparmor_profile,omitempty" json:"apparmor_profile,omitempty"`
+	ReadOnlyRootfs      *bool  `yaml:"read_only_rootfs,omitempty" json:"read_only_rootfs,omitempty"`
+	// WritablePaths are tmpfs mounts used by images that need ephemeral PID
+	// files, logs, package state, or generated platform configuration.
+	WritablePaths []string `yaml:"writable_paths,omitempty" json:"writable_paths,omitempty"`
+	MaskedPaths   []string `yaml:"masked_paths,omitempty" json:"masked_paths,omitempty"`
+	ReadonlyPaths []string `yaml:"readonly_paths,omitempty" json:"readonly_paths,omitempty"`
+	// RuntimeClass, UsernsMode, and PIDMode are selected explicitly when a
+	// deployment uses an alternate OCI runtime or namespace profile. "private"
+	// is the safe default and maps to Docker's omitted PID mode.
+	RuntimeClass string `yaml:"runtime_class,omitempty" json:"runtime_class,omitempty"`
+	UsernsMode   string `yaml:"userns_mode,omitempty" json:"userns_mode,omitempty"`
+	PIDMode      string `yaml:"pid_mode,omitempty" json:"pid_mode,omitempty"`
+}
+
+// DefaultRuntimeHardening returns the profile applied to every expanded
+// device. Docker starts each device without its default bridge network; this
+// profile adds the process/filesystem side of the same tenancy boundary.
+func DefaultRuntimeHardening(kind DeviceKind) RuntimeHardening {
+	truth := true
+	// /var/run is a compatibility symlink to /run in every shipped image; do
+	// not mount both paths because some OCI runtimes reject overlapping tmpfs
+	// mount points.
+	writable := []string{"/run", "/var/log", "/tmp", "/var/tmp", "/etc/twinet"}
+	switch kind {
+	case KindRouter:
+		// /etc/frr is a narrowly scoped host bind owned by the FRR sidecar,
+		// not a generic writable root filesystem.
+	case KindSwitch:
+		writable = append(writable, "/etc/openvswitch")
+	case KindService:
+		writable = append(writable, "/etc/bind", "/var/named")
+	case KindP4:
+		writable = append(writable, "/etc/twinet/p4")
+	}
+	return RuntimeHardening{
+		NoNewPrivileges: &truth, SeccompProfile: "default", AppArmorProfile: "docker-default",
+		ReadOnlyRootfs: &truth, PIDMode: "private", WritablePaths: writable,
+		MaskedPaths: []string{
+			"/proc/asound", "/proc/acpi", "/proc/kcore", "/proc/keys", "/proc/latency_stats",
+			"/proc/timer_list", "/proc/timer_stats", "/proc/sched_debug", "/proc/scsi",
+			"/sys/firmware", "/sys/devices/system/cpu/cpu0/thermal_throttle",
+		},
+		ReadonlyPaths: []string{
+			"/proc/bus", "/proc/fs", "/proc/irq", "/proc/sys", "/proc/sysrq-trigger",
+		},
+	}
+}
+
+// EffectiveRuntimeHardening merges an authored profile over the safe
+// per-device-kind profile.
+func EffectiveRuntimeHardening(kind DeviceKind, authored RuntimeHardening) RuntimeHardening {
+	return authored.Merge(DefaultRuntimeHardening(kind))
+}
+
+// Merge returns h with unset fields inherited from base.
+func (h RuntimeHardening) Merge(base RuntimeHardening) RuntimeHardening {
+	out := h
+	if out.DevelopmentOverride == "" {
+		out.DevelopmentOverride = base.DevelopmentOverride
+	}
+	if out.NoNewPrivileges == nil {
+		out.NoNewPrivileges = base.NoNewPrivileges
+	}
+	if out.SeccompProfile == "" {
+		out.SeccompProfile = base.SeccompProfile
+	}
+	if out.AppArmorProfile == "" {
+		out.AppArmorProfile = base.AppArmorProfile
+	}
+	if out.ReadOnlyRootfs == nil {
+		out.ReadOnlyRootfs = base.ReadOnlyRootfs
+	}
+	if out.RuntimeClass == "" {
+		out.RuntimeClass = base.RuntimeClass
+	}
+	if out.UsernsMode == "" {
+		out.UsernsMode = base.UsernsMode
+	}
+	if out.PIDMode == "" {
+		out.PIDMode = base.PIDMode
+	}
+	out.WritablePaths = mergeStringSet(base.WritablePaths, out.WritablePaths)
+	out.MaskedPaths = mergeStringSet(base.MaskedPaths, out.MaskedPaths)
+	out.ReadonlyPaths = mergeStringSet(base.ReadonlyPaths, out.ReadonlyPaths)
+	return out
+}
+
+// DevelopmentOverrideActive reports whether an exceptional setting carries an
+// audit reason rather than silently behaving like a legacy insecure default.
+func (h RuntimeHardening) DevelopmentOverrideActive() bool {
+	return strings.TrimSpace(h.DevelopmentOverride) != ""
 }
 
 // ResourceRequest is the capacity a device reserves on its host. It is
@@ -304,7 +412,10 @@ func DefaultResourceRequest(kind DeviceKind) ResourceRequest {
 		}
 	case KindSwitch:
 		return ResourceRequest{
-			CPUs: 0.25, Memory: "128Mi", Pids: 64, EphemeralStorage: "128Mi",
+			// ovs-vswitchd starts one handler per available CPU plus
+			// revalidator threads; 64 PIDs kills it on ordinary 56-core
+			// teaching workers before it can create br0.
+			CPUs: 0.25, Memory: "128Mi", Pids: 512, EphemeralStorage: "128Mi",
 			FileDescriptors: 1024, NetDevices: 16,
 		}
 	case KindService:
@@ -327,6 +438,19 @@ func DefaultResourceRequest(kind DeviceKind) ResourceRequest {
 			CPUs: 0.10, Memory: "64Mi", Pids: 32, EphemeralStorage: "64Mi",
 			FileDescriptors: 256, NetDevices: 2,
 		}
+	}
+}
+
+// FRRControlResourceRequest is the additional reservation for the isolated
+// FRR control sidecar. It is deliberately separate from the router shell so
+// admission counts every OCI container the hardened router contract creates.
+func FRRControlResourceRequest() ResourceRequest {
+	return ResourceRequest{
+		// FRR starts zebra, mgmtd, BGP, OSPF, LDP, watchfrr, and their helper
+		// threads together. A tiny sidecar limit turns a healthy topology into
+		// a slow-start race under concurrent lab deployment.
+		CPUs: 0.50, Memory: "256Mi", Pids: 256, EphemeralStorage: "128Mi",
+		FileDescriptors: 1024, NetDevices: 0,
 	}
 }
 
@@ -380,6 +504,7 @@ func (d DeviceDefaults) Merge(base DeviceDefaults) DeviceDefaults {
 	out.Sysctls = mergeStringMap(base.Sysctls, out.Sysctls)
 	out.Capabilities = mergeStringSet(base.Capabilities, out.Capabilities)
 	out.Binds = append(append([]string{}, base.Binds...), out.Binds...)
+	out.Hardening = out.Hardening.Merge(base.Hardening)
 	return out
 }
 
@@ -1104,8 +1229,12 @@ type LegacyPorts struct {
 
 // Placement configures how ASes are distributed across cluster nodes.
 type Placement struct {
-	Strategy string            `yaml:"strategy,omitempty" json:"strategy,omitempty" jsonschema:"enum=pack-by-as,enum=spread-by-as,enum=single-node"`
-	Nodes    []NodeSpec        `yaml:"nodes,omitempty" json:"nodes,omitempty"`
+	Strategy string     `yaml:"strategy,omitempty" json:"strategy,omitempty" jsonschema:"enum=pack-by-as,enum=spread-by-as,enum=single-node"`
+	Nodes    []NodeSpec `yaml:"nodes,omitempty" json:"nodes,omitempty"`
+	// NodePool restricts this lab to nodes carrying the named hardened worker
+	// pool. It is a placement constraint, not a label that merely appears in a
+	// report after an unsafe assignment was already made.
+	NodePool string            `yaml:"node_pool,omitempty" json:"node_pool,omitempty"`
 	Pin      []PlacementPin    `yaml:"pin,omitempty" json:"pin,omitempty"`
 	Reserve  map[string]Budget `yaml:"reserve,omitempty" json:"reserve,omitempty"`
 	// OnNodeLoss decides whether a clustered deployment may move work away
@@ -1117,6 +1246,9 @@ type Placement struct {
 // NodeSpec declares one cluster node.
 type NodeSpec struct {
 	Name string `yaml:"name" json:"name" jsonschema:"required"`
+	// Pool selects a dedicated worker pool (for example sandboxed student
+	// evaluation workers). An empty pool is the ordinary cluster pool.
+	Pool string `yaml:"pool,omitempty" json:"pool,omitempty"`
 	// Addr is the agent's gRPC address. Defaults to name:7200.
 	Addr string `yaml:"addr,omitempty" json:"addr,omitempty"`
 	// UnderlayIP is the VTEP source address for cross-node VXLAN links.
@@ -1129,6 +1261,10 @@ type NodeSpec struct {
 	// node, such as a rack, availability zone, or host. An omitted value is
 	// the node itself, which is conservative for ordinary teaching clusters.
 	FailureDomain string `yaml:"failure_domain,omitempty" json:"failure_domain,omitempty"`
+	// RuntimeClass and UsernsMode are node-approved defaults used when a
+	// device has not selected a more specific hardened runtime profile.
+	RuntimeClass string `yaml:"runtime_class,omitempty" json:"runtime_class,omitempty"`
+	UsernsMode   string `yaml:"userns_mode,omitempty" json:"userns_mode,omitempty"`
 }
 
 // Domain returns the failure domain used for durable-copy placement.

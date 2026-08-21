@@ -38,6 +38,20 @@ func TestControllerWildcard(t *testing.T) {
 	}
 }
 
+func TestMultipleCertificateIdentitiesFailClosed(t *testing.T) {
+	controller, err := URIs(RoleController, []string{"*"}, []string{"*"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	operator, err := URIs(RoleOperator, []string{"lab-a"}, []string{ActionObserve})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := FromCertificate(&x509.Certificate{URIs: append(controller, operator...)}); err == nil {
+		t.Fatal("certificate with conflicting identities was accepted")
+	}
+}
+
 func TestIncompleteOrUnknownClaimsAreRefused(t *testing.T) {
 	if _, err := URIs("root", []string{"*"}, []string{"*"}); err == nil {
 		t.Fatal("an unknown role was issued")

@@ -190,7 +190,9 @@ func TestRepairRechecksHoldBeforeMutating(t *testing.T) {
 }
 
 func TestEventScopeOrderAndBoundedMetrics(t *testing.T) {
-	server := &Server{cfg: Config{Node: "node-0", Token: "secret", EventCapacity: 2}}
+	server := &Server{cfg: Config{
+		Node: "node-0", Token: "secret", EventCapacity: 2, Insecure: true, Listen: "127.0.0.1:7200",
+	}}
 	ring := server.eventLog()
 	ring.append(Event{
 		Timestamp: time.Unix(20, 0), Lab: "lab-b", Scope: "api", Action: "x", Result: "success",

@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+
+	"github.com/HongyuHe/twinet/internal/authz"
 )
 
 // A diagnostic credential is a read-only, single-lab derivative of the cluster
@@ -60,49 +62,14 @@ func diagnosticScope(secret, tok string) (string, bool) {
 // the client supplied is removed first.
 const scopeHeader = "X-Twinet-Diagnostic-Lab"
 
-// authDiag admits either the cluster token or a diagnostic token. Handlers
-// wrapped with it must check diagScopeOf and restrict themselves accordingly.
+// authDiag is retained for internal compatibility handlers. The certificate
+// claim remains the authority boundary; the diagnostic bearer derivative can
+// corroborate it but cannot widen it.
 func (s *Server) authDiag(h http.HandlerFunc) http.HandlerFunc {
-	full := []byte("Bearer " + s.cfg.Token)
-	return func(w http.ResponseWriter, r *http.Request) {
-		r.Header.Del(scopeHeader)
-		if peerClient(r) {
-			http.Error(w, "a node peer certificate may only use the peer replication API",
-				http.StatusForbidden)
-			return
-		}
-		got := r.Header.Get("Authorization")
-		if subtle.ConstantTimeCompare([]byte(got), full) == 1 && !diagnosticClient(r) {
-			h(w, r)
-			return
-		}
-		if lab, ok := diagnosticScope(s.cfg.Token, strings.TrimPrefix(got, "Bearer ")); ok {
-			r.Header.Set(scopeHeader, lab)
-			h(w, r)
-			return
-		}
-		http.Error(w, "unauthorised", http.StatusUnauthorized)
-	}
-}
-
-// diagnosticClient reports whether the transport identity is the certificate
-// issued to an evaluated agent.
-//
-// A leaked cluster token should not be usable from inside the sandbox. The
-// token was found in a world-readable systemd unit and the agent read it, so
-// the certificate it was given is now also a limit rather than only a
-// permission: presented with it, a node refuses the full token and honours only
-// a diagnostic one. Two independent things now have to go wrong.
-func diagnosticClient(r *http.Request) bool {
-	if r.TLS == nil {
-		return false
-	}
-	for _, c := range r.TLS.PeerCertificates {
-		if c.Subject.CommonName == "diagnostic" {
-			return true
-		}
-	}
-	return false
+	return s.authorize(endpointPolicy{
+		Action: authz.ActionObserve, AllowCluster: true,
+		ResolveRequest: scopeFromQuery(authz.ActionObserve, true),
+	}, h)
 }
 
 // diagScopeOf reports the lab a diagnostic caller is confined to, and whether

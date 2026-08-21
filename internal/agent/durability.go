@@ -130,7 +130,7 @@ func (c *httpPeerStateClient) Import(ctx context.Context, req PeerStateRequest) 
 // make a compromised node a controller.
 func (s *Server) peerAuth(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
+		if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 || len(r.TLS.VerifiedChains) == 0 {
 			http.Error(w, "a mutually authenticated peer certificate is required", http.StatusUnauthorized)
 			return
 		}
@@ -144,8 +144,45 @@ func (s *Server) peerAuth(h http.HandlerFunc) http.HandlerFunc {
 			http.Error(w, "peer certificate has no node identity", http.StatusForbidden)
 			return
 		}
-		h(w, r)
+		scope, err := peerRequestScope(r)
+		if err != nil {
+			http.Error(w, "a valid peer-state lab scope is required", http.StatusBadRequest)
+			return
+		}
+		principal := requestPrincipal{
+			Identity: id, Name: cert.Subject.CommonName,
+			CertificateSerial: hex.EncodeToString(cert.SerialNumber.Bytes()),
+		}
+		ctx := context.WithValue(r.Context(), requestPrincipalKey{}, principal)
+		ctx = context.WithValue(ctx, requestScopeKey{}, scope)
+		r = r.WithContext(ctx)
+		if r.Method != http.MethodPost {
+			h(w, r)
+			return
+		}
+		observed := &authorizationResponseWriter{ResponseWriter: w}
+		h(observed, r)
+		result := "success"
+		if observed.status >= http.StatusBadRequest {
+			result = "error"
+		}
+		s.recordAuthorizationAudit(r, scope, principal, result, "")
 	}
+}
+
+func peerRequestScope(r *http.Request) (requestScope, error) {
+	lab := strings.TrimSpace(r.URL.Query().Get("lab"))
+	if r.Method == http.MethodPost {
+		values, err := requestJSONObject(r)
+		if err != nil {
+			return requestScope{}, err
+		}
+		lab = jsonString(values["lab"])
+	}
+	if !labNameRE.MatchString(lab) {
+		return requestScope{}, errors.New("lab is required")
+	}
+	return requestScope{Lab: lab, Action: authz.ActionPeerState, Target: lab}, nil
 }
 
 func peerNodeName(r *http.Request) string {
@@ -448,7 +485,11 @@ func (s *Server) dialPeer(_ context.Context, node model.NodeSpec) (peerStateClie
 		if s.cfg.TLSCert == "" || s.cfg.TLSKey == "" || s.cfg.ClientCA == "" {
 			return nil, errors.New("peer replication requires complete mutual TLS material")
 		}
-		cert, err := tls.LoadX509KeyPair(s.cfg.TLSCert, s.cfg.TLSKey)
+		certPath, keyPath, _, credentialErr := s.peerTLSPaths(time.Now())
+		if credentialErr != nil {
+			return nil, credentialErr
+		}
+		cert, err := tls.LoadX509KeyPair(certPath, keyPath)
 		if err != nil {
 			return nil, fmt.Errorf("load node peer certificate: %w", err)
 		}
@@ -464,13 +505,30 @@ func (s *Server) dialPeer(_ context.Context, node model.NodeSpec) (peerStateClie
 			MinVersion: tls.VersionTLS13, Certificates: []tls.Certificate{cert}, RootCAs: pool,
 		}
 		scheme = "https"
-	} else if !s.cfg.Insecure {
-		return nil, errors.New("peer replication requires mutual TLS; insecure mode must be explicit")
+	} else if !s.insecureLoopbackMode() {
+		return nil, errors.New("peer replication requires mutual TLS; insecure loopback mode must be explicit")
 	}
 	return &httpPeerStateClient{
 		base: scheme + "://" + strings.TrimRight(addr, "/"),
 		http: &http.Client{Timeout: 2 * time.Minute, Transport: transport},
 	}, nil
+}
+
+func (s *Server) peerTLSPaths(now time.Time) (certPath, keyPath string, legacy bool, err error) {
+	if (s.cfg.PeerTLSCert == "") != (s.cfg.PeerTLSKey == "") {
+		return "", "", false, errors.New("peer replication requires -peer-tls-cert and -peer-tls-key together")
+	}
+	if s.cfg.PeerTLSCert != "" {
+		return s.cfg.PeerTLSCert, s.cfg.PeerTLSKey, false, nil
+	}
+	if s.cfg.LegacyPeerCertUntil.IsZero() || !now.Before(s.cfg.LegacyPeerCertUntil) {
+		return "", "", false, errors.New(
+			"peer replication requires a separate peer certificate; the explicit legacy migration deadline is absent or expired")
+	}
+	if s.cfg.TLSCert == "" || s.cfg.TLSKey == "" {
+		return "", "", false, errors.New("legacy peer migration has no listener certificate")
+	}
+	return s.cfg.TLSCert, s.cfg.TLSKey, true, nil
 }
 
 func (s *Server) replicateDurableState(ctx context.Context, top *model.Topology) error {

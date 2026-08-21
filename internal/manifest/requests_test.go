@@ -34,6 +34,23 @@ func TestPartialRequestInheritsKindDefaults(t *testing.T) {
 	}
 }
 
+func TestHardeningRejectsHostSocketAndRouterSysAdmin(t *testing.T) {
+	var diagnostics Diagnostics
+	validateDeviceResources(&diagnostics, "lab.yaml", "kinds.router", model.DeviceDefaults{
+		Capabilities: []string{"NET_ADMIN", "SYS_ADMIN"},
+		Binds:        []string{"/var/run/docker.sock:/var/run/docker.sock"},
+	}, nil)
+	if !diagnostics.HasErrors() {
+		t.Fatal("unsafe device hardening declaration was accepted")
+	}
+	message := diagnostics.String()
+	for _, want := range []string{"SYS_ADMIN", "host-sensitive bind"} {
+		if !strings.Contains(message, want) {
+			t.Errorf("hardening diagnostics = %s, missing %q", message, want)
+		}
+	}
+}
+
 func TestExplicitZeroRequestIsRejectedRatherThanInherited(t *testing.T) {
 	var node yaml.Node
 	if err := yaml.Unmarshal([]byte("requests:\n  cpus: 0\n"), &node); err != nil {

@@ -28,16 +28,26 @@ var eventCorrelationSequence atomic.Uint64
 // identifiers in the event body rather than as Prometheus labels: events are
 // bounded and queryable, while metric cardinality must remain bounded.
 type Event struct {
-	Sequence      uint64    `json:"sequence"`
-	Timestamp     time.Time `json:"timestamp"`
-	Node          string    `json:"node"`
-	Lab           string    `json:"lab,omitempty"`
-	Generation    string    `json:"generation,omitempty"`
-	Scope         string    `json:"scope"`
-	CorrelationID string    `json:"correlation_id,omitempty"`
-	Action        string    `json:"action"`
-	Result        string    `json:"result"`
-	Detail        string    `json:"detail,omitempty"`
+	Sequence   uint64    `json:"sequence"`
+	Timestamp  time.Time `json:"timestamp"`
+	Node       string    `json:"node"`
+	Lab        string    `json:"lab,omitempty"`
+	Generation string    `json:"generation,omitempty"`
+	// FenceGeneration identifies the fenced controller mutation that caused
+	// this event. It is separate from Generation: a deployment generation is
+	// content addressed, while a fence generation orders competing writers.
+	FenceGeneration uint64 `json:"fence_generation,omitempty"`
+	// Identity and CertificateSerial make a privileged mutation attributable
+	// without retaining bearer credentials or certificate bodies.
+	Identity          string `json:"identity,omitempty"`
+	CertificateSerial string `json:"certificate_serial,omitempty"`
+	// Target is the container, device, or cluster object the request changed.
+	Target        string `json:"target,omitempty"`
+	Scope         string `json:"scope"`
+	CorrelationID string `json:"correlation_id,omitempty"`
+	Action        string `json:"action"`
+	Result        string `json:"result"`
+	Detail        string `json:"detail,omitempty"`
 }
 
 // EventsResponse is the finite page returned by GET /v1/events when follow is
@@ -106,6 +116,9 @@ func (r *eventRing) append(event Event) Event {
 	event.Scope = boundedEventScope(event.Scope)
 	event.Action = boundedEventText(event.Action, 80)
 	event.Result = boundedEventResult(event.Result)
+	event.Identity = boundedEventText(event.Identity, 160)
+	event.CertificateSerial = boundedEventText(event.CertificateSerial, 128)
+	event.Target = boundedEventText(event.Target, 256)
 	event.Detail = boundedEventText(event.Detail, maxEventDetail)
 	r.items = append(r.items, event)
 	if len(r.items) > r.capacity {
@@ -208,7 +221,7 @@ func boundedEventScope(value string) string {
 func boundedEventResult(value string) string {
 	switch value {
 	case "success", "error", "unknown", "scheduled", "skipped", "backoff",
-		"held", "exempt", "canceled", "healthy", "broken", "partial":
+		"held", "exempt", "canceled", "healthy", "broken", "partial", "denied":
 		return value
 	default:
 		return "other"
@@ -216,9 +229,49 @@ func boundedEventResult(value string) string {
 }
 
 func boundedEventText(value string, limit int) string {
+	value = redactEventText(value)
 	value = strings.ReplaceAll(strings.ReplaceAll(strings.TrimSpace(value), "\r", " "), "\n", " ")
 	if len(value) > limit {
 		return value[:limit] + "…"
+	}
+	return value
+}
+
+// redactEventText keeps operational error messages useful without letting a
+// bearer credential, private key, or PEM body become durable audit data. Event
+// writers deliberately share this final choke point; a future handler cannot
+// accidentally bypass redaction by calling recordEvent directly.
+func redactEventText(value string) string {
+	replacements := []struct {
+		prefix string
+	}{
+		{"Bearer "},
+		{"bearer "},
+		{"Authorization:"},
+		{"authorization:"},
+		{"token="},
+		{"token:"},
+		{"secret="},
+		{"secret:"},
+		{"-----BEGIN "},
+	}
+	for _, replacement := range replacements {
+		for {
+			index := strings.Index(value, replacement.prefix)
+			if index < 0 {
+				break
+			}
+			end := index + len(replacement.prefix)
+			for end < len(value) {
+				switch value[end] {
+				case ' ', '\t', '\r', '\n', ',', ';', '"', '\'':
+					goto replace
+				}
+				end++
+			}
+		replace:
+			value = value[:index] + "[redacted]" + value[end:]
+		}
 	}
 	return value
 }
@@ -330,7 +383,13 @@ func SortEvents(events []Event) {
 
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	lab := r.URL.Query().Get("lab")
-	if scope, diagnostic := diagScopeOf(r); diagnostic {
+	if scope, scoped := scopedRequestOf(r); scoped && scope.Lab != "" && scope.Lab != "*" {
+		if lab != "" && lab != scope.Lab {
+			httpError(w, http.StatusForbidden, errors.New("this diagnostic session is scoped to another lab"))
+			return
+		}
+		lab = scope.Lab
+	} else if scope, diagnostic := diagScopeOf(r); diagnostic {
 		if lab != "" && lab != scope {
 			httpError(w, http.StatusForbidden, errors.New("this diagnostic session is scoped to another lab"))
 			return

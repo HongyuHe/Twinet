@@ -250,6 +250,10 @@ var skipped = map[string]string{
 	// configuration was written against. Changing host headroom must not make
 	// every archive appear to belong to another exercise revision.
 	"Requests": "host admission reservation, not topology",
+	// Runtime hardening is enforced through the per-container spec hash. It
+	// must recreate a device when changed, but does not alter the course
+	// topology a student's saved work belongs to.
+	"Hardening": "runtime deployment policy; represented by the container spec hash",
 
 	// Lab fields that describe the deployment rather than the exercise. The
 	// same lab must hash identically on a laptop and on a twelve-node cluster,

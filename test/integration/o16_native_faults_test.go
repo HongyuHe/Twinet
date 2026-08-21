@@ -203,11 +203,24 @@ func verifyRoutingContract(t *testing.T, binary, manifest string) {
 	if !strings.Contains(bgp, "1.150.0.2") || strings.Contains(bgp, " Active") || strings.Contains(bgp, " Idle") {
 		t.Fatalf("iBGP did not converge through the P4 data plane:\n%s", bgp)
 	}
-	ping, err := runTwinet(binary, time.Minute, "exec", "-m", manifest, "as1/R1", "--",
-		"ping", "-n", "-c", "2", "-W", "1", "1.150.0.2")
-	if err != nil {
-		t.Fatalf("routed loopback data-plane probe failed: %v\n%s", err, ping)
+	// Zebra can report the OSPF route before the kernel FIB transaction is
+	// visible to a freshly exec'd probe, especially while a hardened OVS
+	// datapath finishes its handler startup. Prove the data plane rather than
+	// mistaking that short control-plane/FIB handoff for a routing failure.
+	var (
+		ping    string
+		pingErr error
+	)
+	pingDeadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(pingDeadline) {
+		ping, pingErr = runTwinet(binary, time.Minute, "exec", "-m", manifest, "as1/R1", "--",
+			"ping", "-n", "-c", "2", "-W", "1", "1.150.0.2")
+		if pingErr == nil {
+			return
+		}
+		time.Sleep(time.Second)
 	}
+	t.Fatalf("routed loopback data-plane probe failed: %v\n%s", pingErr, ping)
 }
 
 func runDocker(timeout time.Duration, args ...string) (string, error) {

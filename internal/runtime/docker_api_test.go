@@ -384,6 +384,86 @@ func TestDockerCLIHardeningSystemPaths(t *testing.T) {
 	}
 }
 
+func TestDockerDefaultSeccompUsesEngineDefaultProfile(t *testing.T) {
+	spec := &Spec{
+		Name: "default-seccomp", Image: "example:latest",
+		SecurityOpt: []string{"no-new-privileges", "seccomp=default", "apparmor=docker-default"},
+	}
+	args, err := dockerCLICreateArgs(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if containsDockerArgPair(args, "--security-opt", "seccomp=default") {
+		t.Fatalf("Docker CLI sent invalid literal default seccomp option: %#v", args)
+	}
+	if !containsDockerArgPair(args, "--security-opt", "apparmor=docker-default") {
+		t.Fatalf("Docker CLI omitted explicit AppArmor profile: %#v", args)
+	}
+	_, hostConfig, err := dockerCreateConfig(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slices.Contains(hostConfig.SecurityOpt, "seccomp=default") ||
+		!slices.Contains(hostConfig.SecurityOpt, "apparmor=docker-default") {
+		t.Fatalf("Docker API security options = %#v", hostConfig.SecurityOpt)
+	}
+}
+
+func TestDockerPIDModeOmitsPrivateAndRendersSharedModes(t *testing.T) {
+	private := &Spec{Name: "isolated-sidecar", Image: "example:latest", PidMode: "private"}
+	args, err := dockerCLICreateArgs(private)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if containsDockerArg(args, "--pid") {
+		t.Fatalf("private PID mode emitted an invalid Docker argument: %#v", args)
+	}
+	_, hostConfig, err := dockerCreateConfig(private)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hostConfig.PidMode != "" {
+		t.Fatalf("private PID mode mapped to HostConfig.PidMode=%q, want empty default", hostConfig.PidMode)
+	}
+	for _, mode := range []string{"host", "container:router"} {
+		args, err := dockerCLICreateArgs(&Spec{Name: "shared", Image: "example:latest", PidMode: mode})
+		if err != nil {
+			t.Fatalf("PID mode %q: %v", mode, err)
+		}
+		if !containsDockerArgPair(args, "--pid", mode) {
+			t.Fatalf("PID mode %q was not rendered in %#v", mode, args)
+		}
+		_, hostConfig, err := dockerCreateConfig(&Spec{Name: "shared", Image: "example:latest", PidMode: mode})
+		if err != nil {
+			t.Fatalf("API PID mode %q: %v", mode, err)
+		}
+		if string(hostConfig.PidMode) != mode {
+			t.Fatalf("API PID mode %q mapped to %q", mode, hostConfig.PidMode)
+		}
+	}
+	if _, err := dockerCLICreateArgs(&Spec{Name: "bad", Image: "example:latest", PidMode: "invalid"}); err == nil {
+		t.Fatal("invalid PID mode was accepted")
+	}
+}
+
+func containsDockerArg(args []string, want string) bool {
+	for _, arg := range args {
+		if arg == want {
+			return true
+		}
+	}
+	return false
+}
+
+func containsDockerArgPair(args []string, first, second string) bool {
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == first && args[i+1] == second {
+			return true
+		}
+	}
+	return false
+}
+
 func TestDockerAPILifecycleCreateInspectAndList(t *testing.T) {
 	var create struct {
 		Env         []string
