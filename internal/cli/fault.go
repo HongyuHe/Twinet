@@ -5,6 +5,7 @@ import (
 
 	"encoding/json"
 	"fmt"
+	"github.com/HongyuHe/twinet/internal/agent"
 	"github.com/HongyuHe/twinet/internal/client"
 	"os"
 	"path/filepath"
@@ -602,11 +603,14 @@ func exemptFunc(top *model.Topology, token string) (
 		if !ok {
 			return fmt.Errorf("no device %q", deviceID)
 		}
-		n, ok := cl.Node(d.Node)
+		_, ok = cl.Node(d.Node)
 		if !ok {
 			return fmt.Errorf("device %s is on unknown node %q", deviceID, d.Node)
 		}
-		return n.Exempt(ctx, top.Name, deviceID, injectionID, on)
+		return cl.Exempt(ctx, d.Node, agent.ExemptRequest{
+			Lab: top.Name, Device: deviceID, ID: injectionID, On: on,
+			Hold: currentHoldToken(),
+		})
 	}, nil
 }
 

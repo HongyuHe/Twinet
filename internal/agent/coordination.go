@@ -1,0 +1,829 @@
+package agent
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"os"
+	"sort"
+	"time"
+
+	"github.com/HongyuHe/twinet/internal/netx"
+)
+
+// Fence identifies one issued mutation lease. Token is deliberately opaque:
+// generation orders leases, while the unguessable token proves that a caller
+// owns that particular generation.
+type Fence struct {
+	Token      string `json:"token,omitempty"`
+	Generation uint64 `json:"generation,omitempty"`
+}
+
+// LeaseAcquireRequest asks one node to issue a mutation fence for a lab.
+type LeaseAcquireRequest struct {
+	Lab        string `json:"lab"`
+	Holder     string `json:"holder,omitempty"`
+	TTLSeconds int    `json:"ttl_seconds,omitempty"`
+}
+
+// LeaseRenewRequest extends an existing mutation lease.
+type LeaseRenewRequest struct {
+	Lab        string `json:"lab"`
+	Fence      Fence  `json:"fence"`
+	TTLSeconds int    `json:"ttl_seconds,omitempty"`
+}
+
+// LeaseReleaseRequest drops an existing mutation lease.
+type LeaseReleaseRequest struct {
+	Lab   string `json:"lab"`
+	Fence Fence  `json:"fence"`
+}
+
+// LeaseResponse describes an issued or renewed lease.
+type LeaseResponse struct {
+	Lab       string    `json:"lab"`
+	Fence     Fence     `json:"fence"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+// OverlayReservationRequest atomically claims the supplied VNIs on one node.
+// The claim is tied to the mutation fence, so an expired controller cannot
+// create an overlay after a newer controller has taken over the lab.
+type OverlayReservationRequest struct {
+	Lab   string   `json:"lab"`
+	Hold  string   `json:"hold,omitempty"`
+	Fence Fence    `json:"fence"`
+	VNIs  []uint32 `json:"vnis"`
+}
+
+// OverlayReservationResponse reports the claimed VNIs.
+type OverlayReservationResponse struct {
+	Lab       string    `json:"lab"`
+	VNIs      []uint32  `json:"vnis"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+const (
+	defaultMutationLeaseSeconds = 90
+	maxMutationLeaseSeconds     = 600
+)
+
+// clusterLease is intentionally in-memory. A process restart invalidates every
+// token; persisted high-water marks ensure that the next token has a newer
+// generation and stale callers cannot become valid again.
+type clusterLease struct {
+	holder string
+	fence  Fence
+	until  time.Time
+}
+
+// overlayClaim is either a short-lived reservation or the durable record of a
+// live overlay. Live claims are released only after normal overlay destruction.
+type overlayClaim struct {
+	Lab        string    `json:"lab"`
+	Generation uint64    `json:"generation"`
+	Until      time.Time `json:"until,omitempty"`
+	Live       bool      `json:"live"`
+}
+
+type generationState struct {
+	Committed string `json:"committed,omitempty"`
+	Prepared  string `json:"prepared,omitempty"`
+}
+
+// applyTransaction persists enough information to fail closed after a crashed
+// coordinator. It intentionally excludes the opaque token: after restart no
+// old caller can continue or finish this transaction.
+type applyTransaction struct {
+	Generation      string            `json:"generation"`
+	Expected        string            `json:"expected,omitempty"`
+	FenceGeneration uint64            `json:"fence_generation"`
+	Requested       json.RawMessage   `json:"requested"`
+	Previous        json.RawMessage   `json:"previous,omitempty"`
+	PreviousGen     string            `json:"previous_generation,omitempty"`
+	Mode            string            `json:"mode,omitempty"`
+	Ungraded        int               `json:"ungraded_as,omitempty"`
+	PeerUnderlay    map[string]string `json:"peer_underlay,omitempty"`
+	Prune           bool              `json:"prune,omitempty"`
+	OnlySteps       []string          `json:"only_steps,omitempty"`
+	Applied         bool              `json:"applied"`
+	Committed       bool              `json:"committed"`
+}
+
+type coordinationState struct {
+	FenceHighWater map[string]uint64           `json:"fence_high_water,omitempty"`
+	Overlays       map[uint32]overlayClaim     `json:"overlays,omitempty"`
+	Generations    map[string]generationState  `json:"generations,omitempty"`
+	Transactions   map[string]applyTransaction `json:"transactions,omitempty"`
+}
+
+func (s *Server) initCoordination() {
+	if s.mutations == nil {
+		s.mutations = map[string]*clusterLease{}
+	}
+	if s.fenceHighWater == nil {
+		s.fenceHighWater = map[string]uint64{}
+	}
+	if s.overlayClaims == nil {
+		s.overlayClaims = map[uint32]overlayClaim{}
+	}
+	if s.generations == nil {
+		s.generations = map[string]generationState{}
+	}
+	if s.transactions == nil {
+		s.transactions = map[string]applyTransaction{}
+	}
+}
+
+func (s *Server) nowTime() time.Time {
+	if s.now != nil {
+		return s.now()
+	}
+	return time.Now()
+}
+
+func leaseTTL(seconds int) time.Duration {
+	if seconds <= 0 {
+		seconds = defaultMutationLeaseSeconds
+	}
+	if seconds > maxMutationLeaseSeconds {
+		seconds = maxMutationLeaseSeconds
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func opaqueFenceToken() (string, error) {
+	var raw [32]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(raw[:]), nil
+}
+
+func (s *Server) loadCoordination() {
+	if s.store == nil {
+		return
+	}
+	raw, err := s.store.Coordination()
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			slog.Warn("reading coordination state", "err", err)
+		}
+		return
+	}
+	var disk coordinationState
+	if err := json.Unmarshal(raw, &disk); err != nil {
+		slog.Warn("reading coordination state", "err", err)
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initCoordination()
+	for lab, generation := range disk.FenceHighWater {
+		if generation > s.fenceHighWater[lab] {
+			s.fenceHighWater[lab] = generation
+		}
+	}
+	for vni, claim := range disk.Overlays {
+		s.overlayClaims[vni] = claim
+	}
+	for lab, generation := range disk.Generations {
+		s.generations[lab] = generation
+	}
+	for lab, transaction := range disk.Transactions {
+		s.transactions[lab] = transaction
+	}
+	_ = s.expireCoordinationLocked(s.nowTime())
+}
+
+// saveCoordinationLocked persists fencing high-water marks, live overlay
+// ownership, and unfinished transactions. The caller holds s.mu.
+func (s *Server) saveCoordinationLocked() error {
+	if s.store == nil {
+		return nil
+	}
+	disk := coordinationState{
+		FenceHighWater: s.fenceHighWater,
+		Overlays:       s.overlayClaims,
+		Generations:    s.generations,
+		Transactions:   s.transactions,
+	}
+	raw, err := json.Marshal(disk)
+	if err != nil {
+		return err
+	}
+	return s.store.PutCoordination(raw)
+}
+
+// expireCoordinationLocked drops expired in-memory leases and their
+// reservations. The caller holds s.mu.
+func (s *Server) expireCoordinationLocked(now time.Time) bool {
+	changed := false
+	for lab, lease := range s.mutations {
+		if !now.Before(lease.until) {
+			delete(s.mutations, lab)
+			changed = true
+		}
+	}
+	for vni, claim := range s.overlayClaims {
+		if !claim.Live && !claim.Until.IsZero() && !now.Before(claim.Until) {
+			delete(s.overlayClaims, vni)
+			changed = true
+		}
+	}
+	return changed
+}
+
+func (s *Server) fenceErrorLocked(lab string, fence Fence, now time.Time) error {
+	if lab == "" {
+		return errors.New("a mutation must name its lab")
+	}
+	if fence.Token == "" || fence.Generation == 0 {
+		return errors.New("a valid mutation fence is required")
+	}
+	lease := s.mutations[lab]
+	if lease == nil || !now.Before(lease.until) {
+		return fmt.Errorf("the mutation lease for lab %q has expired or was released; its fence is stale", lab)
+	}
+	if lease.fence.Generation != fence.Generation ||
+		subtle.ConstantTimeCompare([]byte(lease.fence.Token), []byte(fence.Token)) != 1 {
+		return fmt.Errorf("the mutation fence for lab %q is stale", lab)
+	}
+	return nil
+}
+
+func (s *Server) requireMutationFence(lab string, fence Fence) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initCoordination()
+	changed := s.expireCoordinationLocked(s.nowTime())
+	if changed {
+		if err := s.saveCoordinationLocked(); err != nil {
+			return fmt.Errorf("persisting expired coordination state: %w", err)
+		}
+	}
+	return s.fenceErrorLocked(lab, fence, s.nowTime())
+}
+
+// fencedContext stops an in-flight plan as soon as its fence expires or is
+// superseded. Plan steps receive this context, so no not-yet-started Docker or
+// netlink mutation can run under a stale controller.
+func (s *Server) fencedContext(parent context.Context, lab string, fence Fence) (
+	context.Context, func(),
+) {
+	ctx, cancel := context.WithCancel(parent)
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if err := s.requireMutationFence(lab, fence); err != nil {
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	return ctx, func() {
+		close(stop)
+		cancel()
+		<-done
+	}
+}
+
+func (s *Server) acquireMutationLease(req LeaseAcquireRequest) (LeaseResponse, error) {
+	if req.Lab == "" {
+		return LeaseResponse{}, errors.New("a lab name is required")
+	}
+	token, err := opaqueFenceToken()
+	if err != nil {
+		return LeaseResponse{}, fmt.Errorf("generate fencing token: %w", err)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initCoordination()
+	now := s.nowTime()
+	changed := s.expireCoordinationLocked(now)
+	if held := s.mutations[req.Lab]; held != nil {
+		return LeaseResponse{}, fmt.Errorf("lab %q is already leased by %s for another %s",
+			req.Lab, held.holder, time.Until(held.until).Round(time.Second))
+	}
+	generation := s.fenceHighWater[req.Lab] + 1
+	s.fenceHighWater[req.Lab] = generation
+	until := now.Add(leaseTTL(req.TTLSeconds))
+	lease := &clusterLease{
+		holder: req.Holder,
+		fence:  Fence{Token: token, Generation: generation},
+		until:  until,
+	}
+	s.mutations[req.Lab] = lease
+	if changed || s.store != nil {
+		if err := s.saveCoordinationLocked(); err != nil {
+			delete(s.mutations, req.Lab)
+			return LeaseResponse{}, fmt.Errorf("persisting fence generation: %w", err)
+		}
+	}
+	return LeaseResponse{Lab: req.Lab, Fence: lease.fence, ExpiresAt: until}, nil
+}
+
+func (s *Server) renewMutationLease(req LeaseRenewRequest) (LeaseResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initCoordination()
+	now := s.nowTime()
+	changed := s.expireCoordinationLocked(now)
+	if err := s.fenceErrorLocked(req.Lab, req.Fence, now); err != nil {
+		if changed {
+			_ = s.saveCoordinationLocked()
+		}
+		return LeaseResponse{}, err
+	}
+	lease := s.mutations[req.Lab]
+	lease.until = now.Add(leaseTTL(req.TTLSeconds))
+	for vni, claim := range s.overlayClaims {
+		if !claim.Live && claim.Lab == req.Lab && claim.Generation == req.Fence.Generation {
+			claim.Until = lease.until
+			s.overlayClaims[vni] = claim
+			changed = true
+		}
+	}
+	if changed {
+		if err := s.saveCoordinationLocked(); err != nil {
+			return LeaseResponse{}, fmt.Errorf("persisting renewed reservation: %w", err)
+		}
+	}
+	return LeaseResponse{Lab: req.Lab, Fence: lease.fence, ExpiresAt: lease.until}, nil
+}
+
+func (s *Server) releaseMutationLease(req LeaseReleaseRequest) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initCoordination()
+	now := s.nowTime()
+	changed := s.expireCoordinationLocked(now)
+	if err := s.fenceErrorLocked(req.Lab, req.Fence, now); err != nil {
+		if changed {
+			_ = s.saveCoordinationLocked()
+		}
+		return err
+	}
+	delete(s.mutations, req.Lab)
+	for vni, claim := range s.overlayClaims {
+		if !claim.Live && claim.Lab == req.Lab && claim.Generation == req.Fence.Generation {
+			delete(s.overlayClaims, vni)
+			changed = true
+		}
+	}
+	if changed {
+		if err := s.saveCoordinationLocked(); err != nil {
+			return fmt.Errorf("persisting released reservation: %w", err)
+		}
+	}
+	return nil
+}
+
+func (s *Server) overlayOwnersNow() (map[uint32]string, error) {
+	if s.overlayOwners != nil {
+		return s.overlayOwners()
+	}
+	return netx.OverlayOwners()
+}
+
+func sortedVNIs(vnis []uint32) ([]uint32, error) {
+	seen := map[uint32]bool{}
+	out := make([]uint32, 0, len(vnis))
+	for _, vni := range vnis {
+		if vni == 0 {
+			return nil, errors.New("overlay VNI must be non-zero")
+		}
+		if !seen[vni] {
+			seen[vni] = true
+			out = append(out, vni)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out, nil
+}
+
+func (s *Server) reserveOverlays(req OverlayReservationRequest) (OverlayReservationResponse, error) {
+	vnis, err := sortedVNIs(req.VNIs)
+	if err != nil {
+		return OverlayReservationResponse{}, err
+	}
+	if req.Lab == "" {
+		return OverlayReservationResponse{}, errors.New("a lab name is required")
+	}
+	owners, err := s.overlayOwnersNow()
+	if err != nil {
+		return OverlayReservationResponse{}, fmt.Errorf("listing live overlay ownership: %w", err)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initCoordination()
+	now := s.nowTime()
+	changed := s.expireCoordinationLocked(now)
+	if err := s.fenceErrorLocked(req.Lab, req.Fence, now); err != nil {
+		if changed {
+			_ = s.saveCoordinationLocked()
+		}
+		return OverlayReservationResponse{}, err
+	}
+	lease := s.mutations[req.Lab]
+	for _, vni := range vnis {
+		if owner, exists := owners[vni]; exists && owner != req.Lab {
+			if owner == "" {
+				return OverlayReservationResponse{}, fmt.Errorf(
+					"VNI %d is already present on this node without a Twinet owner; refusing to share it", vni)
+			}
+			return OverlayReservationResponse{}, fmt.Errorf(
+				"VNI %d is already owned by lab %q on this node", vni, owner)
+		}
+		if claim, exists := s.overlayClaims[vni]; exists {
+			switch {
+			case claim.Lab != req.Lab:
+				return OverlayReservationResponse{}, fmt.Errorf(
+					"VNI %d is reserved or live for lab %q on this node", vni, claim.Lab)
+			case claim.Live:
+				continue // an idempotent apply of the owning lab
+			case claim.Generation != req.Fence.Generation:
+				return OverlayReservationResponse{}, fmt.Errorf(
+					"VNI %d is reserved by an older fence for lab %q", vni, req.Lab)
+			}
+		}
+	}
+	for _, vni := range vnis {
+		claim := s.overlayClaims[vni]
+		if claim.Live {
+			// A redeploy of the owning lab keeps the live tunnel, but its
+			// ownership is now guarded by the newer mutation fence.
+			if claim.Generation != req.Fence.Generation {
+				claim.Generation = req.Fence.Generation
+				s.overlayClaims[vni] = claim
+				changed = true
+			}
+			continue
+		}
+		s.overlayClaims[vni] = overlayClaim{
+			Lab: req.Lab, Generation: req.Fence.Generation, Until: lease.until,
+		}
+		changed = true
+	}
+	if changed {
+		if err := s.saveCoordinationLocked(); err != nil {
+			return OverlayReservationResponse{}, fmt.Errorf("persisting overlay reservation: %w", err)
+		}
+	}
+	return OverlayReservationResponse{Lab: req.Lab, VNIs: vnis, ExpiresAt: lease.until}, nil
+}
+
+func (s *Server) promoteOverlayReservations(lab string, fence Fence, vnis []uint32) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initCoordination()
+	now := s.nowTime()
+	if err := s.fenceErrorLocked(lab, fence, now); err != nil {
+		return err
+	}
+	changed := false
+	for _, vni := range vnis {
+		claim, ok := s.overlayClaims[vni]
+		if !ok || claim.Lab != lab || claim.Generation != fence.Generation {
+			return fmt.Errorf("VNI %d was not reserved by this mutation fence", vni)
+		}
+		if !claim.Live {
+			claim.Live = true
+			claim.Until = time.Time{}
+			s.overlayClaims[vni] = claim
+			changed = true
+		}
+	}
+	if changed {
+		if err := s.saveCoordinationLocked(); err != nil {
+			return fmt.Errorf("persisting live overlay ownership: %w", err)
+		}
+	}
+	return nil
+}
+
+func (s *Server) releaseOverlayClaims(lab string, vnis []uint32) error {
+	want := map[uint32]bool{}
+	for _, vni := range vnis {
+		want[vni] = true
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initCoordination()
+	changed := false
+	for vni, claim := range s.overlayClaims {
+		if claim.Lab != lab || (len(want) > 0 && !want[vni]) {
+			continue
+		}
+		delete(s.overlayClaims, vni)
+		changed = true
+	}
+	if changed {
+		return s.saveCoordinationLocked()
+	}
+	return nil
+}
+
+func (s *Server) prepareGeneration(lab string, fence Fence, expected, generation string,
+	requested json.RawMessage, mode string, ungraded int, peers map[string]string, prune bool,
+	onlySteps []string,
+) error {
+	if generation == "" {
+		return errors.New("a deployment generation is required")
+	}
+
+	var previous json.RawMessage
+	if s.store != nil {
+		if raw, err := s.store.Topology(lab); err == nil {
+			previous = append(json.RawMessage(nil), raw...)
+		}
+	}
+	if len(previous) == 0 {
+		s.mu.Lock()
+		if top := s.current[lab]; top != nil {
+			if raw, err := json.Marshal(Serialise(top)); err == nil {
+				previous = raw
+			}
+		}
+		s.mu.Unlock()
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initCoordination()
+	now := s.nowTime()
+	if err := s.fenceErrorLocked(lab, fence, now); err != nil {
+		return err
+	}
+	state := s.generations[lab]
+	if tx, active := s.transactions[lab]; active {
+		if tx.Generation == generation && tx.FenceGeneration == fence.Generation {
+			return nil
+		}
+		return fmt.Errorf("lab %q has an unfinished deployment transaction for generation %q; "+
+			"refusing a new generation until it is recovered", lab, tx.Generation)
+	}
+	if state.Committed != expected {
+		return fmt.Errorf("generation compare-and-swap for lab %q failed: expected %q, node has %q",
+			lab, expected, state.Committed)
+	}
+	s.transactions[lab] = applyTransaction{
+		Generation: generation, Expected: expected, FenceGeneration: fence.Generation,
+		Requested: append(json.RawMessage(nil), requested...), Previous: previous,
+		PreviousGen: state.Committed, Mode: mode, Ungraded: ungraded,
+		PeerUnderlay: peers, Prune: prune, OnlySteps: append([]string(nil), onlySteps...),
+	}
+	state.Prepared = generation
+	s.generations[lab] = state
+	if err := s.saveCoordinationLocked(); err != nil {
+		delete(s.transactions, lab)
+		state.Prepared = ""
+		s.generations[lab] = state
+		return fmt.Errorf("persisting prepared generation: %w", err)
+	}
+	return nil
+}
+
+func (s *Server) checkPreparedGeneration(lab string, fence Fence, generation string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initCoordination()
+	if err := s.fenceErrorLocked(lab, fence, s.nowTime()); err != nil {
+		return err
+	}
+	tx, ok := s.transactions[lab]
+	if !ok || tx.Generation != generation || tx.FenceGeneration != fence.Generation {
+		return fmt.Errorf("generation %q of lab %q was not prepared by this fence", generation, lab)
+	}
+	return nil
+}
+
+func (s *Server) markGenerationApplied(lab string, fence Fence, generation string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initCoordination()
+	if err := s.fenceErrorLocked(lab, fence, s.nowTime()); err != nil {
+		return err
+	}
+	tx, ok := s.transactions[lab]
+	if !ok || tx.Generation != generation || tx.FenceGeneration != fence.Generation {
+		return fmt.Errorf("generation %q of lab %q was not prepared by this fence", generation, lab)
+	}
+	tx.Applied = true
+	s.transactions[lab] = tx
+	if err := s.saveCoordinationLocked(); err != nil {
+		return fmt.Errorf("persisting applied generation: %w", err)
+	}
+	return nil
+}
+
+func (s *Server) transactionForCommit(lab string, fence Fence, generation string) (applyTransaction, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initCoordination()
+	if err := s.fenceErrorLocked(lab, fence, s.nowTime()); err != nil {
+		return applyTransaction{}, err
+	}
+	tx, ok := s.transactions[lab]
+	if !ok || tx.Generation != generation || tx.FenceGeneration != fence.Generation || !tx.Applied {
+		return applyTransaction{}, fmt.Errorf("generation %q of lab %q was not fully applied by this fence",
+			generation, lab)
+	}
+	return tx, nil
+}
+
+func (s *Server) finishCommittedGeneration(lab string, fence Fence, generation string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initCoordination()
+	if err := s.fenceErrorLocked(lab, fence, s.nowTime()); err != nil {
+		return err
+	}
+	tx, ok := s.transactions[lab]
+	if !ok || tx.Generation != generation || tx.FenceGeneration != fence.Generation || !tx.Applied {
+		return fmt.Errorf("generation %q of lab %q cannot be committed by this fence", generation, lab)
+	}
+	state := s.generations[lab]
+	state.Committed, state.Prepared = generation, ""
+	s.generations[lab] = state
+	tx.Committed = true
+	s.transactions[lab] = tx
+	if err := s.saveCoordinationLocked(); err != nil {
+		tx.Committed = false
+		s.transactions[lab] = tx
+		state.Committed, state.Prepared = tx.PreviousGen, generation
+		s.generations[lab] = state
+		return fmt.Errorf("persisting committed generation: %w", err)
+	}
+	return nil
+}
+
+// finalizeCommittedGeneration drops rollback material only after the
+// coordinator has received a commit acknowledgement from every node. Until
+// then an ambiguous response can still be aborted safely.
+func (s *Server) finalizeCommittedGeneration(lab string, fence Fence, generation string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initCoordination()
+	if err := s.fenceErrorLocked(lab, fence, s.nowTime()); err != nil {
+		return err
+	}
+	tx, ok := s.transactions[lab]
+	if !ok || tx.Generation != generation || tx.FenceGeneration != fence.Generation || !tx.Committed {
+		return fmt.Errorf("generation %q of lab %q is not awaiting finalization by this fence",
+			generation, lab)
+	}
+	delete(s.transactions, lab)
+	if err := s.saveCoordinationLocked(); err != nil {
+		s.transactions[lab] = tx
+		return fmt.Errorf("persisting finalized generation: %w", err)
+	}
+	return nil
+}
+
+func (s *Server) transactionForAbort(lab string, fence Fence, generation string) (applyTransaction, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initCoordination()
+	if err := s.fenceErrorLocked(lab, fence, s.nowTime()); err != nil {
+		return applyTransaction{}, err
+	}
+	tx, ok := s.transactions[lab]
+	if !ok {
+		return applyTransaction{}, nil
+	}
+	if tx.Generation != generation || tx.FenceGeneration != fence.Generation {
+		return applyTransaction{}, fmt.Errorf("generation %q of lab %q is not owned by this fence",
+			generation, lab)
+	}
+	return tx, nil
+}
+
+func (s *Server) finishAbortedGeneration(lab string, fence Fence, generation string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initCoordination()
+	if err := s.fenceErrorLocked(lab, fence, s.nowTime()); err != nil {
+		return err
+	}
+	tx, ok := s.transactions[lab]
+	if !ok {
+		return nil
+	}
+	if tx.Generation != generation || tx.FenceGeneration != fence.Generation {
+		return fmt.Errorf("generation %q of lab %q is not owned by this fence",
+			generation, lab)
+	}
+	state := s.generations[lab]
+	state.Committed, state.Prepared = tx.PreviousGen, ""
+	s.generations[lab] = state
+	delete(s.transactions, lab)
+	if err := s.saveCoordinationLocked(); err != nil {
+		return fmt.Errorf("persisting aborted generation: %w", err)
+	}
+	return nil
+}
+
+func (s *Server) committedGenerations() map[string]string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initCoordination()
+	out := make(map[string]string, len(s.generations))
+	for lab, state := range s.generations {
+		if state.Committed != "" {
+			out[lab] = state.Committed
+		}
+	}
+	return out
+}
+
+func (s *Server) mutationLeaseHolder(lab string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initCoordination()
+	_ = s.expireCoordinationLocked(s.nowTime())
+	if lease := s.mutations[lab]; lease != nil {
+		if lease.holder != "" {
+			return lease.holder
+		}
+		return "a fenced cluster operation"
+	}
+	return ""
+}
+
+func (s *Server) handleLeaseAcquire(w http.ResponseWriter, r *http.Request) {
+	var req LeaseAcquireRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpError(w, http.StatusBadRequest, err)
+		return
+	}
+	resp, err := s.acquireMutationLease(req)
+	if err != nil {
+		httpError(w, http.StatusConflict, err)
+		return
+	}
+	writeJSON(w, resp)
+}
+
+func (s *Server) handleLeaseRenew(w http.ResponseWriter, r *http.Request) {
+	var req LeaseRenewRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpError(w, http.StatusBadRequest, err)
+		return
+	}
+	resp, err := s.renewMutationLease(req)
+	if err != nil {
+		httpError(w, http.StatusConflict, err)
+		return
+	}
+	writeJSON(w, resp)
+}
+
+func (s *Server) handleLeaseRelease(w http.ResponseWriter, r *http.Request) {
+	var req LeaseReleaseRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := s.releaseMutationLease(req); err != nil {
+		httpError(w, http.StatusConflict, err)
+		return
+	}
+	writeJSON(w, struct{}{})
+}
+
+func (s *Server) handleOverlayReserve(w http.ResponseWriter, r *http.Request) {
+	var req OverlayReservationRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpError(w, http.StatusBadRequest, err)
+		return
+	}
+	if why := s.refuseMutationIfHeld(req.Lab, req.Hold, "reserving overlay identifiers"); why != "" {
+		httpError(w, http.StatusConflict, errors.New(why))
+		return
+	}
+	resp, err := s.reserveOverlays(req)
+	if err != nil {
+		httpError(w, http.StatusConflict, err)
+		return
+	}
+	writeJSON(w, resp)
+}

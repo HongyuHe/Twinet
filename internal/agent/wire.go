@@ -20,13 +20,17 @@ import (
 // Being explicit here also pins the control-plane-to-agent contract: adding a
 // field to the model does not silently change what a node receives.
 type Wire struct {
-	Lab      string      `json:"lab"`
-	Hash     string      `json:"hash"`
-	Devices  []WireDev   `json:"devices"`
-	Links    []WireLink  `json:"links"`
-	ASes     []WireAS    `json:"ases"`
-	Services []WireSvc   `json:"services,omitempty"`
-	Defaults WireDefault `json:"defaults"`
+	Lab  string `json:"lab"`
+	Hash string `json:"hash"`
+	// Generation is committed only after every node has applied the prepared
+	// topology. It travels with the persisted topology so restart recovery can
+	// reject an older controller even when no lease is active in memory.
+	Generation string      `json:"generation,omitempty"`
+	Devices    []WireDev   `json:"devices"`
+	Links      []WireLink  `json:"links"`
+	ASes       []WireAS    `json:"ases"`
+	Services   []WireSvc   `json:"services,omitempty"`
+	Defaults   WireDefault `json:"defaults"`
 	// PeerUnderlay maps node name to VTEP address. It is carried with the lab
 	// so a node can rebuild a cross-node link on its own initiative, which it
 	// must be able to do: a container that restarts at three in the morning
@@ -62,33 +66,36 @@ type Wire struct {
 
 // WireDev is one device.
 type WireDev struct {
-	ID           string            `json:"id"`
-	Name         string            `json:"name"`
-	Kind         string            `json:"kind"`
-	AS           int               `json:"as,omitempty"`
-	RouterID     int               `json:"router_id,omitempty"`
-	Node         string            `json:"node"`
-	Image        string            `json:"image"`
-	ImageID      string            `json:"image_id,omitempty"`
-	Container    string            `json:"container"`
-	Hostname     string            `json:"hostname"`
-	Owner        string            `json:"owner,omitempty"`
-	CPUs         float64           `json:"cpus,omitempty"`
-	Memory       string            `json:"memory,omitempty"`
-	Pids         int64             `json:"pids,omitempty"`
-	Restart      string            `json:"restart,omitempty"`
-	Privileged   bool              `json:"privileged,omitempty"`
-	Env          map[string]string `json:"env,omitempty"`
-	Sysctls      map[string]string `json:"sysctls,omitempty"`
-	Capabilities []string          `json:"capabilities,omitempty"`
-	Binds        []string          `json:"binds,omitempty"`
-	Command      []string          `json:"command,omitempty"`
-	Labels       map[string]string `json:"labels,omitempty"`
-	ServiceKind  string            `json:"service_kind,omitempty"`
-	L2Gateway    string            `json:"l2_gateway,omitempty"`
-	L2Domain     string            `json:"l2_domain,omitempty"`
-	VLANs        []int             `json:"vlans,omitempty"`
-	Ifaces       []WireIface       `json:"ifaces,omitempty"`
+	ID                string            `json:"id"`
+	Name              string            `json:"name"`
+	Kind              string            `json:"kind"`
+	AS                int               `json:"as,omitempty"`
+	RouterID          int               `json:"router_id,omitempty"`
+	InteriorRole      string            `json:"interior_role,omitempty"`
+	InteriorRoleIndex int               `json:"interior_role_index,omitempty"`
+	PlacementGroup    string            `json:"placement_group,omitempty"`
+	Node              string            `json:"node"`
+	Image             string            `json:"image"`
+	ImageID           string            `json:"image_id,omitempty"`
+	Container         string            `json:"container"`
+	Hostname          string            `json:"hostname"`
+	Owner             string            `json:"owner,omitempty"`
+	CPUs              float64           `json:"cpus,omitempty"`
+	Memory            string            `json:"memory,omitempty"`
+	Pids              int64             `json:"pids,omitempty"`
+	Restart           string            `json:"restart,omitempty"`
+	Privileged        bool              `json:"privileged,omitempty"`
+	Env               map[string]string `json:"env,omitempty"`
+	Sysctls           map[string]string `json:"sysctls,omitempty"`
+	Capabilities      []string          `json:"capabilities,omitempty"`
+	Binds             []string          `json:"binds,omitempty"`
+	Command           []string          `json:"command,omitempty"`
+	Labels            map[string]string `json:"labels,omitempty"`
+	ServiceKind       string            `json:"service_kind,omitempty"`
+	L2Gateway         string            `json:"l2_gateway,omitempty"`
+	L2Domain          string            `json:"l2_domain,omitempty"`
+	VLANs             []int             `json:"vlans,omitempty"`
+	Ifaces            []WireIface       `json:"ifaces,omitempty"`
 }
 
 // WireIface is one interface.
@@ -138,15 +145,18 @@ type WireLink struct {
 
 // WireAS is one autonomous system.
 type WireAS struct {
-	ASN        int      `json:"asn"`
-	Role       string   `json:"role"`
-	Region     string   `json:"region,omitempty"`
-	Template   string   `json:"template,omitempty"`
-	OwnerGroup string   `json:"owner_group,omitempty"`
-	Block      string   `json:"block,omitempty"`
-	BlockV6    string   `json:"block_v6,omitempty"`
-	Routers    []string `json:"routers,omitempty"`
-	Devices    []string `json:"devices,omitempty"`
+	ASN             int                  `json:"asn"`
+	Role            string               `json:"role"`
+	Region          string               `json:"region,omitempty"`
+	Template        string               `json:"template,omitempty"`
+	OwnerGroup      string               `json:"owner_group,omitempty"`
+	Block           string               `json:"block,omitempty"`
+	BlockV6         string               `json:"block_v6,omitempty"`
+	InteriorKind    string               `json:"interior_kind,omitempty"`
+	Distributable   bool                 `json:"distributable,omitempty"`
+	PlacementGroups []WirePlacementGroup `json:"placement_groups,omitempty"`
+	Routers         []string             `json:"routers,omitempty"`
+	Devices         []string             `json:"devices,omitempty"`
 	// MPLS and VRFs carry the advanced course's declarations, which the node
 	// needs in order to create the kernel routing tables and the renderer
 	// needs in order to configure them.
@@ -165,6 +175,15 @@ type WireAS struct {
 	// did not receive it would deploy a lab where the exercise cannot be
 	// configured at all.
 	Multicast model.MulticastSpec `json:"multicast,omitempty"`
+}
+
+// WirePlacementGroup is an atomic placement unit represented by device IDs.
+// Device pointers are rebuilt when the agent reconstructs the topology.
+type WirePlacementGroup struct {
+	ID      string   `json:"id"`
+	ASN     int      `json:"asn"`
+	Class   string   `json:"class,omitempty"`
+	Devices []string `json:"devices"`
 }
 
 // WireSvc is one auxiliary service.
@@ -200,7 +219,9 @@ func Serialise(top *model.Topology) *Wire {
 		wd := WireDev{
 			ServiceKind: d.ServiceKind,
 			ID:          d.ID, Name: d.Name, Kind: string(d.Kind), AS: d.ASN,
-			RouterID: d.RouterID, Node: d.Node, Image: d.Image, ImageID: d.ImageID,
+			RouterID: d.RouterID, InteriorRole: string(d.InteriorRole),
+			InteriorRoleIndex: d.InteriorRoleIndex, PlacementGroup: d.PlacementGroup,
+			Node: d.Node, Image: d.Image, ImageID: d.ImageID,
 			Container: d.Container, Hostname: d.Hostname, Owner: d.Owner,
 			CPUs: d.CPUs, Memory: d.Memory, Pids: d.Pids, Restart: d.Restart,
 			Privileged: d.Privileged, Env: d.Env, Sysctls: d.Sysctls,
@@ -241,8 +262,9 @@ func Serialise(top *model.Topology) *Wire {
 		wa := WireAS{
 			ASN: as.ASN, Role: string(as.Role), Region: as.Region,
 			Template: as.Template, OwnerGroup: as.OwnerGroup,
-			Block: as.Block, BlockV6: as.BlockV6,
-			MPLSEnabled: as.MPLS.Enabled, MPLSCore: as.MPLS.Core,
+			Block: as.Block, BlockV6: as.BlockV6, InteriorKind: string(as.InteriorKind),
+			Distributable: as.Distributable,
+			MPLSEnabled:   as.MPLS.Enabled, MPLSCore: as.MPLS.Core,
 			Multicast:         as.Multicast,
 			Provisioned:       sortedSetKeys(as.Provisioned),
 			ProvisionedIfaces: sortedSetKeys(as.ProvisionedIfaces),
@@ -258,6 +280,13 @@ func Serialise(top *model.Topology) *Wire {
 		}
 		for _, d := range as.Devices {
 			wa.Devices = append(wa.Devices, d.ID)
+		}
+		for _, group := range as.SortedPlacementGroups() {
+			wg := WirePlacementGroup{ID: group.ID, ASN: group.ASN, Class: group.Class}
+			for _, d := range group.Devices {
+				wg.Devices = append(wg.Devices, d.ID)
+			}
+			wa.PlacementGroups = append(wa.PlacementGroups, wg)
 		}
 		w.ASes = append(w.ASes, wa)
 	}
@@ -309,7 +338,9 @@ func (w *Wire) Rehydrate() (*model.Topology, error) {
 		wd := &w.Devices[i]
 		d := &model.Device{
 			ID: wd.ID, Name: wd.Name, Kind: model.DeviceKind(wd.Kind), ASN: wd.AS,
-			RouterID: wd.RouterID, Node: wd.Node, Image: wd.Image, ImageID: wd.ImageID,
+			RouterID: wd.RouterID, InteriorRole: model.InteriorRole(wd.InteriorRole),
+			InteriorRoleIndex: wd.InteriorRoleIndex, PlacementGroup: wd.PlacementGroup,
+			Node: wd.Node, Image: wd.Image, ImageID: wd.ImageID,
 			Container: wd.Container, Hostname: wd.Hostname, Owner: wd.Owner,
 			CPUs: wd.CPUs, Memory: wd.Memory, Pids: wd.Pids, Restart: wd.Restart,
 			Privileged: wd.Privileged, Env: wd.Env, Sysctls: wd.Sysctls,
@@ -361,6 +392,7 @@ func (w *Wire) Rehydrate() (*model.Topology, error) {
 			ASN: wa.ASN, Role: model.ASRole(wa.Role), Region: wa.Region,
 			Template: wa.Template, OwnerGroup: wa.OwnerGroup,
 			Block: wa.Block, BlockV6: wa.BlockV6,
+			InteriorKind: model.InteriorKind(wa.InteriorKind), Distributable: wa.Distributable,
 			ExtPorts:          map[string]*model.ExtPortBinding{},
 			MPLS:              model.MPLSSpec{Enabled: wa.MPLSEnabled, Core: wa.MPLSCore},
 			Multicast:         wa.Multicast,
@@ -387,6 +419,18 @@ func (w *Wire) Rehydrate() (*model.Topology, error) {
 				return nil, fmt.Errorf("AS %d references unknown device %s", wa.ASN, id)
 			}
 			as.Devices = append(as.Devices, d)
+		}
+		for _, wg := range wa.PlacementGroups {
+			group := &model.PlacementGroup{ID: wg.ID, ASN: wg.ASN, Class: wg.Class}
+			for _, id := range wg.Devices {
+				d, ok := top.Devices[id]
+				if !ok {
+					return nil, fmt.Errorf("AS %d placement group %s references unknown device %s",
+						wa.ASN, wg.ID, id)
+				}
+				group.Devices = append(group.Devices, d)
+			}
+			as.PlacementGroups = append(as.PlacementGroups, group)
 		}
 		top.ASes[as.ASN] = as
 	}

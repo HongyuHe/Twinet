@@ -35,7 +35,10 @@ type exemptions struct {
 
 // ExemptRequest adds or removes one exemption.
 type ExemptRequest struct {
-	Lab    string `json:"lab"`
+	Lab  string `json:"lab"`
+	Hold string `json:"hold,omitempty"`
+	// Fence proves the cluster mutation lease that owns this change.
+	Fence  Fence  `json:"fence"`
 	Device string `json:"device"`
 	// ID is an opaque injection identifier.
 	ID string `json:"id"`
@@ -54,6 +57,19 @@ func (s *Server) handleExempt(w http.ResponseWriter, r *http.Request) {
 			errors.New("a lab, a device and an injection identifier are all required"))
 		return
 	}
+	if err := s.requireMutationFence(req.Lab, req.Fence); err != nil {
+		httpError(w, http.StatusConflict, err)
+		return
+	}
+	if why := s.refuseMutationIfHeld(req.Lab, req.Hold, "changing a repair exemption"); why != "" {
+		httpError(w, http.StatusConflict, errors.New(why))
+		return
+	}
+	if err := s.acquire(req.Lab, "exemption"); err != nil {
+		httpError(w, http.StatusConflict, err)
+		return
+	}
+	defer s.release(req.Lab)
 	if err := s.setExempt(req); err != nil {
 		// Reported, not logged and forgotten. An injection whose exemption
 		// could not be recorded will be undone by the repair loop within the

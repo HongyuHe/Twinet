@@ -5,11 +5,10 @@
 // one machine, and exposes them to the control plane over an authenticated
 // HTTP API.
 //
-// The control plane stays stateless: it sends each node the slice of the
-// topology that belongs to it and asks the node to converge. Because every
-// allocated resource is derived by hashing rather than handed out by a
-// registry, two agents independently compute the same VXLAN identifier for a
-// link they share and need no coordination whatsoever.
+// The control plane sends each node the topology it needs to converge. A
+// short-lived fenced lease orders mutations across nodes, and node-local VNI
+// reservations make deterministic overlay identifiers safe when independent
+// labs happen to derive the same value.
 package agent
 
 import (
@@ -163,6 +162,17 @@ type Server struct {
 	// at a time instead of many.
 	ops map[string]*lease
 
+	// mutations are fenced, cluster-scoped operation leases. Unlike ops,
+	// which only serialise work inside this process, these leases are issued
+	// to the controller and survive every handler boundary.
+	mutations      map[string]*clusterLease
+	fenceHighWater map[string]uint64
+	overlayClaims  map[uint32]overlayClaim
+	generations    map[string]generationState
+	transactions   map[string]applyTransaction
+	now            func() time.Time
+	overlayOwners  func() (map[uint32]string, error)
+
 	// holds are labs an external operation has asked this node to leave alone.
 	holds map[string]*hold
 
@@ -205,12 +215,14 @@ func New(cfg Config) (*Server, error) {
 		exempt:      map[string]*exemptions{},
 		partial:     map[string]int{},
 	}
+	srv.initCoordination()
 	if cfg.StateDir != "" {
 		st, err := state.Open(cfg.StateDir)
 		if err != nil {
 			return nil, fmt.Errorf("state directory: %w", err)
 		}
 		srv.store = st
+		srv.loadCoordination()
 		srv.rehydrate()
 	}
 	return srv, nil
@@ -252,6 +264,16 @@ func (s *Server) rehydrate() {
 			continue
 		}
 		s.current[top.Name] = top
+		state := s.generations[top.Name]
+		if wt.Generation != "" {
+			// topology.json is atomically written with its generation, so it
+			// is the authority if a crash landed between that write and the
+			// separate coordination journal update.
+			state.Committed = wt.Generation
+		} else if state.Committed == "" {
+			state.Committed = top.Hash
+		}
+		s.generations[top.Name] = state
 		s.rememberHow(top.Name, wt.Mode, wt.Ungraded)
 		s.loadExemptions(top.Name)
 		if wt.PeerUnderlay != nil {
@@ -295,6 +317,9 @@ func (s *Server) acquire(lab, kind string) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.ops == nil {
+		s.ops = map[string]*lease{}
+	}
 	if held, ok := s.ops[lab]; ok {
 		return fmt.Errorf("another operation is already running on lab %q: %s, started %s ago",
 			lab, held.kind, time.Since(held.at).Round(time.Second))
@@ -356,6 +381,10 @@ func (s *Server) Serve(ctx context.Context) error {
 	mux.HandleFunc("GET /v1/containers", s.authDiag(s.handleContainers))
 	mux.HandleFunc("POST /v1/apply", s.auth(s.handleApply))
 	mux.HandleFunc("POST /v1/destroy", s.auth(s.handleDestroy))
+	mux.HandleFunc("POST /v1/lease/acquire", s.auth(s.handleLeaseAcquire))
+	mux.HandleFunc("POST /v1/lease/renew", s.auth(s.handleLeaseRenew))
+	mux.HandleFunc("POST /v1/lease/release", s.auth(s.handleLeaseRelease))
+	mux.HandleFunc("POST /v1/overlay/reserve", s.auth(s.handleOverlayReserve))
 	mux.HandleFunc("POST /v1/exec", s.authDiag(s.handleExec))
 	mux.HandleFunc("POST /v1/hold", s.auth(s.handleHold))
 	mux.HandleFunc("POST /v1/exempt", s.auth(s.handleExempt))
@@ -512,6 +541,9 @@ type StatusResponse struct {
 	// owns it, so an orchestrator can avoid handing a second lab an identifier
 	// the first is already using.
 	Overlays map[uint32]string `json:"overlays,omitempty"`
+	// Generations are the only committed deployment generations. A prepared
+	// transaction is deliberately absent: it is not a cluster commit.
+	Generations map[string]string `json:"generations,omitempty"`
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -550,6 +582,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	sort.Strings(busy)
 	resp.Busy = busy
 	s.mu.Unlock()
+	resp.Generations = s.committedGenerations()
 
 	if owners, err := netx.OverlayOwners(); err == nil {
 		resp.Overlays = owners
@@ -562,6 +595,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		resp.Labs = nil
 		resp.Hash = ""
 		resp.Lab = ""
+		resp.Generations = nil
 		for _, l := range labs {
 			if l == scope {
 				resp.Lab, resp.Labs = scope, []string{scope}
@@ -596,6 +630,18 @@ type ApplyRequest struct {
 	// Hold is the caller's grading-hold token, if it has one. A lab that is
 	// held refuses changes from anybody else.
 	Hold string `json:"hold,omitempty"`
+	// Fence proves that this controller owns the cluster mutation lease.
+	Fence Fence `json:"fence"`
+	// Phase participates in the cluster prepare/apply/commit protocol. Empty
+	// is retained for dry-run compatibility; mutating cluster applies must use
+	// prepare, apply, commit, finalize, or abort.
+	Phase string `json:"phase,omitempty"`
+	// Lab is used by commit and abort, whose request need not repeat a large
+	// topology payload.
+	Lab string `json:"lab,omitempty"`
+	// ExpectedGeneration is the compare-and-swap value observed before
+	// prepare. Generation is committed only after every node applied.
+	ExpectedGeneration string `json:"expected_generation,omitempty"`
 
 	Topology   *Wire  `json:"topology"`
 	Mode       string `json:"mode"`
@@ -621,7 +667,9 @@ type ApplyRequest struct {
 
 // ApplyResponse reports the outcome.
 type ApplyResponse struct {
-	Node string `json:"node"`
+	Node       string `json:"node"`
+	Generation string `json:"generation,omitempty"`
+	Phase      string `json:"phase,omitempty"`
 	// Steps is how many steps ran and succeeded, and Planned how many the
 	// plan held. They differ on a dry run, on an --only, and on a deploy that
 	// failed part way, which are exactly the runs whose summary must not read
@@ -645,6 +693,26 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, fmt.Errorf("decode request: %w", err))
 		return
 	}
+	switch req.Phase {
+	case "prepare":
+		s.handleApplyPrepare(w, r, req)
+		return
+	case "commit":
+		s.handleApplyCommit(w, r, req)
+		return
+	case "finalize":
+		s.handleApplyFinalize(w, r, req)
+		return
+	case "abort":
+		s.handleApplyAbort(w, r, req)
+		return
+	case "", "apply":
+		// A dry run has no mutation to fence. Every real cluster apply is
+		// deliberately the apply phase of a prepared transaction.
+	default:
+		httpError(w, http.StatusBadRequest, fmt.Errorf("unknown apply phase %q", req.Phase))
+		return
+	}
 	if req.Topology == nil {
 		httpError(w, http.StatusBadRequest, errors.New("no topology supplied"))
 		return
@@ -657,6 +725,21 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 	if why := s.refuseMutationIfHeld(top.Name, req.Hold, "this deployment"); why != "" {
 		httpError(w, http.StatusConflict, errors.New(why))
 		return
+	}
+	if !req.DryRun {
+		if req.Phase != "apply" {
+			httpError(w, http.StatusConflict, errors.New(
+				"a mutating apply must be part of a prepared cluster transaction"))
+			return
+		}
+		if err := s.requireMutationFence(top.Name, req.Fence); err != nil {
+			httpError(w, http.StatusConflict, err)
+			return
+		}
+		if err := s.checkPreparedGeneration(top.Name, req.Fence, req.Generation); err != nil {
+			httpError(w, http.StatusConflict, err)
+			return
+		}
 	}
 	if err := s.acquire(top.Name, "apply"); err != nil {
 		httpError(w, http.StatusConflict, err)
@@ -696,13 +779,40 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		}
 		p = p.Restrict(func(st *plan.Step) bool { return want[st.Scope] })
 	}
-	rep, err := p.Execute(r.Context(), plan.Options{
+	execCtx := r.Context()
+	stopFence := func() {}
+	if req.Phase == "apply" {
+		execCtx, stopFence = s.fencedContext(execCtx, top.Name, req.Fence)
+	}
+	defer stopFence()
+	rep, err := p.Execute(execCtx, plan.Options{
 		Workers:         req.Workers,
 		ContinueOnError: true,
 		DryRun:          req.DryRun,
 	})
 	if err != nil {
 		httpError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if req.Phase == "apply" {
+		resp := ApplyResponse{
+			Node: s.cfg.Node, Steps: rep.Done(), Planned: p.Len(),
+			Devices:    rep.Completed(plan.StageCreate),
+			Links:      rep.Completed(plan.StageWire),
+			WantDevice: rep.Planned(plan.StageCreate),
+			WantLinks:  rep.Planned(plan.StageWire),
+			DurationMS: rep.Duration.Milliseconds(),
+		}
+		if rep.Failed() {
+			resp.Failures = reportFailures(rep)
+			writeJSON(w, resp)
+			return
+		}
+		if err := s.markGenerationApplied(top.Name, req.Fence, req.Generation); err != nil {
+			httpError(w, http.StatusConflict, err)
+			return
+		}
+		writeJSON(w, resp)
 		return
 	}
 
@@ -842,12 +952,7 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if rep.Failed() {
-		resp.Failures = map[string][]string{}
-		for _, scope := range rep.FailedScopes() {
-			for _, e := range rep.ScopeErrors[scope] {
-				resp.Failures[scope] = append(resp.Failures[scope], e.Error())
-			}
-		}
+		resp.Failures = reportFailures(rep)
 	}
 	writeJSON(w, resp)
 }
@@ -856,6 +961,8 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 type DestroyRequest struct {
 	// Hold is the caller's grading-hold token, if it has one.
 	Hold string `json:"hold,omitempty"`
+	// Fence identifies the cluster mutation lease that may remove this lab.
+	Fence Fence `json:"fence"`
 
 	Lab  string   `json:"lab"`
 	VNIs []uint32 `json:"vnis,omitempty"`
@@ -893,6 +1000,10 @@ func (s *Server) handleDestroy(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, errors.New("a lab name is required"))
 		return
 	}
+	if err := s.requireMutationFence(req.Lab, req.Fence); err != nil {
+		httpError(w, http.StatusConflict, err)
+		return
+	}
 	if why := s.refuseMutationIfHeld(req.Lab, req.Hold, "removing it"); why != "" {
 		httpError(w, http.StatusConflict, errors.New(why))
 		return
@@ -902,6 +1013,9 @@ func (s *Server) handleDestroy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer s.release(req.Lab)
+	fenced, stopFence := s.fencedContext(r.Context(), req.Lab, req.Fence)
+	defer stopFence()
+	r = r.WithContext(fenced)
 
 	eng := &deploy.Engine{Runtime: s.rt, Node: s.cfg.Node, State: s.store}
 
@@ -1049,6 +1163,10 @@ func (s *Server) destroyLab(w http.ResponseWriter, r *http.Request,
 	status := "destroyed"
 	if len(problems) > 0 {
 		status = "incomplete"
+	} else if err := s.releaseOverlayClaims(req.Lab, nil); err != nil {
+		status = "incomplete"
+		problems = append(problems, fmt.Sprintf("%s: could not release overlay claims: %v",
+			s.cfg.Node, err))
 	}
 	writeJSON(w, DestroyResponse{Status: status, Lab: req.Lab, Problems: problems})
 }
@@ -1106,6 +1224,8 @@ func (s *Server) handleImages(w http.ResponseWriter, r *http.Request) {
 type ReshapeRequest struct {
 	// Hold is the caller's grading-hold token, if it has one.
 	Hold string `json:"hold,omitempty"`
+	// Fence identifies the cluster mutation lease that may change shaping.
+	Fence Fence `json:"fence"`
 
 	Container string       `json:"container"`
 	Iface     string       `json:"iface"`
@@ -1144,6 +1264,15 @@ func (s *Server) handleReshape(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusForbidden, errors.New("that container is not managed by twinet"))
 		return
 	}
+	if err := s.requireMutationFence(c.Labels[deploy.LabelLab], req.Fence); err != nil {
+		httpError(w, http.StatusConflict, err)
+		return
+	}
+	if err := s.acquire(c.Labels[deploy.LabelLab], "reshape"); err != nil {
+		httpError(w, http.StatusConflict, err)
+		return
+	}
+	defer s.release(c.Labels[deploy.LabelLab])
 	ns, err := s.rt.NSPath(r.Context(), req.Container)
 	if err != nil {
 		httpError(w, http.StatusInternalServerError, err)
@@ -1160,6 +1289,8 @@ func (s *Server) handleReshape(w http.ResponseWriter, r *http.Request) {
 type LifecycleRequest struct {
 	// Hold is the caller's grading-hold token, if it has one.
 	Hold string `json:"hold,omitempty"`
+	// Fence identifies the cluster mutation lease that may change lifecycle.
+	Fence Fence `json:"fence"`
 
 	Container string `json:"container"`
 	// Action is one of state, pause, unpause, stop, start or restart.
@@ -1210,6 +1341,18 @@ func (s *Server) handleLifecycle(w http.ResponseWriter, r *http.Request) {
 	case "state":
 		writeJSON(w, map[string]string{"status": "ok", "state": string(c.State)})
 		return
+	}
+	if err := s.requireMutationFence(c.Labels[deploy.LabelLab], req.Fence); err != nil {
+		httpError(w, http.StatusConflict, err)
+		return
+	}
+	if err := s.acquire(c.Labels[deploy.LabelLab], "lifecycle"); err != nil {
+		httpError(w, http.StatusConflict, err)
+		return
+	}
+	defer s.release(c.Labels[deploy.LabelLab])
+
+	switch req.Action {
 	case "pause":
 		err = s.rt.Pause(r.Context(), req.Container)
 	case "unpause":

@@ -70,6 +70,11 @@ func (s *Server) reconcileOnce(ctx context.Context) {
 				"lab", name, "holder", who)
 			continue
 		}
+		if who := s.mutationLeaseHolder(name); who != "" {
+			slog.Debug("leaving lab alone while a fenced mutation is active",
+				"lab", name, "holder", who)
+			continue
+		}
 		// The survey runs without the lab lock. Holding it for the whole scan
 		// made a background maintenance task block the operator: a deploy
 		// arriving mid-sweep was refused with "another operation is already

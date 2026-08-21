@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -50,6 +51,8 @@ type WireSnapshot struct {
 // StateImportRequest installs snapshots taken on another node.
 type StateImportRequest struct {
 	Lab       string         `json:"lab"`
+	Hold      string         `json:"hold,omitempty"`
+	Fence     Fence          `json:"fence"`
 	Snapshots []WireSnapshot `json:"snapshots"`
 }
 
@@ -122,8 +125,29 @@ func (s *Server) handleStateImport(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, err)
 		return
 	}
+	if req.Lab == "" {
+		httpError(w, http.StatusBadRequest, fmt.Errorf("no lab was named"))
+		return
+	}
+	if err := s.requireMutationFence(req.Lab, req.Fence); err != nil {
+		httpError(w, http.StatusConflict, err)
+		return
+	}
+	if why := s.refuseMutationIfHeld(req.Lab, req.Hold, "importing preserved state"); why != "" {
+		httpError(w, http.StatusConflict, errors.New(why))
+		return
+	}
+	if err := s.acquire(req.Lab, "state import"); err != nil {
+		httpError(w, http.StatusConflict, err)
+		return
+	}
+	defer s.release(req.Lab)
 	stored := 0
 	for _, ws := range req.Snapshots {
+		if err := s.requireMutationFence(req.Lab, req.Fence); err != nil {
+			httpError(w, http.StatusConflict, err)
+			return
+		}
 		snap := ws.Snapshot
 		snap.Content = ws.Content
 		if len(snap.Content) == 0 {

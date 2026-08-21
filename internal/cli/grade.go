@@ -130,6 +130,9 @@ reference, and holds the nodes off from repairing anything while it does.`,
 			if err != nil {
 				return err
 			}
+			if err := rubric.ValidateTopology(top); err != nil {
+				return err
+			}
 
 			exec, err := execFunc(cmd.Context(), top, token)
 			if err != nil {
@@ -365,11 +368,12 @@ func lifecycleFunc(top *model.Topology, token string) (
 		if !ok {
 			return fmt.Errorf("no device %q", deviceID)
 		}
-		n, ok := cl.Node(d.Node)
+		_, ok = cl.Node(d.Node)
 		if !ok {
 			return fmt.Errorf("device %s is on unknown node %q", deviceID, d.Node)
 		}
-		return n.Lifecycle(ctx, agent.LifecycleRequest{Container: d.Container, Action: action})
+		return cl.Lifecycle(ctx, top.Name, d.Node,
+			agent.LifecycleRequest{Container: d.Container, Action: action, Hold: currentHoldToken()})
 	}, nil
 }
 
@@ -465,7 +469,7 @@ func reshapeFunc(top *model.Topology, token string) (
 		if !ok {
 			return fmt.Errorf("no device %q", deviceID)
 		}
-		n, ok := cl.Node(d.Node)
+		_, ok = cl.Node(d.Node)
 		if !ok {
 			return fmt.Errorf("device %s is on unknown node %q", deviceID, d.Node)
 		}
@@ -473,8 +477,9 @@ func reshapeFunc(top *model.Topology, token string) (
 		if err != nil {
 			return err
 		}
-		return n.Reshape(ctx, agent.ReshapeRequest{
+		return cl.Reshape(ctx, top.Name, d.Node, agent.ReshapeRequest{
 			Container: d.Container, Iface: iface, Shaping: s, MTU: mtu,
+			Hold: currentHoldToken(),
 		})
 	}, nil
 }

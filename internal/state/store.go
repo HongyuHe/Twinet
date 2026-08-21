@@ -359,3 +359,18 @@ func (s *Store) ForgetTopology(lab string) error {
 	}
 	return err
 }
+
+// PutCoordination records node-local coordination metadata.
+//
+// Unlike a topology or a snapshot this data belongs to the agent itself: it
+// contains fencing high-water marks and overlay claims shared by every lab on
+// this node. Keeping it in the state store makes an agent restart invalidate
+// old lease tokens without allowing an old controller to become current again.
+func (s *Store) PutCoordination(raw []byte) error {
+	return writeAtomic(filepath.Join(s.root, "coordination.json"), raw, 0o600)
+}
+
+// Coordination returns the node-local coordination metadata.
+func (s *Store) Coordination() ([]byte, error) {
+	return os.ReadFile(filepath.Join(s.root, "coordination.json"))
+}

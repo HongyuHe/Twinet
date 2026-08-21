@@ -1,9 +1,9 @@
 // Package client talks to Twinet node agents.
 //
-// The control plane is stateless and fans out: it computes the whole topology,
-// slices it by node, and asks every agent to converge its slice concurrently.
-// Nothing is stored between invocations, so a control plane that crashes
-// mid-deployment leaves nothing to repair; re-running converges.
+// The control plane fans out after obtaining a short-lived fenced lease from
+// every participating node. It computes the whole topology, slices it by node,
+// and uses prepare/apply/commit so a failed controller never claims a partial
+// cluster deployment.
 package client
 
 import (
@@ -222,9 +222,12 @@ func (n *Node) Hold(ctx context.Context, lab, holder, token string, seconds int)
 
 // Exempt tells the node to leave a device alone, or to look after it again.
 func (n *Node) Exempt(ctx context.Context, lab, device, id string, on bool) error {
+	return n.exempt(ctx, agent.ExemptRequest{Lab: lab, Device: device, ID: id, On: on})
+}
+
+func (n *Node) exempt(ctx context.Context, req agent.ExemptRequest) error {
 	var resp struct{}
-	return n.do(ctx, http.MethodPost, "/v1/exempt",
-		agent.ExemptRequest{Lab: lab, Device: device, ID: id, On: on}, &resp)
+	return n.do(ctx, http.MethodPost, "/v1/exempt", req, &resp)
 }
 
 // Exec runs a command in a container on the node.
@@ -508,18 +511,29 @@ func (c *Cluster) Apply(ctx context.Context, top *model.Topology, req agent.Appl
 	// It is resolved here because this is the one door every deployment goes
 	// through, which is the same reason the version check lives here.
 	c.stampImageIDs(ctx, top)
+	return c.coordinatedApply(ctx, top, req)
+}
 
+// unfencedApply is only for a dry run or an empty local cluster. All
+// mutating multi-node deployments go through coordinatedApply, which supplies
+// a prepared generation and a node-specific fence.
+func (c *Cluster) unfencedApply(ctx context.Context, top *model.Topology,
+	req agent.ApplyRequest,
+) []NodeResult[agent.ApplyResponse] {
 	wire := agent.Serialise(top)
 	peers := map[string]string{}
-	for _, n := range top.Lab.Placement.Nodes {
-		if n.UnderlayIP != "" {
-			peers[n.Name] = n.UnderlayIP
+	if top.Lab != nil {
+		for _, n := range top.Lab.Placement.Nodes {
+			if n.UnderlayIP != "" {
+				peers[n.Name] = n.UnderlayIP
+			}
 		}
 	}
 	return fanOut(ctx, c.Nodes, func(ctx context.Context, n *Node) (agent.ApplyResponse, error) {
 		r := req
 		r.Topology = wire
 		r.PeerUnderlay = peers
+		r.Phase = ""
 		return n.Apply(ctx, r)
 	})
 }
@@ -658,17 +672,13 @@ func short(id string) string {
 
 // Destroy removes the lab from every node.
 func (c *Cluster) Destroy(ctx context.Context, lab string, vnis []uint32) []NodeResult[struct{}] {
-	return fanOut(ctx, c.Nodes, func(ctx context.Context, n *Node) (struct{}, error) {
-		return struct{}{}, n.Destroy(ctx, lab, vnis)
-	})
+	return c.coordinatedDestroy(ctx, lab, vnis, false)
 }
 
 // DestroyEphemeral removes a disposable lab from every node and discards its
 // saved state, so a lab of the same name later starts from the manifest.
 func (c *Cluster) DestroyEphemeral(ctx context.Context, lab string, vnis []uint32) []NodeResult[struct{}] {
-	return fanOut(ctx, c.Nodes, func(ctx context.Context, n *Node) (struct{}, error) {
-		return struct{}{}, n.DestroyEphemeral(ctx, lab, vnis)
-	})
+	return c.coordinatedDestroy(ctx, lab, vnis, true)
 }
 
 // Hold asks every node to leave a lab alone. Failures are returned per node so
@@ -778,6 +788,22 @@ func (n *Node) ImportState(ctx context.Context, req agent.StateImportRequest) (i
 // lab. What it must not do is proceed quietly, so every device it could not
 // carry is named in the returned report.
 func (c *Cluster) MigrateState(ctx context.Context, top *model.Topology) (moved int, problems []string) {
+	if len(c.Nodes) == 0 {
+		return c.migrateStateWithLease(ctx, top, nil)
+	}
+	err := c.withMutationLease(ctx, top.Name, func(lease *MutationLease) error {
+		moved, problems = c.migrateStateWithLease(lease.Context(), top, lease)
+		return nil
+	})
+	if err != nil {
+		problems = append(problems, err.Error())
+	}
+	return moved, problems
+}
+
+func (c *Cluster) migrateStateWithLease(ctx context.Context, top *model.Topology,
+	lease *MutationLease,
+) (moved int, problems []string) {
 	// Where each device is *now*, asked of the cluster rather than read from
 	// the placement record.
 	//
@@ -872,8 +898,11 @@ func (c *Cluster) MigrateState(ctx context.Context, top *model.Topology) (moved 
 					dest, len(snaps)))
 				continue
 			}
-			n, err := destNode.ImportState(ctx, agent.StateImportRequest{
-				Lab: top.Name, Snapshots: snaps})
+			req := agent.StateImportRequest{Lab: top.Name, Snapshots: snaps}
+			if lease != nil {
+				req.Fence, _ = lease.Fence(dest)
+			}
+			n, err := destNode.ImportState(ctx, req)
 			if err != nil {
 				problems = append(problems, fmt.Sprintf(
 					"could not place saved work on %s (%v); those devices will be rebuilt "+
