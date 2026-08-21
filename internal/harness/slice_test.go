@@ -140,6 +140,29 @@ func TestSliceKeepsBothEndsOfEveryLink(t *testing.T) {
 	}
 }
 
+func TestSlicePreservesGeneratedInteriorMetadata(t *testing.T) {
+	l, err := manifest.Load("../../examples/clos")
+	if err != nil {
+		t.Fatal(err)
+	}
+	full, err := expand.Expand(l.Lab)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := Slice(full.Topology, 42, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	as := h.ASes[42]
+	if as.InteriorKind != model.InteriorClos || !as.Distributable {
+		t.Errorf("harness lost Clos metadata: kind=%q distributable=%v", as.InteriorKind, as.Distributable)
+	}
+	if len(as.PlacementGroups) != len(full.Topology.ASes[42].PlacementGroups) {
+		t.Errorf("harness has %d groups, class topology has %d",
+			len(as.PlacementGroups), len(full.Topology.ASes[42].PlacementGroups))
+	}
+}
+
 func TestSliceRetainsTransitObservabilityAtDepthTwo(t *testing.T) {
 	full := classTopology(t)
 	// Depth 2 must reach an AS that is not directly connected to the target,

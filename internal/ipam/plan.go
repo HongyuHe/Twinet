@@ -37,6 +37,16 @@ type Ctx struct {
 	Host      int    // host index within a subnet
 	Name      string // free-form: service name, device name
 	Region    string
+	// Role and the role indexes describe endpoints emitted by an interior
+	// generator. RoleLinkIndex is a deterministic per-generated-interior
+	// link ordinal, intended for cidrSubnet-style plans rather than the
+	// historic byte-sized LinkIndex convention.
+	Role          string
+	PeerRole      string
+	RoleIndex     int
+	PeerRoleIndex int
+	RoleLinkIndex int
+	LinkClass     string
 }
 
 // Plan is a compiled addressing plan. Compilation happens once per lab; the
@@ -54,6 +64,7 @@ const (
 	FieldRouterLoopback   = "router_loopback"
 	FieldRouterLoopbackV6 = "router_loopback_v6"
 	FieldRouterRouter     = "router_router"
+	FieldRouterRouterRole = "router_router_role"
 	FieldRouterHost       = "router_host"
 	FieldL2Domain         = "l2_domain"
 	FieldL2DomainV6       = "l2_domain_v6"

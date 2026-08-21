@@ -81,8 +81,9 @@ func (l *Loaded) validateAddressing(d *Diagnostics, file string) {
 	exprs := map[string]string{
 		ipam.FieldASBlock: a.ASBlock, ipam.FieldASBlockV6: a.ASBlockV6,
 		ipam.FieldRouterLoopback: a.RouterLoopback, ipam.FieldRouterLoopbackV6: a.RouterLoopbackV6,
-		ipam.FieldRouterRouter: a.RouterRouter, ipam.FieldRouterHost: a.RouterHost,
-		ipam.FieldL2Domain: a.L2Domain, ipam.FieldL2DomainV6: a.L2DomainV6, ipam.FieldL2VLAN: a.L2VLAN, ipam.FieldL2VLANV6: a.L2VLANV6,
+		ipam.FieldRouterRouter: a.RouterRouter, ipam.FieldRouterRouterRole: a.RouterRouterRole,
+		ipam.FieldRouterHost: a.RouterHost,
+		ipam.FieldL2Domain:   a.L2Domain, ipam.FieldL2DomainV6: a.L2DomainV6, ipam.FieldL2VLAN: a.L2VLAN, ipam.FieldL2VLANV6: a.L2VLANV6,
 		ipam.FieldInterAS: a.InterAS, ipam.FieldIXPPeering: a.IXPPeering,
 	}
 	for name, expr := range a.Services {
@@ -113,6 +114,7 @@ func (l *Loaded) validateAddressing(d *Diagnostics, file string) {
 			d.AddHint(file, "addressing."+name, nodeAt(root, "addressing"),
 				fmt.Sprintf("addressing.%s could not be evaluated: %v", name, err),
 				"the bindings available are .AS .PeerAS .RouterID .PeerID .LinkIndex "+
+					".Role .PeerRole .RoleIndex .PeerRoleIndex .RoleLinkIndex .LinkClass "+
 					".L2ID .VLAN .VLANIndex .IXP .Low .High .Host .Name .Region")
 			continue
 		}
@@ -133,6 +135,8 @@ var sampleCtx = ipam.Ctx{
 	AS: 1, PeerAS: 2, RouterID: 1, PeerID: 2, LinkIndex: 0,
 	L2ID: 0, VLAN: 10, VLANIndex: 0, IXP: 100,
 	Low: 1, High: 2, Host: 1, Name: "sample", Region: "0",
+	Role: "spine", PeerRole: "leaf", RoleIndex: 1, PeerRoleIndex: 2,
+	RoleLinkIndex: 3, LinkClass: "spine-leaf",
 }
 
 func (l *Loaded) validateTemplates(d *Diagnostics) {
@@ -144,7 +148,20 @@ func (l *Loaded) validateTemplates(d *Diagnostics) {
 		}
 		root := l.Nodes[file]
 
-		if len(tpl.Routers) == 0 {
+		if err := tpl.ValidateInterior(); err != nil {
+			for _, problem := range strings.Split(err.Error(), "\n") {
+				d.Add(file, "interior", problem, nodeAt(root, "interior"))
+			}
+		}
+		if tpl.Interior != nil && tpl.EffectiveInteriorKind() != model.InteriorExplicit {
+			validateLinkProps(d, file, "interior", nodeAt(root, "interior"), tpl.Interior.LinkProps)
+		}
+		routers, routerErr := tpl.EffectiveRouterSpecs()
+		if routerErr != nil {
+			d.Addf(file, "interior", nodeAt(root, "interior"), "cannot generate routers: %v", routerErr)
+			routers = tpl.Routers
+		}
+		if len(routers) == 0 {
 			d.Add(file, "routers", "template declares no routers", nodeAt(root, "routers"))
 		}
 		l.validateProvisioning(d, file, root, name, tpl)
@@ -152,8 +169,8 @@ func (l *Loaded) validateTemplates(d *Diagnostics) {
 		// Router IDs must be unique: the addressing plan indexes on them, so a
 		// duplicate silently aliases two routers' loopbacks and host subnets.
 		byID := map[int][]string{}
-		for _, rn := range sortedMapKeys(tpl.Routers) {
-			r := tpl.Routers[rn]
+		for _, rn := range sortedMapKeys(routers) {
+			r := routers[rn]
 			byID[r.ID] = append(byID[r.ID], rn)
 			if r.ID <= 0 {
 				d.Addf(file, "routers."+rn+".id", nodeAt(root, "routers."+rn),
@@ -174,12 +191,12 @@ func (l *Loaded) validateTemplates(d *Diagnostics) {
 			}
 		}
 
-		for i, il := range tpl.InternalLinks {
+		for i, il := range tpl.EffectiveInternalLinks() {
 			path := fmt.Sprintf("internal_links[%d]", i)
-			if _, ok := tpl.Routers[il.A]; !ok {
+			if _, ok := routers[il.A]; !ok {
 				d.Addf(file, path+".a", nodeAt(root, path), "unknown router %q", il.A)
 			}
-			if _, ok := tpl.Routers[il.B]; !ok {
+			if _, ok := routers[il.B]; !ok {
 				d.Addf(file, path+".b", nodeAt(root, path), "unknown router %q", il.B)
 			}
 			if il.A == il.B {
@@ -190,7 +207,7 @@ func (l *Loaded) validateTemplates(d *Diagnostics) {
 
 		for _, pn := range sortedMapKeys(tpl.ExternalPorts) {
 			ep := tpl.ExternalPorts[pn]
-			if _, ok := tpl.Routers[ep.Router]; !ok {
+			if _, ok := routers[ep.Router]; !ok {
 				d.Addf(file, "external_ports."+pn+".router", nodeAt(root, "external_ports."+pn),
 					"unknown router %q", ep.Router)
 			}
@@ -204,7 +221,7 @@ func (l *Loaded) validateTemplates(d *Diagnostics) {
 				d.Addf(file, path+".id", nodeAt(root, path), "l2 domain id %d already used by %q", dom.ID, prev)
 			}
 			l2IDs[dom.ID] = dn
-			if _, ok := tpl.Routers[dom.Gateway]; !ok {
+			if _, ok := routers[dom.Gateway]; !ok {
 				d.Addf(file, path+".gateway", nodeAt(root, path), "gateway %q is not a router", dom.Gateway)
 			}
 			if len(dom.Switches) == 0 {
@@ -351,9 +368,10 @@ func (l *Loaded) validatePeerings(d *Diagnostics, file string) {
 
 	if g := l.Lab.Peerings.Generator; g != nil {
 		node := nodeAt(root, "peerings.generator")
-		if g.Kind != "tiered-internet" {
+		if !model.Generators.Has(model.GeneratorInterAS, g.Kind) {
 			d.Addf(file, "peerings.generator.kind", node,
-				"unknown generator %q (supported: tiered-internet)", g.Kind)
+				"unknown generator %q (supported: %s)", g.Kind,
+				strings.Join(model.Generators.Kinds(model.GeneratorInterAS), ", "))
 		}
 		inTier := map[int]int{}
 		for ti, tier := range g.Tiers {
@@ -449,9 +467,15 @@ func (l *Loaded) validateServices(d *Diagnostics, file string) {
 				tpl, ok := l.Lab.Templates[tplName]
 				if !ok {
 					d.Addf(file, path+".attach.template", node, "template %q not found", tplName)
-				} else if _, ok := tpl.Routers[s.Attach.Router]; !ok && s.Attach.Router != "" {
-					d.Addf(file, path+".attach.router", node,
-						"template %q has no router %q", tplName, s.Attach.Router)
+				} else {
+					routers, err := tpl.EffectiveRouterSpecs()
+					if err != nil {
+						d.Addf(file, path+".attach.router", node,
+							"template %q has an invalid interior: %v", tplName, err)
+					} else if _, ok := routers[s.Attach.Router]; !ok && s.Attach.Router != "" {
+						d.Addf(file, path+".attach.router", node,
+							"template %q has no router %q", tplName, s.Attach.Router)
+					}
 				}
 			}
 			// A per-AS service needs an addressing entry to derive its subnets.

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math/rand"
 	"sort"
+	"strings"
 
 	"github.com/HongyuHe/twinet/internal/model"
 )
@@ -76,8 +77,12 @@ func mergePeering(over, base model.PeeringLink) model.PeeringLink {
 // the deliberately slow provider and customer links that assignment question
 // 2.5 asks students to discover and engineer around.
 func (e *expander) generate(g *model.PeeringGenerator) ([]model.PeeringLink, error) {
+	if !model.Generators.Has(model.GeneratorInterAS, g.Kind) {
+		return nil, fmt.Errorf("unknown generator kind %q (supported: %s)", g.Kind,
+			strings.Join(model.Generators.Kinds(model.GeneratorInterAS), ", "))
+	}
 	if g.Kind != "tiered-internet" {
-		return nil, fmt.Errorf("unknown generator kind %q (supported: tiered-internet)", g.Kind)
+		return nil, fmt.Errorf("generator kind %q is registered but has no implementation", g.Kind)
 	}
 	if len(g.Tiers) == 0 {
 		return nil, fmt.Errorf("tiers must not be empty")

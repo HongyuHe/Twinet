@@ -209,6 +209,9 @@ func (e *expander) verify() error {
 }
 
 func subnetField(l *model.Link) string {
+	if l.AddressingField != "" {
+		return l.AddressingField
+	}
 	switch {
 	case l.InterAS:
 		return ipam.FieldInterAS

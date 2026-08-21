@@ -51,6 +51,17 @@ type AS struct {
 	Labels     map[string]string
 	Node       string // pinned node, empty means "let the placer decide"
 
+	// InteriorKind records the declaration that produced this AS. Legacy
+	// templates are explicit. The expanded graph remains ordinary routers and
+	// links, while this metadata lets placement and rubric validation make
+	// shape-aware decisions without reparsing the authored template.
+	InteriorKind  InteriorKind
+	Distributable bool
+	// PlacementGroups are atomic scheduling units. Most ASes have one; a
+	// declared distributable Clos has one spine group and one group per leaf
+	// with its directly attached hosts.
+	PlacementGroups []*PlacementGroup
+
 	// MPLS and VRFs carry the advanced course's label-switching and
 	// virtual-routing configuration through to the renderer and the grader,
 	// so both work from the same declaration rather than from two.
@@ -69,6 +80,23 @@ type AS struct {
 	// outright, so a service attachment declared as provisioned was left for
 	// the student to guess at.
 	ProvisionedIfaces map[string]bool
+}
+
+// PlacementGroup is a set of devices that must stay on one node. It is kept
+// on its AS because group IDs are meaningful only within the AS that owns
+// them, even though their IDs are globally namespaced for placement records.
+type PlacementGroup struct {
+	ID      string
+	ASN     int
+	Class   string
+	Devices []*Device
+}
+
+// SortedPlacementGroups returns scheduling groups in stable ID order.
+func (a *AS) SortedPlacementGroups() []*PlacementGroup {
+	out := append([]*PlacementGroup(nil), a.PlacementGroups...)
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
 }
 
 // VRFsSorted returns the VRF names in a stable order.
@@ -126,6 +154,14 @@ type Device struct {
 
 	// RouterID is the stable per-AS router index used by the addressing plan.
 	RouterID int
+	// InteriorRole and InteriorRoleIndex identify a generated device's role
+	// within its AS. They are addressing and placement inputs, not a separate
+	// runtime device kind.
+	InteriorRole      InteriorRole
+	InteriorRoleIndex int
+	// PlacementGroup is the globally unique ID of the atomic group this
+	// device belongs to. Empty retains ordinary AS-granular placement.
+	PlacementGroup string
 	// Node is the cluster node this device is placed on. Filled by the placer.
 	Node string
 	// Ifaces are the device's interfaces, in deterministic order.
@@ -242,6 +278,20 @@ const (
 	RoleIXPLink    IfaceRole = "ixp"
 )
 
+// InteriorRole classifies a generated device by its position in an AS shape.
+type InteriorRole string
+
+const (
+	InteriorRoleExplicit InteriorRole = "explicit"
+	InteriorRoleRing     InteriorRole = "ring"
+	InteriorRoleHub      InteriorRole = "hub"
+	InteriorRoleCore     InteriorRole = "core"
+	InteriorRoleEdge     InteriorRole = "edge"
+	InteriorRoleSpine    InteriorRole = "spine"
+	InteriorRoleLeaf     InteriorRole = "leaf"
+	InteriorRoleHost     InteriorRole = "host"
+)
+
 // LinkKind classifies how a link must be realised.
 type LinkKind string
 
@@ -252,6 +302,24 @@ const (
 	LinkService LinkKind = "service"
 	// LinkFabric is a cable into a shared L2 fabric such as an IXP.
 	LinkFabric LinkKind = "fabric"
+)
+
+// LinkClass distinguishes links emitted by a topology shape for placement
+// locality reporting. Empty retains the legacy inferred classification.
+type LinkClass string
+
+const (
+	LinkClassRing         LinkClass = "ring"
+	LinkClassRingHub      LinkClass = "ring-hub"
+	LinkClassCoreEdge     LinkClass = "core-edge"
+	LinkClassSpineLeaf    LinkClass = "spine-leaf"
+	LinkClassLeafHost     LinkClass = "leaf-host"
+	LinkClassIntraAS      LinkClass = "intra-as"
+	LinkClassInterAS      LinkClass = "inter-as"
+	LinkClassService      LinkClass = "service"
+	LinkClassHost         LinkClass = "host"
+	LinkClassL2           LinkClass = "l2"
+	LinkClassUnclassified LinkClass = "other"
 )
 
 // Link is a point-to-point layer-2 segment between exactly two interfaces.
@@ -291,6 +359,40 @@ type Link struct {
 	VNI uint32
 	// Owner says whether Twinet addresses this link or the student does.
 	Owner ConfigOwner
+	// Class identifies a generated link shape for placement reporting.
+	Class LinkClass
+	// AddressingField is the addressing expression used to number this link.
+	// It lets validation describe generated role-addressed links accurately.
+	AddressingField string
+}
+
+// LocalityClass returns the explicit generated class where present, otherwise
+// derives a useful stable class for existing links.
+func (l *Link) LocalityClass() LinkClass {
+	if l == nil {
+		return LinkClassUnclassified
+	}
+	if l.Class != "" {
+		return l.Class
+	}
+	switch {
+	case l.InterAS:
+		return LinkClassInterAS
+	case l.Kind == LinkService:
+		return LinkClassService
+	case l.A != nil && l.B != nil &&
+		(l.A.Role == RoleHostLink || l.B.Role == RoleHostLink):
+		return LinkClassHost
+	case l.A != nil && l.B != nil &&
+		(l.A.Role == RoleL2Access || l.A.Role == RoleL2Trunk || l.A.Role == RoleL2Uplink ||
+			l.B.Role == RoleL2Access || l.B.Role == RoleL2Trunk || l.B.Role == RoleL2Uplink):
+		return LinkClassL2
+	case l.A != nil && l.B != nil &&
+		(l.A.Role == RoleIntraAS || l.B.Role == RoleIntraAS):
+		return LinkClassIntraAS
+	default:
+		return LinkClassUnclassified
+	}
 }
 
 // PeerRelationship returns what the far side of this link is to the near side.

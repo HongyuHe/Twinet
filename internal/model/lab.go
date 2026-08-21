@@ -299,6 +299,12 @@ type Addressing struct {
 	RouterLoopback   string `yaml:"router_loopback" json:"router_loopback" jsonschema:"required"`
 	RouterLoopbackV6 string `yaml:"router_loopback_v6,omitempty" json:"router_loopback_v6,omitempty"`
 	RouterRouter     string `yaml:"router_router" json:"router_router" jsonschema:"required"`
+	// RouterRouterRole is the optional scalable address expression for links
+	// emitted by an interior generator. It receives Role, PeerRole,
+	// RoleIndex, PeerRoleIndex and RoleLinkIndex in addition to the legacy
+	// addressing context, so a large Clos need not squeeze every link through
+	// the old byte-sized LinkIndex convention.
+	RouterRouterRole string `yaml:"router_router_role,omitempty" json:"router_router_role,omitempty"`
 	RouterHost       string `yaml:"router_host" json:"router_host" jsonschema:"required"`
 
 	L2Domain   string `yaml:"l2_domain,omitempty" json:"l2_domain,omitempty"`
@@ -389,7 +395,7 @@ type ASTemplate struct {
 	Kind       string `yaml:"kind,omitempty" json:"kind,omitempty"`
 	Metadata   Meta   `yaml:"metadata,omitempty" json:"metadata,omitempty"`
 
-	Routers       map[string]*RouterSpec `yaml:"routers" json:"routers" jsonschema:"required"`
+	Routers       map[string]*RouterSpec `yaml:"routers,omitempty" json:"routers,omitempty"`
 	Hosts         HostPolicy             `yaml:"hosts,omitempty" json:"hosts,omitempty"`
 	InternalLinks []InternalLink         `yaml:"internal_links,omitempty" json:"internal_links,omitempty"`
 	L2Domains     map[string]*L2Domain   `yaml:"l2_domains,omitempty" json:"l2_domains,omitempty"`
@@ -411,6 +417,11 @@ type ASTemplate struct {
 	// routing table, so two customers using the same private address space can
 	// both be carried without either seeing the other.
 	VRFs map[string]*VRFSpec `yaml:"vrfs,omitempty" json:"vrfs,omitempty"`
+
+	// Interior optionally replaces the legacy routers/internal_links pair
+	// with a typed generated shape. Omitting it is exactly equivalent to
+	// kind: explicit and preserves every existing template syntax.
+	Interior *InteriorSpec `yaml:"interior,omitempty" json:"interior,omitempty"`
 }
 
 // MPLSSpec turns on label switching for an AS.

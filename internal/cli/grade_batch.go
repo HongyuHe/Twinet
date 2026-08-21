@@ -99,6 +99,9 @@ mark, unless --keep-labs is given for a dispute.`,
 			if err != nil {
 				return err
 			}
+			if err := rubric.ValidateTopology(class); err != nil {
+				return err
+			}
 			subs, unread, err := readSubmissions(subDir, class)
 			if err != nil {
 				return err

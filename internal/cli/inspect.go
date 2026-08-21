@@ -224,12 +224,22 @@ func writePlacement(out io.Writer, top *model.Topology) error {
 	// A single percentage cannot distinguish a good partition from one that
 	// happens to have few inter-AS links.
 	var interCross, interTotal, svcCross, svcTotal, intraCross, intraTotal int
+	type locality struct{ cross, total int }
+	byClass := map[model.LinkClass]locality{}
+	unexpectedIntraSplit := false
 	for _, l := range top.Links {
 		if l.A == nil || l.B == nil || l.A.Device == nil || l.B.Device == nil {
 			continue
 		}
 		x, y := l.A.Device.ASN, l.B.Device.ASN
 		cross := l.CrossNode()
+		class := l.LocalityClass()
+		v := byClass[class]
+		v.total++
+		if cross {
+			v.cross++
+		}
+		byClass[class] = v
 		switch {
 		case x == 0 || y == 0:
 			svcTotal++
@@ -245,6 +255,10 @@ func writePlacement(out io.Writer, top *model.Topology) error {
 			intraTotal++
 			if cross {
 				intraCross++
+				as := top.ASes[x]
+				if as == nil || !as.Distributable || class != model.LinkClassSpineLeaf {
+					unexpectedIntraSplit = true
+				}
 			}
 		}
 	}
@@ -259,7 +273,23 @@ func writePlacement(out io.Writer, top *model.Topology) error {
 	fmt.Fprintf(out, "  inter-AS %s   service %s   intra-AS %s\n",
 		pct(interCross, interTotal), pct(svcCross, svcTotal), pct(intraCross, intraTotal))
 	if intraCross > 0 {
-		fmt.Fprintf(out, "  warning: an autonomous system has been split across nodes\n")
+		if unexpectedIntraSplit {
+			fmt.Fprintf(out, "  warning: an autonomous system has been split across nodes\n")
+		} else {
+			fmt.Fprintf(out, "  note: declared Clos spine-leaf groups cross nodes\n")
+		}
+	}
+	classes := make([]string, 0, len(byClass))
+	for class := range byClass {
+		classes = append(classes, string(class))
+	}
+	sort.Strings(classes)
+	if len(classes) > 0 {
+		fmt.Fprintln(out, "  locality by link class:")
+		for _, raw := range classes {
+			v := byClass[model.LinkClass(raw)]
+			fmt.Fprintf(out, "    %s %s\n", raw, pct(v.cross, v.total))
+		}
 	}
 	return nil
 }

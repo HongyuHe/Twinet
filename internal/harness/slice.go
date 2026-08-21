@@ -123,16 +123,18 @@ func Slice(top *model.Topology, target int, opts Options) (*model.Topology, erro
 	for asn := range keepAS {
 		src := top.ASes[asn]
 		dst := &model.AS{
-			ASN:        src.ASN,
-			Role:       src.Role,
-			Region:     src.Region,
-			Template:   src.Template,
-			OwnerGroup: src.OwnerGroup,
-			Nickname:   src.Nickname,
-			Block:      src.Block,
-			BlockV6:    src.BlockV6,
-			Labels:     copyStrMap(src.Labels),
-			ExtPorts:   map[string]*model.ExtPortBinding{},
+			ASN:           src.ASN,
+			Role:          src.Role,
+			Region:        src.Region,
+			Template:      src.Template,
+			OwnerGroup:    src.OwnerGroup,
+			Nickname:      src.Nickname,
+			Block:         src.Block,
+			BlockV6:       src.BlockV6,
+			Labels:        copyStrMap(src.Labels),
+			ExtPorts:      map[string]*model.ExtPortBinding{},
+			InteriorKind:  src.InteriorKind,
+			Distributable: src.Distributable,
 		}
 		if asn != target {
 			// A neighbour exists only to be a credible peer. It keeps its
@@ -162,6 +164,22 @@ func Slice(top *model.Topology, target int, opts Options) (*model.Topology, erro
 		for _, r := range src.Routers {
 			if nr, ok := out.Devices[r.ID]; ok {
 				dst.Routers = append(dst.Routers, nr)
+			}
+		}
+		for _, srcGroup := range src.PlacementGroups {
+			if srcGroup == nil {
+				continue
+			}
+			dstGroup := &model.PlacementGroup{
+				ID: srcGroup.ID, ASN: srcGroup.ASN, Class: srcGroup.Class,
+			}
+			for _, d := range srcGroup.Devices {
+				if nd, ok := out.Devices[d.ID]; ok {
+					dstGroup.Devices = append(dstGroup.Devices, nd)
+				}
+			}
+			if len(dstGroup.Devices) > 0 {
+				dst.PlacementGroups = append(dst.PlacementGroups, dstGroup)
 			}
 		}
 		for pname, b := range src.ExtPorts {

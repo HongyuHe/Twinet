@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/HongyuHe/twinet/internal/model"
 	"gopkg.in/yaml.v3"
 )
 
@@ -30,6 +31,10 @@ type RubricMeta struct {
 	Name  string  `yaml:"name" json:"name"`
 	Total float64 `yaml:"total,omitempty" json:"total,omitempty"`
 	Notes string  `yaml:"notes,omitempty" json:"notes,omitempty"`
+	// SupportedInteriorKinds optionally constrains a rubric to shapes its
+	// checks were authored for. An omitted list retains compatibility with
+	// every topology, which preserves existing rubrics.
+	SupportedInteriorKinds []model.InteriorKind `yaml:"supported_interior_kinds,omitempty" json:"supported_interior_kinds,omitempty"`
 }
 
 // QuestionSpec is one graded question.
@@ -91,6 +96,19 @@ func (r *Rubric) Validate() error {
 		problems = append(problems, "no questions declared")
 	}
 	seen := map[string]bool{}
+	seenInterior := map[model.InteriorKind]bool{}
+	for _, kind := range r.Metadata.SupportedInteriorKinds {
+		switch {
+		case !kind.Valid():
+			problems = append(problems, fmt.Sprintf(
+				"metadata.supported_interior_kinds contains unknown kind %q (supported: %s)",
+				kind, strings.Join(interiorKinds(), ", ")))
+		case seenInterior[kind]:
+			problems = append(problems, fmt.Sprintf(
+				"metadata.supported_interior_kinds declares %q more than once", kind))
+		}
+		seenInterior[kind] = true
+	}
 	for i, q := range r.Questions {
 		if q.ID == "" {
 			problems = append(problems, fmt.Sprintf("questions[%d] has no id", i))
@@ -167,6 +185,77 @@ func (r *Rubric) Validate() error {
 	return nil
 }
 
+func interiorKinds() []string {
+	kinds := model.InteriorKinds()
+	out := make([]string, len(kinds))
+	for i, k := range kinds {
+		out[i] = string(k)
+	}
+	return out
+}
+
+// RubricCompatibilityError identifies a bad author/infrastructure pairing,
+// never student work. Callers should refuse the run before a zero can appear
+// in a student's report.
+type RubricCompatibilityError struct {
+	Rubric      string
+	Unsupported map[model.InteriorKind][]int
+}
+
+func (e *RubricCompatibilityError) Error() string {
+	kinds := make([]string, 0, len(e.Unsupported))
+	for kind := range e.Unsupported {
+		kinds = append(kinds, string(kind))
+	}
+	sort.Strings(kinds)
+	var parts []string
+	for _, raw := range kinds {
+		kind := model.InteriorKind(raw)
+		asns := append([]int(nil), e.Unsupported[kind]...)
+		sort.Ints(asns)
+		ids := make([]string, len(asns))
+		for i, asn := range asns {
+			ids[i] = fmt.Sprintf("AS %d", asn)
+		}
+		parts = append(parts, fmt.Sprintf("%s (%s)", kind, strings.Join(ids, ", ")))
+	}
+	name := e.Rubric
+	if name == "" {
+		name = "this rubric"
+	}
+	return fmt.Sprintf("%s does not support interior kind(s) %s; this is a rubric/topology author error, not a student deduction",
+		name, strings.Join(parts, ", "))
+}
+
+// ValidateTopology refuses a rubric whose declared shape support does not
+// cover every AS in the expanded lab. A legacy AS is explicit by definition.
+func (r *Rubric) ValidateTopology(top *model.Topology) error {
+	if len(r.Metadata.SupportedInteriorKinds) == 0 {
+		return nil
+	}
+	if top == nil {
+		return fmt.Errorf("cannot check rubric %q against a nil topology", r.Metadata.Name)
+	}
+	allowed := map[model.InteriorKind]bool{}
+	for _, kind := range r.Metadata.SupportedInteriorKinds {
+		allowed[kind] = true
+	}
+	unsupported := map[model.InteriorKind][]int{}
+	for _, asn := range top.SortedASNs() {
+		kind := top.ASes[asn].InteriorKind
+		if kind == "" {
+			kind = model.InteriorExplicit
+		}
+		if !allowed[kind] {
+			unsupported[kind] = append(unsupported[kind], asn)
+		}
+	}
+	if len(unsupported) > 0 {
+		return &RubricCompatibilityError{Rubric: r.Metadata.Name, Unsupported: unsupported}
+	}
+	return nil
+}
+
 // MaxTotal is the sum of every question's points.
 func (r *Rubric) MaxTotal() float64 {
 	var t float64
@@ -200,6 +289,16 @@ func Run(ctx context.Context, r *Rubric, env *Env, opts RunOptions) *Report {
 	rep.RubricNotes = r.Metadata.Notes
 	if lab := env.Topology.Lab; lab != nil {
 		rep.Course, rep.Term = lab.Metadata.Course, lab.Metadata.Term
+	}
+	if err := r.ValidateTopology(env.Topology); err != nil {
+		// A rubric written for a different interior is an authoring failure.
+		// Returning a held/error report rather than running checks prevents
+		// it from being mistaken for a student-earned zero by direct library
+		// callers that did not validate before invoking Run.
+		rep.Err = err.Error()
+		rep.NeedsReview = true
+		rep.Duration = time.Since(start).Round(time.Millisecond).String()
+		return rep
 	}
 	if opts.ConvergeTimeout == 0 {
 		opts.ConvergeTimeout = 90 * time.Second

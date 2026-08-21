@@ -1,0 +1,36 @@
+apiVersion: twinet.dev/v1
+kind: Lab
+metadata:
+  name: clos
+  description: Small distributable Clos fixture for topology, placement, and rubric validation.
+
+addressing:
+  as_block: "{{ .AS }}.0.0.0/8"
+  router_loopback: "{{ .AS }}.{{ add 150 .RouterID }}.0.1/24"
+  router_router: "{{ .AS }}.0.{{ .LinkIndex }}.0/24"
+  # Generated links use cidrSubnet and RoleLinkIndex instead of assuming a
+  # link number fits in one dotted IPv4 octet.
+  router_router_role: "{{ cidrSubnet (printf \"%d.0.0.0/8\" .AS) .RoleLinkIndex 24 }}"
+  router_host: "{{ .AS }}.{{ add 100 .RouterID }}.0.0/24"
+  inter_as: "179.{{ .Low }}.{{ .High }}.0/24"
+
+templates:
+  fabric:
+    interior:
+      kind: clos
+      spines: 2
+      leaves: 3
+      hosts_per_leaf: 2
+      distributable: true
+
+autonomous_systems:
+  - list: [42]
+    role: staff
+    template: fabric
+
+placement:
+  strategy: pack-by-as
+  nodes:
+    - {name: node-a, front: true, underlay_ip: 192.0.2.1}
+    - {name: node-b, underlay_ip: 192.0.2.2}
+    - {name: node-c, underlay_ip: 192.0.2.3}

@@ -1,10 +1,13 @@
 // Package place assigns autonomous systems to cluster nodes.
 //
-// The unit of placement is the AS, not the container. That single decision is
-// what makes scaling out cheap: an AS's internal links are numerous, fast and
-// unshaped, so they stay local veths, while its inter-AS links are few and
-// already throttled to a megabit with milliseconds of emulated delay, so
-// carrying them over a VXLAN tunnel costs nothing a student can observe.
+// The default unit of placement is the AS, not the container. That single
+// decision is what makes scaling out cheap: an AS's internal links are
+// numerous, fast and unshaped, so they stay local veths, while its inter-AS
+// links are few and already throttled to a megabit with milliseconds of
+// emulated delay, so carrying them over a VXLAN tunnel costs nothing a student
+// can observe. A declared distributable Clos is the deliberate narrow
+// exception: its spine group and complete leaf groups can split at their
+// fabric boundary.
 //
 // For an eighty-AS class that is roughly two thousand intra-AS links kept local
 // and a couple of hundred crossing the fabric.
@@ -22,12 +25,18 @@ import (
 type Assignment struct {
 	// ByAS maps AS number to node name.
 	ByAS map[int]string
+	// ByGroup maps a shape-aware placement group to its node. It is empty for
+	// ordinary atomic ASes, so callers and records that only know ByAS remain
+	// fully compatible.
+	ByGroup map[string]string
 	// ByService maps service name to node name.
 	ByService map[string]string
 	// Load is the per-node container count.
 	Load map[string]int
 	// CrossNodeLinks counts links whose endpoints landed on different nodes.
 	CrossNodeLinks int
+	// Locality reports local and cross-node links by their topology class.
+	Locality map[model.LinkClass]LinkLocality
 	// Moved records ASes that could not be left where the record says they
 	// were, and why. Each one is a set of containers that will be rebuilt.
 	Moved []string
@@ -39,12 +48,21 @@ type Assignment struct {
 	Overloaded []string
 }
 
+// LinkLocality is the placement outcome for one class of link.
+type LinkLocality struct {
+	Local     int
+	CrossNode int
+}
+
 // Record is the assignment in the form it is written down in.
 func (a *Assignment) Record(lab, strategy string) *Record {
 	r := &Record{Lab: lab, Strategy: strategy,
-		ByAS: map[int]string{}, ByService: map[string]string{}}
+		ByAS: map[int]string{}, ByGroup: map[string]string{}, ByService: map[string]string{}}
 	for k, v := range a.ByAS {
 		r.ByAS[k] = v
+	}
+	for k, v := range a.ByGroup {
+		r.ByGroup[k] = v
 	}
 	for k, v := range a.ByService {
 		r.ByService[k] = v
@@ -77,6 +95,7 @@ type Record struct {
 	Lab       string            `json:"lab"`
 	Strategy  string            `json:"strategy"`
 	ByAS      map[int]string    `json:"by_as"`
+	ByGroup   map[string]string `json:"by_group,omitempty"`
 	ByService map[string]string `json:"by_service"`
 }
 
@@ -104,6 +123,7 @@ func Place(top *model.Topology, opts Options) (*Assignment, error) {
 	front := lab.FrontNode()
 	a := &Assignment{
 		ByAS:      map[int]string{},
+		ByGroup:   map[string]string{},
 		ByService: map[string]string{},
 		Load:      map[string]int{},
 	}
@@ -131,12 +151,14 @@ func Place(top *model.Topology, opts Options) (*Assignment, error) {
 
 	// Explicit pins win over everything.
 	pinned := map[int]string{}
+	explicitPinned := map[int]bool{}
 	pinnedSvc := map[string]string{}
 	for _, p := range lab.Placement.Pin {
 		for _, asn := range top.SortedASNs() {
 			as := top.ASes[asn]
 			if matches(p.Match, asn, as) {
 				pinned[asn] = p.Node
+				explicitPinned[asn] = true
 			}
 		}
 		if p.Match.Service != "" {
@@ -151,6 +173,7 @@ func Place(top *model.Topology, opts Options) (*Assignment, error) {
 	for _, asn := range top.SortedASNs() {
 		if n := top.ASes[asn].Node; n != "" {
 			pinned[asn] = n
+			explicitPinned[asn] = true
 		}
 	}
 
@@ -201,9 +224,14 @@ func Place(top *model.Topology, opts Options) (*Assignment, error) {
 	// refusal anyone could act on.
 	weight := map[int]demand{}
 	for _, asn := range top.SortedASNs() {
+		as := top.ASes[asn]
 		var d demand
-		for _, dev := range top.ASes[asn].Devices {
-			d = d.add(deviceDemand(dev))
+		if as.Distributable {
+			d = placementAnchorDemand(as)
+		} else {
+			for _, dev := range as.Devices {
+				d = d.add(deviceDemand(dev))
+			}
 		}
 		weight[asn] = d
 	}
@@ -271,6 +299,12 @@ func Place(top *model.Topology, opts Options) (*Assignment, error) {
 		}
 	default:
 		return nil, fmt.Errorf("unknown placement strategy %q; use pack-by-as, spread-by-as or single-node", strategy)
+	}
+
+	if splitMoved, err := distributePlacementGroups(top, a, names, caps, hasCap, opts, explicitPinned); err != nil {
+		return nil, err
+	} else {
+		moved = append(moved, splitMoved...)
 	}
 
 	res, err := finish(top, a)
@@ -357,9 +391,13 @@ func sortedNodeNames(m map[string]demand) []string {
 func finish(top *model.Topology, a *Assignment) (*Assignment, error) {
 	for _, d := range top.SortedDevices() {
 		if d.ASN > 0 {
-			n, ok := a.ByAS[d.ASN]
+			n, ok := a.ByGroup[d.PlacementGroup]
 			if !ok {
-				return nil, fmt.Errorf("device %s belongs to unplaced AS %d", d.ID, d.ASN)
+				n, ok = a.ByAS[d.ASN]
+			}
+			if !ok {
+				return nil, fmt.Errorf("device %s belongs to unplaced AS %d or group %q",
+					d.ID, d.ASN, d.PlacementGroup)
 			}
 			d.Node = n
 			continue
@@ -384,10 +422,17 @@ func finish(top *model.Topology, a *Assignment) (*Assignment, error) {
 		a.Load[d.Node]++
 	}
 	a.CrossNodeLinks = 0
+	a.Locality = map[model.LinkClass]LinkLocality{}
 	for _, l := range top.Links {
+		class := l.LocalityClass()
+		locality := a.Locality[class]
 		if l.CrossNode() {
 			a.CrossNodeLinks++
+			locality.CrossNode++
+		} else {
+			locality.Local++
 		}
+		a.Locality[class] = locality
 	}
 	a.Overloaded = checkCapacity(top, a)
 	return a, nil
@@ -437,5 +482,14 @@ func (a *Assignment) Describe() string {
 		fmt.Fprintf(&b, "%s: %d containers, %d ASes %v\n", n, a.Load[n], len(ases), ases)
 	}
 	fmt.Fprintf(&b, "cross-node links: %d\n", a.CrossNodeLinks)
+	classes := make([]string, 0, len(a.Locality))
+	for class := range a.Locality {
+		classes = append(classes, string(class))
+	}
+	sort.Strings(classes)
+	for _, class := range classes {
+		v := a.Locality[model.LinkClass(class)]
+		fmt.Fprintf(&b, "  %s links: %d local, %d cross-node\n", class, v.Local, v.CrossNode)
+	}
 	return b.String()
 }

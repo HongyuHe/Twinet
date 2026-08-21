@@ -122,6 +122,20 @@ var skipped = map[string]string{
 	"Hosts":    "as above",
 	"Switches": "as above",
 	"Services": "as above",
+	// Interior generation and placement metadata are represented by the
+	// concrete devices, interfaces and links already walked above. Skipping
+	// these annotations preserves the identity of every legacy explicit
+	// topology while still hashing the generated graph and its addresses.
+	"Interior":          "authored generator declaration; compiled graph is hashed",
+	"InteriorKind":      "compiled graph is hashed",
+	"Distributable":     "placement policy, not topology",
+	"PlacementGroups":   "placement policy, not topology",
+	"PlacementGroup":    "placement policy, not topology",
+	"InteriorRole":      "generator annotation; interfaces and graph are hashed",
+	"InteriorRoleIndex": "generator annotation; interfaces and graph are hashed",
+	"Class":             "link locality reporting metadata",
+	"AddressingField":   "diagnostic metadata; resulting subnet is hashed",
+	"RouterRouterRole":  "resulting generated subnets are hashed",
 
 	// Deployment facts, not topology. Two clusters running the same lab must
 	// agree on the hash, or a submission could never be graded anywhere but

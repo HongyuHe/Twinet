@@ -54,6 +54,9 @@ func LoadRecord(dir, lab string) (*Record, error) {
 	if r.ByAS == nil {
 		r.ByAS = map[int]string{}
 	}
+	if r.ByGroup == nil {
+		r.ByGroup = map[string]string{}
+	}
 	if r.ByService == nil {
 		r.ByService = map[string]string{}
 	}

@@ -84,6 +84,7 @@ func (e *expander) compilePlan() (*ipam.Plan, error) {
 		ipam.FieldRouterLoopback:   a.RouterLoopback,
 		ipam.FieldRouterLoopbackV6: a.RouterLoopbackV6,
 		ipam.FieldRouterRouter:     a.RouterRouter,
+		ipam.FieldRouterRouterRole: a.RouterRouterRole,
 		ipam.FieldRouterHost:       a.RouterHost,
 		ipam.FieldL2Domain:         a.L2Domain,
 		ipam.FieldL2DomainV6:       a.L2DomainV6,
@@ -144,6 +145,10 @@ func (e *expander) expandOneAS(asn int, spec model.ASSpec) error {
 		return fmt.Errorf("template %q not found (available: %s)", tplName,
 			strings.Join(e.lab.SortedTemplateNames(), ", "))
 	}
+	shape, err := compileInterior(tpl)
+	if err != nil {
+		return fmt.Errorf("interior: %w", err)
+	}
 
 	role := spec.Role
 	if role == "" {
@@ -170,31 +175,48 @@ func (e *expander) expandOneAS(asn int, spec model.ASSpec) error {
 	}
 
 	as := &model.AS{
-		ASN:        asn,
-		Role:       role,
-		Region:     region,
-		Template:   tplName,
-		OwnerGroup: e.ownerGroup(asn, spec),
-		Nickname:   spec.Nickname,
-		Block:      block,
-		BlockV6:    blockV6,
-		ExtPorts:   map[string]*model.ExtPortBinding{},
-		Labels:     spec.Labels,
-		Node:       spec.Node,
+		ASN:           asn,
+		Role:          role,
+		Region:        region,
+		Template:      tplName,
+		OwnerGroup:    e.ownerGroup(asn, spec),
+		Nickname:      spec.Nickname,
+		Block:         block,
+		BlockV6:       blockV6,
+		ExtPorts:      map[string]*model.ExtPortBinding{},
+		Labels:        spec.Labels,
+		Node:          spec.Node,
+		InteriorKind:  shape.kind,
+		Distributable: shape.distributable,
 	}
 	e.top.ASes[asn] = as
 	compileProvisioning(as, tpl)
 
-	// Routers, in deterministic ID order.
-	routerNames := sortedKeys(tpl.Routers)
-	sort.Slice(routerNames, func(i, j int) bool {
-		return tpl.Routers[routerNames[i]].ID < tpl.Routers[routerNames[j]].ID
-	})
+	// Routers, in deterministic ID order. Explicit interiors retain the
+	// exact legacy order; generated shapes provide their own stable order.
+	routerNames := make([]string, 0, len(shape.routers))
+	routerSpecs := make(map[string]*model.RouterSpec, len(shape.routers))
+	for _, ir := range shape.routers {
+		routerNames = append(routerNames, ir.name)
+		routerSpecs[ir.name] = ir.spec
+	}
 	byName := map[string]*model.Device{}
-	for _, rn := range routerNames {
-		rs := tpl.Routers[rn]
+	for _, ir := range shape.routers {
+		rn, rs := ir.name, ir.spec
 		d := e.newDevice(as, rn, model.KindRouter, rs.DeviceDefaults)
 		d.RouterID = rs.ID
+		if shape.generated {
+			d.InteriorRole = ir.role
+			d.InteriorRoleIndex = ir.roleIndex
+			if shape.kind == model.InteriorClos && shape.distributable {
+				switch ir.role {
+				case model.InteriorRoleSpine:
+					d.PlacementGroup = closSpineGroupID(asn)
+				case model.InteriorRoleLeaf:
+					d.PlacementGroup = closLeafGroupID(asn, ir.roleIndex)
+				}
+			}
+		}
 		d.Services = append([]string{}, rs.Services...)
 		d.L2Gateway = rs.L2Gateway
 		byName[rn] = d
@@ -264,91 +286,155 @@ func (e *expander) expandOneAS(asn int, spec model.ASSpec) error {
 	}
 
 	// Per-router L3 hosts.
-	hostsEnabled := tpl.Hosts.PerRouter == nil || *tpl.Hosts.PerRouter
-	hostName := orDefault(tpl.Hosts.Name, "host")
-	for _, rn := range routerNames {
-		rs := tpl.Routers[rn]
-		if rs.Host != nil && !*rs.Host {
-			continue
-		}
-		if !hostsEnabled && (rs.Host == nil || !*rs.Host) {
-			continue
-		}
-		r := byName[rn]
-		hostDev := e.newDevice(as, hostDeviceName(hostName, rn), model.KindHost, tpl.Hosts.DeviceDefaults)
-
-		hostIface := rn + "router"
-		if tpl.Hosts.Iface != "" {
-			v, err := evalScalar(tpl.Hosts.Iface, map[string]any{"Router": rn, "AS": asn})
-			if err != nil {
-				return fmt.Errorf("hosts.iface: %w", err)
+	if !shape.suppressAutoHosts {
+		hostsEnabled := tpl.Hosts.PerRouter == nil || *tpl.Hosts.PerRouter
+		hostName := orDefault(tpl.Hosts.Name, "host")
+		for _, rn := range routerNames {
+			rs := routerSpecs[rn]
+			if rs.Host != nil && !*rs.Host {
+				continue
 			}
-			hostIface = v
-		}
-
-		subnet := ""
-		if e.plan.Has(ipam.FieldRouterHost) {
-			s, err := e.plan.Eval(ipam.FieldRouterHost, ipam.Ctx{AS: asn, RouterID: rs.ID, Name: rn})
-			if err != nil {
-				return err
+			if !hostsEnabled && (rs.Host == nil || !*rs.Host) {
+				continue
 			}
-			subnet = s
-		}
-		hostAddr, routerAddr := hostPair(subnet)
-		owner := e.ownerFor(as, tpl, rn, model.DomainHostAddressing)
-		// A rule naming one of these interfaces claims it individually. Rules
-		// like that used to be skipped outright, so a manifest that provisioned
-		// a single interface got nothing.
-		hostOwner := e.ownerForIface(as, tpl, hostDev.Name, hostIface, model.DomainHostAddressing)
-		rtrOwner := e.ownerForIface(as, tpl, rn, "host", model.DomainHostAddressing)
+			r := byName[rn]
+			hostDev := e.newDevice(as, hostDeviceName(hostName, rn), model.KindHost, tpl.Hosts.DeviceDefaults)
 
-		hIf := &model.Iface{Device: hostDev, Name: hostIface, Role: model.RoleHostLink,
-			Addr4: hostAddr, Owner: hostOwner, Prescribed: true, Subnet: subnet}
-		rIf := &model.Iface{Device: r, Name: "host", Role: model.RoleHostLink,
-			Addr4: routerAddr, Owner: rtrOwner, Prescribed: true, Subnet: subnet}
-		hostDev.AddIface(hIf)
-		r.AddIface(rIf)
-		e.link(hIf, rIf, model.LinkVeth, e.lab.LinkDefaults, subnet, owner)
+			hostIface := rn + "router"
+			if tpl.Hosts.Iface != "" {
+				v, err := evalScalar(tpl.Hosts.Iface, map[string]any{"Router": rn, "AS": asn})
+				if err != nil {
+					return fmt.Errorf("hosts.iface: %w", err)
+				}
+				hostIface = v
+			}
+
+			subnet := ""
+			if e.plan.Has(ipam.FieldRouterHost) {
+				s, err := e.plan.Eval(ipam.FieldRouterHost, ipam.Ctx{AS: asn, RouterID: rs.ID, Name: rn})
+				if err != nil {
+					return err
+				}
+				subnet = s
+			}
+			hostAddr, routerAddr := hostPair(subnet)
+			owner := e.ownerFor(as, tpl, rn, model.DomainHostAddressing)
+			// A rule naming one of these interfaces claims it individually. Rules
+			// like that used to be skipped outright, so a manifest that provisioned
+			// a single interface got nothing.
+			hostOwner := e.ownerForIface(as, tpl, hostDev.Name, hostIface, model.DomainHostAddressing)
+			rtrOwner := e.ownerForIface(as, tpl, rn, "host", model.DomainHostAddressing)
+
+			hIf := &model.Iface{Device: hostDev, Name: hostIface, Role: model.RoleHostLink,
+				Addr4: hostAddr, Owner: hostOwner, Prescribed: true, Subnet: subnet}
+			rIf := &model.Iface{Device: r, Name: "host", Role: model.RoleHostLink,
+				Addr4: routerAddr, Owner: rtrOwner, Prescribed: true, Subnet: subnet}
+			hostDev.AddIface(hIf)
+			r.AddIface(rIf)
+			e.link(hIf, rIf, model.LinkVeth, e.lab.LinkDefaults, subnet, owner)
+		}
 	}
 
-	// Internal router-router links.
-	for li, il := range tpl.InternalLinks {
-		a, ok := byName[il.A]
-		if !ok {
-			return fmt.Errorf("internal_links[%d]: unknown router %q", li, il.A)
-		}
-		b, ok := byName[il.B]
-		if !ok {
-			return fmt.Errorf("internal_links[%d]: unknown router %q", li, il.B)
-		}
-		subnet := ""
-		if il.Subnet != "" {
-			v, err := evalScalar(il.Subnet, map[string]any{
-				"AS": asn, "RouterID": a.RouterID, "PeerID": b.RouterID, "LinkIndex": li,
-			})
-			if err != nil {
-				return fmt.Errorf("internal_links[%d].subnet: %w", li, err)
+	// Explicit links retain the legacy compilation path, including its
+	// original LinkIndex values. Generated interiors use the role-addressed
+	// input so a large fabric need not consume the old positional space.
+	if !shape.generated {
+		for li, il := range tpl.EffectiveInternalLinks() {
+			a, ok := byName[il.A]
+			if !ok {
+				return fmt.Errorf("internal_links[%d]: unknown router %q", li, il.A)
 			}
-			subnet = v
-		}
-		if subnet == "" && e.plan.Has(ipam.FieldRouterRouter) {
-			s, err := e.plan.Eval(ipam.FieldRouterRouter, ipam.Ctx{
-				AS: asn, LinkIndex: li, RouterID: a.RouterID, PeerID: b.RouterID,
-			})
-			if err != nil {
-				return err
+			b, ok := byName[il.B]
+			if !ok {
+				return fmt.Errorf("internal_links[%d]: unknown router %q", li, il.B)
 			}
-			subnet = s
+			subnet := ""
+			if il.Subnet != "" {
+				v, err := evalScalar(il.Subnet, map[string]any{
+					"AS": asn, "RouterID": a.RouterID, "PeerID": b.RouterID, "LinkIndex": li,
+				})
+				if err != nil {
+					return fmt.Errorf("internal_links[%d].subnet: %w", li, err)
+				}
+				subnet = v
+			}
+			if subnet == "" && e.plan.Has(ipam.FieldRouterRouter) {
+				s, err := e.plan.Eval(ipam.FieldRouterRouter, ipam.Ctx{
+					AS: asn, LinkIndex: li, RouterID: a.RouterID, PeerID: b.RouterID,
+				})
+				if err != nil {
+					return err
+				}
+				subnet = s
+			}
+			aAddr, bAddr := hostPair(subnet)
+			owner := e.ownerFor(as, tpl, il.A, model.DomainRouterInterfaces)
+			aIf := &model.Iface{Device: a, Name: "port_" + il.B, Role: model.RoleIntraAS,
+				Addr4: aAddr, Owner: owner, Prescribed: true, Subnet: subnet}
+			bIf := &model.Iface{Device: b, Name: "port_" + il.A, Role: model.RoleIntraAS,
+				Addr4: bAddr, Owner: owner, Prescribed: true, Subnet: subnet}
+			a.AddIface(aIf)
+			b.AddIface(bIf)
+			e.link(aIf, bIf, model.LinkVeth, il.Merge(e.lab.LinkDefaults), subnet, owner)
 		}
-		aAddr, bAddr := hostPair(subnet)
-		owner := e.ownerFor(as, tpl, il.A, model.DomainRouterInterfaces)
-		aIf := &model.Iface{Device: a, Name: "port_" + il.B, Role: model.RoleIntraAS,
-			Addr4: aAddr, Owner: owner, Prescribed: true, Subnet: subnet}
-		bIf := &model.Iface{Device: b, Name: "port_" + il.A, Role: model.RoleIntraAS,
-			Addr4: bAddr, Owner: owner, Prescribed: true, Subnet: subnet}
-		a.AddIface(aIf)
-		b.AddIface(bIf)
-		e.link(aIf, bIf, model.LinkVeth, il.Merge(e.lab.LinkDefaults), subnet, owner)
+	} else {
+		for li, il := range shape.links {
+			a, ok := byName[il.a]
+			if !ok {
+				return fmt.Errorf("generated %s link[%d]: unknown router %q", shape.kind, li, il.a)
+			}
+			b, ok := byName[il.b]
+			if !ok {
+				return fmt.Errorf("generated %s link[%d]: unknown router %q", shape.kind, li, il.b)
+			}
+			subnet, field, err := e.generatedInteriorSubnet(asn, a, b, li, il.class)
+			if err != nil {
+				return fmt.Errorf("generated %s link[%d]: %w", shape.kind, li, err)
+			}
+			aAddr, bAddr := hostPair(subnet)
+			owner := e.ownerFor(as, tpl, il.a, model.DomainRouterInterfaces)
+			aIf := &model.Iface{Device: a, Name: "port_" + il.b, Role: model.RoleIntraAS,
+				Addr4: aAddr, Owner: owner, Prescribed: true, Subnet: subnet}
+			bIf := &model.Iface{Device: b, Name: "port_" + il.a, Role: model.RoleIntraAS,
+				Addr4: bAddr, Owner: owner, Prescribed: true, Subnet: subnet}
+			a.AddIface(aIf)
+			b.AddIface(bIf)
+			l := e.link(aIf, bIf, model.LinkVeth, il.props.Merge(e.lab.LinkDefaults), subnet, owner)
+			l.Class, l.AddressingField = il.class, field
+		}
+
+		hostRoleIndex := 0
+		for hi, spec := range shape.hosts {
+			leaf, ok := byName[spec.leaf]
+			if !ok {
+				return fmt.Errorf("generated %s host[%d]: unknown leaf %q", shape.kind, hi, spec.leaf)
+			}
+			host := e.newDevice(as, spec.name, model.KindHost, tpl.Hosts.DeviceDefaults)
+			hostRoleIndex++
+			host.InteriorRole = model.InteriorRoleHost
+			host.InteriorRoleIndex = hostRoleIndex
+			if shape.distributable {
+				host.PlacementGroup = closLeafGroupID(asn, spec.leafIndex)
+			}
+
+			subnet, field, err := e.generatedInteriorSubnet(
+				asn, leaf, host, len(shape.links)+hi, model.LinkClassLeafHost)
+			if err != nil {
+				return fmt.Errorf("generated %s host[%d]: %w", shape.kind, hi, err)
+			}
+			hostAddr, leafAddr := hostPair(subnet)
+			owner := e.ownerFor(as, tpl, spec.leaf, model.DomainHostAddressing)
+			hIf := &model.Iface{Device: host, Name: spec.leaf, Role: model.RoleHostLink,
+				Addr4: hostAddr, Owner: e.ownerForIface(as, tpl, host.Name, spec.leaf, model.DomainHostAddressing),
+				Prescribed: true, Subnet: subnet}
+			lIf := &model.Iface{Device: leaf, Name: fmt.Sprintf("host_%d", spec.index), Role: model.RoleHostLink,
+				Addr4: leafAddr, Owner: e.ownerForIface(as, tpl, spec.leaf, fmt.Sprintf("host_%d", spec.index), model.DomainHostAddressing),
+				Prescribed: true, Subnet: subnet}
+			host.AddIface(hIf)
+			leaf.AddIface(lIf)
+			l := e.link(hIf, lIf, model.LinkVeth, tpl.Interior.LinkProps.Merge(e.lab.LinkDefaults), subnet, owner)
+			l.Class, l.AddressingField = model.LinkClassLeafHost, field
+		}
 	}
 
 	// Layer-2 domains.
@@ -357,6 +443,7 @@ func (e *expander) expandOneAS(asn int, spec model.ASSpec) error {
 			return fmt.Errorf("l2_domains.%s: %w", dn, err)
 		}
 	}
+	e.definePlacementGroups(as, shape)
 
 	for _, d := range as.Devices {
 		e.top.Devices[d.ID] = d

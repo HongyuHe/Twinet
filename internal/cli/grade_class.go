@@ -101,6 +101,9 @@ The lab must already be deployed with --solve.`,
 			if err != nil {
 				return err
 			}
+			if err := rubric.ValidateTopology(top); err != nil {
+				return err
+			}
 			subs, unread, err := readSubmissions(subDir, top)
 			if err != nil {
 				return err

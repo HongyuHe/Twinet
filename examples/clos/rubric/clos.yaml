@@ -1,0 +1,13 @@
+apiVersion: twinet.dev/v1
+kind: Rubric
+metadata:
+  name: clos-connectivity
+  total: 1
+  supported_interior_kinds: [clos]
+  notes: This fixture rubric is intentionally small and is suitable for later Clos E2E runs.
+questions:
+  - id: ospf
+    title: Clos interior converges
+    points: 1
+    checks:
+      - check: ospf.full_adjacency

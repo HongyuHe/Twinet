@@ -487,6 +487,21 @@ interior:
    applied to another. A rubric therefore declares which interior kinds it
    grades, and grading a lab whose interior it does not name is refused.
 
+**Shipped declaration and placement contract.** Omitted `interior:` remains
+`explicit`, including the legacy `routers:` and `internal_links:` syntax.
+Generated router-to-router and Clos leaf-host links use the optional
+`addressing.router_router_role` expression, whose context includes `.Role`,
+`.PeerRole`, `.RoleIndex`, `.PeerRoleIndex`, `.RoleLinkIndex`, and
+`.LinkClass`; `cidrSubnet` avoids the old dotted-octet link-index limit.
+
+A `distributable: true` Clos is scheduled as one spine group and one
+leaf-with-hosts group per leaf. All other ASes remain atomic. Placement records
+retain `by_as` and add optional `by_group`, so records from before interior
+groups remain valid. Rubrics may set
+`metadata.supported_interior_kinds: [clos]`; a mismatch is rejected as a
+rubric/topology author error before any student mark is calculated. See
+`examples/clos` for a compact validated fixture.
+
 **Acceptance.** A manifest declaring a Clos interior deploys, converges, is
 graded by a rubric written for it, and places sensibly across three nodes; the
 existing course labs, expressed as `kind: explicit`, produce byte-identical

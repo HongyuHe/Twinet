@@ -1,8 +1,10 @@
 package place
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -139,5 +141,20 @@ func TestRecordSurvivesARoundTrip(t *testing.T) {
 	}
 	if _, err := LoadRecord(dir, "t"); err == nil {
 		t.Error("a corrupt record was read as an absent one")
+	}
+}
+
+func TestAtomicRecordEncodingDoesNotGainGroupFields(t *testing.T) {
+	r := (&Assignment{
+		ByAS:      map[int]string{3: "node-1"},
+		ByGroup:   map[string]string{},
+		ByService: map[string]string{"dns": "node-0"},
+	}).Record("t", "pack-by-as")
+	raw, err := json.Marshal(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "by_group") {
+		t.Errorf("ordinary placement record changed wire format: %s", raw)
 	}
 }
