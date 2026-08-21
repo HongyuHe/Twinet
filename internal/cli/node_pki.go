@@ -5,9 +5,11 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"time"
 
 	"github.com/spf13/cobra"
 
+	"github.com/HongyuHe/twinet/internal/authz"
 	"github.com/HongyuHe/twinet/internal/pki"
 )
 
@@ -89,6 +91,57 @@ would recreate exactly the property that makes the token unacceptable.`,
 	}
 	cmd.Flags().StringVar(&dir, "dir", "", "where to write the material")
 	cmd.Flags().BoolVar(&force, "force", false, "replace an existing CA")
+	cmd.AddCommand(newNodeCredentialCmd(opts))
+	return cmd
+}
+
+func newNodeCredentialCmd(opts *Options) *cobra.Command {
+	var (
+		pkiDir  string
+		outDir  string
+		labs    []string
+		actions []string
+		valid   time.Duration
+	)
+	cmd := &cobra.Command{
+		Use:   "credential <name>",
+		Short: "Issue a lab- and action-scoped operator certificate",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			top, err := loadAndPlace(opts)
+			if err != nil {
+				return err
+			}
+			name := args[0]
+			if pkiDir == "" {
+				pkiDir = filepath.Join(top.Lab.Dir, ".twinet", "pki")
+			}
+			if outDir == "" {
+				outDir = filepath.Join(top.Lab.Dir, ".twinet", "credentials", name)
+			}
+			if len(labs) == 0 {
+				labs = []string{top.Name}
+			}
+			if len(actions) == 0 {
+				return fmt.Errorf("no actions were granted; pass --action for each permitted operation")
+			}
+			m, err := pki.IssueScoped(pkiDir, outDir, name, authz.RoleOperator,
+				labs, actions, valid)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(cmd.OutOrStdout(),
+				"issued operator %q for labs %v and actions %v\n\n"+
+					"  certificate  %s\n  key          %s\n  CA           %s\n",
+				name, labs, actions, m.CertPath, m.KeyPath, m.CAPath)
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&pkiDir, "pki", "", "cluster PKI directory")
+	cmd.Flags().StringVar(&outDir, "out", "", "output directory")
+	cmd.Flags().StringSliceVar(&labs, "lab", nil, "lab this identity may access (repeatable)")
+	cmd.Flags().StringSliceVar(&actions, "action", nil, "permitted action (repeatable)")
+	cmd.Flags().DurationVar(&valid, "valid", 24*time.Hour, "certificate lifetime")
 	return cmd
 }
 
