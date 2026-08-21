@@ -68,7 +68,7 @@ Kubernetes-backed systems.
 | Service links crossing the fabric | 204 / 320 (64%) |
 | Fair reduced-harness grading at concurrency 8 | about 3h15m projected for 100; one observed infrastructure quarantine |
 | VNI test, 100 concurrent 300-link labs | 23 collisions before sequential deconfliction |
-| Live node-0 after labs were gone | 0 managed containers, 28 Twinet VXLANs, 28 Twinet bridges |
+| Authenticated cluster sweep after agent rollout | 0 orphan overlays; 28/24/14 active overlays on node-0/1/2 |
 | Production Go | 57,234 lines |
 | Core orchestration Go | 16,755 lines |
 | Go tests | 26,690 lines |
@@ -181,9 +181,12 @@ report success for a partial cluster mutation.
 ### O5 - Bound overlay object growth and collect garbage automatically
 
 **Problem.** Each cross-node link creates a bridge and VXLAN interface on both
-ends. Concurrent grading multiplies those objects. Orphan cleanup is manual;
-the live cluster currently retains 28 Twinet tunnels and bridges while running
-no Twinet containers.
+ends. Concurrent grading multiplies those objects. Orphan cleanup was manual,
+and prior interrupted grading/deployment runs left abandoned labs and hundreds
+of host objects. An initial unauthenticated shell check in this audit
+misclassified 28 node-0 overlays as orphaned; the authenticated ownership sweep
+correctly proved they were active COS-461 links, and that correction is part of
+the evidence.
 
 **Required outcome.**
 
@@ -199,8 +202,9 @@ no Twinet containers.
 
 **Acceptance.** Overlay tunnel/bridge count grows with active lab/node pairs,
 not cross-node links. Killing a controller halfway through deployment leaves no
-objects after the lease/grace period. The existing 28-object leak is detected
-and safely removable by the automatic path.
+objects after the lease/grace period. A deliberately abandoned synthetic lab is
+detected and safely removed by the automatic path, while every active COS-461
+overlay remains untouched.
 
 ### O6 - Remove front-node service bottlenecks
 
