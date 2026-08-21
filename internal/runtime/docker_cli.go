@@ -78,6 +78,21 @@ func (d *dockerCLI) PullImage(ctx context.Context, ref string, policy PullPolicy
 
 // Create makes a container without starting it.
 func (d *dockerCLI) Create(ctx context.Context, s *Spec) (string, error) {
+	args, err := dockerCLICreateArgs(s)
+	if err != nil {
+		return "", err
+	}
+	out, err := d.mustRun(ctx, args...)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out), nil
+}
+
+func dockerCLICreateArgs(s *Spec) ([]string, error) {
+	if s == nil {
+		return nil, fmt.Errorf("container spec is nil")
+	}
 	args := []string{"create", "--name", s.Name}
 
 	if s.Hostname != "" {
@@ -107,6 +122,9 @@ func (d *dockerCLI) Create(ctx context.Context, s *Spec) (string, error) {
 	for _, c := range s.Capabilities {
 		args = append(args, "--cap-add", c)
 	}
+	for _, c := range s.CapDrop {
+		args = append(args, "--cap-drop", c)
+	}
 	for path, opts := range s.Tmpfs {
 		if opts == "" {
 			args = append(args, "--tmpfs", path)
@@ -117,13 +135,30 @@ func (d *dockerCLI) Create(ctx context.Context, s *Spec) (string, error) {
 	if s.Privileged {
 		args = append(args, "--privileged")
 	}
+	for _, opt := range s.SecurityOpt {
+		args = append(args, "--security-opt", opt)
+	}
+	pathHardening, err := dockerCLIPathHardeningArgs(s)
+	if err != nil {
+		return nil, err
+	}
+	args = append(args, pathHardening...)
+	if s.ReadOnlyRootfs {
+		args = append(args, "--read-only")
+	}
+	if s.RuntimeClass != "" {
+		args = append(args, "--runtime", s.RuntimeClass)
+	}
+	if s.UsernsMode != "" {
+		args = append(args, "--userns", s.UsernsMode)
+	}
 	if s.CPUs > 0 {
 		args = append(args, "--cpus", strconv.FormatFloat(s.CPUs, 'f', -1, 64))
 	}
 	if s.Memory != "" {
 		b, err := ParseMemory(s.Memory)
 		if err != nil {
-			return "", fmt.Errorf("container %s: memory: %w", s.Name, err)
+			return nil, fmt.Errorf("container %s: memory: %w", s.Name, err)
 		}
 		args = append(args, "--memory", FormatMemory(b))
 	}
@@ -187,11 +222,23 @@ func (d *dockerCLI) Create(ctx context.Context, s *Spec) (string, error) {
 	}
 	args = append(args, s.Command...)
 
-	out, err := d.mustRun(ctx, args...)
-	if err != nil {
-		return "", err
+	return args, nil
+}
+
+func dockerCLIPathHardeningArgs(s *Spec) ([]string, error) {
+	if s.MaskedPaths == nil && s.ReadonlyPaths == nil {
+		return nil, nil
 	}
-	return strings.TrimSpace(out), nil
+	if s.MaskedPaths != nil && s.ReadonlyPaths != nil &&
+		len(s.MaskedPaths) == 0 && len(s.ReadonlyPaths) == 0 {
+		for _, opt := range s.SecurityOpt {
+			if opt == "systempaths=unconfined" {
+				return nil, nil
+			}
+		}
+		return []string{"--security-opt", "systempaths=unconfined"}, nil
+	}
+	return nil, fmt.Errorf("Docker CLI fallback cannot represent MaskedPaths or ReadonlyPaths; use the Engine API backend")
 }
 
 // Start starts a created container.

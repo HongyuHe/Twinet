@@ -53,16 +53,31 @@ type Spec struct {
 	Binds        []Bind
 	Sysctls      map[string]string
 	Capabilities []string
-	Privileged   bool
-	CPUs         float64
-	Memory       string
-	PidsLimit    int64
-	Restart      string
-	DNS          []string
-	DNSSearch    []string
-	ExtraHosts   []string
-	Ports        []PortMap
-	Tmpfs        map[string]string
+	CapDrop      []string
+	// SecurityOpt contains Docker security options such as
+	// no-new-privileges, seccomp=..., and apparmor=....
+	SecurityOpt []string
+	// ReadOnlyRootfs mounts the container root filesystem read-only.
+	ReadOnlyRootfs bool
+	// RuntimeClass is the Docker runtime name supplied to --runtime.
+	RuntimeClass string
+	// UsernsMode is the Docker user namespace mode, for example "host".
+	UsernsMode string
+	// MaskedPaths and ReadonlyPaths customize the Engine API's OCI system
+	// path restrictions. The CLI fallback can only represent the paired empty
+	// lists through security-opt=systempaths=unconfined.
+	MaskedPaths   []string
+	ReadonlyPaths []string
+	Privileged    bool
+	CPUs          float64
+	Memory        string
+	PidsLimit     int64
+	Restart       string
+	DNS           []string
+	DNSSearch     []string
+	ExtraHosts    []string
+	Ports         []PortMap
+	Tmpfs         map[string]string
 	// NetworkMode is "none" for every Twinet device: interfaces are attached
 	// explicitly by netx, never by the container engine's own IPAM. This is
 	// what keeps addressing entirely inside the model.

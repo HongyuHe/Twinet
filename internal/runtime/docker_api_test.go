@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -181,6 +182,24 @@ func TestDockerCreateConfigLeavesUnspecifiedOptionsUnset(t *testing.T) {
 		t.Errorf("empty host options = Binds:%#v Tmpfs:%#v Sysctls:%#v, want nil",
 			hostConfig.Binds, hostConfig.Tmpfs, hostConfig.Sysctls)
 	}
+	if hostConfig.CapDrop != nil || hostConfig.SecurityOpt != nil ||
+		hostConfig.MaskedPaths != nil || hostConfig.ReadonlyPaths != nil ||
+		hostConfig.ReadonlyRootfs || hostConfig.Runtime != "" || hostConfig.UsernsMode != "" {
+		t.Errorf("empty hardening options = %#v, want Docker zero values", hostConfig)
+	}
+
+	_, explicitlyCleared, err := dockerCreateConfig(&Spec{
+		Image:         "example:latest",
+		MaskedPaths:   []string{},
+		ReadonlyPaths: []string{},
+	})
+	if err != nil {
+		t.Fatalf("create config with cleared system paths: %v", err)
+	}
+	if explicitlyCleared.MaskedPaths == nil || explicitlyCleared.ReadonlyPaths == nil {
+		t.Errorf("explicitly cleared system paths = Masked:%#v Readonly:%#v, want non-nil empty lists",
+			explicitlyCleared.MaskedPaths, explicitlyCleared.ReadonlyPaths)
+	}
 }
 
 func TestDockerAPIHonorsOperationContext(t *testing.T) {
@@ -217,6 +236,151 @@ func TestDockerAPIHonorsOperationContext(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("Docker API operation did not stop after context cancellation")
+	}
+}
+
+func TestDockerAPIHardeningCreateRequest(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		captured struct {
+			HostConfig struct {
+				SecurityOpt    []string
+				ReadonlyRootfs bool
+				Runtime        string
+				UsernsMode     string
+				CapDrop        []string
+				MaskedPaths    []string
+				ReadonlyPaths  []string
+			}
+		}
+	)
+	fake := newEngineFake(t, func(w http.ResponseWriter, r *http.Request) {
+		if servePing(w, r) {
+			return
+		}
+		if enginePath(r) != "/containers/create" {
+			http.Error(w, "unexpected Docker API request", http.StatusNotFound)
+			return
+		}
+		var request struct {
+			HostConfig struct {
+				SecurityOpt    []string
+				ReadonlyRootfs bool
+				Runtime        string
+				UsernsMode     string
+				CapDrop        []string
+				MaskedPaths    []string
+				ReadonlyPaths  []string
+			}
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode hardening create request: %v", err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		captured = request
+		mu.Unlock()
+		writeDockerJSON(w, http.StatusCreated, map[string]string{"Id": "hardened-id"})
+	})
+	docker := newEngineDocker(t, fake)
+
+	_, err := docker.Create(context.Background(), &Spec{
+		Name:           "hardened",
+		Image:          "example:latest",
+		SecurityOpt:    []string{"no-new-privileges", "seccomp=unconfined", "apparmor=twinet"},
+		ReadOnlyRootfs: true,
+		RuntimeClass:   "runsc",
+		UsernsMode:     "host",
+		CapDrop:        []string{"CAP_NET_RAW", "CAP_SYS_ADMIN"},
+		MaskedPaths:    []string{"/proc/kcore", "/proc/keys"},
+		ReadonlyPaths:  []string{"/proc/sys", "/proc/irq"},
+	})
+	if err != nil {
+		t.Fatalf("create hardened container: %v", err)
+	}
+
+	mu.Lock()
+	got := captured.HostConfig
+	mu.Unlock()
+	if !slices.Equal(got.SecurityOpt, []string{"no-new-privileges", "seccomp=unconfined", "apparmor=twinet"}) {
+		t.Errorf("SecurityOpt = %#v", got.SecurityOpt)
+	}
+	if !got.ReadonlyRootfs || got.Runtime != "runsc" || got.UsernsMode != "host" {
+		t.Errorf("rootfs/runtime/userns = %#v", got)
+	}
+	if !slices.Equal(got.CapDrop, []string{"CAP_NET_RAW", "CAP_SYS_ADMIN"}) {
+		t.Errorf("CapDrop = %#v", got.CapDrop)
+	}
+	if !slices.Equal(got.MaskedPaths, []string{"/proc/kcore", "/proc/keys"}) {
+		t.Errorf("MaskedPaths = %#v", got.MaskedPaths)
+	}
+	if !slices.Equal(got.ReadonlyPaths, []string{"/proc/sys", "/proc/irq"}) {
+		t.Errorf("ReadonlyPaths = %#v", got.ReadonlyPaths)
+	}
+}
+
+func TestDockerCLIHardeningArguments(t *testing.T) {
+	args, err := dockerCLICreateArgs(&Spec{
+		Name:           "hardened",
+		Image:          "example:latest",
+		SecurityOpt:    []string{"no-new-privileges", "seccomp=unconfined", "apparmor=twinet"},
+		ReadOnlyRootfs: true,
+		RuntimeClass:   "runsc",
+		UsernsMode:     "host",
+		CapDrop:        []string{"NET_RAW", "SYS_ADMIN"},
+	})
+	if err != nil {
+		t.Fatalf("build CLI arguments: %v", err)
+	}
+	want := []string{
+		"create", "--name", "hardened", "--network", "none",
+		"--cap-drop", "NET_RAW", "--cap-drop", "SYS_ADMIN",
+		"--security-opt", "no-new-privileges",
+		"--security-opt", "seccomp=unconfined",
+		"--security-opt", "apparmor=twinet",
+		"--read-only", "--runtime", "runsc", "--userns", "host",
+		"example:latest",
+	}
+	if !slices.Equal(args, want) {
+		t.Errorf("CLI arguments = %#v, want %#v", args, want)
+	}
+}
+
+func TestDockerCLIHardeningSystemPaths(t *testing.T) {
+	args, err := dockerCLICreateArgs(&Spec{
+		Name:          "clear-system-paths",
+		Image:         "example:latest",
+		MaskedPaths:   []string{},
+		ReadonlyPaths: []string{},
+	})
+	if err != nil {
+		t.Fatalf("build CLI arguments for cleared system paths: %v", err)
+	}
+	want := []string{
+		"create", "--name", "clear-system-paths", "--network", "none",
+		"--security-opt", "systempaths=unconfined", "example:latest",
+	}
+	if !slices.Equal(args, want) {
+		t.Errorf("CLI system-path arguments = %#v, want %#v", args, want)
+	}
+
+	for _, spec := range []*Spec{
+		{
+			Name:        "custom-masked-paths",
+			Image:       "example:latest",
+			MaskedPaths: []string{"/proc/kcore"},
+		},
+		{
+			Name:          "custom-readonly-paths",
+			Image:         "example:latest",
+			ReadonlyPaths: []string{"/proc/sys"},
+		},
+	} {
+		_, err = dockerCLICreateArgs(spec)
+		if err == nil || !strings.Contains(err.Error(), "cannot represent MaskedPaths or ReadonlyPaths") {
+			t.Fatalf("%s error = %v, want clear CLI compatibility error", spec.Name, err)
+		}
 	}
 }
 

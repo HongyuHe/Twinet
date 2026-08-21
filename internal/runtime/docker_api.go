@@ -116,14 +116,21 @@ func dockerCreateConfig(spec *Spec) (*container.Config, *container.HostConfig, e
 		StopSignal: spec.StopSignal,
 	}
 	hostConfig := &container.HostConfig{
-		Binds:       bindStrings(spec.Binds),
-		NetworkMode: container.NetworkMode(networkMode),
-		CapAdd:      append([]string(nil), spec.Capabilities...),
-		Privileged:  spec.Privileged,
-		Tmpfs:       nonEmptyStringMap(spec.Tmpfs),
-		Sysctls:     nonEmptyStringMap(spec.Sysctls),
-		DNSSearch:   append([]string(nil), spec.DNSSearch...),
-		ExtraHosts:  append([]string(nil), spec.ExtraHosts...),
+		Binds:          bindStrings(spec.Binds),
+		NetworkMode:    container.NetworkMode(networkMode),
+		CapAdd:         append([]string(nil), spec.Capabilities...),
+		CapDrop:        cloneStrings(spec.CapDrop),
+		SecurityOpt:    cloneStrings(spec.SecurityOpt),
+		ReadonlyRootfs: spec.ReadOnlyRootfs,
+		Runtime:        spec.RuntimeClass,
+		UsernsMode:     container.UsernsMode(spec.UsernsMode),
+		MaskedPaths:    cloneStrings(spec.MaskedPaths),
+		ReadonlyPaths:  cloneStrings(spec.ReadonlyPaths),
+		Privileged:     spec.Privileged,
+		Tmpfs:          nonEmptyStringMap(spec.Tmpfs),
+		Sysctls:        nonEmptyStringMap(spec.Sysctls),
+		DNSSearch:      append([]string(nil), spec.DNSSearch...),
+		ExtraHosts:     append([]string(nil), spec.ExtraHosts...),
 	}
 
 	if len(spec.Entrypoint) > 0 {
@@ -208,6 +215,13 @@ func nonEmptyStringMap(values map[string]string) map[string]string {
 		return nil
 	}
 	return values
+}
+
+func cloneStrings(values []string) []string {
+	if values == nil {
+		return nil
+	}
+	return append(values[:0:0], values...)
 }
 
 func bindStrings(binds []Bind) []string {
