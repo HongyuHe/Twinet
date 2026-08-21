@@ -419,14 +419,45 @@ script, and concurrent-controller, node-loss, migration, overlay-GC, and
   `main`.
 - Compare performance against stored budgets and fail on regression.
 
-**Acceptance.** The full gate demonstrates O1-O14 from a clean cluster and
+**Acceptance.** The full gate demonstrates O1-O14 and O16 from a clean cluster and
 produces an auditable report tied to source and image digests.
+
+### O16 - Complete the NIKA substrate coverage
+
+**Problem.** Twinet implements 45 of NIKA's 60 fault types. The missing types
+are not injector stubs; they require P4/BMv2, Kubernetes, SDN/OpenFlow,
+load-balancing/traffic generation, and a controllable MPLS label substrate.
+Leaving them absent means Twinet cannot yet serve as the general NIKA RCA
+platform in the original design goal.
+
+**Required outcome.**
+
+- Add a P4/BMv2 device kind, pinned image, program/control-plane contract, and
+  the six P4 fault implementations.
+- Add an SDN controller/OpenFlow device and switch contract for the three
+  southbound faults.
+- Add load-balancer and deterministic traffic-generator services and implement
+  `load_balancer_overload`.
+- Add a controllable label-space implementation for
+  `mpls_label_limit_exceeded` without weakening container isolation.
+- Support the four Kubernetes faults through an explicit delegated NIKA
+  backend, preserving one Twinet incident/result schema rather than pretending
+  Linux containers reproduce Kubernetes behavior.
+- Make runtime/substrate capabilities machine-readable so an unsupported
+  scenario is refused before injection.
+
+**Acceptance.** Diff Twinet's registry against the pinned NIKA taxonomy and
+obtain 60 of 60 supported through either the native Twinet substrate or the
+declared Kubernetes delegation. Every native fault injects, manifests,
+verifies, resolves, and restores its baseline. NIKA runs unchanged scenarios
+for every substrate and agrees with its reference backend. One hundred
+concurrent mixed-substrate episodes remain isolated and reset cleanly.
 
 ## 5. Implementation order
 
 1. **Protect correctness first:** O4, O7, O12.
 2. **Remove scale bottlenecks:** O2, O3, O5, O6, O8, O9.
-3. **Complete extensibility:** O10, O11.
+3. **Complete extensibility and RCA substrates:** O10, O11, O16.
 4. **Make operation and evidence durable:** O13, O14, O15.
 5. **Run O1 acceptance and optimize until every threshold is met.**
 
