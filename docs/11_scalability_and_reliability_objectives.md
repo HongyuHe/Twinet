@@ -279,6 +279,10 @@ disk disappears.
   reference host address/default route cannot be skipped merely because its
   runtime spec was unchanged. Returning from solve resets reference state and
   restores only durable teaching state.
+- Clustered transaction wires and journals require an explicit `platform` or
+  `solve` mode plus `ungraded` value. Apply/commit/rollback consume the
+  persisted transaction pair only; legacy empty records are audited during
+  migration, never silently reinterpreted by a request-time default.
 - Solve-to-platform removes exact reference addresses and routes only from
   student-owned interfaces; it preserves platform/link-local/kernel state.
   Routing reset is provider-aware: FRR reloads in its private control sidecar,

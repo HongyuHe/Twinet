@@ -27,7 +27,7 @@ func TestCompletedRecoveryClearsRepairRetryState(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		wire, err := json.Marshal(&Wire{Lab: "lab"})
+		wire, err := json.Marshal(&Wire{Lab: "lab", Mode: "platform"})
 		if err != nil {
 			t.Fatal(err)
 		}

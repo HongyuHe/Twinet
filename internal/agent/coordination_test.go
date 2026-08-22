@@ -473,7 +473,7 @@ func TestPreparedGenerationFailsClosedAfterControllerLoss(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw, _ := json.Marshal(&Wire{Lab: "cos461"})
+	raw, _ := json.Marshal(&Wire{Lab: "cos461", Mode: "platform"})
 	if err := s.prepareGeneration("cos461", first.Fence, "", "generation-a", raw,
 		"platform", 0, nil, false, nil, nil); err != nil {
 		t.Fatal(err)
@@ -500,7 +500,7 @@ func TestInterruptedMigrationCannotPruneBeforeVerifiedRestore(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw, _ := json.Marshal(&Wire{Lab: "cos461"})
+	raw, _ := json.Marshal(&Wire{Lab: "cos461", Mode: "platform"})
 	proofs := []StateProof{{Device: "as3/MSP", Snapshots: []WireSnapshot{{
 		Snapshot: state.Snapshot{Lab: "cos461", Device: "as3/MSP", Kind: state.KindFRR, Digest: "digest"},
 		Content:  []byte("router bgp 3\n"),

@@ -229,11 +229,11 @@ func TestTwoControllersRaceOneLabAndOnlyOneCommits(t *testing.T) {
 
 	results := make(chan []NodeResult[agent.ApplyResponse], 2)
 	go func() {
-		results <- c.Apply(t.Context(), top, agent.ApplyRequest{Generation: "generation-a"})
+		results <- c.Apply(t.Context(), top, agent.ApplyRequest{Generation: "generation-a", Mode: "platform"})
 	}()
 	<-a.firstAcquire
 	go func() {
-		results <- c.Apply(t.Context(), top, agent.ApplyRequest{Generation: "generation-b"})
+		results <- c.Apply(t.Context(), top, agent.ApplyRequest{Generation: "generation-b", Mode: "platform"})
 	}()
 	close(a.blockAcquire)
 
@@ -258,6 +258,16 @@ func TestTwoControllersRaceOneLabAndOnlyOneCommits(t *testing.T) {
 		if generation != "generation-a" {
 			t.Fatalf("%s recorded generation %q, not the sole committed generation", stub.name, generation)
 		}
+	}
+}
+
+func TestApplyRequestForNodeCarriesCanonicalTransactionMode(t *testing.T) {
+	wire := &agent.Wire{Lab: "lab", Mode: "solve", Ungraded: 7}
+	out := applyRequestForNode(agent.ApplyRequest{Mode: "solve", Ungraded: 7}, wire, nil,
+		nil, "node-0", "prepare", "old", "new")
+	if out.Mode != "solve" || out.Ungraded != 7 || out.Topology == nil ||
+		out.Topology.Mode != "solve" || out.Topology.Ungraded != 7 {
+		t.Fatalf("node request lost canonical mode: %+v", out)
 	}
 }
 

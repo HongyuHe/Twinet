@@ -27,7 +27,7 @@ func TestPreparedTransactionPersistsPlatformSolveModeTransition(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	requested, _ := json.Marshal(&Wire{Lab: "lab"})
+	requested, _ := json.Marshal(&Wire{Lab: "lab", Mode: string(render.ModeSolve)})
 	if err := server.prepareGeneration("lab", lease.Fence, "", "solve-generation",
 		requested, string(render.ModeSolve), 0, nil, false, nil, nil); err != nil {
 		t.Fatal(err)
@@ -50,7 +50,7 @@ func TestPreparedTransactionPersistsHarnessSolveToPlatformTransition(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw, _ := json.Marshal(&Wire{Lab: "lab"})
+	raw, _ := json.Marshal(&Wire{Lab: "lab", Mode: string(render.ModePlatform)})
 	if err := server.prepareGeneration("lab", lease.Fence, "", "platform-generation",
 		raw, string(render.ModePlatform), 0, nil, false, nil, nil); err != nil {
 		t.Fatal(err)
@@ -82,13 +82,70 @@ func TestSolveToPlatformApplyRequestsStudentReset(t *testing.T) {
 
 func TestTransactionEngineCarriesSourceModeIntoSolveToPlatformApply(t *testing.T) {
 	server := coordinationTestServer(t, nil)
-	engine := server.transactionEngine(&model.Topology{Lab: &model.Lab{}}, applyTransaction{
+	engine, err := server.transactionEngine(&model.Topology{Lab: &model.Lab{}}, applyTransaction{
 		Mode:             string(render.ModePlatform),
 		PreviousMode:     string(render.ModeSolve),
 		PreviousUngraded: 7,
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !engine.ForceStudentReset || !engine.RestoreStudentState ||
 		engine.PreviousMode != string(render.ModeSolve) || engine.PreviousUngraded != 7 {
 		t.Fatalf("solve->platform transaction engine lost source-mode reset contract: %+v", engine)
+	}
+}
+
+func TestTransactionModeIsRequiredAndLegacyMigrationIsExplicit(t *testing.T) {
+	for _, mode := range []string{"", "reference", " PLATFORM "} {
+		_, err := RequireTransactionMode(mode)
+		if mode == " PLATFORM " {
+			if err != nil {
+				t.Fatalf("canonical platform mode rejected: %v", err)
+			}
+			continue
+		}
+		if err == nil {
+			t.Fatalf("invalid transaction mode %q was accepted", mode)
+		}
+	}
+
+	server := coordinationTestServer(t, nil)
+	lease, err := server.acquireMutationLease(LeaseAcquireRequest{Lab: "lab"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(&Wire{Lab: "lab"})
+	if err := server.prepareGeneration("lab", lease.Fence, "", "missing-mode",
+		raw, string(render.ModePlatform), 0, nil, false, nil, nil); err == nil {
+		t.Fatal("prepare accepted an empty topology mode")
+	}
+	legacy := applyTransaction{
+		Requested: raw,
+		Previous:  json.RawMessage(`{"lab":"lab","mode":""}`),
+	}
+	migrated, changed, err := migrateLegacyTransactionModes(legacy)
+	if err != nil || !changed || migrated.Mode != string(render.ModePlatform) ||
+		migrated.PreviousMode != string(render.ModePlatform) {
+		t.Fatalf("explicit legacy platform migration = %+v changed=%t err=%v", migrated, changed, err)
+	}
+}
+
+func TestSolveNoChangeRollbackStaysSolve(t *testing.T) {
+	server := coordinationTestServer(t, nil)
+	tx := applyTransaction{
+		Mode: string(render.ModeSolve), PreviousMode: string(render.ModeSolve),
+		Ungraded: 0, PreviousUngraded: 0,
+	}
+	engine, err := server.transactionEngine(&model.Topology{Lab: &model.Lab{}}, tx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if engine.ForceStudentReset || engine.RestoreStudentState || engine.WritesReference != true {
+		t.Fatalf("solve no-change transaction entered platform reset state: %+v", engine)
+	}
+	mode, ungraded := recoveredMode(tx, Wire{Mode: string(render.ModeSolve)})
+	if mode != render.ModeSolve || ungraded != 0 {
+		t.Fatalf("solve no-change rollback mode = %s/%d", mode, ungraded)
 	}
 }

@@ -452,8 +452,13 @@ func (c *Cluster) coordinatedApplyWithLeaseTimed(ctx context.Context, top *model
 	if lease == nil {
 		return transactionFailure(nodes, nil, errors.New("a coordinated apply needs a mutation lease"))
 	}
+	mode, err := agent.RequireTransactionMode(req.Mode)
+	if err != nil {
+		return transactionFailure(nodes, nil, err)
+	}
+	req.Mode = mode
 	var expected string
-	err := measure("generation_check", func() error {
+	err = measure("generation_check", func() error {
 		var generationErr error
 		expected, generationErr = c.clusterGeneration(lease.Context(), top.Name)
 		return generationErr
@@ -466,6 +471,7 @@ func (c *Cluster) coordinatedApplyWithLeaseTimed(ctx context.Context, top *model
 		return transactionFailure(nodes, nil, errors.New("could not derive a deployment generation"))
 	}
 	wire := agent.Serialise(top)
+	wire.Mode, wire.Ungraded = req.Mode, req.Ungraded
 	peers := map[string]string{}
 	if top.Lab != nil {
 		for _, node := range top.Lab.Placement.Nodes {

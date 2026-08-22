@@ -42,7 +42,7 @@ type Wire struct {
 	// has lost its wiring, and re-rendering in platform mode a lab that was
 	// deployed solved deletes the reference solution from that router --
 	// quietly, as a side effect of a repair that reports success.
-	Mode string `json:"mode,omitempty"`
+	Mode string `json:"mode"`
 	// Ungraded is the one AS that was left at the platform's own configuration
 	// while the rest of the lab was solved, for a private grading harness.
 	//

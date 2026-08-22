@@ -48,6 +48,7 @@ func recoveryServer(t *testing.T, st *state.Store) (*Server, transactionInventor
 	}
 	s.transactions["cos461"] = applyTransaction{
 		Generation: "failed-generation", PreviousGen: "old-generation",
+		PreviousMode: "platform", Mode: "platform",
 		Phase: transactionRollbackNeeded, Prestate: inventory,
 	}
 	s.generations["cos461"] = generationState{
@@ -77,7 +78,7 @@ func TestRecoveryRetriesRollbackAndVerifiesExactPrestate(t *testing.T) {
 	if tx.Phase != transactionRollbackFailed || tx.RecoveryAttempts != 1 {
 		t.Fatalf("failed recovery state = %+v, want rollback_failed attempt 1", tx)
 	}
-	raw, _ := json.Marshal(&Wire{Lab: "cos461"})
+	raw, _ := json.Marshal(&Wire{Lab: "cos461", Mode: "platform"})
 	if err := s.prepareGeneration("cos461", lease.Fence, "old-generation", "another-generation",
 		raw, "platform", 0, nil, false, nil, nil); err == nil {
 		t.Fatal("ordinary mutation was admitted while rollback_failed remained active")

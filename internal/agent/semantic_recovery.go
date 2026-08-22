@@ -27,9 +27,12 @@ func (s *Server) verifyCommittedSemantics(ctx context.Context, top *model.Topolo
 }
 
 func (s *Server) verifyKnownStudentState(ctx context.Context, top *model.Topology,
-	previousMode render.Mode, previousUngraded int,
+	previousMode render.Mode, previousUngraded int, desiredMode render.Mode, desiredUngraded int,
 ) error {
-	if s.store == nil || previousMode != render.ModeSolve {
+	// Snapshot replay is a solve->platform operation only. A solve no-change
+	// transaction must never enter this path: doing so would treat a reference
+	// lab as if it had transitioned back to teaching and restore stale work.
+	if s.store == nil || previousMode != render.ModeSolve || desiredMode == render.ModeSolve {
 		return nil
 	}
 	for _, device := range top.DevicesOnNode(s.cfg.Node) {
@@ -37,6 +40,7 @@ func (s *Server) verifyKnownStudentState(ctx context.Context, top *model.Topolog
 		// a reset/restore proof. The ungraded harness AS was already teaching
 		// mode and must not be treated as a reference answer.
 		if renderModeForDevice(previousMode, previousUngraded, device) != render.ModeSolve ||
+			renderModeForDevice(desiredMode, desiredUngraded, device) == render.ModeSolve ||
 			!deployStudentOwned(top, device) {
 			continue
 		}

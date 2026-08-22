@@ -96,7 +96,7 @@ func TestPreparingTransactionCancelsPeriodicCapture(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := server.prepareGeneration("lab", lease.Fence, "", "new",
-		[]byte(`{"lab":"lab"}`), "platform", 0, nil, false, nil, nil); err != nil {
+		[]byte(`{"lab":"lab","mode":"platform"}`), "platform", 0, nil, false, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	select {

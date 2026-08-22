@@ -37,7 +37,8 @@ func TestApplyAllowsCompatibleRollingSourceBuilds(t *testing.T) {
 		RequireVersion:       "bugfix-build-a",
 		RequireCompatibility: agent.Compatibility(),
 	}
-	c.Apply(context.Background(), &model.Topology{Name: "cos461", Lab: &model.Lab{}}, agent.ApplyRequest{})
+	c.Apply(context.Background(), &model.Topology{Name: "cos461", Lab: &model.Lab{}},
+		agent.ApplyRequest{Mode: "platform"})
 	mu.Lock()
 	defer mu.Unlock()
 	if !applied {
@@ -118,7 +119,8 @@ func TestAClusterWithNoExpectedCompatibilityIsNotBlocked(t *testing.T) {
 	defer srv.Close()
 
 	c := &Cluster{Nodes: []*Node{NewNode("node-1", strings.TrimPrefix(srv.URL, "http://"), "")}}
-	c.Apply(context.Background(), &model.Topology{Name: "cos461", Lab: &model.Lab{}}, agent.ApplyRequest{})
+	c.Apply(context.Background(), &model.Topology{Name: "cos461", Lab: &model.Lab{}},
+		agent.ApplyRequest{Mode: "platform"})
 	if !applied {
 		t.Error("a narrow test cluster with no compatibility expectation refused to do anything")
 	}

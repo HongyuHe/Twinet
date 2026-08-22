@@ -21,7 +21,7 @@ func TestPreparedTransactionPersistsExactRollbackContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw, _ := json.Marshal(&Wire{Lab: "cos461"})
+	raw, _ := json.Marshal(&Wire{Lab: "cos461", Mode: string(render.ModePlatform)})
 	prestate := transactionInventory{
 		StateSafe: true,
 		RuntimeSpecs: []transactionRuntimeSpec{{

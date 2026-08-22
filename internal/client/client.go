@@ -914,6 +914,15 @@ func (c *Cluster) Apply(ctx context.Context, top *model.Topology, req agent.Appl
 		}
 		return out
 	}
+	mode, err := agent.RequireTransactionMode(req.Mode)
+	if err != nil {
+		out := make([]NodeResult[agent.ApplyResponse], 0, len(c.Nodes))
+		for _, n := range c.Nodes {
+			out = append(out, NodeResult[agent.ApplyResponse]{Node: n.Name, Err: err})
+		}
+		return out
+	}
+	req.Mode = mode
 	if req.StrictAdmission {
 		if err := c.Admit(ctx, top, true, req.Overcommit); err != nil {
 			out := make([]NodeResult[agent.ApplyResponse], 0, len(c.Nodes))
@@ -976,6 +985,7 @@ func (c *Cluster) unfencedApply(ctx context.Context, top *model.Topology,
 	req agent.ApplyRequest,
 ) []NodeResult[agent.ApplyResponse] {
 	wire := agent.Serialise(top)
+	wire.Mode, wire.Ungraded = req.Mode, req.Ungraded
 	peers := map[string]string{}
 	if top.Lab != nil {
 		for _, n := range top.Lab.Placement.Nodes {

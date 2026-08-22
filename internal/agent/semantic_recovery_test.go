@@ -8,6 +8,7 @@ import (
 	"github.com/HongyuHe/twinet/internal/model"
 	"github.com/HongyuHe/twinet/internal/render"
 	rt "github.com/HongyuHe/twinet/internal/runtime"
+	"github.com/HongyuHe/twinet/internal/state"
 )
 
 type semanticRuntime struct {
@@ -128,5 +129,24 @@ func TestModeCommitSemanticsIncludesUntouchedLocalDevices(t *testing.T) {
 	got = semanticCommitDevices(top, "node-0", tx, render.ModeSolve)
 	if strings.Join(got, ",") != "as5/MSP_host" {
 		t.Fatalf("unchanged mode expanded semantic proof unexpectedly: %v", got)
+	}
+}
+
+func TestSolveNoChangeNeverRestoresPlatformStudentSnapshots(t *testing.T) {
+	top, host := semanticHostTopology(model.OwnerStudent)
+	store, err := state.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put(state.Snapshot{
+		Lab: top.Name, Device: host.ID, Kind: state.KindAddrs,
+		Content: []byte("2: host inet 10.5.0.2/24 scope global host\n---\n"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	server := &Server{store: store, rt: emptyStateRuntime{}}
+	if err := server.verifyKnownStudentState(context.Background(), top,
+		render.ModeSolve, 0, render.ModeSolve, 0); err != nil {
+		t.Fatalf("solve no-change entered solve->platform restore path: %v", err)
 	}
 }

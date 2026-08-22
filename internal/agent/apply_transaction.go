@@ -43,8 +43,24 @@ func reportFailures(rep *plan.Report) map[string][]string {
 }
 
 func (s *Server) handleApplyPrepare(w http.ResponseWriter, r *http.Request, req ApplyRequest) {
+	mode, err := requiredTransactionMode(req.Mode)
+	if err != nil {
+		httpError(w, http.StatusBadRequest, err)
+		return
+	}
 	if req.Topology == nil {
 		httpError(w, http.StatusBadRequest, errors.New("no topology supplied"))
+		return
+	}
+	wireMode, err := requiredTransactionMode(req.Topology.Mode)
+	if err != nil {
+		httpError(w, http.StatusBadRequest, fmt.Errorf("topology mode invariant: %w", err))
+		return
+	}
+	if wireMode != mode || req.Topology.Ungraded != req.Ungraded {
+		httpError(w, http.StatusBadRequest, fmt.Errorf(
+			"topology mode %s/%d does not match request mode %s/%d",
+			wireMode, req.Topology.Ungraded, mode, req.Ungraded))
 		return
 	}
 	top, err := req.Topology.Rehydrate()
@@ -104,10 +120,6 @@ func (s *Server) handleApplyPrepare(w http.ResponseWriter, r *http.Request, req 
 	dirtyCapture := []string(nil)
 	semanticDirty := []string(nil)
 	if previous != nil {
-		mode := render.Mode(req.Mode)
-		if mode == "" {
-			mode = render.ModePlatform
-		}
 		observed := &deploy.Engine{
 			Runtime:                s.rt,
 			Node:                   s.cfg.Node,
@@ -190,11 +202,17 @@ func (s *Server) handleApplyPrepare(w http.ResponseWriter, r *http.Request, req 
 		return
 	}
 	if err := s.prepareGeneration(top.Name, req.Fence, req.ExpectedGeneration, req.Generation,
-		raw, req.Mode, req.Ungraded, req.PeerUnderlay, req.Prune, req.OnlySteps, req.StateProofs,
+		raw, string(mode), req.Ungraded, req.PeerUnderlay, req.Prune, req.OnlySteps, req.StateProofs,
 		prestate); err != nil {
 		httpError(w, http.StatusConflict, err)
 		return
 	}
+	s.mu.Lock()
+	prepared := s.transactions[top.Name]
+	s.mu.Unlock()
+	s.recordEvent(top.Name, req.Generation, "coordination", s.requestCorrelation(r),
+		"transaction_mode", "success", fmt.Sprintf("previous=%s/%d desired=%s/%d",
+			prepared.PreviousMode, prepared.PreviousUngraded, prepared.Mode, prepared.Ungraded))
 	if err := s.recordGenerationDirtyCapture(top.Name, req.Fence, req.Generation, dirtyCapture); err != nil {
 		httpError(w, http.StatusConflict, err)
 		return
@@ -295,13 +313,19 @@ func (s *Server) commitAppliedTopology(ctx context.Context, top *model.Topology,
 	wire.Generation = tx.Generation
 	wire.PeerUnderlay = tx.PeerUnderlay
 
-	s.mu.Lock()
-	s.initCoordination()
-	prevMode, prevUngraded := s.modes[top.Name], s.ungraded[top.Name]
-	s.mu.Unlock()
-	desiredMode := canonicalMode(tx.Mode)
-	wire.Mode, wire.Ungraded = modeToPersist(authoritative, desiredMode, tx.Ungraded,
-		prevMode, prevUngraded)
+	desiredMode, err := requiredTransactionMode(tx.Mode)
+	if err != nil {
+		return ApplyResponse{}, fmt.Errorf("committed desired mode invariant: %w", err)
+	}
+	previousMode, err := requiredTransactionMode(tx.PreviousMode)
+	if err != nil {
+		return ApplyResponse{}, fmt.Errorf("committed previous mode invariant: %w", err)
+	}
+	slog.Info("committing transaction mode invariant", "lab", top.Name, "generation", tx.Generation,
+		"previous_mode", previousMode, "previous_ungraded", tx.PreviousUngraded,
+		"desired_mode", desiredMode, "desired_ungraded", tx.Ungraded)
+	wire.Mode, wire.Ungraded = modeToPersist(authoritative, string(desiredMode), tx.Ungraded,
+		string(previousMode), tx.PreviousUngraded)
 	raw, err := json.Marshal(wire)
 	if err != nil {
 		return ApplyResponse{}, fmt.Errorf("encode committed topology: %w", err)
@@ -318,7 +342,7 @@ func (s *Server) commitAppliedTopology(ctx context.Context, top *model.Topology,
 	}
 	s.current[top.Name] = top
 	if authoritative {
-		s.rememberHow(top.Name, desiredMode, tx.Ungraded)
+		s.rememberHow(top.Name, string(desiredMode), tx.Ungraded)
 	}
 	if s.peers == nil {
 		s.peers = map[string]map[string]string{}
@@ -331,7 +355,10 @@ func (s *Server) commitAppliedTopology(ctx context.Context, top *model.Topology,
 		Generation: tx.Generation, Phase: "commit",
 	}
 	addPhaseTiming(&resp, "record", time.Since(recordStart))
-	eng := s.transactionEngine(top, tx)
+	eng, err := s.transactionEngine(top, tx)
+	if err != nil {
+		return ApplyResponse{}, err
+	}
 	// Capture and replicate before any prune. A commit that removes the old
 	// placement before its current state and topology record have a verified
 	// failure-domain-separated quorum is not a successful migration.
@@ -376,7 +403,7 @@ func (s *Server) commitAppliedTopology(ctx context.Context, top *model.Topology,
 			}
 		}
 	}
-	if err := s.verifyKnownStudentState(ctx, top, render.Mode(tx.PreviousMode), tx.PreviousUngraded); err != nil {
+	if err := s.verifyKnownStudentState(ctx, top, previousMode, tx.PreviousUngraded, desiredMode, tx.Ungraded); err != nil {
 		return ApplyResponse{}, err
 	}
 	if tx.Prune {
@@ -490,13 +517,16 @@ func addApplyFailure(resp *ApplyResponse, scope string, err error) {
 	resp.Failures[scope] = append(resp.Failures[scope], err.Error())
 }
 
-func (s *Server) transactionEngine(top *model.Topology, tx applyTransaction) *deploy.Engine {
-	mode := render.Mode(tx.Mode)
-	if mode == "" {
-		mode = render.ModePlatform
+func (s *Server) transactionEngine(top *model.Topology, tx applyTransaction) (*deploy.Engine, error) {
+	mode, err := requiredTransactionMode(tx.Mode)
+	if err != nil {
+		return nil, fmt.Errorf("transaction desired mode invariant: %w", err)
 	}
-	previousMode := canonicalMode(tx.PreviousMode)
-	forceStudentReset := needsStudentReset(previousMode, mode)
+	previousMode, err := requiredTransactionMode(tx.PreviousMode)
+	if err != nil {
+		return nil, fmt.Errorf("transaction previous mode invariant: %w", err)
+	}
+	forceStudentReset := needsStudentReset(string(previousMode), mode)
 	return &deploy.Engine{
 		Runtime:                s.rt,
 		Node:                   s.cfg.Node,
@@ -513,7 +543,7 @@ func (s *Server) transactionEngine(top *model.Topology, tx applyTransaction) *de
 		ModeKey:                rendererModeKey(mode, tx.Ungraded),
 		ForceStudentReset:      forceStudentReset,
 		RestoreStudentState:    forceStudentReset,
-		PreviousMode:           previousMode,
+		PreviousMode:           string(previousMode),
 		PreviousUngraded:       tx.PreviousUngraded,
 		RequireImmutableImages: top.Lab.Images.RequiresImmutableImages(),
 		RetainLegacyOverlays:   true,
@@ -523,7 +553,7 @@ func (s *Server) transactionEngine(top *model.Topology, tx applyTransaction) *de
 			}
 			return s.semanticProbe(ctx, top, mode, tx.Ungraded, device)
 		},
-	}
+	}, nil
 }
 
 func overlayVNIsOnNode(top *model.Topology, node string) []uint32 {
@@ -607,6 +637,9 @@ func (s *Server) rollbackPreparedApply(ctx context.Context, lab string, fence Fe
 	rollback := tx
 	rollback.Generation = tx.PreviousGen
 	previousMode, previousUngraded := recoveredMode(tx, oldWire)
+	slog.Info("rolling back transaction mode invariant", "lab", lab, "generation", tx.Generation,
+		"previous_mode", previousMode, "previous_ungraded", previousUngraded,
+		"desired_mode", tx.Mode, "desired_ungraded", tx.Ungraded)
 	rollback.Mode = string(previousMode)
 	rollback.Ungraded = previousUngraded
 	rollback.PeerUnderlay = oldWire.PeerUnderlay
@@ -614,7 +647,10 @@ func (s *Server) rollbackPreparedApply(ctx context.Context, lab string, fence Fe
 	// device has its interfaces and restored student state back, never as the
 	// mechanism that tries to make a failed forward apply disappear.
 	rollback.Prune = false
-	eng := s.transactionEngine(oldTop, rollback)
+	eng, err := s.transactionEngine(oldTop, rollback)
+	if err != nil {
+		return err
+	}
 	eng.RecoveryCompatibility = true
 	p, err := eng.BuildContext(ctx, oldTop)
 	if err != nil {

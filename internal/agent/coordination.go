@@ -17,6 +17,7 @@ import (
 
 	"github.com/HongyuHe/twinet/internal/model"
 	"github.com/HongyuHe/twinet/internal/netx"
+	"github.com/HongyuHe/twinet/internal/render"
 )
 
 // Fence identifies one issued mutation lease. Token is deliberately opaque:
@@ -214,9 +215,9 @@ type applyTransaction struct {
 	// legacy topology blob. Recovery must know whether old runtime state was
 	// reference/solve, a harness submission AS, or teaching mode before it
 	// decides whether a student snapshot may be replayed.
-	PreviousMode         string               `json:"previous_mode,omitempty"`
+	PreviousMode         string               `json:"previous_mode"`
 	PreviousUngraded     int                  `json:"previous_ungraded_as,omitempty"`
-	Mode                 string               `json:"mode,omitempty"`
+	Mode                 string               `json:"mode"`
 	Ungraded             int                  `json:"ungraded_as,omitempty"`
 	PeerUnderlay         map[string]string    `json:"peer_underlay,omitempty"`
 	Prune                bool                 `json:"prune,omitempty"`
@@ -327,6 +328,7 @@ func (s *Server) loadCoordination() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.initCoordination()
+	migrated := false
 	for lab, generation := range disk.FenceHighWater {
 		if generation > s.fenceHighWater[lab] {
 			s.fenceHighWater[lab] = generation
@@ -344,6 +346,20 @@ func (s *Server) loadCoordination() {
 			// restart. Treat them as rollback work rather than guessing.
 			transaction.Phase = transactionRollbackNeeded
 		}
+		updated, changed, migrationErr := migrateLegacyTransactionModes(transaction)
+		if migrationErr != nil {
+			updated.Phase = transactionRollbackFailed
+			updated.Failure = "legacy transaction mode migration refused: " + migrationErr.Error()
+			slog.Error("AUDIT: refusing ambiguous legacy transaction mode",
+				"lab", lab, "generation", transaction.Generation, "err", migrationErr)
+			changed = true
+		} else if changed {
+			slog.Warn("AUDIT: migrated legacy transaction mode fields",
+				"lab", lab, "generation", transaction.Generation,
+				"previous_mode", updated.PreviousMode, "desired_mode", updated.Mode)
+		}
+		transaction = updated
+		migrated = migrated || changed
 		s.transactions[lab] = transaction
 	}
 	for lab, inventory := range disk.Inventories {
@@ -353,6 +369,60 @@ func (s *Server) loadCoordination() {
 		s.overlayLineage[lab] = lineage
 	}
 	_ = s.expireCoordinationLocked(s.nowTime())
+	if migrated {
+		if err := s.saveCoordinationLocked(); err != nil {
+			slog.Error("persisting legacy transaction mode migration", "err", err)
+		}
+	}
+}
+
+// migrateLegacyTransactionModes is the only compatibility bridge for records
+// written before Mode became mandatory. Desired mode may be recovered from the
+// requested wire; an absent desired mode is ambiguous and fails closed rather
+// than silently becoming platform. A pre-mode committed topology explicitly
+// migrates its previous mode to platform.
+func migrateLegacyTransactionModes(tx applyTransaction) (applyTransaction, bool, error) {
+	changed := false
+	if tx.Mode == "" {
+		var requested Wire
+		if len(tx.Requested) == 0 || json.Unmarshal(tx.Requested, &requested) != nil {
+			return tx, false, errors.New("desired mode is absent from both transaction and requested topology")
+		}
+		if requested.Mode == "" {
+			// This branch is only for records already on disk from before
+			// mode was mandatory. Future prepare requests are rejected above.
+			tx.Mode, tx.Ungraded, changed = string(render.ModePlatform), 0, true
+		} else {
+			mode, err := RequireTransactionMode(requested.Mode)
+			if err != nil {
+				return tx, false, fmt.Errorf("requested topology desired mode: %w", err)
+			}
+			tx.Mode, tx.Ungraded, changed = mode, requested.Ungraded, true
+		}
+	}
+	if _, err := RequireTransactionMode(tx.Mode); err != nil {
+		return tx, false, fmt.Errorf("desired mode: %w", err)
+	}
+	if tx.PreviousMode == "" {
+		var previous Wire
+		if len(tx.Previous) > 0 && json.Unmarshal(tx.Previous, &previous) == nil && previous.Mode != "" {
+			mode, err := RequireTransactionMode(previous.Mode)
+			if err != nil {
+				return tx, false, fmt.Errorf("previous topology mode: %w", err)
+			}
+			tx.PreviousMode, tx.PreviousUngraded = mode, previous.Ungraded
+		} else {
+			// A transaction with no previous topology is an initial platform
+			// baseline. A topology that predates the field has the same
+			// explicit migration; the audit caller records it above.
+			tx.PreviousMode, tx.PreviousUngraded = string(render.ModePlatform), 0
+		}
+		changed = true
+	}
+	if _, err := RequireTransactionMode(tx.PreviousMode); err != nil {
+		return tx, false, fmt.Errorf("previous mode: %w", err)
+	}
+	return tx, changed, nil
 }
 
 // saveCoordinationLocked persists fencing high-water marks, live overlay
@@ -925,7 +995,25 @@ func (s *Server) prepareGeneration(lab string, fence Fence, expected, generation
 	if generation == "" {
 		return errors.New("a deployment generation is required")
 	}
-	mode = canonicalMode(mode)
+	desiredMode, err := RequireTransactionMode(mode)
+	if err != nil {
+		return err
+	}
+	if ungraded < 0 {
+		return errors.New("transaction ungraded AS must not be negative")
+	}
+	var requestedWire Wire
+	if len(requested) == 0 || json.Unmarshal(requested, &requestedWire) != nil {
+		return errors.New("prepared transaction requires a valid topology wire with an explicit mode")
+	}
+	requestedMode, err := RequireTransactionMode(requestedWire.Mode)
+	if err != nil {
+		return fmt.Errorf("requested topology mode invariant: %w", err)
+	}
+	if requestedMode != desiredMode || requestedWire.Ungraded != ungraded {
+		return fmt.Errorf("requested topology mode %s/%d does not match desired transaction mode %s/%d",
+			requestedMode, requestedWire.Ungraded, desiredMode, ungraded)
+	}
 
 	var previous json.RawMessage
 	if s.store != nil {
@@ -967,6 +1055,7 @@ func (s *Server) prepareGeneration(lab string, fence Fence, expected, generation
 		before = prestate[0]
 	}
 	previousMode, previousUngraded := "", 0
+	legacyPrevious := false
 	if len(previous) > 0 {
 		var previousWire Wire
 		if json.Unmarshal(previous, &previousWire) == nil {
@@ -974,14 +1063,32 @@ func (s *Server) prepareGeneration(lab string, fence Fence, expected, generation
 		}
 	}
 	if previousMode == "" {
-		previousMode, previousUngraded = s.modes[lab], s.ungraded[lab]
+		// A committed topology predating explicit mode fields is a legacy
+		// platform deployment. Make that migration explicit in the prepared
+		// record and audit logs; do not use a mutable in-memory ApplyRequest
+		// default to infer a desired mode.
+		if len(previous) > 0 {
+			previousMode, legacyPrevious = string(render.ModePlatform), true
+		} else {
+			// A first deployment has no committed topology. In that one
+			// case the already-rehydrated committed mode is the only durable
+			// source available to this process (and preserves harness state
+			// in tests/offline bootstrap).
+			previousMode, previousUngraded = s.modes[lab], s.ungraded[lab]
+			if previousMode == "" {
+				previousMode, previousUngraded = string(render.ModePlatform), 0
+			}
+		}
+	}
+	if _, err := RequireTransactionMode(previousMode); err != nil {
+		return fmt.Errorf("persisted previous mode for lab %q: %w", lab, err)
 	}
 	s.transactions[lab] = applyTransaction{
 		Generation: generation, Expected: expected, FenceGeneration: fence.Generation,
 		Requested: append(json.RawMessage(nil), requested...), Previous: previous,
 		PreviousGen:  state.Committed,
 		PreviousMode: previousMode, PreviousUngraded: previousUngraded,
-		Mode: mode, Ungraded: ungraded,
+		Mode: desiredMode, Ungraded: ungraded,
 		PeerUnderlay: peers, Prune: prune, OnlySteps: append([]string(nil), onlySteps...),
 		StateProofs: append([]StateProof(nil), stateProofs...),
 		Phase:       transactionPrepared, Prestate: before,
@@ -994,6 +1101,10 @@ func (s *Server) prepareGeneration(lab string, fence Fence, expected, generation
 		s.generations[lab] = state
 		return fmt.Errorf("persisting prepared generation: %w", err)
 	}
+	slog.Info("prepared transaction mode invariant", "lab", lab, "generation", generation,
+		"previous_mode", previousMode, "previous_ungraded", previousUngraded,
+		"desired_mode", desiredMode, "desired_ungraded", ungraded,
+		"legacy_previous_mode_migrated", legacyPrevious)
 	// A periodic capture that began before prepare can otherwise keep running
 	// against containers this fenced transaction is about to replace. The
 	// transaction's own boundary capture remains responsible for durability.
@@ -1013,6 +1124,29 @@ func (s *Server) checkPreparedGeneration(lab string, fence Fence, generation str
 		return fmt.Errorf("generation %q of lab %q was not prepared by this fence", generation, lab)
 	}
 	return nil
+}
+
+// transactionForApply returns the durable mode contract for an apply phase.
+// Request fields are checked by the handler but never become the authority:
+// a controller retry must not reinterpret an empty/default Mode after prepare.
+func (s *Server) transactionForApply(lab string, fence Fence, generation string) (applyTransaction, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initCoordination()
+	if err := s.fenceErrorLocked(lab, fence, s.nowTime()); err != nil {
+		return applyTransaction{}, err
+	}
+	tx, ok := s.transactions[lab]
+	if !ok || tx.Generation != generation || tx.FenceGeneration != fence.Generation {
+		return applyTransaction{}, fmt.Errorf("generation %q of lab %q was not prepared by this fence", generation, lab)
+	}
+	if _, err := RequireTransactionMode(tx.Mode); err != nil {
+		return applyTransaction{}, fmt.Errorf("prepared desired mode invariant: %w", err)
+	}
+	if _, err := RequireTransactionMode(tx.PreviousMode); err != nil {
+		return applyTransaction{}, fmt.Errorf("prepared previous mode invariant: %w", err)
+	}
+	return tx, nil
 }
 
 func (s *Server) markGenerationApplying(lab string, fence Fence, generation string) error {
@@ -1158,6 +1292,12 @@ func (s *Server) transactionForCommit(lab string, fence Fence, generation string
 	if len(tx.StateProofs) > 0 && !tx.StateVerified {
 		return applyTransaction{}, fmt.Errorf("generation %q of lab %q has restored state that was not verified; refusing source prune",
 			generation, lab)
+	}
+	if _, err := RequireTransactionMode(tx.Mode); err != nil {
+		return applyTransaction{}, fmt.Errorf("generation %q desired mode invariant: %w", generation, err)
+	}
+	if _, err := RequireTransactionMode(tx.PreviousMode); err != nil {
+		return applyTransaction{}, fmt.Errorf("generation %q previous mode invariant: %w", generation, err)
 	}
 	return tx, nil
 }

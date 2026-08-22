@@ -224,7 +224,7 @@ func TestTouchedSetPersistsBeforeApply(t *testing.T) {
 		t.Fatal(err)
 	}
 	before, fence := lineageServerWithStore(t, store)
-	raw, err := json.Marshal(&Wire{Lab: "lab"})
+	raw, err := json.Marshal(&Wire{Lab: "lab", Mode: "platform"})
 	if err != nil {
 		t.Fatal(err)
 	}

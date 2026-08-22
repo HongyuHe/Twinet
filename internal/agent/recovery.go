@@ -383,6 +383,12 @@ func (s *Server) beginRecovery(lab string, fence Fence, generation, strategy str
 	if !ok || tx.Generation != generation {
 		return applyTransaction{}, fmt.Errorf("generation %q of lab %q has no recovery transaction", generation, lab)
 	}
+	if _, err := RequireTransactionMode(tx.Mode); err != nil {
+		return applyTransaction{}, fmt.Errorf("recovery desired mode invariant: %w", err)
+	}
+	if _, err := RequireTransactionMode(tx.PreviousMode); err != nil {
+		return applyTransaction{}, fmt.Errorf("recovery previous mode invariant: %w", err)
+	}
 	active := tx.Phase == transactionRecovering && !tx.RecoveryDeadline.IsZero() &&
 		now.Before(tx.RecoveryDeadline)
 	if active {
@@ -417,7 +423,8 @@ func (s *Server) beginRecovery(lab string, fence Fence, generation, strategy str
 	tx.RecoveryProgress = now
 	tx.RecoveryDeadline = now.Add(s.recoveryPhaseLimit())
 	tx.RecoveryTotal = totalDeadline
-	tx.RecoveryTarget = "starting recovery"
+	tx.RecoveryTarget = fmt.Sprintf("starting recovery %s/%d -> %s/%d",
+		tx.PreviousMode, tx.PreviousUngraded, tx.Mode, tx.Ungraded)
 	s.transactions[lab] = tx
 	if err := s.saveCoordinationLocked(); err != nil {
 		return applyTransaction{}, err
@@ -2254,7 +2261,10 @@ func (s *Server) forwardTransaction(ctx context.Context, lab string, fence Fence
 			}
 		}
 	}
-	eng := s.transactionEngine(top, current)
+	eng, err := s.transactionEngine(top, current)
+	if err != nil {
+		return s.transactionInventoryStatus(ctx, lab), err
+	}
 	if err := s.markForwardPhase(lab, fence, tx.Generation, "build observed desired diff"); err != nil {
 		return RecoveryStatus{}, err
 	}
@@ -2341,7 +2351,10 @@ func (s *Server) rollbackExactContracts(ctx context.Context, lab string, fence F
 	rollback.Mode = string(previousMode)
 	rollback.Ungraded = previousUngraded
 	rollback.PeerUnderlay = oldWire.PeerUnderlay
-	eng := s.transactionEngine(top, rollback)
+	eng, err := s.transactionEngine(top, rollback)
+	if err != nil {
+		return err
+	}
 	keepWiring, err := s.rollbackCanKeepWiring(ctx, tx, top)
 	if err != nil {
 		return err

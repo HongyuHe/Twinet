@@ -412,6 +412,28 @@ func (s *Server) rehydrate() {
 			slog.Warn("reloading a lab", "lab", lab, "err", err)
 			continue
 		}
+		mode, modeErr := requiredTransactionMode(wt.Mode)
+		if modeErr != nil {
+			if strings.TrimSpace(wt.Mode) != "" {
+				slog.Error("AUDIT: persisted topology has invalid mode", "lab", lab, "mode", wt.Mode, "err", modeErr)
+				continue
+			}
+			// The only committed-topology compatibility bridge: records
+			// predating the required field are explicitly migrated and
+			// rewritten, never silently defaulted in a later apply path.
+			mode = render.ModePlatform
+			wt.Mode, wt.Ungraded = string(mode), 0
+			migrated, marshalErr := json.Marshal(&wt)
+			if marshalErr != nil {
+				slog.Error("AUDIT: encode legacy topology mode migration failed", "lab", lab, "err", marshalErr)
+				continue
+			}
+			if storeErr := s.store.PutTopology(lab, migrated); storeErr != nil {
+				slog.Error("AUDIT: persist legacy topology mode migration failed", "lab", lab, "err", storeErr)
+				continue
+			}
+			slog.Warn("AUDIT: migrated legacy persisted topology mode to platform", "lab", lab)
+		}
 		top, err := wt.Rehydrate()
 		if err != nil {
 			slog.Warn("rehydrating a lab", "lab", lab, "err", err)
@@ -428,7 +450,7 @@ func (s *Server) rehydrate() {
 			state.Committed = top.Hash
 		}
 		s.generations[top.Name] = state
-		s.rememberHow(top.Name, wt.Mode, wt.Ungraded)
+		s.rememberHow(top.Name, string(mode), wt.Ungraded)
 		s.loadExemptions(top.Name)
 		s.loadHolds(top.Name)
 		if wt.PeerUnderlay != nil {
@@ -611,6 +633,27 @@ func canonicalMode(mode string) string {
 		return string(render.ModePlatform)
 	}
 	return mode
+}
+
+// RequireTransactionMode validates the explicit desired mode carried by every
+// clustered transaction request. Unlike canonicalMode it never treats an
+// omitted field as platform: that silent default can turn a solve no-change
+// rollback into a solve->platform restore path.
+func RequireTransactionMode(mode string) (string, error) {
+	switch render.Mode(strings.ToLower(strings.TrimSpace(mode))) {
+	case render.ModePlatform:
+		return string(render.ModePlatform), nil
+	case render.ModeSolve:
+		return string(render.ModeSolve), nil
+	default:
+		return "", fmt.Errorf("transaction mode must be %q or %q, got %q",
+			render.ModePlatform, render.ModeSolve, mode)
+	}
+}
+
+func requiredTransactionMode(mode string) (render.Mode, error) {
+	value, err := RequireTransactionMode(mode)
+	return render.Mode(value), err
 }
 
 func needsStudentReset(previous string, desired render.Mode) bool {
@@ -1407,41 +1450,59 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 	}
 	defer s.release(top.Name)
 
-	mode := render.Mode(req.Mode)
-	if mode == "" {
-		mode = render.ModePlatform
+	requestedMode, modeErr := requiredTransactionMode(req.Mode)
+	if modeErr != nil {
+		httpError(w, http.StatusBadRequest, modeErr)
+		return
 	}
-	// The apply engine must receive the prepared source mode, not merely the
-	// desired mode. A solve->platform transition is a semantic mutation even
-	// when OCI specs and renderer hashes match: it must remove reference
-	// addresses/configuration before replaying the durable teaching snapshot.
-	s.mu.Lock()
-	previousMode, previousUngraded := s.modes[top.Name], s.ungraded[top.Name]
-	if req.Phase == "apply" {
-		if tx, ok := s.transactions[top.Name]; ok && tx.Generation == req.Generation {
-			previousMode, previousUngraded = tx.PreviousMode, tx.PreviousUngraded
+	mode, ungraded := requestedMode, req.Ungraded
+	previousMode, previousUngraded := "", 0
+	peerUnderlay, prune, onlySteps := req.PeerUnderlay, req.Prune, req.OnlySteps
+	if !req.DryRun && req.Phase == "apply" {
+		tx, err := s.transactionForApply(top.Name, req.Fence, req.Generation)
+		if err != nil {
+			httpError(w, http.StatusConflict, err)
+			return
+		}
+		persistedMode, err := requiredTransactionMode(tx.Mode)
+		if err != nil {
+			httpError(w, http.StatusConflict, fmt.Errorf("prepared desired mode: %w", err))
+			return
+		}
+		if requestedMode != persistedMode || req.Ungraded != tx.Ungraded {
+			httpError(w, http.StatusConflict, fmt.Errorf(
+				"apply mode %s/%d does not match prepared desired mode %s/%d",
+				requestedMode, req.Ungraded, persistedMode, tx.Ungraded))
+			return
+		}
+		mode, ungraded = persistedMode, tx.Ungraded
+		previousMode, previousUngraded = tx.PreviousMode, tx.PreviousUngraded
+		peerUnderlay, prune, onlySteps = tx.PeerUnderlay, tx.Prune, tx.OnlySteps
+	}
+	if previousMode != "" {
+		if _, err := requiredTransactionMode(previousMode); err != nil {
+			httpError(w, http.StatusConflict, fmt.Errorf("prepared previous mode: %w", err))
+			return
 		}
 	}
-	s.mu.Unlock()
-	previousMode = canonicalMode(previousMode)
 	forceStudentReset := needsStudentReset(previousMode, mode)
 	eng := &deploy.Engine{
 		Runtime:         s.rt,
 		Node:            s.cfg.Node,
 		Limiter:         s.workLimiter(),
 		PullPolicy:      rt.PullPolicy(req.PullPolicy),
-		Renderer:        renderer(top, mode, req.Ungraded),
+		Renderer:        renderer(top, mode, ungraded),
 		WritesReference: mode == render.ModeSolve,
 		// Solve mode installs the reference solution, which is the one case
 		// where the rendered configuration must overwrite what is there.
-		Authoritative:          mode == render.ModeSolve && req.Ungraded == 0,
+		Authoritative:          mode == render.ModeSolve && ungraded == 0,
 		UnderlayIP:             s.cfg.UnderlayIP,
 		UnderlayDev:            s.cfg.UnderlayDev,
-		PeerUnderlay:           req.PeerUnderlay,
+		PeerUnderlay:           peerUnderlay,
 		State:                  s.store,
-		Prune:                  req.Prune,
+		Prune:                  prune,
 		Generation:             req.Generation,
-		ModeKey:                rendererModeKey(mode, req.Ungraded),
+		ModeKey:                rendererModeKey(mode, ungraded),
 		ForceStudentReset:      forceStudentReset,
 		RestoreStudentState:    forceStudentReset,
 		PreviousMode:           previousMode,
@@ -1452,7 +1513,7 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 			if s.isExempt(top.Name, device.ID) {
 				return nil
 			}
-			return s.semanticProbe(ctx, top, mode, req.Ungraded, device)
+			return s.semanticProbe(ctx, top, mode, ungraded, device)
 		},
 	}
 	if !req.DryRun && req.Phase == "apply" {
@@ -1472,9 +1533,9 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, err)
 		return
 	}
-	if len(req.OnlySteps) > 0 {
+	if len(onlySteps) > 0 {
 		want := map[string]bool{}
-		for _, sc := range req.OnlySteps {
+		for _, sc := range onlySteps {
 			want[sc] = true
 		}
 		p = p.Restrict(func(st *plan.Step) bool { return want[st.Scope] })
