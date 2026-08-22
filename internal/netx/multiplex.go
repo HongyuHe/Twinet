@@ -51,6 +51,11 @@ type MultiplexOverlaySpec struct {
 	// transactional rollback. It may retain a legacy port/MTU long enough to
 	// restore service; ordinary apply still converges to the requested values.
 	PreserveActive bool
+	// ForcePort replaces an active trunk whose receive port differs from the
+	// deterministic pair assignment. Repair uses this only after observing a
+	// broken cross-node link; retaining mismatched active ports on opposite
+	// endpoints black-holes the VNI forever.
+	ForcePort bool
 }
 
 // MultiplexOverlay is one shared bridge/VXLAN pair and its active VNIs.
@@ -422,8 +427,8 @@ func ensureMultiplexPair(h *netlink.Handle, k pairKey, spec MultiplexOverlaySpec
 					return nil, nil, err
 				}
 				if active {
-					if canKeepRecoveryTrunk(vx, local, vtepIndex) ||
-						canKeepActivePort(vx, local, vtepIndex, spec.MTU) {
+					if (spec.PreserveActive && canKeepRecoveryTrunk(vx, local, vtepIndex)) ||
+						(!spec.ForcePort && canKeepActivePort(vx, local, vtepIndex, spec.MTU)) {
 						// Keep a previously allocated (including the first
 						// rollout's standard) port while it carries links.
 						// Pair sets can change between generations, so replacing
@@ -431,9 +436,15 @@ func ensureMultiplexPair(h *netlink.Handle, k pairKey, spec MultiplexOverlaySpec
 						// would cut student traffic and make rollback impossible.
 						reason = ""
 					} else {
-						return nil, nil, fmt.Errorf(
-							"multiplex VXLAN %s conflicts with the requested pair configuration (%s) while active; refusing to replace it",
-							vxlanName, reason)
+						if !spec.ForcePort {
+							return nil, nil, fmt.Errorf(
+								"multiplex VXLAN %s conflicts with the requested pair configuration (%s) while active; refusing to replace it",
+								vxlanName, reason)
+						}
+						// A targeted repair observed a broken pair on both
+						// endpoint agents. Replacing the active receive socket
+						// is the only way to converge an old 4789 trunk with a
+						// peer that has moved to the deterministic port.
 					}
 				}
 				if reason == "" {

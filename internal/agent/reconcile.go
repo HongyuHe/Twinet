@@ -49,6 +49,12 @@ type deviceObservation struct {
 	SpecMatches bool
 }
 
+func (s *Server) semanticRepairAttempted(lab, id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.repairFails[repairKey(lab, id)] >= repairAttemptsBeforeGivingUp
+}
+
 // reconcileLoop repairs devices that have lost their wiring.
 //
 // A container that restarts -- because someone typed `docker restart`, because
@@ -184,7 +190,10 @@ func (s *Server) handleRuntimeEvent(ctx context.Context, event rt.Event) {
 type reconcileRequest struct {
 	lab    string
 	device string
+	force  bool
 }
+
+type forceSemanticRepairKey struct{}
 
 // startReconcileWorkers bounds event-triggered repair fan-out independently
 // of the runtime limiter. A Docker reconnect can replay many events; it must
@@ -335,6 +344,9 @@ func (s *Server) reconcileTarget(ctx context.Context, request reconcileRequest) 
 		return
 	}
 	repairCtx, cancel := context.WithCancel(ctx)
+	if request.force {
+		repairCtx = context.WithValue(repairCtx, forceSemanticRepairKey{}, true)
+	}
 	defer cancel()
 	opID, done, err := s.acquireOperation(request.lab, "reconcile", cancel)
 	if err != nil {
@@ -581,13 +593,14 @@ func (s *Server) repairLab(ctx context.Context, top *model.Topology, broken []*m
 	s.mu.Unlock()
 	eng := &deploy.Engine{
 		Runtime: s.rt, Node: s.cfg.Node, State: s.store,
-		Limiter:         s.workLimiter(),
-		Renderer:        renderer(top, render.Mode(mode), ungraded),
-		WritesReference: render.Mode(mode) == render.ModeSolve,
-		UnderlayIP:      s.cfg.UnderlayIP,
-		UnderlayDev:     s.cfg.UnderlayDev,
-		PeerUnderlay:    s.peerUnderlay(top.Name),
-		ModeKey:         rendererModeKey(render.Mode(mode), ungraded),
+		Limiter:               s.workLimiter(),
+		Renderer:              renderer(top, render.Mode(mode), ungraded),
+		WritesReference:       render.Mode(mode) == render.ModeSolve,
+		UnderlayIP:            s.cfg.UnderlayIP,
+		UnderlayDev:           s.cfg.UnderlayDev,
+		PeerUnderlay:          s.peerUnderlay(top.Name),
+		ModeKey:               rendererModeKey(render.Mode(mode), ungraded),
+		ForceOverlayReconcile: true,
 	}
 	for _, d := range broken {
 		if reason := s.ordinaryMaintenanceSuppression(top.Name); reason != "" {
@@ -595,7 +608,7 @@ func (s *Server) repairLab(ctx context.Context, top *model.Topology, broken []*m
 			s.recordEvent(top.Name, "", "reconcile", "", "repair_skipped", "recovery", reason)
 			return
 		}
-		if s.givingUpOn(top.Name, d.ID) {
+		if s.givingUpOn(top.Name, d.ID) && !forceSemanticRepair(ctx) {
 			s.metricRegistry().observeRepair("backoff")
 			s.recordEvent(top.Name, "", "reconcile", "", "repair_deferred", "backoff",
 				d.ID+" remains in bounded retry backoff")
@@ -606,6 +619,33 @@ func (s *Server) repairLab(ctx context.Context, top *model.Topology, broken []*m
 			if observation.Health == healthHealthy {
 				s.repairSucceeded(top.Name, d.ID)
 			}
+			continue
+		}
+		if isSemanticOnlyDrift(observation.Reason) {
+			if !s.semanticRepairAttempted(top.Name, d.ID) || forceSemanticRepair(ctx) {
+				semanticCtx, cancel := context.WithTimeout(ctx, semanticRepairTimeout)
+				err := eng.RewireDevice(semanticCtx, top, d)
+				if err == nil {
+					err = s.confirmDaemonRepair(semanticCtx, top, d)
+				}
+				cancel()
+				if err == nil {
+					s.repairSucceeded(top.Name, d.ID)
+					s.metricRegistry().observeRepair("success")
+					s.recordEvent(top.Name, "", "reconcile", "", "semantic_repair", "success", d.ID)
+					continue
+				}
+				s.recordEvent(top.Name, "", "reconcile", "", "semantic_repair", "error",
+					d.ID+": "+err.Error())
+			}
+			s.deferSemanticRepair(top.Name, d.ID, observation.Reason)
+			s.recordEvent(top.Name, "", "reconcile", "", "semantic_repair_deferred", "backoff",
+				d.ID+": "+observation.Reason)
+			// Rewiring a device whose interfaces and daemon set are already
+			// healthy cannot create a missing remote route. Leave the lab
+			// idle, report the precise degraded reason, and wait for a later
+			// routing observation to clear it or an operator deployment to
+			// change desired state.
 			continue
 		}
 		class := deviceChangeClass(observation)
@@ -635,13 +675,46 @@ func (s *Server) repairLab(ctx context.Context, top *model.Topology, broken []*m
 		// deployed at the reference throws the reference solution away -- a
 		// far worse outcome than the fault being repaired.
 		if why := observation.Reason; strings.HasPrefix(why, daemonsDown) {
-			if err := s.startDaemons(ctx, top.Name, d); err == nil {
-				s.repairSucceeded(top.Name, d.ID)
-				s.metricRegistry().observeRepair("success")
-				s.recordEvent(top.Name, "", "reconcile", "", "repair", "success",
-					d.ID+" routing daemons restarted")
-				slog.Info("routing daemons restarted", "device", d.ID)
+			if s.requiresFRRControl(d) {
+				controlCtx, cancel := context.WithTimeout(ctx, controlDaemonRepairTimeout)
+				err := eng.EnsureRuntimeSupport(controlCtx, top, d)
+				if err == nil {
+					err = s.startDaemons(controlCtx, top.Name, d)
+				}
+				if err != nil && controlCtx.Err() == nil {
+					err = eng.RecreateRuntimeSupport(controlCtx, top, d)
+					if err == nil {
+						err = s.startDaemons(controlCtx, top.Name, d)
+					}
+				}
+				if err == nil {
+					err = s.confirmDaemonRepair(controlCtx, top, d)
+				}
+				cancel()
+				if err == nil {
+					s.repairSucceeded(top.Name, d.ID)
+					s.metricRegistry().observeRepair("success")
+					s.recordEvent(top.Name, "", "reconcile", "", "repair", "success",
+						d.ID+" FRR control sidecar repaired")
+					continue
+				}
+				s.repairFailed(top.Name, d.ID, "FRR control sidecar repair failed", err)
+				s.recordEvent(top.Name, "", "reconcile", "", "repair", "error",
+					d.ID+": "+err.Error())
+				// Never rewire/re-render the primary as a fallback for a
+				// control-PID namespace fault. One bounded control repair is
+				// enough; the next attempt follows normal backoff.
 				continue
+			}
+			if err := s.startDaemons(ctx, top.Name, d); err == nil {
+				if err := s.confirmDaemonRepair(ctx, top, d); err == nil {
+					s.repairSucceeded(top.Name, d.ID)
+					s.metricRegistry().observeRepair("success")
+					s.recordEvent(top.Name, "", "reconcile", "", "repair", "success",
+						d.ID+" routing daemons restarted")
+					slog.Info("routing daemons restarted", "device", d.ID)
+					continue
+				}
 			} else {
 				// Starting is futile when the reason they are not running is
 				// that the configuration says not to run them.
@@ -713,6 +786,71 @@ func (s *Server) repairLab(ctx context.Context, top *model.Topology, broken []*m
 	}
 }
 
+// forceRewireDevice is the explicit operator path for a known broken link.
+// It performs one bounded rewire with the same ownership/hold protections as
+// automatic repair, and forces a stale active multiplex receive port to the
+// deterministic pair assignment on both endpoint agents.
+func (s *Server) forceRewireDevice(ctx context.Context, top *model.Topology, d *model.Device) error {
+	if top == nil || d == nil {
+		return errors.New("forced repair needs a topology device")
+	}
+	if who := s.heldBy(top.Name); who != "" {
+		return fmt.Errorf("lab is held by %s", who)
+	}
+	if who := s.mutationLeaseHolder(top.Name); who != "" {
+		return fmt.Errorf("lab has active fenced mutation by %s", who)
+	}
+	if reason := s.ordinaryMaintenanceSuppression(top.Name); reason != "" {
+		return errors.New(reason)
+	}
+	repairCtx, cancel := context.WithTimeout(ctx, semanticRepairTimeout)
+	defer cancel()
+	opID, done, err := s.acquireOperation(top.Name, "forced-reconcile", cancel)
+	if err != nil {
+		return err
+	}
+	defer s.releaseOperation(top.Name, opID, done)
+	eng := s.repairEngine(top)
+	if err := eng.RewireDevice(repairCtx, top, d); err != nil {
+		return err
+	}
+	after := s.observeDevice(repairCtx, top.Name, d, false)
+	s.rememberHealth(top.Name, d.ID, after)
+	if after.Health != healthHealthy {
+		if isSemanticOnlyDrift(after.Reason) {
+			// The physical repair is complete; BGP may need one hold timer to
+			// reconverge. Keep the explicit degraded status but do not turn a
+			// successful forced wire repair into an HTTP failure.
+			return nil
+		}
+		reason := after.Reason
+		if reason == "" {
+			reason = string(after.Health)
+		}
+		return errors.New(reason)
+	}
+	s.repairSucceeded(top.Name, d.ID)
+	return nil
+}
+
+func (s *Server) repairEngine(top *model.Topology) *deploy.Engine {
+	s.mu.Lock()
+	mode := s.modes[top.Name]
+	ungraded := s.ungraded[top.Name]
+	s.mu.Unlock()
+	return &deploy.Engine{
+		Runtime: s.rt, Node: s.cfg.Node, State: s.store,
+		Limiter:               s.workLimiter(),
+		Renderer:              renderer(top, render.Mode(mode), ungraded),
+		WritesReference:       render.Mode(mode) == render.ModeSolve,
+		UnderlayIP:            s.cfg.UnderlayIP,
+		UnderlayDev:           s.cfg.UnderlayDev,
+		PeerUnderlay:          s.peerUnderlay(top.Name),
+		ModeKey:               rendererModeKey(render.Mode(mode), ungraded),
+		ForceOverlayReconcile: true,
+	}
+}
+
 // reviveDevice moves a non-joinable desired container back to a state where
 // wiring can be repaired. An absent container is recreated through the normal
 // desired-state engine; exited, dead, and restart-loop states are actively
@@ -748,6 +886,22 @@ func (s *Server) reviveDevice(ctx context.Context, eng *deploy.Engine, top *mode
 	default:
 		return fmt.Errorf("cannot revive container in unrecognised state %q", observation.State)
 	}
+}
+
+// confirmDaemonRepair refreshes the stored health record after a control
+// namespace repair. Without this, status could retain "bgpd (2)" long after a
+// successful bounded repair had reduced it to one process.
+func (s *Server) confirmDaemonRepair(ctx context.Context, top *model.Topology, d *model.Device) error {
+	after := s.observeDevice(ctx, top.Name, d, false)
+	s.rememberHealth(top.Name, d.ID, after)
+	if after.Health == healthHealthy {
+		return nil
+	}
+	reason := after.Reason
+	if reason == "" {
+		reason = string(after.Health)
+	}
+	return errors.New(reason)
 }
 
 func (s *Server) recreateDesiredDevice(ctx context.Context, eng *deploy.Engine, top *model.Topology,
@@ -802,6 +956,12 @@ func (s *Server) waitForJoinable(ctx context.Context, container string) error {
 // with it is that its routing processes are not running. The repair for that is
 // to start them, not to rewire the device, so the two cases are told apart.
 const daemonsDown = "these routing daemons are not running:"
+
+const (
+	controlDaemonRepairTimeout = 20 * time.Second
+	controlDaemonProbeInterval = 200 * time.Millisecond
+	semanticRepairTimeout      = 20 * time.Second
+)
 
 func (s *Server) probeExec(ctx context.Context, container string, cmd rt.ExecCmd) (rt.ExecResult, error) {
 	var result rt.ExecResult
@@ -894,6 +1054,19 @@ func (s *Server) missingDaemons(ctx context.Context, d *model.Device, as *model.
 }
 
 func (s *Server) missingDaemonsResult(ctx context.Context, d *model.Device, as *model.AS) (string, error) {
+	if s.requiresFRRControl(d) {
+		counts, err := s.controlDaemonCounts(ctx, d, as)
+		if err != nil {
+			return "", err
+		}
+		var missing []string
+		for _, name := range render.EnabledDaemonsFor(as) {
+			if counts[name] == 0 {
+				missing = append(missing, name)
+			}
+		}
+		return strings.Join(missing, " "), nil
+	}
 	script := "miss=''; for p in " + strings.Join(render.EnabledDaemonsFor(as), " ") +
 		"; do pidof \"$p\" >/dev/null 2>&1 || miss=\"$miss $p\"; done; echo \"$miss\""
 	r, err := s.probeExec(ctx, s.frrContainer(ctx, d), rt.ExecCmd{Cmd: []string{"sh", "-c", script}})
@@ -1174,17 +1347,51 @@ func (s *Server) peerUnderlay(lab string) map[string]string {
 // replacing it.
 func (s *Server) startDaemons(ctx context.Context, lab string, d *model.Device) error {
 	if s.requiresFRRControl(d) {
+		controlCtx, cancel := context.WithTimeout(ctx, controlDaemonRepairTimeout)
+		defer cancel()
 		control := deploy.FRRControlContainer(d)
-		sidecar, err := s.rt.Inspect(ctx, control)
+		sidecar, err := s.rt.Inspect(controlCtx, control)
 		if err != nil {
 			return fmt.Errorf("inspect FRR control sidecar: %w", err)
 		}
 		if !sidecar.State.Joinable() {
 			return fmt.Errorf("FRR control sidecar %s is not running; refusing to start daemons in primary", control)
 		}
-		if err := s.stopPrimaryFRRDaemons(ctx, d); err != nil {
+		if err := s.stopPrimaryFRRDaemons(controlCtx, d); err != nil {
 			return fmt.Errorf("stop legacy primary FRR daemons: %w", err)
 		}
+		if err := s.stopControlDaemonSet(controlCtx, d); err != nil {
+			return err
+		}
+		result, err := s.probeExec(controlCtx, control, rt.ExecCmd{
+			Cmd: []string{"sh", "-c", "/usr/lib/frr/frrinit.sh start >/dev/null 2>&1"},
+		})
+		if err != nil {
+			return err
+		}
+		if err := result.Err(); err != nil {
+			return fmt.Errorf("start FRR control daemons: %w", err)
+		}
+		as := s.asOf(lab, d)
+		var last error
+		for {
+			if err := s.verifyControlDaemonSet(controlCtx, d, as); err == nil {
+				return nil
+			} else {
+				last = err
+			}
+			timer := time.NewTimer(controlDaemonProbeInterval)
+			select {
+			case <-controlCtx.Done():
+				timer.Stop()
+				return controlCtx.Err()
+			case <-timer.C:
+			}
+			if deadline, ok := controlCtx.Deadline(); ok && time.Until(deadline) <= controlDaemonProbeInterval {
+				break
+			}
+		}
+		return fmt.Errorf("FRR control daemon set did not converge: %w", last)
 	}
 	// Stopped properly before being started.
 	//
@@ -1255,6 +1462,19 @@ func (s *Server) duplicateDaemons(ctx context.Context, d *model.Device, as *mode
 }
 
 func (s *Server) duplicateDaemonsResult(ctx context.Context, d *model.Device, as *model.AS) (string, error) {
+	if s.requiresFRRControl(d) {
+		counts, err := s.controlDaemonCounts(ctx, d, as)
+		if err != nil {
+			return "", err
+		}
+		var dup []string
+		for _, name := range render.EnabledDaemonsFor(as) {
+			if count := counts[name]; count > 1 {
+				dup = append(dup, fmt.Sprintf("%s (%d)", name, count))
+			}
+		}
+		return strings.Join(dup, " "), nil
+	}
 	var dup []string
 	for _, name := range render.EnabledDaemonsFor(as) {
 		// The daemon proper, which is the one started with -d.
@@ -1340,6 +1560,42 @@ func (s *Server) repairFailed(lab, id, what string, err error) {
 		slog.Warn("repair is entering bounded exponential backoff; a later event or audit will retry",
 			"lab", lab, "device", id, "attempts", n, "backoff", delay)
 	}
+}
+
+// deferSemanticRepair records a non-local semantic failure without sending the
+// reconciler through two immediate rewire attempts that cannot change a remote
+// prefix. A later healthy observation still clears it, while an operator sees
+// the device and exact reason in node status.
+func (s *Server) deferSemanticRepair(lab, id, reason string) {
+	k := repairKey(lab, id)
+	s.mu.Lock()
+	if s.repairFails == nil {
+		s.repairFails = map[string]int{}
+	}
+	if s.repairNext == nil {
+		s.repairNext = map[string]time.Time{}
+	}
+	n := s.repairFails[k] + 1
+	if n < repairAttemptsBeforeGivingUp {
+		n = repairAttemptsBeforeGivingUp
+	}
+	s.repairFails[k] = n
+	delay := repairDelay(n)
+	s.repairNext[k] = s.nowTime().Add(delay)
+	s.mu.Unlock()
+	s.metricRegistry().observeRepair("backoff")
+	slog.Warn("semantic drift is not locally repairable; deferring with backoff",
+		"lab", lab, "device", id, "reason", reason, "attempt", n, "backoff", delay)
+	s.queueReconcileAfter(lab, id, delay)
+}
+
+func isSemanticOnlyDrift(reason string) bool {
+	return strings.HasPrefix(reason, "network semantics drifted:")
+}
+
+func forceSemanticRepair(ctx context.Context) bool {
+	force, _ := ctx.Value(forceSemanticRepairKey{}).(bool)
+	return force
 }
 
 func (s *Server) repairSucceeded(lab, id string) {

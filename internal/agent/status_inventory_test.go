@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/HongyuHe/twinet/internal/deploy"
@@ -62,5 +63,26 @@ func TestStatusSeparatesPrimaryAndFRRControlContainers(t *testing.T) {
 	}
 	if status.ContainerCount == nil || *status.ContainerCount != 81 || status.ContainerListError != "" {
 		t.Fatalf("status did not recover retryable inventory: %+v", status)
+	}
+}
+
+func TestStatusIncludesDegradedDeviceReason(t *testing.T) {
+	runtime := &statusRuntime{}
+	server := &Server{
+		cfg:     Config{Node: "node-0"},
+		rt:      runtime,
+		current: map[string]*model.Topology{"lab": {Name: "lab"}},
+		health: map[string]deviceObservation{
+			"lab|as5/CHI": {Health: healthBroken, Reason: "FRR control daemon bgpd has 2 process(es), want exactly one"},
+		},
+	}
+	response := httptest.NewRecorder()
+	server.handleStatus(response, httptest.NewRequest(http.MethodGet, "/v1/status", nil))
+	var status StatusResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &status); err != nil {
+		t.Fatal(err)
+	}
+	if got := status.SemanticHealth["lab"].Reasons["as5/CHI"]; !strings.Contains(got, "want exactly one") {
+		t.Fatalf("degraded reason = %q", got)
 	}
 }

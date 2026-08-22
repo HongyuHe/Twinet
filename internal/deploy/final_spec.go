@@ -255,6 +255,29 @@ func (e *Engine) EnsureRuntimeSupport(ctx context.Context, top *model.Topology, 
 	return e.ensureFRRControl(ctx, top, final)
 }
 
+// RecreateRuntimeSupport replaces only an internal control sidecar. The
+// primary router and its network namespace remain intact, so a daemon/PID
+// namespace repair never becomes a destructive student-container recreate.
+func (e *Engine) RecreateRuntimeSupport(ctx context.Context, top *model.Topology, d *model.Device) error {
+	final, err := e.finalRuntimeSpecs(top, d)
+	if err != nil {
+		return err
+	}
+	if final.controlSpec == nil {
+		return nil
+	}
+	current, err := e.Runtime.Inspect(ctx, final.controlSpec.Name)
+	if err != nil {
+		return err
+	}
+	if current.State != runtime.StateAbsent {
+		if err := e.Runtime.Remove(ctx, final.controlSpec.Name, true); err != nil {
+			return fmt.Errorf("remove FRR control %s: %w", final.controlSpec.Name, err)
+		}
+	}
+	return e.ensureFRRControl(ctx, top, final)
+}
+
 func runtimeSpecHash(spec *runtime.Spec) string {
 	h := sha256.New()
 	write := func(key, value string) { fmt.Fprintf(h, "%s=%d:%s\n", key, len(value), value) }

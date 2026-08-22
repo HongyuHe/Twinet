@@ -242,7 +242,145 @@ It refuses to generate a remotely reachable bearer-token-only agent.`,
 	bootstrap.Flags().StringVar(&bootstrapTokenFile, "token-file", "",
 		"root-readable environment file containing TWINET_TOKEN (default $TWINET_TOKEN_FILE)")
 
-	cmd.AddCommand(status, check, bootstrap, newNodePKICmd(opts), newNodeSweepCmd(opts), newNodeDrainCmd(opts, &token))
+	cmd.AddCommand(status, check, bootstrap, newNodePKICmd(opts), newNodeSweepCmd(opts),
+		newNodeControlsCmd(opts, &token), newNodeReconcileCmd(opts, &token), newNodeDrainCmd(opts, &token))
+	return cmd
+}
+
+func newNodeControlsCmd(opts *Options, token *string) *cobra.Command {
+	var (
+		lab    string
+		repair bool
+	)
+	cmd := &cobra.Command{
+		Use:   "controls",
+		Short: "Audit private FRR control sidecars",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			top, err := loadAndPlace(opts)
+			if err != nil {
+				return err
+			}
+			if lab == "" {
+				lab = top.Name
+			}
+			tok, err := tokenFor(*token)
+			if err != nil {
+				return err
+			}
+			cluster := client.NewCluster(top.Lab, tok)
+			results := cluster.Controls(cmd.Context(), lab)
+			if opts.JSON {
+				return json.NewEncoder(cmd.OutOrStdout()).Encode(results)
+			}
+			w := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
+			fmt.Fprintln(w, "NODE\tDEVICE\tCONTROL\tSTATE\tDAEMONS\tVTY\tSTATUS\tREASON")
+			problems := 0
+			for _, result := range results {
+				if result.Err != nil {
+					problems++
+					fmt.Fprintf(w, "%s\t-\t-\t-\t-\t-\tERROR\t%s\n", result.Node, firstLine(result.Err.Error()))
+					continue
+				}
+				for _, control := range result.Value.Controls {
+					status := "ok"
+					if !control.Healthy {
+						problems++
+						status = "DEGRADED"
+					}
+					fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%t\t%s\t%s\n",
+						result.Node, control.Device, control.Container, control.State,
+						controlDaemonSummary(control.Daemons), control.VTY, status, firstLine(control.Reason))
+				}
+			}
+			if err := w.Flush(); err != nil {
+				return err
+			}
+			if repair {
+				for _, result := range cluster.ReconcileControls(cmd.Context(), lab) {
+					if result.Err != nil {
+						problems++
+						fmt.Fprintf(cmd.ErrOrStderr(), "%s: cannot schedule control repair: %v\n", result.Node, result.Err)
+						continue
+					}
+					if len(result.Value) > 0 {
+						fmt.Fprintf(cmd.OutOrStdout(), "%s: queued control repair for %s\n",
+							result.Node, strings.Join(result.Value, ", "))
+					}
+				}
+			}
+			if problems > 0 && !repair {
+				return fmt.Errorf("%d control sidecar(s) are degraded; rerun with --repair to queue bounded platform repair", problems)
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&lab, "lab", "", "lab to audit (default: manifest lab)")
+	cmd.Flags().BoolVar(&repair, "repair", false, "queue bounded platform repair for unhealthy controls")
+	return cmd
+}
+
+func controlDaemonSummary(counts map[string]int) string {
+	if len(counts) == 0 {
+		return "-"
+	}
+	names := make([]string, 0, len(counts))
+	for name := range counts {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	parts := make([]string, 0, len(names))
+	for _, name := range names {
+		parts = append(parts, fmt.Sprintf("%s=%d", name, counts[name]))
+	}
+	return strings.Join(parts, ",")
+}
+
+func newNodeReconcileCmd(opts *Options, token *string) *cobra.Command {
+	var (
+		lab     string
+		devices []string
+		force   bool
+	)
+	cmd := &cobra.Command{
+		Use:   "reconcile",
+		Short: "Queue bounded desired/observed reconciliation",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			top, err := loadAndPlace(opts)
+			if err != nil {
+				return err
+			}
+			if lab == "" {
+				lab = top.Name
+			}
+			tok, err := tokenFor(*token)
+			if err != nil {
+				return err
+			}
+			results := client.NewCluster(top.Lab, tok).Reconcile(cmd.Context(), lab, devices, force)
+			if opts.JSON {
+				return json.NewEncoder(cmd.OutOrStdout()).Encode(results)
+			}
+			var problems []string
+			for _, result := range results {
+				if result.Err != nil {
+					problems = append(problems, result.Node+": "+result.Err.Error())
+					continue
+				}
+				if len(result.Value.Scheduled) > 0 {
+					fmt.Fprintf(cmd.OutOrStdout(), "%s: queued %s\n",
+						result.Node, strings.Join(result.Value.Scheduled, ", "))
+				}
+			}
+			if len(problems) > 0 {
+				sort.Strings(problems)
+				return fmt.Errorf("could not queue reconciliation: %s", strings.Join(problems, "; "))
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&lab, "lab", "", "lab to reconcile (default: manifest lab)")
+	cmd.Flags().StringSliceVar(&devices, "device", nil, "device ID to reconcile (repeatable; default all local devices)")
+	cmd.Flags().BoolVar(&force, "force", false, "clear automatic repair backoff before queuing")
 	return cmd
 }
 
@@ -821,7 +959,11 @@ func nodeState(v agent.StatusResponse, controller contract.Set) (state, why stri
 		return "state-unhealthy", "durable state store is unavailable"
 	}
 	if v.Convergence["broken"] > 0 {
-		return "degraded", fmt.Sprintf("%d device(s) have semantic/runtime drift", v.Convergence["broken"])
+		why := fmt.Sprintf("%d device(s) have semantic/runtime drift", v.Convergence["broken"])
+		if detail := semanticStatusReason(v.SemanticHealth); detail != "" {
+			why += ": " + detail
+		}
+		return "degraded", why
 	}
 	if v.Convergence["unknown"] > 0 {
 		return "semantic-unknown", fmt.Sprintf("%d device(s) could not be semantically observed", v.Convergence["unknown"])
@@ -833,6 +975,26 @@ func nodeState(v agent.StatusResponse, controller contract.Set) (state, why stri
 		}
 	}
 	return "ok", ""
+}
+
+func semanticStatusReason(values map[string]agent.SemanticHealth) string {
+	labs := make([]string, 0, len(values))
+	for lab := range values {
+		labs = append(labs, lab)
+	}
+	sort.Strings(labs)
+	for _, lab := range labs {
+		health := values[lab]
+		devices := make([]string, 0, len(health.Reasons))
+		for device := range health.Reasons {
+			devices = append(devices, device)
+		}
+		sort.Strings(devices)
+		if len(devices) > 0 {
+			return devices[0] + ": " + firstLine(health.Reasons[devices[0]])
+		}
+	}
+	return ""
 }
 
 func peerReplicationSummary(values map[string]agent.PeerReplicationStatus) string {

@@ -1991,6 +1991,10 @@ func (s *Server) rollbackExactContracts(ctx context.Context, lab string, fence F
 	rollback.Ungraded = previousUngraded
 	rollback.PeerUnderlay = oldWire.PeerUnderlay
 	eng := s.transactionEngine(top, rollback)
+	keepWiring, err := s.rollbackCanKeepWiring(ctx, tx, top)
+	if err != nil {
+		return err
+	}
 	expected := map[string]bool{}
 	for _, entry := range tx.Prestate.RuntimeSpecs {
 		expected[entry.Spec.Name] = true
@@ -2024,16 +2028,18 @@ func (s *Server) rollbackExactContracts(ctx context.Context, lab string, fence F
 		}); err != nil {
 		return err
 	}
-	if err := s.runRecoveryPhase(ctx, lab, fence, tx.Generation,
-		"rollback", "rewire prior topology", func(phaseCtx context.Context) error {
-			return s.workLimiter().Run(phaseCtx, []limiter.Kind{limiter.Apply, limiter.Netlink}, func() error {
-				if err := eng.RewireTopology(phaseCtx, top); err != nil {
-					return fmt.Errorf("rewire exact rollback topology: %w", err)
-				}
-				return nil
-			})
-		}); err != nil {
-		return err
+	if !keepWiring {
+		if err := s.runRecoveryPhase(ctx, lab, fence, tx.Generation,
+			"rollback", "rewire prior topology", func(phaseCtx context.Context) error {
+				return s.workLimiter().Run(phaseCtx, []limiter.Kind{limiter.Apply, limiter.Netlink}, func() error {
+					if err := eng.RewireTopology(phaseCtx, top); err != nil {
+						return fmt.Errorf("rewire exact rollback topology: %w", err)
+					}
+					return nil
+				})
+			}); err != nil {
+			return err
+		}
 	}
 	if err := runBoundedDeviceChecks(ctx, s.recoveryWorkerCount(),
 		tx.Prestate.RuntimeSpecs, s.recoveryArtifactLimit(),
@@ -2090,6 +2096,7 @@ func (s *Server) rollbackExactContracts(ctx context.Context, lab string, fence F
 				}
 				return nil
 			}
+
 			var daemonChecks []transactionArtifact
 			for _, artifact := range entry.Artifacts {
 				if artifact.Command == nil {

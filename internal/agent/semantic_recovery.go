@@ -2,13 +2,14 @@ package agent
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/HongyuHe/twinet/internal/model"
+	"github.com/HongyuHe/twinet/internal/netstate"
+	"github.com/HongyuHe/twinet/internal/nos"
 	"github.com/HongyuHe/twinet/internal/render"
 	rt "github.com/HongyuHe/twinet/internal/runtime"
 	"github.com/HongyuHe/twinet/internal/state"
@@ -120,11 +121,29 @@ func (s *Server) verifyRecoveredSemantics(ctx context.Context, top *model.Topolo
 			ids = append(ids, device.ID)
 		}
 	}
-	return s.verifyTopologySemantics(ctx, top, mode, ungraded, ids, artifacts)
+	// Rollback is a local durability boundary. Exact artifacts, local
+	// addresses/routes, and daemon readiness must be restored before commit;
+	// remote BGP convergence is asynchronous and cannot safely hold a
+	// transaction open or turn one temporarily Active peer into a permanent
+	// rollback failure.
+	return s.verifyTopologyRecoveryContracts(ctx, top, mode, ungraded, ids, artifacts)
 }
 
 func (s *Server) verifyTopologySemantics(ctx context.Context, top *model.Topology,
 	mode render.Mode, ungraded int, ids []string, artifacts map[string][]transactionArtifact,
+) error {
+	return s.verifyTopologyChecks(ctx, top, mode, ungraded, ids, artifacts, true)
+}
+
+func (s *Server) verifyTopologyRecoveryContracts(ctx context.Context, top *model.Topology,
+	mode render.Mode, ungraded int, ids []string, artifacts map[string][]transactionArtifact,
+) error {
+	return s.verifyTopologyChecks(ctx, top, mode, ungraded, ids, artifacts, false)
+}
+
+func (s *Server) verifyTopologyChecks(ctx context.Context, top *model.Topology,
+	mode render.Mode, ungraded int, ids []string, artifacts map[string][]transactionArtifact,
+	verifyRemote bool,
 ) error {
 	if top == nil {
 		return fmt.Errorf("semantic verification needs a topology")
@@ -163,7 +182,11 @@ func (s *Server) verifyTopologySemantics(ctx context.Context, top *model.Topolog
 			if err := s.verifyRenderedArtifacts(verifyCtx, top, device, deviceMode, expected); err != nil {
 				return err
 			}
-			if err := s.semanticProbe(verifyCtx, top, mode, ungraded, device); err != nil {
+			if verifyRemote {
+				if err := s.semanticProbe(verifyCtx, top, mode, ungraded, device); err != nil {
+					return err
+				}
+			} else if err := s.verifyNetworkSemantics(verifyCtx, top, device, deviceMode); err != nil {
 				return err
 			}
 			if waiter := r.Ready(device, s.rt); waiter != nil {
@@ -266,19 +289,57 @@ func (s *Server) semanticProbe(ctx context.Context, top *model.Topology,
 	if err := s.verifyNetworkSemantics(ctx, top, device, deviceMode); err != nil {
 		return err
 	}
-	if device.Kind == model.KindRouter && deviceMode == render.ModeSolve &&
-		device.EffectiveNOS() == model.DefaultNOS {
-		if !s.labHasExemptions(top.Name) {
-			if err := s.verifyReferenceBGPSessions(ctx, device); err != nil {
-				return err
-			}
-			if err := s.verifyReferenceReachability(ctx, top, device); err != nil {
-				return err
-			}
+	if deviceMode != render.ModeSolve || s.labHasExemptions(top.Name) {
+		return nil
+	}
+	requirements, err := semanticHealthRequirements(top, device)
+	if err != nil {
+		return err
+	}
+	if requirements.BGPControl {
+		if err := s.verifyReferenceBGPControl(ctx, device); err != nil {
+			return err
 		}
 	}
-
+	if requirements.Forwarding {
+		if err := s.verifyReferenceReachability(ctx, top, device); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+type semanticHealthPlan struct {
+	Forwarding bool
+	BGPControl bool
+}
+
+// semanticHealthRequirements combines the topology's declared operational
+// role with the selected NOS implementation. An IXP route server therefore
+// proves its BGP control plane and RIB but is never treated as a transit
+// router merely because it happens to run FRR or BIRD.
+func semanticHealthRequirements(top *model.Topology, device *model.Device) (semanticHealthPlan, error) {
+	declared := top.SemanticHealthCapabilities(device)
+	if !declared.Forwarding && !declared.BGPControl {
+		return semanticHealthPlan{}, nil
+	}
+	provider, err := nos.Resolve(device)
+	if err != nil {
+		return semanticHealthPlan{}, err
+	}
+	caps := provider.Capabilities()
+	if declared.Forwarding && !caps.Supports(nos.FeatureForwarding) {
+		return semanticHealthPlan{}, fmt.Errorf("%s uses NOS %q without forwarding capability",
+			device.ID, provider.Name())
+	}
+	if declared.BGPControl && !caps.Supports(nos.FeatureBGP) {
+		return semanticHealthPlan{}, fmt.Errorf("%s uses NOS %q without BGP control capability",
+			device.ID, provider.Name())
+	}
+	return semanticHealthPlan{
+		Forwarding: declared.Forwarding && caps.Supports(nos.FeatureForwarding),
+		BGPControl: declared.BGPControl && caps.Supports(nos.FeatureBGP),
+	}, nil
 }
 
 func (s *Server) labHasExemptions(lab string) bool {
@@ -357,7 +418,7 @@ func referenceReachabilityTargets(top *model.Topology, sourceASN int) []string {
 	return targets
 }
 
-func (s *Server) verifyReferenceBGPSessions(ctx context.Context, device *model.Device) error {
+func referenceBGPPeers(device *model.Device) []string {
 	var peers []string
 	for _, iface := range device.Ifaces {
 		if iface.Peer == nil || iface.Peer.Device == nil || iface.Peer.Device.Kind != model.KindRouter ||
@@ -373,26 +434,61 @@ func (s *Server) verifyReferenceBGPSessions(ctx context.Context, device *model.D
 		return nil
 	}
 	sort.Strings(peers)
-	result, err := s.probeExec(ctx, s.frrContainer(ctx, device), rt.ExecCmd{
-		Cmd: []string{"vtysh", "-c", "show bgp summary json"},
-	})
+	return peers
+}
+
+// verifyReferenceBGPControl reads normalized NOS state rather than assuming
+// FRR's vtysh spelling. It checks the declared sessions and requires a
+// non-empty BGP RIB, which is meaningful for both a transit router and an IXP
+// route server without asking the latter to forward packets to every host.
+func (s *Server) verifyReferenceBGPControl(ctx context.Context, device *model.Device) error {
+	peers := referenceBGPPeers(device)
+	if len(peers) == 0 {
+		return nil
+	}
+	provider, err := nos.Resolve(device)
 	if err != nil {
-		return fmt.Errorf("read BGP sessions of %s: %w", device.ID, err)
+		return err
 	}
-	if result.ExitCode != 0 {
-		return fmt.Errorf("read BGP sessions of %s exited %d", device.ID, result.ExitCode)
+	if err := nos.ValidateStateQuery(provider, device.ID, netstate.QueryBGP); err != nil {
+		return err
 	}
-	var decoded any
-	if err := json.Unmarshal([]byte(result.Stdout), &decoded); err != nil {
-		return fmt.Errorf("parse BGP summary of %s: %w", device.ID, err)
+	exec := netstate.ExecFunc(func(execCtx context.Context, deviceID string, command []string) (rt.ExecResult, error) {
+		if deviceID != device.ID {
+			return rt.ExecResult{}, fmt.Errorf("state query for %s was sent to %s", deviceID, device.ID)
+		}
+		container := device.Container
+		if device.EffectiveNOS() == model.DefaultNOS {
+			container = s.frrContainer(execCtx, device)
+		}
+		return s.probeExec(execCtx, container, rt.ExecCmd{Cmd: command})
+	})
+	state, err := provider.ReadState(ctx, device, exec, netstate.QueryBGP)
+	if err != nil {
+		return fmt.Errorf("read BGP state of %s: %w", device.ID, err)
 	}
 	for _, peer := range peers {
-		state := bgpPeerState(decoded, peer)
-		if !strings.EqualFold(state, "Established") {
-			return fmt.Errorf("%s BGP session to %s is %q, want Established", device.ID, peer, state)
+		found := ""
+		for _, session := range state.BGP.Sessions {
+			if session.Neighbor == peer {
+				found = session.State
+				break
+			}
+		}
+		if !strings.EqualFold(found, "Established") {
+			return fmt.Errorf("%s BGP session to %s is %q, want Established", device.ID, peer, found)
 		}
 	}
+	if len(state.BGP.Paths) == 0 {
+		return fmt.Errorf("%s has established BGP session(s) but no BGP RIB paths", device.ID)
+	}
 	return nil
+}
+
+// verifyReferenceBGPSessions remains a source-compatible helper for callers
+// that only need session/RIB control-plane health.
+func (s *Server) verifyReferenceBGPSessions(ctx context.Context, device *model.Device) error {
+	return s.verifyReferenceBGPControl(ctx, device)
 }
 
 func bgpPeerState(value any, peer string) string {

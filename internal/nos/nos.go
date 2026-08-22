@@ -23,26 +23,31 @@ import (
 type Feature string
 
 const (
-	FeatureIPv4      Feature = "ipv4"
-	FeatureIPv6      Feature = "ipv6"
-	FeatureOSPF      Feature = "ospf"
-	FeatureBGP       Feature = "bgp"
-	FeaturePolicy    Feature = "policy"
-	FeatureCommunity Feature = "community"
-	FeatureRPKI      Feature = "rpki"
-	FeatureVLAN      Feature = "vlan"
-	FeatureTunnels   Feature = "tunnels"
-	FeatureMPLS      Feature = "mpls"
-	FeatureLDP       Feature = "ldp"
-	FeatureVRF       Feature = "vrf"
-	FeatureMulticast Feature = "multicast"
-	FeatureDHCP      Feature = "dhcp"
+	FeatureIPv4 Feature = "ipv4"
+	FeatureIPv6 Feature = "ipv6"
+	// FeatureForwarding says the provider is able to install and operate
+	// kernel forwarding state. A topology may still declare a control-only
+	// route server, in which case the agent intentionally does not require
+	// end-to-end forwarding from that device.
+	FeatureForwarding Feature = "forwarding"
+	FeatureOSPF       Feature = "ospf"
+	FeatureBGP        Feature = "bgp"
+	FeaturePolicy     Feature = "policy"
+	FeatureCommunity  Feature = "community"
+	FeatureRPKI       Feature = "rpki"
+	FeatureVLAN       Feature = "vlan"
+	FeatureTunnels    Feature = "tunnels"
+	FeatureMPLS       Feature = "mpls"
+	FeatureLDP        Feature = "ldp"
+	FeatureVRF        Feature = "vrf"
+	FeatureMulticast  Feature = "multicast"
+	FeatureDHCP       Feature = "dhcp"
 )
 
 // Features returns every known feature in stable order.
 func Features() []Feature {
 	return []Feature{
-		FeatureIPv4, FeatureIPv6, FeatureOSPF, FeatureBGP, FeaturePolicy,
+		FeatureIPv4, FeatureIPv6, FeatureForwarding, FeatureOSPF, FeatureBGP, FeaturePolicy,
 		FeatureCommunity, FeatureRPKI, FeatureVLAN, FeatureTunnels,
 		FeatureMPLS, FeatureLDP, FeatureVRF, FeatureMulticast, FeatureDHCP,
 	}

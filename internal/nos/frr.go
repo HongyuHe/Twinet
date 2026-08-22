@@ -31,7 +31,7 @@ func (frrProvider) StateKind() state.Kind { return state.KindFRR }
 
 func (frrProvider) Capabilities() Capabilities {
 	return NewCapabilities(
-		FeatureIPv4, FeatureIPv6, FeatureOSPF, FeatureBGP, FeaturePolicy,
+		FeatureIPv4, FeatureIPv6, FeatureForwarding, FeatureOSPF, FeatureBGP, FeaturePolicy,
 		FeatureCommunity, FeatureRPKI, FeatureVLAN, FeatureTunnels,
 		FeatureMPLS, FeatureLDP, FeatureVRF, FeatureMulticast, FeatureDHCP,
 	)

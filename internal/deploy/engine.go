@@ -172,6 +172,11 @@ type Engine struct {
 	// fenced forward apply. The transaction commits cleanup only after the
 	// replacement multiplex trunk and service inventory are verified.
 	RetainLegacyOverlays bool
+	// ForceOverlayReconcile permits a targeted repair to replace an active
+	// multiplex trunk whose UDP receive port no longer matches its peer. It is
+	// deliberately off for ordinary deploy/recovery, where preserving a live
+	// trunk avoids unnecessary packet loss.
+	ForceOverlayReconcile bool
 	// RecoveryCompatibility reconstructs a previously committed lab under a
 	// fenced rollback. It strips only legacy SYS_ADMIN requests from student
 	// containers; the internal FRR control sidecar retains that capability.
@@ -1491,6 +1496,7 @@ func (e *Engine) wireCrossNode(ctx context.Context, top *model.Topology, l *mode
 		VNI:            l.VNI,
 		VLAN:           vlan,
 		PreserveActive: e.RecoveryCompatibility,
+		ForcePort:      e.ForceOverlayReconcile,
 	})
 	if err != nil {
 		return fmt.Errorf("link %s: %w", l.ID, err)
@@ -1540,7 +1546,7 @@ func hostSideName(vni uint32) string { return fmt.Sprintf("twp%d", vni) }
 // topology, so VLAN and port collision resolution stays symmetric.
 func multiplexParameters(top *model.Topology, first, second string, target uint32) (uint16, int, int, error) {
 	var vnis []uint32
-	mtu := 1500
+	mtu := 0
 	found := false
 	pairs := map[string][2]string{}
 	for _, link := range top.Links {
@@ -1571,6 +1577,9 @@ func multiplexParameters(top *model.Topology, first, second string, target uint3
 	if !found {
 		return 0, 0, 0, fmt.Errorf("VNI %d is not a cross-node link between %s and %s",
 			target, first, second)
+	}
+	if mtu == 0 {
+		mtu = 1500
 	}
 	vlans, err := netx.AssignOverlayVLANs(vnis)
 	if err != nil {

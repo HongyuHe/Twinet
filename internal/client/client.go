@@ -208,6 +208,38 @@ func (n *Node) Containers(ctx context.Context, lab string) ([]rt.Container, erro
 	return cs, err
 }
 
+// Controls audits private FRR control sidecars without exposing them through
+// the ordinary user-facing container list.
+func (n *Node) Controls(ctx context.Context, lab string) (agent.ControlAuditResponse, error) {
+	var out agent.ControlAuditResponse
+	path := "/v1/controls"
+	if lab != "" {
+		path += "?lab=" + url.QueryEscape(lab)
+	}
+	err := n.do(ctx, http.MethodGet, path, nil, &out)
+	return out, err
+}
+
+// ReconcileControls asks one node to enqueue bounded automatic sidecar repair.
+// Holds, mutation fences, and normal exponential retry still apply at the
+// agent; this is an audit trigger, not a bypass.
+func (n *Node) ReconcileControls(ctx context.Context, lab string) ([]string, error) {
+	var out struct {
+		Scheduled []string `json:"scheduled"`
+	}
+	err := n.do(ctx, http.MethodPost, "/v1/controls/reconcile",
+		agent.ControlReconcileRequest{Lab: lab}, &out)
+	return out.Scheduled, err
+}
+
+// Reconcile queues desired/observed repair checks without bypassing the
+// agent's hold, fence, or bounded-backoff rules.
+func (n *Node) Reconcile(ctx context.Context, req agent.ReconcileRequest) (agent.ReconcileResponse, error) {
+	var out agent.ReconcileResponse
+	err := n.do(ctx, http.MethodPost, "/v1/reconcile", req, &out)
+	return out, err
+}
+
 // Events reads a bounded page from the node's structured event ring. The
 // cursor is node-local; ClusterEvents merges pages deterministically.
 func (n *Node) Events(ctx context.Context, lab string, after uint64, limit int) (agent.EventsResponse, error) {
@@ -639,6 +671,30 @@ func fanOut[T any](ctx context.Context, nodes []*Node, fn func(context.Context, 
 func (c *Cluster) Status(ctx context.Context) []NodeResult[agent.StatusResponse] {
 	return fanOut(ctx, c.Nodes, func(ctx context.Context, n *Node) (agent.StatusResponse, error) {
 		return n.Status(ctx)
+	})
+}
+
+// Controls audits private control sidecars on every node in stable node order.
+func (c *Cluster) Controls(ctx context.Context, lab string) []NodeResult[agent.ControlAuditResponse] {
+	return fanOut(ctx, c.Nodes, func(ctx context.Context, n *Node) (agent.ControlAuditResponse, error) {
+		return n.Controls(ctx, lab)
+	})
+}
+
+// ReconcileControls queues bounded automatic repair on every node that hosts
+// the lab. A controller operation correlation is shared by the fan-out.
+func (c *Cluster) ReconcileControls(ctx context.Context, lab string) []NodeResult[[]string] {
+	ctx = operationContext(ctx)
+	return fanOut(ctx, c.Nodes, func(ctx context.Context, n *Node) ([]string, error) {
+		return n.ReconcileControls(ctx, lab)
+	})
+}
+
+// Reconcile asks every node that hosts a lab to enqueue bounded checks.
+func (c *Cluster) Reconcile(ctx context.Context, lab string, devices []string, force bool) []NodeResult[agent.ReconcileResponse] {
+	ctx = operationContext(ctx)
+	return fanOut(ctx, c.Nodes, func(ctx context.Context, n *Node) (agent.ReconcileResponse, error) {
+		return n.Reconcile(ctx, agent.ReconcileRequest{Lab: lab, Devices: devices, Force: force})
 	})
 }
 

@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 	"strings"
 	"testing"
@@ -38,10 +39,21 @@ func (r *sidecarDaemonRuntime) Exec(_ context.Context, container string, command
 		return rt.ExecResult{}, nil
 	case container == r.primary && strings.Contains(body, "ps -eo args"):
 		return rt.ExecResult{Stdout: strconv.Itoa(r.primaryCount) + "\n"}, nil
+	case container == r.control && strings.Contains(body, "__TWINET_DAEMON__"):
+		var out strings.Builder
+		for _, daemon := range render.EnabledDaemons() {
+			fmt.Fprintf(&out, "__TWINET_DAEMON__%s\t%d\n", daemon, r.controlCount)
+		}
+		return rt.ExecResult{Stdout: out.String()}, nil
+	case container == r.control && strings.Contains(body, "find_frr"):
+		r.controlCount = 0
+		return rt.ExecResult{}, nil
 	case container == r.control && strings.Contains(body, "wc -l"):
 		return rt.ExecResult{Stdout: strconv.Itoa(r.controlCount) + "\n"}, nil
 	case container == r.control && strings.Contains(body, "frrinit.sh start"):
 		r.controlCount = 1
+		return rt.ExecResult{}, nil
+	case container == r.control && len(command.Cmd) >= 3 && command.Cmd[0] == "vtysh":
 		return rt.ExecResult{}, nil
 	case container == r.control && strings.Contains(body, "pidof"):
 		return rt.ExecResult{Stdout: "\n"}, nil
@@ -89,10 +101,54 @@ func TestDuplicateSidecarDaemonsRemainRecoveryFailure(t *testing.T) {
 	if runtime.controlCount != 1 {
 		t.Fatalf("sidecar daemon count after repair = %d, want one", runtime.controlCount)
 	}
+	stopAt, startAt, countAt, vtyAt := -1, -1, -1, -1
 	for _, call := range runtime.calls {
 		if strings.Contains(call, "frrinit.sh start") && !strings.HasPrefix(call, runtime.control+"|") {
 			t.Fatalf("FRR was started in primary container: %s", call)
 		}
 	}
+	for index, call := range runtime.calls {
+		switch {
+		case strings.HasPrefix(call, runtime.control+"|") && strings.Contains(call, "find_frr"):
+			stopAt = index
+		case strings.HasPrefix(call, runtime.control+"|") && strings.Contains(call, "frrinit.sh start"):
+			startAt = index
+		case strings.HasPrefix(call, runtime.control+"|") && strings.Contains(call, "__TWINET_DAEMON__"):
+			countAt = index
+		case strings.HasPrefix(call, runtime.control+"|vtysh -c show version"):
+			vtyAt = index
+		}
+	}
+	if stopAt < 0 || startAt < 0 || stopAt >= startAt {
+		t.Fatalf("control repair did not prove zero daemons before start: calls=%v", runtime.calls)
+	}
+	if countAt < startAt || vtyAt < countAt {
+		t.Fatalf("control repair did not verify exact daemon count and vty socket: calls=%v", runtime.calls)
+	}
 	_ = render.EnabledDaemons // keep the test coupled to the daemon contract
+}
+
+func TestControlAuditReportsDuplicateReason(t *testing.T) {
+	router := sidecarRouter()
+	router.Node = "node-0"
+	top := &model.Topology{
+		Name: "lab", Devices: map[string]*model.Device{router.ID: router},
+		ASes: map[int]*model.AS{router.ASN: {ASN: router.ASN, Devices: []*model.Device{router}}},
+	}
+	runtime := &sidecarDaemonRuntime{
+		primary: router.Container, control: deploy.FRRControlContainer(router), controlCount: 2,
+	}
+	server := &Server{
+		cfg: Config{Node: "node-0"}, rt: runtime,
+		current: map[string]*model.Topology{top.Name: top},
+	}
+	audit := server.auditControls(context.Background(), top.Name)
+	if len(audit) != 1 || audit[0].Healthy || !strings.Contains(audit[0].Reason, "want exactly one") {
+		t.Fatalf("duplicate control audit = %+v", audit)
+	}
+	runtime.controlCount = 1
+	audit = server.auditControls(context.Background(), top.Name)
+	if len(audit) != 1 || !audit[0].Healthy || !audit[0].VTY {
+		t.Fatalf("healthy control audit = %+v", audit)
+	}
 }

@@ -34,7 +34,7 @@ func (birdProvider) StateKind() state.Kind { return state.KindBIRD }
 // provider does not render, apply, and observe them end to end yet.
 func (birdProvider) Capabilities() Capabilities {
 	return NewCapabilities(
-		FeatureIPv4, FeatureIPv6, FeatureOSPF, FeatureBGP, FeaturePolicy,
+		FeatureIPv4, FeatureIPv6, FeatureForwarding, FeatureOSPF, FeatureBGP, FeaturePolicy,
 		FeatureCommunity, FeatureVLAN,
 	)
 }

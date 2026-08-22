@@ -641,6 +641,15 @@ func (s *Server) Serve(ctx context.Context) error {
 	mux.HandleFunc("GET /v1/containers", s.authorize(endpointPolicy{
 		Action: authz.ActionObserve, AllowCluster: true, ResolveRequest: scopeFromQuery(authz.ActionObserve, true),
 	}, s.handleContainers))
+	mux.HandleFunc("GET /v1/controls", s.authorize(endpointPolicy{
+		Action: authz.ActionObserve, AllowCluster: true, ResolveRequest: scopeFromQuery(authz.ActionObserve, true),
+	}, s.observedHandler("controls", s.handleControls)))
+	mux.HandleFunc("POST /v1/controls/reconcile", s.authorize(endpointPolicy{
+		Action: authz.ActionAdmin, Mutation: true, ResolveRequest: scopeFromJSONLab(authz.ActionAdmin),
+	}, s.observedHandler("controls_reconcile", s.handleControlReconcile)))
+	mux.HandleFunc("POST /v1/reconcile", s.authorize(endpointPolicy{
+		Action: authz.ActionAdmin, Mutation: true, ResolveRequest: scopeFromJSONLab(authz.ActionAdmin),
+	}, s.observedHandler("reconcile", s.handleReconcile)))
 	mux.HandleFunc("GET /v1/events", s.authorize(endpointPolicy{
 		Action: authz.ActionObserve, AllowCluster: true, ResolveRequest: scopeFromQuery(authz.ActionObserve, true),
 	}, s.observedHandler("events", s.handleEvents)))
@@ -965,6 +974,10 @@ type SemanticHealth struct {
 	Broken  int `json:"broken"`
 	Unknown int `json:"unknown"`
 	Partial int `json:"partial"`
+	// Reasons names each currently non-healthy device and its bounded last
+	// observation, so an idle node status cannot hide a sidecar/reachability
+	// failure behind aggregate counts.
+	Reasons map[string]string `json:"reasons,omitempty"`
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -1055,7 +1068,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	resp.SemanticHealth = map[string]SemanticHealth{}
 	for key, observation := range s.health {
 		resp.Convergence[string(observation.Health)]++
-		lab, _, _ := strings.Cut(key, "|")
+		lab, device, _ := strings.Cut(key, "|")
 		health := resp.SemanticHealth[lab]
 		switch observation.Health {
 		case healthHealthy:
@@ -1066,6 +1079,12 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 			health.Unknown++
 		case healthPartial:
 			health.Partial++
+		}
+		if observation.Health != healthHealthy && observation.Reason != "" {
+			if health.Reasons == nil {
+				health.Reasons = map[string]string{}
+			}
+			health.Reasons[device] = observation.Reason
 		}
 		resp.SemanticHealth[lab] = health
 	}
