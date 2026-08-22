@@ -40,6 +40,19 @@ func (r ProbeResource) key() string {
 // before a check runs and must not observe or mutate student state.
 type ProbeResourceResolver func(env *Env, args map[string]any) []ProbeResource
 
+func inferredCheckClass(name string) CheckClass {
+	switch name {
+	case "bgp.ibgp_full_mesh", "bgp.ebgp_established",
+		"dataplane.internal_reachability", "l2.vlan_isolation", "ospf.ecmp_paths",
+		"tunnel.sixin4", "policy.transit_for_customers", "policy.traffic_engineering",
+		"vpn.site_reachability", "vpn.label_switched", "vpn.isolation",
+		"multicast.delivery", "multicast.no_flooding":
+		return CheckActive
+	default:
+		return CheckReadOnly
+	}
+}
+
 type scheduledCheck struct {
 	order    int
 	check    *Check
@@ -69,7 +82,13 @@ func scheduleChecks(ctx context.Context, jobs []scheduledCheck, opts RunOptions)
 		return results
 	}
 	if opts.Parallel <= 0 {
-		opts.Parallel = 4
+		opts.Parallel = 8
+	}
+	if opts.ReadParallel <= 0 {
+		opts.ReadParallel = opts.Parallel
+	}
+	if opts.ActiveParallel <= 0 {
+		opts.ActiveParallel = minInt(4, opts.Parallel)
 	}
 	if opts.CheckTimeout <= 0 {
 		opts.CheckTimeout = 120 * time.Second
@@ -138,7 +157,7 @@ func scheduleChecks(ctx context.Context, jobs []scheduledCheck, opts RunOptions)
 			}
 		}
 		for len(running) < opts.Parallel {
-			index, resources, owners, _ := firstRunnable(pending, running)
+			index, resources, owners, _ := firstRunnable(pending, running, byOrder, opts)
 			if index < 0 {
 				for _, blockedJob := range pending {
 					blockedOwners, conflicts := blockingResources(resourcesFor(blockedJob), running)
@@ -165,20 +184,7 @@ func scheduleChecks(ctx context.Context, jobs []scheduledCheck, opts RunOptions)
 			pending = append(pending[:index], pending[index+1:]...)
 			start(job, resources)
 		}
-		if len(running) >= opts.Parallel {
-			for _, job := range pending {
-				if waitReasons[job.order] == nil {
-					waitReasons[job.order] = map[string]bool{}
-				}
-				waitReasons[job.order]["parallel limit"] = true
-				if blockedBy[job.order] == nil {
-					blockedBy[job.order] = map[int]bool{}
-				}
-				for runningOrder := range running {
-					blockedBy[job.order][runningOrder] = true
-				}
-			}
-		}
+		recordPoolWaits(pending, running, byOrder, opts, blockedBy, waitReasons)
 		if len(running) == 0 {
 			// Resources are normalized before scheduling, so this can only
 			// happen if a malformed job escaped normalization. Turn it into
@@ -259,15 +265,105 @@ func scheduleChecks(ctx context.Context, jobs []scheduledCheck, opts RunOptions)
 	return results
 }
 
-func firstRunnable(pending []scheduledCheck, running map[int][]ProbeResource) (int, []ProbeResource, []int, []string) {
+func firstRunnable(pending []scheduledCheck, running map[int][]ProbeResource,
+	byOrder map[int]scheduledCheck, opts RunOptions,
+) (int, []ProbeResource, []int, []string) {
 	for i, job := range pending {
 		resources := resourcesFor(job)
 		owners, _ := blockingResources(resources, running)
-		if len(owners) == 0 {
+		if len(owners) == 0 && poolAvailable(job, running, byOrder, opts) {
 			return i, resources, nil, nil
 		}
 	}
 	return -1, nil, nil, nil
+}
+
+func poolAvailable(job scheduledCheck, running map[int][]ProbeResource,
+	byOrder map[int]scheduledCheck, opts RunOptions,
+) bool {
+	if len(running) >= opts.Parallel {
+		return false
+	}
+	read, active := runningClassCounts(running, byOrder)
+	switch checkClass(job) {
+	case CheckActive:
+		return active < opts.ActiveParallel
+	default:
+		return read < opts.ReadParallel
+	}
+}
+
+func runningClassCounts(running map[int][]ProbeResource,
+	byOrder map[int]scheduledCheck,
+) (read, active int) {
+	for order := range running {
+		if checkClass(byOrder[order]) == CheckActive {
+			active++
+		} else {
+			read++
+		}
+	}
+	return read, active
+}
+
+func checkClass(job scheduledCheck) CheckClass {
+	if job.check != nil && job.check.Class != "" {
+		return job.check.Class
+	}
+	return inferredCheckClass(job.spec.Check)
+}
+
+func recordPoolWaits(pending []scheduledCheck, running map[int][]ProbeResource,
+	byOrder map[int]scheduledCheck, opts RunOptions,
+	blockedBy map[int]map[int]bool, waitReasons map[int]map[string]bool,
+) {
+	read, active := runningClassCounts(running, byOrder)
+	for _, job := range pending {
+		if owners, _ := blockingResources(resourcesFor(job), running); len(owners) > 0 {
+			continue
+		}
+		reason := ""
+		var parents []int
+		switch checkClass(job) {
+		case CheckActive:
+			if active >= opts.ActiveParallel {
+				reason = "active pool limit"
+				for order := range running {
+					if checkClass(byOrder[order]) == CheckActive {
+						parents = append(parents, order)
+					}
+				}
+			}
+		default:
+			if read >= opts.ReadParallel {
+				reason = "read-only pool limit"
+				for order := range running {
+					if checkClass(byOrder[order]) != CheckActive {
+						parents = append(parents, order)
+					}
+				}
+			}
+		}
+		if reason == "" && len(running) >= opts.Parallel {
+			reason = "total check limit"
+			for order := range running {
+				parents = append(parents, order)
+			}
+		}
+		if reason == "" {
+			continue
+		}
+		if waitReasons[job.order] == nil {
+			waitReasons[job.order] = map[string]bool{}
+		}
+		waitReasons[job.order][reason] = true
+		if blockedBy[job.order] == nil {
+			blockedBy[job.order] = map[int]bool{}
+		}
+		for _, parent := range parents {
+			blockedBy[job.order][parent] = true
+		}
+	}
 }
 
 func blockingResources(want []ProbeResource, running map[int][]ProbeResource) ([]int, []string) {

@@ -372,6 +372,40 @@ func scopeForContainer(action string) func(*Server, *http.Request) (requestScope
 	}
 }
 
+// scopeForExecBatch proves every requested container belongs to the same lab.
+// A batch crossing lab boundaries would turn one authorization decision into
+// an enumeration primitive, so it is refused before the handler sees it.
+func scopeForExecBatch(action string) func(*Server, *http.Request) (requestScope, error) {
+	return func(s *Server, r *http.Request) (requestScope, error) {
+		values, err := requestJSONObject(r)
+		if err != nil {
+			return requestScope{}, err
+		}
+		raw := values["requests"]
+		var requests []struct {
+			Container string `json:"container"`
+		}
+		if len(raw) == 0 || json.Unmarshal(raw, &requests) != nil || len(requests) == 0 {
+			return requestScope{}, errors.New("one or more exec requests are required")
+		}
+		var scope requestScope
+		for index, request := range requests {
+			current, err := s.containerScope(action, request.Container, "", 0)
+			if err != nil {
+				return requestScope{}, err
+			}
+			if index == 0 {
+				scope = current
+				continue
+			}
+			if current.Lab != scope.Lab {
+				return requestScope{}, errors.New("all exec batch containers must belong to one lab")
+			}
+		}
+		return scope, nil
+	}
+}
+
 func scopeForAttach(s *Server, r *http.Request) (requestScope, error) {
 	return s.containerScope(authz.ActionExec, strings.TrimSpace(r.URL.Query().Get("container")), "", 0)
 }

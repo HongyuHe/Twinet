@@ -400,6 +400,15 @@ func (n *Node) Exec(ctx context.Context, req agent.ExecRequest) (agent.ExecRespo
 	return resp, err
 }
 
+// ExecBatch groups same-lab device observations into one authenticated HTTP
+// request. Per-device failures stay explicit in the response so a grader can
+// classify them as infrastructure errors rather than false network facts.
+func (n *Node) ExecBatch(ctx context.Context, req agent.ExecBatchRequest) (agent.ExecBatchResponse, error) {
+	var resp agent.ExecBatchResponse
+	err := n.do(ctx, http.MethodPost, "/v1/exec/batch", req, &resp)
+	return resp, err
+}
+
 // Lifecycle changes a container's run state on this node.
 func (n *Node) Lifecycle(ctx context.Context, req agent.LifecycleRequest) error {
 	return n.do(ctx, http.MethodPost, "/v1/lifecycle", req, nil)

@@ -29,6 +29,10 @@ type Env struct {
 
 	// Exec runs a command inside a device of the grading lab.
 	Exec func(ctx context.Context, deviceID string, cmd []string) (rt.ExecResult, error)
+	// BatchExec runs one command per device, preferably coalesced by node. It
+	// is used only by the passive snapshot; active evidence remains individual
+	// so its counter/capture attribution cannot be blurred.
+	BatchExec func(context.Context, []BatchExecRequest) ([]BatchExecResult, error)
 	// StateReader is an optional injected vendor-neutral state source. The
 	// default resolves the device NOS from the topology and calls its provider.
 	// Tests and non-container runtimes can inject the same typed interface.
@@ -53,6 +57,19 @@ type Env struct {
 	// cache hits/misses and raw execs can be attributed without serializing
 	// unrelated checks.
 	trace *checkTrace
+	// observationBatcher coalesces simultaneous state surveys during snapshot
+	// construction. It is nil for direct/library callers and active checks.
+	observationBatcher *observationBatcher
+}
+
+type BatchExecRequest struct {
+	DeviceID string
+	Command  []string
+}
+
+type BatchExecResult struct {
+	Result rt.ExecResult
+	Err    error
 }
 
 // DeviceState reads vendor-neutral operational state from a named device.
@@ -116,12 +133,26 @@ func (e *Env) readDeviceState(ctx context.Context, deviceID string, query netsta
 		reader = provider
 	}
 	exec := e.Exec
+	var executor netstate.Executor = netstate.ExecFunc(exec)
 	if e.snapshot != nil && !e.liveState {
 		exec = func(ctx context.Context, deviceID string, command []string) (rt.ExecResult, error) {
 			return e.snapshot.command(ctx, "netstate", deviceID, command)
 		}
+		fallback := netstate.ExecFunc(exec)
+		batch := func(ctx context.Context, deviceID string, commands [][]string) ([]rt.ExecResult, error) {
+			return e.snapshot.observationBatch(ctx, "netstate-batch", deviceID, commands)
+		}
+		if e.observationBatcher != nil {
+			batch = func(ctx context.Context, deviceID string, commands [][]string) ([]rt.ExecResult, error) {
+				return e.observationBatcher.run(ctx, "netstate-batch", deviceID, commands)
+			}
+		}
+		executor = newStateBatchExecutor(d, query,
+			func(ctx context.Context, deviceID string, commands [][]string) ([]rt.ExecResult, error) {
+				return batch(ctx, deviceID, commands)
+			}, fallback)
 	}
-	state, err := reader.ReadState(ctx, d, netstate.ExecFunc(exec), query)
+	state, err := reader.ReadState(ctx, d, executor, query)
 	if err != nil {
 		op := "read network state " + query.String()
 		return netstate.State{}, e.infra(deviceID, op, err)
@@ -410,6 +441,16 @@ func (e *Env) ArgPaths(key string) [][]string {
 // CheckFunc is a graded assertion about a student's network.
 type CheckFunc func(ctx context.Context, env *Env) Result
 
+// CheckClass separates passive collection from checks that launch packets,
+// captures, counter windows, or control-plane refreshes. The scheduler gives
+// active work a smaller pool so a healthy grade cannot turn into an exec storm.
+type CheckClass string
+
+const (
+	CheckReadOnly CheckClass = "read_only"
+	CheckActive   CheckClass = "active"
+)
+
 // Check is a registered check with its documentation.
 type Check struct {
 	Name string
@@ -430,6 +471,9 @@ type Check struct {
 	// state on either side of an action it performs. It bypasses the snapshot
 	// rather than accidentally treating its first read as the second.
 	LiveObservations bool
+	// Class selects the bounded scheduler pool. Empty receives the reviewed
+	// classification for shipped checks at registration.
+	Class CheckClass
 }
 
 // registry holds every known check. It is populated by init functions in the
@@ -458,6 +502,9 @@ func Register(c *Check) {
 			copy.Args = args
 			return inferredProbeResources(name, &copy)
 		}
+	}
+	if c.Class == "" {
+		c.Class = inferredCheckClass(c.Name)
 	}
 	if _, dup := registry[c.Name]; dup {
 		panic("grade: duplicate check " + c.Name)

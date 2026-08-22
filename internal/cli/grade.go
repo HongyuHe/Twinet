@@ -92,14 +92,15 @@ func newGradeValidateCmd() *cobra.Command {
 
 func newGradeRunCmd(opts *Options) *cobra.Command {
 	var (
-		rubricPath    string
-		asList        []int
-		outDir        string
-		parallel      int
-		checkParallel int
-		token         string
-		converge      time.Duration
-		quiet         bool
+		rubricPath     string
+		asList         []int
+		outDir         string
+		parallel       int
+		checkParallel  int
+		activeParallel int
+		token          string
+		converge       time.Duration
+		quiet          bool
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -137,6 +138,10 @@ reference, and holds the nodes off from repairing anything while it does.`,
 			}
 
 			exec, err := execFunc(cmd.Context(), top, token)
+			if err != nil {
+				return err
+			}
+			batchExec, err := batchExecFunc(top, token, exec)
 			if err != nil {
 				return err
 			}
@@ -209,10 +214,12 @@ reference, and holds the nodes off from repairing anything while it does.`,
 					sem <- struct{}{}
 					defer func() { <-sem }()
 
-					env := &grade.Env{Topology: top, AS: asn, Exec: exec}
+					env := &grade.Env{Topology: top, AS: asn, Exec: exec, BatchExec: batchExec}
 					rep := grade.Run(cmd.Context(), rubric, env, grade.RunOptions{
 						ConvergeTimeout:     converge,
 						Parallel:            checkParallel,
+						ReadParallel:        checkParallel,
+						ActiveParallel:      activeParallel,
 						ObservationParallel: checkParallel,
 					})
 					rep.Submission = fmt.Sprintf("as%d", asn)
@@ -258,8 +265,10 @@ reference, and holds the nodes off from repairing anything while it does.`,
 	cmd.Flags().IntSliceVar(&asList, "as", nil, "AS numbers to grade (default: every student AS)")
 	cmd.Flags().StringVarP(&outDir, "out", "o", "", "directory for reports")
 	cmd.Flags().IntVarP(&parallel, "parallel", "p", 8, "submissions graded concurrently")
-	cmd.Flags().IntVar(&checkParallel, "check-parallel", 32,
-		"maximum non-conflicting checks and passive observations per submission")
+	cmd.Flags().IntVar(&checkParallel, "check-parallel", 8,
+		"maximum checks/passive observations per submission")
+	cmd.Flags().IntVar(&activeParallel, "active-check-parallel", 4,
+		"maximum packet/capture/control-refresh checks per submission")
 	// Four minutes, not ninety seconds.
 	//
 	// Ninety was a guess and it was wrong: an iBGP session in the 12-AS lab was

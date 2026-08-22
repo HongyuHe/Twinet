@@ -279,6 +279,16 @@ func (s *ObservationSnapshot) recordCacheLocked(ctx context.Context, hit, coales
 	}
 }
 
+func (s *ObservationSnapshot) recordExternalBatchExec() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.Stats.Misses++
+	s.Stats.ExecCalls++
+	s.mu.Unlock()
+}
+
 func isObservationCancellation(err error) bool {
 	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
@@ -610,6 +620,8 @@ func collectObservationSnapshot(ctx context.Context, r *Rubric, env *Env, parall
 	}
 	observed := *env
 	observed.snapshot = snapshot
+	batcher := newObservationBatcher(ctx, snapshot, observed.BatchExec)
+	observed.observationBatcher = batcher
 	plan := buildObservationPlan(r, &observed)
 
 	type task struct {
@@ -626,13 +638,13 @@ func collectObservationSnapshot(ctx context.Context, r *Rubric, env *Env, parall
 	for _, device := range plan.ovs {
 		device := device
 		tasks = append(tasks, task{name: "ovs/" + device.ID, run: func() {
-			collectOVSState(ctx, snapshot, device.ID)
+			collectOVSState(ctx, snapshot, batcher, device.ID)
 		}})
 	}
 	for _, device := range plan.svc {
 		device := device
 		tasks = append(tasks, task{name: "service/" + device.ID, run: func() {
-			collectServiceState(ctx, snapshot, device.ID)
+			collectServiceState(ctx, snapshot, batcher, device.ID)
 		}})
 	}
 	sort.Slice(tasks, func(i, j int) bool {
@@ -653,45 +665,56 @@ func collectObservationSnapshot(ctx context.Context, r *Rubric, env *Env, parall
 		}()
 	}
 	wg.Wait()
+	batcher.close()
 	return snapshot
 }
 
-func collectOVSState(ctx context.Context, snapshot *ObservationSnapshot, device string) {
+func collectOVSState(ctx context.Context, snapshot *ObservationSnapshot, batcher *observationBatcher, device string) {
 	if snapshot == nil {
 		return
 	}
-	_, _ = snapshot.command(ctx, "ovs", device,
-		[]string{"ovs-vsctl", "--columns=name,tag", "--format=csv", "list", "port"})
-	_, _ = snapshot.command(ctx, "ovs", device,
-		[]string{"ovs-vsctl", "--columns=name,type,options", "--format=csv", "list", "interface"})
-	bridges, err := snapshot.command(ctx, "ovs", device, []string{"ovs-vsctl", "list-br"})
-	if err != nil || bridges.ExitCode != 0 {
+	first := [][]string{
+		{"ovs-vsctl", "--columns=name,tag", "--format=csv", "list", "port"},
+		{"ovs-vsctl", "--columns=name,type,options", "--format=csv", "list", "interface"},
+		{"ovs-vsctl", "list-br"},
+	}
+	results, err := runObservationBatch(ctx, snapshot, batcher, "ovs-batch", device, first)
+	if err != nil || len(results) != len(first) || results[2].ExitCode != 0 {
 		return
 	}
-	for _, bridge := range strings.Fields(bridges.Stdout) {
-		for _, command := range [][]string{
-			{"ovs-ofctl", "show", bridge},
-			{"ovs-ofctl", "dump-flows", bridge},
-			{"ovs-ofctl", "dump-groups", bridge},
-			{"ovs-vsctl", "get-controller", bridge},
-		} {
-			_, _ = snapshot.command(ctx, "ovs", device, command)
-		}
+	var second [][]string
+	for _, bridge := range strings.Fields(results[2].Stdout) {
+		second = append(second,
+			[]string{"ovs-ofctl", "show", bridge},
+			[]string{"ovs-ofctl", "dump-flows", bridge},
+			[]string{"ovs-ofctl", "dump-groups", bridge},
+			[]string{"ovs-vsctl", "get-controller", bridge},
+		)
+	}
+	if len(second) > 0 {
+		_, _ = runObservationBatch(ctx, snapshot, batcher, "ovs-batch", device, second)
 	}
 }
 
-func collectServiceState(ctx context.Context, snapshot *ObservationSnapshot, device string) {
+func collectServiceState(ctx context.Context, snapshot *ObservationSnapshot, batcher *observationBatcher, device string) {
 	if snapshot == nil {
 		return
 	}
-	for _, command := range [][]string{
+	_, _ = runObservationBatch(ctx, snapshot, batcher, "service-batch", device, [][]string{
 		{"ip", "-j", "address", "show"},
 		{"ip", "-j", "route", "show"},
 		{"sysctl", "-n", "net.ipv4.ip_forward"},
 		{"ps", "-eo", "args"},
-	} {
-		_, _ = snapshot.command(ctx, "service", device, command)
+	})
+}
+
+func runObservationBatch(ctx context.Context, snapshot *ObservationSnapshot, batcher *observationBatcher,
+	source, device string, commands [][]string,
+) ([]rt.ExecResult, error) {
+	if batcher != nil {
+		return batcher.run(ctx, source, device, commands)
 	}
+	return snapshot.observationBatch(ctx, source, device, commands)
 }
 
 // snapshotReadOnlyCommand intentionally has a small allow-list. In

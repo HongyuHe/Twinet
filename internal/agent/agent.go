@@ -730,6 +730,9 @@ func (s *Server) Serve(ctx context.Context) error {
 	mux.HandleFunc("POST /v1/exec", s.authorize(endpointPolicy{
 		Action: authz.ActionExec, Mutation: true, ResolveRequest: scopeForContainer(authz.ActionExec),
 	}, s.observedHandler("exec", s.handleExec)))
+	mux.HandleFunc("POST /v1/exec/batch", s.authorize(endpointPolicy{
+		Action: authz.ActionExec, Mutation: true, ResolveRequest: scopeForExecBatch(authz.ActionExec),
+	}, s.observedHandler("exec_batch", s.handleExecBatch)))
 	mux.HandleFunc("POST /v1/hold", s.authorize(endpointPolicy{
 		Action: authz.ActionLifecycle, Mutation: true, ResolveRequest: scopeFromJSONLab(authz.ActionLifecycle),
 	}, s.observedHandler("hold", s.handleHold)))
@@ -2091,6 +2094,23 @@ type ExecResponse struct {
 	Stderr   string `json:"stderr"`
 }
 
+// ExecBatchRequest groups several read-only grading observations for devices
+// on this node. Authorization requires every container to belong to one lab;
+// individual results retain an error rather than making an absent device look
+// like a negative network fact.
+type ExecBatchRequest struct {
+	Requests []ExecRequest `json:"requests"`
+}
+
+type ExecBatchResult struct {
+	Response ExecResponse `json:"response"`
+	Error    string       `json:"error,omitempty"`
+}
+
+type ExecBatchResponse struct {
+	Results []ExecBatchResult `json:"results"`
+}
+
 // handleImages reports the digest behind every image this node has, so a
 // grading report can name the exact software a mark was produced against.
 func (s *Server) handleImages(w http.ResponseWriter, r *http.Request) {
@@ -2453,9 +2473,55 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, err)
 		return
 	}
-	if req.Container == "" || len(req.Cmd) == 0 {
-		httpError(w, http.StatusBadRequest, errors.New("container and cmd are both required"))
+	res, status, err := s.executeExecRequest(r, req)
+	if err != nil {
+		httpError(w, status, err)
 		return
+	}
+	writeJSON(w, res)
+}
+
+func (s *Server) handleExecBatch(w http.ResponseWriter, r *http.Request) {
+	var req ExecBatchRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpError(w, http.StatusBadRequest, err)
+		return
+	}
+	if len(req.Requests) == 0 || len(req.Requests) > 128 {
+		httpError(w, http.StatusBadRequest, errors.New("batch must contain 1 through 128 exec requests"))
+		return
+	}
+	workers := s.workLimiter().ClampWorkers(limiter.ExecProbe, 8)
+	results := make([]ExecBatchResult, len(req.Requests))
+	sem := make(chan struct{}, workers)
+	var wg sync.WaitGroup
+	for index, one := range req.Requests {
+		index, one := index, one
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+			case <-r.Context().Done():
+				results[index].Error = r.Context().Err().Error()
+				return
+			}
+			defer func() { <-sem }()
+			response, _, err := s.executeExecRequest(r, one)
+			if err != nil {
+				results[index].Error = err.Error()
+				return
+			}
+			results[index].Response = response
+		}()
+	}
+	wg.Wait()
+	writeJSON(w, ExecBatchResponse{Results: results})
+}
+
+func (s *Server) executeExecRequest(r *http.Request, req ExecRequest) (ExecResponse, int, error) {
+	if req.Container == "" || len(req.Cmd) == 0 {
+		return ExecResponse{}, http.StatusBadRequest, errors.New("container and cmd are both required")
 	}
 	// A diagnostic caller is something under evaluation. It may look at one
 	// lab, and it may only look: the hold token, other labs, and every command
@@ -2464,48 +2530,39 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 	diagLab, diagnostic := diagScopeOf(r)
 	if diagnostic {
 		if req.Hold != "" {
-			httpError(w, http.StatusForbidden,
-				errors.New("a diagnostic session may not present a grading hold"))
-			return
+			return ExecResponse{}, http.StatusForbidden,
+				errors.New("a diagnostic session may not present a grading hold")
 		}
 		if err := ReadOnlyCommand(req.Cmd); err != nil {
-			httpError(w, http.StatusForbidden, err)
-			return
+			return ExecResponse{}, http.StatusForbidden, err
 		}
 	}
 	// Running a command inside a lab somebody is grading would land in
 	// somebody's marks. The grader passes its own hold token and is admitted.
 	if why := s.refuseIfHeldByAnother(req.Container, req.Hold); why != "" {
-		httpError(w, http.StatusConflict, errors.New(why))
-		return
+		return ExecResponse{}, http.StatusConflict, errors.New(why)
 	}
 	c, err := s.rt.Inspect(r.Context(), req.Container)
 	if err != nil {
-		httpError(w, http.StatusInternalServerError, err)
-		return
+		return ExecResponse{}, http.StatusInternalServerError, err
 	}
 	if c.State == rt.StateAbsent {
-		httpError(w, http.StatusNotFound, fmt.Errorf("no container %q on %s", req.Container, s.cfg.Node))
-		return
+		return ExecResponse{}, http.StatusNotFound, fmt.Errorf("no container %q on %s", req.Container, s.cfg.Node)
 	}
 	if c.Labels[deploy.LabelManaged] != "true" {
-		httpError(w, http.StatusForbidden, errors.New("that container is not managed by twinet"))
-		return
+		return ExecResponse{}, http.StatusForbidden, errors.New("that container is not managed by twinet")
 	}
 	if isInternalControlContainer(c) {
-		httpError(w, http.StatusForbidden, errors.New("that container is an internal control sidecar"))
-		return
+		return ExecResponse{}, http.StatusForbidden, errors.New("that container is an internal control sidecar")
 	}
 	if req.Owner != "" && c.Labels[deploy.LabelOwner] != req.Owner {
-		httpError(w, http.StatusForbidden,
-			fmt.Errorf("%s belongs to %q, not %q", req.Container, c.Labels[deploy.LabelOwner], req.Owner))
-		return
+		return ExecResponse{}, http.StatusForbidden,
+			fmt.Errorf("%s belongs to %q, not %q", req.Container, c.Labels[deploy.LabelOwner], req.Owner)
 	}
 	if diagnostic && c.Labels[deploy.LabelLab] != diagLab {
-		httpError(w, http.StatusForbidden,
+		return ExecResponse{}, http.StatusForbidden,
 			fmt.Errorf("this diagnostic session is scoped to lab %q; %s belongs to %q",
-				diagLab, req.Container, c.Labels[deploy.LabelLab]))
-		return
+				diagLab, req.Container, c.Labels[deploy.LabelLab])
 	}
 	// Nothing a container says can be believed until the programs saying it
 	// are the ones its image ships.
@@ -2526,8 +2583,7 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 			s.recordEvent(c.Labels[deploy.LabelLab], "", "grading", s.requestCorrelation(r),
 				"grading_exec", "error", err.Error())
 		}
-		httpError(w, http.StatusInternalServerError, err)
-		return
+		return ExecResponse{}, http.StatusInternalServerError, err
 	}
 	if req.Grading {
 		result := "success"
@@ -2538,7 +2594,7 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 		s.recordEvent(c.Labels[deploy.LabelLab], "", "grading", s.requestCorrelation(r),
 			"grading_exec", result, "")
 	}
-	writeJSON(w, ExecResponse{ExitCode: res.ExitCode, Stdout: res.Stdout, Stderr: res.Stderr})
+	return ExecResponse{ExitCode: res.ExitCode, Stdout: res.Stdout, Stderr: res.Stderr}, http.StatusOK, nil
 }
 
 // verifyTools compares a container's programs against its image's, at most once

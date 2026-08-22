@@ -90,6 +90,20 @@ func (t *execTracker) wrap(raw rtExecFunc) rtExecFunc {
 	}
 }
 
+func (t *execTracker) wrapBatch(raw func(context.Context, []BatchExecRequest) ([]BatchExecResult, error)) func(context.Context, []BatchExecRequest) ([]BatchExecResult, error) {
+	return func(ctx context.Context, requests []BatchExecRequest) ([]BatchExecResult, error) {
+		results, err := raw(ctx, requests)
+		t.mu.Lock()
+		for _, result := range results {
+			if result.Err == nil {
+				t.total++
+			}
+		}
+		t.mu.Unlock()
+		return results, err
+	}
+}
+
 func (t *execTracker) count() int {
 	if t == nil {
 		return 0

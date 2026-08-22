@@ -273,6 +273,11 @@ type RunOptions struct {
 	// Parallel bounds how many checks of one submission run at once. Checks
 	// without active-probe conflicts run at once.
 	Parallel int
+	// ReadParallel bounds passive/read-only checks. Zero adopts Parallel.
+	ReadParallel int
+	// ActiveParallel bounds packet/capture/control-refresh checks. Zero uses a
+	// conservative share of Parallel; node agents remain the final limiter.
+	ActiveParallel int
 	// ObservationParallel bounds passive collection requests made by the
 	// controller. Node agents independently enforce their ExecProbe budget.
 	ObservationParallel int
@@ -315,7 +320,13 @@ func Run(ctx context.Context, r *Rubric, env *Env, opts RunOptions) *Report {
 		opts.CheckTimeout = 120 * time.Second
 	}
 	if opts.Parallel <= 0 {
-		opts.Parallel = 4
+		opts.Parallel = 8
+	}
+	if opts.ReadParallel <= 0 {
+		opts.ReadParallel = opts.Parallel
+	}
+	if opts.ActiveParallel <= 0 {
+		opts.ActiveParallel = minInt(4, opts.Parallel)
 	}
 	if opts.ObservationParallel <= 0 {
 		opts.ObservationParallel = minInt(16, maxGradeWorkers(opts.Parallel*2, 4))
@@ -331,6 +342,9 @@ func Run(ctx context.Context, r *Rubric, env *Env, opts RunOptions) *Report {
 	runEnv := *env
 	if runEnv.Exec != nil {
 		runEnv.Exec = execs.wrap(runEnv.Exec)
+	}
+	if runEnv.BatchExec != nil {
+		runEnv.BatchExec = execs.wrapBatch(runEnv.BatchExec)
 	}
 	opts.phases = phases
 	opts.scheduler = newSchedulerTrace()

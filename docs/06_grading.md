@@ -34,7 +34,8 @@ declared shared probe counters, captures, ports, interfaces, or endpoints,
 preserving counter attribution and deterministic report order.
 Reports include machine-readable `phase_timings` and `observation_snapshot`
 records, per-check cache/exec accounting, lock waits, and a scheduler critical
-path. `grade run --check-parallel` controls its per-submission bound.
+path. `grade run --check-parallel` bounds total/passive checks; the smaller
+`--active-check-parallel` pool protects node runtime pressure.
 
 The compact `harness.Options.Synthetic` substrate keeps the target AS and IXPs
 intact while collapsing each other retained AS to one deterministic
