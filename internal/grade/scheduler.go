@@ -5,8 +5,9 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-	"sync"
 	"time"
+
+	"github.com/HongyuHe/twinet/internal/model"
 )
 
 // ProbeResourceKind names a fact whose attribution is invalid when two active
@@ -40,15 +41,22 @@ func (r ProbeResource) key() string {
 type ProbeResourceResolver func(env *Env, args map[string]any) []ProbeResource
 
 type scheduledCheck struct {
-	order int
-	check *Check
-	spec  CheckSpec
-	env   *Env
+	order    int
+	check    *Check
+	spec     CheckSpec
+	env      *Env
+	instance string
+	queuedAt time.Time
+	key      string
+	trace    *checkTrace
 }
 
 type scheduledCheckResult struct {
-	order  int
-	result Result
+	order      int
+	result     Result
+	startedAt  time.Time
+	finishedAt time.Time
+	stats      ObservationStats
 }
 
 // scheduleChecks executes a fixed check set at a bounded width. It always
@@ -69,30 +77,107 @@ func scheduleChecks(ctx context.Context, jobs []scheduledCheck, opts RunOptions)
 
 	pending := append([]scheduledCheck(nil), jobs...)
 	sort.SliceStable(pending, func(i, j int) bool { return pending[i].order < pending[j].order })
+	byOrder := map[int]scheduledCheck{}
+	now := time.Now().UTC()
+	for i := range pending {
+		if pending[i].queuedAt.IsZero() {
+			pending[i].queuedAt = now
+		}
+		if pending[i].key == "" {
+			pending[i].key = schedulerKey(pending[i])
+		}
+		if pending[i].trace == nil {
+			pending[i].trace = &checkTrace{}
+		}
+		byOrder[pending[i].order] = pending[i]
+	}
 	running := map[int][]ProbeResource{}
+	type startMeta struct {
+		resources []ProbeResource
+		blockedBy []int
+		reasons   map[string]bool
+	}
+	metas := map[int]startMeta{}
+	blockedBy := map[int]map[int]bool{}
+	waitReasons := map[int]map[string]bool{}
 	done := make(chan scheduledCheckResult, len(pending))
 	finished := 0
 
 	start := func(job scheduledCheck, resources []ProbeResource) {
 		running[job.order] = resources
+		meta := startMeta{resources: resources, reasons: waitReasons[job.order]}
+		for parent := range blockedBy[job.order] {
+			meta.blockedBy = append(meta.blockedBy, parent)
+		}
+		sort.Ints(meta.blockedBy)
+		metas[job.order] = meta
 		go func() {
-			done <- scheduledCheckResult{
-				order:  job.order,
-				result: executeScheduledCheck(ctx, job, opts),
-			}
+			result, startedAt, finishedAt, stats := executeScheduledCheck(ctx, job, opts)
+			done <- scheduledCheckResult{order: job.order, result: result,
+				startedAt: startedAt, finishedAt: finishedAt, stats: stats}
 		}()
 	}
 
 	for finished < len(jobs) {
+		for _, job := range pending {
+			owners, conflicts := blockingResources(resourcesFor(job), running)
+			if len(owners) == 0 {
+				continue
+			}
+			if blockedBy[job.order] == nil {
+				blockedBy[job.order] = map[int]bool{}
+			}
+			for _, owner := range owners {
+				blockedBy[job.order][owner] = true
+			}
+			if waitReasons[job.order] == nil {
+				waitReasons[job.order] = map[string]bool{}
+			}
+			for _, conflict := range conflicts {
+				waitReasons[job.order]["resource lock: "+conflict] = true
+			}
+		}
 		for len(running) < opts.Parallel {
-			index := firstRunnable(pending, running)
+			index, resources, owners, _ := firstRunnable(pending, running)
 			if index < 0 {
+				for _, blockedJob := range pending {
+					blockedOwners, conflicts := blockingResources(resourcesFor(blockedJob), running)
+					if len(blockedOwners) == 0 {
+						continue
+					}
+					if blockedBy[blockedJob.order] == nil {
+						blockedBy[blockedJob.order] = map[int]bool{}
+					}
+					for _, owner := range blockedOwners {
+						blockedBy[blockedJob.order][owner] = true
+					}
+					if waitReasons[blockedJob.order] == nil {
+						waitReasons[blockedJob.order] = map[string]bool{}
+					}
+					for _, conflict := range conflicts {
+						waitReasons[blockedJob.order]["resource lock: "+conflict] = true
+					}
+				}
 				break
 			}
 			job := pending[index]
-			resources := resourcesFor(job)
+			_ = owners
 			pending = append(pending[:index], pending[index+1:]...)
 			start(job, resources)
+		}
+		if len(running) >= opts.Parallel {
+			for _, job := range pending {
+				if waitReasons[job.order] == nil {
+					waitReasons[job.order] = map[string]bool{}
+				}
+				waitReasons[job.order]["parallel limit"] = true
+				if blockedBy[job.order] == nil {
+					blockedBy[job.order] = map[int]bool{}
+				}
+				for runningOrder := range running {
+					blockedBy[job.order][runningOrder] = true
+				}
+			}
 		}
 		if len(running) == 0 {
 			// Resources are normalized before scheduling, so this can only
@@ -112,10 +197,52 @@ func scheduleChecks(ctx context.Context, jobs []scheduledCheck, opts RunOptions)
 		case completed := <-done:
 			results[completed.order] = completed.result
 			delete(running, completed.order)
+			job := byOrder[completed.order]
+			meta := metas[completed.order]
+			name := job.spec.Check
+			if job.check != nil {
+				name = job.check.Name
+			}
+			reasons := sortedReasonKeys(meta.reasons)
+			parents := make([]string, 0, len(meta.blockedBy))
+			for _, parent := range meta.blockedBy {
+				parents = append(parents, byOrder[parent].key)
+			}
+			if opts.scheduler != nil {
+				opts.scheduler.record(schedulerEvent{
+					key: job.key, check: checkInstance(job), queuedAt: job.queuedAt,
+					startedAt: completed.startedAt, finishedAt: completed.finishedAt,
+					resources: resourceKeys(meta.resources), waitReason: strings.Join(reasons, "; "),
+					blockedBy: parents, stats: completed.stats,
+				})
+			}
+			if opts.phases != nil {
+				if completed.startedAt.After(job.queuedAt) {
+					opts.phases.appendDetail(PhaseTiming{
+						Name: "check_wait", Check: name, StartedAt: job.queuedAt,
+						Instance:   checkInstance(job),
+						FinishedAt: completed.startedAt,
+						Duration:   completed.startedAt.Sub(job.queuedAt).Round(time.Millisecond).String(),
+						WaitReason: strings.Join(reasons, "; "), Resources: resourceKeys(meta.resources),
+					})
+				}
+				opts.phases.appendDetail(PhaseTiming{
+					Name: "check", Check: name, StartedAt: completed.startedAt,
+					Instance:   checkInstance(job),
+					FinishedAt: completed.finishedAt,
+					Duration:   completed.finishedAt.Sub(completed.startedAt).Round(time.Millisecond).String(),
+					WaitReason: strings.Join(reasons, "; "), Resources: resourceKeys(meta.resources),
+					Cache: completed.stats,
+				})
+			}
 			finished++
 		case <-ctx.Done():
 			for _, job := range pending {
-				results[job.order] = Errored(job.check.Name, ctxErr(ctx))
+				name := job.spec.Check
+				if job.check != nil {
+					name = job.check.Name
+				}
+				results[job.order] = Errored(name, ctxErr(ctx))
 			}
 			for order := range running {
 				if results[order].Check == "" {
@@ -132,32 +259,44 @@ func scheduleChecks(ctx context.Context, jobs []scheduledCheck, opts RunOptions)
 	return results
 }
 
-func firstRunnable(pending []scheduledCheck, running map[int][]ProbeResource) int {
+func firstRunnable(pending []scheduledCheck, running map[int][]ProbeResource) (int, []ProbeResource, []int, []string) {
 	for i, job := range pending {
 		resources := resourcesFor(job)
-		if !conflicts(resources, running) {
-			return i
+		owners, _ := blockingResources(resources, running)
+		if len(owners) == 0 {
+			return i, resources, nil, nil
 		}
 	}
-	return -1
+	return -1, nil, nil, nil
 }
 
-func conflicts(want []ProbeResource, running map[int][]ProbeResource) bool {
+func blockingResources(want []ProbeResource, running map[int][]ProbeResource) ([]int, []string) {
 	if len(want) == 0 {
-		return false
+		return nil, nil
 	}
-	held := map[string]bool{}
-	for _, resources := range running {
-		for _, resource := range resources {
-			held[resource.key()] = true
+	owners := map[int]bool{}
+	conflicts := map[string]bool{}
+	for order, held := range running {
+		for _, candidate := range want {
+			for _, resource := range held {
+				if candidate.key() == resource.key() {
+					owners[order] = true
+					conflicts[strings.ReplaceAll(candidate.key(), "\x00", "/")] = true
+				}
+			}
 		}
 	}
-	for _, resource := range want {
-		if held[resource.key()] {
-			return true
-		}
+	outOwners := make([]int, 0, len(owners))
+	for owner := range owners {
+		outOwners = append(outOwners, owner)
 	}
-	return false
+	sort.Ints(outOwners)
+	outConflicts := make([]string, 0, len(conflicts))
+	for conflict := range conflicts {
+		outConflicts = append(outConflicts, conflict)
+	}
+	sort.Strings(outConflicts)
+	return outOwners, outConflicts
 }
 
 func resourcesFor(job scheduledCheck) []ProbeResource {
@@ -189,49 +328,179 @@ func resourcesFor(job scheduledCheck) []ProbeResource {
 // independent AS grades have different device IDs and do not serialize.
 func inferredProbeResources(name string, env *Env) []ProbeResource {
 	switch name {
-	case "dataplane.internal_reachability", "l2.vlan_isolation", "ospf.ecmp_paths",
-		"tunnel.sixin4", "policy.traffic_engineering", "vpn.site_reachability",
-		"vpn.label_switched", "vpn.isolation", "multicast.delivery", "multicast.no_flooding":
-		return targetProbeResources(env)
+	case "bgp.ibgp_full_mesh", "bgp.ebgp_established":
+		return bgpRefreshResources(name, env)
+	case "dataplane.internal_reachability":
+		return internalReachabilityResources(env)
+	case "l2.vlan_isolation", "ospf.ecmp_paths":
+		// VLAN uses ARP/neighbour-table evidence and ECMP uses ordinary
+		// ping/table lookups; neither attributes a shared counter/capture.
+		return nil
+	case "tunnel.sixin4":
+		return sixIn4Resources(env)
+	case "policy.transit_for_customers":
+		return transitResources(env)
+	case "vpn.site_reachability", "vpn.label_switched", "vpn.isolation":
+		return vpnResources(env)
+	case "multicast.delivery", "multicast.no_flooding":
+		return multicastResources(env)
 	default:
 		return nil
 	}
 }
 
-func targetProbeResources(env *Env) []ProbeResource {
-	if env == nil || env.Topology == nil {
+func bgpRefreshResources(name string, env *Env) []ProbeResource {
+	if env == nil {
 		return nil
 	}
-	seen := map[string]bool{}
-	add := func(device string) {
-		if device != "" {
-			seen[device] = true
-		}
-	}
-	for _, device := range targetDevices(env) {
-		add(device.ID)
-		for _, iface := range device.Ifaces {
-			if iface != nil && iface.Peer != nil && iface.Peer.Device != nil {
-				add(iface.Peer.Device.ID)
+	var out []ProbeResource
+	for _, router := range env.Routers() {
+		switch name {
+		case "bgp.ibgp_full_mesh":
+			for _, other := range env.Routers() {
+				if other == router {
+					continue
+				}
+				if loopback, ok := other.IfaceByName("lo"); ok && loopback.Addr4 != "" {
+					out = append(out, ProbeResource{
+						Kind: ProbeCounter, ID: router.ID + "/bgp-session/" + addrOf(loopback.Addr4),
+					})
+				}
+			}
+		case "bgp.ebgp_established":
+			for _, iface := range router.Ifaces {
+				if iface.Role != model.RoleInterAS && iface.Role != model.RoleIXPLink {
+					continue
+				}
+				out = append(out, ProbeResource{
+					Kind: ProbeCounter, ID: router.ID + "/bgp-interface/" + iface.Name,
+				})
 			}
 		}
-	}
-	var out []ProbeResource
-	for device := range seen {
-		out = append(out,
-			ProbeResource{Kind: ProbeCounter, ID: device},
-			ProbeResource{Kind: ProbeCapture, ID: device},
-		)
 	}
 	return out
 }
 
-func executeScheduledCheck(ctx context.Context, job scheduledCheck, opts RunOptions) Result {
+func internalReachabilityResources(env *Env) []ProbeResource {
+	if env == nil || env.Topology == nil {
+		return nil
+	}
+	var devices []*model.Device
+	for _, device := range targetDevices(env) {
+		if device.Kind == model.KindHost && device.L2Domain == "" {
+			devices = append(devices, device)
+		}
+	}
+	return ipv4TransportResources(devices)
+}
+
+func sixIn4Resources(env *Env) []ProbeResource {
+	if env == nil || env.Topology == nil {
+		return nil
+	}
+	var hosts, gateways []*model.Device
+	for _, device := range targetDevices(env) {
+		if device.Kind == model.KindHost && device.L2Domain != "" {
+			hosts = append(hosts, device)
+		}
+		if device.Kind == model.KindRouter && device.L2Gateway != "" {
+			gateways = append(gateways, device)
+		}
+	}
+	out := counterResources(hosts, "tcp", "udp6")
+	for _, gateway := range gateways {
+		out = append(out, ProbeResource{Kind: ProbeInterface, ID: gateway.ID + "/tunnel"})
+	}
+	return out
+}
+
+func transitResources(env *Env) []ProbeResource {
+	if env == nil || env.Topology == nil {
+		return nil
+	}
+	var out []ProbeResource
+	for _, link := range env.Topology.Links {
+		if link == nil || !link.InterAS || link.A == nil || link.B == nil ||
+			link.A.Device == nil || link.B.Device == nil {
+			continue
+		}
+		for _, side := range []*model.Iface{link.A, link.B} {
+			if side.Device.ASN != env.AS || side.Peer == nil || side.Peer.Device == nil {
+				continue
+			}
+			if link.PeerRelationship(side) == model.RelCustomer {
+				out = append(out,
+					ProbeResource{Kind: ProbeSource, ID: side.Peer.Device.ID},
+					ProbeResource{Kind: ProbeInterface, ID: side.Peer.Device.ID + "/" + side.Peer.Name},
+				)
+			}
+		}
+	}
+	for _, device := range env.Topology.SortedDevices() {
+		if device.Kind == model.KindHost && device.ASN != env.AS && device.L2Domain == "" {
+			out = append(out, ProbeResource{Kind: ProbeCounter, ID: device.ID + "/tcp"})
+		}
+	}
+	return out
+}
+
+func vpnResources(env *Env) []ProbeResource {
+	if env == nil || env.Topology == nil {
+		return nil
+	}
+	var devices []*model.Device
+	for _, device := range targetDevices(env) {
+		if device.Kind == model.KindHost {
+			devices = append(devices, device)
+		}
+	}
+	return counterResources(devices, "tcp", "udp4")
+}
+
+func multicastResources(env *Env) []ProbeResource {
+	if env == nil || env.Topology == nil {
+		return nil
+	}
+	var devices []*model.Device
+	for _, device := range targetDevices(env) {
+		if device.Kind == model.KindHost {
+			devices = append(devices, device)
+		}
+	}
+	return counterResources(devices, "udp4")
+}
+
+func ipv4TransportResources(devices []*model.Device) []ProbeResource {
+	return counterResources(devices, "tcp", "udp4")
+}
+
+func counterResources(devices []*model.Device, counters ...string) []ProbeResource {
+	seen := map[string]bool{}
+	for _, device := range devices {
+		if device != nil && device.ID != "" {
+			seen[device.ID] = true
+		}
+	}
+	var out []ProbeResource
+	for device := range seen {
+		for _, counter := range counters {
+			out = append(out, ProbeResource{Kind: ProbeCounter, ID: device + "/" + counter})
+		}
+	}
+	return out
+}
+
+func executeScheduledCheck(ctx context.Context, job scheduledCheck, opts RunOptions) (
+	Result, time.Time, time.Time, ObservationStats,
+) {
+	startedAt := time.Now().UTC()
 	if job.check == nil {
-		return Errored(job.spec.Check, fmt.Errorf("no such check"))
+		finishedAt := time.Now().UTC()
+		return Errored(job.spec.Check, fmt.Errorf("no such check")), startedAt, finishedAt, ObservationStats{}
 	}
 	cctx, cancel := context.WithTimeout(ctx, opts.CheckTimeout)
 	defer cancel()
+	cctx = withCheckTrace(cctx, job.trace)
 
 	// Each check owns mutable arguments and its infrastructure tracker, while
 	// the snapshot and peer cache remain shared by pointer.
@@ -242,6 +511,7 @@ func executeScheduledCheck(ctx context.Context, job scheduledCheck, opts RunOpti
 	env.Args = job.spec.Args
 	env.infraSeen = &infraTracker{}
 	env.liveState = job.check.LiveObservations
+	env.trace = job.trace
 	res := runCheck(cctx, job.check, &env)
 
 	if fail := env.infraSeen.failure(); fail != nil && res.Status != StatusError {
@@ -253,7 +523,34 @@ func executeScheduledCheck(ctx context.Context, job scheduledCheck, opts RunOpti
 				"to look at rather than a judgement about the submission: %w",
 			opts.CheckTimeout, cctx.Err()))
 	}
-	return res
+	return res, startedAt, time.Now().UTC(), job.trace.snapshot()
+}
+
+func schedulerKey(job scheduledCheck) string {
+	return fmt.Sprintf("%04d:%s", job.order, checkInstance(job))
+}
+
+func checkInstance(job scheduledCheck) string {
+	if job.instance != "" {
+		return job.instance
+	}
+	return checkInstanceFor("", job.spec.Check, job.order)
+}
+
+func checkInstanceFor(questionID, check string, index int) string {
+	if questionID == "" {
+		return fmt.Sprintf("%s[%d]", check, index)
+	}
+	return fmt.Sprintf("%s/%s[%d]", questionID, check, index)
+}
+
+func sortedReasonKeys(reasons map[string]bool) []string {
+	out := make([]string, 0, len(reasons))
+	for reason := range reasons {
+		out = append(out, reason)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // runChecks remains the package-local convenience used by focused tests and
@@ -265,10 +562,12 @@ func runChecks(ctx context.Context, q QuestionSpec, env *Env, opts RunOptions) [
 	for i, spec := range q.Checks {
 		check, ok := Lookup(spec.Check)
 		if !ok {
-			jobs = append(jobs, scheduledCheck{order: i, spec: spec})
+			jobs = append(jobs, scheduledCheck{order: i, spec: spec,
+				instance: checkInstanceFor(q.ID, spec.Check, i)})
 			continue
 		}
-		jobs = append(jobs, scheduledCheck{order: i, check: check, spec: spec, env: env})
+		jobs = append(jobs, scheduledCheck{order: i, check: check, spec: spec, env: env,
+			instance: checkInstanceFor(q.ID, spec.Check, i)})
 	}
 	return scheduleChecks(ctx, jobs, opts)
 }
@@ -293,6 +592,7 @@ func runChecksAcrossQuestions(ctx context.Context, questions []QuestionSpec, ind
 			check, _ := Lookup(spec.Check)
 			jobs = append(jobs, scheduledCheck{
 				order: len(jobs), check: check, spec: spec, env: env,
+				instance: checkInstanceFor(q.ID, spec.Check, checkIndex),
 			})
 			locations = append(locations, location{question: questionIndex, check: checkIndex})
 		}
@@ -307,57 +607,4 @@ func runChecksAcrossQuestions(ctx context.Context, questions []QuestionSpec, ind
 		out[where.question][where.check] = result
 	}
 	return out
-}
-
-// waitSnapshotConvergence runs each declared convergence scope once before a
-// grade's immutable observation boundary. An empty scope means both control
-// planes and subsumes the narrower OSPF/BGP waits.
-func waitSnapshotConvergence(ctx context.Context, questions []QuestionSpec,
-	env *Env, timeout time.Duration,
-) map[string]string {
-	scopes := map[string]bool{}
-	for _, question := range questions {
-		if question.Converge {
-			scopes[question.ConvergeScope] = true
-		}
-	}
-	if scopes[""] {
-		scopes = map[string]bool{"": true}
-	}
-	ordered := make([]string, 0, len(scopes))
-	for scope := range scopes {
-		ordered = append(ordered, scope)
-	}
-	sort.Strings(ordered)
-	notes := map[string]string{}
-	var (
-		mu sync.Mutex
-		wg sync.WaitGroup
-	)
-	for _, scope := range ordered {
-		scope := scope
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			live := *env
-			live.liveState = true
-			if err := waitForScope(ctx, &live, scope, timeout); err != nil {
-				mu.Lock()
-				notes[scope] = err.Error()
-				mu.Unlock()
-			}
-		}()
-	}
-	wg.Wait()
-	return notes
-}
-
-func convergenceNote(question QuestionSpec, notes map[string]string) string {
-	if !question.Converge {
-		return ""
-	}
-	if note := notes[question.ConvergeScope]; note != "" {
-		return note
-	}
-	return notes[""]
 }

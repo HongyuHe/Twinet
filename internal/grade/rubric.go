@@ -278,6 +278,9 @@ type RunOptions struct {
 	ObservationParallel int
 	// Progress receives a line per completed question.
 	Progress func(string)
+
+	phases    *phaseRecorder
+	scheduler *schedulerTrace
 }
 
 // Run grades one submission against a rubric.
@@ -318,105 +321,74 @@ func Run(ctx context.Context, r *Rubric, env *Env, opts RunOptions) *Report {
 		opts.ObservationParallel = minInt(16, maxGradeWorkers(opts.Parallel*2, 4))
 	}
 
-	// Every declared convergence scope is waited once, concurrently, before
-	// passive collection. Capturing before a later per-question wait would
-	// freeze a transient route table and turn a correct, still-converging
-	// submission into a deterministic false deduction.
-	var convergenceByScope map[string]string
-	phases.measure("convergence", func() {
-		convergenceByScope = waitSnapshotConvergence(ctx, r.Questions, env, opts.ConvergeTimeout)
-	})
-
-	// Passive collection happens once after the convergence boundary. The
-	// snapshot is shared by every copy of Env and later frozen into the
-	// report. Dynamic checks opt out through Check.LiveObservations.
-	var snapshot *ObservationSnapshot
-	phases.measure("observation", func() {
-		snapshot = collectObservationSnapshot(ctx, r, env, opts.ObservationParallel)
-	})
+	// Class and batch grading already converge a freshly loaded submission
+	// before invoking Run. A live `grade run` must instead observe now: an
+	// unconditional whole-control-plane wait here previously spent the entire
+	// four-minute budget on a healthy reference whose RIB counters continued
+	// to change. The immutable snapshot is the observation boundary; checks
+	// report what it saw rather than serially waiting behind one another.
+	execs := &execTracker{}
 	runEnv := *env
+	if runEnv.Exec != nil {
+		runEnv.Exec = execs.wrap(runEnv.Exec)
+	}
+	opts.phases = phases
+	opts.scheduler = newSchedulerTrace()
+
+	// Passive collection happens once before active checks. The snapshot is
+	// shared by every copy of Env and later frozen into the report. Dynamic
+	// checks opt out through Check.LiveObservations.
+	var snapshot *ObservationSnapshot
+	observationStarted := time.Now().UTC()
+	snapshot = collectObservationSnapshot(ctx, r, &runEnv, opts.ObservationParallel)
+	observationFinished := time.Now().UTC()
+	phases.appendDetail(PhaseTiming{
+		Name: "observation", StartedAt: observationStarted, FinishedAt: observationFinished,
+		Duration: observationFinished.Sub(observationStarted).Round(time.Millisecond).String(),
+		Cache:    snapshot.Stats,
+	})
 	runEnv.snapshot = snapshot
 	earned := map[string]float64{}
-	completed := make([]bool, len(r.Questions))
 	questions := make([]QuestionResult, len(r.Questions))
-	warnings := make([]string, len(r.Questions))
+	indices := make([]int, len(r.Questions))
+	for i := range r.Questions {
+		indices[i] = i
+	}
+	var resultSets map[int][]Result
+	phases.measure("checks", func() {
+		// Dependency controls scoring and feedback, not whether an otherwise
+		// independent observation may be made. Speculatively executing every
+		// check lets a healthy reference use the wide scheduler; a dependent
+		// question is still rendered skipped below if its prerequisite fails.
+		resultSets = runChecksAcrossQuestions(ctx, r.Questions, indices, &runEnv, opts)
+	})
 
-	for done := 0; done < len(r.Questions); {
-		var ready []int
-		for i, q := range r.Questions {
-			if completed[i] {
-				continue
+	for i, q := range r.Questions {
+		if blocker := unmetDependency(q, earned); blocker != "" {
+			questions[i] = QuestionResult{
+				ID: q.ID, Title: q.Title, Points: q.Points, Status: StatusSkipped,
+				Skipped: fmt.Sprintf("%s scored nothing, so this cannot be assessed", blocker),
 			}
-			if !dependenciesComplete(q, earned) {
-				continue
-			}
-			if blocker := unmetDependency(q, earned); blocker != "" {
-				questions[i] = QuestionResult{
-					ID: q.ID, Title: q.Title, Points: q.Points, Status: StatusSkipped,
-					Skipped: fmt.Sprintf("%s scored nothing, so this cannot be assessed", blocker),
-				}
-				completed[i] = true
-				earned[q.ID] = 0
-				done++
-				continue
-			}
-			ready = append(ready, i)
+			earned[q.ID] = 0
+			continue
 		}
-		if done == len(r.Questions) {
-			break
-		}
-		if len(ready) == 0 {
-			// Validate forbids dependency cycles, so this only happens after
-			// context cancellation. Preserve the ungraded distinction rather
-			// than manufacturing a zero.
-			if err := ctxErr(ctx); err != nil {
-				rep.Err = err.Error()
-				break
-			}
-			rep.Err = "grading dependency scheduler made no progress"
+		qr := questionResult(q, resultSets[i])
+		if qr.NeedsReview {
 			rep.NeedsReview = true
-			break
 		}
-
-		var resultSets map[int][]Result
-		phases.measure("checks", func() {
-			resultSets = runChecksAcrossQuestions(ctx, r.Questions, ready, &runEnv, opts)
-		})
-		for _, i := range ready {
-			q := r.Questions[i]
-			qr := questionResult(q, resultSets[i])
-			if note := convergenceNote(q, convergenceByScope); note != "" {
-				warnings[i] = fmt.Sprintf("the network had not settled before %s: %s", q.ID, note)
-				if qr.Note == "" {
-					qr.Note = "the control plane had not converged when this was assessed, " +
-						"which is usually the submission's own doing"
-				} else {
-					qr.Note += "; the control plane had not converged when this was assessed"
-				}
-			}
-			if qr.NeedsReview {
-				rep.NeedsReview = true
-			}
-			questions[i] = qr
-			completed[i] = true
-			earned[q.ID] = qr.Awarded
-			done++
-		}
-		if err := ctxErr(ctx); err != nil {
-			rep.Err = err.Error()
-			break
-		}
+		questions[i] = qr
+		earned[q.ID] = qr.Awarded
+	}
+	if err := ctxErr(ctx); err != nil {
+		rep.Err = err.Error()
 	}
 
-	for i, q := range questions {
+	for _, q := range questions {
 		if q.ID == "" {
 			continue
 		}
 		rep.Questions = append(rep.Questions, q)
 		rep.Total += q.Awarded
-		if warnings[i] != "" {
-			rep.Warnings = append(rep.Warnings, warnings[i])
-		}
 		if opts.Progress != nil {
 			opts.Progress(fmt.Sprintf("%s %s %.2f/%.2f", q.ID, q.Status, q.Awarded, q.Points))
 		}
@@ -424,6 +396,19 @@ func Run(ctx context.Context, r *Rubric, env *Env, opts RunOptions) *Report {
 	if snapshot != nil {
 		snapshot.Freeze()
 		rep.Observation = snapshot
+	}
+	rep.ExecCalls = execs.count()
+	rep.UncachedExecLowerBound = rep.ExecCalls
+	if snapshot != nil {
+		rep.UncachedExecLowerBound += snapshot.Stats.Hits
+	}
+	rep.SchedulerCriticalPath = opts.scheduler.criticalPath()
+	if rep.SchedulerCriticalPath.Duration != "" {
+		phases.appendDetail(PhaseTiming{
+			Name: "scheduler_critical_path", StartedAt: rep.SchedulerCriticalPath.StartedAt,
+			FinishedAt: rep.SchedulerCriticalPath.FinishedAt, Duration: rep.SchedulerCriticalPath.Duration,
+			WaitReason: strings.Join(rep.SchedulerCriticalPath.Checks, " -> "),
+		})
 	}
 	rep.Duration = time.Since(start).Round(time.Millisecond).String()
 	phases.append("grade", start, time.Now())
@@ -438,15 +423,6 @@ func unmetDependency(q QuestionSpec, earned map[string]float64) string {
 		}
 	}
 	return ""
-}
-
-func dependenciesComplete(q QuestionSpec, earned map[string]float64) bool {
-	for _, dep := range q.DependsOn {
-		if _, ok := earned[dep]; !ok {
-			return false
-		}
-	}
-	return true
 }
 
 // questionResult applies the pre-existing grading and quarantine rules after a

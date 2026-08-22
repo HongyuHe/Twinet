@@ -195,14 +195,31 @@ type Report struct {
 	// and benchmark regression detection. It is ordered by phase start/name,
 	// not by goroutine completion order.
 	PhaseTimings []PhaseTiming `json:"phase_timings,omitempty"`
+	// SchedulerCriticalPath identifies the observed serialized chain in the
+	// check scheduler, including actual resource-lock predecessors.
+	SchedulerCriticalPath SchedulerCriticalPath `json:"scheduler_critical_path,omitempty"`
+	// ExecCalls is every raw runtime command issued for this grade. It makes
+	// snapshot/cache regressions visible in the report rather than only in a
+	// controller trace.
+	ExecCalls int `json:"exec_calls,omitempty"`
+	// UncachedExecLowerBound is actual calls plus one avoided command for
+	// every snapshot hit. State hits often replace several provider commands,
+	// so this is deliberately a lower bound rather than an invented exact
+	// counterfactual.
+	UncachedExecLowerBound int `json:"uncached_exec_lower_bound,omitempty"`
 }
 
 // PhaseTiming records a bounded phase of one grade.
 type PhaseTiming struct {
-	Name       string    `json:"name"`
-	StartedAt  time.Time `json:"started_at"`
-	FinishedAt time.Time `json:"finished_at"`
-	Duration   string    `json:"duration"`
+	Name       string           `json:"name"`
+	Check      string           `json:"check,omitempty"`
+	Instance   string           `json:"instance,omitempty"`
+	StartedAt  time.Time        `json:"started_at"`
+	FinishedAt time.Time        `json:"finished_at"`
+	Duration   string           `json:"duration"`
+	WaitReason string           `json:"wait_reason,omitempty"`
+	Resources  []string         `json:"resources,omitempty"`
+	Cache      ObservationStats `json:"observation_cache,omitempty"`
 }
 
 // Percent returns the score as a percentage.

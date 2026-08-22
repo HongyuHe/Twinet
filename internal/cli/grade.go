@@ -258,7 +258,7 @@ reference, and holds the nodes off from repairing anything while it does.`,
 	cmd.Flags().IntSliceVar(&asList, "as", nil, "AS numbers to grade (default: every student AS)")
 	cmd.Flags().StringVarP(&outDir, "out", "o", "", "directory for reports")
 	cmd.Flags().IntVarP(&parallel, "parallel", "p", 8, "submissions graded concurrently")
-	cmd.Flags().IntVar(&checkParallel, "check-parallel", 16,
+	cmd.Flags().IntVar(&checkParallel, "check-parallel", 32,
 		"maximum non-conflicting checks and passive observations per submission")
 	// Four minutes, not ninety seconds.
 	//

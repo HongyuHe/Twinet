@@ -28,11 +28,13 @@ state, OSPF/BGP/RPKI facts, OVS inventory, and directly relevant service state.
 Identical passive reads are deduplicated; unavailable state remains an
 infrastructure error. Active delivery probes are never cached.
 
-The runner schedules dependency-ready questions and checks concurrently. It
-serializes only declared shared probe counters, captures, ports, interfaces, or
-endpoints, preserving counter attribution and deterministic report order.
+The runner speculatively schedules all questions and checks concurrently;
+dependencies still control scoring and skipped feedback. It serializes only
+declared shared probe counters, captures, ports, interfaces, or endpoints,
+preserving counter attribution and deterministic report order.
 Reports include machine-readable `phase_timings` and `observation_snapshot`
-records. `grade run --check-parallel` controls its per-submission bound.
+records, per-check cache/exec accounting, lock waits, and a scheduler critical
+path. `grade run --check-parallel` controls its per-submission bound.
 
 The compact `harness.Options.Synthetic` substrate keeps the target AS and IXPs
 intact while collapsing each other retained AS to one deterministic

@@ -32,6 +32,12 @@ func (r *phaseRecorder) append(name string, start, end time.Time) {
 	r.mu.Unlock()
 }
 
+func (r *phaseRecorder) appendDetail(phase PhaseTiming) {
+	r.mu.Lock()
+	r.phases = append(r.phases, phase)
+	r.mu.Unlock()
+}
+
 func (r *phaseRecorder) list() []PhaseTiming {
 	r.mu.Lock()
 	defer r.mu.Unlock()

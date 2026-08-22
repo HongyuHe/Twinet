@@ -49,6 +49,10 @@ type Env struct {
 	// liveState is set for checks that deliberately compare state before and
 	// after an active control-plane action (for example a BGP refresh).
 	liveState bool
+	// trace belongs to one scheduled check. It is carried through contexts so
+	// cache hits/misses and raw execs can be attributed without serializing
+	// unrelated checks.
+	trace *checkTrace
 }
 
 // DeviceState reads vendor-neutral operational state from a named device.
@@ -56,6 +60,7 @@ type Env struct {
 // translated into an empty FRR table or a student deduction.
 func (e *Env) DeviceState(ctx context.Context, deviceID string, query netstate.Query) (netstate.State, error) {
 	if e.snapshot != nil && !e.liveState {
+		ctx = withCheckTrace(ctx, e.trace)
 		state, err := e.snapshot.state(ctx, deviceID, query, func(ctx context.Context) (netstate.State, error) {
 			return e.readDeviceState(ctx, deviceID, query)
 		})
@@ -186,7 +191,7 @@ func (e *Env) Vtysh(ctx context.Context, device, command string) (string, error)
 		err error
 	)
 	if e.snapshot != nil && !e.liveState && snapshotReadOnlyCommand(cmd) {
-		res, err = e.snapshot.command(ctx, "vtysh", deviceID, cmd)
+		res, err = e.snapshot.command(withCheckTrace(ctx, e.trace), "vtysh", deviceID, cmd)
 	} else {
 		res, err = e.Exec(ctx, deviceID, cmd)
 	}
@@ -233,7 +238,7 @@ func (e *Env) Probe(ctx context.Context, deviceID string, cmd []string) (rt.Exec
 		err error
 	)
 	if e.snapshot != nil && !e.liveState && snapshotReadOnlyCommand(cmd) {
-		res, err = e.snapshot.command(ctx, "exec", deviceID, cmd)
+		res, err = e.snapshot.command(withCheckTrace(ctx, e.trace), "exec", deviceID, cmd)
 	} else {
 		res, err = e.Exec(ctx, deviceID, cmd)
 	}
@@ -250,7 +255,7 @@ func (e *Env) Probe(ctx context.Context, deviceID string, cmd []string) (rt.Exec
 // an identical observation across checks.
 func (e *Env) Observe(ctx context.Context, deviceID string, cmd []string) (rt.ExecResult, error) {
 	if e.snapshot != nil && !e.liveState {
-		return e.snapshot.command(ctx, "exec", deviceID, cmd)
+		return e.snapshot.command(withCheckTrace(ctx, e.trace), "exec", deviceID, cmd)
 	}
 	return e.Exec(ctx, deviceID, cmd)
 }
@@ -445,8 +450,13 @@ func Register(c *Check) {
 	}
 	if c.Resources == nil {
 		name := c.Name
-		c.Resources = func(env *Env, _ map[string]any) []ProbeResource {
-			return inferredProbeResources(name, env)
+		c.Resources = func(env *Env, args map[string]any) []ProbeResource {
+			if env == nil {
+				return inferredProbeResources(name, nil)
+			}
+			copy := *env
+			copy.Args = args
+			return inferredProbeResources(name, &copy)
 		}
 	}
 	if _, dup := registry[c.Name]; dup {

@@ -103,6 +103,20 @@ func TestGradeSnapshotDeduplicatesStateAndReadOnlyExec(t *testing.T) {
 	if len(report.PhaseTimings) == 0 {
 		t.Fatal("report has no machine-readable phase timings")
 	}
+	if report.Observation.Stats.Hits == 0 || report.Observation.Stats.Misses == 0 ||
+		report.ExecCalls != 1 || report.UncachedExecLowerBound <= report.ExecCalls {
+		t.Fatalf("snapshot/exec accounting = stats=%#v execs=%d uncached=%d",
+			report.Observation.Stats, report.ExecCalls, report.UncachedExecLowerBound)
+	}
+	var traced bool
+	for _, phase := range report.PhaseTimings {
+		if phase.Name == "check" && phase.Check == execCheck && phase.Cache.Hits > 0 {
+			traced = true
+		}
+	}
+	if !traced || report.SchedulerCriticalPath.Duration == "" {
+		t.Fatalf("missing per-check trace or critical path: %#v", report)
+	}
 }
 
 func TestSnapshotProviderErrorIsInfrastructureError(t *testing.T) {
@@ -260,5 +274,69 @@ func TestIndependentQuestionsRunConcurrentlyInRubricOrder(t *testing.T) {
 	if report.Total != 2 || len(report.Questions) != 2 ||
 		report.Questions[0].ID != "first" || report.Questions[1].ID != "second" {
 		t.Fatalf("independent question run changed deterministic report order: %#v", report)
+	}
+}
+
+func TestDependentQuestionsExecuteSpeculativelyButScoreInOrder(t *testing.T) {
+	const (
+		first  = "test.scheduler_dependency_first"
+		second = "test.scheduler_dependency_second"
+	)
+	var started atomic.Int64
+	barrier := make(chan struct{})
+	waitBoth := func(ctx context.Context) Result {
+		if started.Add(1) == 2 {
+			close(barrier)
+		}
+		select {
+		case <-barrier:
+			return Pass("unused", Evidence{})
+		case <-ctx.Done():
+			return Errored("unused", ctx.Err())
+		}
+	}
+	registerTestCheck(first, func(ctx context.Context, _ *Env) Result {
+		result := waitBoth(ctx)
+		result.Check = first
+		return result
+	}, nil)
+	registerTestCheck(second, func(ctx context.Context, _ *Env) Result {
+		result := waitBoth(ctx)
+		result.Check = second
+		return result
+	}, nil)
+	report := Run(context.Background(), &Rubric{
+		Metadata: RubricMeta{Name: "speculative-dependencies"},
+		Questions: []QuestionSpec{
+			{ID: "first", Title: "first", Points: 1, Checks: []CheckSpec{{Check: first}}},
+			{ID: "second", Title: "second", Points: 1, DependsOn: []string{"first"},
+				Checks: []CheckSpec{{Check: second}}},
+		},
+	}, &Env{
+		Topology: observationTestTopology(), AS: 3, StateReader: &countingStateReader{},
+		Exec: func(context.Context, string, []string) (rt.ExecResult, error) { return rt.ExecResult{}, nil },
+	}, RunOptions{Parallel: 2, CheckTimeout: time.Second})
+	if report.Total != 2 || report.Questions[0].ID != "first" || report.Questions[1].ID != "second" {
+		t.Fatalf("dependency execution changed deterministic scoring: %#v", report)
+	}
+}
+
+func TestLiveRunDoesNotSpendConvergenceBudgetBeforeSnapshot(t *testing.T) {
+	const checkName = "test.snapshot_without_wait"
+	registerTestCheck(checkName, func(context.Context, *Env) Result {
+		return Pass(checkName, Evidence{})
+	}, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	report := Run(ctx, &Rubric{
+		Metadata: RubricMeta{Name: "no-global-convergence-wait"},
+		Questions: []QuestionSpec{{ID: "q", Title: "q", Points: 1, Converge: true,
+			ConvergeScope: "ospf", Checks: []CheckSpec{{Check: checkName}}}},
+	}, &Env{
+		Topology: observationTestTopology(), AS: 3, StateReader: &countingStateReader{},
+		Exec: func(context.Context, string, []string) (rt.ExecResult, error) { return rt.ExecResult{}, nil },
+	}, RunOptions{ConvergeTimeout: time.Minute})
+	if report.Err != "" || report.Total != 1 {
+		t.Fatalf("healthy live snapshot was delayed behind convergence: %#v", report)
 	}
 }

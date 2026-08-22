@@ -25,6 +25,7 @@ type ObservationSnapshot struct {
 	States      []StateObservation   `json:"states,omitempty"`
 	Commands    []CommandObservation `json:"commands,omitempty"`
 	Errors      []ObservationError   `json:"errors,omitempty"`
+	Stats       ObservationStats     `json:"stats"`
 	Frozen      bool                 `json:"frozen"`
 
 	exec rtExecFunc
@@ -134,6 +135,7 @@ func (s *ObservationSnapshot) state(ctx context.Context, device string, query ne
 	for {
 		s.mu.Lock()
 		if value, ok := s.coveringStateLocked(key); ok {
+			s.recordCacheLocked(ctx, true, false)
 			s.mu.Unlock()
 			return cloneNetstate(value.state), value.err
 		}
@@ -143,6 +145,7 @@ func (s *ObservationSnapshot) state(ctx context.Context, device string, query ne
 				"immutable observation snapshot has no %s state for %s", query.String(), device)
 		}
 		if flight := s.stateRun[key]; flight != nil {
+			s.recordCacheLocked(ctx, true, true)
 			done := flight.done
 			s.mu.Unlock()
 			select {
@@ -153,6 +156,7 @@ func (s *ObservationSnapshot) state(ctx context.Context, device string, query ne
 			}
 		}
 		flight := &observationStateFlight{done: make(chan struct{})}
+		s.recordCacheLocked(ctx, false, false)
 		s.stateRun[key] = flight
 		s.mu.Unlock()
 
@@ -211,6 +215,7 @@ func (s *ObservationSnapshot) command(ctx context.Context, source, device string
 	for {
 		s.mu.Lock()
 		if value, ok := s.commands[key]; ok {
+			s.recordCacheLocked(ctx, true, false)
 			s.mu.Unlock()
 			return value.result, value.err
 		}
@@ -220,6 +225,7 @@ func (s *ObservationSnapshot) command(ctx context.Context, source, device string
 				"immutable observation snapshot has no command %q on %s", strings.Join(command, " "), device)
 		}
 		if flight := s.cmdRun[key]; flight != nil {
+			s.recordCacheLocked(ctx, true, true)
 			done := flight.done
 			s.mu.Unlock()
 			select {
@@ -230,6 +236,7 @@ func (s *ObservationSnapshot) command(ctx context.Context, source, device string
 			}
 		}
 		flight := &observationCommandFlight{done: make(chan struct{})}
+		s.recordCacheLocked(ctx, false, false)
 		s.cmdRun[key] = flight
 		s.mu.Unlock()
 
@@ -246,13 +253,29 @@ func (s *ObservationSnapshot) command(ctx context.Context, source, device string
 		}
 
 		s.mu.Lock()
+		s.Stats.ExecCalls++
 		delete(s.cmdRun, key)
 		if !isObservationCancellation(err) {
 			s.commands[key] = entry
 		}
+
 		close(flight.done)
 		s.mu.Unlock()
 		return result, err
+	}
+}
+
+func (s *ObservationSnapshot) recordCacheLocked(ctx context.Context, hit, coalesced bool) {
+	if hit {
+		s.Stats.Hits++
+	} else {
+		s.Stats.Misses++
+	}
+	if coalesced {
+		s.Stats.Coalesced++
+	}
+	if trace := traceFromContext(ctx); trace != nil {
+		trace.cache(hit, coalesced)
 	}
 }
 
