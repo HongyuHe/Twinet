@@ -312,6 +312,30 @@ func cleanRunningConfig(out string) string {
 	return strings.TrimRight(strings.Join(lines[start:], "\n"), "\n")
 }
 
+// cleanRestoredFRRConfig removes kernel-forwarding directives from a captured
+// running configuration. They are platform runtime policy, already restored
+// by the persisted OCI sysctl contract; replaying the legacy `no ipv6
+// forwarding` line through current FRR's mgmtd can fail even though the
+// desired runtime is healthy. Student routing state remains intact.
+func cleanRestoredFRRConfig(out string) string {
+	lines := strings.Split(cleanRunningConfig(out), "\n")
+	filtered := lines[:0]
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case trimmed == "ipv6 forwarding", trimmed == "no ipv6 forwarding",
+			strings.HasPrefix(trimmed, "hostname "),
+			strings.HasPrefix(trimmed, "frr version "),
+			strings.HasPrefix(trimmed, "frr defaults "),
+			trimmed == "service integrated-vtysh-config",
+			trimmed == "end":
+			continue
+		}
+		filtered = append(filtered, line)
+	}
+	return strings.TrimRight(strings.Join(filtered, "\n"), "\n")
+}
+
 // Restore replays a device's captured configuration into a fresh container.
 func Restore(ctx context.Context, r rt.Runtime, d *model.Device, lab string, store *state.Store) (bool, error) {
 	if store == nil {
@@ -403,7 +427,7 @@ func Restore(ctx context.Context, r rt.Runtime, d *model.Device, lab string, sto
 			// way out. Snapshots outlive the code that wrote them, and a
 			// snapshot taken by an older build must still restore rather than
 			// permanently fail every future deployment of that device.
-			body := []byte(cleanRunningConfig(string(snap.Content)) + "\n")
+			body := []byte(cleanRestoredFRRConfig(string(snap.Content)) + "\n")
 			if err := r.CopyTo(ctx, d.Container, "/etc/twinet/restore.conf", 0o600, body); err != nil {
 				return false, fmt.Errorf("copy saved configuration into %s: %w", d.ID, err)
 			}

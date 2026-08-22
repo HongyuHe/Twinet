@@ -3,12 +3,14 @@ package agent
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/HongyuHe/twinet/internal/deploy"
@@ -28,6 +30,9 @@ type RecoveryRequest struct {
 	Lab      string `json:"lab"`
 	Fence    Fence  `json:"fence"`
 	Strategy string `json:"strategy,omitempty"`
+	// Takeover permits a newly fenced operator to replace a recovery whose
+	// persisted phase deadline has expired. It never steals healthy progress.
+	Takeover bool `json:"takeover,omitempty"`
 }
 
 // RecoveryResponse reports the verified state after a recovery attempt.
@@ -54,8 +59,61 @@ type transactionRuntimeSpec struct {
 	Artifacts []transactionArtifact `json:"artifacts,omitempty"`
 }
 
-const recoveryRetryEvery = 5 * time.Second
-const recoveryRetryBackoff = 30 * time.Second
+const (
+	recoveryRetryEvery             = 5 * time.Second
+	recoveryRetryBackoff           = 30 * time.Second
+	defaultRecoveryPhaseTimeout    = 90 * time.Second
+	defaultRecoveryArtifactTimeout = 4 * time.Minute
+	// Exact rollback restores primary contracts, sidecars, artifacts,
+	// readiness, and student snapshots one fenced target at a time. A
+	// class-scale node legitimately needs longer than a single controller
+	// lease, while every target remains independently deadline-bounded and
+	// visible to a joining operator.
+	defaultRecoveryTotalTimeout = 30 * time.Minute
+	defaultRecoveryLeaseTTL     = 90 * time.Second
+	recoveryLeaseRenewEvery     = 15 * time.Second
+	recoveryStatusObserveLimit  = 2 * time.Second
+)
+
+type recoveryRunOptions struct {
+	takeover  bool
+	automatic bool
+}
+
+func (s *Server) recoveryPhaseLimit() time.Duration {
+	if s.recoveryPhaseTimeout > 0 {
+		return s.recoveryPhaseTimeout
+	}
+	return defaultRecoveryPhaseTimeout
+}
+
+func (s *Server) recoveryTotalLimit() time.Duration {
+	if s.recoveryTotalTimeout > 0 {
+		return s.recoveryTotalTimeout
+	}
+	return defaultRecoveryTotalTimeout
+}
+
+func (s *Server) recoveryLeaseLimit() time.Duration {
+	if s.recoveryLeaseTTL > 0 {
+		return s.recoveryLeaseTTL
+	}
+	return defaultRecoveryLeaseTTL
+}
+
+func (s *Server) recoveryStatusLimit() time.Duration {
+	if s.recoveryStatusTimeout > 0 {
+		return s.recoveryStatusTimeout
+	}
+	return recoveryStatusObserveLimit
+}
+
+func (s *Server) recoveryArtifactLimit() time.Duration {
+	if s.recoveryPhaseTimeout > 0 {
+		return s.recoveryPhaseTimeout
+	}
+	return defaultRecoveryArtifactTimeout
+}
 
 func recoveredMode(tx applyTransaction, wire Wire) (render.Mode, int) {
 	if tx.PreviousMode != "" || tx.PreviousUngraded != 0 {
@@ -95,6 +153,13 @@ func (s *Server) resumeRecoveries(ctx context.Context) {
 		if tx.Committed {
 			continue
 		}
+		if tx.Phase == transactionRecovering && s.ops[lab] != nil {
+			// The in-memory operation record is proof that this process still
+			// owns a live runner. A persisted recovering phase without that
+			// record means the agent restarted; reclaim it immediately under
+			// a fresh fence instead of waiting for a now-dead phase deadline.
+			continue
+		}
 		if lease := s.mutations[lab]; lease != nil && s.nowTime().Before(lease.until) {
 			continue
 		}
@@ -106,16 +171,30 @@ func (s *Server) resumeRecoveries(ctx context.Context) {
 	s.mu.Unlock()
 	sort.Strings(labs)
 	for _, lab := range labs {
-		fence, err := s.acquireRecoveryFence(lab)
-		if err != nil {
-			continue
+		lab := lab
+		go s.runAutomaticRecovery(ctx, lab)
+	}
+}
+
+func (s *Server) runAutomaticRecovery(ctx context.Context, lab string) {
+	fence, err := s.acquireRecoveryFence(lab)
+	if err != nil {
+		return
+	}
+	defer func() {
+		if err := s.releaseMutationLease(LeaseReleaseRequest{Lab: lab, Fence: fence}); err != nil {
+			slog.Debug("releasing automatic recovery lease", "lab", lab, "err", err)
 		}
-		_, err = s.recoverTransaction(ctx, lab, fence)
-		if err != nil {
-			slog.Warn("automatic transaction recovery failed; will retry",
-				"lab", lab, "err", err)
-		}
-		_ = s.releaseMutationLease(LeaseReleaseRequest{Lab: lab, Fence: fence})
+	}()
+
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stopRenew := s.keepRecoveryFence(runCtx, lab, fence)
+	defer stopRenew()
+	if _, err := s.recoverTransactionStrategyOptions(runCtx, lab, fence, "rollback",
+		recoveryRunOptions{takeover: true, automatic: true}); err != nil {
+		slog.Warn("automatic transaction recovery failed; will retry",
+			"lab", lab, "err", err)
 	}
 }
 
@@ -139,17 +218,217 @@ func (s *Server) acquireRecoveryFence(lab string) (Fence, error) {
 	fence := Fence{Token: token, Generation: s.fenceHighWater[lab] + 1}
 	s.fenceHighWater[lab] = fence.Generation
 	s.mutations[lab] = &clusterLease{
-		// Recovery can replay a full class topology and wait for daemon
-		// readiness. Give the internal fenced owner the documented maximum;
-		// expiring half way through would turn a safe rollback into a second
-		// partial mutation.
-		holder: "agent recovery", fence: fence, until: now.Add(leaseTTL(maxMutationLeaseSeconds)),
+		holder: "agent recovery", fence: fence, until: now.Add(s.recoveryLeaseLimit()),
 	}
 	if err := s.saveCoordinationLocked(); err != nil {
 		delete(s.mutations, lab)
 		return Fence{}, err
 	}
 	return fence, nil
+}
+
+// keepRecoveryFence renews only while the persisted phase deadline is still
+// healthy. A stuck runtime call therefore loses its fence shortly after the
+// deadline rather than monopolising recovery for the maximum controller TTL.
+func (s *Server) keepRecoveryFence(ctx context.Context, lab string, fence Fence) func() {
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(recoveryLeaseRenewEvery)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-stop:
+				return
+			case <-ticker.C:
+			}
+			s.mu.Lock()
+			tx, ok := s.transactions[lab]
+			now := s.nowTime()
+			expired := ok && !tx.RecoveryDeadline.IsZero() && !now.Before(tx.RecoveryDeadline)
+			s.mu.Unlock()
+			if expired {
+				return
+			}
+			seconds := int(s.recoveryLeaseLimit().Round(time.Second).Seconds())
+			if _, err := s.renewMutationLease(LeaseRenewRequest{
+				Lab: lab, Fence: fence, TTLSeconds: seconds,
+			}); err != nil {
+				return
+			}
+		}
+	}()
+	return func() {
+		close(stop)
+		<-done
+	}
+}
+
+func (s *Server) recoveryOwner(lab string, fence Fence) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if lease := s.mutations[lab]; lease != nil && lease.fence.Generation == fence.Generation &&
+		subtle.ConstantTimeCompare([]byte(lease.fence.Token), []byte(fence.Token)) == 1 {
+		return lease.holder
+	}
+	return "recovery"
+}
+
+func (s *Server) beginRecovery(lab string, fence Fence, generation, strategy string,
+	totalDeadline time.Time, options recoveryRunOptions,
+) (applyTransaction, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initCoordination()
+	now := s.nowTime()
+	if err := s.fenceErrorLocked(lab, fence, now); err != nil {
+		return applyTransaction{}, err
+	}
+	tx, ok := s.transactions[lab]
+	if !ok || tx.Generation != generation {
+		return applyTransaction{}, fmt.Errorf("generation %q of lab %q has no recovery transaction", generation, lab)
+	}
+	active := tx.Phase == transactionRecovering && !tx.RecoveryDeadline.IsZero() &&
+		now.Before(tx.RecoveryDeadline)
+	if active {
+		if tx.RecoveryStrategy != "" && tx.RecoveryStrategy != strategy {
+			return applyTransaction{}, fmt.Errorf("recovery for lab %q is already running strategy %q", lab, tx.RecoveryStrategy)
+		}
+		if !options.takeover {
+			return applyTransaction{}, fmt.Errorf("recovery for lab %q is already making progress as %q", lab, strategy)
+		}
+	}
+	if tx.Phase == transactionRecovering && !options.takeover {
+		return applyTransaction{}, fmt.Errorf("recovery for lab %q exceeded its deadline; retry with takeover", lab)
+	}
+	tx.Phase = transactionRecovering
+	tx.Failure = ""
+	tx.RecoveryAttempts++
+	tx.LastRecovery = now
+	tx.NextRecovery = time.Time{}
+	tx.RecoveryOwner = s.recoveryOwnerLocked(lab, fence)
+	tx.RecoveryStrategy = strategy
+	tx.RecoveryStarted = now
+	tx.RecoveryProgress = now
+	tx.RecoveryDeadline = now.Add(s.recoveryPhaseLimit())
+	tx.RecoveryTotal = totalDeadline
+	tx.RecoveryTarget = "starting recovery"
+	s.transactions[lab] = tx
+	if err := s.saveCoordinationLocked(); err != nil {
+		return applyTransaction{}, err
+	}
+	return tx, nil
+}
+
+func (s *Server) recoveryOwnerLocked(lab string, fence Fence) string {
+	if lease := s.mutations[lab]; lease != nil && lease.fence.Generation == fence.Generation &&
+		subtle.ConstantTimeCompare([]byte(lease.fence.Token), []byte(fence.Token)) == 1 {
+		return lease.holder
+	}
+	return "recovery"
+}
+
+func (s *Server) updateRecoveryProgress(lab string, fence Fence, generation, target string,
+	deadline time.Time,
+) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initCoordination()
+	if err := s.fenceErrorLocked(lab, fence, s.nowTime()); err != nil {
+		return err
+	}
+	tx, ok := s.transactions[lab]
+	if !ok || tx.Generation != generation {
+		return fmt.Errorf("generation %q of lab %q has no recovery transaction", generation, lab)
+	}
+	tx.RecoveryTarget = target
+	tx.RecoveryProgress = s.nowTime()
+	tx.RecoveryDeadline = deadline
+	s.transactions[lab] = tx
+	if err := s.saveCoordinationLocked(); err != nil {
+		return err
+	}
+	slog.Info("recovery phase progress", "lab", lab, "generation", generation,
+		"action_target", target, "deadline", deadline)
+	return nil
+}
+
+func (s *Server) runRecoveryPhase(ctx context.Context, lab string, fence Fence,
+	generation, action, target string, fn func(context.Context) error,
+) error {
+	return s.runRecoveryPhaseLimit(ctx, lab, fence, generation, action, target,
+		s.recoveryPhaseLimit(), fn)
+}
+
+func (s *Server) runRecoveryPhaseLimit(ctx context.Context, lab string, fence Fence,
+	generation, action, target string, limit time.Duration, fn func(context.Context) error,
+) error {
+	phaseCtx, cancel := context.WithTimeout(ctx, limit)
+	defer cancel()
+	deadline := s.nowTime().Add(limit)
+	if err := s.updateRecoveryProgress(lab, fence, generation, action+": "+target, deadline); err != nil {
+		return err
+	}
+	if err := fn(phaseCtx); err != nil {
+		if phaseCtx.Err() != nil {
+			return fmt.Errorf("%s %s: %w", action, target, phaseCtx.Err())
+		}
+		return fmt.Errorf("%s %s: %w", action, target, err)
+	}
+	s.mu.Lock()
+	tx, active := s.transactions[lab]
+	s.mu.Unlock()
+	if !active || tx.Generation != generation {
+		// A successful commit/finalize removes the transaction atomically.
+		// An old cancelled runner may also observe a newer takeover here; in
+		// both cases it must not overwrite the newer persisted progress.
+		return nil
+	}
+	return s.updateRecoveryProgress(lab, fence, generation, "completed "+action+": "+target, deadline)
+}
+
+// runRecoveryLongPhase is for a composite exact rollback. Each device inside
+// it is still run through runRecoveryPhase, so one blocked container/exec has
+// a bounded deadline; the aggregate may legitimately span more than one
+// device deadline on a class-sized node.
+func (s *Server) runRecoveryLongPhase(ctx context.Context, lab string, fence Fence,
+	generation, action, target string, fn func(context.Context) error,
+) error {
+	s.mu.Lock()
+	tx, ok := s.transactions[lab]
+	s.mu.Unlock()
+	deadline := tx.RecoveryTotal
+	if !ok || deadline.IsZero() {
+		deadline = s.nowTime().Add(s.recoveryTotalLimit())
+	}
+	if err := s.updateRecoveryProgress(lab, fence, generation, action+": "+target, deadline); err != nil {
+		return err
+	}
+	if err := fn(ctx); err != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("%s %s: %w", action, target, ctx.Err())
+		}
+		return fmt.Errorf("%s %s: %w", action, target, err)
+	}
+	s.mu.Lock()
+	current, active := s.transactions[lab]
+	s.mu.Unlock()
+	if !active || current.Generation != generation {
+		return nil
+	}
+	return s.updateRecoveryProgress(lab, fence, generation, "completed "+action+": "+target, deadline)
+}
+
+func (s *Server) failRecovery(lab string, fence Fence, generation string, err error) {
+	if err == nil {
+		return
+	}
+	if markErr := s.markTransactionPhase(lab, fence, generation, transactionRollbackFailed, err.Error()); markErr != nil {
+		slog.Warn("persisting recovery failure", "lab", lab, "err", markErr, "failure", err)
+	}
 }
 
 func (s *Server) transactionFail(phase string) error {
@@ -514,6 +793,12 @@ func (s *Server) markTransactionPhase(lab string, fence Fence, generation string
 		// Leave a deterministic fenced window for an explicit operator
 		// --strategy forward request before automatic rollback retries.
 		tx.NextRecovery = s.nowTime().Add(recoveryRetryBackoff)
+		tx.RecoveryProgress = s.nowTime()
+		tx.RecoveryTarget = "failed"
+	}
+	if phase == transactionCommitted {
+		tx.RecoveryProgress = s.nowTime()
+		tx.RecoveryTarget = "committed"
 	}
 	s.transactions[lab] = tx
 	return s.saveCoordinationLocked()
@@ -524,6 +809,13 @@ func (s *Server) transactionInventoryStatus(ctx context.Context, lab string) Rec
 	s.initCoordination()
 	tx, hasTx := s.transactions[lab]
 	committed, hasCommitted := s.inventories[lab]
+	committedGeneration := s.generations[lab].Committed
+	leaseOwner := ""
+	leaseUntil := time.Time{}
+	if lease := s.mutations[lab]; lease != nil {
+		leaseOwner, leaseUntil = lease.holder, lease.until
+	}
+	now := s.nowTime()
 	s.mu.Unlock()
 
 	status := RecoveryStatus{Lab: lab, Phase: "unknown"}
@@ -534,7 +826,24 @@ func (s *Server) transactionInventoryStatus(ctx context.Context, lab string) Rec
 		status.Generation = tx.Generation
 		status.PreviousGeneration = tx.PreviousGen
 		status.Attempts = tx.RecoveryAttempts
+		status.RetryCount = tx.RecoveryAttempts
 		status.Error = tx.Failure
+		status.LastError = tx.Failure
+		status.Owner = tx.RecoveryOwner
+		status.Strategy = tx.RecoveryStrategy
+		status.StartedAt = tx.RecoveryStarted
+		status.LastProgressAt = tx.RecoveryProgress
+		status.Deadline = tx.RecoveryDeadline
+		status.TotalDeadline = tx.RecoveryTotal
+		status.CurrentTarget = tx.RecoveryTarget
+		if !leaseUntil.IsZero() {
+			status.LeaseExpiresAt = leaseUntil
+			if status.Owner == "" {
+				status.Owner = leaseOwner
+			}
+		}
+		status.TakeoverAllowed = tx.Phase == transactionRecovering &&
+			(!tx.RecoveryDeadline.IsZero() && !now.Before(tx.RecoveryDeadline))
 		if !tx.Committed {
 			status.AllowedStrategies = []string{"rollback", "forward"}
 		}
@@ -545,15 +854,24 @@ func (s *Server) transactionInventoryStatus(ctx context.Context, lab string) Rec
 			want = committed
 		}
 	case hasCommitted:
-		status.Phase, status.Generation, want = "committed", committed.Generation, committed
+		status.Phase, status.Generation, want = "committed", committedGeneration, committed
+		if status.Generation == "" {
+			// Coordination records written before lab-generation lineage used
+			// the inventory generation for both concepts.
+			status.Generation = committed.Generation
+		}
 	default:
 		status.Phase = "idle"
 		return status
 	}
 	status.ExpectedContainers, status.ExpectedVNIs = len(want.Containers), len(want.VNIs)
-	got, err := s.snapshotTransactionInventory(ctx, lab)
+	observeCtx, cancel := context.WithTimeout(ctx, s.recoveryStatusLimit())
+	defer cancel()
+	got, err := s.snapshotTransactionInventory(observeCtx, lab)
 	if err != nil {
-		status.Error = err.Error()
+		if status.Error == "" {
+			status.Error = err.Error()
+		}
 		return status
 	}
 	status.ObservedContainers, status.ObservedVNIs = len(got.Containers), len(got.VNIs)
@@ -617,7 +935,8 @@ func (s *Server) handleRecovery(w http.ResponseWriter, r *http.Request) {
 	if strategy == "" {
 		strategy = "rollback"
 	}
-	status, err := s.recoverTransactionStrategy(r.Context(), req.Lab, req.Fence, strategy)
+	status, err := s.recoverTransactionStrategyOptions(r.Context(), req.Lab, req.Fence, strategy,
+		recoveryRunOptions{takeover: req.Takeover})
 	if err != nil {
 		httpError(w, http.StatusConflict, err)
 		return
@@ -644,6 +963,12 @@ func (s *Server) recoverTransaction(ctx context.Context, lab string, fence Fence
 
 func (s *Server) recoverTransactionStrategy(ctx context.Context, lab string, fence Fence,
 	strategy string,
+) (RecoveryStatus, error) {
+	return s.recoverTransactionStrategyOptions(ctx, lab, fence, strategy, recoveryRunOptions{})
+}
+
+func (s *Server) recoverTransactionStrategyOptions(ctx context.Context, lab string, fence Fence,
+	strategy string, options recoveryRunOptions,
 ) (RecoveryStatus, error) {
 	if strategy != "rollback" && strategy != "forward" {
 		return RecoveryStatus{}, fmt.Errorf("unknown recovery strategy %q", strategy)
@@ -698,60 +1023,101 @@ func (s *Server) recoverTransactionStrategy(ctx context.Context, lab string, fen
 		}
 		return status, nil
 	}
+	totalCtx, totalCancel := context.WithTimeout(ctx, s.recoveryTotalLimit())
+	defer totalCancel()
+	totalDeadline := s.nowTime().Add(s.recoveryTotalLimit())
+	fencedCtx, stopFence := s.fencedContext(totalCtx, lab, fence)
+	defer stopFence()
+	opID, err := s.acquireRecoveryOperation(lab, totalDeadline, totalCancel, options.takeover)
+	if err != nil {
+		return s.transactionInventoryStatus(ctx, lab), err
+	}
+	defer s.releaseRecoveryOperation(lab, opID)
+	tx, err = s.beginRecovery(lab, fence, tx.Generation, strategy, totalDeadline, options)
+	if err != nil {
+		return s.transactionInventoryStatus(ctx, lab), err
+	}
 	if strategy == "forward" {
-		return s.forwardTransaction(ctx, lab, fence, tx)
+		if err := s.runRecoveryPhase(fencedCtx, lab, fence, tx.Generation,
+			"forward", "recorded desired transaction", func(phaseCtx context.Context) error {
+				_, err := s.forwardTransaction(phaseCtx, lab, fence, tx)
+				return err
+			}); err != nil {
+			s.failRecovery(lab, fence, tx.Generation, err)
+			return s.transactionInventoryStatus(ctx, lab), err
+		}
+		return s.transactionInventoryStatus(ctx, lab), nil
 	}
 	if len(tx.Prestate.Containers) > 0 && !tx.Prestate.StateSafe {
-		_ = s.markTransactionPhase(lab, fence, tx.Generation, transactionRollbackFailed,
-			"pre-state snapshots were not durably captured")
+		err := errors.New("refusing recovery before durable student state capture")
+		s.failRecovery(lab, fence, tx.Generation, err)
 		return s.transactionInventoryStatus(ctx, lab), errors.New(
 			"refusing recovery before durable student state capture")
-	}
-	if err := s.markTransactionPhase(lab, fence, tx.Generation, transactionRecovering, ""); err != nil {
-		return RecoveryStatus{}, err
-	}
-	if err := s.acquire(lab, "recovery"); err != nil {
-		return RecoveryStatus{}, err
-	}
-	defer s.release(lab)
-	if err := s.transactionFail("rollback"); err != nil {
-		_ = s.markTransactionPhase(lab, fence, tx.Generation, transactionRollbackFailed, err.Error())
-		return s.transactionInventoryStatus(ctx, lab), err
 	}
 	rollback := s.rollbackPreparedApply
 	if s.recoveryRollback != nil {
 		rollback = s.recoveryRollback
 	}
-	if err := rollback(ctx, lab, fence, tx); err != nil {
-		_ = s.markTransactionPhase(lab, fence, tx.Generation, transactionRollbackFailed, err.Error())
+	runRollback := s.runRecoveryPhase
+	if s.recoveryRollback == nil && len(tx.Prestate.RuntimeSpecs) > 0 {
+		runRollback = s.runRecoveryLongPhase
+	}
+	if err := runRollback(fencedCtx, lab, fence, tx.Generation,
+		"rollback", "restore prior runtime inventory", func(phaseCtx context.Context) error {
+			if err := s.transactionFail("rollback"); err != nil {
+				return err
+			}
+			return rollback(phaseCtx, lab, fence, tx)
+		}); err != nil {
+		s.failRecovery(lab, fence, tx.Generation, err)
 		return s.transactionInventoryStatus(ctx, lab), err
 	}
-	if s.recoveryRollback == nil {
-		if err := s.restoreRecoveredTopology(lab, tx); err != nil {
-			_ = s.markTransactionPhase(lab, fence, tx.Generation, transactionRollbackFailed, err.Error())
-			return s.transactionInventoryStatus(ctx, lab), err
-		}
-		if err := s.verifyRecoveredStudentState(ctx, tx); err != nil {
-			_ = s.markTransactionPhase(lab, fence, tx.Generation, transactionRollbackFailed, err.Error())
-			return s.transactionInventoryStatus(ctx, lab), err
-		}
-		if err := s.replicateRecoveredDurability(ctx, tx); err != nil {
-			_ = s.markTransactionPhase(lab, fence, tx.Generation, transactionRollbackFailed, err.Error())
-			return s.transactionInventoryStatus(ctx, lab), err
+	restore := func(context.Context) error { return s.restoreRecoveredTopology(lab, tx) }
+	if s.recoveryRestore != nil {
+		restore = func(phaseCtx context.Context) error {
+			return s.recoveryRestore(phaseCtx, lab, tx)
 		}
 	}
-	got, verifyErr := s.snapshotTransactionInventory(ctx, lab)
-	if verifyErr == nil {
-		verifyErr = inventoryMatches(tx.Prestate, got)
-	}
-
-	if verifyErr != nil {
-		err := fmt.Errorf("rollback inventory verification failed: %v", verifyErr)
-		_ = s.markTransactionPhase(lab, fence, tx.Generation, transactionRollbackFailed, err.Error())
+	if err := s.runRecoveryPhase(fencedCtx, lab, fence, tx.Generation,
+		"restore", "persist previous topology", restore); err != nil {
+		s.failRecovery(lab, fence, tx.Generation, err)
 		return s.transactionInventoryStatus(ctx, lab), err
 	}
-	if err := s.finishRecoveredGeneration(lab, fence, tx.Generation); err != nil {
-		_ = s.markTransactionPhase(lab, fence, tx.Generation, transactionRollbackFailed, err.Error())
+	verify := func(phaseCtx context.Context) error { return s.verifyRecoveredStudentState(phaseCtx, tx) }
+	if s.recoveryVerify != nil {
+		verify = func(phaseCtx context.Context) error { return s.recoveryVerify(phaseCtx, tx) }
+	}
+	if err := s.runRecoveryPhase(fencedCtx, lab, fence, tx.Generation,
+		"verify", "restored student state and runtime semantics", verify); err != nil {
+		s.failRecovery(lab, fence, tx.Generation, err)
+		return s.transactionInventoryStatus(ctx, lab), err
+	}
+	replicate := func(phaseCtx context.Context) error { return s.replicateRecoveredDurability(phaseCtx, tx) }
+	if s.recoveryReplicate != nil {
+		replicate = func(phaseCtx context.Context) error { return s.recoveryReplicate(phaseCtx, tx) }
+	}
+	if err := s.runRecoveryPhase(fencedCtx, lab, fence, tx.Generation,
+		"replicate", "durable peer quorum", replicate); err != nil {
+		s.failRecovery(lab, fence, tx.Generation, err)
+		return s.transactionInventoryStatus(ctx, lab), err
+	}
+	if err := s.runRecoveryPhase(fencedCtx, lab, fence, tx.Generation,
+		"verify", "exact prior inventory", func(phaseCtx context.Context) error {
+			got, err := s.snapshotTransactionInventory(phaseCtx, lab)
+			if err != nil {
+				return err
+			}
+			return inventoryMatches(tx.Prestate, got)
+		}); err != nil {
+		err = fmt.Errorf("rollback inventory verification failed: %w", err)
+		s.failRecovery(lab, fence, tx.Generation, err)
+		return s.transactionInventoryStatus(ctx, lab), err
+	}
+	if err := s.runRecoveryPhase(fencedCtx, lab, fence, tx.Generation,
+		"commit", "persist recovered generation", func(context.Context) error {
+			return s.finishRecoveredGeneration(lab, fence, tx.Generation)
+		}); err != nil {
+		s.failRecovery(lab, fence, tx.Generation, err)
 		return s.transactionInventoryStatus(ctx, lab), err
 	}
 	return s.transactionInventoryStatus(ctx, lab), nil
@@ -929,10 +1295,6 @@ func (s *Server) forwardTransaction(ctx context.Context, lab string, fence Fence
 			return s.transactionInventoryStatus(ctx, lab), err
 		}
 	}
-	if err := s.acquire(lab, "forward recovery"); err != nil {
-		return RecoveryStatus{}, err
-	}
-	defer s.release(lab)
 	eng := s.transactionEngine(top, current)
 	p, err := eng.Build(top)
 	if err != nil {
@@ -981,7 +1343,7 @@ func (s *Server) forwardTransaction(ctx context.Context, lab string, fence Fence
 // transaction. It deliberately does not call ensureContainer/configure: those
 // functions derive today's hardening and renderer output, precisely the drift
 // a rollback must avoid.
-func (s *Server) rollbackExactContracts(ctx context.Context, lab string,
+func (s *Server) rollbackExactContracts(ctx context.Context, lab string, fence Fence,
 	tx applyTransaction, top *model.Topology,
 ) error {
 	if s.rt == nil {
@@ -1008,119 +1370,207 @@ func (s *Server) rollbackExactContracts(ctx context.Context, lab string,
 	eng := s.transactionEngine(top, rollback)
 	expected := map[string]bool{}
 	for _, entry := range tx.Prestate.RuntimeSpecs {
-		device := byDevice[entry.DeviceID]
-		if device == nil {
-			return fmt.Errorf("rollback contract references unknown device %q", entry.DeviceID)
-		}
-		expected[entry.Spec.Name] = true
-		current, err := s.rt.Inspect(ctx, entry.Spec.Name)
-		if err != nil {
-			return fmt.Errorf("inspect rollback container %s: %w", entry.Spec.Name, err)
-		}
-		if current.State != rt.StateAbsent {
-			if err := s.rt.Remove(ctx, entry.Spec.Name, true); err != nil {
-				return fmt.Errorf("remove dirty rollback container %s: %w", entry.Spec.Name, err)
-			}
-		}
-		if err := eng.PrepareRuntimeSpec(top, device); err != nil {
-			return fmt.Errorf("prepare rollback runtime paths for %s: %w", entry.DeviceID, err)
-		}
-		spec := entry.Spec
-		if _, err := s.rt.Create(ctx, &spec); err != nil {
-			return fmt.Errorf("create exact rollback container %s: %w", spec.Name, err)
-		}
-		if err := s.rt.Start(ctx, spec.Name); err != nil {
-			return fmt.Errorf("start exact rollback container %s: %w", spec.Name, err)
-		}
-	}
-	if err := eng.RewireTopology(ctx, top); err != nil {
-		return fmt.Errorf("rewire exact rollback topology: %w", err)
-	}
-	for _, entry := range tx.Prestate.RuntimeSpecs {
-		device := byDevice[entry.DeviceID]
-		for _, artifact := range entry.Artifacts {
-			if artifact.Command != nil {
-				continue
-			}
-			if artifact.Digest != artifactDigest(artifact.Content) {
-				return fmt.Errorf("rollback artifact %s for %s digest mismatch", artifact.Path, entry.DeviceID)
-			}
-			if err := s.rt.CopyTo(ctx, entry.Spec.Name, artifact.Path, artifact.Mode, artifact.Content); err != nil {
-				return fmt.Errorf("restore rollback artifact %s to %s: %w",
-					artifact.Path, entry.Spec.Name, err)
-			}
-		}
-		if entry.Control != nil {
-			current, err := s.rt.Inspect(ctx, entry.Control.Name)
-			if err != nil {
-				return fmt.Errorf("inspect exact rollback control %s: %w", entry.Control.Name, err)
-			}
-			if current.State != rt.StateAbsent {
-				if err := s.rt.Remove(ctx, entry.Control.Name, true); err != nil {
-					return fmt.Errorf("remove dirty rollback control %s: %w", entry.Control.Name, err)
+		entry := entry
+		if err := s.runRecoveryPhase(ctx, lab, fence, tx.Generation,
+			"rollback", "exact runtime contract: "+entry.DeviceID, func(phaseCtx context.Context) error {
+				device := byDevice[entry.DeviceID]
+				if device == nil {
+					return fmt.Errorf("rollback contract references unknown device %q", entry.DeviceID)
 				}
-			}
-			control := *entry.Control
-			if _, err := s.rt.Create(ctx, &control); err != nil {
-				return fmt.Errorf("create exact rollback control %s: %w", control.Name, err)
-			}
-			if err := s.rt.Start(ctx, control.Name); err != nil {
-				return fmt.Errorf("start exact rollback control %s: %w", control.Name, err)
-			}
-		} else if err := eng.EnsureRuntimeSupport(ctx, top, device); err != nil {
-			return fmt.Errorf("restore rollback support for %s: %w", entry.DeviceID, err)
-		}
-		for _, artifact := range entry.Artifacts {
-			if artifact.Command == nil {
-				continue
-			}
-			raw, _ := json.Marshal(*artifact.Command)
-			if artifact.Digest != artifactDigest(raw) {
-				return fmt.Errorf("rollback command for %s digest mismatch", entry.DeviceID)
-			}
-			container := entry.Spec.Name
-			if artifact.Command.FRRControl && deploy.UsesFRRControl(device) {
-				container = deploy.FRRControlContainer(device)
-			}
-			result, err := s.rt.Exec(ctx, container, rt.ExecCmd{Cmd: artifact.Command.Args})
-			if err != nil {
-				return fmt.Errorf("run rollback command for %s: %w", entry.DeviceID, err)
-			}
-			if err := result.Err(); err != nil && !artifact.Command.IgnoreError {
-				return fmt.Errorf("run rollback command for %s: %w", entry.DeviceID, err)
-			}
-		}
-		if renderModeForDevice(previousMode, previousUngraded, device) != render.ModeSolve {
-			if _, err := deploy.Restore(ctx, s.rt, device, lab, s.store); err != nil {
-				return fmt.Errorf("restore student state for %s: %w", entry.DeviceID, err)
-			}
-		}
-	}
-	for _, entry := range tx.Prestate.RuntimeSpecs {
-		device := byDevice[entry.DeviceID]
-		if waiter := eng.Renderer.Ready(device, s.rt); waiter != nil {
-			if err := plan.Wait(ctx, *waiter); err != nil {
-				return fmt.Errorf("verify exact rollback readiness for %s: %w", entry.DeviceID, err)
-			}
+				expected[entry.Spec.Name] = true
+				// A split FRR control sidecar joins the primary container's
+				// network namespace. It must be removed before replacing that
+				// primary: retaining the old namespace holder can leave Docker
+				// Start blocked with the replacement stuck in Created.
+				if entry.Control != nil {
+					control, err := s.rt.Inspect(phaseCtx, entry.Control.Name)
+					if err != nil {
+						return fmt.Errorf("inspect rollback control %s: %w", entry.Control.Name, err)
+					}
+					if control.State != rt.StateAbsent {
+						if err := s.rt.Remove(phaseCtx, entry.Control.Name, true); err != nil {
+							return fmt.Errorf("remove rollback control %s before primary replacement: %w",
+								entry.Control.Name, err)
+						}
+					}
+				}
+				current, err := s.rt.Inspect(phaseCtx, entry.Spec.Name)
+				if err != nil {
+					return fmt.Errorf("inspect rollback container %s: %w", entry.Spec.Name, err)
+				}
+				if current.State != rt.StateAbsent {
+					if err := s.rt.Remove(phaseCtx, entry.Spec.Name, true); err != nil {
+						return fmt.Errorf("remove dirty rollback container %s: %w", entry.Spec.Name, err)
+					}
+				}
+				if err := eng.PrepareRuntimeSpec(top, device); err != nil {
+					return fmt.Errorf("prepare rollback runtime paths for %s: %w", entry.DeviceID, err)
+				}
+				spec := entry.Spec
+				if _, err := s.rt.Create(phaseCtx, &spec); err != nil {
+					return fmt.Errorf("create exact rollback container %s: %w", spec.Name, err)
+				}
+				if err := s.rt.Start(phaseCtx, spec.Name); err != nil {
+					return fmt.Errorf("start exact rollback container %s: %w", spec.Name, err)
+				}
+				return nil
+			}); err != nil {
+			return err
 		}
 	}
-	containers, err := s.recoveryContainerList(ctx, lab)
-	if err != nil {
+	if err := s.runRecoveryPhase(ctx, lab, fence, tx.Generation,
+		"rollback", "rewire prior topology", func(phaseCtx context.Context) error {
+			if err := eng.RewireTopology(phaseCtx, top); err != nil {
+				return fmt.Errorf("rewire exact rollback topology: %w", err)
+			}
+			return nil
+		}); err != nil {
 		return err
 	}
-	for _, container := range containers {
-		if isInternalControlContainer(container) || expected[container.Name] {
+	for _, entry := range tx.Prestate.RuntimeSpecs {
+		entry := entry
+		if err := s.runRecoveryPhaseLimit(ctx, lab, fence, tx.Generation,
+			"restore", "exact rendered artifacts: "+entry.DeviceID, s.recoveryArtifactLimit(),
+			func(phaseCtx context.Context) error {
+				device := byDevice[entry.DeviceID]
+				for _, artifact := range entry.Artifacts {
+					if artifact.Command != nil {
+						continue
+					}
+					if artifact.Digest != artifactDigest(artifact.Content) {
+						return fmt.Errorf("rollback artifact %s for %s digest mismatch", artifact.Path, entry.DeviceID)
+					}
+					if err := s.rt.CopyTo(phaseCtx, entry.Spec.Name, artifact.Path, artifact.Mode, artifact.Content); err != nil {
+						return fmt.Errorf("restore rollback artifact %s to %s: %w",
+							artifact.Path, entry.Spec.Name, err)
+					}
+				}
+				if entry.Control != nil {
+					current, err := s.rt.Inspect(phaseCtx, entry.Control.Name)
+					if err != nil {
+						return fmt.Errorf("inspect exact rollback control %s: %w", entry.Control.Name, err)
+					}
+					if current.State != rt.StateAbsent {
+						if err := s.rt.Remove(phaseCtx, entry.Control.Name, true); err != nil {
+							return fmt.Errorf("remove dirty rollback control %s: %w", entry.Control.Name, err)
+						}
+					}
+					control := *entry.Control
+					if _, err := s.rt.Create(phaseCtx, &control); err != nil {
+						return fmt.Errorf("create exact rollback control %s: %w", control.Name, err)
+					}
+					if err := s.rt.Start(phaseCtx, control.Name); err != nil {
+						return fmt.Errorf("start exact rollback control %s: %w", control.Name, err)
+					}
+				} else if err := eng.EnsureRuntimeSupport(phaseCtx, top, device); err != nil {
+					return fmt.Errorf("restore rollback support for %s: %w", entry.DeviceID, err)
+				}
+				runCommand := func(artifact transactionArtifact) error {
+					raw, _ := json.Marshal(*artifact.Command)
+					if artifact.Digest != artifactDigest(raw) {
+						return fmt.Errorf("rollback command for %s digest mismatch", entry.DeviceID)
+					}
+					container := entry.Spec.Name
+					if artifact.Command.FRRControl && deploy.UsesFRRControl(device) {
+						container = deploy.FRRControlContainer(device)
+					}
+					result, err := s.rt.Exec(phaseCtx, container, rt.ExecCmd{Cmd: artifact.Command.Args})
+					if err != nil {
+						return fmt.Errorf("run rollback command for %s: %w", entry.DeviceID, err)
+					}
+					if err := result.Err(); err != nil && !artifact.Command.IgnoreError {
+						return fmt.Errorf("run rollback command for %s: %w", entry.DeviceID, err)
+					}
+					return nil
+				}
+				var daemonChecks []transactionArtifact
+				for _, artifact := range entry.Artifacts {
+					if artifact.Command == nil {
+						continue
+					}
+					if artifact.Command.FRRControl &&
+						strings.Contains(artifact.Command.Describe, "check the routing daemons are running") {
+						daemonChecks = append(daemonChecks, artifact)
+						continue
+					}
+					if err := runCommand(artifact); err != nil {
+						return err
+					}
+				}
+				// The persisted command list checks daemons before a later
+				// frrinit start command. During exact rollback the control
+				// namespace was deliberately recreated, so perform that check
+				// after the recorded starter and retain its final validation.
+				for _, artifact := range daemonChecks {
+					if err := runCommand(artifact); err != nil {
+						return err
+					}
+				}
+				return nil
+			}); err != nil {
+			return err
+		}
+	}
+	for _, entry := range tx.Prestate.RuntimeSpecs {
+		entry := entry
+		if err := s.runRecoveryPhase(ctx, lab, fence, tx.Generation,
+			"verify", "exact rollback readiness: "+entry.DeviceID, func(phaseCtx context.Context) error {
+				device := byDevice[entry.DeviceID]
+				if waiter := eng.Renderer.Ready(device, s.rt); waiter != nil {
+					if err := plan.Wait(phaseCtx, *waiter); err != nil {
+						return fmt.Errorf("verify exact rollback readiness for %s: %w", entry.DeviceID, err)
+					}
+				}
+				return nil
+			}); err != nil {
+			return err
+		}
+	}
+	// A restored FRR snapshot is applied through vtysh. The private FRR
+	// control namespace can be running while its socket is not yet usable by
+	// the primary container; applying state before readiness caused retries to
+	// fail with transient "Failure to communicate to zebra" errors. Runtime
+	// contracts and rendered artifacts are already exact at this point, so
+	// waiting does not recompute or weaken the rollback contract.
+	for _, entry := range tx.Prestate.RuntimeSpecs {
+		entry := entry
+		device := byDevice[entry.DeviceID]
+		if renderModeForDevice(previousMode, previousUngraded, device) == render.ModeSolve {
 			continue
 		}
-		if err := s.rt.Remove(ctx, container.Name, true); err != nil {
-			return fmt.Errorf("remove forward-only rollback container %s: %w", container.Name, err)
+		if err := s.runRecoveryPhase(ctx, lab, fence, tx.Generation,
+			"restore", "exact student state: "+entry.DeviceID, func(phaseCtx context.Context) error {
+				if _, err := deploy.Restore(phaseCtx, s.rt, device, lab, s.store); err != nil {
+					return fmt.Errorf("restore student state for %s: %w", entry.DeviceID, err)
+				}
+				return nil
+			}); err != nil {
+			return err
 		}
 	}
-	if err := s.transactionFail("prune"); err != nil {
-		return fmt.Errorf("exact rollback prune failpoint: %w", err)
-	}
-	if _, err := eng.PruneOverlaysContext(ctx, top); err != nil {
-		return fmt.Errorf("prune exact rollback overlays: %w", err)
+	if err := s.runRecoveryPhase(ctx, lab, fence, tx.Generation,
+		"prune", "forward-only runtime objects and overlays", func(phaseCtx context.Context) error {
+			containers, err := s.recoveryContainerList(phaseCtx, lab)
+			if err != nil {
+				return err
+			}
+			for _, container := range containers {
+				if isInternalControlContainer(container) || expected[container.Name] {
+					continue
+				}
+				if err := s.rt.Remove(phaseCtx, container.Name, true); err != nil {
+					return fmt.Errorf("remove forward-only rollback container %s: %w", container.Name, err)
+				}
+			}
+			if err := s.transactionFail("prune"); err != nil {
+				return fmt.Errorf("exact rollback prune failpoint: %w", err)
+			}
+			if _, err := eng.PruneOverlaysContext(phaseCtx, top); err != nil {
+				return fmt.Errorf("prune exact rollback overlays: %w", err)
+			}
+			return nil
+		}); err != nil {
+		return err
 	}
 	return nil
 }

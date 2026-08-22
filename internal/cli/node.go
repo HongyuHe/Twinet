@@ -101,7 +101,7 @@ func newNodeCmd(opts *Options) *cobra.Command {
 			// those is something the next command will refuse to do, and being
 			// told afterwards is not the same as being told.
 			w := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
-			fmt.Fprintln(w, "NODE\tSTATE\tSOURCE\tRUNTIME\tCONTRACTS\tSOCKET\tALLOCATABLE\tRESERVED\tLOAD\tPRESSURE\tIMAGES\tUNDERLAY\tPEER\tCONTAINERS\tLAB")
+			fmt.Fprintln(w, "NODE\tSTATE\tSOURCE\tRUNTIME\tCONTRACTS\tSOCKET\tALLOCATABLE\tRESERVED\tLOAD\tPRESSURE\tIMAGES\tUNDERLAY\tPEER\tCONTAINERS\tLAB\tRECOVERY")
 			bad, degraded := 0, 0
 			for _, r := range results {
 				if r.Err != nil {
@@ -118,13 +118,14 @@ func newNodeCmd(opts *Options) *cobra.Command {
 				if why != "" {
 					lab = why
 				}
-				fmt.Fprintf(w, "%s\t%s\t%s\t%s %s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s %s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 					r.Node, state, v.Version, v.Runtime, v.RuntimeVer, contractSummary(v.Compatibility),
 					dash(v.RuntimeSocket),
 					inventorySummary(v.Inventory.Allocatable), inventorySummary(v.Inventory.Reserved),
 					loadSummary(v.Inventory.Load), limiterPressureSummary(v.Backpressure),
 					imageCacheSummary(v.Inventory.ImageCache),
-					dash(v.UnderlayIP), peerReplicationSummary(v.PeerReplication), containerSummary(v), lab)
+					dash(v.UnderlayIP), peerReplicationSummary(v.PeerReplication), containerSummary(v), lab,
+					recoverySummary(v.Recoveries))
 			}
 			if err := w.Flush(); err != nil {
 				return err
@@ -845,6 +846,36 @@ func peerReplicationSummary(values map[string]agent.PeerReplicationStatus) strin
 		return fmt.Sprintf("%d ok/%d failed", healthy, failed)
 	}
 	return fmt.Sprintf("%d ok", healthy)
+}
+
+func recoverySummary(values map[string]agent.RecoveryStatus) string {
+	if len(values) == 0 {
+		return "-"
+	}
+	labs := make([]string, 0, len(values))
+	for lab := range values {
+		labs = append(labs, lab)
+	}
+	sort.Strings(labs)
+	var out []string
+	for _, lab := range labs {
+		status := values[lab]
+		if status.Phase == "committed" || status.Phase == "idle" {
+			continue
+		}
+		target := status.CurrentTarget
+		if target == "" {
+			target = status.Error
+		}
+		out = append(out, fmt.Sprintf("%s:%s owner=%s strategy=%s target=%s progress=%s deadline=%s retries=%d",
+			lab, status.Phase, dash(status.Owner), dash(status.Strategy), dash(target),
+			dash(status.LastProgressAt.Format(time.RFC3339)), dash(status.Deadline.Format(time.RFC3339)),
+			status.RetryCount))
+	}
+	if len(out) == 0 {
+		return "-"
+	}
+	return strings.Join(out, "; ")
 }
 
 func containerSummary(v agent.StatusResponse) string {

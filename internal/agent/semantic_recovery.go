@@ -174,7 +174,7 @@ func (s *Server) verifyNetworkSemantics(ctx context.Context, top *model.Topology
 		return err
 	}
 	if device.Kind == model.KindSwitch {
-		if err := s.verifySwitchSemantics(ctx, device); err != nil {
+		if err := s.verifySwitchSemantics(ctx, device, mode); err != nil {
 			return err
 		}
 	}
@@ -335,7 +335,7 @@ func hasDefaultRoute(raw, gateway, dev string) bool {
 	return false
 }
 
-func (s *Server) verifySwitchSemantics(ctx context.Context, device *model.Device) error {
+func (s *Server) verifySwitchSemantics(ctx context.Context, device *model.Device, mode render.Mode) error {
 	result, err := s.probeExec(ctx, device.Container, rt.ExecCmd{Cmd: []string{"ovs-vsctl", "list-br"}})
 	if err != nil {
 		return fmt.Errorf("read OVS bridges of %s: %w", device.ID, err)
@@ -344,6 +344,9 @@ func (s *Server) verifySwitchSemantics(ctx context.Context, device *model.Device
 		return fmt.Errorf("%s has no usable OVS bridge", device.ID)
 	}
 	for _, iface := range device.Ifaces {
+		if iface.Owner != model.OwnerPlatform && mode != render.ModeSolve {
+			continue
+		}
 		if iface.VLAN <= 0 && !iface.Trunk {
 			continue
 		}

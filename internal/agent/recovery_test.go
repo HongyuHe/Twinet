@@ -98,8 +98,18 @@ func TestAutomaticRecoveryUsesFreshFenceAfterControllerLoss(t *testing.T) {
 	s, _ := recoveryServer(t, nil)
 	s.recoveryRollback = func(context.Context, string, Fence, applyTransaction) error { return nil }
 	s.resumeRecoveries(context.Background())
-	if _, active := s.transactions["cos461"]; active {
-		t.Fatal("automatic recovery left the failed transaction active")
+	deadline := time.Now().Add(time.Second)
+	for {
+		s.mu.Lock()
+		_, active := s.transactions["cos461"]
+		s.mu.Unlock()
+		if !active {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("automatic recovery left the failed transaction active")
+		}
+		time.Sleep(time.Millisecond)
 	}
 	if s.fenceHighWater["cos461"] == 0 {
 		t.Fatal("automatic recovery did not issue a fresh fenced lease")

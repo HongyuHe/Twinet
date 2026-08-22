@@ -18,6 +18,17 @@ type RecoveryReport struct {
 	Nodes      map[string]agent.RecoveryStatus `json:"nodes"`
 }
 
+// RecoveryOptions controls bounded observation of an in-progress recovery.
+// Progress receives independently observed node state and must not mutate the
+// cluster. Takeover is honored only after agents report a stale deadline.
+type RecoveryOptions struct {
+	Wait     time.Duration
+	Takeover bool
+	Progress func(RecoveryReport)
+}
+
+const defaultRecoveryWait = 2 * time.Minute
+
 // Recover asks one agent to restore its durable pre-transaction inventory.
 func (n *Node) Recover(ctx context.Context, req agent.RecoveryRequest) (agent.RecoveryResponse, error) {
 	var out agent.RecoveryResponse
@@ -41,6 +52,16 @@ func (c *Cluster) Recover(ctx context.Context, lab string) (RecoveryReport, erro
 // RecoverWithStrategy chooses the only two explicit outcomes for a failed
 // transaction. Forward is never selected by automatic deploy recovery.
 func (c *Cluster) RecoverWithStrategy(ctx context.Context, lab, strategy string) (RecoveryReport, error) {
+	return c.RecoverWithOptions(ctx, lab, strategy, RecoveryOptions{Wait: defaultRecoveryWait})
+}
+
+// RecoverWithOptions either starts a fenced recovery or joins the same
+// strategy already running on agents. It never repeatedly contends for a
+// healthy agent-recovery lease: callers receive structured progress while
+// waiting and an immediate conflict for a different strategy.
+func (c *Cluster) RecoverWithOptions(ctx context.Context, lab, strategy string,
+	options RecoveryOptions,
+) (RecoveryReport, error) {
 	if strategy != "rollback" && strategy != "forward" {
 		return RecoveryReport{Lab: lab}, fmt.Errorf("unknown recovery strategy %q", strategy)
 	}
@@ -49,35 +70,175 @@ func (c *Cluster) RecoverWithStrategy(ctx context.Context, lab, strategy string)
 	if err != nil {
 		return initial, err
 	}
+	c.emitRecoveryProgress(options, initial)
 	if !pending {
 		return initial, nil
 	}
-	// Agent-side recovery owns a maximum-TTL internal fence while it rebuilds
-	// a full topology. Wait through that bounded window instead of returning a
-	// misleading lease-conflict error to an operator who asked to recover.
-	deadline := time.Now().Add(12 * time.Minute)
-	var lease *MutationLease
+	if active, conflict, stale := recoveryActivity(initial, strategy); active {
+		if conflict != "" {
+			return initial, fmt.Errorf("recovery for lab %q is already running strategy %q; requested %q",
+				lab, conflict, strategy)
+		}
+		if stale && options.Takeover {
+			return c.takeoverRecovery(ctx, lab, strategy, options)
+		}
+		return c.waitForRecovery(ctx, lab, strategy, initial, options)
+	}
+	lease, err := c.AcquireMutationLease(ctx, lab)
+	if err != nil {
+		// A recovery can acquire its lease between our status sample and this
+		// request. Re-read once and join it rather than sleeping through the
+		// lease TTL.
+		current, _, statusErr := c.readRecoveryStatuses(ctx, lab)
+		if statusErr == nil {
+			c.emitRecoveryProgress(options, current)
+			if active, conflict, stale := recoveryActivity(current, strategy); active {
+				if conflict != "" {
+					return current, fmt.Errorf("recovery for lab %q is already running strategy %q; requested %q",
+						lab, conflict, strategy)
+				}
+				if stale && options.Takeover {
+					return c.takeoverRecovery(ctx, lab, strategy, options)
+				}
+				return c.waitForRecovery(ctx, lab, strategy, current, options)
+			}
+		}
+		return initial, err
+	}
+	if lease == nil {
+		return initial, nil
+	}
+	defer lease.Release()
+	return c.recoverWithLeaseStrategyOptions(lease.Context(), lab, lease, strategy, options)
+}
+
+func (c *Cluster) emitRecoveryProgress(options RecoveryOptions, report RecoveryReport) {
+	if options.Progress != nil {
+		options.Progress(report)
+	}
+}
+
+// recoveryActivity returns whether a node reports an active recovery, a
+// conflicting active strategy, and whether every active reporter has passed
+// its operator-safe takeover deadline.
+func recoveryActivity(report RecoveryReport, strategy string) (active bool, conflict string, stale bool) {
+	stale = true
+	for _, status := range report.Nodes {
+		if status.Phase != "recovering" {
+			continue
+		}
+		active = true
+		if status.Strategy != "" && status.Strategy != strategy {
+			return true, status.Strategy, false
+		}
+		if !status.TakeoverAllowed {
+			stale = false
+		}
+	}
+	return active, "", active && stale
+}
+
+func (c *Cluster) waitForRecovery(ctx context.Context, lab, strategy string,
+	report RecoveryReport, options RecoveryOptions,
+) (RecoveryReport, error) {
+	if options.Wait <= 0 {
+		return report, recoveryWaitError(lab, report)
+	}
+	deadline := time.NewTimer(options.Wait)
+	defer deadline.Stop()
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
 	for {
-		lease, err = c.AcquireMutationLease(ctx, lab)
-		if err == nil || ctx.Err() != nil || time.Now().After(deadline) {
-			break
+		select {
+		case <-ctx.Done():
+			return report, ctx.Err()
+		case <-deadline.C:
+			return report, recoveryWaitError(lab, report)
+		case <-ticker.C:
+		}
+		next, pending, err := c.readRecoveryStatuses(ctx, lab)
+		if err != nil {
+			return next, err
+		}
+		report = next
+		c.emitRecoveryProgress(options, report)
+		if !pending {
+			return report, nil
+		}
+		if active, conflict, stale := recoveryActivity(report, strategy); active {
+			if conflict != "" {
+				return report, fmt.Errorf("recovery for lab %q switched to strategy %q; requested %q",
+					lab, conflict, strategy)
+			}
+			if stale {
+				if options.Takeover {
+					return c.takeoverRecovery(ctx, lab, strategy, options)
+				}
+				return report, fmt.Errorf("recovery for lab %q exceeded its phase deadline; retry with --takeover", lab)
+			}
+		}
+	}
+}
+
+func (c *Cluster) takeoverRecovery(ctx context.Context, lab, strategy string,
+	options RecoveryOptions,
+) (RecoveryReport, error) {
+	deadline := time.NewTimer(options.Wait)
+	defer deadline.Stop()
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		lease, err := c.AcquireMutationLease(ctx, lab)
+		if err == nil {
+			if lease == nil {
+				return RecoveryReport{Lab: lab}, nil
+			}
+			defer lease.Release()
+			return c.recoverWithLeaseStrategyOptions(lease.Context(), lab, lease, strategy,
+				RecoveryOptions{Wait: options.Wait, Takeover: true, Progress: options.Progress})
+		}
+		report, _, statusErr := c.readRecoveryStatuses(ctx, lab)
+		if statusErr != nil {
+			return RecoveryReport{Lab: lab}, err
+		}
+		c.emitRecoveryProgress(options, report)
+		if active, conflict, stale := recoveryActivity(report, strategy); active {
+			if conflict != "" {
+				return report, fmt.Errorf("recovery for lab %q is already running strategy %q; requested %q",
+					lab, conflict, strategy)
+			}
+			if !stale {
+				return c.waitForRecovery(ctx, lab, strategy, report, options)
+			}
+		}
+		if options.Wait <= 0 {
+			return report, fmt.Errorf("recovery takeover for lab %q is not yet fenced: %w", lab, err)
 		}
 		select {
 		case <-ctx.Done():
-		case <-time.After(time.Second):
+			return report, ctx.Err()
+		case <-deadline.C:
+			return report, fmt.Errorf("recovery takeover for lab %q is not yet fenced: %w", lab, err)
+		case <-ticker.C:
 		}
-		if ctx.Err() != nil {
-			break
+	}
+}
+
+func recoveryWaitError(lab string, report RecoveryReport) error {
+	var progress []string
+	for node, status := range report.Nodes {
+		if status.Phase != "recovering" {
+			continue
 		}
+		progress = append(progress, fmt.Sprintf("%s owner=%q strategy=%q target=%q last_progress=%s deadline=%s",
+			node, status.Owner, status.Strategy, status.CurrentTarget,
+			status.LastProgressAt.Format(time.RFC3339), status.Deadline.Format(time.RFC3339)))
 	}
-	if err != nil {
-		return RecoveryReport{Lab: lab}, err
+	sort.Strings(progress)
+	if len(progress) == 0 {
+		return fmt.Errorf("recovery for lab %q is incomplete", lab)
 	}
-	if lease == nil {
-		return RecoveryReport{Lab: lab}, nil
-	}
-	defer lease.Release()
-	return c.recoverWithLeaseStrategy(lease.Context(), lab, lease, strategy)
+	return fmt.Errorf("recovery for lab %q is still in progress: %s", lab, strings.Join(progress, "; "))
 }
 
 func (c *Cluster) readRecoveryStatuses(ctx context.Context, lab string) (RecoveryReport, bool, error) {
@@ -113,11 +274,17 @@ func (c *Cluster) readRecoveryStatuses(ctx context.Context, lab string) (Recover
 }
 
 func (c *Cluster) recoverWithLease(ctx context.Context, lab string, lease *MutationLease) (RecoveryReport, error) {
-	return c.recoverWithLeaseStrategy(ctx, lab, lease, "rollback")
+	return c.recoverWithLeaseStrategyOptions(ctx, lab, lease, "rollback", RecoveryOptions{})
 }
 
 func (c *Cluster) recoverWithLeaseStrategy(ctx context.Context, lab string, lease *MutationLease,
 	strategy string,
+) (RecoveryReport, error) {
+	return c.recoverWithLeaseStrategyOptions(ctx, lab, lease, strategy, RecoveryOptions{})
+}
+
+func (c *Cluster) recoverWithLeaseStrategyOptions(ctx context.Context, lab string, lease *MutationLease,
+	strategy string, options RecoveryOptions,
 ) (RecoveryReport, error) {
 	report := RecoveryReport{Lab: lab, Nodes: map[string]agent.RecoveryStatus{}}
 	var problems []string
@@ -128,7 +295,7 @@ func (c *Cluster) recoverWithLeaseStrategy(ctx context.Context, lab string, leas
 			continue
 		}
 		response, err := node.Recover(ctx, agent.RecoveryRequest{
-			Lab: lab, Fence: fence, Strategy: strategy,
+			Lab: lab, Fence: fence, Strategy: strategy, Takeover: options.Takeover,
 		})
 		if err != nil {
 			problems = append(problems, fmt.Sprintf("%s recovery: %v", node.Name, err))

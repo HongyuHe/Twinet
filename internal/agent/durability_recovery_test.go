@@ -34,7 +34,16 @@ func TestRestoredConfigRetainsSavedStatementsDespiteOrdering(t *testing.T) {
 	if !restoredConfigContains(have, want) {
 		t.Fatal("reordered recovered configuration was rejected")
 	}
+
 	if restoredConfigContains([]byte("router bgp 3\n"), want) {
 		t.Fatal("missing saved student neighbor statement was accepted")
+	}
+}
+
+func TestRestoredConfigIgnoresRuntimeOwnedIPv6Forwarding(t *testing.T) {
+	want := []byte("hostname PHY\nno ipv6 forwarding\nfrr version 10.0\nrouter bgp 8\nend\n")
+	have := []byte("hostname chi.as8\nrouter bgp 8\n")
+	if !restoredConfigContains(have, want) {
+		t.Fatal("runtime-owned forwarding directive made an otherwise restored configuration fail")
 	}
 }

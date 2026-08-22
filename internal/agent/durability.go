@@ -1226,7 +1226,21 @@ func restoredConfigContains(have, want []byte) bool {
 				strings.HasPrefix(line, "Current configuration") {
 				continue
 			}
-			out[strings.Join(strings.Fields(line), " ")] = true
+			line = strings.Join(strings.Fields(line), " ")
+			// IPv6 forwarding is restored by the persisted runtime sysctl
+			// contract rather than the student snapshot. Legacy FRR captures
+			// include this platform-owned line, but recovery intentionally
+			// filters it before vtysh replay because current mgmtd rejects the
+			// duplicate directive.
+			if line == "ipv6 forwarding" || line == "no ipv6 forwarding" ||
+				strings.HasPrefix(line, "hostname ") ||
+				strings.HasPrefix(line, "frr version ") ||
+				strings.HasPrefix(line, "frr defaults ") ||
+				line == "service integrated-vtysh-config" ||
+				line == "end" {
+				continue
+			}
+			out[line] = true
 		}
 		return out
 	}

@@ -161,18 +161,29 @@ type transactionInventory struct {
 // RecoveryStatus is safe to expose in node status and recovery responses. It
 // names a phase and inventory counts, never student configuration content.
 type RecoveryStatus struct {
-	Lab                string   `json:"lab"`
-	Phase              string   `json:"phase"`
-	Generation         string   `json:"generation,omitempty"`
-	PreviousGeneration string   `json:"previous_generation,omitempty"`
-	ExpectedContainers int      `json:"expected_containers"`
-	ObservedContainers int      `json:"observed_containers"`
-	ExpectedVNIs       int      `json:"expected_vnis"`
-	ObservedVNIs       int      `json:"observed_vnis"`
-	Consistent         bool     `json:"consistent"`
-	Attempts           int      `json:"attempts,omitempty"`
-	Error              string   `json:"error,omitempty"`
-	AllowedStrategies  []string `json:"allowed_strategies,omitempty"`
+	Lab                string    `json:"lab"`
+	Phase              string    `json:"phase"`
+	Generation         string    `json:"generation,omitempty"`
+	PreviousGeneration string    `json:"previous_generation,omitempty"`
+	Owner              string    `json:"owner,omitempty"`
+	Strategy           string    `json:"strategy,omitempty"`
+	StartedAt          time.Time `json:"started_at,omitempty"`
+	LastProgressAt     time.Time `json:"last_progress_at,omitempty"`
+	Deadline           time.Time `json:"deadline,omitempty"`
+	TotalDeadline      time.Time `json:"total_deadline,omitempty"`
+	LeaseExpiresAt     time.Time `json:"lease_expires_at,omitempty"`
+	CurrentTarget      string    `json:"current_target,omitempty"`
+	LastError          string    `json:"last_error,omitempty"`
+	RetryCount         int       `json:"retry_count,omitempty"`
+	TakeoverAllowed    bool      `json:"takeover_allowed,omitempty"`
+	ExpectedContainers int       `json:"expected_containers"`
+	ObservedContainers int       `json:"observed_containers"`
+	ExpectedVNIs       int       `json:"expected_vnis"`
+	ObservedVNIs       int       `json:"observed_vnis"`
+	Consistent         bool      `json:"consistent"`
+	Attempts           int       `json:"attempts,omitempty"`
+	Error              string    `json:"error,omitempty"`
+	AllowedStrategies  []string  `json:"allowed_strategies,omitempty"`
 }
 
 // applyTransaction persists enough information to fail closed after a crashed
@@ -209,6 +220,13 @@ type applyTransaction struct {
 	RecoveryAttempts  int                  `json:"recovery_attempts,omitempty"`
 	LastRecovery      time.Time            `json:"last_recovery,omitempty"`
 	NextRecovery      time.Time            `json:"next_recovery,omitempty"`
+	RecoveryOwner     string               `json:"recovery_owner,omitempty"`
+	RecoveryStrategy  string               `json:"recovery_strategy,omitempty"`
+	RecoveryStarted   time.Time            `json:"recovery_started,omitempty"`
+	RecoveryProgress  time.Time            `json:"recovery_progress,omitempty"`
+	RecoveryDeadline  time.Time            `json:"recovery_deadline,omitempty"`
+	RecoveryTotal     time.Time            `json:"recovery_total_deadline,omitempty"`
+	RecoveryTarget    string               `json:"recovery_target,omitempty"`
 	Applied           bool                 `json:"applied"`
 	Committed         bool                 `json:"committed"`
 }
@@ -472,6 +490,13 @@ func (s *Server) acquireMutationLease(req LeaseAcquireRequest) (LeaseResponse, e
 	now := s.nowTime()
 	changed := s.expireCoordinationLocked(now)
 	if held := s.mutations[req.Lab]; held != nil {
+		if tx, recovering := s.transactions[req.Lab]; recovering && tx.Phase == transactionRecovering {
+			return LeaseResponse{}, fmt.Errorf(
+				"lab %q is already leased by %s for another %s; recovery strategy=%q target=%q last_progress=%s deadline=%s",
+				req.Lab, held.holder, time.Until(held.until).Round(time.Second),
+				tx.RecoveryStrategy, tx.RecoveryTarget,
+				tx.RecoveryProgress.Format(time.RFC3339), tx.RecoveryDeadline.Format(time.RFC3339))
+		}
 		return LeaseResponse{}, fmt.Errorf("lab %q is already leased by %s for another %s",
 			req.Lab, held.holder, time.Until(held.until).Round(time.Second))
 	}

@@ -568,7 +568,7 @@ func (s *Server) rollbackPreparedApply(ctx context.Context, lab string, fence Fe
 		return fmt.Errorf("rehydrate previous topology for rollback: %w", err)
 	}
 	if len(tx.Prestate.RuntimeSpecs) > 0 {
-		return s.rollbackExactContracts(ctx, lab, tx, oldTop)
+		return s.rollbackExactContracts(ctx, lab, fence, tx, oldTop)
 	}
 	rollback := tx
 	rollback.Generation = tx.PreviousGen

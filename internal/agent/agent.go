@@ -258,10 +258,18 @@ type Server struct {
 	overlayReverter func(uint32, string) error
 	// Transaction seams let focused tests force failures at destructive
 	// boundaries without touching a host runtime or netlink namespace.
-	transactionFailpoint func(string) error
-	recoveryContainers   func(context.Context, string) ([]rt.Container, error)
-	recoveryOverlays     func(string) ([]uint32, error)
-	recoveryRollback     func(context.Context, string, Fence, applyTransaction) error
+	transactionFailpoint  func(string) error
+	recoveryContainers    func(context.Context, string) ([]rt.Container, error)
+	recoveryOverlays      func(string) ([]uint32, error)
+	recoveryRollback      func(context.Context, string, Fence, applyTransaction) error
+	recoveryRestore       func(context.Context, string, applyTransaction) error
+	recoveryVerify        func(context.Context, applyTransaction) error
+	recoveryReplicate     func(context.Context, applyTransaction) error
+	recoveryPhaseTimeout  time.Duration
+	recoveryTotalTimeout  time.Duration
+	recoveryLeaseTTL      time.Duration
+	recoveryStatusTimeout time.Duration
+	opSequence            uint64
 
 	// holds are labs an external operation has asked this node to leave alone.
 	holds map[string]*hold
@@ -303,8 +311,11 @@ func (s *Server) workLimiter() *limiter.Limiter {
 
 // lease records an in-flight mutating operation on one lab.
 type lease struct {
-	kind string
-	at   time.Time
+	id       uint64
+	kind     string
+	at       time.Time
+	deadline time.Time
+	cancel   context.CancelFunc
 }
 
 // New constructs an agent.
@@ -460,8 +471,48 @@ func (s *Server) acquire(lab, kind string) error {
 		return fmt.Errorf("another operation is already running on lab %q: %s, started %s ago",
 			lab, held.kind, time.Since(held.at).Round(time.Second))
 	}
-	s.ops[lab] = &lease{kind: kind, at: time.Now()}
+	s.opSequence++
+	s.ops[lab] = &lease{id: s.opSequence, kind: kind, at: time.Now()}
 	return nil
+}
+
+// acquireRecoveryOperation permits a newer fence to cancel only a recovery
+// whose persisted deadline has expired. Its ID prevents an old goroutine from
+// deleting a newer operation's lease while it unwinds.
+func (s *Server) acquireRecoveryOperation(lab string, deadline time.Time,
+	cancel context.CancelFunc, takeover bool,
+) (uint64, error) {
+	if lab == "" {
+		return 0, errors.New("a recovery must name the lab it acts on")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ops == nil {
+		s.ops = map[string]*lease{}
+	}
+	if held := s.ops[lab]; held != nil {
+		stale := held.kind == "recovery" && !held.deadline.IsZero() && !s.nowTime().Before(held.deadline)
+		if !stale || !takeover {
+			return 0, fmt.Errorf("another operation is already running on lab %q: %s, started %s ago",
+				lab, held.kind, s.nowTime().Sub(held.at).Round(time.Second))
+		}
+		if held.cancel != nil {
+			held.cancel()
+		}
+		delete(s.ops, lab)
+	}
+	s.opSequence++
+	id := s.opSequence
+	s.ops[lab] = &lease{id: id, kind: "recovery", at: s.nowTime(), deadline: deadline, cancel: cancel}
+	return id, nil
+}
+
+func (s *Server) releaseRecoveryOperation(lab string, id uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if held := s.ops[lab]; held != nil && held.id == id {
+		delete(s.ops, lab)
+	}
 }
 
 // rememberHow records how a lab was deployed, so a repair rebuilds what the lab

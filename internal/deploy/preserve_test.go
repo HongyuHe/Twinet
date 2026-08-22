@@ -16,6 +16,7 @@ func TestCleanRunningConfigStripsVtyshPreamble(t *testing.T) {
 		if strings.Contains(got, bad) {
 			t.Errorf("captured configuration still contains %q:\n%s", bad, got)
 		}
+
 	}
 	if !strings.HasPrefix(got, "!") && !strings.HasPrefix(got, "frr version") {
 		t.Errorf("configuration does not start at the first real line:\n%q", got)
@@ -27,5 +28,18 @@ func TestCleanRunningConfigStripsVtyshPreamble(t *testing.T) {
 	plain := "frr version 10.0\nrouter bgp 3\n exit"
 	if cleanRunningConfig(plain) != plain {
 		t.Errorf("a clean configuration was altered: %q", cleanRunningConfig(plain))
+	}
+}
+
+func TestCleanRestoredFRRConfigKeepsStudentStateButDropsPlatformDirectives(t *testing.T) {
+	raw := "frr version 10.0\nhostname PHY\nno ipv6 forwarding\nrouter bgp 8\n neighbor 10.0.0.1 remote-as 9\nend\n"
+	got := cleanRestoredFRRConfig(raw)
+	for _, platform := range []string{"frr version", "hostname PHY", "no ipv6 forwarding", "\nend"} {
+		if strings.Contains(got, platform) {
+			t.Fatalf("platform directive %q survived restore cleanup: %q", platform, got)
+		}
+	}
+	if !strings.Contains(got, "router bgp 8") || !strings.Contains(got, "neighbor 10.0.0.1") {
+		t.Fatalf("student routing state was removed: %q", got)
 	}
 }
