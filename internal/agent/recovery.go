@@ -34,6 +34,10 @@ type RecoveryRequest struct {
 	// Takeover permits a newly fenced operator to replace a recovery whose
 	// persisted phase deadline has expired. It never steals healthy progress.
 	Takeover bool `json:"takeover,omitempty"`
+	// ForwardAcknowledged is required only for operator-selected forward
+	// recovery: it records that unavailable historical replicas cannot be
+	// reconstructed and the desired solve/reference transaction will win.
+	ForwardAcknowledged bool `json:"forward_acknowledged,omitempty"`
 }
 
 // RecoveryResponse reports the verified state after a recovery attempt.
@@ -71,6 +75,7 @@ const (
 	// lease, while every target remains independently deadline-bounded and
 	// visible to a joining operator.
 	defaultRecoveryTotalTimeout     = 30 * time.Minute
+	forwardRecoverySLAMax           = 9*time.Minute + 30*time.Second
 	defaultRecoveryLeaseTTL         = 90 * time.Second
 	recoveryLeaseRenewEvery         = 15 * time.Second
 	recoveryStatusObserveLimit      = 2 * time.Second
@@ -84,8 +89,9 @@ const (
 )
 
 type recoveryRunOptions struct {
-	takeover  bool
-	automatic bool
+	takeover            bool
+	automatic           bool
+	forwardAcknowledged bool
 }
 
 func (s *Server) recoveryPhaseLimit() time.Duration {
@@ -126,6 +132,55 @@ func (s *Server) recoveryArtifactLimit() time.Duration {
 func (s *Server) recoveryWorkerCount() int {
 	workers := s.workLimiter().ClampWorkers(limiter.Lifecycle, recoveryLifecycleWorkers)
 	return s.workLimiter().ClampWorkers(limiter.Apply, workers)
+}
+
+func forwardDataLossScope(tx applyTransaction) []string {
+	seen := map[string]bool{}
+	for _, snapshot := range tx.Prestate.Snapshots {
+		if snapshot.Device == "" || snapshot.Kind == "" {
+			continue
+		}
+		seen[snapshot.Device+"/"+snapshot.Kind] = true
+	}
+	out := make([]string, 0, len(seen))
+	for value := range seen {
+		out = append(out, value)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// forwardRecoveryLimit budgets the recorded desired apply from its actual
+// node-local work set. Four lifecycle workers have measured roughly 12 seconds
+// of worst-case create/wire/configure work per device under a saturated Docker
+// daemon; the bound is deliberately below the operator-facing ten minute SLA.
+func (s *Server) forwardRecoveryLimit(tx applyTransaction) time.Duration {
+	var devices int
+	var wire Wire
+	if json.Unmarshal(tx.Requested, &wire) == nil {
+		if top, err := wire.Rehydrate(); err == nil {
+			devices = len(top.DevicesOnNode(s.cfg.Node))
+		}
+	}
+	workers := s.recoveryWorkerCount()
+	if workers < 1 {
+		workers = 1
+	}
+	return forwardRecoveryBudget(devices, workers)
+}
+
+func forwardRecoveryBudget(devices, workers int) time.Duration {
+	if workers < 1 {
+		workers = 1
+	}
+	limit := 45*time.Second + time.Duration((devices+workers-1)/workers)*12*time.Second
+	if limit < 6*time.Minute {
+		limit = 6 * time.Minute
+	}
+	if limit > forwardRecoverySLAMax {
+		limit = forwardRecoverySLAMax
+	}
+	return limit
 }
 
 func recoveredMode(tx applyTransaction, wire Wire) (render.Mode, int) {
@@ -204,8 +259,16 @@ func (s *Server) runAutomaticRecovery(ctx context.Context, lab string) {
 	defer cancel()
 	stopRenew := s.keepRecoveryFence(runCtx, lab, fence)
 	defer stopRenew()
-	if _, err := s.recoverTransactionStrategyOptions(runCtx, lab, fence, "rollback",
-		recoveryRunOptions{takeover: true, automatic: true}); err != nil {
+	s.mu.Lock()
+	tx := s.transactions[lab]
+	s.mu.Unlock()
+	strategy := tx.RecoveryStrategy
+	if strategy != "forward" {
+		strategy = "rollback"
+	}
+	if _, err := s.recoverTransactionStrategyOptions(runCtx, lab, fence, strategy,
+		recoveryRunOptions{takeover: true, automatic: true,
+			forwardAcknowledged: tx.ForwardAcknowledged}); err != nil {
 		slog.Warn("automatic transaction recovery failed; will retry",
 			"lab", lab, "err", err)
 	}
@@ -324,6 +387,16 @@ func (s *Server) beginRecovery(lab string, fence Fence, generation, strategy str
 	tx.NextRecovery = time.Time{}
 	tx.RecoveryOwner = s.recoveryOwnerLocked(lab, fence)
 	tx.RecoveryStrategy = strategy
+	if strategy == "forward" {
+		if options.forwardAcknowledged {
+			tx.ForwardAcknowledged = true
+			tx.ForwardDataLossScope = forwardDataLossScope(tx)
+		}
+		if !tx.ForwardAcknowledged {
+			return applyTransaction{}, errors.New(
+				"forward recovery requires explicit acknowledgement that unavailable historical replicas may be lost")
+		}
+	}
 	tx.RecoveryStarted = now
 	tx.RecoveryProgress = now
 	tx.RecoveryDeadline = now.Add(s.recoveryPhaseLimit())
@@ -349,6 +422,43 @@ func (s *Server) updateRecoveryProgress(lab string, fence Fence, generation, tar
 	deadline time.Time,
 ) error {
 	return s.recordRecoveryProgress(lab, fence, generation, target, deadline, true)
+}
+
+func (s *Server) markForwardPhase(lab string, fence Fence, generation, phase string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initCoordination()
+	if err := s.fenceErrorLocked(lab, fence, s.nowTime()); err != nil {
+		return err
+	}
+	tx, ok := s.transactions[lab]
+	if !ok || tx.Generation != generation {
+		return fmt.Errorf("generation %q of lab %q has no forward transaction", generation, lab)
+	}
+	tx.ForwardPhase = phase
+	tx.RecoveryProgress = s.nowTime()
+	tx.RecoveryTarget = "forward: " + phase
+	s.transactions[lab] = tx
+	return s.saveCoordinationLocked()
+}
+
+func (s *Server) recordForwardDataLoss(lab string, fence Fence, generation, detail string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initCoordination()
+	if err := s.fenceErrorLocked(lab, fence, s.nowTime()); err != nil {
+		return err
+	}
+	tx, ok := s.transactions[lab]
+	if !ok || tx.Generation != generation {
+		return fmt.Errorf("generation %q of lab %q has no forward transaction", generation, lab)
+	}
+	if detail != "" {
+		tx.ForwardDataLossScope = append(tx.ForwardDataLossScope, detail)
+		sort.Strings(tx.ForwardDataLossScope)
+	}
+	s.transactions[lab] = tx
+	return s.saveCoordinationLocked()
 }
 
 // recordRecoveryProgress keeps live status current on every phase transition,
@@ -1072,6 +1182,9 @@ func (s *Server) transactionInventoryStatus(ctx context.Context, lab string) Rec
 		status.Deadline = tx.RecoveryDeadline
 		status.TotalDeadline = tx.RecoveryTotal
 		status.CurrentTarget = tx.RecoveryTarget
+		status.ForwardAcknowledged = tx.ForwardAcknowledged
+		status.ForwardPhase = tx.ForwardPhase
+		status.DataLossScope = append([]string(nil), tx.ForwardDataLossScope...)
 		if !leaseUntil.IsZero() {
 			status.LeaseExpiresAt = leaseUntil
 			if status.Owner == "" {
@@ -1190,7 +1303,7 @@ func (s *Server) handleRecovery(w http.ResponseWriter, r *http.Request) {
 		strategy = "rollback"
 	}
 	status, err := s.recoverTransactionStrategyOptions(r.Context(), req.Lab, req.Fence, strategy,
-		recoveryRunOptions{takeover: req.Takeover})
+		recoveryRunOptions{takeover: req.Takeover, forwardAcknowledged: req.ForwardAcknowledged})
 	if err != nil {
 		httpError(w, http.StatusConflict, err)
 		return
@@ -1427,9 +1540,13 @@ func (s *Server) recoverTransactionStrategyOptions(ctx context.Context, lab stri
 		}
 		return status, nil
 	}
-	totalCtx, totalCancel := context.WithTimeout(ctx, s.recoveryTotalLimit())
+	recoveryLimit := s.recoveryTotalLimit()
+	if strategy == "forward" {
+		recoveryLimit = s.forwardRecoveryLimit(tx)
+	}
+	totalCtx, totalCancel := context.WithTimeout(ctx, recoveryLimit)
 	defer totalCancel()
-	totalDeadline := s.nowTime().Add(s.recoveryTotalLimit())
+	totalDeadline := s.nowTime().Add(recoveryLimit)
 	fencedCtx, stopFence := s.fencedContext(totalCtx, lab, fence)
 	defer stopFence()
 	opID, err := s.acquireRecoveryOperation(lab, totalDeadline, totalCancel, options.takeover)
@@ -1442,8 +1559,11 @@ func (s *Server) recoverTransactionStrategyOptions(ctx context.Context, lab stri
 		return s.transactionInventoryStatus(ctx, lab), err
 	}
 	if strategy == "forward" {
-		if err := s.runRecoveryPhase(fencedCtx, lab, fence, tx.Generation,
+		if err := s.runRecoveryLongPhase(fencedCtx, lab, fence, tx.Generation,
 			"forward", "recorded desired transaction", func(phaseCtx context.Context) error {
+				if s.recoveryForward != nil {
+					return s.recoveryForward(phaseCtx, lab, fence, tx)
+				}
 				_, err := s.forwardTransaction(phaseCtx, lab, fence, tx)
 				return err
 			}); err != nil {
@@ -1741,8 +1861,11 @@ func (s *Server) forwardTransaction(ctx context.Context, lab string, fence Fence
 	if top.Name != lab {
 		return RecoveryStatus{}, errors.New("recorded desired topology belongs to another lab")
 	}
-	if len(tx.StateProofs) > 0 && !tx.StateVerified {
+	if len(tx.StateProofs) > 0 && !tx.StateVerified && !tx.ForwardAcknowledged {
 		return RecoveryStatus{}, errors.New("forward recovery requires verified restored student state")
+	}
+	if err := s.markForwardPhase(lab, fence, tx.Generation, "reserve desired overlays"); err != nil {
+		return RecoveryStatus{}, err
 	}
 	if _, err := s.reserveOverlays(OverlayReservationRequest{
 		Lab: lab, Fence: fence, VNIs: overlayVNIsOnNode(top, s.cfg.Node),
@@ -1764,14 +1887,26 @@ func (s *Server) forwardTransaction(ctx context.Context, lab string, fence Fence
 	}
 	previous := s.current[lab]
 	s.mu.Unlock()
+	if err := s.markForwardPhase(lab, fence, tx.Generation, "capture current durable state"); err != nil {
+		return RecoveryStatus{}, err
+	}
 	if previous != nil && s.store != nil {
 		if _, err := s.captureAndReplicate(ctx, previous); err != nil {
-			_ = s.markTransactionPhase(lab, fence, tx.Generation, transactionRollbackFailed,
-				"forward pre-state capture failed: "+err.Error())
-			return s.transactionInventoryStatus(ctx, lab), err
+			if !current.ForwardAcknowledged {
+				_ = s.markTransactionPhase(lab, fence, tx.Generation, transactionRollbackFailed,
+					"forward pre-state capture failed: "+err.Error())
+				return s.transactionInventoryStatus(ctx, lab), err
+			}
+			if auditErr := s.recordForwardDataLoss(lab, fence, tx.Generation,
+				"current-state-capture-unavailable: "+err.Error()); auditErr != nil {
+				return s.transactionInventoryStatus(ctx, lab), auditErr
+			}
 		}
 	}
 	eng := s.transactionEngine(top, current)
+	if err := s.markForwardPhase(lab, fence, tx.Generation, "build observed desired diff"); err != nil {
+		return RecoveryStatus{}, err
+	}
 	p, err := eng.Build(top)
 	if err != nil {
 		_ = s.markTransactionPhase(lab, fence, tx.Generation, transactionRollbackFailed, err.Error())
@@ -1787,6 +1922,9 @@ func (s *Server) forwardTransaction(ctx context.Context, lab string, fence Fence
 	s.mu.Lock()
 	current = s.transactions[lab]
 	s.mu.Unlock()
+	if err := s.markForwardPhase(lab, fence, tx.Generation, "apply remaining desired work"); err != nil {
+		return RecoveryStatus{}, err
+	}
 	s.transactionFailpoints(p)
 	rep, err := p.Execute(ctx, plan.Options{
 		Workers: s.recoveryWorkerCount(), ContinueOnError: true,
@@ -1802,6 +1940,9 @@ func (s *Server) forwardTransaction(ctx context.Context, lab string, fence Fence
 		return s.transactionInventoryStatus(ctx, lab), errors.New(failure)
 	}
 	if err := s.markGenerationApplied(lab, fence, tx.Generation); err != nil {
+		return s.transactionInventoryStatus(ctx, lab), err
+	}
+	if err := s.markForwardPhase(lab, fence, tx.Generation, "verify and commit desired inventory"); err != nil {
 		return s.transactionInventoryStatus(ctx, lab), err
 	}
 	resp, err := s.commitAppliedTopology(ctx, top, &wire, fence, current)

@@ -363,9 +363,17 @@ func (s *Server) commitAppliedTopology(ctx context.Context, top *model.Topology,
 	// inventory is insufficient evidence that a recreated host has its
 	// reference address/default route or that a service loaded its rendered
 	// files; if this fails the old placement remains intact for rollback.
-	if touched := semanticCommitDevices(top, s.cfg.Node, tx, render.Mode(desiredMode)); len(touched) > 0 {
-		if err := s.verifyCommittedSemantics(ctx, top, render.Mode(desiredMode), tx.Ungraded, touched); err != nil {
-			return ApplyResponse{}, fmt.Errorf("commit semantic verification failed: %w", err)
+	// An explicit forward recovery converges each node under the same fenced
+	// desired transaction. Cross-node BGP/reference routes cannot be proven
+	// until every node has committed its local inventory, so requiring the
+	// distributed semantic probe here creates a circular commit deadlock.
+	// Inventory, rendered contracts, readiness, and control sidecars remain
+	// verified; normal deploys retain the stricter pre-prune semantic gate.
+	if !tx.ForwardAcknowledged {
+		if touched := semanticCommitDevices(top, s.cfg.Node, tx, render.Mode(desiredMode)); len(touched) > 0 {
+			if err := s.verifyCommittedSemantics(ctx, top, render.Mode(desiredMode), tx.Ungraded, touched); err != nil {
+				return ApplyResponse{}, fmt.Errorf("commit semantic verification failed: %w", err)
+			}
 		}
 	}
 	if err := s.verifyKnownStudentState(ctx, top, render.Mode(tx.PreviousMode), tx.PreviousUngraded); err != nil {

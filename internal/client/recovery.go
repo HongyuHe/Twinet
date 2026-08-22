@@ -22,9 +22,10 @@ type RecoveryReport struct {
 // Progress receives independently observed node state and must not mutate the
 // cluster. Takeover is honored only after agents report a stale deadline.
 type RecoveryOptions struct {
-	Wait     time.Duration
-	Takeover bool
-	Progress func(RecoveryReport)
+	Wait                time.Duration
+	Takeover            bool
+	ForwardAcknowledged bool
+	Progress            func(RecoveryReport)
 }
 
 const defaultRecoveryWait = 2 * time.Minute
@@ -176,6 +177,16 @@ func (c *Cluster) waitForRecovery(ctx context.Context, lab, strategy string,
 				}
 				return report, fmt.Errorf("recovery for lab %q exceeded its phase deadline; retry with --takeover", lab)
 			}
+		} else {
+			lease, leaseErr := c.AcquireMutationLease(ctx, lab)
+			if leaseErr != nil {
+				return report, leaseErr
+			}
+			if lease == nil {
+				return report, nil
+			}
+			defer lease.Release()
+			return c.recoverWithLeaseStrategyOptions(lease.Context(), lab, lease, strategy, options)
 		}
 	}
 }
@@ -195,7 +206,8 @@ func (c *Cluster) takeoverRecovery(ctx context.Context, lab, strategy string,
 			}
 			defer lease.Release()
 			return c.recoverWithLeaseStrategyOptions(lease.Context(), lab, lease, strategy,
-				RecoveryOptions{Wait: options.Wait, Takeover: true, Progress: options.Progress})
+				RecoveryOptions{Wait: options.Wait, Takeover: true,
+					ForwardAcknowledged: options.ForwardAcknowledged, Progress: options.Progress})
 		}
 		report, _, statusErr := c.readRecoveryStatuses(ctx, lab)
 		if statusErr != nil {
@@ -288,22 +300,37 @@ func (c *Cluster) recoverWithLeaseStrategyOptions(ctx context.Context, lab strin
 ) (RecoveryReport, error) {
 	report := RecoveryReport{Lab: lab, Nodes: map[string]agent.RecoveryStatus{}}
 	var problems []string
-	for _, node := range c.sortedNodes() {
+	type result struct {
+		node   string
+		status agent.RecoveryStatus
+		err    error
+	}
+	nodes := c.sortedNodes()
+	results := make(chan result, len(nodes))
+	for _, node := range nodes {
+		node := node
 		fence, ok := lease.Fence(node.Name)
 		if !ok {
 			problems = append(problems, fmt.Sprintf("%s has no recovery fence", node.Name))
 			continue
 		}
-		response, err := node.Recover(ctx, agent.RecoveryRequest{
-			Lab: lab, Fence: fence, Strategy: strategy, Takeover: options.Takeover,
-		})
-		if err != nil {
-			problems = append(problems, fmt.Sprintf("%s recovery: %v", node.Name, err))
+		go func() {
+			response, err := node.Recover(ctx, agent.RecoveryRequest{
+				Lab: lab, Fence: fence, Strategy: strategy, Takeover: options.Takeover,
+				ForwardAcknowledged: options.ForwardAcknowledged,
+			})
+			results <- result{node: node.Name, status: response.Status, err: err}
+		}()
+	}
+	for range len(nodes) - len(problems) {
+		result := <-results
+		if result.err != nil {
+			problems = append(problems, fmt.Sprintf("%s recovery: %v", result.node, result.err))
 			continue
 		}
-		report.Nodes[node.Name] = response.Status
+		report.Nodes[result.node] = result.status
 	}
-	for _, node := range c.sortedNodes() {
+	for _, node := range nodes {
 		status, err := node.RecoveryStatus(ctx, lab)
 		if err != nil {
 			problems = append(problems, fmt.Sprintf("%s recovery status: %v", node.Name, err))

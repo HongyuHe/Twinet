@@ -262,6 +262,7 @@ type Server struct {
 	recoveryContainers    func(context.Context, string) ([]rt.Container, error)
 	recoveryOverlays      func(string) ([]uint32, error)
 	recoveryRollback      func(context.Context, string, Fence, applyTransaction) error
+	recoveryForward       func(context.Context, string, Fence, applyTransaction) error
 	recoveryRestore       func(context.Context, string, applyTransaction) error
 	recoveryVerify        func(context.Context, applyTransaction) error
 	recoveryReplicate     func(context.Context, applyTransaction) error

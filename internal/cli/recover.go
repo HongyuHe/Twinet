@@ -16,10 +16,11 @@ import (
 // destroy a lab whose prior generation may still be the only safe copy.
 func newRecoverCmd(opts *Options) *cobra.Command {
 	var (
-		token    string
-		strategy string
-		wait     time.Duration
-		takeover bool
+		token              string
+		strategy           string
+		wait               time.Duration
+		takeover           bool
+		acknowledgeForward bool
 	)
 	cmd := &cobra.Command{
 		Use:   "recover",
@@ -39,7 +40,7 @@ func newRecoverCmd(opts *Options) *cobra.Command {
 			var lastProgress string
 			report, err := client.NewCluster(top.Lab, tok).RecoverWithOptions(cmd.Context(), top.Name, strategy,
 				client.RecoveryOptions{
-					Wait: wait, Takeover: takeover,
+					Wait: wait, Takeover: takeover, ForwardAcknowledged: acknowledgeForward,
 					Progress: func(progress client.RecoveryReport) {
 						if opts.JSON {
 							return
@@ -95,6 +96,8 @@ func newRecoverCmd(opts *Options) *cobra.Command {
 		"maximum time to join and poll an in-progress same-strategy recovery (0 reports immediately)")
 	cmd.Flags().BoolVar(&takeover, "takeover", false,
 		"take over only a recovery whose persisted phase deadline has expired")
+	cmd.Flags().BoolVar(&acknowledgeForward, "acknowledge-forward-data-loss", false,
+		"required for --strategy forward when historical replicas are unavailable")
 	return cmd
 }
 

@@ -351,6 +351,7 @@ func TestCommittedRecoveryStatusUsesLabGenerationNotObjectCreationGeneration(t *
 			Generation: "object-created-generation", State: "running",
 		}},
 	}
+
 	s.generations["lab"] = generationState{Committed: "lab-committed-generation"}
 	s.inventories["lab"] = inventory
 	s.recoveryContainers = func(context.Context, string) ([]rt.Container, error) {
@@ -368,5 +369,72 @@ func TestCommittedRecoveryStatusUsesLabGenerationNotObjectCreationGeneration(t *
 	status := s.transactionInventoryStatus(context.Background(), "lab")
 	if status.Generation != "lab-committed-generation" || !status.Consistent {
 		t.Fatalf("recovery status conflated lab and object generations: %+v", status)
+	}
+}
+
+func TestForwardRecoveryRequiresAcknowledgementAndPersistsSelection(t *testing.T) {
+	s, _ := recoveryServer(t, nil)
+	tx := s.transactions["cos461"]
+	tx.Prestate.Snapshots = []transactionSnapshot{{Device: "as1/R1", Kind: string(state.KindFRR)}}
+	s.transactions["cos461"] = tx
+	lease, err := s.acquireMutationLease(LeaseAcquireRequest{Lab: "cos461", Holder: "operator"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.recoverTransactionStrategyOptions(context.Background(), "cos461", lease.Fence,
+		"forward", recoveryRunOptions{}); err == nil {
+		t.Fatal("forward recovery without data-loss acknowledgement was accepted")
+	}
+	called := make(chan struct{})
+	s.recoveryForward = func(context.Context, string, Fence, applyTransaction) error {
+		close(called)
+		return nil
+	}
+	if _, err := s.recoverTransactionStrategyOptions(context.Background(), "cos461", lease.Fence,
+		"forward", recoveryRunOptions{forwardAcknowledged: true}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-called:
+	case <-time.After(time.Second):
+		t.Fatal("acknowledged forward recovery did not run")
+	}
+	tx = s.transactions["cos461"]
+	if tx.RecoveryStrategy != "forward" || !tx.ForwardAcknowledged {
+		t.Fatalf("forward selection was not persisted: %+v", tx)
+	}
+	if len(tx.ForwardDataLossScope) == 0 {
+		t.Fatal("forward data-loss scope was not audited")
+	}
+}
+
+func TestAutomaticRecoveryResumesPersistedForwardStrategy(t *testing.T) {
+	s, _ := recoveryServer(t, nil)
+	tx := s.transactions["cos461"]
+	tx.RecoveryStrategy, tx.ForwardAcknowledged = "forward", true
+	tx.Phase = transactionRollbackFailed
+	s.transactions["cos461"] = tx
+	forward := make(chan struct{})
+	s.recoveryForward = func(context.Context, string, Fence, applyTransaction) error {
+		close(forward)
+		return nil
+	}
+	s.recoveryRollback = func(context.Context, string, Fence, applyTransaction) error {
+		t.Fatal("automatic recovery silently fell back to rollback")
+		return nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s.resumeRecoveries(ctx)
+	select {
+	case <-forward:
+	case <-time.After(time.Second):
+		t.Fatal("automatic recovery did not resume persisted forward strategy")
+	}
+}
+
+func TestForwardRecoveryBudgetFitsTenMinuteSLA(t *testing.T) {
+	if got := forwardRecoveryBudget(212, 4); got > forwardRecoverySLAMax || got < 6*time.Minute {
+		t.Fatalf("212-device forward deadline = %s, want bounded 6m..%s", got, forwardRecoverySLAMax)
 	}
 }
