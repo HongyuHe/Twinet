@@ -27,6 +27,7 @@ import (
 	"github.com/HongyuHe/twinet/internal/limiter"
 	"github.com/HongyuHe/twinet/internal/model"
 	"github.com/HongyuHe/twinet/internal/netx"
+	"github.com/HongyuHe/twinet/internal/nos"
 	"github.com/HongyuHe/twinet/internal/plan"
 	"github.com/HongyuHe/twinet/internal/runtime"
 	"github.com/HongyuHe/twinet/internal/state"
@@ -1778,32 +1779,85 @@ func (e *Engine) configureDesired(ctx context.Context, d *model.Device, state de
 }
 
 func (e *Engine) resetStudentNetworkState(ctx context.Context, d *model.Device) error {
-	var ifaces []string
-	for _, iface := range d.Ifaces {
-		if iface.Owner == model.OwnerStudent {
-			ifaces = append(ifaces, iface.Name)
-		}
-	}
-	for _, iface := range ifaces {
-		// The link was made before configure. If it cannot be reset, carrying
-		// a reference answer into teaching mode is worse than failing the
-		// transition visibly, so never suppress an ip(8) error here.
-		script := "ip addr flush dev " + iface + " scope global || exit $?; " +
-			"ip -6 addr flush dev " + iface + " scope global || exit $?; " +
-			"ip route flush dev " + iface + " || exit $?; " +
-			"ip -6 route flush dev " + iface
-		result, err := e.Runtime.Exec(ctx, d.Container, runtime.ExecCmd{Cmd: []string{"sh", "-c", script}})
+	for _, command := range referenceNetworkResetCommands(d) {
+		result, err := e.Runtime.Exec(ctx, d.Container, runtime.ExecCmd{Cmd: []string{"sh", "-c", command}})
 		if err != nil {
-			return fmt.Errorf("reset reference address state on %s/%s: %w", d.ID, iface, err)
+			return fmt.Errorf("reset reference address state on %s: %w", d.ID, err)
 		}
 		if err := result.Err(); err != nil {
-			return fmt.Errorf("reset reference address state on %s/%s: %w", d.ID, iface, err)
+			return fmt.Errorf("reset reference address state on %s: %w", d.ID, err)
 		}
 	}
 	return nil
 }
 
+// referenceNetworkResetCommands removes only facts that solve mode installed
+// on student-owned interfaces. Alpine iproute2 rejects `addr flush ... scope
+// global` for several link kinds, and blanket flushing can remove platform
+// addresses that teaching mode must retain. Exact deletes are idempotent and
+// leave link-local/kernel addresses untouched.
+func referenceNetworkResetCommands(d *model.Device) []string {
+	if d == nil {
+		return nil
+	}
+	var commands []string
+	for _, iface := range d.Ifaces {
+		if iface.Owner != model.OwnerStudent {
+			continue
+		}
+		lines := []string{
+			"ip link show dev " + iface.Name + " >/dev/null 2>&1 || exit $?",
+		}
+		if iface.Addr4 != "" {
+			lines = append(lines,
+				"if ip -o -4 addr show dev "+iface.Name+
+					" | awk '$3 == \"inet\" && $4 == \""+iface.Addr4+"\" { found=1 } END { exit !found }'; then",
+				"  ip addr del "+iface.Addr4+" dev "+iface.Name+" || exit $?",
+				"fi")
+		}
+		if iface.Addr6 != "" {
+			lines = append(lines,
+				"if ip -o -6 addr show dev "+iface.Name+
+					" | awk '$3 == \"inet6\" && $4 == \""+iface.Addr6+"\" { found=1 } END { exit !found }'; then",
+				"  ip -6 addr del "+iface.Addr6+" dev "+iface.Name+" || exit $?",
+				"fi")
+		}
+		// Routes on a student-owned non-loopback interface are part of the
+		// reference answer in solve mode. Deleting the exact loopback address
+		// already removes its connected route; flushing lo risks kernel local
+		// defaults that platform mode never owned.
+		if iface.Name != "lo" {
+			lines = append(lines,
+				"ip route flush dev "+iface.Name+" || exit $?",
+				"ip -6 route flush dev "+iface.Name+" || exit $?")
+		}
+		commands = append(commands, strings.Join(lines, "\n"))
+	}
+	// `tun6` is the renderer's reference-only 6in4 tunnel. A student's
+	// captured tunnel is restored after platform mode is configured; an
+	// untouched teaching start remains blank.
+	if d.Kind == model.KindRouter && d.L2Gateway != "" {
+		commands = append(commands, strings.Join([]string{
+			"if ip link show tun6 >/dev/null 2>&1; then",
+			"  ip -6 route flush dev tun6 || exit $?",
+			"  ip tunnel del tun6 || exit $?",
+			"fi",
+		}, "\n"))
+	}
+	return commands
+}
+
 func (e *Engine) restartPlatformRouting(ctx context.Context, d *model.Device) error {
+	provider, err := nos.Resolve(d)
+	if err != nil {
+		return fmt.Errorf("resolve routing provider for %s: %w", d.ID, err)
+	}
+	// BIRD's renderer invokes birdProvider.Apply, which replaces/reloads BIRD
+	// with the platform file. It has no FRR init script and must never be sent
+	// an FRR lifecycle command during a mode transition.
+	if provider.Name() != model.DefaultNOS {
+		return nil
+	}
 	container := d.Container
 	if e.usesFRRControl(d) {
 		container = FRRControlContainer(d)

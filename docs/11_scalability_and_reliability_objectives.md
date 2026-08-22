@@ -279,6 +279,11 @@ disk disappears.
   reference host address/default route cannot be skipped merely because its
   runtime spec was unchanged. Returning from solve resets reference state and
   restores only durable teaching state.
+- Solve-to-platform removes exact reference addresses and routes only from
+  student-owned interfaces; it preserves platform/link-local/kernel state.
+  Routing reset is provider-aware: FRR reloads in its private control sidecar,
+  while BIRD applies its own platform configuration and never invokes FRR
+  lifecycle scripts.
 
 ### O8 - Implement true reconciliation and correct self-healing
 

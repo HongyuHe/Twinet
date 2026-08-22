@@ -2291,11 +2291,16 @@ func (s *Server) rollbackExactContracts(ctx context.Context, lab string, fence F
 			if device == nil {
 				return fmt.Errorf("rollback contract references unknown device %q", entry.DeviceID)
 			}
+			current, err := s.rt.Inspect(phaseCtx, entry.Spec.Name)
+			if err != nil {
+				return fmt.Errorf("inspect rollback primary %s: %w", entry.Spec.Name, err)
+			}
 			// A split FRR control sidecar joins the primary container's
-			// network namespace. It must be removed before replacing that
-			// primary: retaining the old namespace holder can leave Docker
-			// Start blocked with the replacement stuck in Created.
-			if entry.Control != nil {
+			// network namespace. Remove it only when the primary genuinely
+			// needs replacement. Retrying a timeout must never tear down a
+			// healthy restored control merely because another object stalled.
+			replacePrimary := current.State == rt.StateAbsent || !exactRuntimeSpecMatches(current, &entry.Spec)
+			if replacePrimary && entry.Control != nil {
 				if err := s.removeRecoveryContainerIfPresent(phaseCtx, entry.Control.Name); err != nil {
 					return fmt.Errorf("remove rollback control %s before primary replacement: %w",
 						entry.Control.Name, err)
@@ -2313,8 +2318,8 @@ func (s *Server) rollbackExactContracts(ctx context.Context, lab string, fence F
 		return err
 	}
 	if !keepWiring {
-		if err := s.runRecoveryPhase(ctx, lab, fence, tx.Generation,
-			"rollback", "rewire prior topology", func(phaseCtx context.Context) error {
+		if err := s.runRecoveryPhaseLimit(ctx, lab, fence, tx.Generation,
+			"rollback", "rewire prior topology", s.recoveryArtifactLimit(), func(phaseCtx context.Context) error {
 				return s.workLimiter().Run(phaseCtx, []limiter.Kind{limiter.Apply, limiter.Netlink}, func() error {
 					if err := eng.RewireTopology(phaseCtx, top); err != nil {
 						return fmt.Errorf("rewire exact rollback topology: %w", err)
