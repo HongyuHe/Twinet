@@ -48,6 +48,9 @@ const (
 	// changing one link's delay changes it, which would otherwise recreate
 	// every container in the class.
 	LabelSpec = "twinet.spec-hash"
+	// LabelRuntimeContract names the version folded into LabelSpec. It makes
+	// a policy migration auditable while the hash remains the authority.
+	LabelRuntimeContract = "twinet.runtime-spec-contract"
 	// LabelGen is the deployment generation, used to find objects that the
 	// current topology no longer wants.
 	LabelGen      = "twinet.generation"
@@ -164,12 +167,13 @@ type Engine struct {
 
 	// pendingRestore records devices whose captured configuration must be
 	// replayed once their interfaces exist.
-	pendingRestore sync.Map
-	observationMu  sync.Mutex
-	observation    *observationTracker
-	lastDiff       BuildDiff
-	mutationMu     sync.Mutex
-	mutations      map[string]int
+	pendingRestore       sync.Map
+	observationMu        sync.Mutex
+	observation          *observationTracker
+	lastDiff             BuildDiff
+	mutationMu           sync.Mutex
+	mutations            map[string]int
+	removeEmptyMultiplex func(string) ([]string, error)
 }
 
 func (e *Engine) limited(ctx context.Context, kinds []limiter.Kind, fn func() error) error {
@@ -285,11 +289,12 @@ func (e *Engine) BuildContext(ctx context.Context, top *model.Topology) (*plan.P
 			Needs:    []string{imageStep[dev.Image]},
 			Run: func(ctx context.Context) error {
 				return e.limited(ctx, []limiter.Kind{limiter.Apply, limiter.Lifecycle}, func() error {
-					if err := e.ensureContainer(ctx, top, dev); err != nil {
+					state := desired[dev.ID]
+					if err := e.ensureContainer(ctx, top, dev, state.runtime); err != nil {
 						return err
 					}
 					e.recordMutation("create", 1)
-					return tracker.markDevice(dev.ID, observedDeviceState{SpecHash: SpecHash(dev)})
+					return tracker.markDevice(dev.ID, observedDeviceState{SpecHash: state.runtime.spec.Labels[LabelSpec]})
 				})
 			},
 		})
@@ -373,7 +378,7 @@ func (e *Engine) BuildContext(ctx context.Context, top *model.Topology) (*plan.P
 						return err
 					}
 					return tracker.markDevice(dev.ID, observedDeviceState{
-						SpecHash: SpecHash(dev), ConfigHash: state.configHash,
+						SpecHash: state.runtime.spec.Labels[LabelSpec], ConfigHash: state.configHash,
 						FileHash: state.fileHash, CommandHash: state.commandHash, ReadyHash: "",
 					})
 				})
@@ -411,7 +416,7 @@ func (e *Engine) BuildContext(ctx context.Context, top *model.Topology) (*plan.P
 						}
 						state := desired[dev.ID]
 						return tracker.markDevice(dev.ID, observedDeviceState{
-							SpecHash: SpecHash(dev), ConfigHash: state.configHash,
+							SpecHash: state.runtime.spec.Labels[LabelSpec], ConfigHash: state.configHash,
 							FileHash: state.fileHash, CommandHash: state.commandHash, ReadyHash: state.readyHash,
 						})
 					})
@@ -471,16 +476,15 @@ func (e *Engine) pullPolicy() runtime.PullPolicy {
 // A container built from a different topology is replaced rather than reused:
 // silently running a stale container is worse than recreating one, because the
 // difference is invisible to a student.
-func (e *Engine) ensureContainer(ctx context.Context, top *model.Topology, d *model.Device) error {
+func (e *Engine) ensureContainer(ctx context.Context, top *model.Topology, d *model.Device,
+	final finalDeviceSpec,
+) error {
 	cur, err := e.Runtime.Inspect(ctx, d.Container)
 	if err != nil {
 		return err
 	}
-	controlBinds, err := e.frrControlBinds(top, d)
-	if err != nil {
-		return err
-	}
-	want := SpecHash(d)
+
+	want := final.spec.Labels[LabelSpec]
 
 	if cur.State != runtime.StateAbsent {
 		forceRecoveryRecreate := e.RecoveryCompatibility && d.Kind == model.KindService
@@ -490,7 +494,7 @@ func (e *Engine) ensureContainer(ctx context.Context, top *model.Topology, d *mo
 		// away whatever the student had configured inside.
 		if cur.Labels[LabelSpec] == want && !forceRecoveryRecreate {
 			if cur.State.Joinable() {
-				if err := e.ensureFRRControl(ctx, top, d, controlBinds); err != nil {
+				if err := e.ensureFRRControl(ctx, top, final); err != nil {
 					return err
 				}
 				return nil
@@ -503,7 +507,7 @@ func (e *Engine) ensureContainer(ctx context.Context, top *model.Topology, d *mo
 			if err := e.restoreIfNeeded(ctx, top, d); err != nil {
 				return err
 			}
-			return e.ensureFRRControl(ctx, top, d, controlBinds)
+			return e.ensureFRRControl(ctx, top, final)
 		}
 
 		// It genuinely must be replaced. Capture first; if capture fails we
@@ -520,58 +524,10 @@ func (e *Engine) ensureContainer(ctx context.Context, top *model.Topology, d *mo
 		}
 	}
 
-	binds := make([]runtime.Bind, 0, len(d.Binds)+len(controlBinds))
-	for _, b := range d.Binds {
-		parts := strings.Split(b, ":")
-		bind := runtime.Bind{Source: parts[0]}
-		if len(parts) > 1 {
-			bind.Target = parts[1]
-		}
-		if len(parts) > 2 && parts[2] == "ro" {
-			bind.ReadOnly = true
-		}
-		binds = append(binds, bind)
-	}
-	binds = append(binds, controlBinds...)
-	platformBinds, err := e.writableBinds(top, d, binds)
-	if err != nil {
+	if err := e.prepareFinalRuntimeSpecs(top, final); err != nil {
 		return err
 	}
-	binds = append(binds, platformBinds...)
-	hardening, err := e.hardenedRuntimeSpec(d, binds)
-	if err != nil {
-		return err
-	}
-	cpus, memory, pids := effectiveRuntimeLimits(d)
-	spec := &runtime.Spec{
-		Name:           d.Container,
-		Image:          d.Image,
-		Hostname:       shortHostname(d),
-		Command:        d.Command,
-		Env:            d.Env,
-		Labels:         e.labels(top, d),
-		Sysctls:        d.Sysctls,
-		Capabilities:   hardening.Capabilities,
-		CapDrop:        hardening.CapDrop,
-		SecurityOpt:    hardening.SecurityOpt,
-		ReadOnlyRootfs: hardening.ReadOnlyRootfs,
-		RuntimeClass:   hardening.RuntimeClass,
-		UsernsMode:     hardening.UsernsMode,
-		PidMode:        hardening.PidMode,
-		MaskedPaths:    hardening.MaskedPaths,
-		ReadonlyPaths:  hardening.ReadonlyPaths,
-		Privileged:     d.Privileged,
-		CPUs:           cpus,
-		Memory:         memory,
-		PidsLimit:      pids,
-		Restart:        d.Restart,
-		NetworkMode:    "none",
-		Init:           true,
-		Binds:          binds,
-		Tmpfs:          hardening.Tmpfs,
-	}
-
-	if _, err := e.Runtime.Create(ctx, spec); err != nil {
+	if _, err := e.Runtime.Create(ctx, final.spec); err != nil {
 		return err
 	}
 	if err := e.Runtime.Start(ctx, d.Container); err != nil {
@@ -580,7 +536,7 @@ func (e *Engine) ensureContainer(ctx context.Context, top *model.Topology, d *mo
 	if err := e.restoreIfNeeded(ctx, top, d); err != nil {
 		return err
 	}
-	return e.ensureFRRControl(ctx, top, d, controlBinds)
+	return e.ensureFRRControl(ctx, top, final)
 }
 
 // FRRControlContainer returns the private control-plane container associated
@@ -610,12 +566,21 @@ func (e *Engine) usesFRRControl(d *model.Device) bool {
 	// The split runtime needs Docker/Podman namespace sharing. Unit runtimes
 	// deliberately stay single-container fakes; they test planning without
 	// creating host directories or a second process namespace.
-	switch e.Runtime.Name() {
+	switch runtimeName(e.Runtime) {
 	case "docker", "podman":
 		return true
 	default:
 		return false
 	}
+}
+
+func runtimeName(r runtime.Runtime) (name string) {
+	defer func() {
+		if recover() != nil {
+			name = ""
+		}
+	}()
+	return r.Name()
 }
 
 const frrControlContractVersion = "frr-control-v2"
@@ -624,36 +589,9 @@ func (e *Engine) frrControlBinds(top *model.Topology, d *model.Device) ([]runtim
 	if !e.usesFRRControl(d) {
 		return nil, nil
 	}
-	root := e.frrControlRoot()
-	sum := sha256.Sum256([]byte(top.Name + "\x00" + d.ID))
-	dir := filepath.Join(root, top.Name, hex.EncodeToString(sum[:8]))
-	etc, run, log := filepath.Join(dir, "etc"), filepath.Join(dir, "run"), filepath.Join(dir, "log")
-	for _, path := range []string{etc, run, log} {
-		if err := os.MkdirAll(path, 0o775); err != nil {
-			return nil, fmt.Errorf("create FRR control directory for %s: %w", d.ID, err)
-		}
-	}
-	// These IDs are pinned by images/router/Dockerfile's Alpine FRR package.
-	// The shell remains root in its own container and can edit its own config,
-	// but it has no CAP_SYS_ADMIN and cannot enter the sidecar.
-	for _, path := range []string{etc, run} {
-		if err := os.Chown(path, 100, 102); err != nil {
-			return nil, fmt.Errorf("set FRR vty ownership for %s: %w", d.ID, err)
-		}
-	}
-	if err := os.Chown(log, 100, 101); err != nil {
-		return nil, fmt.Errorf("set FRR log ownership for %s: %w", d.ID, err)
-	}
-	vtysh := filepath.Join(etc, "vtysh.conf")
-	if _, err := os.Stat(vtysh); os.IsNotExist(err) {
-		if err := os.WriteFile(vtysh, []byte("service integrated-vtysh-config\n"), 0o640); err != nil {
-			return nil, fmt.Errorf("write FRR vty configuration for %s: %w", d.ID, err)
-		}
-		if err := os.Chown(vtysh, 100, 102); err != nil {
-			return nil, fmt.Errorf("set FRR vty configuration ownership for %s: %w", d.ID, err)
-		}
-	} else if err != nil {
-		return nil, fmt.Errorf("inspect FRR vty configuration for %s: %w", d.ID, err)
+	etc, run, _, err := e.frrControlPaths(top, d)
+	if err != nil {
+		return nil, err
 	}
 	return []runtime.Bind{
 		{Source: etc, Target: "/etc/frr"},
@@ -665,18 +603,55 @@ func (e *Engine) frrControlBinds(top *model.Topology, d *model.Device) ([]runtim
 // configuration directory and vty sockets they need to configure and observe
 // their own routing daemon, but not the sidecar's log filesystem.
 func (e *Engine) frrControlLogBind(top *model.Topology, d *model.Device) (runtime.Bind, error) {
-	if top == nil || d == nil {
-		return runtime.Bind{}, fmt.Errorf("FRR control log bind needs a topology and device")
-	}
-	sum := sha256.Sum256([]byte(top.Name + "\x00" + d.ID))
-	log := filepath.Join(e.frrControlRoot(), top.Name, hex.EncodeToString(sum[:8]), "log")
-	if err := os.MkdirAll(log, 0o775); err != nil {
-		return runtime.Bind{}, fmt.Errorf("create FRR control log directory for %s: %w", d.ID, err)
-	}
-	if err := os.Chown(log, 100, 101); err != nil {
-		return runtime.Bind{}, fmt.Errorf("set FRR log ownership for %s: %w", d.ID, err)
+	_, _, log, err := e.frrControlPaths(top, d)
+	if err != nil {
+		return runtime.Bind{}, err
 	}
 	return runtime.Bind{Source: log, Target: "/var/log/frr"}, nil
+}
+
+func (e *Engine) frrControlPaths(top *model.Topology, d *model.Device) (etc, run, log string, err error) {
+	if top == nil || d == nil {
+		return "", "", "", fmt.Errorf("FRR control paths need a topology and device")
+	}
+	sum := sha256.Sum256([]byte(top.Name + "\x00" + d.ID))
+	dir := filepath.Join(e.frrControlRoot(), top.Name, hex.EncodeToString(sum[:8]))
+	return filepath.Join(dir, "etc"), filepath.Join(dir, "run"), filepath.Join(dir, "log"), nil
+}
+
+func (e *Engine) prepareFRRControlPaths(top *model.Topology, d *model.Device) error {
+	if !e.usesFRRControl(d) {
+		return nil
+	}
+	etc, run, log, err := e.frrControlPaths(top, d)
+	if err != nil {
+		return err
+	}
+	for _, path := range []string{etc, run, log} {
+		if err := os.MkdirAll(path, 0o775); err != nil {
+			return fmt.Errorf("create FRR control directory for %s: %w", d.ID, err)
+		}
+	}
+	for _, path := range []string{etc, run} {
+		if err := os.Chown(path, 100, 102); err != nil {
+			return fmt.Errorf("set FRR vty ownership for %s: %w", d.ID, err)
+		}
+	}
+	if err := os.Chown(log, 100, 101); err != nil {
+		return fmt.Errorf("set FRR log ownership for %s: %w", d.ID, err)
+	}
+	vtysh := filepath.Join(etc, "vtysh.conf")
+	if _, err := os.Stat(vtysh); os.IsNotExist(err) {
+		if err := os.WriteFile(vtysh, []byte("service integrated-vtysh-config\n"), 0o640); err != nil {
+			return fmt.Errorf("write FRR vty configuration for %s: %w", d.ID, err)
+		}
+		if err := os.Chown(vtysh, 100, 102); err != nil {
+			return fmt.Errorf("set FRR vty configuration ownership for %s: %w", d.ID, err)
+		}
+	} else if err != nil {
+		return fmt.Errorf("inspect FRR vty configuration for %s: %w", d.ID, err)
+	}
+	return nil
 }
 
 func (e *Engine) frrControlRoot() string {
@@ -715,30 +690,7 @@ func (e *Engine) writableBinds(top *model.Topology, d *model.Device,
 		name := strings.TrimPrefix(target, "/")
 		name = strings.ReplaceAll(name, "/", "-")
 		source := filepath.Join(root, name)
-		if err := os.MkdirAll(source, 0o755); err != nil {
-			return nil, fmt.Errorf("create writable platform mount for %s at %s: %w", d.ID, target, err)
-		}
 		out = append(out, runtime.Bind{Source: source, Target: target})
-	}
-	// A parent bind hides image directories below it. Create every declared
-	// child upfront (for example /etc/twinet/p4 under /etc/twinet), so Docker
-	// CopyToContainer can address the exact renderer destination without a
-	// shell fallback through the read-only root filesystem.
-	for _, target := range hardening.WritablePaths {
-		target = filepath.Clean(target)
-		for _, bind := range out {
-			if target != bind.Target && !strings.HasPrefix(target, bind.Target+"/") {
-				continue
-			}
-			relative, err := filepath.Rel(bind.Target, target)
-			if err != nil || relative == "." {
-				break
-			}
-			if err := os.MkdirAll(filepath.Join(bind.Source, relative), 0o755); err != nil {
-				return nil, fmt.Errorf("create writable child mount for %s at %s: %w", d.ID, target, err)
-			}
-			break
-		}
 	}
 	return out, nil
 }
@@ -747,7 +699,53 @@ func (e *Engine) writableRoot() string {
 	if e.WritableRoot != "" {
 		return e.WritableRoot
 	}
+	if e.ObservationRoot != "" {
+		// Test/offline engines often redirect observed state to a writable
+		// workspace. Keep their derived platform volumes beside that state
+		// rather than assuming the privileged agent's /run root.
+		return filepath.Join(e.ObservationRoot, "writable")
+	}
 	return filepath.Join("/run", "twinet", "writable")
+}
+
+// prepareFinalRuntimeSpecs performs the only filesystem side effects needed
+// for a derived runtime contract. It is called immediately before a primary
+// or sidecar create/recreate, never by RuntimeSpec, FinalSpecHash, or observed
+// planning.
+func (e *Engine) prepareFinalRuntimeSpecs(top *model.Topology, final finalDeviceSpec) error {
+	if err := e.preparePlatformBinds(final.device, final.platformBinds); err != nil {
+		return err
+	}
+	return e.prepareFRRControlPaths(top, final.device)
+}
+
+func (e *Engine) preparePlatformBinds(d *model.Device, binds []runtime.Bind) error {
+	if d == nil {
+		return fmt.Errorf("prepare platform binds for nil device")
+	}
+	for _, bind := range binds {
+		if err := os.MkdirAll(bind.Source, 0o755); err != nil {
+			return fmt.Errorf("create writable platform mount for %s at %s: %w", d.ID, bind.Target, err)
+		}
+	}
+	hardening := effectiveHardening(d)
+	for _, target := range hardening.WritablePaths {
+		target = filepath.Clean(target)
+		for _, bind := range binds {
+			if target != bind.Target && !strings.HasPrefix(target, bind.Target+"/") {
+				continue
+			}
+			relative, err := filepath.Rel(bind.Target, target)
+			if err != nil || relative == "." {
+				break
+			}
+			if err := os.MkdirAll(filepath.Join(bind.Source, relative), 0o755); err != nil {
+				return fmt.Errorf("create writable child mount for %s at %s: %w", d.ID, target, err)
+			}
+			break
+		}
+	}
+	return nil
 }
 
 func platformWritableBindTargets(paths []string) []string {
@@ -787,67 +785,33 @@ func platformWritableBindTargets(paths []string) []string {
 	return out
 }
 
-func (e *Engine) ensureFRRControl(ctx context.Context, top *model.Topology, d *model.Device, binds []runtime.Bind) error {
-	if !e.usesFRRControl(d) {
+func (e *Engine) ensureFRRControl(ctx context.Context, top *model.Topology, final finalDeviceSpec) error {
+	spec := final.controlSpec
+	if spec == nil {
 		return nil
 	}
-	name := FRRControlContainer(d)
+	name := spec.Name
 	current, err := e.Runtime.Inspect(ctx, name)
 	if err != nil {
 		return err
 	}
-	want := frrControlSpecHash(d)
+	want := spec.Labels[LabelSpec]
 	if current.State != runtime.StateAbsent {
 		if current.Labels[LabelSpec] == want && current.State.Joinable() {
 			return nil
 		}
 		if err := e.Runtime.Remove(ctx, name, true); err != nil {
-			return fmt.Errorf("replace FRR control for %s: %w", d.ID, err)
+			return fmt.Errorf("replace FRR control %s: %w", name, err)
 		}
 	}
-	labels := e.labels(top, d)
-	labels[LabelFRRControl] = "true"
-	labels[LabelInternal] = "true"
-	labels[LabelSpec] = want
-	labels[LabelKind] = "frr-control"
-	sidecarRequest := model.FRRControlResourceRequest()
-	setRequestLabels(labels, sidecarRequest)
-	sidecarBinds := append([]runtime.Bind(nil), binds...)
-	logBind, err := e.frrControlLogBind(top, d)
-	if err != nil {
+	if err := e.prepareFinalRuntimeSpecs(top, final); err != nil {
 		return err
-	}
-	sidecarBinds = append(sidecarBinds, logBind)
-	hardening, err := e.hardenedRuntimeSpec(d, sidecarBinds)
-	if err != nil {
-		return err
-	}
-	spec := &runtime.Spec{
-		Name: name, Image: d.Image,
-		Command: []string{"sleep", "infinity"},
-		Labels:  labels, Binds: sidecarBinds,
-		Capabilities:   frrControlCapabilities(d),
-		CapDrop:        hardening.CapDrop,
-		SecurityOpt:    hardening.SecurityOpt,
-		ReadOnlyRootfs: hardening.ReadOnlyRootfs,
-		RuntimeClass:   hardening.RuntimeClass,
-		UsernsMode:     hardening.UsernsMode,
-		PidMode:        hardening.PidMode,
-		MaskedPaths:    hardening.MaskedPaths,
-		ReadonlyPaths:  hardening.ReadonlyPaths,
-		Tmpfs:          hardening.Tmpfs,
-		CPUs:           sidecarRequest.CPUs,
-		Memory:         sidecarRequest.Memory,
-		PidsLimit:      sidecarRequest.Pids,
-		Restart:        d.Restart,
-		NetworkMode:    "container:" + d.Container,
-		Init:           true,
 	}
 	if _, err := e.Runtime.Create(ctx, spec); err != nil {
-		return fmt.Errorf("create FRR control for %s: %w", d.ID, err)
+		return fmt.Errorf("create FRR control %s: %w", name, err)
 	}
 	if err := e.Runtime.Start(ctx, name); err != nil {
-		return fmt.Errorf("start FRR control for %s: %w", d.ID, err)
+		return fmt.Errorf("start FRR control %s: %w", name, err)
 	}
 	return nil
 }
@@ -1317,7 +1281,7 @@ func sortedCopy(in []string) []string {
 	return out
 }
 
-func (e *Engine) labels(top *model.Topology, d *model.Device) map[string]string {
+func (e *Engine) labels(top *model.Topology, d *model.Device, specHash string) map[string]string {
 	request := d.Requests
 	if request.Empty() {
 		request = model.DefaultResourceRequest(d.Kind)
@@ -1330,7 +1294,9 @@ func (e *Engine) labels(top *model.Topology, d *model.Device) map[string]string 
 		LabelKind:     string(d.Kind),
 		LabelNode:     e.Node,
 		LabelHash:     top.Hash,
-		LabelSpec:     SpecHash(d),
+	}
+	if specHash != "" {
+		out[LabelSpec] = specHash
 	}
 	if top.Lab != nil && top.Lab.Images.LockDigest != "" {
 		out[LabelImageLock] = top.Lab.Images.LockDigest
@@ -1872,7 +1838,7 @@ func (e *Engine) Destroy(ctx context.Context, lab string) error {
 	}
 	if ctxErr == nil {
 		if err := e.limited(ctx, []limiter.Kind{limiter.Netlink}, func() error {
-			_, removeErr := netx.RemoveEmptyMultiplexOverlays(lab)
+			_, removeErr := e.removeEmptyMultiplexOverlays(lab)
 			return removeErr
 		}); err != nil {
 			problems = append(problems, fmt.Sprintf("remove empty multiplex overlays: %v", err))
@@ -1887,6 +1853,13 @@ func (e *Engine) Destroy(ctx context.Context, lab string) error {
 		}
 	}
 	return deterministicError(ctxErr, problems)
+}
+
+func (e *Engine) removeEmptyMultiplexOverlays(lab string) ([]string, error) {
+	if e.removeEmptyMultiplex != nil {
+		return e.removeEmptyMultiplex(lab)
+	}
+	return netx.RemoveEmptyMultiplexOverlays(lab)
 }
 
 func removalGroups(containers []runtime.Container) [][]runtime.Container {

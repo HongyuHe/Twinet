@@ -137,28 +137,31 @@ type transactionContainer struct {
 // transactionInventory is both rollback evidence and the post-recovery
 // verifier. Overlay VNIs cover legacy and multiplex objects uniformly.
 type transactionInventory struct {
-	TopologyHash string                 `json:"topology_hash,omitempty"`
-	Generation   string                 `json:"generation,omitempty"`
-	Containers   []transactionContainer `json:"containers,omitempty"`
-	VNIs         []uint32               `json:"vnis,omitempty"`
-	CapturedAt   time.Time              `json:"captured_at"`
-	StateSafe    bool                   `json:"state_safe"`
+	TopologyHash string                   `json:"topology_hash,omitempty"`
+	Generation   string                   `json:"generation,omitempty"`
+	Containers   []transactionContainer   `json:"containers,omitempty"`
+	VNIs         []uint32                 `json:"vnis,omitempty"`
+	CapturedAt   time.Time                `json:"captured_at"`
+	StateSafe    bool                     `json:"state_safe"`
+	RuntimeSpecs []transactionRuntimeSpec `json:"runtime_specs,omitempty"`
+	OverlayState []netx.MultiplexOverlay  `json:"overlay_state,omitempty"`
 }
 
 // RecoveryStatus is safe to expose in node status and recovery responses. It
 // names a phase and inventory counts, never student configuration content.
 type RecoveryStatus struct {
-	Lab                string `json:"lab"`
-	Phase              string `json:"phase"`
-	Generation         string `json:"generation,omitempty"`
-	PreviousGeneration string `json:"previous_generation,omitempty"`
-	ExpectedContainers int    `json:"expected_containers"`
-	ObservedContainers int    `json:"observed_containers"`
-	ExpectedVNIs       int    `json:"expected_vnis"`
-	ObservedVNIs       int    `json:"observed_vnis"`
-	Consistent         bool   `json:"consistent"`
-	Attempts           int    `json:"attempts,omitempty"`
-	Error              string `json:"error,omitempty"`
+	Lab                string   `json:"lab"`
+	Phase              string   `json:"phase"`
+	Generation         string   `json:"generation,omitempty"`
+	PreviousGeneration string   `json:"previous_generation,omitempty"`
+	ExpectedContainers int      `json:"expected_containers"`
+	ObservedContainers int      `json:"observed_containers"`
+	ExpectedVNIs       int      `json:"expected_vnis"`
+	ObservedVNIs       int      `json:"observed_vnis"`
+	Consistent         bool     `json:"consistent"`
+	Attempts           int      `json:"attempts,omitempty"`
+	Error              string   `json:"error,omitempty"`
+	AllowedStrategies  []string `json:"allowed_strategies,omitempty"`
 }
 
 // applyTransaction persists enough information to fail closed after a crashed
@@ -185,6 +188,7 @@ type applyTransaction struct {
 	Failure           string               `json:"failure,omitempty"`
 	RecoveryAttempts  int                  `json:"recovery_attempts,omitempty"`
 	LastRecovery      time.Time            `json:"last_recovery,omitempty"`
+	NextRecovery      time.Time            `json:"next_recovery,omitempty"`
 	Applied           bool                 `json:"applied"`
 	Committed         bool                 `json:"committed"`
 }

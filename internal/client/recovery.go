@@ -35,6 +35,15 @@ func (n *Node) RecoveryStatus(ctx context.Context, lab string) (agent.RecoverySt
 // Recover resumes a failed transaction under a fresh cluster lease and waits
 // until every reachable node proves the same generation and exact inventory.
 func (c *Cluster) Recover(ctx context.Context, lab string) (RecoveryReport, error) {
+	return c.RecoverWithStrategy(ctx, lab, "rollback")
+}
+
+// RecoverWithStrategy chooses the only two explicit outcomes for a failed
+// transaction. Forward is never selected by automatic deploy recovery.
+func (c *Cluster) RecoverWithStrategy(ctx context.Context, lab, strategy string) (RecoveryReport, error) {
+	if strategy != "rollback" && strategy != "forward" {
+		return RecoveryReport{Lab: lab}, fmt.Errorf("unknown recovery strategy %q", strategy)
+	}
 	ctx = operationContext(ctx)
 	initial, pending, err := c.readRecoveryStatuses(ctx, lab)
 	if err != nil {
@@ -68,7 +77,7 @@ func (c *Cluster) Recover(ctx context.Context, lab string) (RecoveryReport, erro
 		return RecoveryReport{Lab: lab}, nil
 	}
 	defer lease.Release()
-	return c.recoverWithLease(lease.Context(), lab, lease)
+	return c.recoverWithLeaseStrategy(lease.Context(), lab, lease, strategy)
 }
 
 func (c *Cluster) readRecoveryStatuses(ctx context.Context, lab string) (RecoveryReport, bool, error) {
@@ -104,6 +113,12 @@ func (c *Cluster) readRecoveryStatuses(ctx context.Context, lab string) (Recover
 }
 
 func (c *Cluster) recoverWithLease(ctx context.Context, lab string, lease *MutationLease) (RecoveryReport, error) {
+	return c.recoverWithLeaseStrategy(ctx, lab, lease, "rollback")
+}
+
+func (c *Cluster) recoverWithLeaseStrategy(ctx context.Context, lab string, lease *MutationLease,
+	strategy string,
+) (RecoveryReport, error) {
 	report := RecoveryReport{Lab: lab, Nodes: map[string]agent.RecoveryStatus{}}
 	var problems []string
 	for _, node := range c.sortedNodes() {
@@ -112,7 +127,9 @@ func (c *Cluster) recoverWithLease(ctx context.Context, lab string, lease *Mutat
 			problems = append(problems, fmt.Sprintf("%s has no recovery fence", node.Name))
 			continue
 		}
-		response, err := node.Recover(ctx, agent.RecoveryRequest{Lab: lab, Fence: fence})
+		response, err := node.Recover(ctx, agent.RecoveryRequest{
+			Lab: lab, Fence: fence, Strategy: strategy,
+		})
 		if err != nil {
 			problems = append(problems, fmt.Sprintf("%s recovery: %v", node.Name, err))
 			continue

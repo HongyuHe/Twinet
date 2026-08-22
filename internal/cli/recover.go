@@ -14,7 +14,10 @@ import (
 // newRecoverCmd resumes a durable rollback rather than telling an operator to
 // destroy a lab whose prior generation may still be the only safe copy.
 func newRecoverCmd(opts *Options) *cobra.Command {
-	var token string
+	var (
+		token    string
+		strategy string
+	)
 	cmd := &cobra.Command{
 		Use:   "recover",
 		Short: "Resume and verify a failed cluster transaction",
@@ -30,7 +33,7 @@ func newRecoverCmd(opts *Options) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			report, err := client.NewCluster(top.Lab, tok).Recover(cmd.Context(), top.Name)
+			report, err := client.NewCluster(top.Lab, tok).RecoverWithStrategy(cmd.Context(), top.Name, strategy)
 			if opts.JSON {
 				if encodeErr := json.NewEncoder(cmd.OutOrStdout()).Encode(report); encodeErr != nil {
 					return encodeErr
@@ -68,5 +71,7 @@ func newRecoverCmd(opts *Options) *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&token, "token", "", "agent token (or set TWINET_TOKEN)")
+	cmd.Flags().StringVar(&strategy, "strategy", "rollback",
+		"recovery strategy: rollback (safe default) or forward (explicit desired transaction resume)")
 	return cmd
 }

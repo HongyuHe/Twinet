@@ -71,6 +71,7 @@ type desiredDeviceState struct {
 	fileHash    string
 	commandHash string
 	readyHash   string
+	runtime     finalDeviceSpec
 }
 
 type nodeObservedState struct {
@@ -315,16 +316,23 @@ func (e *Engine) observeNode(ctx context.Context, top *model.Topology, devices [
 		if err != nil {
 			return nil, nil, BuildDiff{}, err
 		}
+		state.runtime, err = e.finalRuntimeSpecs(top, d)
+		if err != nil {
+			return nil, nil, BuildDiff{}, err
+		}
 		desired[d.ID] = state
 		container, ok := byName[d.Container]
 		specDirty := !ok || container.State == runtime.StateAbsent || !container.State.Joinable() ||
-			container.Labels[LabelSpec] != SpecHash(d)
+			container.Labels[LabelSpec] != state.runtime.spec.Labels[LabelSpec] ||
+			container.Labels[LabelRuntimeContract] != runtimeSpecContractVersion
 		if e.RecoveryCompatibility && d.Kind == model.KindService {
 			specDirty = true
 		}
-		if !specDirty && e.usesFRRControl(d) {
+		if !specDirty && state.runtime.controlSpec != nil {
 			control, controlOK := byName[FRRControlContainer(d)]
-			specDirty = !controlOK || !control.State.Joinable() || control.Labels[LabelSpec] != frrControlSpecHash(d)
+			specDirty = !controlOK || !control.State.Joinable() ||
+				control.Labels[LabelSpec] != state.runtime.controlSpec.Labels[LabelSpec] ||
+				control.Labels[LabelRuntimeContract] != runtimeSpecContractVersion
 		}
 		if specDirty {
 			diff.Create[d.ID] = true
@@ -337,7 +345,7 @@ func (e *Engine) observeNode(ctx context.Context, top *model.Topology, devices [
 		bootstrap := !specDirty && container.Labels[LabelHash] == top.Hash && d.ASN > 0
 		if !known && bootstrap {
 			previous = observedDeviceState{
-				SpecHash: SpecHash(d), ConfigHash: state.configHash,
+				SpecHash: state.runtime.spec.Labels[LabelSpec], ConfigHash: state.configHash,
 				FileHash: state.fileHash, CommandHash: state.commandHash, ReadyHash: state.readyHash,
 			}
 			tracker.bootstrapDevice(d.ID, previous)

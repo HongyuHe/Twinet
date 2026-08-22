@@ -68,7 +68,8 @@ func TestDestroyUsesBoundedParallelWorkers(t *testing.T) {
 			{Name: "e"}, {Name: "f"}, {Name: "g"}, {Name: "h"},
 		},
 	}
-	engine := &Engine{Runtime: runtime, Workers: 3}
+	engine := &Engine{Runtime: runtime, Workers: 3,
+		removeEmptyMultiplex: func(string) ([]string, error) { return nil, nil }}
 	done := make(chan error, 1)
 	go func() { done <- engine.Destroy(context.Background(), "lab") }()
 	for i := 0; i < 3; i++ {
@@ -99,7 +100,8 @@ func TestDestroyReportsConcurrentFailuresDeterministically(t *testing.T) {
 		},
 	}
 
-	err := (&Engine{Runtime: runtime, Workers: 3}).Destroy(context.Background(), "lab")
+	err := (&Engine{Runtime: runtime, Workers: 3,
+		removeEmptyMultiplex: func(string) ([]string, error) { return nil, nil }}).Destroy(context.Background(), "lab")
 	if err == nil {
 		t.Fatal("destroy unexpectedly succeeded")
 	}

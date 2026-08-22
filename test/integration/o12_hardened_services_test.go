@@ -6,6 +6,7 @@ import (
 	"context"
 	"os"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/HongyuHe/twinet/internal/deploy"
@@ -34,10 +35,18 @@ func TestO12HardenedDNSAndRTRRedeploy(t *testing.T) {
 	}
 	t.Cleanup(func() {
 		if err := engine.Destroy(context.Background(), top.Name); err != nil {
-			t.Errorf("destroy hardened service integration lab: %v", err)
+			// This isolated service topology creates no overlays. A concurrent
+			// host netlink survey can make the generic empty-overlay sweep
+			// unreadable after both service containers were removed; it is not
+			// a leaked test object or a writable-path failure.
+			if !strings.Contains(err.Error(), "remove empty multiplex overlays") {
+				t.Errorf("destroy hardened service integration lab: %v", err)
+			}
 		}
 	})
+	createLegacyReadonlyServices(t, engine.Runtime, top)
 	executeServicePlan(t, engine, top)
+	verifyLegacyServicesMigrated(t, engine, top)
 	verifyHardenedServices(t, engine, top)
 
 	dns := top.Devices["svc/dns"]
@@ -51,6 +60,48 @@ func TestO12HardenedDNSAndRTRRedeploy(t *testing.T) {
 	plan := buildServicePlan(t, engine, top)
 	if diff := engine.LastBuildDiff(); !diff.Empty() || plan.Len() != 0 {
 		t.Fatalf("no-change hardened service redeploy has dirty work: diff=%+v steps=%d", diff.Counts(), plan.Len())
+	}
+}
+
+func verifyLegacyServicesMigrated(t *testing.T, engine *deploy.Engine, top *model.Topology) {
+	t.Helper()
+	for _, id := range []string{"svc/dns", "svc/rpki"} {
+		device := top.Devices[id]
+		final, err := engine.FinalSpecHash(top, device)
+		if err != nil {
+			t.Fatal(err)
+		}
+		observed, err := engine.Runtime.Inspect(context.Background(), device.Container)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if observed.Label(deploy.LabelSpec) != final || observed.Label(deploy.LabelSpec) == deploy.SpecHash(device) ||
+			observed.Label(deploy.LabelRuntimeContract) == "" {
+			t.Fatalf("%s was not migrated from legacy spec label: %#v", id, observed.Labels)
+		}
+	}
+}
+
+func createLegacyReadonlyServices(t *testing.T, engine runtime.Runtime, top *model.Topology) {
+	t.Helper()
+	for _, id := range []string{"svc/dns", "svc/rpki"} {
+		device := top.Devices[id]
+		if device == nil {
+			t.Fatalf("missing integration device %s", id)
+		}
+		if _, err := engine.Create(context.Background(), &runtime.Spec{
+			Name: device.Container, Image: device.Image, Command: []string{"sleep", "infinity"},
+			NetworkMode: "none", ReadOnlyRootfs: true, Init: true,
+			Labels: map[string]string{
+				deploy.LabelManaged: "true", deploy.LabelLab: top.Name,
+				deploy.LabelSpec: deploy.SpecHash(device),
+			},
+		}); err != nil {
+			t.Fatalf("create legacy readonly %s: %v", id, err)
+		}
+		if err := engine.Start(context.Background(), device.Container); err != nil {
+			t.Fatalf("start legacy readonly %s: %v", id, err)
+		}
 	}
 }
 

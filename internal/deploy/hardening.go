@@ -18,17 +18,7 @@ func (e *Engine) hardenedRuntimeSpec(d *model.Device, binds []runtime.Bind) (*ru
 	if d == nil {
 		return nil, fmt.Errorf("cannot harden a nil device")
 	}
-	device := d
-	if e.RecoveryCompatibility {
-		clone := *d
-		clone.Capabilities = clone.Capabilities[:0:0]
-		for _, capability := range d.Capabilities {
-			if normalizeCapability(capability) != "SYS_ADMIN" {
-				clone.Capabilities = append(clone.Capabilities, capability)
-			}
-		}
-		device = &clone
-	}
+	device := e.effectiveRuntimeDevice(d)
 	h := effectiveHardening(device)
 	if err := validateRuntimeHardening(device, h); err != nil {
 		return nil, err
@@ -45,7 +35,7 @@ func (e *Engine) hardenedRuntimeSpec(d *model.Device, binds []runtime.Bind) (*ru
 		"seccomp=" + h.SeccompProfile,
 		"apparmor=" + h.AppArmorProfile,
 	}
-	if e.Runtime != nil && e.Runtime.Name() == "podman" &&
+	if e.Runtime != nil && runtimeName(e.Runtime) == "podman" &&
 		strings.EqualFold(h.AppArmorProfile, "docker-default") {
 		// Podman selects its loaded default AppArmor profile when no explicit
 		// profile is supplied. Its rootful service on supported Ubuntu hosts
@@ -68,6 +58,20 @@ func (e *Engine) hardenedRuntimeSpec(d *model.Device, binds []runtime.Bind) (*ru
 		Tmpfs:          tmpfs,
 		NetworkMode:    "none",
 	}, nil
+}
+
+func (e *Engine) effectiveRuntimeDevice(d *model.Device) *model.Device {
+	if d == nil || !e.RecoveryCompatibility {
+		return d
+	}
+	clone := *d
+	clone.Capabilities = clone.Capabilities[:0:0]
+	for _, capability := range d.Capabilities {
+		if normalizeCapability(capability) != "SYS_ADMIN" {
+			clone.Capabilities = append(clone.Capabilities, capability)
+		}
+	}
+	return &clone
 }
 
 func effectiveHardening(d *model.Device) model.RuntimeHardening {

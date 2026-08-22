@@ -90,19 +90,33 @@ func (r observedRenderer) Commands(d *model.Device) ([]Command, error) {
 
 func (r observedRenderer) Ready(*model.Device, rt.Runtime) *plan.Waiter { return nil }
 
+func seedObservedContainers(t *testing.T, engine *Engine, top *model.Topology,
+	runtime *observedRuntime,
+) {
+	t.Helper()
+	for _, d := range top.Devices {
+		hash, err := engine.FinalSpecHash(top, d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		runtime.containers = append(runtime.containers, rt.Container{
+			Name: d.Container, State: rt.StateRunning,
+			Labels: map[string]string{
+				LabelSpec: hash, LabelHash: top.Hash, LabelRuntimeContract: runtimeSpecContractVersion,
+			},
+		})
+	}
+}
+
 func TestObservedNoChangeBuildUsesOneRuntimeListForLargeNode(t *testing.T) {
 	top := observedTopology(t, 212, nil)
 	renderer := observedRenderer{revision: map[string]string{}}
 	runtime := observedRuntime{files: map[string][]byte{}}
 	for _, d := range top.Devices {
-		runtime.containers = append(runtime.containers, rt.Container{
-			Name: d.Container, State: rt.StateRunning,
-			Labels: map[string]string{LabelSpec: SpecHash(d), LabelHash: top.Hash},
-		})
 		renderer.revision[d.ID] = "one"
 	}
-
 	engine := &Engine{Runtime: &runtime, Node: "node-a", Renderer: renderer, ObservationRoot: observeTestRoot(t)}
+	seedObservedContainers(t, engine, top, &runtime)
 
 	first, err := engine.Build(top)
 	if err != nil {
@@ -149,12 +163,9 @@ func TestObservedNoChangeBuildScalesTo84AS(t *testing.T) {
 	runtime := observedRuntime{files: map[string][]byte{}}
 	for _, d := range top.Devices {
 		renderer.revision[d.ID] = "one"
-		runtime.containers = append(runtime.containers, rt.Container{
-			Name: d.Container, State: rt.StateRunning,
-			Labels: map[string]string{LabelSpec: SpecHash(d), LabelHash: top.Hash},
-		})
 	}
 	engine := &Engine{Runtime: &runtime, Node: "node-a", Renderer: renderer, ObservationRoot: observeTestRoot(t)}
+	seedObservedContainers(t, engine, top, &runtime)
 	if p, err := engine.Build(top); err != nil || p.Len() != 0 {
 		t.Fatalf("84-AS bootstrap build = %#v, %v", p, err)
 	}
@@ -185,13 +196,9 @@ func TestObservedServiceConfigChangeTouchesOnlyThatService(t *testing.T) {
 	runtime := observedRuntime{files: map[string][]byte{}}
 	for _, d := range top.Devices {
 		renderer.revision[d.ID] = "one"
-		runtime.containers = append(runtime.containers, rt.Container{
-			Name: d.Container, State: rt.StateRunning,
-			Labels: map[string]string{LabelSpec: SpecHash(d), LabelHash: top.Hash},
-		})
 	}
-
 	engine := &Engine{Runtime: &runtime, Node: "node-a", Renderer: renderer, ObservationRoot: observeTestRoot(t)}
+	seedObservedContainers(t, engine, top, &runtime)
 	if p, err := engine.Build(top); err != nil || p.Len() != 1 {
 		t.Fatalf("bootstrap build = %#v, %v", p, err)
 	} else if _, err := p.Execute(context.Background(), plan.Options{Workers: 1}); err != nil {
@@ -236,12 +243,9 @@ func TestObservedBootstrapRepairsServiceFilesWithoutTouchingRouters(t *testing.T
 	runtime := observedRuntime{files: map[string][]byte{}}
 	for _, d := range top.Devices {
 		renderer.revision[d.ID] = "one"
-		runtime.containers = append(runtime.containers, rt.Container{
-			Name: d.Container, State: rt.StateRunning,
-			Labels: map[string]string{LabelSpec: SpecHash(d), LabelHash: top.Hash},
-		})
 	}
 	engine := &Engine{Runtime: &runtime, Node: "node-a", Renderer: renderer, ObservationRoot: observeTestRoot(t)}
+	seedObservedContainers(t, engine, top, &runtime)
 	p, err := engine.Build(top)
 	if err != nil {
 		t.Fatal(err)
@@ -258,12 +262,9 @@ func TestObservedStudentConfigChangeMarksOnlyThatDeviceForCapture(t *testing.T) 
 	runtime := observedRuntime{files: map[string][]byte{}}
 	for _, d := range top.Devices {
 		renderer.revision[d.ID] = "one"
-		runtime.containers = append(runtime.containers, rt.Container{
-			Name: d.Container, State: rt.StateRunning,
-			Labels: map[string]string{LabelSpec: SpecHash(d), LabelHash: top.Hash},
-		})
 	}
 	engine := &Engine{Runtime: &runtime, Node: "node-a", Renderer: renderer, ObservationRoot: observeTestRoot(t)}
+	seedObservedContainers(t, engine, top, &runtime)
 	if p, err := engine.Build(top); err != nil || p.Len() != 0 {
 		t.Fatalf("bootstrap = %#v, %v", p, err)
 	}
@@ -284,12 +285,9 @@ func TestObservedDelayChangePlansOnlyItsWire(t *testing.T) {
 	runtime := observedRuntime{files: map[string][]byte{}}
 	for _, d := range top.Devices {
 		renderer.revision[d.ID] = "one"
-		runtime.containers = append(runtime.containers, rt.Container{
-			Name: d.Container, State: rt.StateRunning,
-			Labels: map[string]string{LabelSpec: SpecHash(d), LabelHash: top.Hash},
-		})
 	}
 	engine := &Engine{Runtime: &runtime, Node: "node-a", Renderer: renderer, ObservationRoot: observeTestRoot(t)}
+	seedObservedContainers(t, engine, top, &runtime)
 	if p, err := engine.Build(top); err != nil || p.Len() != 0 {
 		t.Fatalf("bootstrap build = %#v, %v", p, err)
 	}

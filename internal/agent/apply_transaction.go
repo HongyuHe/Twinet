@@ -117,6 +117,18 @@ func (s *Server) handleApplyPrepare(w http.ResponseWriter, r *http.Request, req 
 			prestate.StateSafe = true
 		}
 	}
+	if previous != nil {
+		s.mu.Lock()
+		previousMode, previousUngraded := s.modes[top.Name], s.ungraded[top.Name]
+		s.mu.Unlock()
+		specs, overlays, err := s.snapshotRollbackContracts(r.Context(), previous,
+			previousMode, previousUngraded, prestate.Generation, prestate)
+		if err != nil {
+			httpError(w, http.StatusConflict, fmt.Errorf("capture exact rollback contracts: %w", err))
+			return
+		}
+		prestate.RuntimeSpecs, prestate.OverlayState = specs, overlays
+	}
 	raw, err := json.Marshal(req.Topology)
 	if err != nil {
 		httpError(w, http.StatusBadRequest, fmt.Errorf("encode topology: %w", err))
@@ -306,7 +318,10 @@ func (s *Server) commitAppliedTopology(ctx context.Context, top *model.Topology,
 	if len(resp.Failures) > 0 {
 		return resp, nil
 	}
-	inventory := expectedTransactionInventory(top, s.cfg.Node, tx.Generation)
+	inventory, err := expectedTransactionInventoryFinal(eng, top, s.cfg.Node, tx.Generation)
+	if err != nil {
+		return ApplyResponse{}, fmt.Errorf("derive committed runtime inventory: %w", err)
+	}
 	if !tx.Prune {
 		// An explicitly non-pruning deployment preserves deliberate extra
 		// objects. Record what it actually left rather than pretending the
@@ -438,6 +453,9 @@ func (s *Server) rollbackPreparedApply(ctx context.Context, lab string, fence Fe
 	oldTop, err := oldWire.Rehydrate()
 	if err != nil {
 		return fmt.Errorf("rehydrate previous topology for rollback: %w", err)
+	}
+	if len(tx.Prestate.RuntimeSpecs) > 0 {
+		return s.rollbackExactContracts(ctx, lab, tx, oldTop)
 	}
 	rollback := tx
 	rollback.Generation = tx.PreviousGen

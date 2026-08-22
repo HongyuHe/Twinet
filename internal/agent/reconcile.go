@@ -843,7 +843,25 @@ func (s *Server) observeDevice(ctx context.Context, lab string, d *model.Device,
 	if err != nil {
 		return deviceObservation{Health: healthUnknown, Reason: "runtime inspect unreadable: " + err.Error()}
 	}
-	specMatches := c.Label(deploy.LabelSpec) == "" || c.Label(deploy.LabelSpec) == deploy.SpecHash(d)
+	wantSpec, specErr := s.finalSpecHash(lab, d)
+	if specErr != nil {
+		return deviceObservation{Health: healthUnknown, State: c.State,
+			Reason: "desired runtime specification is unreadable: " + specErr.Error()}
+	}
+	specMatches := c.Label(deploy.LabelSpec) == wantSpec
+	s.mu.Lock()
+	_, hasCurrentTopology := s.current[lab]
+	s.mu.Unlock()
+	if !hasCurrentTopology && c.Label(deploy.LabelSpec) == "" {
+		// Synthetic/offline repair callers have no persisted topology from
+		// which to derive a final OCI request. Do not turn that diagnostic
+		// fallback into a recreation loop; active agent labs take the strict
+		// contract path below.
+		specMatches = true
+	}
+	if hasCurrentTopology && runtimeNameForReconcile(s.rt) != "" {
+		specMatches = specMatches && c.Label(deploy.LabelRuntimeContract) == deploy.RuntimeSpecContractVersion
+	}
 	switch c.State {
 	case rt.StateAbsent:
 		return deviceObservation{Health: healthBroken, State: c.State, SpecMatches: specMatches, Reason: "container is absent"}
@@ -977,6 +995,42 @@ func (s *Server) observeDevice(ctx context.Context, lab string, d *model.Device,
 }
 
 // peerUnderlay returns the VTEP addresses recorded for a lab.
+func (s *Server) finalSpecHash(lab string, d *model.Device) (string, error) {
+	// Lightweight unit runtimes often embed a nil Runtime and expose no
+	// concrete backend name. They cannot materialize a real OCI create
+	// request, so retain the legacy hash only for that test/offline shape.
+	// Docker/Podman agents always take the final-spec path below.
+	if s.rt == nil || runtimeNameForReconcile(s.rt) == "" {
+		return deploy.SpecHash(d), nil
+	}
+	s.mu.Lock()
+	top := s.current[lab]
+	mode := s.modes[lab]
+	ungraded := s.ungraded[lab]
+	s.mu.Unlock()
+	if top == nil {
+		return deploy.SpecHash(d), nil
+	}
+	eng := &deploy.Engine{
+		Runtime: s.rt, Node: s.cfg.Node, State: s.store,
+		Renderer:        renderer(top, render.Mode(mode), ungraded),
+		WritesReference: render.Mode(mode) == render.ModeSolve,
+		UnderlayIP:      s.cfg.UnderlayIP,
+		UnderlayDev:     s.cfg.UnderlayDev,
+		PeerUnderlay:    s.peerUnderlay(top.Name),
+	}
+	return eng.FinalSpecHash(top, d)
+}
+
+func runtimeNameForReconcile(r rt.Runtime) (name string) {
+	defer func() {
+		if recover() != nil {
+			name = ""
+		}
+	}()
+	return r.Name()
+}
+
 func (s *Server) peerUnderlay(lab string) map[string]string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
