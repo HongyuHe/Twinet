@@ -548,7 +548,15 @@ func modeToPersist(authoritative bool, mode string, ungraded int,
 	if authoritative {
 		return mode, ungraded
 	}
+
 	return prevMode, prevUngraded
+}
+
+func canonicalMode(mode string) string {
+	if mode == "" {
+		return string(render.ModePlatform)
+	}
+	return mode
 }
 
 func (s *Server) release(lab string) {
@@ -849,6 +857,9 @@ type StatusResponse struct {
 	// Generations are the only committed deployment generations. A prepared
 	// transaction is deliberately absent: it is not a cluster commit.
 	Generations map[string]string `json:"generations,omitempty"`
+	// Modes exposes the committed renderer contract per lab so a node that
+	// reports a healthy inventory cannot hide a platform/solve drift.
+	Modes map[string]LabModeStatus `json:"modes,omitempty"`
 	// Recoveries exposes durable transaction state and inventory verification.
 	// A controller must not read an HTTP 200 status as proof that a failed
 	// apply preserved services; Consistent is the proof boundary.
@@ -880,6 +891,11 @@ type StatusResponse struct {
 	// peer acknowledged state. Keys are stable "lab/peer" tuples so an
 	// operator can correlate failure-domain quorum loss without state data.
 	PeerReplication map[string]PeerReplicationStatus `json:"peer_replication,omitempty"`
+}
+
+type LabModeStatus struct {
+	Mode     string `json:"mode"`
+	Ungraded int    `json:"ungraded_as,omitempty"`
 }
 
 type SemanticHealth struct {
@@ -993,6 +1009,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Unlock()
 	resp.Generations = s.committedGenerations()
+	resp.Modes = s.committedModes()
 	resp.Recoveries = s.recoveryStatuses(r.Context())
 	resp.PeerReplication = s.peerReplicationStatuses()
 
@@ -1016,6 +1033,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		resp.Hash = ""
 		resp.Lab = ""
 		resp.Generations = nil
+		resp.Modes = nil
 		resp.Recoveries = nil
 		resp.PeerReplication = nil
 		resp.SemanticHealth = nil
@@ -1318,6 +1336,7 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		State:                  s.store,
 		Prune:                  req.Prune,
 		Generation:             req.Generation,
+		ModeKey:                rendererModeKey(mode, req.Ungraded),
 		RequireImmutableImages: top.Lab.Images.RequiresImmutableImages(),
 		RetainLegacyOverlays:   req.Phase == "apply",
 		SemanticProbe: func(ctx context.Context, device *model.Device) error {

@@ -121,6 +121,7 @@ func (s *Server) handleApplyPrepare(w http.ResponseWriter, r *http.Request, req 
 			PeerUnderlay:           req.PeerUnderlay,
 			State:                  s.store,
 			Generation:             req.Generation,
+			ModeKey:                rendererModeKey(mode, req.Ungraded),
 			RequireImmutableImages: top.Lab.Images.RequiresImmutableImages(),
 			RetainLegacyOverlays:   true,
 			SemanticProbe: func(ctx context.Context, device *model.Device) error {
@@ -299,7 +300,8 @@ func (s *Server) commitAppliedTopology(ctx context.Context, top *model.Topology,
 	s.initCoordination()
 	prevMode, prevUngraded := s.modes[top.Name], s.ungraded[top.Name]
 	s.mu.Unlock()
-	wire.Mode, wire.Ungraded = modeToPersist(authoritative, tx.Mode, tx.Ungraded,
+	desiredMode := canonicalMode(tx.Mode)
+	wire.Mode, wire.Ungraded = modeToPersist(authoritative, desiredMode, tx.Ungraded,
 		prevMode, prevUngraded)
 	raw, err := json.Marshal(wire)
 	if err != nil {
@@ -317,7 +319,7 @@ func (s *Server) commitAppliedTopology(ctx context.Context, top *model.Topology,
 	}
 	s.current[top.Name] = top
 	if authoritative {
-		s.rememberHow(top.Name, tx.Mode, tx.Ungraded)
+		s.rememberHow(top.Name, desiredMode, tx.Ungraded)
 	}
 	if s.peers == nil {
 		s.peers = map[string]map[string]string{}
@@ -363,9 +365,12 @@ func (s *Server) commitAppliedTopology(ctx context.Context, top *model.Topology,
 	// reference address/default route or that a service loaded its rendered
 	// files; if this fails the old placement remains intact for rollback.
 	if touched := semanticTouchedDevices(tx); len(touched) > 0 {
-		if err := s.verifyCommittedSemantics(ctx, top, render.Mode(tx.Mode), tx.Ungraded, touched); err != nil {
+		if err := s.verifyCommittedSemantics(ctx, top, render.Mode(desiredMode), tx.Ungraded, touched); err != nil {
 			return ApplyResponse{}, fmt.Errorf("commit semantic verification failed: %w", err)
 		}
+	}
+	if err := s.verifyKnownStudentState(ctx, top, render.Mode(tx.PreviousMode), tx.PreviousUngraded); err != nil {
+		return ApplyResponse{}, err
 	}
 	if tx.Prune {
 		if err := s.transactionFail("prune"); err != nil {
@@ -483,6 +488,8 @@ func (s *Server) transactionEngine(top *model.Topology, tx applyTransaction) *de
 	if mode == "" {
 		mode = render.ModePlatform
 	}
+	previousMode := canonicalMode(tx.PreviousMode)
+	forceStudentReset := previousMode == string(render.ModeSolve) && mode != render.ModeSolve
 	return &deploy.Engine{
 		Runtime:                s.rt,
 		Node:                   s.cfg.Node,
@@ -496,6 +503,11 @@ func (s *Server) transactionEngine(top *model.Topology, tx applyTransaction) *de
 		State:                  s.store,
 		Prune:                  tx.Prune,
 		Generation:             tx.Generation,
+		ModeKey:                rendererModeKey(mode, tx.Ungraded),
+		ForceStudentReset:      forceStudentReset,
+		RestoreStudentState:    forceStudentReset,
+		PreviousMode:           previousMode,
+		PreviousUngraded:       tx.PreviousUngraded,
 		RequireImmutableImages: top.Lab.Images.RequiresImmutableImages(),
 		RetainLegacyOverlays:   true,
 		SemanticProbe: func(ctx context.Context, device *model.Device) error {

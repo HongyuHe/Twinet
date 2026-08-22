@@ -138,6 +138,18 @@ type Engine struct {
 	Prune bool
 	// Generation stamps this deployment, so pruning can identify leftovers.
 	Generation string
+	// ModeKey identifies the desired renderer mode and ungraded harness AS.
+	// It is persisted alongside observed hashes so a restarted agent cannot
+	// bootstrap a platform container as if a requested solve had already run.
+	ModeKey string
+	// ForceStudentReset is set only for a committed solve->platform
+	// transition. Reference configuration must not survive merely because the
+	// primary container spec did not change; student snapshots are replayed
+	// afterwards when RestoreStudentState is set.
+	ForceStudentReset   bool
+	RestoreStudentState bool
+	PreviousMode        string
+	PreviousUngraded    int
 	// SemanticProbe is an agent-supplied, cheap runtime fingerprint check.
 	// It lets no-change deploys detect address/route/session drift that labels
 	// and rendered-file hashes cannot observe, without coupling deploy to the
@@ -212,7 +224,17 @@ func (e *Engine) authoritativeDevice(d *model.Device) bool {
 	if renderer, ok := e.Renderer.(deviceAuthorityRenderer); ok {
 		return renderer.AuthoritativeDevice(d)
 	}
+
 	return e.Authoritative
+}
+
+func (e *Engine) shouldForceStudentReset(d *model.Device) bool {
+	if !e.ForceStudentReset || d == nil {
+		return false
+	}
+	previousSolve := e.PreviousMode == "solve" &&
+		(e.PreviousUngraded == 0 || d.ASN != e.PreviousUngraded)
+	return previousSolve && !e.authoritativeDevice(d)
 }
 
 // FileSpec is a file to place inside a container.
@@ -395,7 +417,13 @@ func (e *Engine) BuildContext(ctx context.Context, top *model.Topology) (*plan.P
 					// Whatever the student had is replayed *after* the platform's
 					// own configuration and after the interfaces exist, so it wins
 					// over the defaults and lands on devices that are present.
-					if err := e.replayPending(ctx, top, dev); err != nil {
+					if e.RestoreStudentState && e.shouldForceStudentReset(dev) && studentOwned(top, dev) {
+						if _, err := Restore(ctx, e.Runtime, dev, top.Name, e.State); err != nil {
+							return fmt.Errorf("restore student state after solve->platform transition for %s: %w", dev.ID, err)
+						}
+						e.pendingRestore.Delete(dev.ID)
+						e.clearRestorePending(ctx, dev)
+					} else if err := e.replayPending(ctx, top, dev); err != nil {
 						return err
 					}
 					return tracker.markDevice(dev.ID, observedDeviceState{
@@ -1661,6 +1689,11 @@ func (e *Engine) configureDesired(ctx context.Context, d *model.Device, state de
 	if e.Renderer == nil {
 		return nil
 	}
+	if e.shouldForceStudentReset(d) && hasStudentConfig(d) {
+		if err := e.resetStudentNetworkState(ctx, d); err != nil {
+			return err
+		}
+	}
 	for _, path := range sortedKeys(state.files) {
 		f := state.files[path]
 		keep, err := e.holdsStudentWork(ctx, d, path)
@@ -1699,10 +1732,56 @@ func (e *Engine) configureDesired(ctx context.Context, d *model.Device, state de
 		}
 		e.recordMutation("command", 1)
 	}
+	if e.shouldForceStudentReset(d) && d.Kind == model.KindRouter {
+		if err := e.restartPlatformRouting(ctx, d); err != nil {
+			return err
+		}
+	}
 	if err := e.writeConfigurationMarker(ctx, d, state.configHash); err != nil {
 		return err
 	}
+
 	e.recordMutation("configure", 1)
+	return nil
+}
+
+func (e *Engine) resetStudentNetworkState(ctx context.Context, d *model.Device) error {
+	var ifaces []string
+	for _, iface := range d.Ifaces {
+		if iface.Owner == model.OwnerStudent {
+			ifaces = append(ifaces, iface.Name)
+		}
+	}
+	for _, iface := range ifaces {
+		script := "ip addr flush dev " + iface + " 2>/dev/null || true; " +
+			"ip -6 addr flush dev " + iface + " 2>/dev/null || true; " +
+			"ip route flush dev " + iface + " 2>/dev/null || true; " +
+			"ip -6 route flush dev " + iface + " 2>/dev/null || true"
+		result, err := e.Runtime.Exec(ctx, d.Container, runtime.ExecCmd{Cmd: []string{"sh", "-c", script}})
+		if err != nil {
+			return fmt.Errorf("reset reference address state on %s/%s: %w", d.ID, iface, err)
+		}
+		if err := result.Err(); err != nil {
+			return fmt.Errorf("reset reference address state on %s/%s: %w", d.ID, iface, err)
+		}
+	}
+	return nil
+}
+
+func (e *Engine) restartPlatformRouting(ctx context.Context, d *model.Device) error {
+	container := d.Container
+	if e.usesFRRControl(d) {
+		container = FRRControlContainer(d)
+	}
+	result, err := e.Runtime.Exec(ctx, container, runtime.ExecCmd{Cmd: []string{
+		"sh", "-c", "/usr/lib/frr/frrinit.sh restart",
+	}})
+	if err != nil {
+		return fmt.Errorf("restart platform routing on %s: %w", d.ID, err)
+	}
+	if err := result.Err(); err != nil {
+		return fmt.Errorf("restart platform routing on %s: %w", d.ID, err)
+	}
 	return nil
 }
 
@@ -1767,7 +1846,7 @@ func (e *Engine) configurationCurrent(ctx context.Context, d *model.Device,
 	for _, path := range sortedKeys(files) {
 		// This path is controlled by the student once it has content. Do not
 		// turn a comparison into an excuse to load or overwrite it.
-		if studentOwnedPaths[path] && hasStudentConfig(d) && !e.authoritativeDevice(d) {
+		if studentOwnedPaths[path] && hasStudentConfig(d) && !e.authoritativeDevice(d) && !e.shouldForceStudentReset(d) {
 			continue
 		}
 		if !e.fileContentMatches(ctx, d, path, files[path].Content) {
@@ -1817,7 +1896,7 @@ func (e *Engine) holdsStudentWork(ctx context.Context, d *model.Device, path str
 	// whatever is there. Preserving in that mode would make the golden answer
 	// silently not apply, which is worse than the loss this guard prevents:
 	// the grading oracle would be wrong and nothing would say so.
-	if e.authoritativeDevice(d) {
+	if e.authoritativeDevice(d) || e.shouldForceStudentReset(d) {
 		return false, nil
 	}
 	res, err := e.Runtime.Exec(ctx, d.Container, runtime.ExecCmd{

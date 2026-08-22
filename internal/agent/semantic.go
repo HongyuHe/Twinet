@@ -1,9 +1,18 @@
 package agent
 
 import (
+	"strconv"
+
 	"github.com/HongyuHe/twinet/internal/model"
 	"github.com/HongyuHe/twinet/internal/render"
 )
+
+func rendererModeKey(mode render.Mode, ungraded int) string {
+	if mode == "" {
+		mode = render.ModePlatform
+	}
+	return string(mode) + "/ungraded=" + strconv.Itoa(ungraded)
+}
 
 // renderModeForDevice mirrors render.Renderer's per-device harness policy.
 // A grading harness is solved except for the one AS under evaluation; treating

@@ -58,7 +58,7 @@ func newRecoverCmd(opts *Options) *cobra.Command {
 				}
 			} else {
 				w := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
-				fmt.Fprintln(w, "NODE\tPHASE\tGENERATION\tCONTAINERS\tVNIS\tSTATUS")
+				fmt.Fprintln(w, "NODE\tPHASE\tMODE\tGENERATION\tCONTAINERS\tVNIS\tSTATUS")
 				nodes := make([]string, 0, len(report.Nodes))
 				for node := range report.Nodes {
 					nodes = append(nodes, node)
@@ -70,8 +70,8 @@ func newRecoverCmd(opts *Options) *cobra.Command {
 					if !status.Consistent {
 						state = status.Error
 					}
-					fmt.Fprintf(w, "%s\t%s\t%s\t%d/%d\t%d/%d\t%s\n",
-						node, status.Phase, status.Generation,
+					fmt.Fprintf(w, "%s\t%s\t%s/%d\t%s\t%d/%d\t%d/%d\t%s\n",
+						node, status.Phase, status.Mode, status.Ungraded, status.Generation,
 						status.ObservedContainers, status.ExpectedContainers,
 						status.ObservedVNIs, status.ExpectedVNIs, state)
 				}

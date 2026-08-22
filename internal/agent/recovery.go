@@ -825,6 +825,8 @@ func (s *Server) transactionInventoryStatus(ctx context.Context, lab string) Rec
 		status.Phase = string(tx.Phase)
 		status.Generation = tx.Generation
 		status.PreviousGeneration = tx.PreviousGen
+		status.Mode, status.Ungraded = tx.Mode, tx.Ungraded
+		status.PreviousMode, status.PreviousUngraded = tx.PreviousMode, tx.PreviousUngraded
 		status.Attempts = tx.RecoveryAttempts
 		status.RetryCount = tx.RecoveryAttempts
 		status.Error = tx.Failure
@@ -860,6 +862,9 @@ func (s *Server) transactionInventoryStatus(ctx context.Context, lab string) Rec
 			// the inventory generation for both concepts.
 			status.Generation = committed.Generation
 		}
+		s.mu.Lock()
+		status.Mode, status.Ungraded = s.modes[lab], s.ungraded[lab]
+		s.mu.Unlock()
 	default:
 		status.Phase = "idle"
 		return status

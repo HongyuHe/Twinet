@@ -18,7 +18,7 @@ import (
 	"github.com/HongyuHe/twinet/internal/runtime"
 )
 
-const observationVersion = 1
+const observationVersion = 2
 
 // BuildDiff is the desired-versus-observed result used to construct a minimal
 // executable deployment DAG. Its maps are keyed by canonical device/link IDs.
@@ -87,6 +87,7 @@ type nodeObservedState struct {
 	Version int    `json:"version"`
 	Lab     string `json:"lab"`
 	Node    string `json:"node"`
+	Mode    string `json:"mode,omitempty"`
 
 	Devices map[string]observedDeviceState `json:"devices"`
 	Links   map[string]observedLinkState   `json:"links"`
@@ -205,6 +206,9 @@ func (t *observationTracker) link(id string) (observedLinkState, bool) {
 func (t *observationTracker) markDevice(id string, value observedDeviceState) error {
 	t.mu.Lock()
 	t.state.Devices[id] = value
+	if t.e.ModeKey != "" {
+		t.state.Mode = t.e.ModeKey
+	}
 	t.changed = true
 	err := t.saveLocked()
 	t.mu.Unlock()
@@ -310,6 +314,7 @@ func (e *Engine) observeNode(ctx context.Context, top *model.Topology, devices [
 	observedFor := time.Since(start)
 	diffStart := time.Now()
 	desired := make(map[string]desiredDeviceState, len(devices))
+	modeDirty := e.ModeKey != "" && tracker.state.Mode != e.ModeKey
 	diff := BuildDiff{
 		ObservedFor: observedFor,
 		Create:      map[string]bool{},
@@ -358,7 +363,7 @@ func (e *Engine) observeNode(ctx context.Context, top *model.Topology, devices [
 
 		previous, known := tracker.device(d.ID)
 		bootstrap := !specDirty && container.Labels[LabelHash] == top.Hash && d.ASN > 0
-		if !known && bootstrap {
+		if !known && bootstrap && !modeDirty {
 			previous = observedDeviceState{
 				SpecHash: state.runtime.spec.Labels[LabelSpec], ConfigHash: state.configHash,
 				FileHash: state.fileHash, CommandHash: state.commandHash, ReadyHash: state.readyHash,
@@ -366,7 +371,7 @@ func (e *Engine) observeNode(ctx context.Context, top *model.Topology, devices [
 			tracker.bootstrapDevice(d.ID, previous)
 			known = true
 		}
-		if e.Renderer != nil && (specDirty || !known || previous.ConfigHash != state.configHash ||
+		if e.Renderer != nil && (modeDirty || specDirty || !known || previous.ConfigHash != state.configHash ||
 			previous.FileHash != state.fileHash || previous.CommandHash != state.commandHash) {
 			diff.Configure[d.ID] = true
 			if studentOwned(top, d) {
@@ -374,7 +379,7 @@ func (e *Engine) observeNode(ctx context.Context, top *model.Topology, devices [
 			}
 		}
 		if e.Renderer != nil && e.Renderer.Ready(d, e.Runtime) != nil &&
-			(specDirty || diff.Configure[d.ID] || !known || previous.ReadyHash != state.readyHash) {
+			(modeDirty || specDirty || diff.Configure[d.ID] || !known || previous.ReadyHash != state.readyHash) {
 			diff.Ready[d.ID] = true
 		}
 		if e.SemanticProbe != nil && !specDirty {

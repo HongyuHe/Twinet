@@ -565,6 +565,7 @@ func (s *Server) repairLab(ctx context.Context, top *model.Topology, broken []*m
 		UnderlayIP:      s.cfg.UnderlayIP,
 		UnderlayDev:     s.cfg.UnderlayDev,
 		PeerUnderlay:    s.peerUnderlay(top.Name),
+		ModeKey:         rendererModeKey(render.Mode(mode), ungraded),
 	}
 	for _, d := range broken {
 		if s.givingUpOn(top.Name, d.ID) {

@@ -11,6 +11,7 @@ import (
 	"github.com/HongyuHe/twinet/internal/model"
 	"github.com/HongyuHe/twinet/internal/render"
 	rt "github.com/HongyuHe/twinet/internal/runtime"
+	"github.com/HongyuHe/twinet/internal/state"
 )
 
 // verifyCommittedSemantics is the proof boundary that inventory alone cannot
@@ -22,6 +23,37 @@ func (s *Server) verifyCommittedSemantics(ctx context.Context, top *model.Topolo
 	mode render.Mode, ungraded int, touched []string,
 ) error {
 	return s.verifyTopologySemantics(ctx, top, mode, ungraded, touched, nil)
+}
+
+func (s *Server) verifyKnownStudentState(ctx context.Context, top *model.Topology,
+	previousMode render.Mode, previousUngraded int,
+) error {
+	if s.store == nil || previousMode != render.ModeSolve {
+		return nil
+	}
+	for _, device := range top.DevicesOnNode(s.cfg.Node) {
+		// Only devices that were reference-owned before the transition need
+		// a reset/restore proof. The ungraded harness AS was already teaching
+		// mode and must not be treated as a reference answer.
+		if renderModeForDevice(previousMode, previousUngraded, device) != render.ModeSolve ||
+			!deployStudentOwned(top, device) {
+			continue
+		}
+		var expected []state.Snapshot
+		for _, kind := range state.AllKinds {
+			snapshot, err := s.store.Current(top.Name, device.ID, kind)
+			if err == nil {
+				expected = append(expected, snapshot)
+			}
+		}
+		if len(expected) == 0 {
+			continue // intentional blank student start
+		}
+		if _, err := verifyRestoredState(ctx, s.rt, device, top.Name, top.Hash, expected); err != nil {
+			return fmt.Errorf("verify restored solve->platform student state for %s: %w", device.ID, err)
+		}
+	}
+	return nil
 }
 
 func semanticTouchedDevices(tx applyTransaction) []string {

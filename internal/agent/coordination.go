@@ -165,6 +165,10 @@ type RecoveryStatus struct {
 	Phase              string    `json:"phase"`
 	Generation         string    `json:"generation,omitempty"`
 	PreviousGeneration string    `json:"previous_generation,omitempty"`
+	Mode               string    `json:"mode,omitempty"`
+	Ungraded           int       `json:"ungraded_as,omitempty"`
+	PreviousMode       string    `json:"previous_mode,omitempty"`
+	PreviousUngraded   int       `json:"previous_ungraded_as,omitempty"`
 	Owner              string    `json:"owner,omitempty"`
 	Strategy           string    `json:"strategy,omitempty"`
 	StartedAt          time.Time `json:"started_at,omitempty"`
@@ -908,6 +912,7 @@ func (s *Server) prepareGeneration(lab string, fence Fence, expected, generation
 	if generation == "" {
 		return errors.New("a deployment generation is required")
 	}
+	mode = canonicalMode(mode)
 
 	var previous json.RawMessage
 	if s.store != nil {
@@ -1374,6 +1379,17 @@ func (s *Server) committedGenerations() map[string]string {
 		if state.Committed != "" {
 			out[lab] = state.Committed
 		}
+
+	}
+	return out
+}
+
+func (s *Server) committedModes() map[string]LabModeStatus {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := map[string]LabModeStatus{}
+	for lab, mode := range s.modes {
+		out[lab] = LabModeStatus{Mode: mode, Ungraded: s.ungraded[lab]}
 	}
 	return out
 }
