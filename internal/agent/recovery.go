@@ -65,7 +65,7 @@ type transactionRuntimeSpec struct {
 }
 
 const (
-	overlayInventorySchema         = 2
+	overlayInventorySchema         = 3
 	recoveryRetryEvery             = 5 * time.Second
 	recoveryRetryBackoff           = 30 * time.Second
 	defaultRecoveryPhaseTimeout    = 90 * time.Second
@@ -971,6 +971,10 @@ func preserveLegacyTrunkPort(expected *netx.OverlayInventory, observed transacti
 			for j := range expected.Bindings {
 				if expected.Bindings[j].NodeA == actual.NodeA && expected.Bindings[j].NodeB == actual.NodeB {
 					expected.Bindings[j].Port = actual.Port
+					// A schema-v1/v2 record never carried this port fact.
+					// Persist that the live standard-port carrier was
+					// explicitly verified rather than synthesized.
+					expected.Bindings[j].Legacy = true
 				}
 			}
 			break
@@ -1418,7 +1422,6 @@ func (s *Server) migrateLegacyCommittedInventory(ctx context.Context, lab string
 	if got.Schema < overlayInventorySchema {
 		return transactionInventory{}, errors.New("live overlay inspection did not return schema-v2 bindings")
 	}
-	preserveLegacyTrunkPort(&expected, got)
 	upgraded := committed
 	upgraded.Schema = overlayInventorySchema
 	upgraded.LogicalBindings = expected.Bindings
@@ -1501,6 +1504,7 @@ func (s *Server) committedTopologyForInventory(lab string) (*model.Topology, map
 		}
 		return top, peer, nil
 	}
+
 	if s.store == nil {
 		return nil, nil, fmt.Errorf("committed topology for %q is unavailable", lab)
 	}
@@ -1522,6 +1526,69 @@ func (s *Server) committedTopologyForInventory(lab string) (*model.Topology, map
 		}
 	}
 	return top, peer, nil
+}
+
+// refreshCommittedOverlayInventory persists the post-repair schema-v3 facts.
+// It is used by explicit overlay reconciliation so a repaired port/VNI is not
+// immediately compared against the stale committed record on the next status
+// or deploy.
+func (s *Server) refreshCommittedOverlayInventory(ctx context.Context, lab string,
+	top *model.Topology, eng *deploy.Engine,
+) error {
+	s.mu.Lock()
+	committed, exists := s.inventories[lab]
+	s.mu.Unlock()
+	if !exists {
+		return nil
+	}
+	expected, err := eng.ExpectedOverlayInventory(top)
+	if err != nil {
+		return err
+	}
+	got, err := s.snapshotTransactionInventory(ctx, lab)
+	if err != nil {
+		return err
+	}
+	if got.Schema < overlayInventorySchema {
+		return errors.New("live overlay inspection did not return schema-v3 bindings")
+	}
+	upgraded := committed
+	upgraded.Schema = overlayInventorySchema
+	upgraded.LogicalBindings = expected.Bindings
+	upgraded.PhysicalTrunks = expected.Trunks
+	upgraded.VNIs = bindingVNIs(expected.Bindings)
+	if err := inventoryMatches(upgraded, got); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initCoordination()
+	current, ok := s.inventories[lab]
+	if !ok || current.Generation != committed.Generation {
+		return fmt.Errorf("committed inventory for %q changed during overlay reconciliation", lab)
+	}
+	previous := current
+	tx, hadTx := s.transactions[lab]
+	state := s.generations[lab]
+	previousState := state
+	s.inventories[lab] = upgraded
+	if hadTx && tx.Committed && tx.Generation == upgraded.Generation {
+		delete(s.transactions, lab)
+		if state.Prepared == tx.Generation {
+			state.Prepared = ""
+			s.generations[lab] = state
+		}
+	}
+	if err := s.saveCoordinationLocked(); err != nil {
+		s.inventories[lab] = previous
+		if hadTx {
+			s.transactions[lab] = tx
+		}
+		s.generations[lab] = previousState
+		return err
+	}
+	return nil
 }
 
 func (s *Server) recoveryStatuses(ctx context.Context) map[string]RecoveryStatus {

@@ -84,6 +84,11 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 		resp.OverlayRepaired = report.Repaired
 		resp.OverlayFailed = report.Failed
 		resp.OverlayExtra = report.Extra
+		if len(report.Failed) == 0 && len(report.Extra) == 0 {
+			if err := s.refreshCommittedOverlayInventory(r.Context(), req.Lab, top, repair); err != nil {
+				resp.OverlayFailed = map[string]string{"inventory": err.Error()}
+			}
+		}
 	}
 	scheduled := []string{}
 	for _, device := range top.SortedDevices() {

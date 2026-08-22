@@ -51,7 +51,7 @@ func TestLegacyCommittedInventoryMigratesFourteenBindingsSevenTrunks(t *testing.
 	}
 }
 
-func TestLegacyCommittedInventoryRetainsActiveStandardPorts(t *testing.T) {
+func TestLegacyCommittedInventoryRequiresClusterReconcileForStandardPorts(t *testing.T) {
 	top, peers := inventoryTopology("lab", 2, 2)
 	expected := expectedInventoryForTest(t, top, peers)
 	for i := range expected.Trunks {
@@ -61,12 +61,72 @@ func TestLegacyCommittedInventoryRetainsActiveStandardPorts(t *testing.T) {
 				expected.Bindings[j].NodeB == expected.Trunks[i].NodeB {
 				expected.Bindings[j].Port = netx.VXLANPort
 			}
+
 		}
 	}
 	server := inventoryMigrationServer(t, nil, top, peers, expected)
 	status := server.transactionInventoryStatus(context.Background(), top.Name)
+	if status.Consistent || status.Error == "" {
+		t.Fatalf("standard-port migration was accepted without cluster reconcile: %#v", status)
+	}
+	if server.inventories[top.Name].Schema >= overlayInventorySchema {
+		t.Fatalf("standard-port migration persisted before both endpoints reconciled: %#v", server.inventories[top.Name])
+	}
+}
+
+func TestSchemaV2CommittedInventoryMigratesSynthesizedPortToCurrentBinding(t *testing.T) {
+	top, peers := inventoryTopology("lab", 2, 2)
+	actual := expectedInventoryForTest(t, top, peers)
+	server := inventoryMigrationServer(t, nil, top, peers, actual)
+	legacy := cloneOverlayInventory(transactionInventory{
+		Schema:          2,
+		Generation:      "g",
+		VNIs:            bindingVNIs(actual.Bindings),
+		LogicalBindings: actual.Bindings,
+		PhysicalTrunks:  actual.Trunks,
+	})
+	for i := range legacy.LogicalBindings {
+		legacy.LogicalBindings[i].Port = netx.VXLANPort
+	}
+
+	for i := range legacy.PhysicalTrunks {
+		legacy.PhysicalTrunks[i].Port = netx.VXLANPort
+	}
+	server.inventories[top.Name] = legacy
+	status := server.transactionInventoryStatus(context.Background(), top.Name)
 	if !status.Consistent || server.inventories[top.Name].Schema != overlayInventorySchema {
-		t.Fatalf("standard-port migration = %#v inventory=%#v", status, server.inventories[top.Name])
+		t.Fatalf("schema-v2 port migration = %#v inventory=%#v", status, server.inventories[top.Name])
+	}
+	for i, binding := range server.inventories[top.Name].LogicalBindings {
+		if binding.Port != actual.Bindings[i].Port {
+			t.Fatalf("binding %d persisted port %d, want current %d", i, binding.Port, actual.Bindings[i].Port)
+		}
+	}
+}
+
+func TestOverlayReconcilePersistsCurrentBindingInventory(t *testing.T) {
+	top, peers := inventoryTopology("lab", 1, 2)
+	actual := expectedInventoryForTest(t, top, peers)
+	server := inventoryMigrationServer(t, nil, top, peers, actual)
+	legacy := server.inventories[top.Name]
+	legacy.Schema = 2
+	for i := range legacy.LogicalBindings {
+		legacy.LogicalBindings[i].Port = netx.VXLANPort
+	}
+	for i := range legacy.PhysicalTrunks {
+		legacy.PhysicalTrunks[i].Port = netx.VXLANPort
+	}
+	server.inventories[top.Name] = legacy
+	eng := &deploy.Engine{Node: "node-0", PeerUnderlay: peers}
+	if err := server.refreshCommittedOverlayInventory(context.Background(), top.Name, top, eng); err != nil {
+		t.Fatal(err)
+	}
+	got := server.inventories[top.Name]
+	if got.Schema != overlayInventorySchema || got.LogicalBindings[0].Port != actual.Bindings[0].Port {
+		t.Fatalf("reconcile did not persist current inventory: %#v", got)
+	}
+	if _, stale := server.transactions[top.Name]; stale {
+		t.Fatal("reconcile did not clear matching committed transaction")
 	}
 }
 

@@ -119,18 +119,22 @@ func (e *Engine) reconcileOverlayLink(ctx context.Context, top *model.Topology, 
 		return err
 	}
 	bridge, err := netx.EnsureMultiplexOverlay(netx.MultiplexOverlaySpec{
-		Lab:            top.Name,
-		LocalNode:      e.Node,
-		RemoteNode:     remote.Device.Node,
-		LocalIP:        e.UnderlayIP,
-		RemoteIP:       peer,
-		UnderlayDev:    e.UnderlayDev,
-		MTU:            mtu,
-		Port:           port,
-		VNI:            link.VNI,
-		VLAN:           vlan,
-		PreserveActive: true,
-		ForcePort:      true,
+		Lab:         top.Name,
+		LocalNode:   e.Node,
+		RemoteNode:  remote.Device.Node,
+		LocalIP:     e.UnderlayIP,
+		RemoteIP:    peer,
+		UnderlayDev: e.UnderlayDev,
+		MTU:         mtu,
+		Port:        port,
+		VNI:         link.VNI,
+		VLAN:        vlan,
+		// An explicit node reconcile is cluster-fanned-out, so it may move
+		// both endpoints from a legacy receive port to the current pair
+		// port. Recovery/status uses the default false and will report a
+		// port/MTU drift rather than changing only one endpoint.
+		PreserveActive: !e.ForceOverlayReconcile,
+		ForcePort:      e.ForceOverlayReconcile,
 	})
 	if err != nil {
 		return err
