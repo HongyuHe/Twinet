@@ -104,6 +104,33 @@ after a partial failure, a reboot, or a topology edit.`,
 						len(rec.ByAS))
 				}
 			}
+			// A completed placement record lets the controller ask every
+			// agent for one read-only desired/observed witness before it pays
+			// for inventory, image resolution, leases, and a transaction
+			// journal. Any dirty/semantic/contract drift falls through to the
+			// ordinary fenced path below.
+			if clustered(top) && !dryRun && !rebalance && !prune && !overcommit && only == "" && rec != nil {
+				if _, err := place.Place(top, place.Options{Fixed: rec}); err != nil {
+					return err
+				}
+				tok, err := tokenFor(token)
+				if err != nil {
+					return err
+				}
+				var noop bool
+				if err := phases.measure("noop_preflight", func() error {
+					var preflightErr error
+					noop, preflightErr = tryClusterNoop(cmd.Context(), top, tok, modeName(solve), 0,
+						cmd.OutOrStdout(), cmd.ErrOrStderr())
+					return preflightErr
+				}); err != nil {
+					return err
+				}
+				if noop {
+					phases.print(cmd.ErrOrStderr())
+					return nil
+				}
+			}
 			var inventory []place.NodeInventory
 			if clustered(top) {
 				tok, err := tokenFor(token)

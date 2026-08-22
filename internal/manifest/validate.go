@@ -1304,6 +1304,10 @@ func (l *Loaded) validatePlacement(d *Diagnostics, file string) {
 		validateBudget(d, file, "placement.reserve."+name, p.Reserve[name],
 			nodeAt(root, "placement.reserve."+name))
 	}
+	if p.Convergence.MaxConcurrent < 0 {
+		d.Add(file, "placement.convergence.max_concurrent",
+			"max_concurrent must be positive when specified", nodeAt(root, "placement.convergence"))
+	}
 	switch p.OnNodeLoss {
 	case "", "fail", "reschedule":
 	default:

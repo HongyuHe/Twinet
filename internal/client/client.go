@@ -330,6 +330,21 @@ func (n *Node) Apply(ctx context.Context, req agent.ApplyRequest) (agent.ApplyRe
 	return resp, err
 }
 
+// Plan performs a read-only desired/observed no-op preflight.
+func (n *Node) Plan(ctx context.Context, req agent.PlanRequest) (agent.PlanResponse, error) {
+	var resp agent.PlanResponse
+	err := n.do(ctx, http.MethodPost, "/v1/plan", req, &resp)
+	return resp, err
+}
+
+// PlanVerify checks a read-only no-op witness immediately before the
+// controller returns without acquiring a mutation lease.
+func (n *Node) PlanVerify(ctx context.Context, req agent.PlanVerifyRequest) (agent.PlanVerifyResponse, error) {
+	var resp agent.PlanVerifyResponse
+	err := n.do(ctx, http.MethodPost, "/v1/plan/verify", req, &resp)
+	return resp, err
+}
+
 // Destroy removes a lab from the node.
 func (n *Node) Destroy(ctx context.Context, lab string, vnis []uint32) error {
 	return n.destroy(ctx, agent.DestroyRequest{Lab: lab, VNIs: vnis})

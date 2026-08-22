@@ -63,10 +63,14 @@ type ImageCacheInventory struct {
 // Reserved is the sum of Twinet requests, while Used is system observation;
 // admission subtracts Reserved, not a noisy instantaneous CPU sample.
 type HostInventory struct {
-	ObservedAt    time.Time                    `json:"observed_at"`
-	Physical      ResourceInventory            `json:"physical"`
-	Allocatable   ResourceInventory            `json:"allocatable"`
-	Used          ResourceInventory            `json:"used"`
+	ObservedAt  time.Time         `json:"observed_at"`
+	Physical    ResourceInventory `json:"physical"`
+	Allocatable ResourceInventory `json:"allocatable"`
+	Used        ResourceInventory `json:"used"`
+	// Peak is the maximum observed host usage since this agent started. It
+	// lets a scale deployment be evaluated against its reservation assumptions
+	// without pretending one post-convergence sample was the startup peak.
+	Peak          ResourceInventory            `json:"peak"`
 	Reserved      ResourceInventory            `json:"reserved"`
 	Reservations  map[string]ResourceInventory `json:"reservations_by_lab,omitempty"`
 	Load          LoadAverage                  `json:"load"`
@@ -84,6 +88,7 @@ type cpuSample struct {
 type hostInventoryObserver struct {
 	mu       sync.Mutex
 	previous *cpuSample
+	peak     ResourceInventory
 
 	readFile   func(string) ([]byte, error)
 	readDir    func(string) ([]os.DirEntry, error)
@@ -246,10 +251,10 @@ func (o *hostInventoryObserver) observe(stateDir string, containers []rt.Contain
 		if fdLimit != nil {
 			// A netdev carries queues, namespace bookkeeping, and file-backed
 			// handles. The kernel has no portable netdev-count ceiling, so use
-			// the conservative lower of 4096 and one eighth of handle capacity.
+			// the conservative lower of 5000 and one eighth of handle capacity.
 			limit := *fdLimit / 8
-			if limit > 4096 {
-				limit = 4096
+			if limit > 5000 {
+				limit = 5000
 			}
 			if limit < count+64 {
 				limit = count + 64
@@ -318,11 +323,25 @@ func (o *hostInventoryObserver) observe(stateDir string, containers []rt.Contain
 	if inv.Load.One == nil {
 		markUnknown("load")
 	}
+	inv.Peak = o.recordPeak(inv.Used)
 	for name := range unknown {
 		inv.Unknown = append(inv.Unknown, name)
 	}
 	sortStrings(inv.Unknown)
 	return inv
+}
+
+func (o *hostInventoryObserver) recordPeak(used ResourceInventory) ResourceInventory {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.peak.CPUs = maxFloatPtr(o.peak.CPUs, used.CPUs)
+	o.peak.MemoryBytes = maxInt64Ptr(o.peak.MemoryBytes, used.MemoryBytes)
+	o.peak.DiskBytes = maxInt64Ptr(o.peak.DiskBytes, used.DiskBytes)
+	o.peak.Pids = maxInt64Ptr(o.peak.Pids, used.Pids)
+	o.peak.FileDescriptors = maxInt64Ptr(o.peak.FileDescriptors, used.FileDescriptors)
+	o.peak.NetDevices = maxInt64Ptr(o.peak.NetDevices, used.NetDevices)
+	o.peak.Containers = maxIntPtr(o.peak.Containers, used.Containers)
+	return cloneInventory(o.peak)
 }
 
 func (o *hostInventoryObserver) cpuUsage(now time.Time) *float64 {
@@ -432,7 +451,12 @@ func estimatedContainers(r ResourceInventory) *int {
 	if len(candidates) == 0 {
 		return nil
 	}
-	limit := 600
+	// The historical 600-primary-device target predates the isolated FRR
+	// control sidecar. A full 2,020-device scale lab now carries 644
+	// additional controls (2,664 runtime containers): 1,250 leaves at least
+	// 20% room on the measured three-worker placement while CPU, memory, PID,
+	// FD, and netdev budgets remain the tighter safety constraints.
+	limit := 1250
 	for _, n := range candidates {
 		if n < limit {
 			limit = n
@@ -718,6 +742,62 @@ func addInt(a, b *int) *int {
 		out += *b
 	}
 	return intPtr(out)
+}
+
+func maxFloatPtr(old, next *float64) *float64 {
+	if next == nil {
+		return old
+	}
+	if old == nil || *next > *old {
+		return float64Ptr(*next)
+	}
+	return old
+}
+
+func maxInt64Ptr(old, next *int64) *int64 {
+	if next == nil {
+		return old
+	}
+	if old == nil || *next > *old {
+		return int64Ptr(*next)
+	}
+	return old
+}
+
+func maxIntPtr(old, next *int) *int {
+	if next == nil {
+		return old
+	}
+	if old == nil || *next > *old {
+		return intPtr(*next)
+	}
+	return old
+}
+
+func cloneInventory(in ResourceInventory) ResourceInventory {
+	out := ResourceInventory{}
+	if in.CPUs != nil {
+		out.CPUs = float64Ptr(*in.CPUs)
+	}
+	if in.MemoryBytes != nil {
+		out.MemoryBytes = int64Ptr(*in.MemoryBytes)
+	}
+	if in.DiskBytes != nil {
+		out.DiskBytes = int64Ptr(*in.DiskBytes)
+	}
+	if in.Pids != nil {
+		out.Pids = int64Ptr(*in.Pids)
+	}
+	if in.FileDescriptors != nil {
+		out.FileDescriptors = int64Ptr(*in.FileDescriptors)
+	}
+	if in.NetDevices != nil {
+		out.NetDevices = int64Ptr(*in.NetDevices)
+	}
+	if in.Containers != nil {
+		out.Containers = intPtr(*in.Containers)
+	}
+	return out
 }
 
 func sortStrings(values []string) {

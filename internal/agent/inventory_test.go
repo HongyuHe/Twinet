@@ -41,6 +41,19 @@ func TestReservationFallsBackToConservativeKindRequest(t *testing.T) {
 	}
 }
 
+func TestContainerEstimateAccountsForSidecarScaleTarget(t *testing.T) {
+	memory := int64(225 << 30)
+	pids := int64(1_000_000)
+	fds := int64(1_000_000)
+	netdevs := int64(5_000)
+	got := estimatedContainers(ResourceInventory{
+		MemoryBytes: &memory, Pids: &pids, FileDescriptors: &fds, NetDevices: &netdevs,
+	})
+	if got == nil || *got != 1250 {
+		t.Fatalf("container estimate = %v, want 1250 sidecar-aware target", got)
+	}
+}
+
 func containsInventoryUnknown(all []string, want string) bool {
 	for _, value := range all {
 		if value == want {

@@ -18,7 +18,9 @@ defaults:
 kinds:
   router:
     image: hyhe/twinet-router:0.1
-    requests: {cpus: 0.50, memory: 128Mi, pids: 64, ephemeral_storage: 256Mi, file_descriptors: 1024, netdevs: 10}
+    # 0.04 shell + 0.08 internal FRR control = 0.12 CPU/router aggregate.
+    # The 2 CPU/512Mi hard limits remain burst caps.
+    requests: {cpus: 0.04, memory: 128Mi, pids: 64, ephemeral_storage: 256Mi, file_descriptors: 1024, netdevs: 8}
     capabilities: [NET_ADMIN, NET_RAW]
     sysctls:
       net.ipv4.ip_forward: "1"
@@ -30,19 +32,19 @@ kinds:
       net.ipv4.icmp_ratelimit: "0"
   host:
     image: hyhe/twinet-host:0.1
-    requests: {cpus: 0.10, memory: 64Mi, pids: 32, ephemeral_storage: 64Mi, file_descriptors: 256, netdevs: 2}
+    requests: {cpus: 0.02, memory: 64Mi, pids: 32, ephemeral_storage: 64Mi, file_descriptors: 256, netdevs: 2}
     capabilities: [NET_ADMIN, NET_RAW]
     pids: 128
     sysctls:
       net.ipv6.conf.all.disable_ipv6: "0"
   switch:
     image: hyhe/twinet-switch:0.1
-    requests: {cpus: 0.25, memory: 128Mi, pids: 64, ephemeral_storage: 128Mi, file_descriptors: 1024, netdevs: 16}
+    requests: {cpus: 0.04, memory: 128Mi, pids: 512, ephemeral_storage: 128Mi, file_descriptors: 1024, netdevs: 8}
     capabilities: [NET_ADMIN, NET_RAW, SYS_NICE]
     pids: 512
   service:
     image: hyhe/twinet-svc:0.1
-    requests: {cpus: 0.25, memory: 128Mi, pids: 64, ephemeral_storage: 256Mi, file_descriptors: 1024, netdevs: 8}
+    requests: {cpus: 0.10, memory: 128Mi, pids: 256, ephemeral_storage: 256Mi, file_descriptors: 1024, netdevs: 8}
     capabilities: [NET_ADMIN, NET_RAW]
 
 link_defaults:
@@ -160,8 +162,34 @@ access:
   endpoints: {mode: active-active}
 
 placement:
-  strategy: pack-by-as
+  # Resource-aware spreading keeps the heterogeneous transit/IXP systems
+  # below the 80% steady reservation target on all three workers.
+  strategy: spread-by-as
+  # Steady-state upper bounds for the measured three-worker teaching cluster.
+  # Live agent allocatable inventory remains authoritative when it is lower.
+  # node-0 additionally reserves front-end/service headroom.
+  convergence:
+    max_concurrent: 6
+  reserve:
+    node-0:
+      cpus: 1
+      memory: 8Gi
+      pids: 8192
+      ephemeral_storage: 20Gi
+      file_descriptors: 16384
+      netdevs: 256
+      containers: 32
   nodes:
-    - {name: node-0, addr: "10.0.1.1:7200", underlay_ip: 10.0.1.1, front: true}
-    - {name: node-1, addr: "10.0.1.2:7200", underlay_ip: 10.0.1.2}
-    - {name: node-2, addr: "10.0.1.3:7200", underlay_ip: 10.0.1.3}
+    - name: node-0
+      addr: "10.0.1.1:7200"
+      underlay_ip: 10.0.1.1
+      front: true
+      capacity: {cpus: 50.4, memory: 225Gi, pids: 1000000, ephemeral_storage: 750Gi, file_descriptors: 1000000, netdevs: 5000, containers: 1250}
+    - name: node-1
+      addr: "10.0.1.2:7200"
+      underlay_ip: 10.0.1.2
+      capacity: {cpus: 50.4, memory: 225Gi, pids: 1000000, ephemeral_storage: 750Gi, file_descriptors: 1000000, netdevs: 5000, containers: 1250}
+    - name: node-2
+      addr: "10.0.1.3:7200"
+      underlay_ip: 10.0.1.3
+      capacity: {cpus: 50.4, memory: 225Gi, pids: 1000000, ephemeral_storage: 750Gi, file_descriptors: 1000000, netdevs: 5000, containers: 1250}

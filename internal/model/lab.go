@@ -412,23 +412,27 @@ func DefaultResourceRequest(kind DeviceKind) ResourceRequest {
 	switch kind {
 	case KindRouter:
 		return ResourceRequest{
-			CPUs: 0.50, Memory: "128Mi", Pids: 64, EphemeralStorage: "256Mi",
-			FileDescriptors: 1024, NetDevices: 10,
+			// The router shell is intentionally light. Its FRR control
+			// sidecar carries the daemon reservation below; together they
+			// reserve 0.12 CPU, which is the measured steady-state plus
+			// convergence share used by the three-node scale target.
+			CPUs: 0.04, Memory: "128Mi", Pids: 64, EphemeralStorage: "256Mi",
+			FileDescriptors: 1024, NetDevices: 8,
 		}
 	case KindSwitch:
 		return ResourceRequest{
 			// ovs-vswitchd starts one handler per available CPU plus
 			// revalidator threads; 64 PIDs kills it on ordinary 56-core
 			// teaching workers before it can create br0.
-			CPUs: 0.25, Memory: "128Mi", Pids: 512, EphemeralStorage: "128Mi",
-			FileDescriptors: 1024, NetDevices: 16,
+			CPUs: 0.04, Memory: "128Mi", Pids: 512, EphemeralStorage: "128Mi",
+			FileDescriptors: 1024, NetDevices: 8,
 		}
 	case KindService:
 		return ResourceRequest{
 			// BIND sizes worker/listener threads from visible CPUs. A 64-PID
 			// service cgroup aborts on ordinary multi-core nodes before DNS
 			// can bind, even though its memory and CPU reservation are sound.
-			CPUs: 0.25, Memory: "128Mi", Pids: 512, EphemeralStorage: "256Mi",
+			CPUs: 0.10, Memory: "128Mi", Pids: 512, EphemeralStorage: "256Mi",
 			FileDescriptors: 1024, NetDevices: 8,
 		}
 	case KindP4:
@@ -443,7 +447,7 @@ func DefaultResourceRequest(kind DeviceKind) ResourceRequest {
 		}
 	default: // hosts and unknown legacy kinds
 		return ResourceRequest{
-			CPUs: 0.10, Memory: "64Mi", Pids: 32, EphemeralStorage: "64Mi",
+			CPUs: 0.02, Memory: "64Mi", Pids: 32, EphemeralStorage: "64Mi",
 			FileDescriptors: 256, NetDevices: 2,
 		}
 	}
@@ -454,10 +458,11 @@ func DefaultResourceRequest(kind DeviceKind) ResourceRequest {
 // admission counts every OCI container the hardened router contract creates.
 func FRRControlResourceRequest() ResourceRequest {
 	return ResourceRequest{
-		// FRR starts zebra, mgmtd, BGP, OSPF, LDP, watchfrr, and their helper
-		// threads together. A tiny sidecar limit turns a healthy topology into
-		// a slow-start race under concurrent lab deployment.
-		CPUs: 0.50, Memory: "256Mi", Pids: 256, EphemeralStorage: "128Mi",
+		// The daemon process is queued through the convergence budget rather
+		// than reserving a peak core for every idle router. Together with the
+		// 0.04 router shell, this is a 0.12 CPU aggregate request. Runtime
+		// limits remain independent burst caps.
+		CPUs: 0.08, Memory: "256Mi", Pids: 256, EphemeralStorage: "128Mi",
 		FileDescriptors: 1024, NetDevices: 0,
 	}
 }
@@ -1249,10 +1254,21 @@ type Placement struct {
 	NodePool string            `yaml:"node_pool,omitempty" json:"node_pool,omitempty"`
 	Pin      []PlacementPin    `yaml:"pin,omitempty" json:"pin,omitempty"`
 	Reserve  map[string]Budget `yaml:"reserve,omitempty" json:"reserve,omitempty"`
+	// Convergence bounds simultaneous router control-plane starts on one
+	// node. It is intentionally separate from steady-state requests: a
+	// deployment queues a short burst instead of reserving every router's
+	// peak CPU permanently.
+	Convergence ConvergenceBudget `yaml:"convergence,omitempty" json:"convergence,omitempty"`
 	// OnNodeLoss decides whether a clustered deployment may move work away
 	// from an unavailable node. Rescheduling still requires verified durable
 	// replicas; it is never permission to rebuild from an empty image.
 	OnNodeLoss string `yaml:"on_node_loss,omitempty" json:"on_node_loss,omitempty" jsonschema:"enum=fail,enum=reschedule"`
+}
+
+// ConvergenceBudget controls the optional per-lab portion of the node-wide
+// convergence queue. Zero uses the agent's shared conservative default.
+type ConvergenceBudget struct {
+	MaxConcurrent int `yaml:"max_concurrent,omitempty" json:"max_concurrent,omitempty"`
 }
 
 // NodeSpec declares one cluster node.

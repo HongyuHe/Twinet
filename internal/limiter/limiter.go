@@ -20,18 +20,22 @@ const (
 	Netlink   Kind = "netlink"
 	ImagePull Kind = "image_pull"
 	Capture   Kind = "capture"
+	// Convergence bounds router daemon starts/configuration bursts. It is
+	// intentionally distinct from steady-state admission requests.
+	Convergence Kind = "convergence"
 )
 
-var allKinds = []Kind{Apply, Lifecycle, ExecProbe, Netlink, ImagePull, Capture}
+var allKinds = []Kind{Apply, Lifecycle, ExecProbe, Netlink, ImagePull, Capture, Convergence}
 
 // Config configures one node-wide budget per operation class.
 type Config struct {
-	Apply     int
-	Lifecycle int
-	ExecProbe int
-	Netlink   int
-	ImagePull int
-	Capture   int
+	Apply       int
+	Lifecycle   int
+	ExecProbe   int
+	Netlink     int
+	ImagePull   int
+	Capture     int
+	Convergence int
 }
 
 // DefaultConfig is conservative enough for a node that hosts multiple labs,
@@ -39,12 +43,13 @@ type Config struct {
 func DefaultConfig() Config {
 	n := runtime.NumCPU()
 	return Config{
-		Apply:     bounded(n*2, 4, 32),
-		Lifecycle: bounded(n*2, 4, 16),
-		ExecProbe: bounded(n*4, 8, 48),
-		Netlink:   bounded(n, 2, 12),
-		ImagePull: 2,
-		Capture:   bounded(n, 2, 8),
+		Apply:       bounded(n*2, 4, 32),
+		Lifecycle:   bounded(n*2, 4, 16),
+		ExecProbe:   bounded(n*4, 8, 48),
+		Netlink:     bounded(n, 2, 12),
+		ImagePull:   2,
+		Capture:     bounded(n, 2, 8),
+		Convergence: bounded(n, 2, 8),
 	}
 }
 
@@ -87,6 +92,7 @@ func New(cfg Config) *Limiter {
 	limits := map[Kind]int{
 		Apply: cfg.Apply, Lifecycle: cfg.Lifecycle, ExecProbe: cfg.ExecProbe,
 		Netlink: cfg.Netlink, ImagePull: cfg.ImagePull, Capture: cfg.Capture,
+		Convergence: cfg.Convergence,
 	}
 	out := &Limiter{buckets: map[Kind]*bucket{}}
 	for _, kind := range allKinds {

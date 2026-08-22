@@ -144,7 +144,10 @@ func (e *Engine) finalFRRControlSpec(top *model.Topology, d *model.Device,
 	labels[LabelInternal] = "true"
 	labels[LabelKind] = "frr-control"
 	setRequestLabels(labels, model.FRRControlResourceRequest())
-	request := model.FRRControlResourceRequest()
+	// Scheduling request and runtime limit are deliberately separate. The
+	// control sidecar shares a router's convergence burst cap, while its
+	// small steady reservation is what admission accounts for.
+	cpus, memory, pids := effectiveRuntimeLimits(d)
 	spec := &runtime.Spec{
 		Name:           FRRControlContainer(d),
 		Image:          d.Image,
@@ -161,9 +164,9 @@ func (e *Engine) finalFRRControlSpec(top *model.Topology, d *model.Device,
 		MaskedPaths:    append([]string(nil), hardening.MaskedPaths...),
 		ReadonlyPaths:  append([]string(nil), hardening.ReadonlyPaths...),
 		Tmpfs:          cloneStringMap(hardening.Tmpfs),
-		CPUs:           request.CPUs,
-		Memory:         request.Memory,
-		PidsLimit:      request.Pids,
+		CPUs:           cpus,
+		Memory:         memory,
+		PidsLimit:      pids,
 		Restart:        d.Restart,
 		NetworkMode:    "container:" + d.Container,
 		Init:           true,

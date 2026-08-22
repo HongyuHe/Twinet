@@ -15,6 +15,7 @@ import (
 	"github.com/HongyuHe/twinet/internal/images"
 	"github.com/HongyuHe/twinet/internal/manifest"
 	"github.com/HongyuHe/twinet/internal/model"
+	"github.com/HongyuHe/twinet/internal/place"
 	"github.com/HongyuHe/twinet/internal/render"
 )
 
@@ -90,13 +91,14 @@ func newValidateCmd(opts *Options) *cobra.Command {
 
 func newInspectCmd(opts *Options) *cobra.Command {
 	var (
-		showLinks   bool
-		showIfaces  bool
-		showAddr    bool
-		filterAS    int
-		filterOwner string
-		showPlace   bool
-		showConfig  string
+		showLinks    bool
+		showIfaces   bool
+		showAddr     bool
+		filterAS     int
+		filterOwner  string
+		showPlace    bool
+		showCapacity bool
+		showConfig   string
 	)
 	cmd := &cobra.Command{
 		Use:   "inspect",
@@ -108,6 +110,12 @@ func newInspectCmd(opts *Options) *cobra.Command {
 			}
 			if showPlace {
 				return writePlacement(cmd.OutOrStdout(), top)
+			}
+			if showCapacity {
+				if opts.JSON {
+					return json.NewEncoder(cmd.OutOrStdout()).Encode(place.SummarizeCapacity(top))
+				}
+				return writeCapacity(cmd.OutOrStdout(), top)
 			}
 			if showConfig != "" {
 				return writeReferenceConfig(cmd.OutOrStdout(), top, showConfig)
@@ -188,9 +196,93 @@ func newInspectCmd(opts *Options) *cobra.Command {
 	cmd.Flags().IntVar(&filterAS, "as", 0, "restrict output to one AS")
 	cmd.Flags().StringVar(&filterOwner, "owner", "", "restrict output to one owner group")
 	cmd.Flags().BoolVar(&showPlace, "placement", false, "show how ASes are distributed across nodes")
+	cmd.Flags().BoolVar(&showCapacity, "capacity", false,
+		"show requested resources, internal sidecars, and static-capacity pressure")
 	cmd.Flags().StringVar(&showConfig, "config", "",
 		"print the reference configuration for one router, e.g. as3/ATL")
 	return cmd
+}
+
+// writeCapacity reports planning reservations, not Docker limits. It is useful
+// before agents are reachable: static manifest capacity is an optional upper
+// bound, while a clustered deploy takes the minimum with live inventory.
+func writeCapacity(out io.Writer, top *model.Topology) error {
+	summary := place.SummarizeCapacity(top)
+	fmt.Fprintf(out, "capacity plan for %s\n", top.Name)
+	fmt.Fprintln(out, "  requests are guaranteed steady/convergence shares; container limits remain burst caps")
+	fmt.Fprintf(out, "  total (including internal controls): %s\n\n", resourceSummary(summary.Total))
+
+	kinds := make([]string, 0, len(summary.PrimaryByKind))
+	for kind := range summary.PrimaryByKind {
+		kinds = append(kinds, string(kind))
+	}
+	sort.Strings(kinds)
+	kw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(kw, "COMPONENT\tREQUESTS")
+	for _, raw := range kinds {
+		fmt.Fprintf(kw, "%s primary\t%s\n", raw, resourceSummary(summary.PrimaryByKind[model.DeviceKind(raw)]))
+	}
+	if !summary.Controls.Empty() {
+		fmt.Fprintf(kw, "frr-control sidecars\t%s\n", resourceSummary(summary.Controls))
+	}
+	if err := kw.Flush(); err != nil {
+		return err
+	}
+
+	nodes := make([]string, 0, len(summary.ByNode))
+	seenNodes := map[string]bool{}
+	for node := range summary.ByNode {
+		nodes = append(nodes, node)
+		seenNodes[node] = true
+	}
+	for node := range summary.Capacity {
+		if !seenNodes[node] {
+			nodes = append(nodes, node)
+			seenNodes[node] = true
+		}
+	}
+	sort.Strings(nodes)
+	fmt.Fprintln(out)
+	nw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(nw, "NODE\tREQUESTS\tSTATIC CAPACITY\tPRESSURE\tHEADROOM")
+	for _, node := range nodes {
+		capacity := "-"
+		pressure, headroom := "n/a", "n/a"
+		if summary.CapacityKnown[node] {
+			capacity = resourceSummary(summary.Capacity[node])
+			p := summary.Pressure[node]
+			if p.Dimension != "unbounded" {
+				pressure = fmt.Sprintf("%s %.1f%%", p.Dimension, 100*p.Ratio)
+				headroom = fmt.Sprintf("%.1f%%", 100*(1-p.Ratio))
+			}
+		}
+		fmt.Fprintf(nw, "%s\t%s\t%s\t%s\t%s\n",
+			node, resourceSummary(summary.ByNode[node]), capacity, pressure, headroom)
+	}
+	if err := nw.Flush(); err != nil {
+		return err
+	}
+	if !summary.Unplaced.Empty() {
+		fmt.Fprintf(out, "\nunplaced requests: %s\n", resourceSummary(summary.Unplaced))
+	}
+	return nil
+}
+
+func resourceSummary(r place.Resources) string {
+	return fmt.Sprintf("%dc %.2fCPU %s mem %s disk %dp %dfd %dnd",
+		r.Containers, r.CPUs, inspectBytes(r.MemoryBytes), inspectBytes(r.DiskBytes),
+		r.Pids, r.FileDescriptors, r.NetDevices)
+}
+
+func inspectBytes(v int64) string {
+	switch {
+	case v >= 1<<30:
+		return fmt.Sprintf("%.1fGi", float64(v)/(1<<30))
+	case v >= 1<<20:
+		return fmt.Sprintf("%dMi", v>>20)
+	default:
+		return fmt.Sprintf("%dB", v)
+	}
 }
 
 // writePlacement shows which node each AS landed on and how many links have to

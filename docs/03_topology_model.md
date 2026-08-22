@@ -22,6 +22,12 @@ The model owns:
   from student-owned configuration; and
 - the expected/reference configuration used by rendering and grading.
 
+`requests` reserve a host scheduling share; `cpus`, `memory`, and `pids`
+remain hard container burst limits. FRR routers have a primary shell and an
+internal control sidecar, so capacity reporting and admission count both
+explicitly. `placement.convergence.max_concurrent` queues control-plane start
+bursts instead of treating peak startup CPU as an idle reservation.
+
 Deterministic derivation avoids duplicate allocation ledgers. It does not erase
 durable state: student snapshots, topology records, lease/fence data, event
 journals, and replica acknowledgements are persisted by the node state store.

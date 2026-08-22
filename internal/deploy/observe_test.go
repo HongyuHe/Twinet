@@ -2,6 +2,7 @@ package deploy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/HongyuHe/twinet/internal/model"
+	"github.com/HongyuHe/twinet/internal/netx"
 	"github.com/HongyuHe/twinet/internal/plan"
 	rt "github.com/HongyuHe/twinet/internal/runtime"
 )
@@ -161,6 +163,37 @@ func TestObservedNoChangeBuildUsesOneRuntimeListForLargeNode(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 30*time.Second {
 		t.Fatalf("212-device synthetic no-change build took %s, want under 30s", elapsed)
+	}
+}
+
+func TestReadOnlyObservationDoesNotPersistOrMutate(t *testing.T) {
+	top := observedTopology(t, 2, nil)
+	renderer := observedRenderer{revision: map[string]string{}}
+	runtime := observedRuntime{files: map[string][]byte{}}
+	for _, d := range top.Devices {
+		renderer.revision[d.ID] = "one"
+	}
+	engine := &Engine{
+		Runtime:             &runtime,
+		Node:                "node-a",
+		Renderer:            renderer,
+		ObservationRoot:     observeTestRoot(t),
+		ObservationReadOnly: true,
+	}
+	seedObservedContainers(t, engine, top, &runtime)
+
+	p, err := engine.Build(top)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Len() != 0 || !engine.LastBuildDiff().Empty() {
+		t.Fatalf("read-only healthy plan = %#v, diff=%#v", p.Steps(), engine.LastBuildDiff())
+	}
+	if lists, execs, copies := runtime.counts(); lists != 1 || execs != 0 || copies != 0 {
+		t.Fatalf("read-only observation calls = list %d exec %d copy %d, want 1/0/0", lists, execs, copies)
+	}
+	if _, err := os.Stat(engine.observationPath(top.Name)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("read-only observation persisted a cache: %v", err)
 	}
 }
 
@@ -371,6 +404,74 @@ func TestObservedDelayChangePlansOnlyItsWire(t *testing.T) {
 	}
 	if p.Len() != 1 || p.Steps()[0].ID != "wire:link-a" {
 		t.Fatalf("delay edit plan = %#v, want only wire:link-a", p.Steps())
+	}
+}
+
+func TestObservedOverlayBindingDriftPlansOnlyItsLink(t *testing.T) {
+	leftA := &model.Device{ID: "as1/R1", Name: "R1", Container: "tw-as1-r1", Node: "node-a", ASN: 1}
+	rightA := &model.Device{ID: "as2/R1", Name: "R1", Container: "tw-as2-r1", Node: "node-b", ASN: 2}
+	leftB := &model.Device{ID: "as3/R1", Name: "R1", Container: "tw-as3-r1", Node: "node-a", ASN: 3}
+	rightB := &model.Device{ID: "as4/R1", Name: "R1", Container: "tw-as4-r1", Node: "node-b", ASN: 4}
+	link := func(id string, vni uint32, left, right *model.Device) *model.Link {
+		a, b := &model.Iface{Device: left, Name: "eth0"}, &model.Iface{Device: right, Name: "eth0"}
+		out := &model.Link{ID: id, VNI: vni, Kind: model.LinkVeth, A: a, B: b}
+		a.Link, b.Link = out, out
+		left.Ifaces = append(left.Ifaces, a)
+		right.Ifaces = append(right.Ifaces, b)
+		return out
+	}
+	top := &model.Topology{
+		Name: "observed-overlay", Hash: "observed-overlay-hash",
+		Devices: map[string]*model.Device{
+			leftA.ID: leftA, rightA.ID: rightA, leftB.ID: leftB, rightB.ID: rightB,
+		},
+		Links: []*model.Link{
+			link("pair-100", 100, leftA, rightA),
+			link("pair-101", 101, leftB, rightB),
+		},
+		ASes: map[int]*model.AS{
+			1: {ASN: 1, Role: model.RoleStudent}, 2: {ASN: 2, Role: model.RoleStudent},
+			3: {ASN: 3, Role: model.RoleStudent}, 4: {ASN: 4, Role: model.RoleStudent},
+		},
+	}
+	renderer := observedRenderer{revision: map[string]string{}}
+	runtime := observedRuntime{files: map[string][]byte{}}
+	for _, device := range top.Devices {
+		renderer.revision[device.ID] = "one"
+	}
+	engine := &Engine{
+		Runtime: &runtime, Node: "node-a", Renderer: renderer, ObservationRoot: observeTestRoot(t),
+		PeerUnderlay: map[string]string{"node-b": "10.0.0.2"},
+	}
+	expected, err := engine.ExpectedOverlayInventory(top)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actual := netx.OverlayInventory{
+		Bindings: append([]netx.LogicalBinding(nil), expected.Bindings...),
+		Trunks:   append([]netx.PhysicalTrunk(nil), expected.Trunks...),
+	}
+	engine.inspectOverlayInventory = func(string) (netx.OverlayInventory, error) {
+		return actual, nil
+	}
+	seedObservedContainers(t, engine, top, &runtime)
+	if p, err := engine.Build(top); err != nil || p.Len() != 0 {
+		t.Fatalf("healthy overlay baseline = %#v, %v", p, err)
+	}
+	for i := range actual.Bindings {
+		if actual.Bindings[i].VNI == 101 {
+			actual.Bindings[i].Peer = "10.0.0.99"
+		}
+	}
+	p, err := engine.Build(top)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Len() != 1 || p.Steps()[0].ID != "wire:pair-101" {
+		t.Fatalf("overlay binding drift plan = %#v, want only wire:pair-101", p.Steps())
+	}
+	if !engine.LastBuildDiff().Wire["pair-101"] || engine.LastBuildDiff().Wire["pair-100"] {
+		t.Fatalf("overlay dirty set = %#v", engine.LastBuildDiff().Wire)
 	}
 }
 

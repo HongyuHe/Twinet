@@ -682,6 +682,12 @@ func (s *Server) Serve(ctx context.Context) error {
 	mux.HandleFunc("GET /v1/status", s.authorize(endpointPolicy{
 		Action: authz.ActionObserve, AllowCluster: true, ResolveRequest: scopeFromQuery(authz.ActionObserve, true),
 	}, s.observedHandler("status", s.handleStatus)))
+	mux.HandleFunc("POST /v1/plan", s.authorize(endpointPolicy{
+		Action: authz.ActionDeploy, ResolveRequest: scopeFromJSONLab(authz.ActionDeploy),
+	}, s.observedHandler("plan", s.handlePlan)))
+	mux.HandleFunc("POST /v1/plan/verify", s.authorize(endpointPolicy{
+		Action: authz.ActionDeploy, ResolveRequest: scopeFromJSONLab(authz.ActionDeploy),
+	}, s.observedHandler("plan_verify", s.handlePlanVerify)))
 	mux.HandleFunc("GET /v1/containers", s.authorize(endpointPolicy{
 		Action: authz.ActionObserve, AllowCluster: true, ResolveRequest: scopeFromQuery(authz.ActionObserve, true),
 	}, s.handleContainers))

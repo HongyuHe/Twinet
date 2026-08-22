@@ -70,6 +70,11 @@ func (d demand) empty() bool {
 		d.NetDevices == 0
 }
 
+// Empty reports whether a reservation has no requested resources.
+func (d demand) Empty() bool {
+	return d.empty()
+}
+
 // Capacity represents observed allocatable capacity. Nil means the agent
 // could not determine that dimension; it never means zero capacity.
 type Capacity struct {

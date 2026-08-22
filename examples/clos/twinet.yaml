@@ -6,13 +6,13 @@ metadata:
 
 kinds:
   router:
-    requests: {cpus: 0.50, memory: 128Mi, pids: 64, ephemeral_storage: 256Mi, file_descriptors: 1024, netdevs: 10}
+    requests: {cpus: 0.04, memory: 128Mi, pids: 64, ephemeral_storage: 256Mi, file_descriptors: 1024, netdevs: 8}
   host:
-    requests: {cpus: 0.10, memory: 64Mi, pids: 32, ephemeral_storage: 64Mi, file_descriptors: 256, netdevs: 2}
+    requests: {cpus: 0.02, memory: 64Mi, pids: 32, ephemeral_storage: 64Mi, file_descriptors: 256, netdevs: 2}
   switch:
-    requests: {cpus: 0.25, memory: 128Mi, pids: 64, ephemeral_storage: 128Mi, file_descriptors: 1024, netdevs: 16}
+    requests: {cpus: 0.04, memory: 128Mi, pids: 512, ephemeral_storage: 128Mi, file_descriptors: 1024, netdevs: 8}
   service:
-    requests: {cpus: 0.25, memory: 128Mi, pids: 64, ephemeral_storage: 256Mi, file_descriptors: 1024, netdevs: 8}
+    requests: {cpus: 0.10, memory: 128Mi, pids: 512, ephemeral_storage: 256Mi, file_descriptors: 1024, netdevs: 8}
 
 addressing:
   as_block: "{{ .AS }}.0.0.0/8"

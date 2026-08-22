@@ -308,7 +308,7 @@ func (e *Engine) observeNode(ctx context.Context, top *model.Topology, devices [
 	for _, container := range containers {
 		byName[container.Name] = container
 	}
-	liveVNI := map[uint32]bool{}
+	overlayDirty := map[uint32]bool{}
 	hasCrossNode := false
 	for _, link := range top.Links {
 		if link != nil && link.CrossNode() &&
@@ -318,15 +318,15 @@ func (e *Engine) observeNode(ctx context.Context, top *model.Topology, devices [
 		}
 	}
 	if hasCrossNode {
-		overlays, err := netx.ListMultiplexOverlaysOfLab(top.Name)
+		expected, err := e.ExpectedOverlayInventory(top)
+		if err != nil {
+			return nil, nil, BuildDiff{}, fmt.Errorf("derive expected overlays for %s: %w", top.Name, err)
+		}
+		actual, err := e.observedOverlayInventory(top.Name)
 		if err != nil {
 			return nil, nil, BuildDiff{}, fmt.Errorf("observe overlays for %s: %w", top.Name, err)
 		}
-		for _, overlay := range overlays {
-			for _, vni := range overlay.VNIs {
-				liveVNI[vni] = true
-			}
-		}
+		overlayDirty = dirtyOverlayBindings(expected, actual)
 	}
 	observedFor := time.Since(start)
 	diffStart := time.Now()
@@ -343,6 +343,7 @@ func (e *Engine) observeNode(ctx context.Context, top *model.Topology, devices [
 		Capture:     map[string]bool{},
 	}
 	wantDevices := make(map[string]bool, len(devices))
+	semanticDevices := make([]*model.Device, 0, len(devices))
 	for _, d := range devices {
 		wantDevices[d.ID] = true
 		state, err := e.renderDesired(d)
@@ -400,19 +401,32 @@ func (e *Engine) observeNode(ctx context.Context, top *model.Topology, devices [
 			diff.Ready[d.ID] = true
 		}
 		if e.SemanticProbe != nil && !specDirty {
-			if err := e.SemanticProbe(ctx, d); err != nil {
-				// The renderer commands are deliberately idempotent. Mark the
-				// device dirty so `deploy --solve` repairs a live address,
-				// route, VLAN, or BGP-session drift even when every observed
-				// file hash says the deploy is otherwise a no-op.
-				diff.Semantic[d.ID] = true
-				diff.Configure[d.ID] = true
-				if studentOwned(top, d) {
-					diff.Capture[d.ID] = true
-				}
-				if e.Renderer != nil && e.Renderer.Ready(d, e.Runtime) != nil {
-					diff.Ready[d.ID] = true
-				}
+			semanticDevices = append(semanticDevices, d)
+		}
+	}
+	if len(semanticDevices) > 0 {
+		_, semanticErrs, ctxErr := e.runBounded(ctx, len(semanticDevices), func(i int) error {
+			return e.SemanticProbe(ctx, semanticDevices[i])
+		})
+		if ctxErr != nil {
+			return nil, nil, BuildDiff{}, ctxErr
+		}
+		for i, semanticErr := range semanticErrs {
+			if semanticErr == nil {
+				continue
+			}
+			d := semanticDevices[i]
+			// The renderer commands are deliberately idempotent. Mark the
+			// device dirty so `deploy --solve` repairs a live address, route,
+			// VLAN, or BGP-session drift even when every observed file hash
+			// says the deploy is otherwise a no-op.
+			diff.Semantic[d.ID] = true
+			diff.Configure[d.ID] = true
+			if studentOwned(top, d) {
+				diff.Capture[d.ID] = true
+			}
+			if e.Renderer != nil && e.Renderer.Ready(d, e.Runtime) != nil {
+				diff.Ready[d.ID] = true
 			}
 		}
 	}
@@ -436,16 +450,108 @@ func (e *Engine) observeNode(ctx context.Context, top *model.Topology, devices [
 			known = true
 			previous = observedLinkState{Hash: hash}
 		}
-		if modeDirty || endpointCreate || !known || previous.Hash != hash || (link.CrossNode() && !liveVNI[link.VNI]) {
+		if modeDirty || endpointCreate || !known || previous.Hash != hash ||
+			(link.CrossNode() && overlayDirty[link.VNI]) {
 			diff.Wire[link.ID] = true
 		}
 	}
 	tracker.prune(wantDevices, wantLinks)
-	if err := tracker.save(); err != nil {
-		return nil, nil, BuildDiff{}, err
+	if !e.ObservationReadOnly {
+		if err := tracker.save(); err != nil {
+			return nil, nil, BuildDiff{}, err
+		}
 	}
 	diff.DiffedFor = time.Since(diffStart)
 	return tracker, desired, diff, nil
+}
+
+func (e *Engine) observedOverlayInventory(lab string) (netx.OverlayInventory, error) {
+	if e.inspectOverlayInventory != nil {
+		return e.inspectOverlayInventory(lab)
+	}
+	return netx.InspectOverlayInventory(lab)
+}
+
+// dirtyOverlayBindings returns the logical links that cannot be accepted as a
+// no-op. Logical VNI/VLAN/FDB facts and physical shared trunks are both
+// verified: a present VNI alone is insufficient evidence that frames reach
+// only the intended peer.
+func dirtyOverlayBindings(expected, actual netx.OverlayInventory) map[uint32]bool {
+	dirty := map[uint32]bool{}
+	expectedByVNI := map[uint32]netx.LogicalBinding{}
+	for _, binding := range expected.Bindings {
+		expectedByVNI[binding.VNI] = binding
+	}
+	markAll := func() {
+		for vni := range expectedByVNI {
+			dirty[vni] = true
+		}
+	}
+	markPair := func(a, b string) {
+		for vni, binding := range expectedByVNI {
+			if binding.NodeA == a && binding.NodeB == b {
+				dirty[vni] = true
+			}
+		}
+	}
+
+	actualByVNI := map[uint32][]netx.LogicalBinding{}
+	for _, binding := range actual.Bindings {
+		actualByVNI[binding.VNI] = append(actualByVNI[binding.VNI], binding)
+	}
+	for vni, want := range expectedByVNI {
+		got := actualByVNI[vni]
+		if len(got) != 1 || !sameLogicalBinding(want, got[0]) {
+			dirty[vni] = true
+		}
+	}
+	for vni := range actualByVNI {
+		if _, known := expectedByVNI[vni]; !known {
+			markAll()
+		}
+	}
+
+	expectedTrunks := map[string]netx.PhysicalTrunk{}
+	for _, trunk := range expected.Trunks {
+		expectedTrunks[trunkPairKey(trunk.NodeA, trunk.NodeB)] = trunk
+	}
+	actualTrunks := map[string][]netx.PhysicalTrunk{}
+	for _, trunk := range actual.Trunks {
+		if trunk.Legacy {
+			continue
+		}
+		key := trunkPairKey(trunk.NodeA, trunk.NodeB)
+		actualTrunks[key] = append(actualTrunks[key], trunk)
+	}
+	for key, want := range expectedTrunks {
+		got := actualTrunks[key]
+		if len(got) != 1 || !samePhysicalTrunk(want, got[0]) {
+			markPair(want.NodeA, want.NodeB)
+		}
+	}
+	for key := range actualTrunks {
+		if _, known := expectedTrunks[key]; !known {
+			markAll()
+		}
+	}
+	return dirty
+}
+
+func sameLogicalBinding(a, b netx.LogicalBinding) bool {
+	return a.VNI == b.VNI && a.VLAN == b.VLAN && a.Peer == b.Peer &&
+		a.MTU == b.MTU && a.Port == b.Port && a.NodeA == b.NodeA && a.NodeB == b.NodeB
+}
+
+func samePhysicalTrunk(a, b netx.PhysicalTrunk) bool {
+	return a.Bridge == b.Bridge && a.Vxlan == b.Vxlan && a.MTU == b.MTU &&
+		a.Port == b.Port && a.NodeA == b.NodeA && a.NodeB == b.NodeB
+}
+
+func trunkPairKey(a, b string) string {
+	if a > b {
+		a, b = b, a
+	}
+	return a + "\x00" + b
 }
 
 func linkLabelHashMatches(containers map[string]runtime.Container, link *model.Link, node, hash string) bool {

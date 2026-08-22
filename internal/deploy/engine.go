@@ -100,6 +100,10 @@ type Engine struct {
 	// not turn their individually bounded worker pools into an unbounded
 	// node-wide burst.
 	Limiter *limiter.Limiter
+	// ConvergenceLimit is an optional per-lab ceiling layered under the
+	// node-wide limiter.Convergence budget. It queues startup bursts without
+	// inflating every router's steady scheduling request.
+	ConvergenceLimit int
 	// Workers bounds capture, pruning, and teardown fan-out. Zero uses a
 	// conservative default so a large lab cannot turn cleanup into an
 	// unbounded burst of runtime or netlink requests.
@@ -187,16 +191,24 @@ type Engine struct {
 	// Empty uses /run/twinet/observed. It contains hashes only, never student
 	// configuration bytes.
 	ObservationRoot string
+	// ObservationReadOnly computes desired/observed state without updating the
+	// local snapshot. It is used by controller no-op preflight, which must not
+	// reserve a generation or leave deployment state behind.
+	ObservationReadOnly bool
 
 	// pendingRestore records devices whose captured configuration must be
 	// replayed once their interfaces exist.
-	pendingRestore       sync.Map
-	observationMu        sync.Mutex
-	observation          *observationTracker
-	lastDiff             BuildDiff
-	mutationMu           sync.Mutex
-	mutations            map[string]int
-	removeEmptyMultiplex func(string) ([]string, error)
+	pendingRestore          sync.Map
+	observationMu           sync.Mutex
+	observation             *observationTracker
+	lastDiff                BuildDiff
+	mutationMu              sync.Mutex
+	mutations               map[string]int
+	convergenceMu           sync.Mutex
+	convergenceGate         chan struct{}
+	convergenceGateLimit    int
+	removeEmptyMultiplex    func(string) ([]string, error)
+	inspectOverlayInventory func(string) (netx.OverlayInventory, error)
 }
 
 func (e *Engine) limited(ctx context.Context, kinds []limiter.Kind, fn func() error) error {
@@ -204,6 +216,56 @@ func (e *Engine) limited(ctx context.Context, kinds []limiter.Kind, fn func() er
 		return fn()
 	}
 	return e.Limiter.Run(ctx, kinds, fn)
+}
+
+func (e *Engine) convergenceSlots(top *model.Topology) int {
+	if e.ConvergenceLimit > 0 {
+		return e.ConvergenceLimit
+	}
+	if top != nil && top.Lab != nil {
+		return top.Lab.Placement.Convergence.MaxConcurrent
+	}
+	return 0
+}
+
+func (e *Engine) acquireConvergence(ctx context.Context, top *model.Topology,
+	d *model.Device,
+) (func(), error) {
+	if d == nil || d.Kind != model.KindRouter {
+		return func() {}, nil
+	}
+	limit := e.convergenceSlots(top)
+	if limit <= 0 {
+		return func() {}, nil
+	}
+	e.convergenceMu.Lock()
+	if e.convergenceGate == nil || e.convergenceGateLimit != limit {
+		e.convergenceGate = make(chan struct{}, limit)
+		e.convergenceGateLimit = limit
+	}
+	gate := e.convergenceGate
+	e.convergenceMu.Unlock()
+	select {
+	case gate <- struct{}{}:
+		return func() { <-gate }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (e *Engine) converging(ctx context.Context, top *model.Topology, d *model.Device,
+	fn func() error,
+) error {
+	release, err := e.acquireConvergence(ctx, top, d)
+	if err != nil {
+		return err
+	}
+	defer release()
+	kinds := []limiter.Kind{limiter.Apply, limiter.ExecProbe}
+	if d != nil && d.Kind == model.KindRouter {
+		kinds = append(kinds, limiter.Convergence)
+	}
+	return e.limited(ctx, kinds, fn)
 }
 
 // Renderer produces the files and commands that configure a device.
@@ -415,7 +477,7 @@ func (e *Engine) BuildContext(ctx context.Context, top *model.Topology) (*plan.P
 			Describe: "configure " + dev.ID,
 			Needs:    dedup(needs),
 			Run: func(ctx context.Context) error {
-				return e.limited(ctx, []limiter.Kind{limiter.Apply, limiter.ExecProbe}, func() error {
+				return e.converging(ctx, top, dev, func() error {
 					state := desired[dev.ID]
 					if err := e.configureDesired(ctx, dev, state); err != nil {
 						return err

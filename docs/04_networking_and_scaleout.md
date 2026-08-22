@@ -59,6 +59,30 @@ with live allocatable inventory. Missing inventory and overload are refusals.
 `--overcommit` is an explicit audited override, not an implicit scheduling
 fallback.
 
+### Scale request calibration
+
+Requests are a guaranteed steady-state/convergence share, not a Docker burst
+cap. The bundled scale manifest reserves `0.04` CPU for a router shell plus
+`0.08` for its private FRR control sidecar (`0.12` aggregate), `0.02` for a
+host, `0.04` for a switch, and `0.10` for a service. Its existing CPU/memory/PID
+limits remain burst caps (for example, the router remains `2 CPU / 512Mi`).
+
+`twinet inspect --capacity -m examples/scale` reports every primary request,
+FRR controls separately, node totals, and static-capacity pressure. The
+three-worker planning result is 110.60 requested CPU against 151.20 allocatable
+CPU before the front-node reserve; the heaviest placed node remains below 80%.
+Memory, PID, FD, disk, and netdev reservations remain explicit, and the scale
+manifest reserves front-node service headroom.
+`placement.convergence.max_concurrent` queues router starts instead of inflating idle CPU requests;
+the node-wide convergence limiter also protects concurrent labs.
+
+The 22 GiB / load-13-of-56 observation in [09](09_status.md) motivated this
+calibration, but it is not evidence for the revised sidecar-aware deployment.
+Run a live initial deploy and capture peak agent inventory before promoting
+this planning result to a measured acceptance claim. Agent status exposes
+`inventory.used` and the agent-lifetime high-water `inventory.peak` for that
+capture.
+
 The current scale result is **measured**, not a capacity promise:
 [09 — Measurements](09_status.md#measurements) records its topology, node
 count, timing, utilization, and qualification.
