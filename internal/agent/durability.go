@@ -326,6 +326,9 @@ func (s *Server) captureDueState(ctx context.Context) {
 	sort.Strings(labs)
 	s.mu.Unlock()
 	for _, lab := range labs {
+		if reason := s.ordinaryMaintenanceSuppression(lab); reason != "" {
+			continue
+		}
 		top, policy, ok := s.durabilityTopology(lab)
 		mode, ungraded := s.modeAndUngraded(lab)
 		if !ok || top == nil || !hasCapturableStudentDevice(top, mode, ungraded, s.cfg.Node) {
@@ -344,22 +347,35 @@ func (s *Server) captureDueState(ctx context.Context) {
 		if !captureDue && !retryDue {
 			continue
 		}
-		if !s.beginDurability(lab) {
+		periodicCtx, ok := s.beginPeriodicDurability(ctx, lab)
+		if !ok {
 			continue
 		}
-		go func(lab string, top *model.Topology, policy model.StatePolicy, captureDue bool) {
+		go func(periodicCtx context.Context, lab string, top *model.Topology, policy model.StatePolicy, captureDue bool) {
 			defer s.endDurability(lab)
+			// A transaction may have become durable after this periodic task
+			// was scheduled. Do not race rollback by capturing a half-restored
+			// namespace or attempting peer replication with its canceled
+			// context; recovery itself owns the next durable boundary.
+			if s.ordinaryMaintenanceSuppression(lab) != "" {
+				return
+			}
 			var err error
 			if captureDue {
-				_, err = s.captureAndReplicate(ctx, top)
+				_, err = s.captureAndReplicate(periodicCtx, top)
 			} else {
-				err = s.replicateDurableState(ctx, top)
+				err = s.replicateDurableState(periodicCtx, top)
 			}
 			if err != nil {
+				if periodicCtx.Err() != nil && s.ordinaryMaintenanceSuppression(lab) != "" {
+					// Expected cancellation: a newly persisted transaction
+					// owns the next capture/replication boundary.
+					return
+				}
 				slog.Error("periodic durable replication failed", "lab", lab, "err", err,
 					"fail_closed", policy.FailClosedEnabled())
 			}
-		}(lab, top, policy, captureDue)
+		}(periodicCtx, lab, top, policy, captureDue)
 	}
 }
 
@@ -394,17 +410,22 @@ func hasCapturableStudentDevice(top *model.Topology, mode render.Mode, ungraded 
 	return false
 }
 
-func (s *Server) beginDurability(lab string) bool {
+func (s *Server) beginPeriodicDurability(parent context.Context, lab string) (context.Context, bool) {
 	s.durabilityMu.Lock()
 	defer s.durabilityMu.Unlock()
 	if s.durabilityBusy == nil {
 		s.durabilityBusy = map[string]bool{}
 	}
 	if s.durabilityBusy[lab] {
-		return false
+		return nil, false
 	}
+	if s.durabilityCancel == nil {
+		s.durabilityCancel = map[string]context.CancelFunc{}
+	}
+	ctx, cancel := context.WithCancel(parent)
 	s.durabilityBusy[lab] = true
-	return true
+	s.durabilityCancel[lab] = cancel
+	return ctx, true
 }
 
 func (s *Server) endDurability(lab string) {
@@ -413,7 +434,23 @@ func (s *Server) endDurability(lab string) {
 		s.durabilityBusy = map[string]bool{}
 	}
 	delete(s.durabilityBusy, lab)
+	if cancel := s.durabilityCancel[lab]; cancel != nil {
+		cancel()
+	}
+	delete(s.durabilityCancel, lab)
 	s.durabilityMu.Unlock()
+}
+
+// stopPeriodicDurability cancels only agent-scheduled work. It is invoked as
+// soon as a transaction is persisted so a stale capture cannot race rollback
+// or turn its expected peer quorum into a noisy canceled failure.
+func (s *Server) stopPeriodicDurability(lab string) {
+	s.durabilityMu.Lock()
+	cancel := s.durabilityCancel[lab]
+	s.durabilityMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 }
 
 // captureAndReplicate takes a bounded capture and confirms every current

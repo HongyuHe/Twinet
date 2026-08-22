@@ -221,6 +221,10 @@ func (s *Server) queueReconcile(ctx context.Context, lab, device string) {
 	if lab == "" {
 		return
 	}
+	if reason := s.ordinaryMaintenanceSuppression(lab); reason != "" {
+		s.metricRegistry().observeRepair("recovery")
+		return
+	}
 	s.reconcileMu.Lock()
 	queue := s.reconcileQueue
 	if queue == nil {
@@ -277,6 +281,11 @@ func (s *Server) queueReconcileAfter(lab, device string, delay time.Duration) {
 }
 
 func (s *Server) reconcileTarget(ctx context.Context, request reconcileRequest) {
+	if reason := s.ordinaryMaintenanceSuppression(request.lab); reason != "" {
+		s.metricRegistry().observeRepair("recovery")
+		s.recordEvent(request.lab, "", "reconcile", "", "repair_skipped", "recovery", reason)
+		return
+	}
 	s.mu.Lock()
 	top := s.current[request.lab]
 	s.mu.Unlock()
@@ -325,11 +334,14 @@ func (s *Server) reconcileTarget(ctx context.Context, request reconcileRequest) 
 	if len(broken) == 0 {
 		return
 	}
-	if err := s.acquire(request.lab, "reconcile"); err != nil {
+	repairCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	opID, done, err := s.acquireOperation(request.lab, "reconcile", cancel)
+	if err != nil {
 		return
 	}
-	defer s.release(request.lab)
-	s.repairLab(ctx, top, broken)
+	defer s.releaseOperation(request.lab, opID, done)
+	s.repairLab(repairCtx, top, broken)
 }
 
 // rememberHealth keeps only the last bounded state per device. It makes a
@@ -380,7 +392,7 @@ func (s *Server) reconcileOnce(ctx context.Context) {
 				"lab", name, "holder", who)
 			continue
 		}
-		if why := s.recoveryMutationRefusal(name); why != "" {
+		if why := s.ordinaryMaintenanceSuppression(name); why != "" {
 			slog.Debug("leaving lab alone while durable recovery owns it",
 				"lab", name, "reason", why)
 			continue
@@ -398,11 +410,15 @@ func (s *Server) reconcileOnce(ctx context.Context) {
 		// Repairing does change things, so it takes the lock -- and yields
 		// immediately if a deploy or a destroy holds it, because whatever they
 		// are doing is a better answer than this loop's.
-		if err := s.acquire(name, "reconcile"); err != nil {
+		repairCtx, cancel := context.WithCancel(ctx)
+		opID, done, err := s.acquireOperation(name, "reconcile", cancel)
+		if err != nil {
+			cancel()
 			continue
 		}
-		s.repairLab(ctx, top, broken)
-		s.release(name)
+		s.repairLab(repairCtx, top, broken)
+		cancel()
+		s.releaseOperation(name, opID, done)
 	}
 }
 
@@ -417,7 +433,8 @@ func (s *Server) reconcileSample(ctx context.Context) {
 	}
 	s.mu.Unlock()
 	for name, top := range labs {
-		if top == nil || s.heldBy(name) != "" || s.mutationLeaseHolder(name) != "" {
+		if top == nil || s.heldBy(name) != "" || s.mutationLeaseHolder(name) != "" ||
+			s.ordinaryMaintenanceSuppression(name) != "" {
 			continue
 		}
 		var devices []*model.Device
@@ -490,6 +507,11 @@ func (s *Server) repairLab(ctx context.Context, top *model.Topology, broken []*m
 	if who := s.mutationLeaseHolder(top.Name); who != "" {
 		s.metricRegistry().observeRepair("held")
 		s.recordEvent(top.Name, "", "reconcile", "", "repair_skipped", "held", who)
+		return
+	}
+	if reason := s.ordinaryMaintenanceSuppression(top.Name); reason != "" {
+		s.metricRegistry().observeRepair("recovery")
+		s.recordEvent(top.Name, "", "reconcile", "", "repair_skipped", "recovery", reason)
 		return
 	}
 	if s.repairHook != nil {
@@ -568,6 +590,11 @@ func (s *Server) repairLab(ctx context.Context, top *model.Topology, broken []*m
 		ModeKey:         rendererModeKey(render.Mode(mode), ungraded),
 	}
 	for _, d := range broken {
+		if reason := s.ordinaryMaintenanceSuppression(top.Name); reason != "" {
+			s.metricRegistry().observeRepair("recovery")
+			s.recordEvent(top.Name, "", "reconcile", "", "repair_skipped", "recovery", reason)
+			return
+		}
 		if s.givingUpOn(top.Name, d.ID) {
 			s.metricRegistry().observeRepair("backoff")
 			s.recordEvent(top.Name, "", "reconcile", "", "repair_deferred", "backoff",
@@ -584,6 +611,10 @@ func (s *Server) repairLab(ctx context.Context, top *model.Topology, broken []*m
 		class := deviceChangeClass(observation)
 		s.recordEvent(top.Name, "", "reconcile", "", "change_plan", "scheduled",
 			d.ID+"="+string(class))
+		if reason := s.ordinaryMaintenanceSuppression(top.Name); reason != "" {
+			s.metricRegistry().observeRepair("recovery")
+			return
+		}
 		if err := s.reviveDevice(ctx, eng, top, d, observation); err != nil {
 			s.repairFailed(top.Name, d.ID, "container lifecycle repair failed", err)
 			s.recordEvent(top.Name, "", "reconcile", "", "repair", "error",
@@ -628,6 +659,10 @@ func (s *Server) repairLab(ctx context.Context, top *model.Topology, broken []*m
 					"its configuration is written again", "device", d.ID, "err", err)
 			}
 		}
+		if reason := s.ordinaryMaintenanceSuppression(top.Name); reason != "" {
+			s.metricRegistry().observeRepair("recovery")
+			return
+		}
 		if err := eng.RewireDevice(ctx, top, d); err != nil {
 			s.repairFailed(top.Name, d.ID, "rewiring failed", err)
 			s.recordEvent(top.Name, "", "reconcile", "", "repair", "error",
@@ -644,6 +679,10 @@ func (s *Server) repairLab(ctx context.Context, top *model.Topology, broken []*m
 		// unattended every few seconds, so this needed no unusual sequence of
 		// events to happen.
 		if renderModeForDevice(render.Mode(mode), ungraded, d) != render.ModeSolve {
+			if reason := s.ordinaryMaintenanceSuppression(top.Name); reason != "" {
+				s.metricRegistry().observeRepair("recovery")
+				return
+			}
 			if _, err := deploy.Restore(ctx, s.rt, d, top.Name, s.store); err != nil {
 				s.repairFailed(top.Name, d.ID, "configuration could not be put back after rewiring", err)
 				s.recordEvent(top.Name, "", "reconcile", "", "repair", "error",

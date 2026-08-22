@@ -259,6 +259,16 @@ disk disappears.
 - Restore clears stale dynamic facts before replay and fails on the first
   rejected command. FRR/BIRD configuration is replayed only after its daemon
   is ready, after interfaces and tunnels have been restored.
+- A persisted unfinished transaction gates event repair, sampled/full semantic
+  audit, periodic capture/replication, and GC before their loops can mutate a
+  rehydrated lab. Recovery cancels already scheduled periodic work and is the
+  sole writer until it verifies and finalizes the terminal inventory.
+- Exact rollback uses a small shared lifecycle worker budget, reuses an
+  inspected matching/exited container, and resolves duplicate-name errors by
+  re-inspection rather than blindly creating another container.
+- Kernel-created tunnel defaults (`sit0`, `tunl0`, GRE/GRETAP/ERSPAN, IP6
+  tunnel, and VTI defaults) are excluded from captures and never deleted by
+  restore; named student 6in4 tunnels remain durable facts.
 - Renderer mode and harness `ungraded` are transaction state. A mode
   transition rewires and semantically verifies every local device, so a
   reference host address/default route cannot be skipped merely because its

@@ -101,6 +101,42 @@ func TestCanonicalTunnelAndOVSSnapshotsIgnoreOrderingNoise(t *testing.T) {
 	}
 }
 
+func TestCanonicalTunnelSnapshotExcludesKernelDefaults(t *testing.T) {
+	raw := `sit0: ipv6/ip remote any local any ttl 64
+	tunl0: ipip/ip remote any local any ttl inherit
+	gre0@NONE: gre/ip remote 0.0.0.0 local 0.0.0.0 ttl inherit
+gretap0: gretap/ip remote 0.0.0.0 local 0.0.0.0 ttl inherit
+erspan0: erspan/ip remote any local any ttl inherit
+ip6tnl0: ip6tnl/ip6 remote :: local :: encaplimit 0
+tun6: ipv6/ip remote 3.153.0.1 local 3.156.0.1 ttl 64
+`
+	body := CanonicalDynamicSnapshot(state.KindTunnels, raw)
+	if !strings.Contains(body, "tunnel tun6 3.153.0.1 3.156.0.1") {
+		t.Fatalf("named student tunnel missing from canonical snapshot: %q", body)
+	}
+	for _, kernel := range []string{"sit0", "tunl0", "gre0", "gretap0", "erspan0", "ip6tnl0"} {
+		if strings.Contains(body, "tunnel "+kernel+" ") {
+			t.Fatalf("kernel default %s leaked into canonical snapshot: %q", kernel, body)
+		}
+	}
+	legacyV2 := "twinet-state/v2 tunnels\ntunnel gre0 0.0.0.0 0.0.0.0\n" +
+		"tunnel tun6 3.153.0.1 3.156.0.1\n"
+	commands := tunnelReplay(legacyV2)
+	joined := strings.Join(commands, "\n")
+	if strings.Contains(joined, "gre0") || !strings.Contains(joined, "tun6") {
+		t.Fatalf("legacy tunnel replay was not hygienic: %q", joined)
+	}
+	runtime := &dynamicRestoreRuntime{}
+	device := &model.Device{ID: "as3/ATL", Kind: model.KindRouter, Container: "atl"}
+	if err := resetDynamicState(context.Background(), runtime, device, state.KindTunnels); err != nil {
+		t.Fatal(err)
+	}
+	if got := runtime.joined(); len(got) != 1 ||
+		!strings.Contains(got[0], "gre0|gretap0|erspan0") {
+		t.Fatalf("tunnel reset does not protect kernel defaults: %q", got)
+	}
+}
+
 func TestRestoreCanonicalDynamicStateClearsStaleFactsBeforeReplay(t *testing.T) {
 	store, err := state.Open(t.TempDir())
 	if err != nil {

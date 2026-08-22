@@ -258,6 +258,10 @@ func normalizedCanonicalDynamic(kind state.Kind, raw string) (string, bool) {
 		if len(fields) == 0 {
 			continue
 		}
+		if kind == state.KindTunnels && fields[0] == "tunnel" && len(fields) == 4 &&
+			kernelDefaultTunnel(fields[1], fields[2], fields[3]) {
+			continue
+		}
 		set[strings.Join(fields, " ")] = true
 	}
 	return canonicalLines(string(kind), set), true
@@ -357,9 +361,10 @@ func canonicalTunnels(raw string) string {
 				continue
 			}
 			name := strings.TrimSuffix(fields[0], ":")
+			name, _, _ = strings.Cut(name, "@")
 			remote, local := fieldAfter(line, "remote"), fieldAfter(line, "local")
-			if name != "" && name != "sit0" && remote != "" && local != "" &&
-				remote != "any" && local != "any" {
+			if name != "" && remote != "" && local != "" &&
+				!kernelDefaultTunnel(name, remote, local) {
 				set["tunnel "+name+" "+remote+" "+local] = true
 			}
 			continue
@@ -369,6 +374,21 @@ func canonicalTunnels(raw string) string {
 		}
 	}
 	return canonicalLines("tunnels", set)
+}
+
+// kernelDefaultTunnel identifies netdevs created by the kernel's tunnel
+// drivers. They are not student state and deleting one during restore fails
+// with EPERM (or disrupts an unrelated provider), even when a raw ip dump
+// renders it with 0.0.0.0 instead of "any".
+func kernelDefaultTunnel(name, remote, local string) bool {
+	name, _, _ = strings.Cut(strings.ToLower(name), "@")
+	switch name {
+	case "sit0", "tunl0", "ipip0", "gre0", "gretap0", "erspan0",
+		"ip6tnl0", "ip6gre0", "ip6gretap0", "ip_vti0", "ip6_vti0":
+		return true
+	}
+	return remote == "" || local == "" || remote == "any" || local == "any" ||
+		remote == "0.0.0.0" || local == "0.0.0.0" || remote == "::" || local == "::"
 }
 
 func canonicalOVS(raw string) string {
@@ -732,12 +752,15 @@ for iface in $ifaces; do
   ip -6 route flush dev "$iface" || exit $?
 done`
 	case state.KindTunnels:
-		// sit0 is the kernel's built-in tunnel and must never be deleted.
+		// Kernel-created defaults are not student state and must never be
+		// deleted. Some drivers render their endpoint as 0.0.0.0, so names
+		// are the durable exclusion boundary here.
 		script = `tunnels=$(ip -d tunnel show) || exit $?
 printf '%s\n' "$tunnels" | while IFS= read -r line; do
   case "$line" in *" remote "*" local "*) ;; *) continue ;; esac
   name=${line%%:*}
-  case "$name" in ""|sit0) continue ;; esac
+  name=${name%%@*}
+  case "$name" in ""|sit0|tunl0|ipip0|gre0|gretap0|erspan0|ip6tnl0|ip6gre0|ip6gretap0|ip_vti0|ip6_vti0) continue ;; esac
   ip tunnel del "$name" || exit $?
 done || exit $?`
 	case state.KindOVS:
@@ -882,6 +905,9 @@ func canonicalTunnelReplay(body string) []string {
 				continue
 			}
 			name, remote, local := fields[1], fields[2], fields[3]
+			if kernelDefaultTunnel(name, remote, local) {
+				continue
+			}
 			out = append(out,
 				fmt.Sprintf("if ip link show %s >/dev/null 2>&1; then ip tunnel del %s; fi; "+
 					"ip tunnel add %s mode sit remote %s local %s ttl 64", name, name, name, remote, local),

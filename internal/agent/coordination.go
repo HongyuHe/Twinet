@@ -981,6 +981,10 @@ func (s *Server) prepareGeneration(lab string, fence Fence, expected, generation
 		s.generations[lab] = state
 		return fmt.Errorf("persisting prepared generation: %w", err)
 	}
+	// A periodic capture that began before prepare can otherwise keep running
+	// against containers this fenced transaction is about to replace. The
+	// transaction's own boundary capture remains responsible for durability.
+	s.stopPeriodicDurability(lab)
 	return nil
 }
 

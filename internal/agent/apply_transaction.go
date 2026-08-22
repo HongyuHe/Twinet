@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/HongyuHe/twinet/internal/deploy"
-	"github.com/HongyuHe/twinet/internal/limiter"
 	"github.com/HongyuHe/twinet/internal/model"
 	"github.com/HongyuHe/twinet/internal/netx"
 	"github.com/HongyuHe/twinet/internal/plan"
@@ -614,7 +613,7 @@ func (s *Server) rollbackPreparedApply(ctx context.Context, lab string, fence Fe
 		return fmt.Errorf("build rollback plan: %w", err)
 	}
 	rep, err := p.Execute(ctx, plan.Options{
-		Workers: s.workLimiter().ClampWorkers(limiter.Apply, 0), ContinueOnError: true,
+		Workers: s.recoveryWorkerCount(), ContinueOnError: true,
 	})
 	if err != nil {
 		return fmt.Errorf("run rollback plan: %w", err)

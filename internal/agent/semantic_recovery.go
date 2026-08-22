@@ -8,7 +8,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/HongyuHe/twinet/internal/limiter"
 	"github.com/HongyuHe/twinet/internal/model"
 	"github.com/HongyuHe/twinet/internal/render"
 	rt "github.com/HongyuHe/twinet/internal/runtime"
@@ -145,7 +144,7 @@ func (s *Server) verifyTopologySemantics(ctx context.Context, top *model.Topolog
 		}
 		devices = append(devices, device)
 	}
-	return runBoundedDeviceChecks(ctx, s.workLimiter().ClampWorkers(limiter.Apply, 0),
+	return runBoundedDeviceChecks(ctx, s.recoveryWorkerCount(),
 		devices, s.recoveryArtifactLimit(),
 		func(device *model.Device) string { return "semantic verification " + device.ID },
 		func(verifyCtx context.Context, device *model.Device) error {

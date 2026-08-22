@@ -270,6 +270,13 @@ func (s *Server) gcProtectedLabs(ctx context.Context, now time.Time) (map[string
 	for lab := range s.current {
 		protected[lab] = true
 	}
+	// A recovered topology may not yet be installed in current after an
+	// agent restart, but its transaction journal is durable evidence that
+	// rollback/forward still needs the objects and records. Never collect in
+	// the lease gap before recovery recreates its in-memory operation.
+	for lab := range s.transactions {
+		protected[lab] = true
+	}
 	for lab := range s.ops {
 		protected[lab] = true
 	}

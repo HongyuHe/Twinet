@@ -295,9 +295,13 @@ type Server struct {
 	durabilityMu   sync.Mutex
 	lastCapture    map[string]time.Time
 	durabilityBusy map[string]bool
-	peerDial       peerDialer
-	peerHealthMu   sync.Mutex
-	peerHealth     map[string]PeerReplicationStatus
+	// durabilityCancel holds only periodic work. Transaction-bound capture is
+	// deliberately not cancellable through this map: it is part of the
+	// fenced operation that owns recovery.
+	durabilityCancel map[string]context.CancelFunc
+	peerDial         peerDialer
+	peerHealthMu     sync.Mutex
+	peerHealth       map[string]PeerReplicationStatus
 }
 
 func (s *Server) workLimiter() *limiter.Limiter {
@@ -316,6 +320,7 @@ type lease struct {
 	at       time.Time
 	deadline time.Time
 	cancel   context.CancelFunc
+	done     chan struct{}
 }
 
 // New constructs an agent.
@@ -349,13 +354,14 @@ func New(cfg Config) (*Server, error) {
 		tools:     integrity.NewChecker(engine).Verify,
 		toolsSeen: map[string]toolsVerdict{},
 
-		repairFails:    map[string]int{},
-		repairNext:     map[string]time.Time{},
-		exempt:         map[string]*exemptions{},
-		partial:        map[string]int{},
-		lastCapture:    map[string]time.Time{},
-		durabilityBusy: map[string]bool{},
-		peerHealth:     map[string]PeerReplicationStatus{},
+		repairFails:      map[string]int{},
+		repairNext:       map[string]time.Time{},
+		exempt:           map[string]*exemptions{},
+		partial:          map[string]int{},
+		lastCapture:      map[string]time.Time{},
+		durabilityBusy:   map[string]bool{},
+		durabilityCancel: map[string]context.CancelFunc{},
+		peerHealth:       map[string]PeerReplicationStatus{},
 	}
 	if source, ok := interface{}(engine).(rt.EventSource); ok {
 		srv.eventSource = source
@@ -459,8 +465,17 @@ func insecureReason(cfg Config) string {
 // so a caller learns immediately that something else is mid-flight on that lab.
 // Operations on other labs are unaffected.
 func (s *Server) acquire(lab, kind string) error {
+	_, _, err := s.acquireOperation(lab, kind, nil)
+	return err
+}
+
+// acquireOperation records a cancellable local operation. Recovery may
+// preempt only reconciliation: a persisted rollback is stronger authority than
+// opportunistic repair, and the returned ID prevents the canceled repair from
+// deleting the recovery lease while it unwinds.
+func (s *Server) acquireOperation(lab, kind string, cancel context.CancelFunc) (uint64, chan struct{}, error) {
 	if lab == "" {
-		return errors.New("an operation must name the lab it acts on")
+		return 0, nil, errors.New("an operation must name the lab it acts on")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -468,16 +483,22 @@ func (s *Server) acquire(lab, kind string) error {
 		s.ops = map[string]*lease{}
 	}
 	if held, ok := s.ops[lab]; ok {
-		return fmt.Errorf("another operation is already running on lab %q: %s, started %s ago",
+		return 0, nil, fmt.Errorf("another operation is already running on lab %q: %s, started %s ago",
 			lab, held.kind, time.Since(held.at).Round(time.Second))
 	}
 	s.opSequence++
-	s.ops[lab] = &lease{id: s.opSequence, kind: kind, at: time.Now()}
-	return nil
+	id := s.opSequence
+	var done chan struct{}
+	if cancel != nil {
+		done = make(chan struct{})
+	}
+	s.ops[lab] = &lease{id: id, kind: kind, at: time.Now(), cancel: cancel, done: done}
+	return id, done, nil
 }
 
-// acquireRecoveryOperation permits a newer fence to cancel only a recovery
-// whose persisted deadline has expired. Its ID prevents an old goroutine from
+// acquireRecoveryOperation gives durable recovery priority over cancellable
+// reconciliation, and permits a newer fence to cancel only a recovery whose
+// persisted deadline has expired. Its ID prevents an old goroutine from
 // deleting a newer operation's lease while it unwinds.
 func (s *Server) acquireRecoveryOperation(lab string, deadline time.Time,
 	cancel context.CancelFunc, takeover bool,
@@ -486,24 +507,43 @@ func (s *Server) acquireRecoveryOperation(lab string, deadline time.Time,
 		return 0, errors.New("a recovery must name the lab it acts on")
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.ops == nil {
 		s.ops = map[string]*lease{}
 	}
+	var reconcileDone chan struct{}
 	if held := s.ops[lab]; held != nil {
-		stale := held.kind == "recovery" && !held.deadline.IsZero() && !s.nowTime().Before(held.deadline)
-		if !stale || !takeover {
-			return 0, fmt.Errorf("another operation is already running on lab %q: %s, started %s ago",
-				lab, held.kind, s.nowTime().Sub(held.at).Round(time.Second))
-		}
-		if held.cancel != nil {
+		if held.kind == "reconcile" && held.cancel != nil {
 			held.cancel()
+			reconcileDone = held.done
+			delete(s.ops, lab)
+		} else {
+			stale := held.kind == "recovery" && !held.deadline.IsZero() && !s.nowTime().Before(held.deadline)
+			if !stale || !takeover {
+				s.mu.Unlock()
+				return 0, fmt.Errorf("another operation is already running on lab %q: %s, started %s ago",
+					lab, held.kind, s.nowTime().Sub(held.at).Round(time.Second))
+			}
+			if held.cancel != nil {
+				held.cancel()
+			}
+			delete(s.ops, lab)
 		}
-		delete(s.ops, lab)
 	}
 	s.opSequence++
 	id := s.opSequence
 	s.ops[lab] = &lease{id: id, kind: "recovery", at: s.nowTime(), deadline: deadline, cancel: cancel}
+	s.mu.Unlock()
+	if reconcileDone != nil {
+		timer := time.NewTimer(recoveryReconcileHandoffTimeout)
+		defer timer.Stop()
+		select {
+		case <-reconcileDone:
+		case <-timer.C:
+			s.releaseRecoveryOperation(lab, id)
+			return 0, fmt.Errorf("reconcile did not yield to durable recovery within %s",
+				recoveryReconcileHandoffTimeout)
+		}
+	}
 	return id, nil
 }
 
@@ -512,6 +552,17 @@ func (s *Server) releaseRecoveryOperation(lab string, id uint64) {
 	defer s.mu.Unlock()
 	if held := s.ops[lab]; held != nil && held.id == id {
 		delete(s.ops, lab)
+	}
+}
+
+func (s *Server) releaseOperation(lab string, id uint64, done chan struct{}) {
+	s.mu.Lock()
+	if held := s.ops[lab]; held != nil && held.id == id {
+		delete(s.ops, lab)
+	}
+	s.mu.Unlock()
+	if done != nil {
+		close(done)
 	}
 }
 

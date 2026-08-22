@@ -70,10 +70,17 @@ const (
 	// class-scale node legitimately needs longer than a single controller
 	// lease, while every target remains independently deadline-bounded and
 	// visible to a joining operator.
-	defaultRecoveryTotalTimeout = 30 * time.Minute
-	defaultRecoveryLeaseTTL     = 90 * time.Second
-	recoveryLeaseRenewEvery     = 15 * time.Second
-	recoveryStatusObserveLimit  = 2 * time.Second
+	defaultRecoveryTotalTimeout     = 30 * time.Minute
+	defaultRecoveryLeaseTTL         = 90 * time.Second
+	recoveryLeaseRenewEvery         = 15 * time.Second
+	recoveryStatusObserveLimit      = 2 * time.Second
+	recoveryReconcileHandoffTimeout = 5 * time.Second
+	recoveryProgressPersistEvery    = 2 * time.Second
+	// Recovering every primary and FRR sidecar at the normal apply worker
+	// limit can saturate Docker precisely when it is already restarting
+	// namespaces. Keep this intentionally small; the shared limiter can make
+	// it smaller on constrained nodes.
+	recoveryLifecycleWorkers = 4
 )
 
 type recoveryRunOptions struct {
@@ -114,6 +121,11 @@ func (s *Server) recoveryArtifactLimit() time.Duration {
 		return s.recoveryPhaseTimeout
 	}
 	return defaultRecoveryArtifactTimeout
+}
+
+func (s *Server) recoveryWorkerCount() int {
+	workers := s.workLimiter().ClampWorkers(limiter.Lifecycle, recoveryLifecycleWorkers)
+	return s.workLimiter().ClampWorkers(limiter.Apply, workers)
 }
 
 func recoveredMode(tx applyTransaction, wire Wire) (render.Mode, int) {
@@ -321,6 +333,7 @@ func (s *Server) beginRecovery(lab string, fence Fence, generation, strategy str
 	if err := s.saveCoordinationLocked(); err != nil {
 		return applyTransaction{}, err
 	}
+	s.stopPeriodicDurability(lab)
 	return tx, nil
 }
 
@@ -335,22 +348,40 @@ func (s *Server) recoveryOwnerLocked(lab string, fence Fence) string {
 func (s *Server) updateRecoveryProgress(lab string, fence Fence, generation, target string,
 	deadline time.Time,
 ) error {
+	return s.recordRecoveryProgress(lab, fence, generation, target, deadline, true)
+}
+
+// recordRecoveryProgress keeps live status current on every phase transition,
+// but rate-limits journal fsyncs for rapid successful phases. The durable
+// begin/failure/finalization records are sufficient to resume after a crash;
+// repeatedly persisting "completed" bookkeeping made an otherwise idle
+// automatic recovery exceed its lease while Docker was under load.
+func (s *Server) recordRecoveryProgress(lab string, fence Fence, generation, target string,
+	deadline time.Time, force bool,
+) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.initCoordination()
-	if err := s.fenceErrorLocked(lab, fence, s.nowTime()); err != nil {
+	now := s.nowTime()
+	if err := s.fenceErrorLocked(lab, fence, now); err != nil {
 		return err
 	}
 	tx, ok := s.transactions[lab]
 	if !ok || tx.Generation != generation {
 		return fmt.Errorf("generation %q of lab %q has no recovery transaction", generation, lab)
 	}
+	priorProgress, priorDeadline := tx.RecoveryProgress, tx.RecoveryDeadline
+	persist := force || priorProgress.IsZero() ||
+		now.Sub(priorProgress) >= recoveryProgressPersistEvery ||
+		priorDeadline.IsZero() || deadline.After(priorDeadline.Add(recoveryProgressPersistEvery))
 	tx.RecoveryTarget = target
-	tx.RecoveryProgress = s.nowTime()
+	tx.RecoveryProgress = now
 	tx.RecoveryDeadline = deadline
 	s.transactions[lab] = tx
-	if err := s.saveCoordinationLocked(); err != nil {
-		return err
+	if persist {
+		if err := s.saveCoordinationLocked(); err != nil {
+			return err
+		}
 	}
 	slog.Info("recovery phase progress", "lab", lab, "generation", generation,
 		"action_target", target, "deadline", deadline)
@@ -370,7 +401,7 @@ func (s *Server) runRecoveryPhaseLimit(ctx context.Context, lab string, fence Fe
 	phaseCtx, cancel := context.WithTimeout(ctx, limit)
 	defer cancel()
 	deadline := s.nowTime().Add(limit)
-	if err := s.updateRecoveryProgress(lab, fence, generation, action+": "+target, deadline); err != nil {
+	if err := s.recordRecoveryProgress(lab, fence, generation, action+": "+target, deadline, false); err != nil {
 		return err
 	}
 	if err := fn(phaseCtx); err != nil {
@@ -388,7 +419,12 @@ func (s *Server) runRecoveryPhaseLimit(ctx context.Context, lab string, fence Fe
 		// both cases it must not overwrite the newer persisted progress.
 		return nil
 	}
-	return s.updateRecoveryProgress(lab, fence, generation, "completed "+action+": "+target, deadline)
+	// Completion is represented by the next in-memory phase transition or
+	// terminal commit. Avoid a second coordination fsync for every successful
+	// short phase: under a saturated Docker node those redundant writes made
+	// automatic recovery spend seconds reporting completion rather than
+	// restoring.
+	return nil
 }
 
 // runRecoveryLongPhase is for a composite exact rollback. Its independent
@@ -419,7 +455,9 @@ func (s *Server) runRecoveryLongPhase(ctx context.Context, lab string, fence Fen
 	if !active || current.Generation != generation {
 		return nil
 	}
-	return s.updateRecoveryProgress(lab, fence, generation, "completed "+action+": "+target, deadline)
+	// See runRecoveryPhase: phase entry is durable progress; completion is
+	// either followed by the next durable phase or terminal finalization.
+	return nil
 }
 
 // runBoundedDeviceChecks runs independent device operations concurrently while
@@ -543,6 +581,126 @@ func (s *Server) recoveryContainerList(ctx context.Context, lab string) ([]rt.Co
 	return s.rt.List(ctx, rt.Filter{All: true, Labels: map[string]string{
 		deploy.LabelManaged: "true", deploy.LabelLab: lab,
 	}})
+}
+
+func exactRuntimeSpecMatches(container rt.Container, spec *rt.Spec) bool {
+	if spec == nil || container.Name != spec.Name || spec.Labels == nil {
+		return false
+	}
+	wantSpec := spec.Labels[deploy.LabelSpec]
+	if wantSpec == "" || container.Label(deploy.LabelSpec) != wantSpec {
+		return false
+	}
+	if wantContract := spec.Labels[deploy.LabelRuntimeContract]; wantContract != "" &&
+		container.Label(deploy.LabelRuntimeContract) != wantContract {
+		return false
+	}
+	return true
+}
+
+// ensureExactRecoveryContainer resolves Docker's duplicate-name race by
+// inspecting the object that owns the expected name. A matching running or
+// exited container is reused/startable; only a known mismatching contract is
+// removed. This makes an interrupted recovery converge instead of issuing a
+// blind Create against a container another recovery phase already restored.
+func (s *Server) ensureExactRecoveryContainer(ctx context.Context, spec *rt.Spec) error {
+	if spec == nil || spec.Name == "" {
+		return errors.New("exact recovery container has no name")
+	}
+	return s.workLimiter().Run(ctx, []limiter.Kind{limiter.Apply, limiter.Lifecycle}, func() error {
+		var current rt.Container
+		var lastCreateErr error
+		for attempt := 0; attempt < 4; attempt++ {
+			observed, err := s.rt.Inspect(ctx, spec.Name)
+			if err != nil {
+				return fmt.Errorf("inspect exact recovery container %s: %w", spec.Name, err)
+			}
+			if observed.State != rt.StateAbsent && !exactRuntimeSpecMatches(observed, spec) {
+				if err := s.rt.Remove(ctx, spec.Name, true); err != nil {
+					return fmt.Errorf("remove mismatching recovery container %s: %w", spec.Name, err)
+				}
+				if err := recoveryNameRetry(ctx); err != nil {
+					return err
+				}
+				continue
+			}
+			if observed.State == rt.StateAbsent {
+				if _, err := s.rt.Create(ctx, spec); err != nil {
+					lastCreateErr = err
+					// Docker can return a duplicate-name error after another
+					// recovery attempt created the exact object. Re-inspect
+					// and adopt it, or remove a known mismatch on the next
+					// bounded iteration.
+					if retryErr := recoveryNameRetry(ctx); retryErr != nil {
+						return fmt.Errorf("create exact recovery container %s: %w", spec.Name, err)
+					}
+					continue
+				}
+				current = rt.Container{Name: spec.Name, State: rt.StateCreated}
+			} else {
+				current = observed
+			}
+			break
+		}
+		if current.Name == "" {
+			if lastCreateErr == nil {
+				return fmt.Errorf("exact recovery container %s remained in an unresolved runtime state", spec.Name)
+			}
+			return fmt.Errorf("exact recovery container %s remained in a duplicate-name conflict: %w",
+				spec.Name, lastCreateErr)
+		}
+		switch current.State {
+		case rt.StateRunning:
+			return nil
+		case rt.StatePaused:
+			if err := s.rt.Unpause(ctx, spec.Name); err != nil {
+				return fmt.Errorf("unpause exact recovery container %s: %w", spec.Name, err)
+			}
+			return nil
+		case rt.StateRestarting:
+			if err := s.rt.Stop(ctx, spec.Name, deploy.DefaultStopTimeout); err != nil {
+				return fmt.Errorf("stop restarting recovery container %s: %w", spec.Name, err)
+			}
+			fallthrough
+		case rt.StateCreated, rt.StateExited, rt.StateDead:
+			if err := s.rt.Start(ctx, spec.Name); err != nil {
+				return fmt.Errorf("start exact recovery container %s: %w", spec.Name, err)
+			}
+			return nil
+		default:
+			return fmt.Errorf("exact recovery container %s has unexpected state %q", spec.Name, current.State)
+		}
+	})
+}
+
+func recoveryNameRetry(ctx context.Context) error {
+	timer := time.NewTimer(50 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func (s *Server) removeRecoveryContainerIfPresent(ctx context.Context, name string) error {
+	if name == "" {
+		return nil
+	}
+	return s.workLimiter().Run(ctx, []limiter.Kind{limiter.Apply, limiter.Lifecycle}, func() error {
+		current, err := s.rt.Inspect(ctx, name)
+		if err != nil {
+			return fmt.Errorf("inspect recovery container %s: %w", name, err)
+		}
+		if current.State == rt.StateAbsent {
+			return nil
+		}
+		if err := s.rt.Remove(ctx, name, true); err != nil {
+			return fmt.Errorf("remove recovery container %s: %w", name, err)
+		}
+		return nil
+	})
 }
 
 func (s *Server) recoveryOverlayList(lab string) ([]uint32, error) {
@@ -990,16 +1148,31 @@ func (s *Server) recoveryStatuses(ctx context.Context) map[string]RecoveryStatus
 	return out
 }
 
-func (s *Server) recoveryMutationRefusal(lab string) string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.initCoordination()
-	tx, ok := s.transactions[lab]
-	if !ok || tx.Committed {
+// ordinaryMaintenanceSuppression is intentionally based on the persisted
+// transaction journal, not the in-memory operation lease. A restart erases an
+// ops lease before automatic recovery obtains a new one; event repair, audit,
+// capture, or GC must not mistake that gap for permission to mutate a partially
+// rolled-back lab. A transaction is released only when finalization deletes it.
+func (s *Server) ordinaryMaintenanceSuppression(lab string) string {
+	if lab == "" {
 		return ""
 	}
-	return fmt.Sprintf("lab %q is %s for failed generation %q; ordinary mutation is refused until recovery verifies the prior inventory",
-		lab, tx.Phase, tx.Generation)
+	s.mu.Lock()
+	tx, active := s.transactions[lab]
+	s.mu.Unlock()
+	if !active {
+		return ""
+	}
+	return fmt.Sprintf("durable transaction %q is %s", tx.Generation, tx.Phase)
+}
+
+func (s *Server) recoveryMutationRefusal(lab string) string {
+	reason := s.ordinaryMaintenanceSuppression(lab)
+	if reason == "" {
+		return ""
+	}
+	return fmt.Sprintf("lab %q has %s; ordinary mutation is refused until the transaction is finalized",
+		lab, reason)
 }
 
 func (s *Server) handleRecovery(w http.ResponseWriter, r *http.Request) {
@@ -1303,7 +1476,7 @@ func (s *Server) verifyRecoveredStudentState(ctx context.Context, tx applyTransa
 			restoreDevices = append(restoreDevices, device)
 		}
 	}
-	if err := runBoundedDeviceChecks(ctx, s.workLimiter().ClampWorkers(limiter.Apply, 0),
+	if err := runBoundedDeviceChecks(ctx, s.recoveryWorkerCount(),
 		restoreDevices, s.recoveryArtifactLimit(),
 		func(device *model.Device) string { return "verify restored student state " + device.ID },
 		func(verifyCtx context.Context, device *model.Device) error {
@@ -1400,7 +1573,7 @@ func (s *Server) forwardTransaction(ctx context.Context, lab string, fence Fence
 	s.mu.Unlock()
 	s.transactionFailpoints(p)
 	rep, err := p.Execute(ctx, plan.Options{
-		Workers: s.workLimiter().ClampWorkers(limiter.Apply, 0), ContinueOnError: true,
+		Workers: s.recoveryWorkerCount(), ContinueOnError: true,
 	})
 	if err != nil || rep.Failed() {
 		failure := "forward recovery failed"
@@ -1465,8 +1638,8 @@ func (s *Server) rollbackExactContracts(ctx context.Context, lab string, fence F
 	for _, entry := range tx.Prestate.RuntimeSpecs {
 		expected[entry.Spec.Name] = true
 	}
-	if err := runBoundedDeviceChecks(ctx, s.workLimiter().ClampWorkers(limiter.Apply, 0),
-		tx.Prestate.RuntimeSpecs, s.recoveryPhaseLimit(),
+	if err := runBoundedDeviceChecks(ctx, s.recoveryWorkerCount(),
+		tx.Prestate.RuntimeSpecs, s.recoveryArtifactLimit(),
 		func(entry transactionRuntimeSpec) string { return "exact runtime contract " + entry.DeviceID },
 		func(phaseCtx context.Context, entry transactionRuntimeSpec) error {
 			device := byDevice[entry.DeviceID]
@@ -1478,35 +1651,17 @@ func (s *Server) rollbackExactContracts(ctx context.Context, lab string, fence F
 			// primary: retaining the old namespace holder can leave Docker
 			// Start blocked with the replacement stuck in Created.
 			if entry.Control != nil {
-				control, err := s.rt.Inspect(phaseCtx, entry.Control.Name)
-				if err != nil {
-					return fmt.Errorf("inspect rollback control %s: %w", entry.Control.Name, err)
-				}
-				if control.State != rt.StateAbsent {
-					if err := s.rt.Remove(phaseCtx, entry.Control.Name, true); err != nil {
-						return fmt.Errorf("remove rollback control %s before primary replacement: %w",
-							entry.Control.Name, err)
-					}
-				}
-			}
-			current, err := s.rt.Inspect(phaseCtx, entry.Spec.Name)
-			if err != nil {
-				return fmt.Errorf("inspect rollback container %s: %w", entry.Spec.Name, err)
-			}
-			if current.State != rt.StateAbsent {
-				if err := s.rt.Remove(phaseCtx, entry.Spec.Name, true); err != nil {
-					return fmt.Errorf("remove dirty rollback container %s: %w", entry.Spec.Name, err)
+				if err := s.removeRecoveryContainerIfPresent(phaseCtx, entry.Control.Name); err != nil {
+					return fmt.Errorf("remove rollback control %s before primary replacement: %w",
+						entry.Control.Name, err)
 				}
 			}
 			if err := eng.PrepareRuntimeSpec(top, device); err != nil {
 				return fmt.Errorf("prepare rollback runtime paths for %s: %w", entry.DeviceID, err)
 			}
 			spec := entry.Spec
-			if _, err := s.rt.Create(phaseCtx, &spec); err != nil {
-				return fmt.Errorf("create exact rollback container %s: %w", spec.Name, err)
-			}
-			if err := s.rt.Start(phaseCtx, spec.Name); err != nil {
-				return fmt.Errorf("start exact rollback container %s: %w", spec.Name, err)
+			if err := s.ensureExactRecoveryContainer(phaseCtx, &spec); err != nil {
+				return err
 			}
 			return nil
 		}); err != nil {
@@ -1514,14 +1669,16 @@ func (s *Server) rollbackExactContracts(ctx context.Context, lab string, fence F
 	}
 	if err := s.runRecoveryPhase(ctx, lab, fence, tx.Generation,
 		"rollback", "rewire prior topology", func(phaseCtx context.Context) error {
-			if err := eng.RewireTopology(phaseCtx, top); err != nil {
-				return fmt.Errorf("rewire exact rollback topology: %w", err)
-			}
-			return nil
+			return s.workLimiter().Run(phaseCtx, []limiter.Kind{limiter.Apply, limiter.Netlink}, func() error {
+				if err := eng.RewireTopology(phaseCtx, top); err != nil {
+					return fmt.Errorf("rewire exact rollback topology: %w", err)
+				}
+				return nil
+			})
 		}); err != nil {
 		return err
 	}
-	if err := runBoundedDeviceChecks(ctx, s.workLimiter().ClampWorkers(limiter.Apply, 0),
+	if err := runBoundedDeviceChecks(ctx, s.recoveryWorkerCount(),
 		tx.Prestate.RuntimeSpecs, s.recoveryArtifactLimit(),
 		func(entry transactionRuntimeSpec) string { return "exact rendered artifacts " + entry.DeviceID },
 		func(phaseCtx context.Context, entry transactionRuntimeSpec) error {
@@ -1536,29 +1693,21 @@ func (s *Server) rollbackExactContracts(ctx context.Context, lab string, fence F
 				if artifact.Digest != artifactDigest(artifact.Content) {
 					return fmt.Errorf("rollback artifact %s for %s digest mismatch", artifact.Path, entry.DeviceID)
 				}
-				if err := s.rt.CopyTo(phaseCtx, entry.Spec.Name, artifact.Path, artifact.Mode, artifact.Content); err != nil {
+				if err := s.workLimiter().Run(phaseCtx, []limiter.Kind{limiter.Apply, limiter.ExecProbe}, func() error {
+					return s.rt.CopyTo(phaseCtx, entry.Spec.Name, artifact.Path, artifact.Mode, artifact.Content)
+				}); err != nil {
 					return fmt.Errorf("restore rollback artifact %s to %s: %w",
 						artifact.Path, entry.Spec.Name, err)
 				}
 			}
 			if entry.Control != nil {
-				current, err := s.rt.Inspect(phaseCtx, entry.Control.Name)
-				if err != nil {
-					return fmt.Errorf("inspect exact rollback control %s: %w", entry.Control.Name, err)
-				}
-				if current.State != rt.StateAbsent {
-					if err := s.rt.Remove(phaseCtx, entry.Control.Name, true); err != nil {
-						return fmt.Errorf("remove dirty rollback control %s: %w", entry.Control.Name, err)
-					}
-				}
 				control := *entry.Control
-				if _, err := s.rt.Create(phaseCtx, &control); err != nil {
-					return fmt.Errorf("create exact rollback control %s: %w", control.Name, err)
+				if err := s.ensureExactRecoveryContainer(phaseCtx, &control); err != nil {
+					return err
 				}
-				if err := s.rt.Start(phaseCtx, control.Name); err != nil {
-					return fmt.Errorf("start exact rollback control %s: %w", control.Name, err)
-				}
-			} else if err := eng.EnsureRuntimeSupport(phaseCtx, top, device); err != nil {
+			} else if err := s.workLimiter().Run(phaseCtx, []limiter.Kind{limiter.Apply, limiter.Lifecycle}, func() error {
+				return eng.EnsureRuntimeSupport(phaseCtx, top, device)
+			}); err != nil {
 				return fmt.Errorf("restore rollback support for %s: %w", entry.DeviceID, err)
 			}
 			runCommand := func(artifact transactionArtifact) error {
@@ -1570,7 +1719,12 @@ func (s *Server) rollbackExactContracts(ctx context.Context, lab string, fence F
 				if artifact.Command.FRRControl && deploy.UsesFRRControl(device) {
 					container = deploy.FRRControlContainer(device)
 				}
-				result, err := s.rt.Exec(phaseCtx, container, rt.ExecCmd{Cmd: artifact.Command.Args})
+				var result rt.ExecResult
+				err := s.workLimiter().Run(phaseCtx, []limiter.Kind{limiter.Apply, limiter.ExecProbe}, func() error {
+					var execErr error
+					result, execErr = s.rt.Exec(phaseCtx, container, rt.ExecCmd{Cmd: artifact.Command.Args})
+					return execErr
+				})
 				if err != nil {
 					return fmt.Errorf("run rollback command for %s: %w", entry.DeviceID, err)
 				}
@@ -1606,7 +1760,7 @@ func (s *Server) rollbackExactContracts(ctx context.Context, lab string, fence F
 		}); err != nil {
 		return err
 	}
-	if err := runBoundedDeviceChecks(ctx, s.workLimiter().ClampWorkers(limiter.Apply, 0),
+	if err := runBoundedDeviceChecks(ctx, s.recoveryWorkerCount(),
 		tx.Prestate.RuntimeSpecs, s.recoveryPhaseLimit(),
 		func(entry transactionRuntimeSpec) string { return "exact rollback readiness " + entry.DeviceID },
 		func(phaseCtx context.Context, entry transactionRuntimeSpec) error {
@@ -1636,7 +1790,7 @@ func (s *Server) rollbackExactContracts(ctx context.Context, lab string, fence F
 			studentEntries = append(studentEntries, entry)
 		}
 	}
-	if err := runBoundedDeviceChecks(ctx, s.workLimiter().ClampWorkers(limiter.Apply, 0),
+	if err := runBoundedDeviceChecks(ctx, s.recoveryWorkerCount(),
 		studentEntries, s.recoveryArtifactLimit(),
 		func(entry transactionRuntimeSpec) string { return "exact student state " + entry.DeviceID },
 		func(phaseCtx context.Context, entry transactionRuntimeSpec) error {
@@ -1644,7 +1798,10 @@ func (s *Server) rollbackExactContracts(ctx context.Context, lab string, fence F
 			if device == nil {
 				return fmt.Errorf("student state references unknown device %q", entry.DeviceID)
 			}
-			if _, err := deploy.Restore(phaseCtx, s.rt, device, lab, s.store); err != nil {
+			if err := s.workLimiter().Run(phaseCtx, []limiter.Kind{limiter.Apply, limiter.ExecProbe}, func() error {
+				_, err := deploy.Restore(phaseCtx, s.rt, device, lab, s.store)
+				return err
+			}); err != nil {
 				return fmt.Errorf("restore student state for %s: %w", entry.DeviceID, err)
 			}
 			return nil
