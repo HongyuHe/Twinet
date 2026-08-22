@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/HongyuHe/twinet/internal/model"
+	"github.com/HongyuHe/twinet/internal/svc"
 )
 
 type birdPeer struct {
@@ -14,6 +15,9 @@ type birdPeer struct {
 	relationship  model.Relationship
 	internal      bool
 	routeServer   bool
+	slow          bool
+	ixpRecipients []int
+	sameRegion    []int
 }
 
 // BirdRouter renders the BIRD 2 configuration used by staff/reference
@@ -49,6 +53,13 @@ func BirdRouter(top *model.Topology, d *model.Device) (RouterConfig, error) {
 	}
 	if as.BlockV6 != "" {
 		fmt.Fprintf(&b, "protocol static own6 { ipv6; route %s reject; }\n", as.BlockV6)
+	}
+	// The RPKI exercise needs a route whose origin is demonstrably wrong. FRR
+	// originates it with `network`; BIRD needs an equally real route in its
+	// RIB before BGP can export it. Omitting this made the mixed reference
+	// appear to reject an invalid route that the lab never announced.
+	if hijacker, prefix := svc.HijackOrigin(top); hijacker == as.ASN && prefix != "" && prefix != as.Block {
+		fmt.Fprintf(&b, "protocol static hijack4 { ipv4; route %s reject; }\n", prefix)
 	}
 	b.WriteString("\n")
 
@@ -114,7 +125,12 @@ func BirdRouter(top *model.Topology, d *model.Device) (RouterConfig, error) {
 			asn:          peerASN,
 			relationship: relationship,
 			routeServer:  iface.Role == model.RoleIXPLink,
+			slow:         iface.Role != model.RoleIXPLink && parseDelayMS(iface.Link) >= 25,
 		})
+		if iface.Role == model.RoleIXPLink {
+			peers[len(peers)-1].ixpRecipients, peers[len(peers)-1].sameRegion =
+				birdIXPPolicyMembers(top, as.ASN, peerASN, as.Region)
+		}
 	}
 	sort.Slice(peers, func(i, j int) bool { return peers[i].name < peers[j].name })
 
@@ -122,7 +138,7 @@ func BirdRouter(top *model.Topology, d *model.Device) (RouterConfig, error) {
 		if peer.internal {
 			continue
 		}
-		renderBirdFilters(&b, peer)
+		renderBirdFilters(&b, as.ASN, peer)
 	}
 	for _, peer := range peers {
 		fmt.Fprintf(&b, "protocol bgp %s {\n", peer.name)
@@ -155,7 +171,7 @@ func BirdRouter(top *model.Topology, d *model.Device) (RouterConfig, error) {
 	return RouterConfig{Platform: b.String()}, nil
 }
 
-func renderBirdFilters(b *strings.Builder, peer birdPeer) {
+func renderBirdFilters(b *strings.Builder, localASN int, peer birdPeer) {
 	pref, community := 100, 30
 	switch peer.relationship {
 	case model.RelCustomer:
@@ -163,16 +179,56 @@ func renderBirdFilters(b *strings.Builder, peer birdPeer) {
 	case model.RelPeer:
 		pref, community = 200, 20
 	}
+	if peer.slow {
+		pref -= slowLinkPenalty
+	}
 	fmt.Fprintf(b, "filter import_%s {\n", peer.name)
+	for _, asn := range peer.sameRegion {
+		// FRR's IXP policy rejects a route that has already crossed another
+		// student system in this region. BIRD's AS-path mask is the semantic
+		// equivalent of the two FRR access-list spellings (terminal and
+		// interior occurrence).
+		fmt.Fprintf(b, "  if bgp_path ~ [* %d *] then reject;\n", asn)
+	}
 	fmt.Fprintf(b, "  bgp_local_pref = %d;\n", pref)
 	fmt.Fprintf(b, "  bgp_community.add((1,%d));\n", community)
 	b.WriteString("  accept;\n}\n")
 	fmt.Fprintf(b, "filter export_%s {\n", peer.name)
+	// FRR originates only the AS block, the declared hijack, and BGP-learned
+	// routes. Exporting BIRD's direct/kernel link routes turns transport
+	// subnets into Internet destinations and changes both policy and grading.
+	b.WriteString("  if source != RTS_BGP && source != RTS_STATIC then reject;\n")
 	if peer.relationship != model.RelCustomer {
 		b.WriteString("  if (1,20) ~ bgp_community then reject;\n")
 		b.WriteString("  if (1,30) ~ bgp_community then reject;\n")
 	}
+	for _, recipient := range peer.ixpRecipients {
+		fmt.Fprintf(b, "  bgp_community.add((%d,%d));\n", peer.asn, recipient)
+	}
+	if peer.slow {
+		for range 3 {
+			fmt.Fprintf(b, "  bgp_path.prepend(%d);\n", localASN)
+		}
+	}
 	b.WriteString("  accept;\n}\n\n")
+}
+
+// birdIXPPolicyMembers returns the export community target set and the
+// same-region student ASNs that must not be re-imported from a route server.
+// It mirrors ixpPolicy's topology-derived FRR behavior.
+func birdIXPPolicyMembers(top *model.Topology, localASN, ixpASN int, region string) ([]int, []int) {
+	var recipients, sameRegion []int
+	for _, asn := range top.SortedASNs() {
+		as := top.ASes[asn]
+		if as == nil || asn == localASN || as.Role == model.RoleIXP || !attachedTo(top, asn, ixpASN) {
+			continue
+		}
+		recipients = append(recipients, asn)
+		if as.Role == model.RoleStudent && as.Region == region {
+			sameRegion = append(sameRegion, asn)
+		}
+	}
+	return recipients, sameRegion
 }
 
 func birdIdentifier(value string) string {

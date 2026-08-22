@@ -88,6 +88,60 @@ func TestHardeningRejectsHostEscapeAndHashesPolicy(t *testing.T) {
 	}
 }
 
+func TestPlatformWritableBindsCoverRenderedServiceState(t *testing.T) {
+	device := &model.Device{ID: "svc/dns", Kind: model.KindService, ServiceKind: "builtin.dns"}
+	engine := &Engine{WritableRoot: t.TempDir()}
+	binds, err := engine.writableBinds(&model.Topology{Name: "lab"}, device, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, target := range []string{"/etc/twinet", "/etc/bind", "/var/named", "/var/run/named"} {
+		if !bindCovers(target, binds) {
+			t.Errorf("service writable bind set %#v does not cover %s", binds, target)
+		}
+	}
+	spec, err := engine.hardenedRuntimeSpec(device, binds)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, target := range []string{"/etc/twinet", "/etc/bind", "/var/named", "/var/run/named"} {
+		if _, tmpfs := spec.Tmpfs[target]; tmpfs {
+			t.Errorf("%s is a Docker-copyable bind target and must not be shadowed by tmpfs", target)
+		}
+	}
+}
+
+func TestPlatformWritableBindsRemainStableAcrossRecreate(t *testing.T) {
+	device := &model.Device{ID: "as1/R1", Kind: model.KindRouter}
+	top := &model.Topology{Name: "lab"}
+	engine := &Engine{
+		Runtime:        hardeningRuntime{},
+		WritableRoot:   t.TempDir(),
+		FRRControlRoot: t.TempDir(),
+	}
+	first, err := engine.writableBinds(top, device, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := engine.writableBinds(top, device, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) != len(second) {
+		t.Fatalf("writable bind count changed across recreate: %#v %#v", first, second)
+	}
+	for i := range first {
+		if first[i] != second[i] {
+			t.Fatalf("writable bind changed across recreate: %#v %#v", first, second)
+		}
+	}
+	paths := PlatformWritablePaths(device)
+	if !WritablePathCovers(paths, "/etc/frr/frr.conf") ||
+		!WritablePathCovers(paths, "/run/frr/zebra.vty") {
+		t.Fatalf("router sidecar sharing paths disappeared: %#v", paths)
+	}
+}
+
 func TestPodmanKeepsSystemPathHardeningAndUsesItsDefaultAppArmor(t *testing.T) {
 	device := &model.Device{
 		ID: "as1/R1", Kind: model.KindRouter, Image: "router",

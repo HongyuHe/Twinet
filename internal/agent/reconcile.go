@@ -702,7 +702,7 @@ func (s *Server) reviveDevice(ctx context.Context, eng *deploy.Engine, top *mode
 func (s *Server) recreateDesiredDevice(ctx context.Context, eng *deploy.Engine, top *model.Topology,
 	d *model.Device,
 ) error {
-	p, err := eng.Build(top)
+	p, err := eng.BuildContext(ctx, top)
 	if err != nil {
 		return err
 	}

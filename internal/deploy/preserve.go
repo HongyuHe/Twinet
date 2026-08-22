@@ -210,6 +210,29 @@ func Capture(ctx context.Context, r rt.Runtime, d *model.Device, lab, topoHash s
 
 // CaptureAll snapshots every student-owned device on this node.
 func (e *Engine) CaptureAll(ctx context.Context, top *model.Topology, store *state.Store) (int, error) {
+	return e.captureSelected(ctx, top, store, nil)
+}
+
+// CaptureDevices snapshots only named devices at a destructive deployment
+// boundary. Periodic durability capture intentionally continues to use
+// CaptureAll; a no-change deploy must not turn into a class-wide configuration
+// survey.
+func (e *Engine) CaptureDevices(ctx context.Context, top *model.Topology, store *state.Store, ids []string) (int, error) {
+	only := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		only[id] = true
+	}
+	return e.captureSelected(ctx, top, store, only)
+}
+
+// CaptureDirty snapshots only student-owned devices that this Engine's most
+// recent Build marked as destructively touched. It is for deployment
+// boundaries; periodic durability capture must continue to call CaptureAll.
+func (e *Engine) CaptureDirty(ctx context.Context, top *model.Topology, store *state.Store) (int, error) {
+	return e.CaptureDevices(ctx, top, store, e.DirtyCaptureDevices())
+}
+
+func (e *Engine) captureSelected(ctx context.Context, top *model.Topology, store *state.Store, only map[string]bool) (int, error) {
 	if store == nil {
 		return 0, nil
 	}
@@ -221,7 +244,7 @@ func (e *Engine) CaptureAll(ctx context.Context, top *model.Topology, store *sta
 	}
 	var devices []*model.Device
 	for _, d := range top.DevicesOnNode(e.Node) {
-		if studentOwned(top, d) {
+		if studentOwned(top, d) && (only == nil || only[d.ID]) {
 			devices = append(devices, d)
 		}
 	}

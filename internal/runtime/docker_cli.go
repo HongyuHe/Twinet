@@ -677,14 +677,6 @@ func (d *dockerCLI) CopyTo(ctx context.Context, name, dst string, mode int64, co
 
 	_, errs, err := d.run(ctx, &buf, "cp", "-", name+":"+dir)
 	if err != nil {
-		if readonlyRootfsCopyError(errs) {
-			if fallbackErr := writeReadonlyRootfsFile(ctx, d, name, dst, mode, content); fallbackErr == nil {
-				return nil
-			} else {
-				return fmt.Errorf("docker cp into %s:%s: %w: %s; writable-mount fallback: %v",
-					name, dir, err, strings.TrimSpace(errs), fallbackErr)
-			}
-		}
 		return fmt.Errorf("docker cp into %s:%s: %w: %s", name, dir, err, strings.TrimSpace(errs))
 	}
 	return nil

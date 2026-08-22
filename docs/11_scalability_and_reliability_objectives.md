@@ -398,8 +398,10 @@ another lab; all course exercises still work without `CAP_SYS_ADMIN`.
   `--rotate` and records certificate serials without keys.
 - Every expanded device uses `cap-drop ALL`, a minimal add set,
   no-new-privileges, named seccomp/AppArmor profiles, a read-only root
-  filesystem, explicit tmpfs scratch paths, masked/read-only OCI paths, and
-  no default Docker network. Runtime class, user namespace, and worker-pool
+  filesystem, explicit tmpfs scratch paths plus per-device bind volumes for
+  renderer-owned files, masked/read-only OCI paths, and no default Docker
+  network. Docker API and CLI copies target those volumes; neither claims a
+  shell bypass of a read-only root. Runtime class, user namespace, and worker-pool
   selection are typed manifest/placement fields. Unsafe values, host socket
   mounts, agent credential environment, and `SYS_ADMIN` topology devices are
   rejected; a named development override is auditable but never permits a

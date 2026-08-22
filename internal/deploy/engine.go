@@ -139,6 +139,11 @@ type Engine struct {
 	// unprivileged router shell and its privileged FRR control sidecar. Empty
 	// selects the node-local runtime path.
 	FRRControlRoot string
+	// WritableRoot holds per-device bind mounts for platform-rendered files.
+	// Docker's archive copy API refuses a read-only rootfs even when a tmpfs
+	// target is mounted, while bind targets remain writable and survive a
+	// container recreation. Empty selects the node-local runtime path.
+	WritableRoot string
 	// RequireImmutableImages rejects a post-pull image that cannot be proven
 	// to match a registry manifest digest. It is set for release and grading
 	// image policies; development remains explicitly tag-capable.
@@ -152,10 +157,19 @@ type Engine struct {
 	// containers; the internal FRR control sidecar retains that capability.
 	// This permits service recovery without reintroducing the old privilege.
 	RecoveryCompatibility bool
+	// ObservationRoot persists the node-local desired/observed hash snapshot.
+	// Empty uses /run/twinet/observed. It contains hashes only, never student
+	// configuration bytes.
+	ObservationRoot string
 
 	// pendingRestore records devices whose captured configuration must be
 	// replayed once their interfaces exist.
 	pendingRestore sync.Map
+	observationMu  sync.Mutex
+	observation    *observationTracker
+	lastDiff       BuildDiff
+	mutationMu     sync.Mutex
+	mutations      map[string]int
 }
 
 func (e *Engine) limited(ctx context.Context, kinds []limiter.Kind, fn func() error) error {
@@ -196,17 +210,33 @@ type Command struct {
 	FRRControl bool
 }
 
-// Build constructs the deployment plan for the devices placed on this node.
+// Build constructs the deployment plan using a node-local desired/observed
+// snapshot. Callers that have a request context should prefer BuildContext.
 func (e *Engine) Build(top *model.Topology) (*plan.Plan, error) {
+	return e.BuildContext(context.Background(), top)
+}
+
+// BuildContext constructs the minimal executable deployment DAG for this node.
+func (e *Engine) BuildContext(ctx context.Context, top *model.Topology) (*plan.Plan, error) {
 	p := plan.New()
+	e.resetMutationCounts()
 	devices := top.DevicesOnNode(e.Node)
 	if len(devices) == 0 {
+		e.setBuildObservation(nil, BuildDiff{})
 		return p, nil
 	}
+	tracker, desired, diff, err := e.observeNode(ctx, top, devices)
+	if err != nil {
+		return nil, err
+	}
+	e.setBuildObservation(tracker, diff)
 
 	// One image pull per distinct image, shared by every device that needs it.
 	images := map[string][]*model.Device{}
 	for _, d := range devices {
+		if !diff.Create[d.ID] {
+			continue
+		}
 		if d.Image == "" {
 			return nil, fmt.Errorf("device %s has no image; set it under kinds.%s.image", d.ID, d.Kind)
 		}
@@ -220,7 +250,11 @@ func (e *Engine) Build(top *model.Topology) (*plan.Plan, error) {
 			ID: id, Stage: plan.StageImage, Describe: "pull " + image,
 			Run: func(ctx context.Context) error {
 				return e.limited(ctx, []limiter.Kind{limiter.Apply, limiter.ImagePull}, func() error {
-					return e.Runtime.PullImage(ctx, image, e.pullPolicy())
+					if err := e.Runtime.PullImage(ctx, image, e.pullPolicy()); err != nil {
+						return err
+					}
+					e.recordMutation("image", 1)
+					return nil
 				})
 			},
 		})
@@ -239,6 +273,9 @@ func (e *Engine) Build(top *model.Topology) (*plan.Plan, error) {
 
 	// Create and start each container.
 	for _, d := range devices {
+		if !diff.Create[d.ID] {
+			continue
+		}
 		dev := d
 		p.Add(&plan.Step{
 			ID:       "create:" + dev.ID,
@@ -248,7 +285,11 @@ func (e *Engine) Build(top *model.Topology) (*plan.Plan, error) {
 			Needs:    []string{imageStep[dev.Image]},
 			Run: func(ctx context.Context) error {
 				return e.limited(ctx, []limiter.Kind{limiter.Apply, limiter.Lifecycle}, func() error {
-					return e.ensureContainer(ctx, top, dev)
+					if err := e.ensureContainer(ctx, top, dev); err != nil {
+						return err
+					}
+					e.recordMutation("create", 1)
+					return tracker.markDevice(dev.ID, observedDeviceState{SpecHash: SpecHash(dev)})
 				})
 			},
 		})
@@ -257,16 +298,19 @@ func (e *Engine) Build(top *model.Topology) (*plan.Plan, error) {
 	// Wire each link with at least one endpoint on this node.
 	for _, l := range top.Links {
 		link := l
+		if !diff.Wire[link.ID] {
+			continue
+		}
 		aHere := link.A.Device.Node == e.Node
 		bHere := link.B.Device.Node == e.Node
 		if !aHere && !bHere {
 			continue
 		}
 		var needs []string
-		if aHere {
+		if aHere && diff.Create[link.A.Device.ID] {
 			needs = append(needs, "create:"+link.A.Device.ID)
 		}
-		if bHere {
+		if bHere && diff.Create[link.B.Device.ID] {
 			needs = append(needs, "create:"+link.B.Device.ID)
 		}
 		p.Add(&plan.Step{
@@ -277,7 +321,18 @@ func (e *Engine) Build(top *model.Topology) (*plan.Plan, error) {
 			Needs:    needs,
 			Run: func(ctx context.Context) error {
 				return e.limited(ctx, []limiter.Kind{limiter.Apply, limiter.Netlink}, func() error {
-					return e.wire(ctx, top, link)
+					if err := e.wire(ctx, top, link); err != nil {
+						return err
+					}
+					e.recordMutation("wire", 1)
+					if !link.Props.Empty() {
+						e.recordMutation("qdisc", qdiscEndpointsOnNode(link, e.Node))
+					}
+					hash, err := e.desiredWireHash(top, link)
+					if err != nil {
+						return err
+					}
+					return tracker.markLink(link.ID, hash)
 				})
 			},
 		})
@@ -287,9 +342,15 @@ func (e *Engine) Build(top *model.Topology) (*plan.Plan, error) {
 	// a half-wired interface list.
 	for _, d := range devices {
 		dev := d
-		needs := []string{"create:" + dev.ID}
+		if !diff.Configure[dev.ID] {
+			continue
+		}
+		var needs []string
+		if diff.Create[dev.ID] {
+			needs = append(needs, "create:"+dev.ID)
+		}
 		for _, i := range dev.Ifaces {
-			if i.Link != nil {
+			if i.Link != nil && diff.Wire[i.Link.ID] {
 				needs = append(needs, "wire:"+i.Link.ID)
 			}
 		}
@@ -301,13 +362,20 @@ func (e *Engine) Build(top *model.Topology) (*plan.Plan, error) {
 			Needs:    dedup(needs),
 			Run: func(ctx context.Context) error {
 				return e.limited(ctx, []limiter.Kind{limiter.Apply, limiter.ExecProbe}, func() error {
-					if err := e.configure(ctx, dev); err != nil {
+					state := desired[dev.ID]
+					if err := e.configureDesired(ctx, dev, state); err != nil {
 						return err
 					}
 					// Whatever the student had is replayed *after* the platform's
 					// own configuration and after the interfaces exist, so it wins
 					// over the defaults and lands on devices that are present.
-					return e.replayPending(ctx, top, dev)
+					if err := e.replayPending(ctx, top, dev); err != nil {
+						return err
+					}
+					return tracker.markDevice(dev.ID, observedDeviceState{
+						SpecHash: SpecHash(dev), ConfigHash: state.configHash,
+						FileHash: state.fileHash, CommandHash: state.commandHash, ReadyHash: "",
+					})
 				})
 			},
 		})
@@ -317,6 +385,9 @@ func (e *Engine) Build(top *model.Topology) (*plan.Plan, error) {
 	if e.Renderer != nil {
 		for _, d := range devices {
 			dev := d
+			if !diff.Ready[dev.ID] {
+				continue
+			}
 			w := e.Renderer.Ready(dev, e.Runtime)
 			if w == nil {
 				continue
@@ -327,10 +398,22 @@ func (e *Engine) Build(top *model.Topology) (*plan.Plan, error) {
 				Stage:    plan.StageReady,
 				Scope:    scopeOf(dev),
 				Describe: "wait for " + dev.ID,
-				Needs:    []string{"configure:" + dev.ID},
+				Needs: func() []string {
+					if diff.Configure[dev.ID] {
+						return []string{"configure:" + dev.ID}
+					}
+					return nil
+				}(),
 				Run: func(ctx context.Context) error {
 					return e.limited(ctx, []limiter.Kind{limiter.Apply, limiter.ExecProbe}, func() error {
-						return plan.Wait(ctx, waiter)
+						if err := plan.Wait(ctx, waiter); err != nil {
+							return err
+						}
+						state := desired[dev.ID]
+						return tracker.markDevice(dev.ID, observedDeviceState{
+							SpecHash: SpecHash(dev), ConfigHash: state.configHash,
+							FileHash: state.fileHash, CommandHash: state.commandHash, ReadyHash: state.readyHash,
+						})
 					})
 				},
 			})
@@ -338,6 +421,17 @@ func (e *Engine) Build(top *model.Topology) (*plan.Plan, error) {
 	}
 
 	return p, p.Validate()
+}
+
+func qdiscEndpointsOnNode(link *model.Link, node string) int {
+	ends := 0
+	if link.A.Device.Node == node {
+		ends++
+	}
+	if link.B.Device.Node == node {
+		ends++
+	}
+	return ends
 }
 
 // verifyPulledImage runs after the pull and before any container is created.
@@ -439,6 +533,11 @@ func (e *Engine) ensureContainer(ctx context.Context, top *model.Topology, d *mo
 		binds = append(binds, bind)
 	}
 	binds = append(binds, controlBinds...)
+	platformBinds, err := e.writableBinds(top, d, binds)
+	if err != nil {
+		return err
+	}
+	binds = append(binds, platformBinds...)
 	hardening, err := e.hardenedRuntimeSpec(d, binds)
 	if err != nil {
 		return err
@@ -585,6 +684,107 @@ func (e *Engine) frrControlRoot() string {
 		return e.FRRControlRoot
 	}
 	return filepath.Join("/run", "twinet", "frr-control")
+}
+
+// writableBinds gives platform-rendered files a host-backed writable target.
+// A Docker tmpfs is appropriate for daemon scratch state, but Docker's
+// CopyToContainer API rejects it when ReadonlyRootfs is true. These mounts are
+// therefore a deliberate control-plane volume contract, not an attempt to
+// make the root filesystem writable.
+func (e *Engine) writableBinds(top *model.Topology, d *model.Device,
+	existing []runtime.Bind,
+) ([]runtime.Bind, error) {
+	if top == nil || d == nil {
+		return nil, fmt.Errorf("platform writable mounts need a topology and device")
+	}
+	hardening := effectiveHardening(d)
+	targets := platformWritableBindTargets(hardening.WritablePaths)
+	if len(targets) == 0 {
+		return nil, nil
+	}
+	sum := sha256.Sum256([]byte(top.Name + "\x00" + d.ID))
+	root := filepath.Join(e.writableRoot(), top.Name, hex.EncodeToString(sum[:8]))
+	var out []runtime.Bind
+	for _, target := range targets {
+		allBinds := make([]runtime.Bind, 0, len(existing)+len(out))
+		allBinds = append(allBinds, existing...)
+		allBinds = append(allBinds, out...)
+		if bindCovers(target, allBinds) {
+			continue
+		}
+		name := strings.TrimPrefix(target, "/")
+		name = strings.ReplaceAll(name, "/", "-")
+		source := filepath.Join(root, name)
+		if err := os.MkdirAll(source, 0o755); err != nil {
+			return nil, fmt.Errorf("create writable platform mount for %s at %s: %w", d.ID, target, err)
+		}
+		out = append(out, runtime.Bind{Source: source, Target: target})
+	}
+	// A parent bind hides image directories below it. Create every declared
+	// child upfront (for example /etc/twinet/p4 under /etc/twinet), so Docker
+	// CopyToContainer can address the exact renderer destination without a
+	// shell fallback through the read-only root filesystem.
+	for _, target := range hardening.WritablePaths {
+		target = filepath.Clean(target)
+		for _, bind := range out {
+			if target != bind.Target && !strings.HasPrefix(target, bind.Target+"/") {
+				continue
+			}
+			relative, err := filepath.Rel(bind.Target, target)
+			if err != nil || relative == "." {
+				break
+			}
+			if err := os.MkdirAll(filepath.Join(bind.Source, relative), 0o755); err != nil {
+				return nil, fmt.Errorf("create writable child mount for %s at %s: %w", d.ID, target, err)
+			}
+			break
+		}
+	}
+	return out, nil
+}
+
+func (e *Engine) writableRoot() string {
+	if e.WritableRoot != "" {
+		return e.WritableRoot
+	}
+	return filepath.Join("/run", "twinet", "writable")
+}
+
+func platformWritableBindTargets(paths []string) []string {
+	ephemeral := map[string]bool{
+		"/run": true, "/var/run": true, "/var/log": true, "/var/tmp": true,
+		"/tmp": true, "/etc/openvswitch": true,
+	}
+	seen := map[string]bool{}
+	var candidates []string
+	for _, target := range paths {
+		target = filepath.Clean(target)
+		if ephemeral[target] || seen[target] {
+			continue
+		}
+		seen[target] = true
+		candidates = append(candidates, target)
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if len(candidates[i]) != len(candidates[j]) {
+			return len(candidates[i]) < len(candidates[j])
+		}
+		return candidates[i] < candidates[j]
+	})
+	var out []string
+	for _, target := range candidates {
+		covered := false
+		for _, parent := range out {
+			if target == parent || strings.HasPrefix(target, parent+"/") {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			out = append(out, target)
+		}
+	}
+	return out
 }
 
 func (e *Engine) ensureFRRControl(ctx context.Context, top *model.Topology, d *model.Device, binds []runtime.Bind) error {
@@ -1429,20 +1629,25 @@ func (e *Engine) configure(ctx context.Context, d *model.Device) error {
 	if e.Renderer == nil {
 		return nil
 	}
-	files, err := e.Renderer.Files(d)
+	state, err := e.renderDesired(d)
 	if err != nil {
-		return fmt.Errorf("render files for %s: %w", d.ID, err)
+		return err
 	}
-	cmds, err := e.Renderer.Commands(d)
-	if err != nil {
-		return fmt.Errorf("render commands for %s: %w", d.ID, err)
-	}
-	hash := ConfigHash(files, cmds)
-	if !e.RecoveryCompatibility && e.configurationCurrent(ctx, d, files, hash) {
+	if !e.RecoveryCompatibility && e.configurationCurrent(ctx, d, state.files, state.configHash) {
 		return nil
 	}
-	for _, path := range sortedKeys(files) {
-		f := files[path]
+	return e.configureDesired(ctx, d, state)
+}
+
+// configureDesired applies a pre-rendered dirty configuration. Build renders
+// once during observation, so the executable plan does not render again or
+// perform an extra marker/file survey for every untouched device.
+func (e *Engine) configureDesired(ctx context.Context, d *model.Device, state desiredDeviceState) error {
+	if e.Renderer == nil {
+		return nil
+	}
+	for _, path := range sortedKeys(state.files) {
+		f := state.files[path]
 		keep, err := e.holdsStudentWork(ctx, d, path)
 		if err != nil {
 			return err
@@ -1463,8 +1668,9 @@ func (e *Engine) configure(ctx context.Context, d *model.Device) error {
 		if err := e.Runtime.CopyTo(ctx, d.Container, path, f.Mode, f.Content); err != nil {
 			return fmt.Errorf("write %s to %s: %w", path, d.ID, err)
 		}
+		e.recordMutation("copy", 1)
 	}
-	for _, c := range cmds {
+	for _, c := range state.commands {
 		container := d.Container
 		if c.FRRControl && e.usesFRRControl(d) {
 			container = FRRControlContainer(d)
@@ -1476,10 +1682,12 @@ func (e *Engine) configure(ctx context.Context, d *model.Device) error {
 		if err := res.Err(); err != nil && !c.IgnoreError {
 			return fmt.Errorf("%s: %s: %w", d.ID, c.Describe, err)
 		}
+		e.recordMutation("command", 1)
 	}
-	if err := e.writeConfigurationMarker(ctx, d, hash); err != nil {
+	if err := e.writeConfigurationMarker(ctx, d, state.configHash); err != nil {
 		return err
 	}
+	e.recordMutation("configure", 1)
 	return nil
 }
 
@@ -1673,6 +1881,9 @@ func (e *Engine) Destroy(ctx context.Context, lab string) error {
 	if len(problems) == 0 && ctxErr == nil {
 		if err := os.RemoveAll(filepath.Join(e.frrControlRoot(), lab)); err != nil {
 			problems = append(problems, fmt.Sprintf("remove FRR control state: %v", err))
+		}
+		if err := os.RemoveAll(filepath.Join(e.writableRoot(), lab)); err != nil {
+			problems = append(problems, fmt.Sprintf("remove writable platform state: %v", err))
 		}
 	}
 	return deterministicError(ctxErr, problems)

@@ -3610,17 +3610,13 @@ func checkInternalReachability(ctx context.Context, env *Env) Result {
 			addrOf[d.ID] = a
 		}
 	}
-	type probe struct {
-		from, to *model.Device
-		srcIface string // set when probing from a shared service container
-	}
-	var pairs []probe
+	var pairs []reachabilityProbe
 	for _, a := range hosts {
 		for _, b := range hosts {
 			if a.ID == b.ID || addrOf[b.ID] == "" {
 				continue
 			}
-			pairs = append(pairs, probe{from: a, to: b})
+			pairs = append(pairs, reachabilityProbe{from: a, to: b})
 		}
 	}
 
@@ -3644,7 +3640,7 @@ func checkInternalReachability(ctx context.Context, env *Env) Result {
 			if addrOf[h.ID] == "" {
 				continue
 			}
-			pairs = append(pairs, probe{from: s.Device, to: h, srcIface: s.Iface})
+			pairs = append(pairs, reachabilityProbe{from: s.Device, to: h, srcIface: s.Iface})
 		}
 	}
 	if len(pairs) == 0 {
@@ -3671,38 +3667,10 @@ func checkInternalReachability(ctx context.Context, env *Env) Result {
 	// reads and not 112.
 	echoesBefore := receivedEchoes(ctx, env, hosts)
 
-	var (
-		mu     sync.Mutex
-		failed []string
-		wg     sync.WaitGroup
-	)
-	sem := make(chan struct{}, 16)
-	for _, p := range pairs {
-		wg.Add(1)
-		go func(p probe) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			addr := addrOf[p.to.ID]
-			args := []string{"ping", "-c", "2", "-W", "2", "-i", "0.2"}
-			if p.srcIface != "" {
-				args = append(args, "-I", p.srcIface)
-			}
-			args = append(args, addr)
-			res, err := env.Probe(ctx, p.from.ID, args)
-			if err != nil || res.ExitCode != 0 {
-				from := p.from.Name
-				if p.srcIface != "" {
-					from = p.from.ID + " (the " + p.from.Name + " network)"
-				}
-				mu.Lock()
-				failed = append(failed, fmt.Sprintf("%s cannot reach %s (%s)",
-					from, p.to.Name, addr))
-				mu.Unlock()
-			}
-		}(p)
+	failed, batchedPings := batchedPingFailures(ctx, env, pairs, addrOf)
+	if !batchedPings {
+		failed = legacyPingFailures(ctx, env, pairs, addrOf)
 	}
-	wg.Wait()
 
 	// And the same pairs, with something other than a ping.
 	//
@@ -3713,8 +3681,15 @@ func checkInternalReachability(ctx context.Context, env *Env) Result {
 	// arranged, and the destination's own count of what reached it is read --
 	// a refusal proves only that somebody answered, and any router on the way
 	// can send one carrying the destination's address.
-	pingOnly := unreachableByTCP(ctx, env, hosts, addrOf)
-	pingOnly = append(pingOnly, unreachableByUDP(ctx, env, hosts, addrOf)...)
+	var pingOnly []string
+	if !batchedTransportVerified(ctx, env, hosts, addrOf) {
+		// A batch that cannot prove every flow falls back to the original
+		// per-destination witnesses. Wrong submissions therefore retain the
+		// full discriminator; healthy references avoid hundreds of remote
+		// command round trips.
+		pingOnly = unreachableByTCP(ctx, env, hosts, addrOf)
+		pingOnly = append(pingOnly, unreachableByUDP(ctx, env, hosts, addrOf)...)
+	}
 	sort.Strings(pingOnly)
 	failed = append(failed, pingOnly...)
 

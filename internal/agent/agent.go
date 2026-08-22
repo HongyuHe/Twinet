@@ -1069,17 +1069,22 @@ type ApplyResponse struct {
 	// plan held. They differ on a dry run, on an --only, and on a deploy that
 	// failed part way, which are exactly the runs whose summary must not read
 	// like a complete one.
-	Steps      int                 `json:"steps"`
-	Planned    int                 `json:"planned,omitempty"`
-	Devices    int                 `json:"devices"`
-	Links      int                 `json:"links"`
-	WantDevice int                 `json:"want_devices,omitempty"`
-	WantLinks  int                 `json:"want_links,omitempty"`
-	DryRun     bool                `json:"dry_run,omitempty"`
-	DurationMS int64               `json:"duration_ms"`
-	Failures   map[string][]string `json:"failures,omitempty"`
-	Pruned     []string            `json:"pruned,omitempty"`
-	Snapshots  int                 `json:"snapshots,omitempty"`
+	Steps      int   `json:"steps"`
+	Planned    int   `json:"planned,omitempty"`
+	Devices    int   `json:"devices"`
+	Links      int   `json:"links"`
+	WantDevice int   `json:"want_devices,omitempty"`
+	WantLinks  int   `json:"want_links,omitempty"`
+	DryRun     bool  `json:"dry_run,omitempty"`
+	DurationMS int64 `json:"duration_ms"`
+	// PhaseMS separates bounded observation/diff/capture work from executable
+	// plan time, so a no-change regression names its actual bottleneck.
+	PhaseMS   map[string]int64    `json:"phase_ms,omitempty"`
+	Dirty     map[string]int      `json:"dirty,omitempty"`
+	Mutations map[string]int      `json:"mutations,omitempty"`
+	Failures  map[string][]string `json:"failures,omitempty"`
+	Pruned    []string            `json:"pruned,omitempty"`
+	Snapshots int                 `json:"snapshots,omitempty"`
 }
 
 func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
@@ -1193,7 +1198,7 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	p, err := eng.Build(top)
+	p, err := eng.BuildContext(r.Context(), top)
 	if err != nil {
 		httpError(w, http.StatusBadRequest, err)
 		return
@@ -1220,6 +1225,8 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		DryRun:          req.DryRun,
 	})
 	s.recordPlanMetrics(rep)
+	deploymentStats := eng.DeploymentStats(rep)
+	s.recordDeploymentStats(deploymentStats, rep)
 	if err != nil {
 		if req.Phase == "apply" && !req.DryRun {
 			_ = s.markTransactionPhase(top.Name, req.Fence, req.Generation,
@@ -1250,6 +1257,11 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 			WantDevice: rep.Planned(plan.StageCreate),
 			WantLinks:  rep.Planned(plan.StageWire),
 			DurationMS: rep.Duration.Milliseconds(),
+		}
+		attachDeploymentStats(&resp, deploymentStats, rep)
+		if err := s.recordGenerationDirtyCapture(top.Name, req.Fence, req.Generation, eng.DirtyCaptureDevices()); err != nil {
+			httpError(w, http.StatusConflict, err)
+			return
 		}
 		if rep.Failed() {
 			resp.Failures = reportFailures(rep)
@@ -1354,6 +1366,7 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		DryRun:     req.DryRun,
 		DurationMS: rep.Duration.Milliseconds(),
 	}
+	attachDeploymentStats(&resp, deploymentStats, rep)
 	if recordFailure != "" {
 		resp.Failures = map[string][]string{"state": {recordFailure}}
 	}
@@ -1393,7 +1406,8 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 	// captureAndReplicate, which still copies the repair records but never
 	// files the reference answer as student work.
 	if s.store != nil && !req.DryRun && !rep.Failed() {
-		if n, err := s.captureAndReplicate(r.Context(), top); err != nil {
+		captureStart := time.Now()
+		if n, err := s.captureAndReplicateDirty(r.Context(), top, eng.DirtyCaptureDevices()); err != nil {
 			if boundaryErr := s.durableBoundary(top, "completing this deployment", err); boundaryErr != nil {
 				if resp.Failures == nil {
 					resp.Failures = map[string][]string{}
@@ -1403,6 +1417,9 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		} else {
 			resp.Snapshots = n
 		}
+		captureElapsed := time.Since(captureStart)
+		addCaptureTiming(&resp, captureElapsed)
+		s.metricRegistry().observePhase("capture", captureElapsed, "success")
 	}
 	if rep.Failed() {
 		resp.Failures = reportFailures(rep)

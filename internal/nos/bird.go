@@ -250,7 +250,10 @@ func readBirdBGP(ctx context.Context, d *model.Device, exec netstate.Executor, q
 			}
 			continue
 		}
-		path := netstate.BGPPath{Prefix: matches[1], Valid: true, Best: strings.Contains(raw, " * ")}
+		path := netstate.BGPPath{
+			Prefix: matches[1], Valid: true, Best: strings.Contains(raw, " * "),
+			Source: birdPathSource(matches[2]),
+		}
 		if via := birdViaRE.FindStringSubmatch(raw); len(via) == 2 {
 			path.NextHops = []netstate.NextHop{{Address: via[1]}}
 		}
@@ -262,6 +265,24 @@ func readBirdBGP(ctx context.Context, d *model.Device, exec netstate.Executor, q
 		current = &out.Paths[len(out.Paths)-1]
 	}
 	return out, nil
+}
+
+func birdPathSource(protocol string) string {
+	fields := strings.Fields(protocol)
+	if len(fields) == 0 {
+		return ""
+	}
+	name := strings.ToLower(fields[0])
+	switch {
+	case strings.HasPrefix(name, "ibgp"):
+		return "internal"
+	case strings.HasPrefix(name, "ebgp"):
+		return "external"
+	case strings.HasPrefix(name, "own"), strings.HasPrefix(name, "hijack"), strings.HasPrefix(name, "static"):
+		return "local"
+	default:
+		return ""
+	}
 }
 
 func birdCommunities(raw string) []string {

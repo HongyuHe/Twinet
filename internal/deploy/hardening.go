@@ -3,6 +3,7 @@ package deploy
 import (
 	"fmt"
 	"path"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -28,17 +29,7 @@ func (e *Engine) hardenedRuntimeSpec(d *model.Device, binds []runtime.Bind) (*ru
 		}
 		device = &clone
 	}
-	h := model.EffectiveRuntimeHardening(device.Kind, device.Hardening)
-	if device.EffectiveNOS() == "bird" {
-		h.WritablePaths = append(h.WritablePaths, "/etc/bird")
-	}
-	if device.Kind == model.KindService {
-		// Service renderers materialize generated zones and daemon state after
-		// creation. A read-only root is retained, with only these explicit
-		// service-state directories supplied as tmpfs mounts.
-		h.WritablePaths = append(h.WritablePaths,
-			"/etc/bind", "/var/named", "/var/run/named", "/var/log")
-	}
+	h := effectiveHardening(device)
 	if err := validateRuntimeHardening(device, h); err != nil {
 		return nil, err
 	}
@@ -77,6 +68,60 @@ func (e *Engine) hardenedRuntimeSpec(d *model.Device, binds []runtime.Bind) (*ru
 		Tmpfs:          tmpfs,
 		NetworkMode:    "none",
 	}, nil
+}
+
+func effectiveHardening(d *model.Device) model.RuntimeHardening {
+	if d == nil {
+		return model.RuntimeHardening{}
+	}
+	h := model.EffectiveRuntimeHardening(d.Kind, d.Hardening)
+	if d.EffectiveNOS() == "bird" {
+		h.WritablePaths = append(h.WritablePaths, "/etc/bird")
+	}
+	if d.Kind == model.KindService {
+		// Service renderers materialize generated zones and daemon state after
+		// creation. A read-only root is retained, with only these explicit
+		// service-state directories supplied as writable mount targets.
+		h.WritablePaths = append(h.WritablePaths,
+			"/etc/bind", "/var/named", "/var/run/named", "/var/log")
+	}
+	return h
+}
+
+// PlatformWritablePaths is the complete declared writable contract for one
+// device. It includes the split FRR control mounts, whose ownership is
+// intentionally separate from an ordinary router root filesystem.
+func PlatformWritablePaths(d *model.Device) []string {
+	h := effectiveHardening(d)
+	paths := append([]string(nil), h.WritablePaths...)
+	if UsesFRRControl(d) {
+		paths = append(paths, "/etc/frr", "/run/frr", "/var/log/frr")
+	}
+	sort.Slice(paths, func(i, j int) bool {
+		if len(paths[i]) != len(paths[j]) {
+			return len(paths[i]) < len(paths[j])
+		}
+		return paths[i] < paths[j]
+	})
+	out := paths[:0]
+	for _, path := range paths {
+		if len(out) == 0 || out[len(out)-1] != path {
+			out = append(out, path)
+		}
+	}
+	return out
+}
+
+// WritablePathCovers reports whether a declared writable mount covers path.
+func WritablePathCovers(paths []string, path string) bool {
+	path = filepath.Clean(path)
+	for _, root := range paths {
+		root = filepath.Clean(root)
+		if path == root || strings.HasPrefix(path, root+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 func hardeningTmpfsOptions(target string) string {

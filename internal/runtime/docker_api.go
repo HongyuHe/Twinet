@@ -715,14 +715,6 @@ func (d *dockerAPI) CopyTo(ctx context.Context, name, dst string, mode int64, co
 		Content:         bytes.NewReader(archive.Bytes()),
 	})
 	if err != nil {
-		if readonlyRootfsCopyError(err.Error()) {
-			if fallbackErr := writeReadonlyRootfsFile(ctx, d, name, dst, mode, content); fallbackErr == nil {
-				return nil
-			} else {
-				return fmt.Errorf("%s cp into %s:%s: %w; writable-mount fallback: %v",
-					d.engineName(), name, dir, err, fallbackErr)
-			}
-		}
 		return fmt.Errorf("%s cp into %s:%s: %w", d.engineName(), name, dir, err)
 	}
 	return nil

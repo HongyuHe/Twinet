@@ -165,26 +165,28 @@ type RecoveryStatus struct {
 // coordinator. It intentionally excludes the opaque token: after restart no
 // old caller can continue or finish this transaction.
 type applyTransaction struct {
-	Generation       string               `json:"generation"`
-	Expected         string               `json:"expected,omitempty"`
-	FenceGeneration  uint64               `json:"fence_generation"`
-	Requested        json.RawMessage      `json:"requested"`
-	Previous         json.RawMessage      `json:"previous,omitempty"`
-	PreviousGen      string               `json:"previous_generation,omitempty"`
-	Mode             string               `json:"mode,omitempty"`
-	Ungraded         int                  `json:"ungraded_as,omitempty"`
-	PeerUnderlay     map[string]string    `json:"peer_underlay,omitempty"`
-	Prune            bool                 `json:"prune,omitempty"`
-	OnlySteps        []string             `json:"only_steps,omitempty"`
-	StateProofs      []StateProof         `json:"state_proofs,omitempty"`
-	StateVerified    bool                 `json:"state_verified,omitempty"`
-	Phase            transactionPhase     `json:"phase,omitempty"`
-	Prestate         transactionInventory `json:"prestate,omitempty"`
-	Failure          string               `json:"failure,omitempty"`
-	RecoveryAttempts int                  `json:"recovery_attempts,omitempty"`
-	LastRecovery     time.Time            `json:"last_recovery,omitempty"`
-	Applied          bool                 `json:"applied"`
-	Committed        bool                 `json:"committed"`
+	Generation        string               `json:"generation"`
+	Expected          string               `json:"expected,omitempty"`
+	FenceGeneration   uint64               `json:"fence_generation"`
+	Requested         json.RawMessage      `json:"requested"`
+	Previous          json.RawMessage      `json:"previous,omitempty"`
+	PreviousGen       string               `json:"previous_generation,omitempty"`
+	Mode              string               `json:"mode,omitempty"`
+	Ungraded          int                  `json:"ungraded_as,omitempty"`
+	PeerUnderlay      map[string]string    `json:"peer_underlay,omitempty"`
+	Prune             bool                 `json:"prune,omitempty"`
+	OnlySteps         []string             `json:"only_steps,omitempty"`
+	StateProofs       []StateProof         `json:"state_proofs,omitempty"`
+	DirtyCapture      []string             `json:"dirty_capture,omitempty"`
+	DirtyCaptureKnown bool                 `json:"dirty_capture_known,omitempty"`
+	StateVerified     bool                 `json:"state_verified,omitempty"`
+	Phase             transactionPhase     `json:"phase,omitempty"`
+	Prestate          transactionInventory `json:"prestate,omitempty"`
+	Failure           string               `json:"failure,omitempty"`
+	RecoveryAttempts  int                  `json:"recovery_attempts,omitempty"`
+	LastRecovery      time.Time            `json:"last_recovery,omitempty"`
+	Applied           bool                 `json:"applied"`
+	Committed         bool                 `json:"committed"`
 }
 
 type coordinationState struct {
@@ -943,6 +945,7 @@ func (s *Server) markGenerationApplied(lab string, fence Fence, generation strin
 	if err := s.fenceErrorLocked(lab, fence, s.nowTime()); err != nil {
 		return err
 	}
+
 	tx, ok := s.transactions[lab]
 	if !ok || tx.Generation != generation || tx.FenceGeneration != fence.Generation {
 		return fmt.Errorf("generation %q of lab %q was not prepared by this fence", generation, lab)
@@ -953,6 +956,26 @@ func (s *Server) markGenerationApplied(lab string, fence Fence, generation strin
 		return fmt.Errorf("persisting applied generation: %w", err)
 	}
 	return nil
+}
+
+// recordGenerationDirtyCapture persists the narrow destructive set produced
+// by the apply plan so commit capture does not fall back to a class-wide
+// CaptureAll on an otherwise no-change deployment.
+func (s *Server) recordGenerationDirtyCapture(lab string, fence Fence, generation string, ids []string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initCoordination()
+	if err := s.fenceErrorLocked(lab, fence, s.nowTime()); err != nil {
+		return err
+	}
+	tx, ok := s.transactions[lab]
+	if !ok || tx.Generation != generation || tx.FenceGeneration != fence.Generation {
+		return fmt.Errorf("generation %q of lab %q was not prepared by this fence", generation, lab)
+	}
+	tx.DirtyCapture = append([]string(nil), ids...)
+	tx.DirtyCaptureKnown = true
+	s.transactions[lab] = tx
+	return s.saveCoordinationLocked()
 }
 
 func (s *Server) transactionForCommit(lab string, fence Fence, generation string) (applyTransaction, error) {

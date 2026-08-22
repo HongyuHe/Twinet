@@ -376,6 +376,17 @@ func (s *Server) endDurability(lab string) {
 // captureAndReplicate takes a bounded capture and confirms every current
 // object has the policy's required number of independent copies.
 func (s *Server) captureAndReplicate(ctx context.Context, top *model.Topology) (int, error) {
+	return s.captureAndReplicateSelected(ctx, top, nil)
+}
+
+// captureAndReplicateDirty is used at a deployment boundary. Periodic
+// durability calls captureAndReplicate and therefore still captures the full
+// student-owned set independently of deploy reconciliation.
+func (s *Server) captureAndReplicateDirty(ctx context.Context, top *model.Topology, ids []string) (int, error) {
+	return s.captureAndReplicateSelected(ctx, top, ids)
+}
+
+func (s *Server) captureAndReplicateSelected(ctx context.Context, top *model.Topology, ids []string) (int, error) {
 	if top == nil || top.Lab == nil {
 		return 0, errors.New("durability needs a topology with a lab policy")
 	}
@@ -391,7 +402,15 @@ func (s *Server) captureAndReplicate(ctx context.Context, top *model.Topology) (
 		Runtime: s.rt, Node: s.cfg.Node, Limiter: s.workLimiter(), State: s.store,
 		Renderer: renderer(top, render.ModePlatform, 0),
 	}
-	n, err := eng.CaptureAll(ctx, top, s.store)
+	var (
+		n   int
+		err error
+	)
+	if ids == nil {
+		n, err = eng.CaptureAll(ctx, top, s.store)
+	} else {
+		n, err = eng.CaptureDevices(ctx, top, s.store, ids)
+	}
 	if err != nil {
 		return n, fmt.Errorf("capture current student state: %w", err)
 	}

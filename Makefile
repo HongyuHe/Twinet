@@ -293,7 +293,7 @@ o12-integration:
 		{ echo "make o12-integration requires a reachable Docker daemon"; exit 2; }
 	@$(MAKE) --no-print-directory images
 	REGISTRY="$(REGISTRY)" TAG="$(TAG)" TWINET_O12_INTEGRATION_ALLOW_DESTRUCTIVE=1 \
-		$(GO) test -count=1 -tags o12integration ./test/integration/... -run '^TestO12Docker'
+		$(GO) test -count=1 -tags o12integration ./test/integration/... -run '^TestO12'
 
 # O16 images are explicit because they pull a large pinned BMv2 base and may
 # need a privileged Docker daemon. This target never reports a green result

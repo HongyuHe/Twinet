@@ -53,7 +53,13 @@ func TestNOSImagesStart(t *testing.T) {
 	bird := start(fmt.Sprintf("%s/twinet-bird:%s", registry, tag))
 	run("exec", frr, "sh", "-c", "/usr/lib/frr/frrinit.sh start && vtysh -c 'show version' >/dev/null")
 	run("exec", bird, "sh", "-c",
-		"printf 'router id 127.0.0.1; protocol device {}\\n' >/etc/bird/bird.conf && "+
+		"cat >/etc/bird/bird.conf <<'BIRD'\n"+
+			"router id 127.0.0.1;\n"+
+			"protocol device {}\n"+
+			"protocol static hijack4 { ipv4; route 10.128.0.0/9 reject; }\n"+
+			"filter export_reference { if source != RTS_BGP && source != RTS_STATIC then reject; bgp_path.prepend(1); accept; }\n"+
+			"protocol bgp reference { local as 1; neighbor 192.0.2.2 as 2; ipv4 { import none; export filter export_reference; }; }\n"+
+			"BIRD\n"+
 			"bird -c /etc/bird/bird.conf -s /run/bird.ctl && "+
 			"birdc -r -s /run/bird.ctl show status >/dev/null")
 }

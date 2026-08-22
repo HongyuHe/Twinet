@@ -82,3 +82,47 @@ func TestMixedNOSRubricUsesProviderNeutralSessionState(t *testing.T) {
 		t.Fatalf("mixed NOS rubric report = %#v", report)
 	}
 }
+
+type localHijackReader struct{}
+
+func (localHijackReader) ReadState(_ context.Context, d *model.Device, _ netstate.Executor,
+	query netstate.Query,
+) (netstate.State, error) {
+	state := netstate.State{}
+	if d.ID == "as1/ALL" && query.Has(netstate.QueryBGPRIB) {
+		state.BGP.Paths = []netstate.BGPPath{{Prefix: "10.128.0.0/9", Source: "local", Valid: true}}
+	}
+	if d.ID == "as1/ALL" && query.Has(netstate.QueryBGPSessions) {
+		state.BGP.Sessions = []netstate.BGPSession{{Neighbor: "192.0.2.2", RemoteAS: 3, State: "Established"}}
+	}
+	return state, nil
+}
+
+func TestInvalidOriginPremiseReadsBIRDRIBThroughNetstate(t *testing.T) {
+	bird := &model.Device{ID: "as1/ALL", Name: "ALL", ASN: 1, Kind: model.KindRouter, NOS: "bird"}
+	student := &model.Device{ID: "as3/MSP", Name: "MSP", ASN: 3, Kind: model.KindRouter}
+	birdIface := &model.Iface{Device: bird, Name: "ext_3_MSP", Role: model.RoleInterAS, Addr4: "192.0.2.1/24"}
+	studentIface := &model.Iface{Device: student, Name: "ext_1_ALL", Role: model.RoleInterAS, Addr4: "192.0.2.2/24"}
+	link := &model.Link{A: birdIface, B: studentIface, InterAS: true}
+	birdIface.Link, birdIface.Peer = link, studentIface
+	studentIface.Link, studentIface.Peer = link, birdIface
+	bird.Ifaces, student.Ifaces = []*model.Iface{birdIface}, []*model.Iface{studentIface}
+	topology := &model.Topology{
+		Lab:     &model.Lab{RPKI: model.RPKISpec{Invalid: map[int]string{2: "10.128.0.0/9"}}},
+		Devices: map[string]*model.Device{bird.ID: bird, student.ID: student},
+		ASes: map[int]*model.AS{
+			1: {ASN: 1, Role: model.RoleStaff, Routers: []*model.Device{bird}},
+			2: {ASN: 2, Role: model.RoleStaff},
+			3: {ASN: 3, Role: model.RoleStudent, Routers: []*model.Device{student}},
+		},
+	}
+	env := &Env{
+		Topology: topology, AS: 3, StateReader: localHijackReader{},
+		Exec: func(context.Context, string, []string) (rt.ExecResult, error) {
+			return rt.ExecResult{}, nil
+		},
+	}
+	if why := hijackIsAnnounced(context.Background(), env); why != "" {
+		t.Fatalf("BIRD local origin was not recognized: %s", why)
+	}
+}

@@ -425,7 +425,10 @@ func DefaultResourceRequest(kind DeviceKind) ResourceRequest {
 		}
 	case KindService:
 		return ResourceRequest{
-			CPUs: 0.25, Memory: "128Mi", Pids: 64, EphemeralStorage: "256Mi",
+			// BIND sizes worker/listener threads from visible CPUs. A 64-PID
+			// service cgroup aborts on ordinary multi-core nodes before DNS
+			// can bind, even though its memory and CPU reservation are sound.
+			CPUs: 0.25, Memory: "128Mi", Pids: 512, EphemeralStorage: "256Mi",
 			FileDescriptors: 1024, NetDevices: 8,
 		}
 	case KindP4:

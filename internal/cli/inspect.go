@@ -551,10 +551,18 @@ func writeReferenceConfig(w io.Writer, top *model.Topology, id string) error {
 	if d.Kind != model.KindRouter {
 		return fmt.Errorf("%s is a %s; only routers have a reference configuration", id, d.Kind)
 	}
-	cfg, err := render.Router(top, d)
+	files, err := render.New(top, render.ModeSolve).Files(d)
 	if err != nil {
 		return err
 	}
-	fmt.Fprint(w, cfg.Platform+cfg.Expected)
+	path := "/etc/frr/frr.conf"
+	if d.EffectiveNOS() == "bird" {
+		path = "/etc/bird/bird.conf"
+	}
+	config, ok := files[path]
+	if !ok {
+		return fmt.Errorf("%s (%s) rendered no configuration at %s", d.ID, d.EffectiveNOS(), path)
+	}
+	_, err = w.Write(config.Content)
 	return nil
 }

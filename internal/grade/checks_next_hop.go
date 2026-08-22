@@ -4,12 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/netip"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
 	"github.com/HongyuHe/twinet/internal/model"
 )
+
+type nextHopUse struct{ router, prefix, nh string }
 
 func init() {
 	Register(&Check{
@@ -47,9 +51,7 @@ func checkNextHopSelf(ctx context.Context, env *Env) Result {
 	var unusable []bad
 	var unread []string
 	checked := 0
-	// Per router, because a router that carries none of the AS's external
-	// routes contributes nothing to a total and disappears into it.
-	carriedOn := map[string]int{}
+	var uses []nextHopUse
 	// Which external destinations each router holds, so a router that is
 	// missing some of what the rest of the AS has can be named.
 	holds := map[string]map[string]bool{}
@@ -85,17 +87,30 @@ func checkNextHopSelf(ctx context.Context, env *Env) Result {
 						continue
 					}
 					checked++
-					carriedOn[r.Name]++
-					ok, why, err := env.resolves(ctx, r.ID, nh.IP)
-					if err != nil {
-						unread = append(unread, fmt.Sprintf("%s: %v", r.Name, err))
-						continue
-					}
-					if !ok {
-						unusable = append(unusable, bad{r.Name, prefix, nh.IP, why})
-					}
+					uses = append(uses, nextHopUse{router: r.Name, prefix: prefix, nh: nh.IP})
 				}
 			}
+		}
+	}
+
+	// A reference table contains many prefixes sharing a handful of next
+	// hops. Asking the kernel once per path made this check serially issue
+	// hundreds of route lookups and regularly exhaust its two-minute budget.
+	// One agent-side shell batch per router asks every distinct next hop while
+	// retaining the kernel's actual forwarding decision for each.
+	resolved, resolveErrs := resolveNextHopsBatched(ctx, env, uses)
+	for _, use := range uses {
+		if err := resolveErrs[use.router]; err != nil {
+			unread = append(unread, fmt.Sprintf("%s: %v", use.router, err))
+			continue
+		}
+		result, ok := resolved[use.router][use.nh]
+		if !ok {
+			unread = append(unread, fmt.Sprintf("%s: no kernel answer for next hop %s", use.router, use.nh))
+			continue
+		}
+		if !result.ok {
+			unusable = append(unusable, bad{use.router, use.prefix, use.nh, result.why})
 		}
 	}
 
@@ -104,6 +119,7 @@ func checkNextHopSelf(ctx context.Context, env *Env) Result {
 		return Errored("bgp.next_hop_self",
 			fmt.Errorf("no router's table could be read: %s", strings.Join(unread, "; ")))
 	}
+
 	if checked == 0 {
 		return Fail("bgp.next_hop_self", Evidence{
 			Expected: "externally learned routes carried across the AS by iBGP",
@@ -227,6 +243,69 @@ func checkNextHopSelf(ctx context.Context, env *Env) Result {
 			"everywhere, and the traffic is dropped",
 		Command: "show ip bgp json; show ip route <next-hop> json",
 	})
+}
+
+type nextHopResolution struct {
+	ok  bool
+	why string
+}
+
+// resolveNextHopsBatched asks each router's kernel about every distinct BGP
+// next hop in one agent-side execution. It deliberately uses ip route get,
+// not a vendor RIB: policy rules and the FIB decide whether packets move.
+func resolveNextHopsBatched(ctx context.Context, env *Env, uses []nextHopUse) (
+	map[string]map[string]nextHopResolution, map[string]error,
+) {
+	needs := map[string]map[string]bool{}
+	for _, use := range uses {
+		if needs[use.router] == nil {
+			needs[use.router] = map[string]bool{}
+		}
+		needs[use.router][use.nh] = true
+	}
+	out := map[string]map[string]nextHopResolution{}
+	errs := map[string]error{}
+	var (
+		mu sync.Mutex
+		wg sync.WaitGroup
+	)
+	for router, set := range needs {
+		router, set := router, set
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			device, ok := env.Device(router)
+			if !ok {
+				mu.Lock()
+				errs[router] = fmt.Errorf("router is not in the topology")
+				mu.Unlock()
+				return
+			}
+			addrs := make([]string, 0, len(set))
+			results := map[string]nextHopResolution{}
+			for addr := range set {
+				if _, err := netip.ParseAddr(addr); err != nil {
+					results[addr] = nextHopResolution{why: "an invalid next-hop address"}
+					continue
+				}
+				addrs = append(addrs, addr)
+			}
+			sort.Strings(addrs)
+			got, err := env.kernelForwardsMany(ctx, device.ID, addrs)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				errs[router] = err
+				return
+			}
+			for addr, result := range got {
+				results[addr] = result
+			}
+			out[router] = results
+		}()
+	}
+	wg.Wait()
+	return out, errs
 }
 
 // unreachedOutside names the routers that hold external routes and cannot send
@@ -399,21 +478,102 @@ func (e *Env) resolves(ctx context.Context, deviceID, addr string) (bool, string
 // policy rules, alternate tables and anything else installed outside the
 // daemon's view all take effect here and nowhere else.
 func (e *Env) kernelForwards(ctx context.Context, deviceID, addr string) (string, bool) {
-	res, err := e.Probe(ctx, deviceID, []string{"ip", "route", "get", addr})
+	results, err := e.kernelForwardsMany(ctx, deviceID, []string{addr})
 	if err != nil {
 		return "", true // the machinery failed; that is not the submission's fault
 	}
-	out := strings.ToLower(res.Stdout + " " + res.Stderr)
-	switch {
-	case res.ExitCode != 0:
-		return fmt.Sprintf("a route the routing daemon installed, which the kernel will not "+
-			"use: %s", firstLine(strings.TrimSpace(res.Stderr+res.Stdout))), false
-	case strings.Contains(out, "blackhole"), strings.Contains(out, "unreachable"),
-		strings.Contains(out, "prohibit"):
-		return "a route the routing daemon installed, which a policy rule sends somewhere " +
-			"that discards it", false
+	result, ok := results[addr]
+	if !ok {
+		return "a route the routing daemon installed, which the kernel did not answer for", false
 	}
-	return "", true
+	return result.why, result.ok
+}
+
+// kernelForwardsMany runs all route lookups inside one agent-side shell. Each
+// address is passed as an argv element after netip validation, never interpolated
+// into the script, so a route attribute cannot become shell syntax.
+func (e *Env) kernelForwardsMany(ctx context.Context, deviceID string,
+	addrs []string,
+) (map[string]nextHopResolution, error) {
+	out := make(map[string]nextHopResolution, len(addrs))
+	if len(addrs) == 0 {
+		return out, nil
+	}
+	for _, addr := range addrs {
+		if _, err := netip.ParseAddr(addr); err != nil {
+			out[addr] = nextHopResolution{why: "an invalid next-hop address"}
+		}
+	}
+	valid := make([]string, 0, len(addrs))
+	for _, addr := range addrs {
+		if _, bad := out[addr]; !bad {
+			valid = append(valid, addr)
+		}
+	}
+	if len(valid) == 0 {
+		return out, nil
+	}
+	const script = `n=0
+for addr in "$@"; do
+  echo "@ $n"
+  ip route get "$addr" 2>&1 | head -1
+  n=$((n+1))
+done`
+	command := []string{"sh", "-c", script, "--"}
+	command = append(command, valid...)
+	res, err := e.Probe(ctx, deviceID, command)
+	if err != nil {
+		return nil, err
+	}
+	if res.ExitCode != 0 {
+		return nil, fmt.Errorf("batched kernel route lookup exited %d: %s",
+			res.ExitCode, firstLine(res.Stderr))
+	}
+
+	current := -1
+	for _, line := range strings.Split(res.Stdout, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "@ ") {
+			index, parseErr := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(line, "@ ")))
+			if parseErr != nil || index < 0 || index >= len(valid) {
+				current = -1
+			} else {
+				current = index
+			}
+			continue
+		}
+		if current < 0 {
+			continue
+		}
+		addr := valid[current]
+		lower := strings.ToLower(line)
+		switch {
+		case strings.Contains(lower, "network is unreachable"),
+			strings.Contains(lower, "invalid argument"),
+			strings.Contains(lower, "not found"):
+			out[addr] = nextHopResolution{why: "no route the kernel can use"}
+		case strings.Contains(lower, "blackhole"),
+			strings.Contains(lower, "unreachable"),
+			strings.Contains(lower, "prohibit"):
+			out[addr] = nextHopResolution{
+				why: "a route the routing daemon installed, which a policy rule sends somewhere that discards it",
+			}
+		case strings.Contains(lower, " dev "):
+			out[addr] = nextHopResolution{ok: true}
+		default:
+			out[addr] = nextHopResolution{why: "a kernel route with no forwarding device"}
+		}
+		current = -1
+	}
+	for _, addr := range valid {
+		if _, ok := out[addr]; !ok {
+			out[addr] = nextHopResolution{why: "no route the kernel answered for"}
+		}
+	}
+	return out, nil
 }
 
 // routeEntryJSON is one entry of `show ip route <addr> json`.

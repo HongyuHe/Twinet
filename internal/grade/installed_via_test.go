@@ -75,6 +75,31 @@ func TestAStaticRouteOutTheFastInterfaceIsNotReported(t *testing.T) {
 	}
 }
 
+func TestTransportLinkSubnetIsNotATrafficEngineeringDestination(t *testing.T) {
+	const routes = `{
+	  "179.1.3.0/24": [{"protocol":"connected","selected":true,
+	    "nexthops":[{"fib":true,"directlyConnected":true,"interfaceName":"ext_1_ALL","active":true}]}]
+	}`
+	const bgp = `{"routes":{
+	  "179.1.3.0/24":[{"path":"1","nexthops":[{"ip":"179.1.3.2"}]}]
+	}}`
+	env := fakeRouteEnv(map[string]string{
+		"show ip route json": routes,
+		"show ip bgp json":   bgp,
+	})
+	env.Topology.Links = []*model.Link{{Subnet: "179.1.3.0/24"}}
+
+	via, unreadable := installedVia(context.Background(), env,
+		[]string{"179.1.1.2"}, map[string]map[string]bool{"MSP": {"ext_1_ALL": true}},
+		[]string{"179.1.3.2"})
+	if unreadable != "" {
+		t.Fatalf("the route table was not read: %s", unreadable)
+	}
+	if len(via) != 0 {
+		t.Fatalf("a connected transport subnet was treated as a TE destination: %v", via)
+	}
+}
+
 func fakeRouteEnv(replies map[string]string) *Env {
 	return &Env{
 		Topology: &model.Topology{ASes: map[int]*model.AS{

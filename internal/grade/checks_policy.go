@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/HongyuHe/twinet/internal/model"
+	"github.com/HongyuHe/twinet/internal/netstate"
 	"github.com/HongyuHe/twinet/internal/svc"
 )
 
@@ -2534,15 +2535,64 @@ func hijackIsAnnounced(ctx context.Context, env *Env) string {
 	}
 	var why []string
 	for _, r := range as.Routers {
-		res, err := env.Probe(ctx, r.ID, []string{"vtysh", "-c", "show bgp ipv4 unicast " + prefix})
+		state, err := env.DeviceState(ctx, r.ID, netstate.QueryBGPRIB)
 		if err != nil {
 			why = append(why, fmt.Sprintf("%s: %v", r.ID, err))
 			continue
 		}
-		if res.ExitCode == 0 && strings.Contains(res.Stdout, prefix) {
+		originated := false
+		for _, path := range state.BGP.Paths {
+			if path.Prefix != prefix {
+				continue
+			}
+			// The premise belongs to the staff-operated origin. A propagated
+			// copy from somebody else is not proof that the declared origin
+			// actually announced it, while both FRR's network route and
+			// BIRD's static origin normalize as local.
+			if path.Source == "local" {
+				originated = true
+				break
+			}
+		}
+		if !originated {
+			why = append(why, fmt.Sprintf("%s does not have %s in its table", r.ID, prefix))
+			continue
+		}
+		// For the mixed COS reference, AS 1 originates the prefix directly
+		// towards AS 3. A local static route is not enough: prove the
+		// provider's BGP session to the assessed AS is established, so the
+		// invalid update is offered to AS 3 before its RPKI policy rejects it.
+		var peers []string
+		for _, iface := range r.Ifaces {
+			if iface.Peer == nil || iface.Peer.Device == nil || iface.Peer.Device.ASN != env.AS {
+				continue
+			}
+			if iface.Role != model.RoleInterAS && iface.Role != model.RoleIXPLink {
+				continue
+			}
+			if addr := addrOnly(iface.Peer.Addr4); addr != "" {
+				peers = append(peers, addr)
+			}
+		}
+		if len(peers) == 0 {
+			// A topology where the declared origin reaches the assessed AS
+			// through another reference still has a sound origin premise.
 			return ""
 		}
-		why = append(why, fmt.Sprintf("%s does not have %s in its table", r.ID, prefix))
+		sessions, sessionErr := env.DeviceState(ctx, r.ID, netstate.QueryBGPSessions)
+		if sessionErr != nil {
+			why = append(why, fmt.Sprintf("%s: %v", r.ID, sessionErr))
+			continue
+		}
+		for _, peer := range peers {
+			for _, session := range sessions.BGP.Sessions {
+				if session.Neighbor == peer && strings.EqualFold(session.State, "Established") {
+					return ""
+				}
+			}
+		}
+		why = append(why, fmt.Sprintf("%s originates %s but has no established BGP session to AS %d",
+			r.ID, prefix, env.AS))
 	}
 	return strings.Join(truncate(why, 3), "; ")
 }
@@ -3103,6 +3153,9 @@ func installedVia(ctx context.Context, env *Env, slow []string, slowIf map[strin
 			continue
 		}
 		for prefix, entries := range tbl.Table() {
+			if !routableTEDestination(env, prefix) {
+				continue
+			}
 			for _, e := range entries {
 				for _, nh := range e.Nexthops {
 					if isFast[nh.IP] {
@@ -3141,7 +3194,7 @@ func installedVia(ctx context.Context, env *Env, slow []string, slowIf map[strin
 		}
 		flagged := map[string]bool{}
 		for prefix, entries := range routes {
-			if !alt[prefix] {
+			if !alt[prefix] || !routableTEDestination(env, prefix) {
 				continue
 			}
 			for _, e := range entries {
@@ -3195,4 +3248,42 @@ func installedVia(ctx context.Context, env *Env, slow []string, slowIf map[strin
 		}
 	}
 	return via, ""
+}
+
+// routableTEDestination excludes topology transport and local prefixes from
+// traffic-engineering candidates. A BGP table can contain an external link's
+// /24 after redistribution, but the router attached to that link reaches it
+// directly; it cannot choose a fast versus slow transit path for that
+// infrastructure subnet. Treating it as a destination deducted marks from the
+// reference merely because its connected route left over the slow interface.
+func routableTEDestination(env *Env, prefix string) bool {
+	normalized := normalPrefix(prefix)
+	if normalized == "" {
+		return false
+	}
+	for _, link := range env.Topology.Links {
+		if normalPrefix(link.Subnet) == normalized || normalPrefix(link.SubnetV6) == normalized {
+			return false
+		}
+	}
+	as := env.Topology.ASes[env.AS]
+	if as != nil {
+		if normalPrefix(as.Block) == normalized || normalPrefix(as.BlockV6) == normalized {
+			return false
+		}
+		for _, device := range as.Devices {
+			for _, iface := range device.Ifaces {
+				for _, address := range []string{iface.Addr4, iface.Addr6} {
+					if address == "" {
+						continue
+					}
+					if parsed, err := netip.ParsePrefix(address); err == nil &&
+						parsed.Masked().String() == normalized {
+						return false
+					}
+				}
+			}
+		}
+	}
+	return true
 }

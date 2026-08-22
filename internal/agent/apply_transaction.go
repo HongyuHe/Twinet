@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/HongyuHe/twinet/internal/deploy"
 	"github.com/HongyuHe/twinet/internal/limiter"
@@ -257,7 +258,18 @@ func (s *Server) commitAppliedTopology(ctx context.Context, top *model.Topology,
 	// placement before its current state and topology record have a verified
 	// failure-domain-separated quorum is not a successful migration.
 	if s.store != nil {
-		n, captureErr := s.captureAndReplicate(ctx, top)
+		captureStart := time.Now()
+		var (
+			n          int
+			captureErr error
+		)
+		if tx.DirtyCaptureKnown {
+			n, captureErr = s.captureAndReplicateDirty(ctx, top, tx.DirtyCapture)
+		} else {
+			// Transactions prepared by an older agent lack a dirty set; keep
+			// the conservative full capture compatibility path.
+			n, captureErr = s.captureAndReplicate(ctx, top)
+		}
 		if captureErr != nil {
 			if err := s.durableBoundary(top, "committing this deployment", captureErr); err != nil {
 				return ApplyResponse{}, err
@@ -265,6 +277,9 @@ func (s *Server) commitAppliedTopology(ctx context.Context, top *model.Topology,
 		} else {
 			resp.Snapshots = n
 		}
+		captureElapsed := time.Since(captureStart)
+		addCaptureTiming(&resp, captureElapsed)
+		s.metricRegistry().observePhase("capture", captureElapsed, metricResult(captureErr))
 	}
 	if tx.Prune {
 		if err := s.transactionFail("prune"); err != nil {
@@ -435,7 +450,7 @@ func (s *Server) rollbackPreparedApply(ctx context.Context, lab string, fence Fe
 	rollback.Prune = false
 	eng := s.transactionEngine(oldTop, rollback)
 	eng.RecoveryCompatibility = true
-	p, err := eng.Build(oldTop)
+	p, err := eng.BuildContext(ctx, oldTop)
 	if err != nil {
 		return fmt.Errorf("build rollback plan: %w", err)
 	}

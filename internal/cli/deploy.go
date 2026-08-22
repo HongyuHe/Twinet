@@ -296,7 +296,13 @@ after a partial failure, a reboot, or a topology edit.`,
 				p = p.Restrict(func(st *plan.Step) bool { return want[st.Scope] })
 			}
 			if p.Len() == 0 {
-				return fmt.Errorf("nothing is placed on node %q; check placement.nodes", node)
+				if len(scope) > 0 {
+					return fmt.Errorf("nothing is placed on node %q; check placement.nodes", node)
+				}
+				if !quiet {
+					fmt.Fprintln(cmd.OutOrStdout(), "no changes; lab is already converged")
+				}
+				return nil
 			}
 
 			obs := newProgress(cmd.OutOrStdout(), p.Len(), quiet)
