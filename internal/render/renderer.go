@@ -62,6 +62,14 @@ func (r *Renderer) modeFor(d *model.Device) Mode {
 	return r.Mode
 }
 
+// AuthoritativeDevice reports whether Twinet owns every configured fact for
+// one device. Deploy uses this optional renderer capability while wiring so a
+// solved harness restores reference addresses on surrounding hosts without
+// overwriting the ungraded submission AS.
+func (r *Renderer) AuthoritativeDevice(d *model.Device) bool {
+	return r.modeFor(d) == ModeSolve
+}
+
 func New(top *model.Topology, mode Mode) *Renderer {
 	if mode == "" {
 		mode = ModePlatform

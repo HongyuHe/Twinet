@@ -135,6 +135,15 @@ type transactionContainer struct {
 	State      string `json:"state"`
 }
 
+// transactionSnapshot is the immutable state evidence captured before a
+// destructive transaction. Recovery must find the exact digest again; merely
+// finding any newer-looking snapshot is stale-state substitution.
+type transactionSnapshot struct {
+	Device string `json:"device"`
+	Kind   string `json:"kind"`
+	Digest string `json:"digest"`
+}
+
 // transactionInventory is both rollback evidence and the post-recovery
 // verifier. Overlay VNIs cover legacy and multiplex objects uniformly.
 type transactionInventory struct {
@@ -144,6 +153,7 @@ type transactionInventory struct {
 	VNIs         []uint32                 `json:"vnis,omitempty"`
 	CapturedAt   time.Time                `json:"captured_at"`
 	StateSafe    bool                     `json:"state_safe"`
+	Snapshots    []transactionSnapshot    `json:"snapshots,omitempty"`
 	RuntimeSpecs []transactionRuntimeSpec `json:"runtime_specs,omitempty"`
 	OverlayState []netx.MultiplexOverlay  `json:"overlay_state,omitempty"`
 }
@@ -1262,6 +1272,25 @@ func (s *Server) finishRecoveredGeneration(lab string, fence Fence, generation s
 	s.generations[lab] = state
 	s.inventories[lab] = tx.Prestate
 	delete(s.transactions, lab)
+	// A completed semantic recovery supersedes every failed targeted repair
+	// observation from the interrupted generation. Leaving those entries
+	// behind makes status report a recovered lab as still retrying and can
+	// immediately rewire a device that the rollback just proved healthy.
+	for key := range s.repairFails {
+		if strings.HasPrefix(key, lab+"|") {
+			delete(s.repairFails, key)
+		}
+	}
+	for key := range s.repairNext {
+		if strings.HasPrefix(key, lab+"|") {
+			delete(s.repairNext, key)
+		}
+	}
+	for key := range s.partial {
+		if strings.HasPrefix(key, lab+"|") {
+			delete(s.partial, key)
+		}
+	}
 	if err := s.saveCoordinationLocked(); err != nil {
 		s.transactions[lab] = tx
 		return fmt.Errorf("persisting recovered generation: %w", err)

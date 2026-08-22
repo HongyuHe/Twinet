@@ -288,6 +288,8 @@ type Server struct {
 	lastCapture    map[string]time.Time
 	durabilityBusy map[string]bool
 	peerDial       peerDialer
+	peerHealthMu   sync.Mutex
+	peerHealth     map[string]PeerReplicationStatus
 }
 
 func (s *Server) workLimiter() *limiter.Limiter {
@@ -342,6 +344,7 @@ func New(cfg Config) (*Server, error) {
 		partial:        map[string]int{},
 		lastCapture:    map[string]time.Time{},
 		durabilityBusy: map[string]bool{},
+		peerHealth:     map[string]PeerReplicationStatus{},
 	}
 	if source, ok := interface{}(engine).(rt.EventSource); ok {
 		srv.eventSource = source
@@ -655,6 +658,9 @@ func (s *Server) Serve(ctx context.Context) error {
 			}
 			slog.Warn("AUDIT: using an expiring legacy listener certificate for peer replication",
 				"until", s.cfg.LegacyPeerCertUntil.Format(time.RFC3339))
+		} else if err := validatePeerTLSIdentity(s.cfg.Node, s.cfg.PeerTLSCert,
+			s.cfg.PeerTLSKey, s.cfg.ClientCA); err != nil {
+			return fmt.Errorf("validate replication-only peer credential: %w", err)
 		}
 		cfg := &tls.Config{MinVersion: tls.VersionTLS13}
 		pool := x509.NewCertPool()
@@ -805,6 +811,10 @@ type StatusResponse struct {
 	// Explicit false lets a controller treat a surviving runtime with a lost
 	// state disk as unavailable for durable placement.
 	StateStoreHealthy *bool `json:"state_store_healthy,omitempty"`
+	// PeerReplication exposes whether every recently contacted durability
+	// peer acknowledged state. Keys are stable "lab/peer" tuples so an
+	// operator can correlate failure-domain quorum loss without state data.
+	PeerReplication map[string]PeerReplicationStatus `json:"peer_replication,omitempty"`
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -876,6 +886,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 	resp.Generations = s.committedGenerations()
 	resp.Recoveries = s.recoveryStatuses(r.Context())
+	resp.PeerReplication = s.peerReplicationStatuses()
 
 	if owners, err := netx.OverlayOwners(); err == nil {
 		resp.Overlays = owners
@@ -898,6 +909,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		resp.Lab = ""
 		resp.Generations = nil
 		resp.Recoveries = nil
+		resp.PeerReplication = nil
 		// Aggregates carry no tenant identifiers and remain useful to a
 		// diagnostic caller, but a count of every active lab is not needed.
 		// Reservations name other labs, which is cluster business a
@@ -1070,14 +1082,19 @@ type ApplyResponse struct {
 	// plan held. They differ on a dry run, on an --only, and on a deploy that
 	// failed part way, which are exactly the runs whose summary must not read
 	// like a complete one.
-	Steps      int   `json:"steps"`
-	Planned    int   `json:"planned,omitempty"`
-	Devices    int   `json:"devices"`
-	Links      int   `json:"links"`
-	WantDevice int   `json:"want_devices,omitempty"`
-	WantLinks  int   `json:"want_links,omitempty"`
-	DryRun     bool  `json:"dry_run,omitempty"`
-	DurationMS int64 `json:"duration_ms"`
+	Steps   int `json:"steps"`
+	Planned int `json:"planned,omitempty"`
+	Devices int `json:"devices"`
+	Links   int `json:"links"`
+	// CrossLinkEndpoints counts completed/planned wire endpoints belonging to
+	// cross-node links. The controller derives logical links from this actual
+	// count; it must never subtract manifest cross-links from zero work.
+	CrossLinkEndpoints     int   `json:"cross_link_endpoints,omitempty"`
+	WantCrossLinkEndpoints int   `json:"want_cross_link_endpoints,omitempty"`
+	WantDevice             int   `json:"want_devices,omitempty"`
+	WantLinks              int   `json:"want_links,omitempty"`
+	DryRun                 bool  `json:"dry_run,omitempty"`
+	DurationMS             int64 `json:"duration_ms"`
 	// PhaseMS separates bounded observation/diff/capture work from executable
 	// plan time, so a no-change regression names its actual bottleneck.
 	PhaseMS   map[string]int64    `json:"phase_ms,omitempty"`
@@ -1238,6 +1255,8 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 	s.recordPlanMetrics(rep)
 	deploymentStats := eng.DeploymentStats(rep)
 	s.recordDeploymentStats(deploymentStats, rep)
+	crossDone := wireCrossEndpoints(rep.Results, top, false)
+	crossWant := plannedCrossEndpoints(p, top)
 	if err != nil {
 		if req.Phase == "apply" && !req.DryRun {
 			_ = s.markTransactionPhase(top.Name, req.Fence, req.Generation,
@@ -1263,13 +1282,16 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 			Node: s.cfg.Node, AgentVersion: Version, ControllerVersion: req.ControllerVersion,
 			ImageDigests: imageDigests,
 			Steps:        rep.Done(), Planned: p.Len(),
-			Devices:    rep.Completed(plan.StageCreate),
-			Links:      rep.Completed(plan.StageWire),
-			WantDevice: rep.Planned(plan.StageCreate),
-			WantLinks:  rep.Planned(plan.StageWire),
-			DurationMS: rep.Duration.Milliseconds(),
+			Devices:                rep.Completed(plan.StageCreate),
+			Links:                  rep.Completed(plan.StageWire),
+			CrossLinkEndpoints:     crossDone,
+			WantCrossLinkEndpoints: crossWant,
+			WantDevice:             rep.Planned(plan.StageCreate),
+			WantLinks:              rep.Planned(plan.StageWire),
+			DurationMS:             rep.Duration.Milliseconds(),
 		}
 		attachDeploymentStats(&resp, deploymentStats, rep)
+		recordStart := time.Now()
 		if err := s.recordGenerationDirtyCapture(top.Name, req.Fence, req.Generation, eng.DirtyCaptureDevices()); err != nil {
 			httpError(w, http.StatusConflict, err)
 			return
@@ -1287,6 +1309,7 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 			httpError(w, http.StatusConflict, err)
 			return
 		}
+		addPhaseTiming(&resp, "record", time.Since(recordStart))
 		s.recordEvent(top.Name, req.Generation, "deploy", s.requestCorrelation(r),
 			"apply", "success", fmt.Sprintf("steps=%d", resp.Steps))
 		writeJSON(w, resp)
@@ -1301,6 +1324,7 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 	// -- and an agent restart read the disk copy back, so the node came up
 	// believing an unsolved lab was the reference and stopped preserving
 	// anybody's work.
+	recordStart := time.Now()
 	authoritative := len(req.OnlySteps) == 0 && !rep.Failed()
 
 	s.mu.Lock()
@@ -1370,14 +1394,17 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		Node: s.cfg.Node, AgentVersion: Version, ControllerVersion: req.ControllerVersion,
 		ImageDigests: imageDigests,
 		Steps:        rep.Done(), Planned: p.Len(),
-		Devices:    rep.Completed(plan.StageCreate),
-		Links:      rep.Completed(plan.StageWire),
-		WantDevice: rep.Planned(plan.StageCreate),
-		WantLinks:  rep.Planned(plan.StageWire),
-		DryRun:     req.DryRun,
-		DurationMS: rep.Duration.Milliseconds(),
+		Devices:                rep.Completed(plan.StageCreate),
+		Links:                  rep.Completed(plan.StageWire),
+		CrossLinkEndpoints:     crossDone,
+		WantCrossLinkEndpoints: crossWant,
+		WantDevice:             rep.Planned(plan.StageCreate),
+		WantLinks:              rep.Planned(plan.StageWire),
+		DryRun:                 req.DryRun,
+		DurationMS:             rep.Duration.Milliseconds(),
 	}
 	attachDeploymentStats(&resp, deploymentStats, rep)
+	addPhaseTiming(&resp, "record", time.Since(recordStart))
 	if recordFailure != "" {
 		resp.Failures = map[string][]string{"state": {recordFailure}}
 	}
@@ -1564,7 +1591,8 @@ func (s *Server) captureBeforeDestroy(ctx context.Context, eng *deploy.Engine, l
 	{
 		s.mu.Lock()
 		top := s.current[lab]
-		solved := s.modes[lab] == string(render.ModeSolve)
+		mode := render.Mode(s.modes[lab])
+		ungraded := s.ungraded[lab]
 		s.mu.Unlock()
 		// Not while the reference solution is what is on the devices.
 		//
@@ -1573,7 +1601,12 @@ func (s *Server) captureBeforeDestroy(ctx context.Context, eng *deploy.Engine, l
 		// filed the answer as each student's saved configuration, to be
 		// replayed the next time anything recreated their container.
 		switch {
-		case solved:
+		case top == nil && mode == render.ModeSolve:
+			// Compatibility for an already-solved legacy harness whose
+			// topology record was deliberately absent: no device-specific
+			// ungraded exception can be inferred, so never file the reference
+			// answer as student state.
+		case top != nil && !hasCapturableStudentDevice(top, mode, ungraded, s.cfg.Node):
 			// Nothing of anybody's to save: the reference answer is what is on
 			// the devices.
 		case top == nil:

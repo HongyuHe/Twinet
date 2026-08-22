@@ -194,6 +194,22 @@ type Renderer interface {
 	Ready(d *model.Device, rt runtime.Runtime) *plan.Waiter
 }
 
+// deviceAuthorityRenderer is an optional extension implemented by renderers
+// that can distinguish a solved grading harness from its one ungraded AS.
+// Engine.Authoritative is lab-wide for backwards compatibility, but using it
+// for every endpoint would put reference addresses back on the submission AS
+// during a targeted repair.
+type deviceAuthorityRenderer interface {
+	AuthoritativeDevice(*model.Device) bool
+}
+
+func (e *Engine) authoritativeDevice(d *model.Device) bool {
+	if renderer, ok := e.Renderer.(deviceAuthorityRenderer); ok {
+		return renderer.AuthoritativeDevice(d)
+	}
+	return e.Authoritative
+}
+
 // FileSpec is a file to place inside a container.
 type FileSpec struct {
 	Content []byte
@@ -1567,7 +1583,7 @@ func (e *Engine) endpoint(top *model.Topology, i *model.Iface, nsPath string, l 
 		if i.Addr6 != "" {
 			ep.Addrs = append(ep.Addrs, i.Addr6)
 		}
-	} else if e.Authoritative {
+	} else if e.authoritativeDevice(i.Device) {
 		// Solve mode installs the reference answer, which includes the
 		// addresses a student would have chosen, so it owns them too.
 		ep.OwnAddrs = true
@@ -1718,7 +1734,7 @@ func (e *Engine) configurationCurrent(ctx context.Context, d *model.Device,
 	for _, path := range sortedKeys(files) {
 		// This path is controlled by the student once it has content. Do not
 		// turn a comparison into an excuse to load or overwrite it.
-		if studentOwnedPaths[path] && hasStudentConfig(d) && !e.Authoritative {
+		if studentOwnedPaths[path] && hasStudentConfig(d) && !e.authoritativeDevice(d) {
 			continue
 		}
 		if !e.fileContentMatches(ctx, d, path, files[path].Content) {
@@ -1768,7 +1784,7 @@ func (e *Engine) holdsStudentWork(ctx context.Context, d *model.Device, path str
 	// whatever is there. Preserving in that mode would make the golden answer
 	// silently not apply, which is worse than the loss this guard prevents:
 	// the grading oracle would be wrong and nothing would say so.
-	if e.Authoritative {
+	if e.authoritativeDevice(d) {
 		return false, nil
 	}
 	res, err := e.Runtime.Exec(ctx, d.Container, runtime.ExecCmd{
@@ -2013,7 +2029,18 @@ func (e *Engine) RewireDevice(ctx context.Context, top *model.Topology, d *model
 	}
 	// Interfaces are only half the device. The daemons were started against a
 	// namespace that no longer exists, so they are pointed at the new one.
+	//
+	// Rewire is an explicit repair boundary, not an ordinary no-change
+	// deploy. The observed configuration marker can still match after a host
+	// lost its address/default route, so configure() would incorrectly skip
+	// the idempotent `ip addr replace` and `ip route replace` commands. Apply
+	// the pre-rendered desired commands directly while retaining the
+	// student-owned-file protection in configureDesired.
 	return e.limited(ctx, []limiter.Kind{limiter.ExecProbe}, func() error {
-		return e.configure(ctx, d)
+		state, err := e.renderDesired(d)
+		if err != nil {
+			return err
+		}
+		return e.configureDesired(ctx, d, state)
 	})
 }

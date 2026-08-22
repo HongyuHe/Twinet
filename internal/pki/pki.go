@@ -356,6 +356,41 @@ func IssueNodePeer(pkiDir, outDir, node string, valid time.Duration) (Material, 
 	return m, nil
 }
 
+// RotateNodePeer replaces a node's replication-only leaf while retaining a
+// non-secret serial audit record. Peer leaves share the cluster CA, so agents
+// already serving that CA accept the new leaf during a rolling restart; the
+// outgoing dialer reloads this path for every durability attempt.
+func RotateNodePeer(pkiDir, outDir, node string, valid time.Duration) (Material, Rotation, error) {
+	certPath := filepath.Join(outDir, node+"_peer_cert.pem")
+	previous, err := leafSerial(certPath)
+	if err != nil && !os.IsNotExist(err) {
+		return Material{}, Rotation{}, err
+	}
+	if os.IsNotExist(err) {
+		return Material{}, Rotation{}, fmt.Errorf("cannot rotate peer %s: existing certificate %s is absent", node, certPath)
+	}
+	m, err := IssueNodePeer(pkiDir, outDir, node, valid)
+	if err != nil {
+		return Material{}, Rotation{}, err
+	}
+	cert, err := readCertificate(m.CertPath)
+	if err != nil {
+		return Material{}, Rotation{}, err
+	}
+	rotation := Rotation{
+		Name: node, Role: authz.RolePeer, PreviousSerial: previous,
+		CurrentSerial: cert.SerialNumber.Text(16), RotatedAt: time.Now().UTC(), NotAfter: cert.NotAfter.UTC(),
+	}
+	raw, err := json.Marshal(rotation)
+	if err != nil {
+		return Material{}, Rotation{}, err
+	}
+	if err := os.WriteFile(filepath.Join(outDir, node+"_peer_rotation.json"), append(raw, '\n'), 0o600); err != nil {
+		return Material{}, Rotation{}, err
+	}
+	return m, rotation, nil
+}
+
 // Rotation records a credential replacement without retaining key material.
 // The serials are enough to correlate agent audit events during a rollout.
 type Rotation struct {

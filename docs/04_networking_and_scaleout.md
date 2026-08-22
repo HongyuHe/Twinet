@@ -69,7 +69,18 @@ The state policy distinguishes a local single-copy lab from a replicated
 cluster policy. Agents capture student-owned state, exchange content-addressed
 artifacts, persist acknowledgements, and require the configured evidence at
 destructive/migration boundaries. Peer state transfer uses a peer-scoped mTLS
-route rather than controller mutation credentials.
+route rather than controller mutation credentials. Each node has a
+replication-only peer client leaf separate from its listener certificate;
+peer retries use bounded backoff and node status reports failed or missing
+peer acknowledgements. Rolling replacement of a peer leaf signed by the
+cluster CA is supported without granting controller authority.
+
+Recovery does not treat a matching container/VNI inventory as success. Before
+commit it checks the exact rendered files plus host addresses/default routes,
+switch VLAN state, router NOS readiness, and service health for every touched
+device. A solved host regains its reference address and route; a teaching-mode
+student-owned interface remains deliberately blank unless a saved student
+snapshot requires it.
 
 This is a shipped implementation path. It does not justify an unconditional
 claim that every failure mode has passed live acceptance: the known recovery

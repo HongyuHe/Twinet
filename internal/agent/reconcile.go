@@ -631,7 +631,7 @@ func (s *Server) repairLab(ctx context.Context, top *model.Topology, broken []*m
 		// is a converged network, just not the answer. A repair runs
 		// unattended every few seconds, so this needed no unusual sequence of
 		// events to happen.
-		if !eng.WritesReference {
+		if renderModeForDevice(render.Mode(mode), ungraded, d) != render.ModeSolve {
 			if _, err := deploy.Restore(ctx, s.rt, d, top.Name, s.store); err != nil {
 				s.repairFailed(top.Name, d.ID, "configuration could not be put back after rewiring", err)
 				s.recordEvent(top.Name, "", "reconcile", "", "repair", "error",
@@ -990,6 +990,10 @@ func (s *Server) observeDevice(ctx context.Context, lab string, d *model.Device,
 		} else if strings.TrimSpace(r.Stdout) == "0" {
 			return deviceObservation{Health: healthBroken, State: c.State, SpecMatches: specMatches, Reason: "it has no bridge"}
 		}
+	}
+	if reason := s.semanticReason(ctx, lab, d); reason != "" {
+		return deviceObservation{Health: healthBroken, State: c.State, SpecMatches: specMatches,
+			Reason: "network semantics drifted: " + reason}
 	}
 	return deviceObservation{Health: healthHealthy, State: c.State, SpecMatches: specMatches}
 }

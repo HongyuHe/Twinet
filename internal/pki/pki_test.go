@@ -151,6 +151,31 @@ func TestRotateScopedCredentialRecordsSerialWithoutSecrets(t *testing.T) {
 	if _, err := Generate(dir, map[string][]string{"node-0": {"127.0.0.1"}}); err != nil {
 		t.Fatal(err)
 	}
+
+	{
+		dir := t.TempDir()
+		if _, err := Generate(dir, map[string][]string{"node-0": {"127.0.0.1"}}); err != nil {
+			t.Fatal(err)
+		}
+		before, err := leafSerial(filepath.Join(dir, "node-0_peer_cert.pem"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, rotation, err := RotateNodePeer(dir, dir, "node-0", time.Hour)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rotation.PreviousSerial != before || rotation.CurrentSerial == before || rotation.Role != authz.RolePeer {
+			t.Fatalf("peer rotation record = %#v", rotation)
+		}
+		raw, err := os.ReadFile(filepath.Join(dir, "node-0_peer_rotation.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(raw), "PRIVATE KEY") {
+			t.Fatal("peer rotation audit leaked key material")
+		}
+	}
 	out := t.TempDir()
 	first, err := IssueScoped(dir, out, "ta", authz.RoleOperator,
 		[]string{"lab-a"}, []string{authz.ActionDeploy}, time.Hour)

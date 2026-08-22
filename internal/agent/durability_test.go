@@ -210,6 +210,118 @@ func TestFreshExportRefusesStaleFallbackUnlessExplicitlyRequested(t *testing.T) 
 	}
 
 	{
+		attempts := 0
+		err, next := retryPeer(t.Context(), func() error {
+			attempts++
+			if attempts < 3 {
+				return errors.New("connection refused during rolling restart")
+			}
+			return nil
+		})
+		if err != nil || !next.IsZero() || attempts != 3 {
+			t.Fatalf("peer retry = err=%v next=%s attempts=%d, want success after 3",
+				err, next, attempts)
+		}
+	}
+
+	{
+		dir := t.TempDir()
+		bundle, err := pki.Generate(dir, map[string][]string{
+			"n0": {"n0", "127.0.0.1", "localhost"},
+			"n1": {"n1", "127.0.0.1", "localhost"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		caPEM, err := os.ReadFile(bundle.CA.CertPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(caPEM) {
+			t.Fatal("generated CA did not parse")
+		}
+		serverCert, err := tls.LoadX509KeyPair(bundle.Nodes["n1"].CertPath, bundle.Nodes["n1"].KeyPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		receiverStore, err := state.Open(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		receiver := &Server{
+			cfg:     Config{Node: "n1"},
+			store:   receiverStore,
+			holds:   map[string]*hold{},
+			exempt:  map[string]*exemptions{},
+			current: map[string]*model.Topology{},
+		}
+		mux := http.NewServeMux()
+		mux.HandleFunc("GET /v1/peer/state/inventory", receiver.peerAuth(receiver.handlePeerStateInventory))
+		mux.HandleFunc("POST /v1/peer/state", receiver.peerAuth(receiver.handlePeerStateImport))
+		peerServer := httptest.NewUnstartedServer(mux)
+		peerServer.TLS = &tls.Config{
+			MinVersion:   tls.VersionTLS13,
+			Certificates: []tls.Certificate{serverCert},
+			ClientCAs:    pool,
+			ClientAuth:   tls.RequireAndVerifyClientCert,
+		}
+		peerServer.StartTLS()
+		defer peerServer.Close()
+
+		top, device := durableTopology()
+		top.Lab.Placement.Nodes[1].Addr = peerServer.URL
+		sourceStore, err := state.Open(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := sourceStore.Put(state.Snapshot{
+			Lab: top.Name, Device: device.ID, Kind: state.KindFRR, Content: []byte("router bgp 1\n"),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := sourceStore.PutTopology(top.Name, []byte(`{"mode":"platform"}`)); err != nil {
+			t.Fatal(err)
+		}
+		source := &Server{
+			cfg: Config{
+				Node: "n0", TLSCert: bundle.Nodes["n0"].CertPath, TLSKey: bundle.Nodes["n0"].KeyPath,
+				ClientCA:    bundle.CA.CertPath,
+				PeerTLSCert: bundle.Peers["n0"].CertPath, PeerTLSKey: bundle.Peers["n0"].KeyPath,
+			},
+			store: sourceStore, current: map[string]*model.Topology{top.Name: top},
+			modes: map[string]string{}, ungraded: map[string]int{}, holds: map[string]*hold{},
+			lastCapture: map[string]time.Time{}, durabilityBusy: map[string]bool{},
+		}
+		if err := source.replicateDurableState(t.Context(), top); err != nil {
+			t.Fatalf("peer mTLS replication failed: %v", err)
+		}
+		if _, err := receiverStore.Current(top.Name, device.ID, state.KindFRR); err != nil {
+			t.Fatalf("peer did not receive verified state: %v", err)
+		}
+
+		// Same-CA leaf rotation is safe during a rolling restart: dialPeer reloads
+		// the dedicated client material on the next replication attempt while the
+		// still-running receiver validates both old and new leaves.
+		if _, err := pki.IssueNodePeer(dir, dir, "n0", time.Hour); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := sourceStore.Put(state.Snapshot{
+			Lab: top.Name, Device: device.ID, Kind: state.KindFRR,
+			Content: []byte("router bgp 1\n neighbor 192.0.2.2 remote-as 2\n"),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := source.replicateDurableState(t.Context(), top); err != nil {
+			t.Fatalf("replication after peer leaf rotation failed: %v", err)
+		}
+		health := source.peerReplicationStatuses()[peerHealthKey(top.Name, "n1")]
+		if !health.Healthy || health.ConsecutiveFailures != 0 {
+			t.Fatalf("peer health after verified rotation = %+v", health)
+		}
+	}
+
+	{
 		bundle, err := pki.Generate(t.TempDir(), map[string][]string{
 			"n0": {"127.0.0.1", "localhost"},
 		})

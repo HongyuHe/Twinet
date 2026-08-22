@@ -710,7 +710,15 @@ func (s *Server) recoverTransactionStrategy(ctx context.Context, lab string, fen
 		return s.transactionInventoryStatus(ctx, lab), err
 	}
 	if s.recoveryRollback == nil {
+		if err := s.restoreRecoveredTopology(lab, tx); err != nil {
+			_ = s.markTransactionPhase(lab, fence, tx.Generation, transactionRollbackFailed, err.Error())
+			return s.transactionInventoryStatus(ctx, lab), err
+		}
 		if err := s.verifyRecoveredStudentState(ctx, tx); err != nil {
+			_ = s.markTransactionPhase(lab, fence, tx.Generation, transactionRollbackFailed, err.Error())
+			return s.transactionInventoryStatus(ctx, lab), err
+		}
+		if err := s.replicateRecoveredDurability(ctx, tx); err != nil {
 			_ = s.markTransactionPhase(lab, fence, tx.Generation, transactionRollbackFailed, err.Error())
 			return s.transactionInventoryStatus(ctx, lab), err
 		}
@@ -719,6 +727,7 @@ func (s *Server) recoverTransactionStrategy(ctx context.Context, lab string, fen
 	if verifyErr == nil {
 		verifyErr = inventoryMatches(tx.Prestate, got)
 	}
+
 	if verifyErr != nil {
 		err := fmt.Errorf("rollback inventory verification failed: %v", verifyErr)
 		_ = s.markTransactionPhase(lab, fence, tx.Generation, transactionRollbackFailed, err.Error())
@@ -731,8 +740,69 @@ func (s *Server) recoverTransactionStrategy(ctx context.Context, lab string, fen
 	return s.transactionInventoryStatus(ctx, lab), nil
 }
 
+// restoreRecoveredTopology makes the old mode/ungarded policy authoritative
+// before semantic verification and peer replication. Exact-contract rollback
+// used to recreate containers but leave the agent believing the failed forward
+// mode was still current, so a solved host could be recaptured as reference
+// state or an ungraded submission could be skipped entirely.
+func (s *Server) restoreRecoveredTopology(lab string, tx applyTransaction) error {
+	if len(tx.Previous) == 0 {
+		return nil
+	}
+	var wire Wire
+	if err := json.Unmarshal(tx.Previous, &wire); err != nil {
+		return fmt.Errorf("read recovered topology: %w", err)
+	}
+	top, err := wire.Rehydrate()
+	if err != nil {
+		return fmt.Errorf("rehydrate recovered topology: %w", err)
+	}
+	if top.Name != lab {
+		return fmt.Errorf("recovered topology belongs to %q, not %q", top.Name, lab)
+	}
+	if s.store != nil {
+		if err := s.store.PutTopology(lab, tx.Previous); err != nil {
+			return fmt.Errorf("persist recovered topology: %w", err)
+		}
+	}
+	s.mu.Lock()
+	if s.current == nil {
+		s.current = map[string]*model.Topology{}
+	}
+	s.current[lab] = top
+	s.rememberHow(lab, wire.Mode, wire.Ungraded)
+	if s.peers == nil {
+		s.peers = map[string]map[string]string{}
+	}
+	s.peers[lab] = wire.PeerUnderlay
+	s.mu.Unlock()
+	return nil
+}
+
+// replicateRecoveredDurability makes recovery completion contingent on the
+// same peer quorum as a forward destructive boundary. A locally repaired
+// namespace is not a completed recovery if the sole durable copy still lives
+// on the recovering node.
+func (s *Server) replicateRecoveredDurability(ctx context.Context, tx applyTransaction) error {
+	if s.store == nil || len(tx.Previous) == 0 {
+		return nil
+	}
+	var wire Wire
+	if err := json.Unmarshal(tx.Previous, &wire); err != nil {
+		return fmt.Errorf("read recovered topology for durability replication: %w", err)
+	}
+	top, err := wire.Rehydrate()
+	if err != nil {
+		return fmt.Errorf("rehydrate recovered topology for durability replication: %w", err)
+	}
+	if _, err := s.captureAndReplicate(ctx, top); err != nil {
+		return fmt.Errorf("recovery peer quorum: %w", err)
+	}
+	return nil
+}
+
 func (s *Server) verifyRecoveredStudentState(ctx context.Context, tx applyTransaction) error {
-	if s.store == nil || s.rt == nil || len(tx.Previous) == 0 {
+	if s.rt == nil || len(tx.Previous) == 0 {
 		return nil
 	}
 
@@ -740,29 +810,54 @@ func (s *Server) verifyRecoveredStudentState(ctx context.Context, tx applyTransa
 	if err := json.Unmarshal(tx.Previous, &wire); err != nil {
 		return fmt.Errorf("read pre-state topology for restore verification: %w", err)
 	}
-	if wire.Mode == string(render.ModeSolve) {
-		// A solved reference/harness intentionally does not replay stored
-		// student snapshots over the reference answer.
-		return nil
-	}
 	top, err := wire.Rehydrate()
 	if err != nil {
 		return fmt.Errorf("rehydrate pre-state topology for restore verification: %w", err)
 	}
-	for _, device := range top.DevicesOnNode(s.cfg.Node) {
-		var expected []state.Snapshot
-		for _, kind := range state.AllKinds {
-			snapshot, err := s.store.Current(top.Name, device.ID, kind)
-			if err == nil {
-				expected = append(expected, snapshot)
-			}
+	expectedByDevice := map[string][]state.Snapshot{}
+	if len(tx.Prestate.Snapshots) > 0 {
+		if s.store == nil {
+			return errors.New("recovery snapshot manifest exists but the state store is unavailable")
 		}
-		if len(expected) == 0 {
+		for _, expected := range tx.Prestate.Snapshots {
+			snapshot, err := s.store.Current(top.Name, expected.Device, state.Kind(expected.Kind))
+			if err != nil {
+				return fmt.Errorf("recovery snapshot %s/%s is missing: %w", expected.Device, expected.Kind, err)
+			}
+			if snapshot.Digest != expected.Digest {
+				return fmt.Errorf("recovery snapshot %s/%s digest is %s, want captured %s",
+					expected.Device, expected.Kind, snapshot.Digest, expected.Digest)
+			}
+			expectedByDevice[expected.Device] = append(expectedByDevice[expected.Device], snapshot)
+		}
+	}
+	for _, device := range top.DevicesOnNode(s.cfg.Node) {
+		if renderModeForDevice(render.Mode(wire.Mode), wire.Ungraded, device) == render.ModeSolve {
+			// A solved reference device intentionally does not replay student
+			// snapshots. An ungraded AS in a private harness reaches the
+			// platform path above and is preserved normally.
 			continue
 		}
-		if _, err := verifyRestoredState(ctx, s.rt, device, top.Name, top.Hash, expected); err != nil {
-			return fmt.Errorf("verify restored student state for %s: %w", device.ID, err)
+		if s.store != nil {
+			expected := expectedByDevice[device.ID]
+			if len(tx.Prestate.Snapshots) == 0 {
+				for _, kind := range state.AllKinds {
+					snapshot, err := s.store.Current(top.Name, device.ID, kind)
+					if err == nil {
+						expected = append(expected, snapshot)
+					}
+				}
+			}
+			if len(expected) > 0 {
+				if _, err := verifyRestoredState(ctx, s.rt, device, top.Name, top.Hash, expected); err != nil {
+					return fmt.Errorf("verify restored student state for %s: %w", device.ID, err)
+				}
+			}
 		}
+	}
+	if err := s.verifyRecoveredSemantics(ctx, top, render.Mode(wire.Mode), wire.Ungraded,
+		tx.Prestate.RuntimeSpecs); err != nil {
+		return fmt.Errorf("verify recovered rendered/network semantics: %w", err)
 	}
 	return nil
 }
@@ -883,6 +978,13 @@ func (s *Server) rollbackExactContracts(ctx context.Context, lab string,
 	}
 	rollback := tx
 	rollback.Generation, rollback.Prune = tx.PreviousGen, false
+	// Exact artifacts were captured from the previous wire. Rewiring through
+	// the failed forward mode can leave a solved host without its reference
+	// address/default route (or install one on an ungraded submission AS)
+	// before the persisted commands are replayed.
+	rollback.Mode = oldWire.Mode
+	rollback.Ungraded = oldWire.Ungraded
+	rollback.PeerUnderlay = oldWire.PeerUnderlay
 	eng := s.transactionEngine(top, rollback)
 	expected := map[string]bool{}
 	for _, entry := range tx.Prestate.RuntimeSpecs {
@@ -968,7 +1070,7 @@ func (s *Server) rollbackExactContracts(ctx context.Context, lab string,
 				return fmt.Errorf("run rollback command for %s: %w", entry.DeviceID, err)
 			}
 		}
-		if oldWire.Mode != string(render.ModeSolve) {
+		if renderModeForDevice(render.Mode(oldWire.Mode), oldWire.Ungraded, device) != render.ModeSolve {
 			if _, err := deploy.Restore(ctx, s.rt, device, lab, s.store); err != nil {
 				return fmt.Errorf("restore student state for %s: %w", entry.DeviceID, err)
 			}

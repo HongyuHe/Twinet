@@ -66,12 +66,32 @@ type PeerStateInventoryResponse struct {
 	Artifacts []state.ArtifactMeta `json:"artifacts"`
 }
 
+// PeerReplicationStatus is a bounded, operator-visible replication health
+// record. It deliberately reports no state content: the actionable fact is
+// whether a failure-domain peer acknowledged the current digest quorum.
+type PeerReplicationStatus struct {
+	Lab                 string    `json:"lab"`
+	Peer                string    `json:"peer"`
+	Healthy             bool      `json:"healthy"`
+	ConsecutiveFailures int       `json:"consecutive_failures,omitempty"`
+	LastSuccess         time.Time `json:"last_success,omitempty"`
+	LastFailure         time.Time `json:"last_failure,omitempty"`
+	NextRetry           time.Time `json:"next_retry,omitempty"`
+	Error               string    `json:"error,omitempty"`
+}
+
 type peerStateClient interface {
 	Inventory(context.Context, string) (PeerStateInventoryResponse, error)
 	Import(context.Context, PeerStateRequest) (PeerStateResponse, error)
 }
 
 type peerDialer func(context.Context, model.NodeSpec) (peerStateClient, error)
+
+const (
+	peerRetryMin      = 100 * time.Millisecond
+	peerRetryMax      = 2 * time.Second
+	peerRetryAttempts = 5
+)
 
 type httpPeerStateClient struct {
 	base string
@@ -307,7 +327,8 @@ func (s *Server) captureDueState(ctx context.Context) {
 	s.mu.Unlock()
 	for _, lab := range labs {
 		top, policy, ok := s.durabilityTopology(lab)
-		if !ok || top == nil || s.modeOf(lab) == string(render.ModeSolve) {
+		mode, ungraded := s.modeAndUngraded(lab)
+		if !ok || top == nil || !hasCapturableStudentDevice(top, mode, ungraded, s.cfg.Node) {
 			continue
 		}
 		interval, err := time.ParseDuration(policy.CaptureInterval)
@@ -318,20 +339,27 @@ func (s *Server) captureDueState(ctx context.Context) {
 		s.durabilityMu.Lock()
 		last := s.lastCapture[lab]
 		s.durabilityMu.Unlock()
-		if !last.IsZero() && time.Since(last) < interval {
+		captureDue := last.IsZero() || time.Since(last) >= interval
+		retryDue := s.peerReplicationRetryDue(lab)
+		if !captureDue && !retryDue {
 			continue
 		}
 		if !s.beginDurability(lab) {
 			continue
 		}
-		go func(lab string, top *model.Topology, policy model.StatePolicy) {
+		go func(lab string, top *model.Topology, policy model.StatePolicy, captureDue bool) {
 			defer s.endDurability(lab)
-			_, err := s.captureAndReplicate(ctx, top)
+			var err error
+			if captureDue {
+				_, err = s.captureAndReplicate(ctx, top)
+			} else {
+				err = s.replicateDurableState(ctx, top)
+			}
 			if err != nil {
-				slog.Error("periodic durable capture failed", "lab", lab, "err", err,
+				slog.Error("periodic durable replication failed", "lab", lab, "err", err,
 					"fail_closed", policy.FailClosedEnabled())
 			}
-		}(lab, top, policy)
+		}(lab, top, policy, captureDue)
 	}
 }
 
@@ -349,6 +377,21 @@ func (s *Server) modeOf(lab string) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.modes[lab]
+}
+
+func (s *Server) modeAndUngraded(lab string) (render.Mode, int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return render.Mode(s.modes[lab]), s.ungraded[lab]
+}
+
+func hasCapturableStudentDevice(top *model.Topology, mode render.Mode, ungraded int, node string) bool {
+	for _, device := range top.DevicesOnNode(node) {
+		if capturesStudentState(top, mode, ungraded, device) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) beginDurability(lab string) bool {
@@ -393,24 +436,37 @@ func (s *Server) captureAndReplicateSelected(ctx context.Context, top *model.Top
 	if s.store == nil {
 		return 0, errors.New("this node has no state store")
 	}
-	if s.modeOf(top.Name) == string(render.ModeSolve) {
-		// A solved grading harness contains the reference answer, never a
-		// student's state. Topology records may still be replicated by commit.
-		return 0, s.replicateDurableState(ctx, top)
-	}
+	mode, ungraded := s.modeAndUngraded(top.Name)
 	eng := &deploy.Engine{
 		Runtime: s.rt, Node: s.cfg.Node, Limiter: s.workLimiter(), State: s.store,
 		Renderer: renderer(top, render.ModePlatform, 0),
 	}
-	var (
-		n   int
-		err error
-	)
-	if ids == nil {
-		n, err = eng.CaptureAll(ctx, top, s.store)
-	} else {
-		n, err = eng.CaptureDevices(ctx, top, s.store, ids)
+	eligible := map[string]bool{}
+	for _, device := range top.DevicesOnNode(s.cfg.Node) {
+		if capturesStudentState(top, mode, ungraded, device) {
+			eligible[device.ID] = true
+		}
 	}
+	if ids != nil {
+		asked := map[string]bool{}
+		for _, id := range ids {
+			if eligible[id] {
+				asked[id] = true
+			}
+		}
+		eligible = asked
+	}
+	if len(eligible) == 0 {
+		// A solved reference has no student-owned state, but its topology,
+		// mode, holds, and exemptions still need peer durability.
+		return 0, s.replicateDurableState(ctx, top)
+	}
+	selected := make([]string, 0, len(eligible))
+	for id := range eligible {
+		selected = append(selected, id)
+	}
+	sort.Strings(selected)
+	n, err := eng.CaptureDevices(ctx, top, s.store, selected)
 	if err != nil {
 		return n, fmt.Errorf("capture current student state: %w", err)
 	}
@@ -432,13 +488,45 @@ func (s *Server) ensureDurableState(ctx context.Context, top *model.Topology) er
 	if s.store == nil {
 		return errors.New("this node has no state store")
 	}
+
 	return s.replicateDurableState(ctx, top)
+}
+
+func (s *Server) durableSnapshotManifest(lab string, ids []string) ([]transactionSnapshot, error) {
+	if s.store == nil {
+		return nil, errors.New("this node has no state store")
+	}
+	allowed := map[string]bool{}
+	for _, id := range ids {
+		allowed[id] = true
+	}
+	snapshots, err := s.store.CurrentSnapshots(lab)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]transactionSnapshot, 0, len(snapshots))
+	for _, snapshot := range snapshots {
+		if len(allowed) > 0 && !allowed[snapshot.Device] {
+			continue
+		}
+		out = append(out, transactionSnapshot{
+			Device: snapshot.Device, Kind: string(snapshot.Kind), Digest: snapshot.Digest,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Device != out[j].Device {
+			return out[i].Device < out[j].Device
+		}
+		return out[i].Kind < out[j].Kind
+	})
+	return out, nil
 }
 
 func (s *Server) replicaTargets(top *model.Topology) ([]model.NodeSpec, error) {
 	if top == nil || top.Lab == nil {
 		return nil, errors.New("durability needs a topology with a lab policy")
 	}
+
 	policy := top.Lab.State
 	if policy.ReplicationFactor < 1 {
 		return nil, fmt.Errorf("invalid replication factor %d", policy.ReplicationFactor)
@@ -476,11 +564,157 @@ func (s *Server) replicaTargets(top *model.Topology) ([]model.NodeSpec, error) {
 		policy.ReplicationFactor, want, local.Domain(), len(out))
 }
 
+// ensurePeerQuorumReachable proves the replication transport before a
+// transaction creates or replaces anything. Commit still verifies per-object
+// digest acknowledgements, but a known-broken peer TLS quorum must not allow a
+// destructive plan to begin and then discover the problem after containers
+// were removed.
+func (s *Server) ensurePeerQuorumReachable(ctx context.Context, top *model.Topology) error {
+	targets, err := s.replicaTargets(top)
+	if err != nil {
+		return err
+	}
+	for _, target := range targets {
+		err, nextRetry := retryPeer(ctx, func() error {
+			peer, err := s.peerFor(ctx, target)
+			if err != nil {
+				return fmt.Errorf("dial durable peer %s: %w", target.Name, err)
+			}
+			if _, err := peer.Inventory(ctx, top.Name); err != nil {
+				return fmt.Errorf("probe durable peer %s: %w", target.Name, err)
+			}
+			return nil
+		})
+		if err != nil {
+			s.recordPeerReplication(top.Name, target.Name, err, nextRetry)
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Server) peerFor(ctx context.Context, node model.NodeSpec) (peerStateClient, error) {
 	if s.peerDial != nil {
 		return s.peerDial(ctx, node)
 	}
 	return s.dialPeer(ctx, node)
+}
+
+func peerHealthKey(lab, peer string) string { return lab + "/" + peer }
+
+func (s *Server) recordPeerReplication(lab, peer string, err error, nextRetry time.Time) {
+	s.peerHealthMu.Lock()
+	defer s.peerHealthMu.Unlock()
+	if s.peerHealth == nil {
+		s.peerHealth = map[string]PeerReplicationStatus{}
+	}
+	key := peerHealthKey(lab, peer)
+	status := s.peerHealth[key]
+	status.Lab, status.Peer = lab, peer
+	if err == nil {
+		status.Healthy = true
+		status.ConsecutiveFailures = 0
+		status.LastSuccess = time.Now().UTC()
+		status.Error = ""
+		status.NextRetry = time.Time{}
+	} else {
+		status.Healthy = false
+		status.ConsecutiveFailures++
+		status.LastFailure = time.Now().UTC()
+		status.NextRetry = nextRetry.UTC()
+		status.Error = err.Error()
+	}
+	s.peerHealth[key] = status
+}
+
+func (s *Server) peerReplicationStatuses() map[string]PeerReplicationStatus {
+	s.peerHealthMu.Lock()
+	out := make(map[string]PeerReplicationStatus, len(s.peerHealth))
+	for key, status := range s.peerHealth {
+		out[key] = status
+	}
+	s.peerHealthMu.Unlock()
+
+	// A missing acknowledgement is not health. Report required peers for
+	// every active lab explicitly rather than making an empty map look like a
+	// healthy quorum immediately after a restart.
+	s.mu.Lock()
+	tops := make([]*model.Topology, 0, len(s.current))
+	for _, top := range s.current {
+		tops = append(tops, top)
+	}
+	s.mu.Unlock()
+	for _, top := range tops {
+		targets, err := s.replicaTargets(top)
+		if err != nil {
+			key := peerHealthKey(top.Name, "<quorum>")
+			if _, exists := out[key]; !exists {
+				out[key] = PeerReplicationStatus{Lab: top.Name, Peer: "<quorum>", Error: err.Error()}
+			}
+			continue
+		}
+		for _, target := range targets {
+			key := peerHealthKey(top.Name, target.Name)
+			if _, exists := out[key]; !exists {
+				out[key] = PeerReplicationStatus{
+					Lab: top.Name, Peer: target.Name,
+					Error: "no peer replication acknowledgement recorded",
+				}
+			}
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func (s *Server) peerReplicationRetryDue(lab string) bool {
+	now := time.Now()
+	s.peerHealthMu.Lock()
+	defer s.peerHealthMu.Unlock()
+	for _, status := range s.peerHealth {
+		if status.Lab != lab || status.Healthy {
+			continue
+		}
+		if status.NextRetry.IsZero() || !now.Before(status.NextRetry) {
+			return true
+		}
+	}
+	return false
+}
+
+func retryPeer(ctx context.Context, fn func() error) (error, time.Time) {
+	delay := peerRetryMin
+	var last error
+	for attempt := 0; attempt < peerRetryAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err, time.Now().UTC()
+		}
+		if err := fn(); err == nil {
+			return nil, time.Time{}
+		} else {
+			last = err
+		}
+		if attempt+1 == peerRetryAttempts {
+			break
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err(), time.Now().UTC()
+		case <-timer.C:
+		}
+		delay *= 2
+		if delay > peerRetryMax {
+			delay = peerRetryMax
+		}
+	}
+	if last == nil {
+		last = errors.New("peer replication failed without an error")
+	}
+	return last, time.Now().Add(delay).UTC()
 }
 
 func (s *Server) dialPeer(_ context.Context, node model.NodeSpec) (peerStateClient, error) {
@@ -521,7 +755,14 @@ func (s *Server) dialPeer(_ context.Context, node model.NodeSpec) (peerStateClie
 			return nil, fmt.Errorf("peer CA %s has no certificate", s.cfg.ClientCA)
 		}
 		transport.TLSClientConfig = &tls.Config{
-			MinVersion: tls.VersionTLS13, Certificates: []tls.Certificate{cert}, RootCAs: pool,
+			MinVersion:   tls.VersionTLS13,
+			Certificates: []tls.Certificate{cert},
+			RootCAs:      pool,
+			// Bind peer replication to the manifest node identity rather than
+			// whichever underlay alias happened to be dialled. Generate always
+			// includes NodeSpec.Name in the listener SANs; a mismatch is a
+			// fail-closed rollout error, not a reason to disable verification.
+			ServerName: node.Name,
 		}
 		scheme = "https"
 	} else if !s.insecureLoopbackMode() {
@@ -548,6 +789,44 @@ func (s *Server) peerTLSPaths(now time.Time) (certPath, keyPath string, legacy b
 		return "", "", false, errors.New("legacy peer migration has no listener certificate")
 	}
 	return s.cfg.TLSCert, s.cfg.TLSKey, true, nil
+}
+
+func validatePeerTLSIdentity(node, certPath, keyPath, caPath string) error {
+	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+	if err != nil {
+		return fmt.Errorf("load peer TLS credential: %w", err)
+	}
+	if len(cert.Certificate) == 0 {
+		return errors.New("peer TLS credential has no leaf certificate")
+	}
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		return fmt.Errorf("parse peer TLS leaf: %w", err)
+	}
+	identity, err := authz.FromCertificate(leaf)
+	if err != nil {
+		return fmt.Errorf("peer TLS certificate identity: %w", err)
+	}
+	if identity.Role != authz.RolePeer || !identity.Allows("*", authz.ActionPeerState) {
+		return errors.New("peer TLS certificate is not limited to peer-state")
+	}
+	if leaf.Subject.CommonName != node {
+		return fmt.Errorf("peer TLS certificate belongs to node %q, not %q", leaf.Subject.CommonName, node)
+	}
+	pem, err := os.ReadFile(caPath)
+	if err != nil {
+		return fmt.Errorf("read peer CA: %w", err)
+	}
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(pem) {
+		return fmt.Errorf("peer CA %s contains no certificate", caPath)
+	}
+	if _, err := leaf.Verify(x509.VerifyOptions{
+		Roots: roots, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}); err != nil {
+		return fmt.Errorf("peer TLS certificate is not trusted for client authentication: %w", err)
+	}
+	return nil
 }
 
 func (s *Server) replicateDurableState(ctx context.Context, top *model.Topology) error {
@@ -586,13 +865,21 @@ func (s *Server) replicateDurableState(ctx context.Context, top *model.Topology)
 	}
 
 	for _, target := range targets {
-		peer, err := s.peerFor(ctx, target)
+		var inventory PeerStateInventoryResponse
+		err, nextRetry := retryPeer(ctx, func() error {
+			peer, err := s.peerFor(ctx, target)
+			if err != nil {
+				return fmt.Errorf("dial durable peer %s: %w", target.Name, err)
+			}
+			inventory, err = peer.Inventory(ctx, top.Name)
+			if err != nil {
+				return fmt.Errorf("read durable inventory from %s: %w", target.Name, err)
+			}
+			return nil
+		})
 		if err != nil {
-			return fmt.Errorf("dial durable peer %s: %w", target.Name, err)
-		}
-		inventory, err := peer.Inventory(ctx, top.Name)
-		if err != nil {
-			return fmt.Errorf("read durable inventory from %s: %w", target.Name, err)
+			s.recordPeerReplication(top.Name, target.Name, err, nextRetry)
+			return err
 		}
 		have := map[string]string{}
 		for _, meta := range inventory.Artifacts {
@@ -614,9 +901,21 @@ func (s *Server) replicateDurableState(ctx context.Context, top *model.Topology)
 		}
 		acked := have
 		if len(request.Snapshots) > 0 || len(request.Records) > 0 {
-			response, err := peer.Import(ctx, request)
+			var response PeerStateResponse
+			err, nextRetry = retryPeer(ctx, func() error {
+				peer, err := s.peerFor(ctx, target)
+				if err != nil {
+					return fmt.Errorf("dial durable peer %s: %w", target.Name, err)
+				}
+				response, err = peer.Import(ctx, request)
+				if err != nil {
+					return fmt.Errorf("replicate durable state to %s: %w", target.Name, err)
+				}
+				return nil
+			})
 			if err != nil {
-				return fmt.Errorf("replicate durable state to %s: %w", target.Name, err)
+				s.recordPeerReplication(top.Name, target.Name, err, nextRetry)
+				return err
 			}
 			for _, ack := range response.Acks {
 				acked[ack.Key] = ack.Digest
@@ -625,12 +924,15 @@ func (s *Server) replicateDurableState(ctx context.Context, top *model.Topology)
 		now := time.Now().UTC()
 		for key, digest := range expected {
 			if acked[key] != digest {
-				return fmt.Errorf("peer %s did not acknowledge durable %s digest %s", target.Name, key, digest)
+				err := fmt.Errorf("peer %s did not acknowledge durable %s digest %s", target.Name, key, digest)
+				s.recordPeerReplication(top.Name, target.Name, err, time.Now().Add(peerRetryMin))
+				return err
 			}
 			status.Acks[key] = appendAck(status.Acks[key], state.ReplicaAck{
 				Node: target.Name, FailureDomain: target.Domain(), Digest: digest, Acknowledged: now,
 			})
 		}
+		s.recordPeerReplication(top.Name, target.Name, nil, time.Time{})
 	}
 	if err := s.store.PutReplicaStatus(status); err != nil {
 		return fmt.Errorf("persist durable replica acknowledgements: %w", err)

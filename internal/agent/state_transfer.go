@@ -109,6 +109,12 @@ func (s *Server) handleStateExport(w http.ResponseWriter, r *http.Request) {
 
 	resp := StateExportResponse{Lab: lab}
 	for _, d := range devices {
+		if !s.exportsStudentState(lab, d) {
+			// Solve-mode reference devices are recreated from their persisted
+			// renderer contract, never from a stale student snapshot. The
+			// ungraded AS of a private harness remains exportable.
+			continue
+		}
 		found := false
 		for _, k := range state.AllKinds {
 			snap, err := s.store.Current(lab, d, k)
@@ -258,13 +264,11 @@ func (s *Server) captureBeforeExport(ctx context.Context, lab string, devices []
 	}
 	s.mu.Lock()
 	top := s.current[lab]
-	solved := s.modes[lab] == string(render.ModeSolve)
+	mode := render.Mode(s.modes[lab])
+	ungraded := s.ungraded[lab]
 	s.mu.Unlock()
 	if top == nil {
 		return fmt.Errorf("this node has no topology record for %q", lab)
-	}
-	if solved {
-		return fmt.Errorf("lab %q is currently solved, so a fresh export would capture the reference answer", lab)
 	}
 	want := map[string]bool{}
 	for _, d := range devices {
@@ -277,6 +281,9 @@ func (s *Server) captureBeforeExport(ctx context.Context, lab string, devices []
 		}
 		if d.Node != s.cfg.Node {
 			return fmt.Errorf("device %s is placed on %s, not source %s", id, d.Node, s.cfg.Node)
+		}
+		if renderModeForDevice(mode, ungraded, d) == render.ModeSolve {
+			continue
 		}
 		current, err := s.rt.Inspect(ctx, d.Container)
 		if err != nil {
@@ -299,4 +306,20 @@ func (s *Server) captureBeforeExport(ctx context.Context, lab string, devices []
 		return err
 	}
 	return nil
+}
+
+func (s *Server) exportsStudentState(lab, id string) bool {
+	s.mu.Lock()
+	top := s.current[lab]
+	mode := render.Mode(s.modes[lab])
+	ungraded := s.ungraded[lab]
+	s.mu.Unlock()
+	if top == nil {
+		return true
+	}
+	device, ok := top.Device(id)
+	if !ok {
+		return false
+	}
+	return renderModeForDevice(mode, ungraded, device) != render.ModeSolve
 }

@@ -18,6 +18,7 @@ func attachDeploymentStats(resp *ApplyResponse, stats deploy.DeploymentStats, re
 		"verify":  0,
 		"apply":   0,
 		"capture": 0,
+		"record":  0,
 	}
 	if report == nil {
 		return
@@ -37,10 +38,14 @@ func attachDeploymentStats(resp *ApplyResponse, stats deploy.DeploymentStats, re
 }
 
 func addCaptureTiming(resp *ApplyResponse, elapsed time.Duration) {
+	addPhaseTiming(resp, "capture", elapsed)
+}
+
+func addPhaseTiming(resp *ApplyResponse, phase string, elapsed time.Duration) {
 	if resp.PhaseMS == nil {
 		resp.PhaseMS = map[string]int64{}
 	}
-	resp.PhaseMS["capture"] += elapsed.Milliseconds()
+	resp.PhaseMS[phase] += elapsed.Milliseconds()
 }
 
 func (s *Server) recordDeploymentStats(stats deploy.DeploymentStats, report *plan.Report) {

@@ -677,6 +677,12 @@ func (c *Cluster) HealthCheck(ctx context.Context) error {
 		if result.Value.StateStoreHealthy != nil && !*result.Value.StateStoreHealthy {
 			problems = append(problems, fmt.Sprintf("%s: durable state store is unavailable", result.Node))
 		}
+		for _, peer := range result.Value.PeerReplication {
+			if !peer.Healthy {
+				problems = append(problems, fmt.Sprintf("%s: durability peer %s is unhealthy (%s)",
+					result.Node, peer.Peer, peer.Error))
+			}
+		}
 	}
 	if len(problems) == 0 {
 		if err := c.RuntimeCompatibility(ctx); err != nil {

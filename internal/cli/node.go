@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -100,7 +101,7 @@ func newNodeCmd(opts *Options) *cobra.Command {
 			// those is something the next command will refuse to do, and being
 			// told afterwards is not the same as being told.
 			w := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
-			fmt.Fprintln(w, "NODE\tSTATE\tSOURCE\tRUNTIME\tCONTRACTS\tSOCKET\tALLOCATABLE\tRESERVED\tLOAD\tPRESSURE\tIMAGES\tUNDERLAY\tCONTAINERS\tLAB")
+			fmt.Fprintln(w, "NODE\tSTATE\tSOURCE\tRUNTIME\tCONTRACTS\tSOCKET\tALLOCATABLE\tRESERVED\tLOAD\tPRESSURE\tIMAGES\tUNDERLAY\tPEER\tCONTAINERS\tLAB")
 			bad, degraded := 0, 0
 			for _, r := range results {
 				if r.Err != nil {
@@ -117,13 +118,13 @@ func newNodeCmd(opts *Options) *cobra.Command {
 				if why != "" {
 					lab = why
 				}
-				fmt.Fprintf(w, "%s\t%s\t%s\t%s %s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\n",
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s %s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\n",
 					r.Node, state, v.Version, v.Runtime, v.RuntimeVer, contractSummary(v.Compatibility),
 					dash(v.RuntimeSocket),
 					inventorySummary(v.Inventory.Allocatable), inventorySummary(v.Inventory.Reserved),
 					loadSummary(v.Inventory.Load), limiterPressureSummary(v.Backpressure),
 					imageCacheSummary(v.Inventory.ImageCache),
-					dash(v.UnderlayIP), v.Containers, lab)
+					dash(v.UnderlayIP), peerReplicationSummary(v.PeerReplication), v.Containers, lab)
 			}
 			if err := w.Flush(); err != nil {
 				return err
@@ -580,11 +581,18 @@ func deployCluster(ctx context.Context, top *model.Topology, tok string, req age
 		Write([]byte) (int, error)
 	}) error {
 	c := client.NewCluster(top.Lab, tok)
+	controllerPhases := map[string]time.Duration{}
+	measure := func(name string, fn func() error) error {
+		start := time.Now()
+		err := fn()
+		controllerPhases[name] += time.Since(start)
+		return err
+	}
 
 	// The runtime is part of the substrate contract. Check it before admission
 	// reads, VNI deconfliction, state migration, or any fenced request so a
 	// Docker agent cannot mutate a lab that explicitly requested Podman.
-	if err := c.RuntimeCompatibility(ctx); err != nil {
+	if err := measure("runtime_compatibility", func() error { return c.RuntimeCompatibility(ctx) }); err != nil {
 		return err
 	}
 
@@ -592,7 +600,9 @@ func deployCluster(ctx context.Context, top *model.Topology, tok string, req age
 	// writes by callers, and every node mutation. A capacity refusal after
 	// any of those has already changed the cluster it was meant to protect.
 	if req.StrictAdmission {
-		if err := c.Admit(ctx, top, true, req.Overcommit); err != nil {
+		if err := measure("admission", func() error {
+			return c.Admit(ctx, top, true, req.Overcommit)
+		}); err != nil {
 			return fmt.Errorf("strict admission refused deployment before mutation: %w", err)
 		}
 	}
@@ -600,13 +610,27 @@ func deployCluster(ctx context.Context, top *model.Topology, tok string, req age
 	// Move any overlay identifier another lab is already using, before the
 	// topology is sent anywhere. Doing it here means both ends of every link
 	// receive the same value without the nodes having to agree on anything.
-	if moved := deconflictOverlays(ctx, c, top); moved > 0 {
+	moved := 0
+	if err := measure("overlay_deconfliction", func() error {
+		moved = deconflictOverlays(ctx, c, top)
+		return nil
+	}); err != nil {
+		return err
+	}
+	if moved > 0 {
 		fmt.Fprintf(errOut, "  moved %d overlay identifier(s) that another lab was using\n", moved)
 	}
 
 	// Refuse to build a lab whose links cannot fit through the fabric.
-	if problems := c.CheckUnderlay(ctx, top); len(problems) > 0 {
-		for _, p := range problems {
+	var underlayProblems []string
+	if err := measure("underlay", func() error {
+		underlayProblems = c.CheckUnderlay(ctx, top)
+		return nil
+	}); err != nil {
+		return err
+	}
+	if len(underlayProblems) > 0 {
+		for _, p := range underlayProblems {
 			fmt.Fprintln(errOut, "  "+p)
 		}
 		return fmt.Errorf("the underlay cannot carry this lab; fix the above or lower link_defaults.mtu")
@@ -615,23 +639,33 @@ func deployCluster(ctx context.Context, top *model.Topology, tok string, req age
 	// Source builds may differ during a safe rolling upgrade. The independent
 	// protocol, renderer, and state contracts are what determine whether the
 	// nodes can render and persist one lab safely.
-	if err := checkVersionSkew(ctx, c); err != nil {
+	if err := measure("version_skew", func() error { return checkVersionSkew(ctx, c) }); err != nil {
 		return err
 	}
 
 	start := time.Now()
-	results, durable := c.ApplyDurable(ctx, top, req, durability)
+	var (
+		results []client.NodeResult[agent.ApplyResponse]
+		durable client.DurabilityReport
+	)
+	if err := measure("cluster_transaction", func() error {
+		results, durable = c.ApplyDurable(ctx, top, req, durability)
+		return nil
+	}); err != nil {
+		return err
+	}
 	if durable.Moved > 0 {
 		fmt.Fprintf(errOut, "  moved %d device(s) through fresh durable state transfer\n", durable.Moved)
 	}
 	for _, audit := range durable.Audit {
 		fmt.Fprintln(errOut, "  AUDIT: "+audit)
 	}
+	printControllerPhases(errOut, controllerPhases, durable.Phases)
 
 	w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(w, "NODE\tSTEPS\tDURATION\tSTATUS")
 	failed := 0
-	devices, links, wantDev, wantLink := 0, 0, 0, 0
+	devices, links, crossEndpoints, wantDev, wantLink, wantCrossEndpoints := 0, 0, 0, 0, 0, 0
 	reached := 0
 	for _, r := range results {
 		if r.Err != nil {
@@ -642,8 +676,10 @@ func deployCluster(ctx context.Context, top *model.Topology, tok string, req age
 		reached++
 		devices += r.Value.Devices
 		links += r.Value.Links
+		crossEndpoints += r.Value.CrossLinkEndpoints
 		wantDev += r.Value.WantDevice
 		wantLink += r.Value.WantLinks
+		wantCrossEndpoints += r.Value.WantCrossLinkEndpoints
 		status := "ok"
 		if len(r.Value.Failures) > 0 {
 			failed++
@@ -666,20 +702,17 @@ func deployCluster(ctx context.Context, top *model.Topology, tok string, req age
 		}
 	}
 
-	// Summed from what the nodes reported doing, not from the manifest. A
-	// cross-node link is wired from both ends, so the per-node totals count it
-	// twice. Subtracting the topology's cross-node count undoes that, but only
-	// for a run that covered the whole topology: with --only, or a node that
-	// did not answer, the endpoints summed here are a subset the manifest's
-	// figure says nothing about. Those cases report endpoints and say so
-	// rather than printing a link count they cannot support.
-	s := top.Stats()
+	// Summed from actual per-node wire results, not the manifest. A cross-node
+	// link reports two completed endpoints, so only the reported cross-endpoint
+	// count is divided by two. This keeps a zero-work deploy at zero rather
+	// than subtracting every cross-node link in the topology.
 	whole := failed == 0 && reached == len(c.Nodes) && len(req.OnlySteps) == 0
 	if req.DryRun {
 		if whole {
+			logicalWantLinks := logicalLinks(wantLink, wantCrossEndpoints)
 			fmt.Fprintf(out, "\ndry run: %d devices and %d links would be deployed "+
 				"across %d nodes; nothing was changed\n",
-				wantDev, wantLink-s.CrossNode, len(c.Nodes))
+				wantDev, logicalWantLinks, len(c.Nodes))
 		} else {
 			fmt.Fprintf(out, "\ndry run: %d devices and %d link endpoints would be "+
 				"deployed across the %d node(s) that answered; nothing was changed\n",
@@ -691,8 +724,9 @@ func deployCluster(ctx context.Context, top *model.Topology, tok string, req age
 		return nil
 	}
 	if whole {
+		completedLinks := logicalLinks(links, crossEndpoints)
 		fmt.Fprintf(out, "\n%d devices, %d links (%d cross-node) across %d nodes in %s\n",
-			devices, links-s.CrossNode, s.CrossNode, len(c.Nodes),
+			devices, completedLinks, crossEndpoints/2, len(c.Nodes),
 			time.Since(start).Round(time.Millisecond))
 	} else {
 		fmt.Fprintf(out, "\n%d of %d devices and %d of %d link endpoints deployed "+
@@ -705,6 +739,42 @@ func deployCluster(ctx context.Context, top *model.Topology, tok string, req age
 		return fmt.Errorf("%d node(s) reported problems; re-run deploy to converge", failed)
 	}
 	return nil
+}
+
+func logicalLinks(endpoints, crossEndpoints int) int {
+	if endpoints <= 0 {
+		return 0
+	}
+	if crossEndpoints < 0 {
+		crossEndpoints = 0
+	}
+	if crossEndpoints > endpoints {
+		crossEndpoints = endpoints
+	}
+	return endpoints - crossEndpoints/2
+}
+
+func printControllerPhases(out interface{ Write([]byte) (int, error) }, outer map[string]time.Duration, inner client.PhaseTimings) {
+	all := map[string]time.Duration{}
+	for name, elapsed := range outer {
+		all[name] += elapsed
+	}
+	for name, elapsed := range inner {
+		all[name] += elapsed
+	}
+	if len(all) == 0 {
+		return
+	}
+	names := make([]string, 0, len(all))
+	for name := range all {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	fmt.Fprint(out, "  controller phases:")
+	for _, name := range names {
+		fmt.Fprintf(out, " %s=%s", name, all[name].Round(time.Millisecond))
+	}
+	fmt.Fprintln(out)
 }
 
 // restoreScopes is the set of deployment scopes a restore must cover: the
@@ -742,7 +812,34 @@ func nodeState(v agent.StatusResponse, controller contract.Set) (state, why stri
 	if len(v.Busy) > 0 {
 		return "busy", "operation in flight: " + strings.Join(v.Busy, ", ")
 	}
+	if v.StateStoreHealthy != nil && !*v.StateStoreHealthy {
+		return "state-unhealthy", "durable state store is unavailable"
+	}
+	for _, peer := range v.PeerReplication {
+		if !peer.Healthy {
+			return "peer-unhealthy", fmt.Sprintf("durability peer %s is not acknowledged: %s",
+				peer.Peer, peer.Error)
+		}
+	}
 	return "ok", ""
+}
+
+func peerReplicationSummary(values map[string]agent.PeerReplicationStatus) string {
+	if len(values) == 0 {
+		return "-"
+	}
+	healthy, failed := 0, 0
+	for _, status := range values {
+		if status.Healthy {
+			healthy++
+		} else {
+			failed++
+		}
+	}
+	if failed > 0 {
+		return fmt.Sprintf("%d ok/%d failed", healthy, failed)
+	}
+	return fmt.Sprintf("%d ok", healthy)
 }
 
 func contractSummary(value contract.Set) string {

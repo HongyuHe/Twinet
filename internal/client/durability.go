@@ -27,8 +27,9 @@ type DurabilityOptions struct {
 // controller. Audit entries are deliberately conspicuous: a request to accept
 // possible data loss must not be indistinguishable from a healthy migration.
 type DurabilityReport struct {
-	Moved int
-	Audit []string
+	Moved  int
+	Audit  []string
+	Phases PhaseTimings
 }
 
 type migrationPlan struct {
@@ -44,40 +45,67 @@ func (c *Cluster) ApplyDurable(ctx context.Context, top *model.Topology,
 	req agent.ApplyRequest, options DurabilityOptions,
 ) ([]NodeResult[agent.ApplyResponse], DurabilityReport) {
 	nodes := c.sortedNodes()
+	report := DurabilityReport{Phases: PhaseTimings{}}
 	if top == nil || top.Lab == nil {
-		return transactionFailure(nodes, nil, errors.New("durable apply needs a topology with a lab")), DurabilityReport{}
+		return transactionFailure(nodes, nil, errors.New("durable apply needs a topology with a lab")), report
 	}
 	top.Lab.Normalize()
 	if req.ControllerVersion == "" {
 		req.ControllerVersion = c.RequireVersion
 	}
-	if err := c.RuntimeCompatibility(ctx); err != nil {
-		return transactionFailure(nodes, nil, err), DurabilityReport{}
+	if err := report.Phases.measure("runtime_compatibility", func() error { return c.RuntimeCompatibility(ctx) }); err != nil {
+		return transactionFailure(nodes, nil, err), report
 	}
-	if err := c.VersionSkew(ctx); err != nil {
-		return transactionFailure(nodes, nil, err), DurabilityReport{}
+	if err := report.Phases.measure("version_skew", func() error { return c.VersionSkew(ctx) }); err != nil {
+		return transactionFailure(nodes, nil, err), report
 	}
 	if req.StrictAdmission {
-		if err := c.Admit(ctx, top, true, req.Overcommit); err != nil {
-			return transactionFailure(nodes, nil, err), DurabilityReport{}
+		if err := report.Phases.measure("admission", func() error {
+			return c.Admit(ctx, top, true, req.Overcommit)
+		}); err != nil {
+			return transactionFailure(nodes, nil, err), report
 		}
 	}
-	c.stampImageIDs(ctx, top)
+	report.Phases.measure("image_resolution", func() error {
+		c.stampImageIDs(ctx, top)
+		return nil
+	})
 	if req.DryRun || len(nodes) == 0 {
-		return c.coordinatedApply(ctx, top, req), DurabilityReport{}
+		start := time.Now()
+		results := c.coordinatedApply(ctx, top, req)
+		report.Phases.add("transaction", time.Since(start))
+		return results, report
 	}
-	if _, err := c.Recover(ctx, top.Name); err != nil {
+	if err := report.Phases.measure("recovery_check", func() error {
+		_, err := c.Recover(ctx, top.Name)
+		return err
+	}); err != nil {
 		return transactionFailure(nodes, nil, fmt.Errorf(
-			"refusing deploy while prior transaction recovery is incomplete: %w", err)), DurabilityReport{}
+			"refusing deploy while prior transaction recovery is incomplete: %w", err)), report
 	}
 
-	lease, err := c.AcquireMutationLease(ctx, top.Name)
+	var lease *MutationLease
+	err := report.Phases.measure("lease_acquire", func() error {
+		var acquireErr error
+		lease, acquireErr = c.AcquireMutationLease(ctx, top.Name)
+		return acquireErr
+	})
 	if err != nil {
-		return transactionFailure(nodes, nil, err), DurabilityReport{}
+		return transactionFailure(nodes, nil, err), report
 	}
-	defer lease.Release()
-	plan, err := c.prepareMigration(lease.Context(), top, lease, options)
+	defer func() {
+		start := time.Now()
+		lease.Release()
+		report.Phases.add("lease_release", time.Since(start))
+	}()
+	var plan migrationPlan
+	err = report.Phases.measure("state_migration", func() error {
+		var migrationErr error
+		plan, migrationErr = c.prepareMigration(lease.Context(), top, lease, options)
+		return migrationErr
+	})
 	if err != nil {
+		plan.report.Phases = report.Phases
 		return transactionFailure(nodes, nil, err), plan.report
 	}
 	if plan.report.Moved > 0 {
@@ -91,10 +119,13 @@ func (c *Cluster) ApplyDurable(ctx context.Context, top *model.Topology,
 		// announcing the same prefixes, so movement itself implies prune.
 		req.Prune = true
 	}
-	results := c.coordinatedApplyWithLease(lease.Context(), top, req, lease, plan.proofs)
+	start := time.Now()
+	results := c.coordinatedApplyWithLeaseTimed(lease.Context(), top, req, lease, plan.proofs, report.Phases)
+	report.Phases.add("transaction", time.Since(start))
 	for _, audit := range plan.report.Audit {
 		slog.Error("AUDIT: durable migration exception", "lab", top.Name, "detail", audit)
 	}
+	plan.report.Phases = report.Phases
 	return results, plan.report
 }
 

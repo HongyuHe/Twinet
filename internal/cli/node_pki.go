@@ -195,21 +195,25 @@ func newNodePeerCredentialCmd(opts *Options) *cobra.Command {
 			if _, err := os.Stat(certPath); err == nil && !rotate {
 				return fmt.Errorf("%s already exists; use --rotate after rolling out a replacement peer credential", certPath)
 			}
+			var (
+				m        pki.Material
+				rotation pki.Rotation
+			)
 			if rotate {
-				// Peer rotation has the same deliberate replacement semantics as
-				// operator credentials. Preserve the old serial in the command
-				// output without ever printing a key or bearer secret.
-				if _, err := os.Stat(certPath); err != nil {
-					return fmt.Errorf("cannot rotate peer %q: %w", node, err)
-				}
+				m, rotation, err = pki.RotateNodePeer(pkiDir, outDir, node, valid)
+			} else {
+				m, err = pki.IssueNodePeer(pkiDir, outDir, node, valid)
 			}
-			m, err := pki.IssueNodePeer(pkiDir, outDir, node, valid)
 			if err != nil {
 				return err
 			}
 			fmt.Fprintf(cmd.OutOrStdout(),
 				"issued peer-state-only identity for %q\n\n  certificate  %s\n  key          %s\n  CA           %s\n",
 				node, m.CertPath, m.KeyPath, m.CAPath)
+			if rotate {
+				fmt.Fprintf(cmd.OutOrStdout(), "  rotated serial %s -> %s (expires %s)\n",
+					rotation.PreviousSerial, rotation.CurrentSerial, rotation.NotAfter.Format(time.RFC3339))
+			}
 			return nil
 		},
 	}

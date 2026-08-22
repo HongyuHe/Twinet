@@ -436,11 +436,28 @@ func (c *Cluster) coordinatedApply(ctx context.Context, top *model.Topology,
 func (c *Cluster) coordinatedApplyWithLease(ctx context.Context, top *model.Topology,
 	req agent.ApplyRequest, lease *MutationLease, proofs map[string][]agent.StateProof,
 ) []NodeResult[agent.ApplyResponse] {
+	return c.coordinatedApplyWithLeaseTimed(ctx, top, req, lease, proofs, nil)
+}
+
+func (c *Cluster) coordinatedApplyWithLeaseTimed(ctx context.Context, top *model.Topology,
+	req agent.ApplyRequest, lease *MutationLease, proofs map[string][]agent.StateProof, phases PhaseTimings,
+) []NodeResult[agent.ApplyResponse] {
+	measure := func(name string, fn func() error) error {
+		if phases == nil {
+			return fn()
+		}
+		return phases.measure(name, fn)
+	}
 	nodes := c.sortedNodes()
 	if lease == nil {
 		return transactionFailure(nodes, nil, errors.New("a coordinated apply needs a mutation lease"))
 	}
-	expected, err := c.clusterGeneration(lease.Context(), top.Name)
+	var expected string
+	err := measure("generation_check", func() error {
+		var generationErr error
+		expected, generationErr = c.clusterGeneration(lease.Context(), top.Name)
+		return generationErr
+	})
 	if err != nil {
 		return transactionFailure(nodes, nil, err)
 	}
@@ -457,21 +474,27 @@ func (c *Cluster) coordinatedApplyWithLease(ctx context.Context, top *model.Topo
 			}
 		}
 	}
-	if err := c.reserveOverlays(lease.Context(), lease, top, req.Hold); err != nil {
+	if err := measure("overlay_reservation", func() error {
+		return c.reserveOverlays(lease.Context(), lease, top, req.Hold)
+	}); err != nil {
 		return transactionFailure(nodes, nil, err)
 	}
 
-	for _, node := range nodes {
-		prepare := applyRequestForNode(req, wire, peers, lease, node.Name,
-			"prepare", expected, generation)
-		if proofs != nil {
-			prepare.StateProofs = append([]agent.StateProof(nil), proofs[node.Name]...)
+	if err := measure("prepare", func() error {
+		for _, node := range nodes {
+			prepare := applyRequestForNode(req, wire, peers, lease, node.Name,
+				"prepare", expected, generation)
+			if proofs != nil {
+				prepare.StateProofs = append([]agent.StateProof(nil), proofs[node.Name]...)
+			}
+			if _, err := node.Apply(lease.Context(), prepare); err != nil {
+				return fmt.Errorf("prepare %s: %w", node.Name, err)
+			}
 		}
-		if _, err := node.Apply(lease.Context(), prepare); err != nil {
-			cause := c.recoverFailedApply(ctx, lease, top.Name,
-				fmt.Errorf("prepare %s: %w", node.Name, err))
-			return transactionFailure(nodes, nil, cause)
-		}
+		return nil
+	}); err != nil {
+		cause := c.recoverFailedApply(ctx, lease, top.Name, err)
+		return transactionFailure(nodes, nil, cause)
 	}
 
 	values := map[string]agent.ApplyResponse{}
@@ -480,25 +503,28 @@ func (c *Cluster) coordinatedApplyWithLease(ctx context.Context, top *model.Topo
 		mu       sync.Mutex
 		applyErr error
 	)
-	for _, node := range nodes {
-		wg.Add(1)
-		go func(node *Node) {
-			defer wg.Done()
-			apply := applyRequestForNode(req, wire, peers, lease, node.Name,
-				"apply", expected, generation)
-			resp, err := node.Apply(lease.Context(), apply)
-			if err == nil {
-				err = responseFailure(resp)
-			}
-			mu.Lock()
-			values[node.Name] = resp
-			if err != nil && applyErr == nil {
-				applyErr = fmt.Errorf("apply %s: %w", node.Name, err)
-			}
-			mu.Unlock()
-		}(node)
-	}
-	wg.Wait()
+	_ = measure("apply", func() error {
+		for _, node := range nodes {
+			wg.Add(1)
+			go func(node *Node) {
+				defer wg.Done()
+				apply := applyRequestForNode(req, wire, peers, lease, node.Name,
+					"apply", expected, generation)
+				resp, err := node.Apply(lease.Context(), apply)
+				if err == nil {
+					err = responseFailure(resp)
+				}
+				mu.Lock()
+				values[node.Name] = resp
+				if err != nil && applyErr == nil {
+					applyErr = fmt.Errorf("apply %s: %w", node.Name, err)
+				}
+				mu.Unlock()
+			}(node)
+		}
+		wg.Wait()
+		return nil
+	})
 	if applyErr == nil {
 		applyErr = lease.Err()
 	}
@@ -506,68 +532,88 @@ func (c *Cluster) coordinatedApplyWithLease(ctx context.Context, top *model.Topo
 		return transactionFailure(nodes, values,
 			c.recoverFailedApply(ctx, lease, top.Name, applyErr))
 	}
-	for _, node := range nodes {
-		if err := verifyAppliedImageDigests(top, node.Name, values[node.Name]); err != nil {
-			return transactionFailure(nodes, values, c.recoverFailedApply(ctx, lease, top.Name,
-				fmt.Errorf("verify post-pull images on %s: %w", node.Name, err)))
+	if err := measure("postpull_verify", func() error {
+		for _, node := range nodes {
+			if err := verifyAppliedImageDigests(top, node.Name, values[node.Name]); err != nil {
+				return fmt.Errorf("verify post-pull images on %s: %w", node.Name, err)
+			}
 		}
+		return nil
+	}); err != nil {
+		return transactionFailure(nodes, values, c.recoverFailedApply(ctx, lease, top.Name, err))
 	}
 
 	// Restore proof happens while the source placement is still running. A
 	// commit below is the first path that can prune it, and transactions with
 	// proofs refuse to commit until this endpoint persisted verification.
-	for _, node := range nodes {
-		if len(proofs[node.Name]) == 0 {
-			continue
+	if err := measure("state_restore_verify", func() error {
+		for _, node := range nodes {
+			if len(proofs[node.Name]) == 0 {
+				continue
+			}
+			fence, ok := lease.Fence(node.Name)
+			if !ok {
+				return fmt.Errorf("no mutation fence for node %s", node.Name)
+			}
+			if _, err := node.VerifyStateRestore(lease.Context(), agent.StateVerifyRequest{
+				Lab: top.Name, Fence: fence, Generation: generation,
+			}); err != nil {
+				return fmt.Errorf("verify restored state on %s: %w", node.Name, err)
+			}
 		}
-		fence, ok := lease.Fence(node.Name)
-		if !ok {
-			return transactionFailure(nodes, values, fmt.Errorf("no mutation fence for node %s", node.Name))
-		}
-		if _, err := node.VerifyStateRestore(lease.Context(), agent.StateVerifyRequest{
-			Lab: top.Name, Fence: fence, Generation: generation,
-		}); err != nil {
-			return transactionFailure(nodes, values, c.recoverFailedApply(ctx, lease, top.Name,
-				fmt.Errorf("verify restored state on %s: %w", node.Name, err)))
-		}
+		return nil
+	}); err != nil {
+		return transactionFailure(nodes, values, c.recoverFailedApply(ctx, lease, top.Name, err))
 	}
 
-	for _, node := range nodes {
-		commit := applyRequestForNode(req, wire, peers, lease, node.Name,
-			"commit", expected, generation)
-		commit.Topology = nil
-		resp, err := node.Apply(lease.Context(), commit)
-		if err == nil {
-			err = responseFailure(resp)
+	if err := measure("commit", func() error {
+		for _, node := range nodes {
+			commit := applyRequestForNode(req, wire, peers, lease, node.Name,
+				"commit", expected, generation)
+			commit.Topology = nil
+			resp, err := node.Apply(lease.Context(), commit)
+			if err == nil {
+				err = responseFailure(resp)
+			}
+			if err != nil {
+				return fmt.Errorf("commit %s: %w", node.Name, err)
+			}
+			if applied, ok := values[node.Name]; ok {
+				resp.AgentVersion, resp.ControllerVersion = applied.AgentVersion, applied.ControllerVersion
+				resp.ImageDigests = applied.ImageDigests
+				resp.Steps, resp.Planned = applied.Steps, applied.Planned
+				resp.Devices, resp.Links = applied.Devices, applied.Links
+				resp.CrossLinkEndpoints, resp.WantCrossLinkEndpoints =
+					applied.CrossLinkEndpoints, applied.WantCrossLinkEndpoints
+				resp.WantDevice, resp.WantLinks = applied.WantDevice, applied.WantLinks
+				resp.DurationMS = applied.DurationMS
+			}
+			values[node.Name] = resp
 		}
-		if err != nil {
-			return transactionFailure(nodes, values, c.recoverFailedApply(ctx, lease, top.Name,
-				fmt.Errorf("commit %s: %w", node.Name, err)))
-		}
-		if applied, ok := values[node.Name]; ok {
-			resp.AgentVersion, resp.ControllerVersion = applied.AgentVersion, applied.ControllerVersion
-			resp.ImageDigests = applied.ImageDigests
-			resp.Steps, resp.Planned = applied.Steps, applied.Planned
-			resp.Devices, resp.Links = applied.Devices, applied.Links
-			resp.WantDevice, resp.WantLinks = applied.WantDevice, applied.WantLinks
-			resp.DurationMS = applied.DurationMS
-		}
-		values[node.Name] = resp
+		return nil
+	}); err != nil {
+		return transactionFailure(nodes, values, c.recoverFailedApply(ctx, lease, top.Name, err))
 	}
-	for _, node := range nodes {
-		finalize := applyRequestForNode(req, wire, peers, lease, node.Name,
-			"finalize", expected, generation)
-		finalize.Topology = nil
-		if _, err := node.Apply(lease.Context(), finalize); err != nil {
-			// Every node acknowledged commit before finalization begins. Do
-			// not roll that complete generation back merely because cleanup
-			// failed; report the failure and leave the retained transaction
-			// fail-closed until it can be finalized or deliberately recovered.
-			return transactionFailure(nodes, values,
-				fmt.Errorf("finalize %s: %w", node.Name, err))
+
+	if err := measure("finalize", func() error {
+		for _, node := range nodes {
+			finalize := applyRequestForNode(req, wire, peers, lease, node.Name,
+				"finalize", expected, generation)
+			finalize.Topology = nil
+			if _, err := node.Apply(lease.Context(), finalize); err != nil {
+				return fmt.Errorf("finalize %s: %w", node.Name, err)
+			}
 		}
+		return nil
+	}); err != nil {
+		// Every node acknowledged commit before finalization begins. Do not
+		// roll that complete generation back merely because cleanup failed.
+		return transactionFailure(nodes, values, err)
 	}
-	if err := c.verifyCommittedRecovery(lease.Context(), top.Name, generation); err != nil {
+
+	if err := measure("recovery_verify", func() error {
+		return c.verifyCommittedRecovery(lease.Context(), top.Name, generation)
+	}); err != nil {
 		return transactionFailure(nodes, values, err)
 	}
 	if err := lease.Err(); err != nil {

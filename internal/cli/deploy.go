@@ -50,6 +50,7 @@ func newDeployCmd(opts *Options) *cobra.Command {
 is actually running and creates only what is missing, so it is safe to re-run
 after a partial failure, a reboot, or a topology edit.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			phases := deployPhaseTimings{}
 			// Rebalancing moves systems between machines, and pruning is what
 			// removes them from the machine they left. A scope switches
 			// pruning off, because a scoped deploy has not looked at the
@@ -64,12 +65,22 @@ after a partial failure, a reboot, or a topology edit.`,
 					"both places and announce its prefix from both. Rebalance the " +
 					"whole lab, or move nothing")
 			}
-			top, err := load(opts)
+			var top *model.Topology
+			err := phases.measure("topology", func() error {
+				var loadErr error
+				top, loadErr = load(opts)
+				return loadErr
+			})
 			if err != nil {
 				return err
 			}
 			warnSingleNodeDurability(cmd.ErrOrStderr(), top)
-			rec, err := place.LoadRecord(labPrivateDir(top), top.Name)
+			var rec *place.Record
+			err = phases.measure("placement_record", func() error {
+				var recordErr error
+				rec, recordErr = place.LoadRecord(labPrivateDir(top), top.Name)
+				return recordErr
+			})
 			if err != nil {
 				return err
 			}
@@ -78,7 +89,11 @@ after a partial failure, a reboot, or a topology edit.`,
 				// No record, but the lab may still be running -- deployed by
 				// an earlier version, or the record lost. What is running is
 				// the authority.
-				rec, err = adoptRunningPlacement(cmd.Context(), top, token)
+				err = phases.measure("placement_adoption", func() error {
+					var adoptErr error
+					rec, adoptErr = adoptRunningPlacement(cmd.Context(), top, token)
+					return adoptErr
+				})
 				if err != nil {
 					return err
 				}
@@ -96,7 +111,14 @@ after a partial failure, a reboot, or a topology edit.`,
 					return err
 				}
 				cluster := client.NewCluster(top.Lab, tok)
-				lost := unavailableClusterNodes(cluster.Status(cmd.Context()))
+				var lost []string
+				err = phases.measure("cluster_status", func() error {
+					lost = unavailableClusterNodes(cluster.Status(cmd.Context()))
+					return nil
+				})
+				if err != nil {
+					return err
+				}
 				if len(lost) > 0 {
 					if top.Lab.Placement.OnNodeLoss != "reschedule" {
 						return fmt.Errorf("cluster health check failed before placement; %s is unavailable and placement.on_node_loss is %q",
@@ -117,10 +139,14 @@ after a partial failure, a reboot, or a topology edit.`,
 						strings.Join(lost, ", "))
 					cluster = client.NewCluster(top.Lab, tok)
 				}
-				if err := cluster.HealthCheck(cmd.Context()); err != nil {
+				if err := phases.measure("cluster_health", func() error { return cluster.HealthCheck(cmd.Context()) }); err != nil {
 					return err
 				}
-				inventory, err = cluster.Inventories(cmd.Context())
+				err = phases.measure("inventory", func() error {
+					var inventoryErr error
+					inventory, inventoryErr = cluster.Inventories(cmd.Context())
+					return inventoryErr
+				})
 				if err != nil {
 					if !overcommit {
 						return fmt.Errorf("strict admission requires live inventory before placement: %w", err)
@@ -131,9 +157,14 @@ after a partial failure, a reboot, or a topology edit.`,
 					inventory = nil
 				}
 			}
-			a, err := place.Place(top, place.Options{
-				Fixed: rec, Rebalance: rebalance, Inventory: inventory,
-				Strict: clustered(top), Overcommit: overcommit,
+			var a *place.Assignment
+			err = phases.measure("placement", func() error {
+				var placementErr error
+				a, placementErr = place.Place(top, place.Options{
+					Fixed: rec, Rebalance: rebalance, Inventory: inventory,
+					Strict: clustered(top), Overcommit: overcommit,
+				})
+				return placementErr
 			})
 			if err != nil {
 				return err
@@ -147,7 +178,9 @@ after a partial failure, a reboot, or a topology edit.`,
 				if err != nil {
 					return err
 				}
-				if err := client.NewCluster(top.Lab, tok).Admit(cmd.Context(), top, true, overcommit); err != nil {
+				if err := phases.measure("admission_record", func() error {
+					return client.NewCluster(top.Lab, tok).Admit(cmd.Context(), top, true, overcommit)
+				}); err != nil {
 					return fmt.Errorf("strict admission refused deployment before placement record write: %w", err)
 				}
 			}
@@ -173,7 +206,9 @@ after a partial failure, a reboot, or a topology edit.`,
 					"AUDIT: --overcommit accepted placement for lab %q; requests may exceed live allocatable capacity\n",
 					top.Name)
 			}
-			if err := resolveImageIDs(cmd.Context(), top, token); err != nil {
+			if err := phases.measure("image_resolution", func() error {
+				return resolveImageIDs(cmd.Context(), top, token)
+			}); err != nil {
 				return err
 			}
 			record := a.Record(top.Name, strategyOf(top, rebalance, adopted))
@@ -201,28 +236,32 @@ after a partial failure, a reboot, or a topology edit.`,
 					}
 				}
 				moved := placementRecordMoved(rec, record)
-				deployErr := deployCluster(cmd.Context(), top, tok, agent.ApplyRequest{
-					Mode:            modeName(solve),
-					PullPolicy:      pull,
-					Workers:         workers,
-					DryRun:          dryRun,
-					StrictAdmission: true,
-					Overcommit:      overcommit,
-					// A deployment that moves an autonomous system to a
-					// different machine must remove it from the old one.
-					//
-					// Pruning was opt-in, and the engine's own comment says
-					// what that costs: the moved system runs on both nodes and
-					// announces the same prefix from two places, which is a
-					// fault nobody would think to look for because both halves
-					// look correct. A move is exactly when it matters, so a
-					// move now prunes whether it was asked for or not.
-					Prune:      (prune || rebalance || moved) && only == "",
-					Generation: time.Now().UTC().Format("20060102T150405"),
-					OnlySteps:  scope,
-				}, client.DurabilityOptions{
-					Previous: rec, AllowStaleState: allowStale, AllowDataLoss: allowLoss,
-				}, cmd.OutOrStdout(), cmd.ErrOrStderr())
+				var deployErr error
+				_ = phases.measure("deploy_transaction", func() error {
+					deployErr = deployCluster(cmd.Context(), top, tok, agent.ApplyRequest{
+						Mode:            modeName(solve),
+						PullPolicy:      pull,
+						Workers:         workers,
+						DryRun:          dryRun,
+						StrictAdmission: true,
+						Overcommit:      overcommit,
+						// A deployment that moves an autonomous system to a
+						// different machine must remove it from the old one.
+						//
+						// Pruning was opt-in, and the engine's own comment says
+						// what that costs: the moved system runs on both nodes and
+						// announces the same prefix from two places, which is a
+						// fault nobody would think to look for because both halves
+						// look correct. A move is exactly when it matters, so a
+						// move now prunes whether it was asked for or not.
+						Prune:      (prune || rebalance || moved) && only == "",
+						Generation: time.Now().UTC().Format("20060102T150405"),
+						OnlySteps:  scope,
+					}, client.DurabilityOptions{
+						Previous: rec, AllowStaleState: allowStale, AllowDataLoss: allowLoss,
+					}, cmd.OutOrStdout(), cmd.ErrOrStderr())
+					return deployErr
+				})
 				if deployErr != nil {
 					if !dryRun {
 						if discardErr := place.DiscardStagedRecord(labPrivateDir(top)); discardErr != nil {
@@ -236,6 +275,7 @@ after a partial failure, a reboot, or a topology edit.`,
 						return fmt.Errorf("deployment committed but placement record could not be committed: %w", err)
 					}
 				}
+				phases.print(cmd.ErrOrStderr())
 				return nil
 			}
 

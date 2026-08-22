@@ -73,6 +73,15 @@ func (s *Server) handleApplyPrepare(w http.ResponseWriter, r *http.Request, req 
 		slog.Error("AUDIT: applying clustered lab without a durable node state store because fail_closed=false",
 			"lab", top.Name, "node", s.cfg.Node, "err", durableStoreErr)
 	}
+	if err := s.ensurePeerQuorumReachable(r.Context(), top); err != nil {
+		if top.Lab.State.FailClosedEnabled() {
+			httpError(w, http.StatusServiceUnavailable,
+				fmt.Errorf("refusing destructive transaction before apply because durability peer quorum is unavailable: %w", err))
+			return
+		}
+		slog.Error("AUDIT: applying while durability peer quorum is unavailable because fail_closed=false",
+			"lab", top.Name, "node", s.cfg.Node, "err", err)
+	}
 	if why := s.refuseMutationIfHeld(top.Name, req.Hold, "this deployment"); why != "" {
 		httpError(w, http.StatusConflict, errors.New(why))
 		return
@@ -93,6 +102,33 @@ func (s *Server) handleApplyPrepare(w http.ResponseWriter, r *http.Request, req 
 	s.mu.Lock()
 	previous := s.current[top.Name]
 	s.mu.Unlock()
+	dirtyCapture := []string(nil)
+	if previous != nil {
+		mode := render.Mode(req.Mode)
+		if mode == "" {
+			mode = render.ModePlatform
+		}
+		observed := &deploy.Engine{
+			Runtime:                s.rt,
+			Node:                   s.cfg.Node,
+			Limiter:                s.workLimiter(),
+			Renderer:               renderer(top, mode, req.Ungraded),
+			WritesReference:        mode == render.ModeSolve,
+			Authoritative:          mode == render.ModeSolve && req.Ungraded == 0,
+			UnderlayIP:             s.cfg.UnderlayIP,
+			UnderlayDev:            s.cfg.UnderlayDev,
+			PeerUnderlay:           req.PeerUnderlay,
+			State:                  s.store,
+			Generation:             req.Generation,
+			RequireImmutableImages: top.Lab.Images.RequiresImmutableImages(),
+			RetainLegacyOverlays:   true,
+		}
+		if _, err := observed.BuildContext(r.Context(), top); err != nil {
+			httpError(w, http.StatusConflict, fmt.Errorf("observe prepared deployment: %w", err))
+			return
+		}
+		dirtyCapture = observed.DirtyCaptureDevices()
+	}
 	if previous != nil {
 		prestate.TopologyHash = previous.Hash
 	}
@@ -104,7 +140,13 @@ func (s *Server) handleApplyPrepare(w http.ResponseWriter, r *http.Request, req 
 				"refusing a destructive transaction without the previous topology and durable student state"))
 			return
 		}
-		if _, captureErr := s.captureAndReplicate(r.Context(), previous); captureErr != nil {
+		if len(dirtyCapture) == 0 {
+			// A no-change/delay-only request has no destructive container
+			// boundary. Periodic durability remains responsible for the full
+			// class snapshot; prepare records inventory but does not spend a
+			// minute recapturing every router.
+			prestate.StateSafe = true
+		} else if _, captureErr := s.captureAndReplicateDirty(r.Context(), previous, dirtyCapture); captureErr != nil {
 			if boundaryErr := s.durableBoundary(previous, "preparing a destructive transaction", captureErr); boundaryErr != nil {
 				httpError(w, http.StatusConflict, boundaryErr)
 				return
@@ -116,6 +158,14 @@ func (s *Server) handleApplyPrepare(w http.ResponseWriter, r *http.Request, req 
 		} else {
 			prestate.StateSafe = true
 		}
+	}
+	if previous != nil && prestate.StateSafe && len(dirtyCapture) > 0 {
+		snapshots, err := s.durableSnapshotManifest(previous.Name, dirtyCapture)
+		if err != nil {
+			httpError(w, http.StatusConflict, fmt.Errorf("record durable snapshot manifest: %w", err))
+			return
+		}
+		prestate.Snapshots = snapshots
 	}
 	if previous != nil {
 		s.mu.Lock()
@@ -137,6 +187,10 @@ func (s *Server) handleApplyPrepare(w http.ResponseWriter, r *http.Request, req 
 	if err := s.prepareGeneration(top.Name, req.Fence, req.ExpectedGeneration, req.Generation,
 		raw, req.Mode, req.Ungraded, req.PeerUnderlay, req.Prune, req.OnlySteps, req.StateProofs,
 		prestate); err != nil {
+		httpError(w, http.StatusConflict, err)
+		return
+	}
+	if err := s.recordGenerationDirtyCapture(top.Name, req.Fence, req.Generation, dirtyCapture); err != nil {
 		httpError(w, http.StatusConflict, err)
 		return
 	}
@@ -227,6 +281,7 @@ func (s *Server) handleApplyFinalize(w http.ResponseWriter, r *http.Request, req
 func (s *Server) commitAppliedTopology(ctx context.Context, top *model.Topology, wire *Wire,
 	fence Fence, tx applyTransaction,
 ) (ApplyResponse, error) {
+	recordStart := time.Now()
 	authoritative := len(tx.OnlySteps) == 0
 	wire.Generation = tx.Generation
 	wire.PeerUnderlay = tx.PeerUnderlay
@@ -265,6 +320,7 @@ func (s *Server) commitAppliedTopology(ctx context.Context, top *model.Topology,
 		Node: s.cfg.Node, AgentVersion: Version,
 		Generation: tx.Generation, Phase: "commit",
 	}
+	addPhaseTiming(&resp, "record", time.Since(recordStart))
 	eng := s.transactionEngine(top, tx)
 	// Capture and replicate before any prune. A commit that removes the old
 	// placement before its current state and topology record have a verified
@@ -292,6 +348,15 @@ func (s *Server) commitAppliedTopology(ctx context.Context, top *model.Topology,
 		captureElapsed := time.Since(captureStart)
 		addCaptureTiming(&resp, captureElapsed)
 		s.metricRegistry().observePhase("capture", captureElapsed, metricResult(captureErr))
+	}
+	// Semantic proof is deliberately before pruning. A matching OCI
+	// inventory is insufficient evidence that a recreated host has its
+	// reference address/default route or that a service loaded its rendered
+	// files; if this fails the old placement remains intact for rollback.
+	if touched := semanticTouchedDevices(tx); len(touched) > 0 {
+		if err := s.verifyCommittedSemantics(ctx, top, render.Mode(tx.Mode), tx.Ungraded, touched); err != nil {
+			return ApplyResponse{}, fmt.Errorf("commit semantic verification failed: %w", err)
+		}
 	}
 	if tx.Prune {
 		if err := s.transactionFail("prune"); err != nil {
