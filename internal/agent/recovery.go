@@ -842,7 +842,16 @@ func (s *Server) snapshotTransactionInventory(ctx context.Context, lab string) (
 		return transactionInventory{}, fmt.Errorf("list pre-transaction containers: %w", err)
 	}
 	out := transactionInventory{CapturedAt: s.nowTime()}
-	if s.recoveryOverlays != nil {
+	if s.recoveryOverlayInventory != nil {
+		overlays, err := s.recoveryOverlayInventory(lab)
+		if err != nil {
+			return transactionInventory{}, fmt.Errorf("inspect pre-transaction overlays: %w", err)
+		}
+		out.Schema = overlayInventorySchema
+		out.LogicalBindings = overlays.Bindings
+		out.PhysicalTrunks = overlays.Trunks
+		out.VNIs = bindingVNIs(overlays.Bindings)
+	} else if s.recoveryOverlays != nil {
 		vnis, err := s.recoveryOverlayList(lab)
 		if err != nil {
 			return transactionInventory{}, fmt.Errorf("list pre-transaction overlays: %w", err)
@@ -1273,6 +1282,15 @@ func (s *Server) transactionInventoryStatus(ctx context.Context, lab string) Rec
 	s.mu.Unlock()
 
 	status := RecoveryStatus{Lab: lab, Phase: "unknown"}
+	var migrationErr error
+	if hasCommitted && committed.Schema < overlayInventorySchema && s.canMigrateLegacyCommitted(lab) {
+		migrated, err := s.migrateLegacyCommittedInventory(ctx, lab, committed)
+		if err != nil {
+			migrationErr = err
+		} else {
+			committed = migrated
+		}
+	}
 	var want transactionInventory
 	switch {
 	case hasTx:
@@ -1341,6 +1359,10 @@ func (s *Server) transactionInventoryStatus(ctx context.Context, lab string) Rec
 	status.ObservedContainers, status.ObservedVNIs = len(got.Containers), len(got.VNIs)
 	status.ObservedLogicalBindings = len(got.LogicalBindings)
 	status.ObservedPhysicalTrunks = len(got.PhysicalTrunks)
+	if migrationErr != nil {
+		status.Error = "migrate legacy committed overlay inventory: " + migrationErr.Error()
+		return status
+	}
 	if err := inventoryMatches(want, got); err != nil {
 		if status.Error == "" {
 			status.Error = err.Error()
@@ -1352,6 +1374,132 @@ func (s *Server) transactionInventoryStatus(ctx context.Context, lab string) Rec
 	// controller cannot mistake "HTTP answered" for atomic completion.
 	status.Consistent = !hasTx || tx.Phase == transactionCommitted
 	return status
+}
+
+func (s *Server) canMigrateLegacyCommitted(lab string) bool {
+	s.mu.Lock()
+	haveCurrent := s.current[lab] != nil
+	store := s.store
+	s.mu.Unlock()
+	if haveCurrent {
+		return true
+	}
+	if store == nil {
+		return false
+	}
+	_, err := store.Topology(lab)
+	return err == nil
+}
+
+// migrateLegacyCommittedInventory upgrades a schema-v1 committed count record
+// only after reconstructing the topology's exact logical bindings and
+// verifying them against live netlink state. A legacy count is never treated
+// as proof that a shared trunk carries the right links.
+func (s *Server) migrateLegacyCommittedInventory(ctx context.Context, lab string,
+	committed transactionInventory,
+) (transactionInventory, error) {
+	top, peer, err := s.committedTopologyForInventory(lab)
+	if err != nil {
+		return transactionInventory{}, err
+	}
+	eng := &deploy.Engine{
+		Runtime: s.rt, Node: s.cfg.Node, Limiter: s.workLimiter(),
+		UnderlayIP: s.cfg.UnderlayIP, UnderlayDev: s.cfg.UnderlayDev,
+		PeerUnderlay: peer, Generation: committed.Generation,
+	}
+	expected, err := eng.ExpectedOverlayInventory(top)
+	if err != nil {
+		return transactionInventory{}, fmt.Errorf("derive expected bindings: %w", err)
+	}
+	got, err := s.snapshotTransactionInventory(ctx, lab)
+	if err != nil {
+		return transactionInventory{}, err
+	}
+	if got.Schema < overlayInventorySchema {
+		return transactionInventory{}, errors.New("live overlay inspection did not return schema-v2 bindings")
+	}
+	preserveLegacyTrunkPort(&expected, got)
+	upgraded := committed
+	upgraded.Schema = overlayInventorySchema
+	upgraded.LogicalBindings = expected.Bindings
+	upgraded.PhysicalTrunks = expected.Trunks
+	upgraded.VNIs = bindingVNIs(expected.Bindings)
+	if err := inventoryMatches(upgraded, got); err != nil {
+		return transactionInventory{}, err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initCoordination()
+	current, ok := s.inventories[lab]
+	if !ok || current.Schema >= overlayInventorySchema {
+		if ok {
+			return current, nil
+		}
+		return transactionInventory{}, fmt.Errorf("committed inventory for %q disappeared during migration", lab)
+	}
+	previousInventory := current
+	tx, hadTx := s.transactions[lab]
+	state := s.generations[lab]
+	previousState := state
+	s.inventories[lab] = upgraded
+	if hadTx && tx.Committed && tx.Generation == upgraded.Generation {
+		delete(s.transactions, lab)
+		if state.Prepared == tx.Generation {
+			state.Prepared = ""
+			s.generations[lab] = state
+		}
+	}
+	if err := s.saveCoordinationLocked(); err != nil {
+		s.inventories[lab] = previousInventory
+		if hadTx {
+			s.transactions[lab] = tx
+		}
+		s.generations[lab] = previousState
+		return transactionInventory{}, fmt.Errorf("persist schema-v2 committed inventory: %w", err)
+	}
+	return upgraded, nil
+}
+
+func (s *Server) committedTopologyForInventory(lab string) (*model.Topology, map[string]string, error) {
+	s.mu.Lock()
+	top := s.current[lab]
+	peer := map[string]string{}
+	for node, address := range s.peers[lab] {
+		peer[node] = address
+	}
+	s.mu.Unlock()
+	if top != nil {
+		if len(peer) == 0 && top.Lab != nil {
+			for _, node := range top.Lab.Placement.Nodes {
+				if node.UnderlayIP != "" {
+					peer[node.Name] = node.UnderlayIP
+				}
+			}
+		}
+		return top, peer, nil
+	}
+	if s.store == nil {
+		return nil, nil, fmt.Errorf("committed topology for %q is unavailable", lab)
+	}
+	raw, err := s.store.Topology(lab)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read committed topology for %q: %w", lab, err)
+	}
+	var wire Wire
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		return nil, nil, fmt.Errorf("decode committed topology for %q: %w", lab, err)
+	}
+	top, err = wire.Rehydrate()
+	if err != nil {
+		return nil, nil, fmt.Errorf("rehydrate committed topology for %q: %w", lab, err)
+	}
+	if len(peer) == 0 {
+		for node, address := range wire.PeerUnderlay {
+			peer[node] = address
+		}
+	}
+	return top, peer, nil
 }
 
 func (s *Server) recoveryStatuses(ctx context.Context) map[string]RecoveryStatus {

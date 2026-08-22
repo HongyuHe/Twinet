@@ -258,19 +258,20 @@ type Server struct {
 	overlayReverter func(uint32, string) error
 	// Transaction seams let focused tests force failures at destructive
 	// boundaries without touching a host runtime or netlink namespace.
-	transactionFailpoint  func(string) error
-	recoveryContainers    func(context.Context, string) ([]rt.Container, error)
-	recoveryOverlays      func(string) ([]uint32, error)
-	recoveryRollback      func(context.Context, string, Fence, applyTransaction) error
-	recoveryForward       func(context.Context, string, Fence, applyTransaction) error
-	recoveryRestore       func(context.Context, string, applyTransaction) error
-	recoveryVerify        func(context.Context, applyTransaction) error
-	recoveryReplicate     func(context.Context, applyTransaction) error
-	recoveryPhaseTimeout  time.Duration
-	recoveryTotalTimeout  time.Duration
-	recoveryLeaseTTL      time.Duration
-	recoveryStatusTimeout time.Duration
-	opSequence            uint64
+	transactionFailpoint     func(string) error
+	recoveryContainers       func(context.Context, string) ([]rt.Container, error)
+	recoveryOverlays         func(string) ([]uint32, error)
+	recoveryOverlayInventory func(string) (netx.OverlayInventory, error)
+	recoveryRollback         func(context.Context, string, Fence, applyTransaction) error
+	recoveryForward          func(context.Context, string, Fence, applyTransaction) error
+	recoveryRestore          func(context.Context, string, applyTransaction) error
+	recoveryVerify           func(context.Context, applyTransaction) error
+	recoveryReplicate        func(context.Context, applyTransaction) error
+	recoveryPhaseTimeout     time.Duration
+	recoveryTotalTimeout     time.Duration
+	recoveryLeaseTTL         time.Duration
+	recoveryStatusTimeout    time.Duration
+	opSequence               uint64
 
 	// holds are labs an external operation has asked this node to leave alone.
 	holds map[string]*hold
