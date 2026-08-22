@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strconv"
@@ -31,6 +32,9 @@ func semanticTouchedDevices(tx applyTransaction) []string {
 	for _, id := range tx.DirtyCapture {
 		seen[id] = true
 	}
+	for _, id := range tx.Semantic {
+		seen[id] = true
+	}
 	out := make([]string, 0, len(seen))
 	for id := range seen {
 		out = append(out, id)
@@ -52,6 +56,14 @@ func (s *Server) verifyRecoveredSemantics(ctx context.Context, top *model.Topolo
 		artifacts[spec.DeviceID] = append([]transactionArtifact(nil), spec.Artifacts...)
 		ids = append(ids, spec.DeviceID)
 	}
+	if len(ids) == 0 {
+		// Legacy transactions lack exact per-device contracts, but recovery
+		// may still not declare an inventory-only success. Render the whole
+		// recovered local topology and verify its observable semantics.
+		for _, device := range top.DevicesOnNode(s.cfg.Node) {
+			ids = append(ids, device.ID)
+		}
+	}
 	return s.verifyTopologySemantics(ctx, top, mode, ungraded, ids, artifacts)
 }
 
@@ -71,6 +83,9 @@ func (s *Server) verifyTopologySemantics(ctx context.Context, top *model.Topolog
 	r := renderer(top, mode, ungraded)
 	for _, device := range top.DevicesOnNode(s.cfg.Node) {
 		if !want[device.ID] {
+			continue
+		}
+		if s.isExempt(top.Name, device.ID) {
 			continue
 		}
 		expected := artifacts[device.ID]
@@ -170,6 +185,7 @@ func (s *Server) verifyNetworkSemantics(ctx context.Context, top *model.Topology
 	if err := s.verifyExpectedAddresses(ctx, device, mode); err != nil {
 		return err
 	}
+
 	if err := s.verifyExpectedDefaultRoute(ctx, top, device, mode); err != nil {
 		return err
 	}
@@ -179,6 +195,169 @@ func (s *Server) verifyNetworkSemantics(ctx context.Context, top *model.Topology
 		}
 	}
 	return nil
+}
+
+func (s *Server) semanticProbe(ctx context.Context, top *model.Topology,
+	mode render.Mode, ungraded int, device *model.Device,
+) error {
+	deviceMode := renderModeForDevice(mode, ungraded, device)
+	if err := s.verifyNetworkSemantics(ctx, top, device, deviceMode); err != nil {
+		return err
+	}
+	if device.Kind == model.KindRouter && deviceMode == render.ModeSolve &&
+		device.EffectiveNOS() == model.DefaultNOS {
+		if !s.labHasExemptions(top.Name) {
+			if err := s.verifyReferenceBGPSessions(ctx, device); err != nil {
+				return err
+			}
+			if err := s.verifyReferenceReachability(ctx, top, device); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+func (s *Server) labHasExemptions(lab string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ex := s.exempt[lab]
+	return ex != nil && len(ex.Devices) > 0
+}
+
+// verifyReferenceReachability checks one representative host address from
+// every other AS in a single namespace exec. BGP sessions alone can be
+// Established while a leaked/missing prefix leaves forwarding "Network
+// unreachable"; this catches the AS3-to-AS5/AS10 failure without issuing one
+// controller probe per destination.
+func (s *Server) verifyReferenceReachability(ctx context.Context, top *model.Topology, device *model.Device) error {
+	targets := referenceReachabilityTargets(top, device.ASN)
+	if len(targets) == 0 {
+		return nil
+	}
+	script := "failed=''; "
+	for _, target := range targets {
+		script += "ip route get " + target + " >/dev/null 2>&1 || failed=\"$failed " + target + "\"; "
+	}
+	script += `printf '%s\n' "$failed"`
+	result, err := s.probeExec(ctx, device.Container, rt.ExecCmd{Cmd: []string{"sh", "-c", script}})
+	if err != nil {
+		return fmt.Errorf("probe reference forwarding from %s: %w", device.ID, err)
+	}
+	if result.ExitCode != 0 {
+		return fmt.Errorf("probe reference forwarding from %s exited %d", device.ID, result.ExitCode)
+	}
+	if missing := strings.Fields(result.Stdout); len(missing) > 0 {
+		return fmt.Errorf("%s has no route to reference host address(es) %s",
+			device.ID, strings.Join(missing, ", "))
+	}
+	return nil
+}
+
+func referenceReachabilityTargets(top *model.Topology, sourceASN int) []string {
+	if top == nil {
+		return nil
+	}
+	var targets []string
+	for _, asn := range top.SortedASNs() {
+		if asn == sourceASN {
+			continue
+		}
+		as := top.ASes[asn]
+		if as == nil {
+			continue
+		}
+		found := ""
+		for _, device := range as.Devices {
+			if device.Kind != model.KindHost {
+				continue
+			}
+			for _, iface := range device.Ifaces {
+				if iface.Addr4 == "" {
+					continue
+				}
+				candidate := cidrAddress(iface.Addr4)
+				if candidate != "" && !strings.HasPrefix(candidate, "127.") {
+					found = candidate
+					break
+				}
+			}
+			if found != "" {
+				break
+			}
+		}
+		if found != "" {
+			targets = append(targets, found)
+		}
+	}
+	sort.Strings(targets)
+	return targets
+}
+
+func (s *Server) verifyReferenceBGPSessions(ctx context.Context, device *model.Device) error {
+	var peers []string
+	for _, iface := range device.Ifaces {
+		if iface.Peer == nil || iface.Peer.Device == nil || iface.Peer.Device.Kind != model.KindRouter ||
+			iface.Peer.Addr4 == "" {
+			continue
+		}
+		switch iface.Role {
+		case model.RoleInterAS, model.RoleIXPLink:
+			peers = append(peers, cidrAddress(iface.Peer.Addr4))
+		}
+	}
+	if len(peers) == 0 {
+		return nil
+	}
+	sort.Strings(peers)
+	result, err := s.probeExec(ctx, s.frrContainer(ctx, device), rt.ExecCmd{
+		Cmd: []string{"vtysh", "-c", "show bgp summary json"},
+	})
+	if err != nil {
+		return fmt.Errorf("read BGP sessions of %s: %w", device.ID, err)
+	}
+	if result.ExitCode != 0 {
+		return fmt.Errorf("read BGP sessions of %s exited %d", device.ID, result.ExitCode)
+	}
+	var decoded any
+	if err := json.Unmarshal([]byte(result.Stdout), &decoded); err != nil {
+		return fmt.Errorf("parse BGP summary of %s: %w", device.ID, err)
+	}
+	for _, peer := range peers {
+		state := bgpPeerState(decoded, peer)
+		if !strings.EqualFold(state, "Established") {
+			return fmt.Errorf("%s BGP session to %s is %q, want Established", device.ID, peer, state)
+		}
+	}
+	return nil
+}
+
+func bgpPeerState(value any, peer string) string {
+	switch current := value.(type) {
+	case map[string]any:
+		if child, ok := current[peer]; ok {
+			if fields, ok := child.(map[string]any); ok {
+				for _, key := range []string{"state", "bgpState", "connectionState"} {
+					if state, ok := fields[key].(string); ok {
+						return state
+					}
+				}
+			}
+		}
+		for _, child := range current {
+			if state := bgpPeerState(child, peer); state != "" {
+				return state
+			}
+		}
+	case []any:
+		for _, child := range current {
+			if state := bgpPeerState(child, peer); state != "" {
+				return state
+			}
+		}
+	}
+	return ""
 }
 
 func (s *Server) verifyExpectedAddresses(ctx context.Context, device *model.Device, mode render.Mode) error {
@@ -385,7 +564,7 @@ func (s *Server) semanticReason(ctx context.Context, lab string, device *model.D
 	if top == nil {
 		return ""
 	}
-	if err := s.verifyNetworkSemantics(ctx, top, device, renderModeForDevice(mode, ungraded, device)); err != nil {
+	if err := s.semanticProbe(ctx, top, mode, ungraded, device); err != nil {
 		return err.Error()
 	}
 	return ""

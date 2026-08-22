@@ -1305,6 +1305,12 @@ func (s *Server) forwardTransaction(ctx context.Context, lab string, fence Fence
 		eng.DirtyCreateDevices(), eng.DirtyOverlayVNIs(top), current.TouchedKnown); err != nil {
 		return s.transactionInventoryStatus(ctx, lab), fmt.Errorf("persist forward recovery touched set: %w", err)
 	}
+	if err := s.recordGenerationSemantic(lab, fence, tx.Generation, eng.DirtySemanticDevices()); err != nil {
+		return s.transactionInventoryStatus(ctx, lab), fmt.Errorf("persist forward recovery semantic set: %w", err)
+	}
+	s.mu.Lock()
+	current = s.transactions[lab]
+	s.mu.Unlock()
 	s.transactionFailpoints(p)
 	rep, err := p.Execute(ctx, plan.Options{
 		Workers: s.workLimiter().ClampWorkers(limiter.Apply, 0), ContinueOnError: true,

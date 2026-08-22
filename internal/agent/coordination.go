@@ -210,6 +210,8 @@ type applyTransaction struct {
 	StateProofs       []StateProof         `json:"state_proofs,omitempty"`
 	DirtyCapture      []string             `json:"dirty_capture,omitempty"`
 	DirtyCaptureKnown bool                 `json:"dirty_capture_known,omitempty"`
+	Semantic          []string             `json:"semantic_devices,omitempty"`
+	SemanticKnown     bool                 `json:"semantic_known,omitempty"`
 	Touched           []string             `json:"touched_objects,omitempty"`
 	TouchedVNIs       []uint32             `json:"touched_vnis,omitempty"`
 	TouchedKnown      bool                 `json:"touched_known,omitempty"`
@@ -1037,12 +1039,34 @@ func (s *Server) recordGenerationDirtyCapture(lab string, fence Fence, generatio
 	if err := s.fenceErrorLocked(lab, fence, s.nowTime()); err != nil {
 		return err
 	}
+
 	tx, ok := s.transactions[lab]
 	if !ok || tx.Generation != generation || tx.FenceGeneration != fence.Generation {
 		return fmt.Errorf("generation %q of lab %q was not prepared by this fence", generation, lab)
 	}
 	tx.DirtyCapture = append([]string(nil), ids...)
 	tx.DirtyCaptureKnown = true
+	s.transactions[lab] = tx
+	return s.saveCoordinationLocked()
+}
+
+// recordGenerationSemantic persists dynamic-state drift discovered by the
+// observed deployment pass. These devices must be semantically verified at
+// commit even when their OCI spec was reused and no student snapshot was
+// needed.
+func (s *Server) recordGenerationSemantic(lab string, fence Fence, generation string, ids []string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initCoordination()
+	if err := s.fenceErrorLocked(lab, fence, s.nowTime()); err != nil {
+		return err
+	}
+	tx, ok := s.transactions[lab]
+	if !ok || tx.Generation != generation || tx.FenceGeneration != fence.Generation {
+		return fmt.Errorf("generation %q of lab %q was not prepared by this fence", generation, lab)
+	}
+	tx.Semantic = append([]string(nil), ids...)
+	tx.SemanticKnown = true
 	s.transactions[lab] = tx
 	return s.saveCoordinationLocked()
 }

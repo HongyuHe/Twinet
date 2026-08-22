@@ -35,6 +35,9 @@ type BuildDiff struct {
 	Wire      map[string]bool
 	Configure map[string]bool
 	Ready     map[string]bool
+	// Semantic names devices whose cheap live fingerprint disagreed with the
+	// rendered topology despite matching OCI/config hashes.
+	Semantic map[string]bool
 
 	// Capture names student-owned devices whose container/configuration may
 	// have been destructively touched. A delay-only qdisc change never enters
@@ -45,7 +48,7 @@ type BuildDiff struct {
 // Empty reports whether the reconcile plan has no runtime mutations or
 // readiness verification to perform.
 func (d BuildDiff) Empty() bool {
-	return len(d.Create) == 0 && len(d.Wire) == 0 && len(d.Configure) == 0 && len(d.Ready) == 0
+	return len(d.Create) == 0 && len(d.Wire) == 0 && len(d.Configure) == 0 && len(d.Ready) == 0 && len(d.Semantic) == 0
 }
 
 // Counts returns deterministic dirty-set cardinalities for responses and
@@ -56,6 +59,7 @@ func (d BuildDiff) Counts() map[string]int {
 		"wire":      len(d.Wire),
 		"configure": len(d.Configure),
 		"ready":     len(d.Ready),
+		"semantic":  len(d.Semantic),
 		"capture":   len(d.Capture),
 	}
 }
@@ -313,6 +317,7 @@ func (e *Engine) observeNode(ctx context.Context, top *model.Topology, devices [
 		Wire:        map[string]bool{},
 		Configure:   map[string]bool{},
 		Ready:       map[string]bool{},
+		Semantic:    map[string]bool{},
 		Capture:     map[string]bool{},
 	}
 	wantDevices := make(map[string]bool, len(devices))
@@ -371,6 +376,22 @@ func (e *Engine) observeNode(ctx context.Context, top *model.Topology, devices [
 		if e.Renderer != nil && e.Renderer.Ready(d, e.Runtime) != nil &&
 			(specDirty || diff.Configure[d.ID] || !known || previous.ReadyHash != state.readyHash) {
 			diff.Ready[d.ID] = true
+		}
+		if e.SemanticProbe != nil && !specDirty {
+			if err := e.SemanticProbe(ctx, d); err != nil {
+				// The renderer commands are deliberately idempotent. Mark the
+				// device dirty so `deploy --solve` repairs a live address,
+				// route, VLAN, or BGP-session drift even when every observed
+				// file hash says the deploy is otherwise a no-op.
+				diff.Semantic[d.ID] = true
+				diff.Configure[d.ID] = true
+				if studentOwned(top, d) {
+					diff.Capture[d.ID] = true
+				}
+				if e.Renderer != nil && e.Renderer.Ready(d, e.Runtime) != nil {
+					diff.Ready[d.ID] = true
+				}
+			}
 		}
 	}
 
@@ -550,6 +571,7 @@ func (e *Engine) LastBuildDiff() BuildDiff {
 	out.Wire = cloneBoolMap(out.Wire)
 	out.Configure = cloneBoolMap(out.Configure)
 	out.Ready = cloneBoolMap(out.Ready)
+	out.Semantic = cloneBoolMap(out.Semantic)
 	out.Capture = cloneBoolMap(out.Capture)
 	return out
 }
@@ -568,6 +590,20 @@ func (e *Engine) DirtyCaptureDevices() []string {
 	diff := e.LastBuildDiff()
 	out := make([]string, 0, len(diff.Capture))
 	for id := range diff.Capture {
+		out = append(out, id)
+	}
+
+	sort.Strings(out)
+	return out
+}
+
+// DirtySemanticDevices returns devices whose runtime fingerprint drifted while
+// OCI/config hashes remained current. Callers persist this set so commit cannot
+// report an inventory-only success after a dynamic host or BGP repair.
+func (e *Engine) DirtySemanticDevices() []string {
+	diff := e.LastBuildDiff()
+	out := make([]string, 0, len(diff.Semantic))
+	for id := range diff.Semantic {
 		out = append(out, id)
 	}
 	sort.Strings(out)

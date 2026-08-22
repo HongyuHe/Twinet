@@ -103,6 +103,7 @@ func (s *Server) handleApplyPrepare(w http.ResponseWriter, r *http.Request, req 
 	previous := s.current[top.Name]
 	s.mu.Unlock()
 	dirtyCapture := []string(nil)
+	semanticDirty := []string(nil)
 	if previous != nil {
 		mode := render.Mode(req.Mode)
 		if mode == "" {
@@ -122,12 +123,16 @@ func (s *Server) handleApplyPrepare(w http.ResponseWriter, r *http.Request, req 
 			Generation:             req.Generation,
 			RequireImmutableImages: top.Lab.Images.RequiresImmutableImages(),
 			RetainLegacyOverlays:   true,
+			SemanticProbe: func(ctx context.Context, device *model.Device) error {
+				return s.semanticProbe(ctx, top, mode, req.Ungraded, device)
+			},
 		}
 		if _, err := observed.BuildContext(r.Context(), top); err != nil {
 			httpError(w, http.StatusConflict, fmt.Errorf("observe prepared deployment: %w", err))
 			return
 		}
 		dirtyCapture = observed.DirtyCaptureDevices()
+		semanticDirty = observed.DirtySemanticDevices()
 	}
 	if previous != nil {
 		prestate.TopologyHash = previous.Hash
@@ -191,6 +196,10 @@ func (s *Server) handleApplyPrepare(w http.ResponseWriter, r *http.Request, req 
 		return
 	}
 	if err := s.recordGenerationDirtyCapture(top.Name, req.Fence, req.Generation, dirtyCapture); err != nil {
+		httpError(w, http.StatusConflict, err)
+		return
+	}
+	if err := s.recordGenerationSemantic(top.Name, req.Fence, req.Generation, semanticDirty); err != nil {
 		httpError(w, http.StatusConflict, err)
 		return
 	}
@@ -489,6 +498,12 @@ func (s *Server) transactionEngine(top *model.Topology, tx applyTransaction) *de
 		Generation:             tx.Generation,
 		RequireImmutableImages: top.Lab.Images.RequiresImmutableImages(),
 		RetainLegacyOverlays:   true,
+		SemanticProbe: func(ctx context.Context, device *model.Device) error {
+			if s.isExempt(top.Name, device.ID) {
+				return nil
+			}
+			return s.semanticProbe(ctx, top, mode, tx.Ungraded, device)
+		},
 	}
 }
 

@@ -138,6 +138,11 @@ type Engine struct {
 	Prune bool
 	// Generation stamps this deployment, so pruning can identify leftovers.
 	Generation string
+	// SemanticProbe is an agent-supplied, cheap runtime fingerprint check.
+	// It lets no-change deploys detect address/route/session drift that labels
+	// and rendered-file hashes cannot observe, without coupling deploy to the
+	// agent's mode and durability policy.
+	SemanticProbe func(context.Context, *model.Device) error
 	// FRRControlRoot holds the host directories shared only between an
 	// unprivileged router shell and its privileged FRR control sidecar. Empty
 	// selects the node-local runtime path.

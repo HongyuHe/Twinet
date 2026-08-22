@@ -27,6 +27,10 @@ const (
 	reconcileFullEvery = 10 * time.Minute
 	reconcileRetryMin  = 100 * time.Millisecond
 	reconcileRetryMax  = 5 * time.Second
+	// semanticSampleWidth bounds the cheap dynamic-state audit fan-out while
+	// avoiding a one-device-per-five-minutes blind spot that left an idle
+	// recovered host broken for hours.
+	semanticSampleWidth = 8
 )
 
 type deviceHealth string
@@ -425,8 +429,15 @@ func (s *Server) reconcileSample(ctx context.Context) {
 		if len(devices) == 0 {
 			continue
 		}
-		slot := int(time.Now().Unix()/int64(reconcileEvery/time.Second)) % len(devices)
-		s.queueReconcile(ctx, name, devices[slot].ID)
+		slot := int(time.Now().Unix() / int64(reconcileEvery/time.Second))
+		start := (slot * semanticSampleWidth) % len(devices)
+		width := semanticSampleWidth
+		if width > len(devices) {
+			width = len(devices)
+		}
+		for offset := 0; offset < width; offset++ {
+			s.queueReconcile(ctx, name, devices[(start+offset)%len(devices)].ID)
+		}
 	}
 }
 

@@ -866,6 +866,10 @@ type StatusResponse struct {
 	// Convergence is the latest observed device-health classification. Unknown
 	// is explicitly distinct from healthy and never folded into zero.
 	Convergence map[string]int `json:"convergence"`
+	// SemanticHealth keeps the same health facts per lab so an operator can
+	// see that an otherwise idle recovery is degraded by one missing host
+	// address instead of reading an aggregate node count as success.
+	SemanticHealth map[string]SemanticHealth `json:"semantic_health,omitempty"`
 	// Unknown names status dimensions that could not be observed.
 	Unknown []string `json:"unknown,omitempty"`
 	// StateStoreHealthy is nil for an older agent that cannot report it.
@@ -876,6 +880,13 @@ type StatusResponse struct {
 	// peer acknowledged state. Keys are stable "lab/peer" tuples so an
 	// operator can correlate failure-domain quorum loss without state data.
 	PeerReplication map[string]PeerReplicationStatus `json:"peer_replication,omitempty"`
+}
+
+type SemanticHealth struct {
+	Healthy int `json:"healthy"`
+	Broken  int `json:"broken"`
+	Unknown int `json:"unknown"`
+	Partial int `json:"partial"`
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -963,8 +974,22 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	sort.Strings(busy)
 	resp.Busy = busy
 	resp.Convergence = map[string]int{}
-	for _, observation := range s.health {
+	resp.SemanticHealth = map[string]SemanticHealth{}
+	for key, observation := range s.health {
 		resp.Convergence[string(observation.Health)]++
+		lab, _, _ := strings.Cut(key, "|")
+		health := resp.SemanticHealth[lab]
+		switch observation.Health {
+		case healthHealthy:
+			health.Healthy++
+		case healthBroken:
+			health.Broken++
+		case healthUnknown:
+			health.Unknown++
+		case healthPartial:
+			health.Partial++
+		}
+		resp.SemanticHealth[lab] = health
 	}
 	s.mu.Unlock()
 	resp.Generations = s.committedGenerations()
@@ -993,6 +1018,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		resp.Generations = nil
 		resp.Recoveries = nil
 		resp.PeerReplication = nil
+		resp.SemanticHealth = nil
 		// Aggregates carry no tenant identifiers and remain useful to a
 		// diagnostic caller, but a count of every active lab is not needed.
 		// Reservations name other labs, which is cluster business a
@@ -1294,6 +1320,12 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		Generation:             req.Generation,
 		RequireImmutableImages: top.Lab.Images.RequiresImmutableImages(),
 		RetainLegacyOverlays:   req.Phase == "apply",
+		SemanticProbe: func(ctx context.Context, device *model.Device) error {
+			if s.isExempt(top.Name, device.ID) {
+				return nil
+			}
+			return s.semanticProbe(ctx, top, mode, req.Ungraded, device)
+		},
 	}
 	if !req.DryRun && req.Phase == "apply" {
 		if err := s.markGenerationApplying(top.Name, req.Fence, req.Generation); err != nil {
@@ -1384,6 +1416,10 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		attachDeploymentStats(&resp, deploymentStats, rep)
 		recordStart := time.Now()
 		if err := s.recordGenerationDirtyCapture(top.Name, req.Fence, req.Generation, eng.DirtyCaptureDevices()); err != nil {
+			httpError(w, http.StatusConflict, err)
+			return
+		}
+		if err := s.recordGenerationSemantic(top.Name, req.Fence, req.Generation, eng.DirtySemanticDevices()); err != nil {
 			httpError(w, http.StatusConflict, err)
 			return
 		}

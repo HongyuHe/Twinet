@@ -820,6 +820,12 @@ func nodeState(v agent.StatusResponse, controller contract.Set) (state, why stri
 	if v.StateStoreHealthy != nil && !*v.StateStoreHealthy {
 		return "state-unhealthy", "durable state store is unavailable"
 	}
+	if v.Convergence["broken"] > 0 {
+		return "degraded", fmt.Sprintf("%d device(s) have semantic/runtime drift", v.Convergence["broken"])
+	}
+	if v.Convergence["unknown"] > 0 {
+		return "semantic-unknown", fmt.Sprintf("%d device(s) could not be semantically observed", v.Convergence["unknown"])
+	}
 	for _, peer := range v.PeerReplication {
 		if !peer.Healthy {
 			return "peer-unhealthy", fmt.Sprintf("durability peer %s is not acknowledged: %s",

@@ -82,6 +82,10 @@ device. A solved host regains its reference address and route; a teaching-mode
 student-owned interface remains deliberately blank unless a saved student
 snapshot requires it.
 
+No-change deploy observation also probes compact live semantic fingerprints.
+An address/route/BGP-session drift becomes a targeted configure/ready plan;
+an actually healthy no-change deployment still has zero mutation steps.
+
 FRR routers use a private control sidecar: legacy daemons in the student shell
 are stopped before the sidecar owns the daemon set, and recovery refuses
 duplicate sidecar daemons. `twinet node status` reports primary topology
