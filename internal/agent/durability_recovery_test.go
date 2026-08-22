@@ -13,6 +13,11 @@ func TestRestoredAddressesIgnoreKernelNoiseButRequireSavedAddresses(t *testing.T
 	if restoredAddressesPresent(missing, want) {
 		t.Fatal("different restored student address was accepted")
 	}
+	extra := []byte("17: eth0@if18    inet 10.3.0.2/24 scope global eth0\n" +
+		"17: eth0@if18    inet 10.3.0.99/24 scope global eth0\n---\n")
+	if restoredAddressesPresent(extra, want) {
+		t.Fatal("extra restored student address was accepted")
+	}
 }
 
 func TestRestoredTunnelsRequireSemanticTunnelAndRouteFacts(t *testing.T) {
@@ -25,6 +30,11 @@ func TestRestoredTunnelsRequireSemanticTunnelAndRouteFacts(t *testing.T) {
 	}
 	if restoredTunnelsPresent([]byte("tun6: ipv6/ip remote 3.9.0.1 local 3.2.0.1 ttl 64\n"), want) {
 		t.Fatal("different tunnel endpoint was accepted")
+	}
+	if restoredTunnelsPresent([]byte("tun6: ipv6/ip remote 3.1.0.1 local 3.2.0.1 ttl 64\n"+
+		"tun7: ipv6/ip remote 3.3.0.1 local 3.4.0.1 ttl 64\n"+
+		"default via 2001:db8::1 dev tun6 metric 1024\n"), want) {
+		t.Fatal("extra student tunnel was accepted")
 	}
 }
 

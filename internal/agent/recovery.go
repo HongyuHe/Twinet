@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/HongyuHe/twinet/internal/deploy"
@@ -390,10 +391,9 @@ func (s *Server) runRecoveryPhaseLimit(ctx context.Context, lab string, fence Fe
 	return s.updateRecoveryProgress(lab, fence, generation, "completed "+action+": "+target, deadline)
 }
 
-// runRecoveryLongPhase is for a composite exact rollback. Each device inside
-// it is still run through runRecoveryPhase, so one blocked container/exec has
-// a bounded deadline; the aggregate may legitimately span more than one
-// device deadline on a class-sized node.
+// runRecoveryLongPhase is for a composite exact rollback. Its independent
+// device operations use bounded per-device workers, while the aggregate stays
+// fenced through the persisted total deadline.
 func (s *Server) runRecoveryLongPhase(ctx context.Context, lab string, fence Fence,
 	generation, action, target string, fn func(context.Context) error,
 ) error {
@@ -420,6 +420,82 @@ func (s *Server) runRecoveryLongPhase(ctx context.Context, lab string, fence Fen
 		return nil
 	}
 	return s.updateRecoveryProgress(lab, fence, generation, "completed "+action+": "+target, deadline)
+}
+
+// runBoundedDeviceChecks runs independent device operations concurrently while
+// preserving a per-device deadline and returning as soon as one systemic
+// failure is known. Exact rollback used to process every device serially after
+// the first rejected restore command, turning a bad dynamic snapshot into a
+// tens-of-minutes recovery loop.
+func runBoundedDeviceChecks[T any](ctx context.Context, workers int, items []T,
+	limit time.Duration, label func(T) string, fn func(context.Context, T) error,
+) error {
+	if len(items) == 0 {
+		return nil
+	}
+	if workers <= 0 {
+		workers = 1
+	}
+	if workers > len(items) {
+		workers = len(items)
+	}
+	workCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	jobs := make(chan T)
+	var wg sync.WaitGroup
+	var once sync.Once
+	var firstErr error
+	record := func(item T, err error) {
+		if err == nil {
+			return
+		}
+		once.Do(func() {
+			firstErr = fmt.Errorf("%s: %w", label(item), err)
+			cancel()
+		})
+	}
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-workCtx.Done():
+					return
+				case item, ok := <-jobs:
+					if !ok {
+						return
+					}
+					if workCtx.Err() != nil {
+						return
+					}
+					itemCtx, itemCancel := context.WithTimeout(workCtx, limit)
+					err := fn(itemCtx, item)
+					if err == nil && itemCtx.Err() != nil {
+						err = itemCtx.Err()
+					}
+					itemCancel()
+					record(item, err)
+				}
+			}
+		}()
+	}
+
+feed:
+	for _, item := range items {
+		select {
+		case <-workCtx.Done():
+			break feed
+		case jobs <- item:
+		}
+	}
+	close(jobs)
+	wg.Wait()
+	if firstErr != nil {
+		return firstErr
+	}
+	return ctx.Err()
 }
 
 func (s *Server) failRecovery(lab string, fence Fence, generation string, err error) {
@@ -1221,29 +1297,35 @@ func (s *Server) verifyRecoveredStudentState(ctx context.Context, tx applyTransa
 		}
 	}
 	mode, ungraded := recoveredMode(tx, wire)
+	var restoreDevices []*model.Device
 	for _, device := range top.DevicesOnNode(s.cfg.Node) {
-		if renderModeForDevice(mode, ungraded, device) == render.ModeSolve {
-			// A solved reference device intentionally does not replay student
-			// snapshots. An ungraded AS in a private harness reaches the
-			// platform path above and is preserved normally.
-			continue
+		if renderModeForDevice(mode, ungraded, device) != render.ModeSolve {
+			restoreDevices = append(restoreDevices, device)
 		}
-		if s.store != nil {
-			expected := expectedByDevice[device.ID]
-			if len(tx.Prestate.Snapshots) == 0 {
-				for _, kind := range state.AllKinds {
-					snapshot, err := s.store.Current(top.Name, device.ID, kind)
-					if err == nil {
-						expected = append(expected, snapshot)
+	}
+	if err := runBoundedDeviceChecks(ctx, s.workLimiter().ClampWorkers(limiter.Apply, 0),
+		restoreDevices, s.recoveryArtifactLimit(),
+		func(device *model.Device) string { return "verify restored student state " + device.ID },
+		func(verifyCtx context.Context, device *model.Device) error {
+			if s.store != nil {
+				expected := expectedByDevice[device.ID]
+				if len(tx.Prestate.Snapshots) == 0 {
+					for _, kind := range state.AllKinds {
+						snapshot, err := s.store.Current(top.Name, device.ID, kind)
+						if err == nil {
+							expected = append(expected, snapshot)
+						}
+					}
+				}
+				if len(expected) > 0 {
+					if _, err := verifyRestoredState(verifyCtx, s.rt, device, top.Name, top.Hash, expected); err != nil {
+						return fmt.Errorf("verify restored student state for %s: %w", device.ID, err)
 					}
 				}
 			}
-			if len(expected) > 0 {
-				if _, err := verifyRestoredState(ctx, s.rt, device, top.Name, top.Hash, expected); err != nil {
-					return fmt.Errorf("verify restored student state for %s: %w", device.ID, err)
-				}
-			}
-		}
+			return nil
+		}); err != nil {
+		return err
 	}
 	if err := s.verifyRecoveredSemantics(ctx, top, mode, ungraded,
 		tx.Prestate.RuntimeSpecs); err != nil {
@@ -1381,53 +1463,54 @@ func (s *Server) rollbackExactContracts(ctx context.Context, lab string, fence F
 	eng := s.transactionEngine(top, rollback)
 	expected := map[string]bool{}
 	for _, entry := range tx.Prestate.RuntimeSpecs {
-		entry := entry
-		if err := s.runRecoveryPhase(ctx, lab, fence, tx.Generation,
-			"rollback", "exact runtime contract: "+entry.DeviceID, func(phaseCtx context.Context) error {
-				device := byDevice[entry.DeviceID]
-				if device == nil {
-					return fmt.Errorf("rollback contract references unknown device %q", entry.DeviceID)
-				}
-				expected[entry.Spec.Name] = true
-				// A split FRR control sidecar joins the primary container's
-				// network namespace. It must be removed before replacing that
-				// primary: retaining the old namespace holder can leave Docker
-				// Start blocked with the replacement stuck in Created.
-				if entry.Control != nil {
-					control, err := s.rt.Inspect(phaseCtx, entry.Control.Name)
-					if err != nil {
-						return fmt.Errorf("inspect rollback control %s: %w", entry.Control.Name, err)
-					}
-					if control.State != rt.StateAbsent {
-						if err := s.rt.Remove(phaseCtx, entry.Control.Name, true); err != nil {
-							return fmt.Errorf("remove rollback control %s before primary replacement: %w",
-								entry.Control.Name, err)
-						}
-					}
-				}
-				current, err := s.rt.Inspect(phaseCtx, entry.Spec.Name)
+		expected[entry.Spec.Name] = true
+	}
+	if err := runBoundedDeviceChecks(ctx, s.workLimiter().ClampWorkers(limiter.Apply, 0),
+		tx.Prestate.RuntimeSpecs, s.recoveryPhaseLimit(),
+		func(entry transactionRuntimeSpec) string { return "exact runtime contract " + entry.DeviceID },
+		func(phaseCtx context.Context, entry transactionRuntimeSpec) error {
+			device := byDevice[entry.DeviceID]
+			if device == nil {
+				return fmt.Errorf("rollback contract references unknown device %q", entry.DeviceID)
+			}
+			// A split FRR control sidecar joins the primary container's
+			// network namespace. It must be removed before replacing that
+			// primary: retaining the old namespace holder can leave Docker
+			// Start blocked with the replacement stuck in Created.
+			if entry.Control != nil {
+				control, err := s.rt.Inspect(phaseCtx, entry.Control.Name)
 				if err != nil {
-					return fmt.Errorf("inspect rollback container %s: %w", entry.Spec.Name, err)
+					return fmt.Errorf("inspect rollback control %s: %w", entry.Control.Name, err)
 				}
-				if current.State != rt.StateAbsent {
-					if err := s.rt.Remove(phaseCtx, entry.Spec.Name, true); err != nil {
-						return fmt.Errorf("remove dirty rollback container %s: %w", entry.Spec.Name, err)
+				if control.State != rt.StateAbsent {
+					if err := s.rt.Remove(phaseCtx, entry.Control.Name, true); err != nil {
+						return fmt.Errorf("remove rollback control %s before primary replacement: %w",
+							entry.Control.Name, err)
 					}
 				}
-				if err := eng.PrepareRuntimeSpec(top, device); err != nil {
-					return fmt.Errorf("prepare rollback runtime paths for %s: %w", entry.DeviceID, err)
+			}
+			current, err := s.rt.Inspect(phaseCtx, entry.Spec.Name)
+			if err != nil {
+				return fmt.Errorf("inspect rollback container %s: %w", entry.Spec.Name, err)
+			}
+			if current.State != rt.StateAbsent {
+				if err := s.rt.Remove(phaseCtx, entry.Spec.Name, true); err != nil {
+					return fmt.Errorf("remove dirty rollback container %s: %w", entry.Spec.Name, err)
 				}
-				spec := entry.Spec
-				if _, err := s.rt.Create(phaseCtx, &spec); err != nil {
-					return fmt.Errorf("create exact rollback container %s: %w", spec.Name, err)
-				}
-				if err := s.rt.Start(phaseCtx, spec.Name); err != nil {
-					return fmt.Errorf("start exact rollback container %s: %w", spec.Name, err)
-				}
-				return nil
-			}); err != nil {
-			return err
-		}
+			}
+			if err := eng.PrepareRuntimeSpec(top, device); err != nil {
+				return fmt.Errorf("prepare rollback runtime paths for %s: %w", entry.DeviceID, err)
+			}
+			spec := entry.Spec
+			if _, err := s.rt.Create(phaseCtx, &spec); err != nil {
+				return fmt.Errorf("create exact rollback container %s: %w", spec.Name, err)
+			}
+			if err := s.rt.Start(phaseCtx, spec.Name); err != nil {
+				return fmt.Errorf("start exact rollback container %s: %w", spec.Name, err)
+			}
+			return nil
+		}); err != nil {
+		return err
 	}
 	if err := s.runRecoveryPhase(ctx, lab, fence, tx.Generation,
 		"rollback", "rewire prior topology", func(phaseCtx context.Context) error {
@@ -1438,104 +1521,107 @@ func (s *Server) rollbackExactContracts(ctx context.Context, lab string, fence F
 		}); err != nil {
 		return err
 	}
-	for _, entry := range tx.Prestate.RuntimeSpecs {
-		entry := entry
-		if err := s.runRecoveryPhaseLimit(ctx, lab, fence, tx.Generation,
-			"restore", "exact rendered artifacts: "+entry.DeviceID, s.recoveryArtifactLimit(),
-			func(phaseCtx context.Context) error {
-				device := byDevice[entry.DeviceID]
-				for _, artifact := range entry.Artifacts {
-					if artifact.Command != nil {
-						continue
-					}
-					if artifact.Digest != artifactDigest(artifact.Content) {
-						return fmt.Errorf("rollback artifact %s for %s digest mismatch", artifact.Path, entry.DeviceID)
-					}
-					if err := s.rt.CopyTo(phaseCtx, entry.Spec.Name, artifact.Path, artifact.Mode, artifact.Content); err != nil {
-						return fmt.Errorf("restore rollback artifact %s to %s: %w",
-							artifact.Path, entry.Spec.Name, err)
+	if err := runBoundedDeviceChecks(ctx, s.workLimiter().ClampWorkers(limiter.Apply, 0),
+		tx.Prestate.RuntimeSpecs, s.recoveryArtifactLimit(),
+		func(entry transactionRuntimeSpec) string { return "exact rendered artifacts " + entry.DeviceID },
+		func(phaseCtx context.Context, entry transactionRuntimeSpec) error {
+			device := byDevice[entry.DeviceID]
+			if device == nil {
+				return fmt.Errorf("rollback artifacts reference unknown device %q", entry.DeviceID)
+			}
+			for _, artifact := range entry.Artifacts {
+				if artifact.Command != nil {
+					continue
+				}
+				if artifact.Digest != artifactDigest(artifact.Content) {
+					return fmt.Errorf("rollback artifact %s for %s digest mismatch", artifact.Path, entry.DeviceID)
+				}
+				if err := s.rt.CopyTo(phaseCtx, entry.Spec.Name, artifact.Path, artifact.Mode, artifact.Content); err != nil {
+					return fmt.Errorf("restore rollback artifact %s to %s: %w",
+						artifact.Path, entry.Spec.Name, err)
+				}
+			}
+			if entry.Control != nil {
+				current, err := s.rt.Inspect(phaseCtx, entry.Control.Name)
+				if err != nil {
+					return fmt.Errorf("inspect exact rollback control %s: %w", entry.Control.Name, err)
+				}
+				if current.State != rt.StateAbsent {
+					if err := s.rt.Remove(phaseCtx, entry.Control.Name, true); err != nil {
+						return fmt.Errorf("remove dirty rollback control %s: %w", entry.Control.Name, err)
 					}
 				}
-				if entry.Control != nil {
-					current, err := s.rt.Inspect(phaseCtx, entry.Control.Name)
-					if err != nil {
-						return fmt.Errorf("inspect exact rollback control %s: %w", entry.Control.Name, err)
-					}
-					if current.State != rt.StateAbsent {
-						if err := s.rt.Remove(phaseCtx, entry.Control.Name, true); err != nil {
-							return fmt.Errorf("remove dirty rollback control %s: %w", entry.Control.Name, err)
-						}
-					}
-					control := *entry.Control
-					if _, err := s.rt.Create(phaseCtx, &control); err != nil {
-						return fmt.Errorf("create exact rollback control %s: %w", control.Name, err)
-					}
-					if err := s.rt.Start(phaseCtx, control.Name); err != nil {
-						return fmt.Errorf("start exact rollback control %s: %w", control.Name, err)
-					}
-				} else if err := eng.EnsureRuntimeSupport(phaseCtx, top, device); err != nil {
-					return fmt.Errorf("restore rollback support for %s: %w", entry.DeviceID, err)
+				control := *entry.Control
+				if _, err := s.rt.Create(phaseCtx, &control); err != nil {
+					return fmt.Errorf("create exact rollback control %s: %w", control.Name, err)
 				}
-				runCommand := func(artifact transactionArtifact) error {
-					raw, _ := json.Marshal(*artifact.Command)
-					if artifact.Digest != artifactDigest(raw) {
-						return fmt.Errorf("rollback command for %s digest mismatch", entry.DeviceID)
-					}
-					container := entry.Spec.Name
-					if artifact.Command.FRRControl && deploy.UsesFRRControl(device) {
-						container = deploy.FRRControlContainer(device)
-					}
-					result, err := s.rt.Exec(phaseCtx, container, rt.ExecCmd{Cmd: artifact.Command.Args})
-					if err != nil {
-						return fmt.Errorf("run rollback command for %s: %w", entry.DeviceID, err)
-					}
-					if err := result.Err(); err != nil && !artifact.Command.IgnoreError {
-						return fmt.Errorf("run rollback command for %s: %w", entry.DeviceID, err)
-					}
-					return nil
+				if err := s.rt.Start(phaseCtx, control.Name); err != nil {
+					return fmt.Errorf("start exact rollback control %s: %w", control.Name, err)
 				}
-				var daemonChecks []transactionArtifact
-				for _, artifact := range entry.Artifacts {
-					if artifact.Command == nil {
-						continue
-					}
-					if artifact.Command.FRRControl &&
-						strings.Contains(artifact.Command.Describe, "check the routing daemons are running") {
-						daemonChecks = append(daemonChecks, artifact)
-						continue
-					}
-					if err := runCommand(artifact); err != nil {
-						return err
-					}
+			} else if err := eng.EnsureRuntimeSupport(phaseCtx, top, device); err != nil {
+				return fmt.Errorf("restore rollback support for %s: %w", entry.DeviceID, err)
+			}
+			runCommand := func(artifact transactionArtifact) error {
+				raw, _ := json.Marshal(*artifact.Command)
+				if artifact.Digest != artifactDigest(raw) {
+					return fmt.Errorf("rollback command for %s digest mismatch", entry.DeviceID)
 				}
-				// The persisted command list checks daemons before a later
-				// frrinit start command. During exact rollback the control
-				// namespace was deliberately recreated, so perform that check
-				// after the recorded starter and retain its final validation.
-				for _, artifact := range daemonChecks {
-					if err := runCommand(artifact); err != nil {
-						return err
-					}
+				container := entry.Spec.Name
+				if artifact.Command.FRRControl && deploy.UsesFRRControl(device) {
+					container = deploy.FRRControlContainer(device)
+				}
+				result, err := s.rt.Exec(phaseCtx, container, rt.ExecCmd{Cmd: artifact.Command.Args})
+				if err != nil {
+					return fmt.Errorf("run rollback command for %s: %w", entry.DeviceID, err)
+				}
+				if err := result.Err(); err != nil && !artifact.Command.IgnoreError {
+					return fmt.Errorf("run rollback command for %s: %w", entry.DeviceID, err)
 				}
 				return nil
-			}); err != nil {
-			return err
-		}
+			}
+			var daemonChecks []transactionArtifact
+			for _, artifact := range entry.Artifacts {
+				if artifact.Command == nil {
+					continue
+				}
+				if artifact.Command.FRRControl &&
+					strings.Contains(artifact.Command.Describe, "check the routing daemons are running") {
+					daemonChecks = append(daemonChecks, artifact)
+					continue
+				}
+				if err := runCommand(artifact); err != nil {
+					return err
+				}
+			}
+			// The persisted command list checks daemons before a later
+			// frrinit start command. During exact rollback the control
+			// namespace was deliberately recreated, so perform that check
+			// after the recorded starter and retain its final validation.
+			for _, artifact := range daemonChecks {
+				if err := runCommand(artifact); err != nil {
+					return err
+				}
+			}
+			return nil
+		}); err != nil {
+		return err
 	}
-	for _, entry := range tx.Prestate.RuntimeSpecs {
-		entry := entry
-		if err := s.runRecoveryPhase(ctx, lab, fence, tx.Generation,
-			"verify", "exact rollback readiness: "+entry.DeviceID, func(phaseCtx context.Context) error {
-				device := byDevice[entry.DeviceID]
-				if waiter := eng.Renderer.Ready(device, s.rt); waiter != nil {
-					if err := plan.Wait(phaseCtx, *waiter); err != nil {
-						return fmt.Errorf("verify exact rollback readiness for %s: %w", entry.DeviceID, err)
-					}
+	if err := runBoundedDeviceChecks(ctx, s.workLimiter().ClampWorkers(limiter.Apply, 0),
+		tx.Prestate.RuntimeSpecs, s.recoveryPhaseLimit(),
+		func(entry transactionRuntimeSpec) string { return "exact rollback readiness " + entry.DeviceID },
+		func(phaseCtx context.Context, entry transactionRuntimeSpec) error {
+			device := byDevice[entry.DeviceID]
+			if device == nil {
+				return fmt.Errorf("rollback readiness references unknown device %q", entry.DeviceID)
+			}
+			if waiter := eng.Renderer.Ready(device, s.rt); waiter != nil {
+				if err := plan.Wait(phaseCtx, *waiter); err != nil {
+					return fmt.Errorf("verify exact rollback readiness for %s: %w", entry.DeviceID, err)
 				}
-				return nil
-			}); err != nil {
-			return err
-		}
+			}
+			return nil
+		}); err != nil {
+		return err
 	}
 	// A restored FRR snapshot is applied through vtysh. The private FRR
 	// control namespace can be running while its socket is not yet usable by
@@ -1543,21 +1629,27 @@ func (s *Server) rollbackExactContracts(ctx context.Context, lab string, fence F
 	// fail with transient "Failure to communicate to zebra" errors. Runtime
 	// contracts and rendered artifacts are already exact at this point, so
 	// waiting does not recompute or weaken the rollback contract.
+	var studentEntries []transactionRuntimeSpec
 	for _, entry := range tx.Prestate.RuntimeSpecs {
-		entry := entry
 		device := byDevice[entry.DeviceID]
-		if renderModeForDevice(previousMode, previousUngraded, device) == render.ModeSolve {
-			continue
+		if device != nil && renderModeForDevice(previousMode, previousUngraded, device) != render.ModeSolve {
+			studentEntries = append(studentEntries, entry)
 		}
-		if err := s.runRecoveryPhase(ctx, lab, fence, tx.Generation,
-			"restore", "exact student state: "+entry.DeviceID, func(phaseCtx context.Context) error {
-				if _, err := deploy.Restore(phaseCtx, s.rt, device, lab, s.store); err != nil {
-					return fmt.Errorf("restore student state for %s: %w", entry.DeviceID, err)
-				}
-				return nil
-			}); err != nil {
-			return err
-		}
+	}
+	if err := runBoundedDeviceChecks(ctx, s.workLimiter().ClampWorkers(limiter.Apply, 0),
+		studentEntries, s.recoveryArtifactLimit(),
+		func(entry transactionRuntimeSpec) string { return "exact student state " + entry.DeviceID },
+		func(phaseCtx context.Context, entry transactionRuntimeSpec) error {
+			device := byDevice[entry.DeviceID]
+			if device == nil {
+				return fmt.Errorf("student state references unknown device %q", entry.DeviceID)
+			}
+			if _, err := deploy.Restore(phaseCtx, s.rt, device, lab, s.store); err != nil {
+				return fmt.Errorf("restore student state for %s: %w", entry.DeviceID, err)
+			}
+			return nil
+		}); err != nil {
+		return err
 	}
 	if err := s.runRecoveryPhase(ctx, lab, fence, tx.Generation,
 		"prune", "forward-only runtime objects and overlays", func(phaseCtx context.Context) error {

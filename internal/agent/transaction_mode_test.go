@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/HongyuHe/twinet/internal/model"
 	"github.com/HongyuHe/twinet/internal/render"
 	"github.com/HongyuHe/twinet/internal/state"
 )
@@ -58,5 +59,36 @@ func TestPreparedTransactionPersistsHarnessSolveToPlatformTransition(t *testing.
 	if tx.Mode != string(render.ModePlatform) || tx.PreviousMode != string(render.ModeSolve) ||
 		tx.PreviousUngraded != 7 {
 		t.Fatalf("solve harness->platform contract lost: %+v", tx)
+	}
+}
+
+func TestSolveToPlatformApplyRequestsStudentReset(t *testing.T) {
+	cases := []struct {
+		previous string
+		desired  render.Mode
+		want     bool
+	}{
+		{previous: string(render.ModeSolve), desired: render.ModePlatform, want: true},
+		{previous: string(render.ModeSolve), desired: render.ModeSolve, want: false},
+		{previous: string(render.ModePlatform), desired: render.ModePlatform, want: false},
+	}
+	for _, tc := range cases {
+		if got := needsStudentReset(tc.previous, tc.desired); got != tc.want {
+			t.Errorf("needsStudentReset(%q, %q) = %t, want %t",
+				tc.previous, tc.desired, got, tc.want)
+		}
+	}
+}
+
+func TestTransactionEngineCarriesSourceModeIntoSolveToPlatformApply(t *testing.T) {
+	server := coordinationTestServer(t, nil)
+	engine := server.transactionEngine(&model.Topology{Lab: &model.Lab{}}, applyTransaction{
+		Mode:             string(render.ModePlatform),
+		PreviousMode:     string(render.ModeSolve),
+		PreviousUngraded: 7,
+	})
+	if !engine.ForceStudentReset || !engine.RestoreStudentState ||
+		engine.PreviousMode != string(render.ModeSolve) || engine.PreviousUngraded != 7 {
+		t.Fatalf("solve->platform transaction engine lost source-mode reset contract: %+v", engine)
 	}
 }

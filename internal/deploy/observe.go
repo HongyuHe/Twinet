@@ -18,7 +18,9 @@ import (
 	"github.com/HongyuHe/twinet/internal/runtime"
 )
 
-const observationVersion = 2
+// observationVersion 3 invalidates mode markers written before mode state was
+// published only after the complete transition plan succeeded.
+const observationVersion = 3
 
 // BuildDiff is the desired-versus-observed result used to construct a minimal
 // executable deployment DAG. Its maps are keyed by canonical device/link IDs.
@@ -206,10 +208,25 @@ func (t *observationTracker) link(id string) (observedLinkState, bool) {
 func (t *observationTracker) markDevice(id string, value observedDeviceState) error {
 	t.mu.Lock()
 	t.state.Devices[id] = value
-	if t.e.ModeKey != "" {
-		t.state.Mode = t.e.ModeKey
-	}
 	t.changed = true
+	err := t.saveLocked()
+	t.mu.Unlock()
+	return err
+}
+
+// markMode records a renderer mode only after the plan has completed every
+// mode-sensitive wire/configure/readiness step. Marking it from the first
+// configured device lets an interrupted platform->solve retry treat untouched
+// hosts as current because their OCI/config hashes did not change.
+func (t *observationTracker) markMode() error {
+	if t.e.ModeKey == "" {
+		return nil
+	}
+	t.mu.Lock()
+	if t.state.Mode != t.e.ModeKey {
+		t.state.Mode = t.e.ModeKey
+		t.changed = true
+	}
 	err := t.saveLocked()
 	t.mu.Unlock()
 	return err
@@ -419,7 +436,7 @@ func (e *Engine) observeNode(ctx context.Context, top *model.Topology, devices [
 			known = true
 			previous = observedLinkState{Hash: hash}
 		}
-		if endpointCreate || !known || previous.Hash != hash || (link.CrossNode() && !liveVNI[link.VNI]) {
+		if modeDirty || endpointCreate || !known || previous.Hash != hash || (link.CrossNode() && !liveVNI[link.VNI]) {
 			diff.Wire[link.ID] = true
 		}
 	}

@@ -1067,10 +1067,10 @@ func (s *Server) handleStateVerify(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, response)
 }
 
-// verifyRestoredState captures the destination after restore and checks both
-// raw digest and a whitespace-insensitive semantic form. The latter handles
-// daemons that render equivalent configuration with benign line wrapping while
-// still refusing changed commands.
+// verifyRestoredState captures the destination after restore. Stable files use
+// their content digest; dynamic network state uses deploy's typed canonical
+// facts so kernel indices, lifetimes, and ordering cannot reject an exact
+// restore while a real missing or extra address, route, tunnel, or VLAN does.
 func verifyRestoredState(ctx context.Context, r rt.Runtime, device *model.Device,
 	lab, topology string, expected []state.Snapshot,
 ) ([]string, error) {
@@ -1088,29 +1088,22 @@ func verifyRestoredState(ctx context.Context, r rt.Runtime, device *model.Device
 		if !ok {
 			return nil, fmt.Errorf("%s restored no %s state", device.ID, want.Kind)
 		}
+		if want.Kind == state.KindAddrs || want.Kind == state.KindTunnels || want.Kind == state.KindOVS {
+			gotCanonical := deploy.CanonicalDynamicSnapshot(want.Kind, string(have.Content))
+			wantCanonical := deploy.CanonicalDynamicSnapshot(want.Kind, string(want.Content))
+			if gotCanonical == wantCanonical {
+				verified = append(verified, string(want.Kind))
+				continue
+			}
+			return nil, fmt.Errorf("%s restored %s dynamic facts differ from captured state",
+				device.ID, want.Kind)
+		}
 		haveDigest := have.Digest
 		if haveDigest == "" {
 			sum := sha256.Sum256(have.Content)
 			haveDigest = hex.EncodeToString(sum[:])
 		}
 		if haveDigest == want.Digest || equivalentState(have.Content, want.Content) {
-			verified = append(verified, string(want.Kind))
-			continue
-		}
-		if want.Kind == state.KindAddrs && restoredAddressesPresent(have.Content, want.Content) {
-			verified = append(verified, string(want.Kind))
-			continue
-		}
-		if want.Kind == state.KindTunnels && restoredTunnelsPresent(have.Content, want.Content) {
-			verified = append(verified, string(want.Kind))
-			continue
-		}
-		if want.Kind == state.KindTunnels {
-			// Restore executes each reconstructed tunnel/route command and
-			// fails the rollback if one fails. Kernel tunnel dumps include
-			// volatile encap/cache fields that cannot be byte-compared after a
-			// namespace recreation, so successful replay is the durable
-			// semantic proof once endpoint parsing above found no stable match.
 			verified = append(verified, string(want.Kind))
 			continue
 		}
@@ -1158,6 +1151,9 @@ func restoredAddressesPresent(have, want []byte) bool {
 		return out
 	}
 	got, expected := parse(have), parse(want)
+	if len(got) != len(expected) {
+		return false
+	}
 	for key := range expected {
 		if !got[key] {
 			return false
@@ -1205,6 +1201,9 @@ func restoredTunnelsPresent(have, want []byte) bool {
 		return out
 	}
 	got, expected := parse(have), parse(want)
+	if len(got) != len(expected) {
+		return false
+	}
 	for key := range expected {
 		if !got[key] {
 			return false

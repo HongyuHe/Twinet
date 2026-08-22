@@ -559,6 +559,10 @@ func canonicalMode(mode string) string {
 	return mode
 }
 
+func needsStudentReset(previous string, desired render.Mode) bool {
+	return canonicalMode(previous) == string(render.ModeSolve) && desired != render.ModeSolve
+}
+
 func (s *Server) release(lab string) {
 	s.mu.Lock()
 	delete(s.ops, lab)
@@ -1320,6 +1324,20 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 	if mode == "" {
 		mode = render.ModePlatform
 	}
+	// The apply engine must receive the prepared source mode, not merely the
+	// desired mode. A solve->platform transition is a semantic mutation even
+	// when OCI specs and renderer hashes match: it must remove reference
+	// addresses/configuration before replaying the durable teaching snapshot.
+	s.mu.Lock()
+	previousMode, previousUngraded := s.modes[top.Name], s.ungraded[top.Name]
+	if req.Phase == "apply" {
+		if tx, ok := s.transactions[top.Name]; ok && tx.Generation == req.Generation {
+			previousMode, previousUngraded = tx.PreviousMode, tx.PreviousUngraded
+		}
+	}
+	s.mu.Unlock()
+	previousMode = canonicalMode(previousMode)
+	forceStudentReset := needsStudentReset(previousMode, mode)
 	eng := &deploy.Engine{
 		Runtime:         s.rt,
 		Node:            s.cfg.Node,
@@ -1337,6 +1355,10 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		Prune:                  req.Prune,
 		Generation:             req.Generation,
 		ModeKey:                rendererModeKey(mode, req.Ungraded),
+		ForceStudentReset:      forceStudentReset,
+		RestoreStudentState:    forceStudentReset,
+		PreviousMode:           previousMode,
+		PreviousUngraded:       previousUngraded,
 		RequireImmutableImages: top.Lab.Images.RequiresImmutableImages(),
 		RetainLegacyOverlays:   req.Phase == "apply",
 		SemanticProbe: func(ctx context.Context, device *model.Device) error {

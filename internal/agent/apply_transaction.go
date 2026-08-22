@@ -364,7 +364,7 @@ func (s *Server) commitAppliedTopology(ctx context.Context, top *model.Topology,
 	// inventory is insufficient evidence that a recreated host has its
 	// reference address/default route or that a service loaded its rendered
 	// files; if this fails the old placement remains intact for rollback.
-	if touched := semanticTouchedDevices(tx); len(touched) > 0 {
+	if touched := semanticCommitDevices(top, s.cfg.Node, tx, render.Mode(desiredMode)); len(touched) > 0 {
 		if err := s.verifyCommittedSemantics(ctx, top, render.Mode(desiredMode), tx.Ungraded, touched); err != nil {
 			return ApplyResponse{}, fmt.Errorf("commit semantic verification failed: %w", err)
 		}
@@ -489,7 +489,7 @@ func (s *Server) transactionEngine(top *model.Topology, tx applyTransaction) *de
 		mode = render.ModePlatform
 	}
 	previousMode := canonicalMode(tx.PreviousMode)
-	forceStudentReset := previousMode == string(render.ModeSolve) && mode != render.ModeSolve
+	forceStudentReset := needsStudentReset(previousMode, mode)
 	return &deploy.Engine{
 		Runtime:                s.rt,
 		Node:                   s.cfg.Node,

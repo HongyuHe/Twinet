@@ -249,6 +249,22 @@ reschedule it, and compare the restored configuration byte-for-byte and
 semantically. No acknowledged configuration may be lost when any one node or
 disk disappears.
 
+#### O7 recovery-state contract
+
+- Dynamic address, route, tunnel, and OVS snapshots use versioned typed,
+  sorted facts rather than raw `ip`/OVS output. Kernel interface indexes,
+  peer suffixes, link-local addresses, lifetimes, and route cache decorations
+  do not change a snapshot digest; missing or extra student-significant facts
+  do.
+- Restore clears stale dynamic facts before replay and fails on the first
+  rejected command. FRR/BIRD configuration is replayed only after its daemon
+  is ready, after interfaces and tunnels have been restored.
+- Renderer mode and harness `ungraded` are transaction state. A mode
+  transition rewires and semantically verifies every local device, so a
+  reference host address/default route cannot be skipped merely because its
+  runtime spec was unchanged. Returning from solve resets reference state and
+  restores only durable teaching state.
+
 ### O8 - Implement true reconciliation and correct self-healing
 
 **Problem.** Deploy is idempotent but does not compute a minimal change plan.

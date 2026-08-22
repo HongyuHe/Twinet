@@ -22,6 +22,9 @@ func TestCapturedTrunkListsHaveNoSpaces(t *testing.T) {
 	if strings.Contains(switchCapture, `tr -d '[]'`) {
 		t.Error("the capture script still strips only brackets, leaving the space that breaks the restore")
 	}
+	if strings.Contains(switchCapture, "2>/dev/null") || !strings.Contains(switchCapture, "|| exit $?") {
+		t.Error("switch capture hides ovs-vsctl failures instead of refusing a destructive restore")
+	}
 }
 
 func TestATwoVLANTrunkSurvivesTheRoundTrip(t *testing.T) {

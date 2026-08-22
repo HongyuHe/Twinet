@@ -23,6 +23,7 @@ type observedRuntime struct {
 	listCalls  int
 	execs      int
 	copies     int
+	failExec   func(rt.ExecCmd) bool
 }
 
 func (r *observedRuntime) Name() string { return "fake" }
@@ -60,6 +61,9 @@ func (r *observedRuntime) Exec(_ context.Context, _ string, cmd rt.ExecCmd) (rt.
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.execs++
+	if r.failExec != nil && r.failExec(cmd) {
+		return rt.ExecResult{ExitCode: 17, Stderr: "forced command failure"}, nil
+	}
 	if strings.Contains(strings.Join(cmd.Cmd, " "), "cat "+configurationMarker) {
 		return rt.ExecResult{ExitCode: 1}, nil
 	}

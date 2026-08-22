@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/netip"
 	"os"
 	"sort"
 	"strings"
@@ -38,13 +39,18 @@ import (
 // for it by name, so a submission that made another -- which is a perfectly
 // good way to build a switch -- had those ports read as absent, and came back
 // from its own snapshot with their VLANs gone.
-const switchCapture = `for b in $(ovs-vsctl list-br 2>/dev/null); do
-for p in $(ovs-vsctl list-ports "$b" 2>/dev/null); do
-  tag=$(ovs-vsctl get port "$p" tag 2>/dev/null | tr -d '[] ')
-  trunks=$(ovs-vsctl get port "$p" trunks 2>/dev/null | tr -d '[] ')
-  mode=$(ovs-vsctl get port "$p" vlan_mode 2>/dev/null | tr -d '"')
-  echo "port $p tag=${tag} trunks=${trunks} mode=${mode}"
-done
+const switchCapture = `bridges=$(ovs-vsctl list-br) || exit $?
+for b in $bridges; do
+  ports=$(ovs-vsctl list-ports "$b") || exit $?
+  for p in $ports; do
+    tag=$(ovs-vsctl get port "$p" tag) || exit $?
+    trunks=$(ovs-vsctl get port "$p" trunks) || exit $?
+    mode=$(ovs-vsctl get port "$p" vlan_mode) || exit $?
+    tag=$(printf '%s' "$tag" | tr -d '[] ')
+    trunks=$(printf '%s' "$trunks" | tr -d '[] ')
+    mode=$(printf '%s' "$mode" | tr -d '"')
+    echo "port $p tag=${tag} trunks=${trunks} mode=${mode}"
+  done
 done`
 
 // ErrNotRunning reports that a device's container exists but is not running, so
@@ -149,14 +155,17 @@ func Capture(ctx context.Context, r rt.Runtime, d *model.Device, lab, topoHash s
 		return "", false
 	}
 	add := func(kind state.Kind, body string) {
-		body = strings.TrimSpace(body)
+		body = CanonicalDynamicSnapshot(kind, body)
 		if body == "" {
 			return
+		}
+		if !strings.HasSuffix(body, "\n") {
+			body += "\n"
 		}
 		out = append(out, state.Snapshot{
 			Lab: lab, AS: d.ASN, Device: d.ID, Kind: kind,
 			TakenAt: time.Now().UTC(), Topology: topoHash,
-			Content: []byte(body + "\n"),
+			Content: []byte(body),
 		})
 	}
 
@@ -181,17 +190,19 @@ func Capture(ctx context.Context, r rt.Runtime, d *model.Device, lab, topoHash s
 		// Tunnels are configured with ip(8) rather than through FRR, so they
 		// are captured separately or the 6in4 exercise would be lost.
 		if body, ok := read("the tunnels", []string{"sh", "-c",
-			"ip -d tunnel show 2>/dev/null; ip -6 route show 2>/dev/null"}); ok {
+			"ip -d tunnel show || exit $?; ip -6 route show"}); ok {
 			add(state.KindTunnels, body)
 		}
-		if body, ok := read("the addresses", []string{"sh", "-c",
-			"ip -o addr show; echo ---; ip -o link show type vlan"}); ok {
+		if body, ok := read("the addresses and routes", []string{"sh", "-c",
+			"ip -o addr show || exit $?; echo ---; ip -o route show || exit $?; echo ---; " +
+				"ip -o -6 route show || exit $?; echo ---; ip -o link show type vlan"}); ok {
 			add(state.KindAddrs, body)
 		}
 
 	case model.KindHost:
 		if body, ok := read("the addresses and routes", []string{"sh", "-c",
-			"ip -o addr show; echo ---; ip -o route show; echo ---; ip -o -6 route show"}); ok {
+			"ip -o addr show || exit $?; echo ---; ip -o route show || exit $?; echo ---; " +
+				"ip -o -6 route show"}); ok {
 			add(state.KindAddrs, body)
 		}
 
@@ -206,6 +217,217 @@ func Capture(ctx context.Context, r rt.Runtime, d *model.Device, lab, topoHash s
 		return out, fmt.Errorf("%s", strings.Join(missed, "; "))
 	}
 	return out, nil
+}
+
+const dynamicStateVersion = "twinet-state/v2"
+
+// CanonicalDynamicSnapshot returns the deterministic typed representation used
+// for content-addressed addresses, tunnels, and OVS state. Raw `ip -o` output
+// carries interface indices, peer suffixes, link-local addresses, lifetimes,
+// and route cache details that change across an otherwise exact restore. It
+// accepts legacy raw output too, so verification remains compatible with
+// snapshots written before canonical dynamic state shipped.
+func CanonicalDynamicSnapshot(kind state.Kind, raw string) string {
+	if canonical, ok := normalizedCanonicalDynamic(kind, raw); ok {
+		return canonical
+	}
+	switch kind {
+	case state.KindAddrs:
+		return canonicalAddresses(raw)
+	case state.KindTunnels:
+		return canonicalTunnels(raw)
+	case state.KindOVS:
+		return canonicalOVS(raw)
+	default:
+		return strings.TrimSpace(raw)
+	}
+}
+
+func normalizedCanonicalDynamic(kind state.Kind, raw string) (string, bool) {
+	lines := strings.Split(strings.TrimSpace(raw), "\n")
+	if len(lines) == 0 || strings.TrimSpace(lines[0]) != dynamicStateVersion+" "+string(kind) {
+		return "", false
+	}
+	set := map[string]bool{}
+	for _, line := range lines[1:] {
+		if kind == state.KindOVS {
+			addCanonicalOVSPort(line, set)
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		set[strings.Join(fields, " ")] = true
+	}
+	return canonicalLines(string(kind), set), true
+}
+
+func canonicalAddresses(raw string) string {
+	sections := 0
+	set := map[string]bool{}
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "---" {
+			sections++
+			continue
+		}
+		if line == "" {
+			continue
+		}
+		switch sections {
+		case 0:
+			fields := strings.Fields(line)
+			if len(fields) < 4 {
+				continue
+			}
+			iface := strings.TrimSuffix(fields[1], ":")
+			iface, _, _ = strings.Cut(iface, "@")
+			for i := 2; i+1 < len(fields); i++ {
+				family := fields[i]
+				if family != "inet" && family != "inet6" {
+					continue
+				}
+				address := fields[i+1]
+				if dynamicKernelAddress(address) {
+					continue
+				}
+				set["addr "+family+" "+iface+" "+address] = true
+			}
+		case 1:
+			if route := canonicalRoute(line); route != "" {
+				set["route inet "+route] = true
+			}
+		default:
+			if route := canonicalRoute(line); route != "" {
+				set["route inet6 "+route] = true
+			}
+		}
+	}
+	return canonicalLines("addrs", set)
+}
+
+func dynamicKernelAddress(address string) bool {
+	host, _, _ := strings.Cut(address, "/")
+	return strings.HasPrefix(host, "127.") || host == "::1" ||
+		strings.HasPrefix(strings.ToLower(host), "fe80:")
+}
+
+func canonicalRoute(line string) string {
+	fields := strings.Fields(line)
+	if len(fields) == 0 || !routeStart(fields[0]) {
+		return ""
+	}
+	var out []string
+	for i := 0; i < len(fields); i++ {
+		switch fields[i] {
+		case "proto", "src", "pref", "expires", "cache":
+			i++ // their following value is runtime decoration, not user state
+			continue
+		case "linkdown":
+			continue
+		}
+		out = append(out, fields[i])
+	}
+	return strings.Join(out, " ")
+}
+
+func routeStart(first string) bool {
+	switch first {
+	case "default", "blackhole", "unreachable", "prohibit", "throw", "nat", "local", "broadcast", "anycast", "multicast":
+		return true
+	}
+	if _, err := netip.ParsePrefix(first); err == nil {
+		return true
+	}
+	_, err := netip.ParseAddr(first)
+	return err == nil
+}
+
+func canonicalTunnels(raw string) string {
+	set := map[string]bool{}
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if strings.Contains(line, "remote ") && strings.Contains(line, "local ") {
+			fields := strings.Fields(line)
+			if len(fields) == 0 {
+				continue
+			}
+			name := strings.TrimSuffix(fields[0], ":")
+			remote, local := fieldAfter(line, "remote"), fieldAfter(line, "local")
+			if name != "" && name != "sit0" && remote != "" && local != "" &&
+				remote != "any" && local != "any" {
+				set["tunnel "+name+" "+remote+" "+local] = true
+			}
+			continue
+		}
+		if route := canonicalRoute(line); route != "" {
+			set["route inet6 "+route] = true
+		}
+	}
+	return canonicalLines("tunnels", set)
+}
+
+func canonicalOVS(raw string) string {
+	set := map[string]bool{}
+	for _, line := range strings.Split(raw, "\n") {
+		addCanonicalOVSPort(line, set)
+	}
+	return canonicalLines("ovs", set)
+}
+
+func addCanonicalOVSPort(line string, set map[string]bool) {
+	fields := strings.Fields(strings.TrimSpace(line))
+	if len(fields) < 2 || fields[0] != "port" {
+		return
+	}
+	port := fields[1]
+	tag, trunks, mode := "", "", ""
+	for _, field := range fields[2:] {
+		switch {
+		case strings.HasPrefix(field, "tag="):
+			tag = strings.Trim(strings.TrimPrefix(field, "tag="), "[]")
+		case strings.HasPrefix(field, "trunks="):
+			trunks = canonicalVLANList(strings.TrimPrefix(field, "trunks="))
+		case strings.HasPrefix(field, "mode="):
+			mode = strings.Trim(strings.TrimPrefix(field, "mode="), "[]")
+		}
+	}
+	// A port with no VLAN state is platform plumbing, not student-owned
+	// switch configuration. Excluding it prevents an extra empty veth
+	// from making an otherwise exact restore fail verification.
+	if tag != "" || trunks != "" || mode != "" {
+		set["port "+port+" tag="+tag+" trunks="+trunks+" mode="+mode] = true
+	}
+}
+
+func canonicalVLANList(raw string) string {
+	raw = strings.Trim(raw, "[]")
+	if raw == "" {
+		return ""
+	}
+	parts := strings.Split(raw, ",")
+	for i := range parts {
+		parts[i] = strings.TrimSpace(parts[i])
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, ",")
+}
+
+func canonicalLines(kind string, set map[string]bool) string {
+	lines := make([]string, 0, len(set))
+	for line := range set {
+		lines = append(lines, line)
+	}
+	sort.Strings(lines)
+	body := dynamicStateVersion + " " + kind + "\n"
+	if len(lines) != 0 {
+		body += strings.Join(lines, "\n") + "\n"
+	}
+	return body
 }
 
 // CaptureAll snapshots every student-owned device on this node.
@@ -364,23 +586,27 @@ func Restore(ctx context.Context, r rt.Runtime, d *model.Device, lab string, sto
 		case len(snap.Content) == 0:
 			return nil
 		}
+		if err := resetDynamicState(ctx, r, d, kind); err != nil {
+			return err
+		}
 		cmds := build(string(snap.Content))
 		if len(cmds) == 0 {
+			// An explicitly captured empty dynamic state is still a restore:
+			// resetDynamicState removed stale facts that were not in it.
+			if kind == state.KindAddrs || kind == state.KindTunnels || kind == state.KindOVS {
+				restored = true
+			}
 			return nil
 		}
-		var failed []string
 		for _, cmd := range cmds {
 			res, err := r.Exec(ctx, d.Container, rt.ExecCmd{Cmd: []string{"sh", "-c", cmd}})
 			switch {
 			case err != nil:
-				failed = append(failed, fmt.Sprintf("%s: %v", cmd, err))
+				return fmt.Errorf("restore %s %s command %q: %w", d.ID, kind, cmd, err)
 			case res.ExitCode != 0:
-				failed = append(failed, fmt.Sprintf("%s: %s", cmd, firstLine(res.Stderr)))
+				return fmt.Errorf("restore %s %s command %q exited %d: %s",
+					d.ID, kind, cmd, res.ExitCode, firstLine(res.Stderr))
 			}
-		}
-		if len(failed) > 0 {
-			return fmt.Errorf("restore %s %s: %d of %d commands failed: %s",
-				d.ID, kind, len(failed), len(cmds), strings.Join(failed, "; "))
 		}
 		restored = true
 		return nil
@@ -392,6 +618,16 @@ func Restore(ctx context.Context, r rt.Runtime, d *model.Device, lab string, sto
 		if providerErr != nil {
 			return false, fmt.Errorf("resolve NOS for saved configuration of %s: %w", d.ID, providerErr)
 		}
+		// Network facts are restored before routing configuration. Resetting
+		// stale routes after vtysh/birdc would flush routes the daemon just
+		// installed; restoring interfaces first also gives the daemon its
+		// endpoint addresses before it parses saved neighbors.
+		if err := replay(state.KindAddrs, addrReplay); err != nil {
+			return restored, err
+		}
+		if err := replay(state.KindTunnels, tunnelReplay); err != nil {
+			return restored, err
+		}
 		if provider.Name() != model.DefaultNOS {
 			snap, err := store.Current(lab, d.ID, provider.StateKind())
 			switch {
@@ -401,16 +637,15 @@ func Restore(ctx context.Context, r rt.Runtime, d *model.Device, lab string, sto
 				return false, fmt.Errorf("reading the saved %s configuration of %s: %w",
 					provider.Name(), d.ID, err)
 			case len(snap.Content) > 0:
+				if provider.Name() == "bird" {
+					if err := waitForBIRDRestoreReady(ctx, r, d); err != nil {
+						return false, err
+					}
+				}
 				if err := provider.Restore(ctx, d, r, snap); err != nil {
 					return false, err
 				}
 				restored = true
-			}
-			if err := replay(state.KindTunnels, tunnelReplay); err != nil {
-				return restored, err
-			}
-			if err := replay(state.KindAddrs, addrReplay); err != nil {
-				return restored, err
 			}
 			return restored, nil
 		}
@@ -419,6 +654,9 @@ func Restore(ctx context.Context, r rt.Runtime, d *model.Device, lab string, sto
 			return false, fmt.Errorf("reading the saved configuration of %s: %w", d.ID, err)
 		}
 		if err == nil && len(snap.Content) > 0 {
+			if err := waitForFRRRestoreReady(ctx, r, d); err != nil {
+				return false, err
+			}
 			// The captured configuration is replayed through vtysh's own file
 			// loader, which is the same path `restore_configs` used and the
 			// only one that accepts a running-config verbatim.
@@ -457,12 +695,6 @@ func Restore(ctx context.Context, r rt.Runtime, d *model.Device, lab string, sto
 			}
 			restored = true
 		}
-		if err := replay(state.KindTunnels, tunnelReplay); err != nil {
-			return restored, err
-		}
-		if err := replay(state.KindAddrs, addrReplay); err != nil {
-			return restored, err
-		}
 
 	case model.KindHost:
 		if err := replay(state.KindAddrs, addrReplay); err != nil {
@@ -477,51 +709,156 @@ func Restore(ctx context.Context, r rt.Runtime, d *model.Device, lab string, sto
 	return restored, nil
 }
 
+// resetDynamicState removes stale dynamic facts before a canonical replay.
+// Captures contain all meaningful facts for a student-owned device, so adding
+// the saved facts without first clearing the old ones could leave a failed
+// solve-mode address, route, tunnel, or VLAN behind. Every reset command is
+// required: an error leaves recovery pending rather than claiming an exact
+// restore that has known extra state.
+func resetDynamicState(ctx context.Context, r rt.Runtime, d *model.Device, kind state.Kind) error {
+	var script string
+	switch kind {
+	case state.KindAddrs:
+		// Addresses and routes may have been installed by a failed reference
+		// apply even when the saved teaching state was intentionally blank.
+		// Enumerate live interfaces instead of snapshot interfaces so a legacy
+		// blank snapshot can still remove that stale reference address.
+		script = `links=$(ip -o link show) || exit $?
+ifaces=$(printf '%s\n' "$links" | sed -n 's/^[0-9][0-9]*: \([^:@]*\).*/\1/p') || exit $?
+for iface in $ifaces; do
+  ip addr flush dev "$iface" scope global || exit $?
+  ip -6 addr flush dev "$iface" scope global || exit $?
+  ip route flush dev "$iface" || exit $?
+  ip -6 route flush dev "$iface" || exit $?
+done`
+	case state.KindTunnels:
+		// sit0 is the kernel's built-in tunnel and must never be deleted.
+		script = `tunnels=$(ip -d tunnel show) || exit $?
+printf '%s\n' "$tunnels" | while IFS= read -r line; do
+  case "$line" in *" remote "*" local "*) ;; *) continue ;; esac
+  name=${line%%:*}
+  case "$name" in ""|sit0) continue ;; esac
+  ip tunnel del "$name" || exit $?
+done || exit $?`
+	case state.KindOVS:
+		script = `bridges=$(ovs-vsctl list-br) || exit $?
+for bridge in $bridges; do
+  ports=$(ovs-vsctl list-ports "$bridge") || exit $?
+  for port in $ports; do
+    ovs-vsctl clear port "$port" tag || exit $?
+    ovs-vsctl clear port "$port" trunks || exit $?
+    ovs-vsctl clear port "$port" vlan_mode || exit $?
+  done
+done`
+	default:
+		return nil
+	}
+	res, err := r.Exec(ctx, d.Container, rt.ExecCmd{Cmd: []string{"sh", "-c", script}})
+	if err != nil {
+		return fmt.Errorf("reset restored %s state on %s: %w", kind, d.ID, err)
+	}
+	if res.ExitCode != 0 {
+		return fmt.Errorf("reset restored %s state on %s exited %d: %s",
+			kind, d.ID, res.ExitCode, firstLine(res.Stderr))
+	}
+	return nil
+}
+
+// waitForFRRRestoreReady avoids replaying a saved configuration while the
+// control sidecar has started but zebra's vty socket is not usable yet. A
+// vtysh exit 13 is transient at that point, not evidence that a valid student
+// snapshot should be discarded.
+func waitForFRRRestoreReady(ctx context.Context, r rt.Runtime, d *model.Device) error {
+	const timeout = 30 * time.Second
+	readyCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	var last string
+	for {
+		result, err := r.Exec(readyCtx, d.Container, rt.ExecCmd{
+			Cmd: []string{"vtysh", "-c", "show version"},
+		})
+		if err == nil && result.ExitCode == 0 {
+			return nil
+		}
+		if err != nil {
+			last = err.Error()
+		} else {
+			last = fmt.Sprintf("vtysh exited %d: %s", result.ExitCode, firstLine(result.Stderr))
+		}
+		select {
+		case <-readyCtx.Done():
+			if last == "" {
+				last = readyCtx.Err().Error()
+			}
+			return fmt.Errorf("wait for routing daemon readiness on %s: %s", d.ID, last)
+		case <-ticker.C:
+		}
+	}
+}
+
+func waitForBIRDRestoreReady(ctx context.Context, r rt.Runtime, d *model.Device) error {
+	const timeout = 30 * time.Second
+	readyCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	var last string
+	for {
+		result, err := r.Exec(readyCtx, d.Container, rt.ExecCmd{
+			Cmd: []string{"birdc", "-r", "-s", "/run/bird.ctl", "show", "status"},
+		})
+		if err == nil && result.ExitCode == 0 {
+			return nil
+		}
+		if err != nil {
+			last = err.Error()
+		} else {
+			last = fmt.Sprintf("birdc exited %d: %s", result.ExitCode, firstLine(result.Stderr))
+		}
+		select {
+		case <-readyCtx.Done():
+			if last == "" {
+				last = readyCtx.Err().Error()
+			}
+			return fmt.Errorf("wait for BIRD daemon readiness on %s: %s", d.ID, last)
+		case <-ticker.C:
+		}
+	}
+}
+
 // addrReplay turns captured `ip -o` output back into commands.
 func addrReplay(body string) []string {
+	return canonicalAddrReplay(CanonicalDynamicSnapshot(state.KindAddrs, body))
+}
+
+func canonicalAddrReplay(body string) []string {
 	var out []string
-	section := 0
-	for _, line := range strings.Split(body, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "---" {
-			section++
-			continue
-		}
-		if line == "" {
-			continue
-		}
+	for _, line := range strings.Split(body, "\n")[1:] {
 		fields := strings.Fields(line)
-		switch section {
-		case 0: // addresses
-			if len(fields) < 4 {
+		if len(fields) < 1 {
+			continue
+		}
+		switch fields[0] {
+		case "addr":
+			if len(fields) != 4 {
 				continue
 			}
-			iface := strings.TrimSuffix(fields[1], ":")
-			for i := 2; i+1 < len(fields); i++ {
-				if fields[i] != "inet" && fields[i] != "inet6" {
-					continue
-				}
-				addr := fields[i+1]
-				// Link-local and loopback addresses are the kernel's, not the
-				// student's, and re-adding them fails noisily.
-				if strings.HasPrefix(addr, "fe80:") || strings.HasPrefix(addr, "127.") ||
-					strings.HasPrefix(addr, "::1") {
-					continue
-				}
-				flag := ""
-				if fields[i] == "inet6" {
-					flag = "-6 "
-				}
-				out = append(out, fmt.Sprintf("ip %saddr replace %s dev %s", flag, addr, iface))
+			flag := ""
+			if fields[1] == "inet6" {
+				flag = "-6 "
 			}
-		case 1, 2: // routes
-			if strings.HasPrefix(line, "default") || strings.Contains(line, " via ") {
-				flag := ""
-				if section == 2 {
-					flag = "-6 "
-				}
-				out = append(out, fmt.Sprintf("ip %sroute replace %s", flag, line))
+			out = append(out, fmt.Sprintf("ip %saddr replace %s dev %s", flag, fields[3], fields[2]))
+		case "route":
+			if len(fields) < 3 {
+				continue
 			}
+			flag := ""
+			if fields[1] == "inet6" {
+				flag = "-6 "
+			}
+			out = append(out, "ip "+flag+"route replace "+strings.Join(fields[2:], " "))
 		}
 	}
 	return out
@@ -529,39 +866,38 @@ func addrReplay(body string) []string {
 
 // tunnelReplay reconstructs 6in4 tunnels from captured output.
 func tunnelReplay(body string) []string {
+	return canonicalTunnelReplay(CanonicalDynamicSnapshot(state.KindTunnels, body))
+}
+
+func canonicalTunnelReplay(body string) []string {
 	var out []string
-	for _, line := range strings.Split(body, "\n") {
-		line = strings.TrimSpace(line)
-		// `ip tunnel show` prints e.g. "tun6: ipv6/ip remote 3.153.0.1 local 3.156.0.1 ttl 64"
-		if !strings.Contains(line, "remote ") || !strings.Contains(line, "local ") {
+	for _, line := range strings.Split(body, "\n")[1:] {
+		fields := strings.Fields(line)
+		if len(fields) < 1 {
 			continue
 		}
-		name := strings.TrimSuffix(strings.Fields(line)[0], ":")
-		if name == "" || name == "sit0" {
-			continue
+		switch fields[0] {
+		case "tunnel":
+			if len(fields) != 4 {
+				continue
+			}
+			name, remote, local := fields[1], fields[2], fields[3]
+			out = append(out,
+				fmt.Sprintf("if ip link show %s >/dev/null 2>&1; then ip tunnel del %s; fi; "+
+					"ip tunnel add %s mode sit remote %s local %s ttl 64", name, name, name, remote, local),
+				fmt.Sprintf("ip link set %s up", name))
+		case "route":
+			if len(fields) >= 3 && fields[1] == "inet6" {
+				out = append(out, "ip -6 route replace "+strings.Join(fields[2:], " "))
+			}
 		}
-		remote, local := fieldAfter(line, "remote"), fieldAfter(line, "local")
-		if remote == "" || local == "" || remote == "any" || local == "any" {
-			continue
-		}
-		out = append(out,
-			fmt.Sprintf("if ip link show %s >/dev/null 2>&1; then ip tunnel del %s; fi; "+
-				"ip tunnel add %s mode sit remote %s local %s ttl 64",
-				name, name, name, remote, local),
-			fmt.Sprintf("ip link set %s up", name))
-	}
-	for _, line := range strings.Split(body, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || (!strings.HasPrefix(line, "default") && !strings.Contains(line, " via ")) {
-			continue
-		}
-		out = append(out, "ip -6 route replace "+line)
 	}
 	return out
 }
 
 // ovsReplay reconstructs a switch's port VLAN assignment.
 func ovsReplay(body string) []string {
+	body = CanonicalDynamicSnapshot(state.KindOVS, body)
 	var out []string
 	for _, line := range strings.Split(body, "\n") {
 		fields := strings.Fields(strings.TrimSpace(line))

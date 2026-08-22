@@ -474,6 +474,29 @@ func (e *Engine) BuildContext(ctx context.Context, top *model.Topology) (*plan.P
 		}
 	}
 
+	// A renderer mode is a semantic contract, not a per-container hash. Do
+	// not publish it while a partially failed transition still has untouched
+	// hosts or links: the next retry must keep all of them dirty. The final
+	// marker is deliberately a plan step so dependency failure prevents it
+	// from being written, and scoped applies omit it with the rest of the
+	// whole-lab mode transition.
+	if e.ModeKey != "" && tracker.state.Mode != e.ModeKey {
+		needs := make([]string, 0, p.Len())
+		for _, step := range p.Steps() {
+			needs = append(needs, step.ID)
+		}
+		p.Add(&plan.Step{
+			ID:       "record-mode",
+			Stage:    plan.StageReady,
+			Scope:    "mode",
+			Describe: "record renderer mode",
+			Needs:    needs,
+			Run: func(context.Context) error {
+				return tracker.markMode()
+			},
+		})
+	}
+
 	return p, p.Validate()
 }
 
@@ -1753,10 +1776,13 @@ func (e *Engine) resetStudentNetworkState(ctx context.Context, d *model.Device) 
 		}
 	}
 	for _, iface := range ifaces {
-		script := "ip addr flush dev " + iface + " 2>/dev/null || true; " +
-			"ip -6 addr flush dev " + iface + " 2>/dev/null || true; " +
-			"ip route flush dev " + iface + " 2>/dev/null || true; " +
-			"ip -6 route flush dev " + iface + " 2>/dev/null || true"
+		// The link was made before configure. If it cannot be reset, carrying
+		// a reference answer into teaching mode is worse than failing the
+		// transition visibly, so never suppress an ip(8) error here.
+		script := "ip addr flush dev " + iface + " scope global || exit $?; " +
+			"ip -6 addr flush dev " + iface + " scope global || exit $?; " +
+			"ip route flush dev " + iface + " || exit $?; " +
+			"ip -6 route flush dev " + iface
 		result, err := e.Runtime.Exec(ctx, d.Container, runtime.ExecCmd{Cmd: []string{"sh", "-c", script}})
 		if err != nil {
 			return fmt.Errorf("reset reference address state on %s/%s: %w", d.ID, iface, err)

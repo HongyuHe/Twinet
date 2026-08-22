@@ -99,10 +99,34 @@ func TestHarnessModeCapturesOnlyUngradedStudentState(t *testing.T) {
 			t.Fatal("harness did not restore reference authority for surrounding ASes")
 		}
 	}
+
 	if !capturesStudentState(top, "solve", 5, host) {
 		t.Fatal("ungraded harness host was not eligible for student snapshot capture")
 	}
 	if renderModeForDevice("solve", 5, host) != "platform" {
 		t.Fatal("ungraded harness host was rendered as reference solve")
+	}
+}
+
+func TestModeCommitSemanticsIncludesUntouchedLocalDevices(t *testing.T) {
+	top := &model.Topology{Devices: map[string]*model.Device{
+		"as5/MSP_host":  {ID: "as5/MSP_host", Node: "node-0"},
+		"as10/SFO_host": {ID: "as10/SFO_host", Node: "node-0"},
+		"as3/ATL":       {ID: "as3/ATL", Node: "node-1"},
+	}}
+	tx := applyTransaction{
+		PreviousMode: string(render.ModePlatform), Mode: string(render.ModeSolve),
+		Touched: []string{"as5/MSP_host"},
+	}
+	got := semanticCommitDevices(top, "node-0", tx, render.ModeSolve)
+	if strings.Join(got, ",") != "as10/SFO_host,as5/MSP_host" {
+		t.Fatalf("solve mode commit skipped untouched local device: %v", got)
+	}
+
+	tx.PreviousMode = string(render.ModeSolve)
+	tx.Mode = string(render.ModeSolve)
+	got = semanticCommitDevices(top, "node-0", tx, render.ModeSolve)
+	if strings.Join(got, ",") != "as5/MSP_host" {
+		t.Fatalf("unchanged mode expanded semantic proof unexpectedly: %v", got)
 	}
 }

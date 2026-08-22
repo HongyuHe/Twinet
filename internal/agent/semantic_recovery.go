@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/HongyuHe/twinet/internal/limiter"
 	"github.com/HongyuHe/twinet/internal/model"
 	"github.com/HongyuHe/twinet/internal/render"
 	rt "github.com/HongyuHe/twinet/internal/runtime"
@@ -75,6 +76,30 @@ func semanticTouchedDevices(tx applyTransaction) []string {
 	return out
 }
 
+// semanticCommitDevices expands a mode/harness transition to the entire local
+// lab. Mode is not represented by an OCI spec hash: a host that was not
+// otherwise dirty can still be missing its solve/reference address or retain
+// an answer while returning to teaching mode.
+func semanticCommitDevices(top *model.Topology, node string, tx applyTransaction, desired render.Mode) []string {
+	seen := map[string]bool{}
+	for _, id := range semanticTouchedDevices(tx) {
+		seen[id] = true
+	}
+	modeChanged := canonicalMode(tx.PreviousMode) != canonicalMode(string(desired)) ||
+		tx.PreviousUngraded != tx.Ungraded
+	if modeChanged && top != nil {
+		for _, device := range top.DevicesOnNode(node) {
+			seen[device.ID] = true
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for id := range seen {
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // verifyRecoveredSemantics validates a rollback against the persisted
 // pre-transaction artifacts. Unlike the desired forward path, these bytes are
 // the exact historic renderer contract and must not be reinterpreted through a
@@ -113,40 +138,46 @@ func (s *Server) verifyTopologySemantics(ctx context.Context, top *model.Topolog
 		return nil
 	}
 	r := renderer(top, mode, ungraded)
+	var devices []*model.Device
 	for _, device := range top.DevicesOnNode(s.cfg.Node) {
 		if !want[device.ID] {
 			continue
 		}
-		if s.isExempt(top.Name, device.ID) {
-			continue
-		}
-		expected := artifacts[device.ID]
-		if expected == nil {
-			var err error
-			expected, err = renderedSemanticArtifacts(r, device)
-			if err != nil {
-				return fmt.Errorf("render semantic artifacts for %s: %w", device.ID, err)
-			}
-		}
-		if err := s.verifyRenderedArtifacts(ctx, top, device,
-			renderModeForDevice(mode, ungraded, device), expected); err != nil {
-			return err
-		}
-		if err := s.verifyNetworkSemantics(ctx, top, device,
-			renderModeForDevice(mode, ungraded, device)); err != nil {
-			return err
-		}
-		if waiter := r.Ready(device, s.rt); waiter != nil {
-			ready, err := waiter.Check(ctx)
-			if err != nil {
-				return fmt.Errorf("semantic readiness of %s: %w", device.ID, err)
-			}
-			if !ready {
-				return fmt.Errorf("semantic readiness of %s is false", device.ID)
-			}
-		}
+		devices = append(devices, device)
 	}
-	return nil
+	return runBoundedDeviceChecks(ctx, s.workLimiter().ClampWorkers(limiter.Apply, 0),
+		devices, s.recoveryArtifactLimit(),
+		func(device *model.Device) string { return "semantic verification " + device.ID },
+		func(verifyCtx context.Context, device *model.Device) error {
+			if s.isExempt(top.Name, device.ID) {
+				return nil
+			}
+			expected := artifacts[device.ID]
+			if expected == nil {
+				var err error
+				expected, err = renderedSemanticArtifacts(r, device)
+				if err != nil {
+					return fmt.Errorf("render semantic artifacts for %s: %w", device.ID, err)
+				}
+			}
+			deviceMode := renderModeForDevice(mode, ungraded, device)
+			if err := s.verifyRenderedArtifacts(verifyCtx, top, device, deviceMode, expected); err != nil {
+				return err
+			}
+			if err := s.semanticProbe(verifyCtx, top, mode, ungraded, device); err != nil {
+				return err
+			}
+			if waiter := r.Ready(device, s.rt); waiter != nil {
+				ready, err := waiter.Check(verifyCtx)
+				if err != nil {
+					return fmt.Errorf("semantic readiness of %s: %w", device.ID, err)
+				}
+				if !ready {
+					return fmt.Errorf("semantic readiness of %s is false", device.ID)
+				}
+			}
+			return nil
+		})
 }
 
 func renderedSemanticArtifacts(r *render.Renderer, device *model.Device) ([]transactionArtifact, error) {
