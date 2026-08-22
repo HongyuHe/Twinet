@@ -188,7 +188,9 @@ func renderBirdFilters(b *strings.Builder, localASN int, peer birdPeer) {
 		// student system in this region. BIRD's AS-path mask is the semantic
 		// equivalent of the two FRR access-list spellings (terminal and
 		// interior occurrence).
-		fmt.Fprintf(b, "  if bgp_path ~ [* %d *] then reject;\n", asn)
+		// BIRD AS-path masks need the [= ... =] delimiters; bare [* ASN *]
+		// is parsed as a literal list and rejects the whole configuration.
+		fmt.Fprintf(b, "  if bgp_path ~ [= * %d * =] then reject;\n", asn)
 	}
 	fmt.Fprintf(b, "  bgp_local_pref = %d;\n", pref)
 	fmt.Fprintf(b, "  bgp_community.add((1,%d));\n", community)
