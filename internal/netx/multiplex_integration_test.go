@@ -143,6 +143,48 @@ func TestMultiplexOverlaySharesTunnelAndIsolatesFrames(t *testing.T) {
 		t.Fatalf("frame leaked from VNI 5001 into VNI 5002: %v", err)
 	}
 
+	// Remove exactly one active mapping while preserving the shared trunk and
+	// endpoint veth, then reconcile it through the same Ensure/Attach path
+	// used by deploy binding repair.
+	if err := hostA.Do(func() error { return RemoveOverlay(5001) }); err != nil {
+		t.Fatal(err)
+	}
+	if err := hostA.Do(func() error {
+		bridge, err := EnsureMultiplexOverlay(MultiplexOverlaySpec{
+			Lab: "mux-test", LocalNode: "host-a", RemoteNode: "host-b",
+			LocalIP: "198.18.0.1", RemoteIP: "198.18.0.2", UnderlayDev: "tmuxua",
+			MTU: 1400, VNI: 5001, VLAN: vlans[5001],
+		})
+		if err != nil {
+			return err
+		}
+		return AttachToMultiplexOverlay("tmha1", bridge, vlans[5001])
+	}); err != nil {
+		t.Fatal(err)
+	}
+	assertPhysicalInventory(t, hostA, "mux-test", 2, 1)
+	udpReady = make(chan error, 1)
+	udpResult = make(chan error, 1)
+	go receiveIntegrationUDP(clientA2, "10.77.1.2", 29002, udpReady, udpResult)
+	if err := <-udpReady; err != nil {
+		t.Fatal(err)
+	}
+	rawReady = make(chan error, 1)
+	rawResult = make(chan error, 1)
+	go receiveForeignFrame(clientB2, "tmb2", macA1, rawReady, rawResult)
+	if err := <-rawReady; err != nil {
+		t.Fatal(err)
+	}
+	if err := sendIntegrationUDP(clientA1, "10.77.1.2", 29002, []byte("only-vni-5001")); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-udpResult; err != nil {
+		t.Fatalf("repaired binding did not restore delivery: %v", err)
+	}
+	if err := <-rawResult; err != nil {
+		t.Fatalf("repaired binding leaked into VNI 5002: %v", err)
+	}
+
 }
 
 // This deliberately disables the in-process pair lock. It models independent

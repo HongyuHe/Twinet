@@ -461,6 +461,7 @@ func DeleteHostLink(name string) error {
 	if err != nil {
 		return fmt.Errorf("open host netlink handle: %w", err)
 	}
+
 	defer h.Close()
 	l, err := h.LinkByName(name)
 	if err != nil {
@@ -473,6 +474,25 @@ func DeleteHostLink(name string) error {
 		return fmt.Errorf("delete %s: %w", name, err)
 	}
 	return nil
+}
+
+// HostLinkPresent reports whether a host-namespace link exists without
+// modifying it. Overlay binding repair uses this to refuse a missing endpoint
+// before it creates a new trunk mapping for a cable that is not present.
+func HostLinkPresent(name string) (bool, error) {
+	h, err := netlink.NewHandle()
+	if err != nil {
+		return false, fmt.Errorf("open host netlink handle: %w", err)
+	}
+	defer h.Close()
+	_, err = h.LinkByName(name)
+	if err == nil {
+		return true, nil
+	}
+	if IsNotFound(err) {
+		return false, nil
+	}
+	return false, fmt.Errorf("look up %s: %w", name, err)
 }
 
 // endpointHandle opens an independent netlink socket in an endpoint's target

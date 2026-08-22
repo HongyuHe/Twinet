@@ -340,6 +340,7 @@ func newNodeReconcileCmd(opts *Options, token *string) *cobra.Command {
 		lab     string
 		devices []string
 		force   bool
+		overlay bool
 	)
 	cmd := &cobra.Command{
 		Use:   "reconcile",
@@ -356,7 +357,7 @@ func newNodeReconcileCmd(opts *Options, token *string) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			results := client.NewCluster(top.Lab, tok).Reconcile(cmd.Context(), lab, devices, force)
+			results := client.NewCluster(top.Lab, tok).ReconcileWithOverlay(cmd.Context(), lab, devices, force, overlay)
 			if opts.JSON {
 				return json.NewEncoder(cmd.OutOrStdout()).Encode(results)
 			}
@@ -370,6 +371,17 @@ func newNodeReconcileCmd(opts *Options, token *string) *cobra.Command {
 					fmt.Fprintf(cmd.OutOrStdout(), "%s: queued %s\n",
 						result.Node, strings.Join(result.Value.Scheduled, ", "))
 				}
+				if len(result.Value.OverlayRepaired) > 0 {
+					fmt.Fprintf(cmd.OutOrStdout(), "%s: repaired overlay bindings %s\n",
+						result.Node, strings.Join(result.Value.OverlayRepaired, ", "))
+				}
+				if len(result.Value.OverlayExtra) > 0 {
+					problems = append(problems, result.Node+": extra overlay bindings require explicit prune: "+
+						strings.Join(result.Value.OverlayExtra, ", "))
+				}
+				for binding, failure := range result.Value.OverlayFailed {
+					problems = append(problems, result.Node+": overlay "+binding+": "+failure)
+				}
 			}
 			if len(problems) > 0 {
 				sort.Strings(problems)
@@ -381,6 +393,7 @@ func newNodeReconcileCmd(opts *Options, token *string) *cobra.Command {
 	cmd.Flags().StringVar(&lab, "lab", "", "lab to reconcile (default: manifest lab)")
 	cmd.Flags().StringSliceVar(&devices, "device", nil, "device ID to reconcile (repeatable; default all local devices)")
 	cmd.Flags().BoolVar(&force, "force", false, "clear automatic repair backoff before queuing")
+	cmd.Flags().BoolVar(&overlay, "overlay", false, "repair logical VNI/VLAN bindings too (implicit when no --device is given)")
 	return cmd
 }
 

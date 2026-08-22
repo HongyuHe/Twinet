@@ -1425,7 +1425,29 @@ func (s *Server) migrateLegacyCommittedInventory(ctx context.Context, lab string
 	upgraded.PhysicalTrunks = expected.Trunks
 	upgraded.VNIs = bindingVNIs(expected.Bindings)
 	if err := inventoryMatches(upgraded, got); err != nil {
-		return transactionInventory{}, err
+		if s.rt == nil {
+			// Focused inventory/restart tests may inject only an observed
+			// inventory seam. A real agent always has a runtime and is the
+			// only environment allowed to touch endpoint namespaces.
+			return transactionInventory{}, err
+		}
+		repair, repairErr := eng.ReconcileOverlayBindings(ctx, top)
+		if repairErr != nil {
+			return transactionInventory{}, fmt.Errorf("inspect overlay drift: %w", repairErr)
+		}
+		if len(repair.Failed) > 0 {
+			return transactionInventory{}, fmt.Errorf("repair logical bindings failed: %v", repair.Failed)
+		}
+		if len(repair.Extra) > 0 {
+			return transactionInventory{}, fmt.Errorf("extra logical bindings require explicit prune: %v", repair.Extra)
+		}
+		got, repairErr = s.snapshotTransactionInventory(ctx, lab)
+		if repairErr != nil {
+			return transactionInventory{}, repairErr
+		}
+		if err := inventoryMatches(upgraded, got); err != nil {
+			return transactionInventory{}, err
+		}
 	}
 
 	s.mu.Lock()

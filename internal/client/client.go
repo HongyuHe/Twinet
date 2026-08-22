@@ -692,9 +692,15 @@ func (c *Cluster) ReconcileControls(ctx context.Context, lab string) []NodeResul
 
 // Reconcile asks every node that hosts a lab to enqueue bounded checks.
 func (c *Cluster) Reconcile(ctx context.Context, lab string, devices []string, force bool) []NodeResult[agent.ReconcileResponse] {
+	return c.ReconcileWithOverlay(ctx, lab, devices, force, false)
+}
+
+// ReconcileWithOverlay additionally repairs missing/mismatched logical
+// VNI/VLAN bindings. It does not recreate endpoint containers.
+func (c *Cluster) ReconcileWithOverlay(ctx context.Context, lab string, devices []string, force, overlay bool) []NodeResult[agent.ReconcileResponse] {
 	ctx = operationContext(ctx)
 	return fanOut(ctx, c.Nodes, func(ctx context.Context, n *Node) (agent.ReconcileResponse, error) {
-		return n.Reconcile(ctx, agent.ReconcileRequest{Lab: lab, Devices: devices, Force: force})
+		return n.Reconcile(ctx, agent.ReconcileRequest{Lab: lab, Devices: devices, Force: force, Overlay: overlay})
 	})
 }
 
