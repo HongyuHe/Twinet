@@ -121,6 +121,7 @@ after a partial failure, a reboot, or a topology edit.`,
 				if err := phases.measure("noop_preflight", func() error {
 					var preflightErr error
 					noop, preflightErr = tryClusterNoop(cmd.Context(), top, tok, modeName(solve), 0,
+						opts.Verbose, opts.JSON,
 						cmd.OutOrStdout(), cmd.ErrOrStderr())
 					return preflightErr
 				}); err != nil {
