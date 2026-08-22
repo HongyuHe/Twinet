@@ -41,12 +41,40 @@ type Env struct {
 	// this struct and they must share one cache -- and because a mutex inside
 	// a struct that is copied is a mutex that protects nothing.
 	peers *peerCache
+
+	// snapshot is shared by every copy of Env made for a grade. It caches only
+	// passive observations; active probes deliberately bypass it so counters
+	// and captures continue to attribute one flow to one check.
+	snapshot *ObservationSnapshot
+	// liveState is set for checks that deliberately compare state before and
+	// after an active control-plane action (for example a BGP refresh).
+	liveState bool
 }
 
 // DeviceState reads vendor-neutral operational state from a named device.
 // Unsupported provider state is recorded as infrastructure unsupported, never
 // translated into an empty FRR table or a student deduction.
 func (e *Env) DeviceState(ctx context.Context, deviceID string, query netstate.Query) (netstate.State, error) {
+	if e.snapshot != nil && !e.liveState {
+		state, err := e.snapshot.state(ctx, deviceID, query, func(ctx context.Context) (netstate.State, error) {
+			return e.readDeviceState(ctx, deviceID, query)
+		})
+		if err != nil {
+			return netstate.State{}, e.infra(deviceID, "read network state "+query.String(), err)
+		}
+		return state, nil
+	}
+	return e.readDeviceState(ctx, deviceID, query)
+}
+
+// LiveDeviceState bypasses the passive snapshot. It exists only for checks
+// that establish a before/after witness around an active action; using a
+// cached counter or BGP update total there would weaken that witness.
+func (e *Env) LiveDeviceState(ctx context.Context, deviceID string, query netstate.Query) (netstate.State, error) {
+	return e.readDeviceState(ctx, deviceID, query)
+}
+
+func (e *Env) readDeviceState(ctx context.Context, deviceID string, query netstate.Query) (netstate.State, error) {
 	if e.Topology == nil {
 		return netstate.State{}, e.infra(deviceID, "read network state", fmt.Errorf("no topology is available"))
 	}
@@ -82,7 +110,13 @@ func (e *Env) DeviceState(ctx context.Context, deviceID string, query netstate.Q
 		}
 		reader = provider
 	}
-	state, err := reader.ReadState(ctx, d, netstate.ExecFunc(e.Exec), query)
+	exec := e.Exec
+	if e.snapshot != nil && !e.liveState {
+		exec = func(ctx context.Context, deviceID string, command []string) (rt.ExecResult, error) {
+			return e.snapshot.command(ctx, "netstate", deviceID, command)
+		}
+	}
+	state, err := reader.ReadState(ctx, d, netstate.ExecFunc(exec), query)
 	if err != nil {
 		op := "read network state " + query.String()
 		return netstate.State{}, e.infra(deviceID, op, err)
@@ -145,7 +179,17 @@ func (e *Env) Vtysh(ctx context.Context, device, command string) (string, error)
 			})
 		}
 	}
-	res, err := e.Exec(ctx, model.DeviceID(e.AS, device), []string{"vtysh", "-c", command})
+	deviceID := model.DeviceID(e.AS, device)
+	cmd := []string{"vtysh", "-c", command}
+	var (
+		res rt.ExecResult
+		err error
+	)
+	if e.snapshot != nil && !e.liveState && snapshotReadOnlyCommand(cmd) {
+		res, err = e.snapshot.command(ctx, "vtysh", deviceID, cmd)
+	} else {
+		res, err = e.Exec(ctx, deviceID, cmd)
+	}
 	if err != nil {
 		return "", e.infra(device, command, err)
 	}
@@ -184,11 +228,31 @@ func (e *Env) VtyshJSON(ctx context.Context, device, command string, out any) er
 // the single worst thing this system can get wrong, because it produces a
 // plausible mark that nobody has any reason to question.
 func (e *Env) Probe(ctx context.Context, deviceID string, cmd []string) (rt.ExecResult, error) {
-	res, err := e.Exec(ctx, deviceID, cmd)
+	var (
+		res rt.ExecResult
+		err error
+	)
+	if e.snapshot != nil && !e.liveState && snapshotReadOnlyCommand(cmd) {
+		res, err = e.snapshot.command(ctx, "exec", deviceID, cmd)
+	} else {
+		res, err = e.Exec(ctx, deviceID, cmd)
+	}
 	if err != nil {
 		return res, e.infra(deviceID, strings.Join(cmd, " "), err)
 	}
 	return res, nil
+}
+
+// Observe runs a declared passive command through the per-grade snapshot.
+// Unlike Probe it does not classify an error as a grading infrastructure error:
+// callers that intentionally retain a model fallback (for example optional
+// host address discovery) can preserve that behaviour while still deduplicating
+// an identical observation across checks.
+func (e *Env) Observe(ctx context.Context, deviceID string, cmd []string) (rt.ExecResult, error) {
+	if e.snapshot != nil && !e.liveState {
+		return e.snapshot.command(ctx, "exec", deviceID, cmd)
+	}
+	return e.Exec(ctx, deviceID, cmd)
 }
 
 // InfraError marks a failure of the grading machinery rather than of the
@@ -348,6 +412,19 @@ type Check struct {
 	Describe string
 	// Run performs the assertion.
 	Run CheckFunc
+	// Observations declares the passive vendor-neutral state this check can
+	// consume from the per-grade snapshot. Empty uses the conservative
+	// built-in declaration for the shipped check name.
+	Observations []ObservationDependency
+	// Resources declares active probe resources. Checks with no active
+	// probes leave it nil and can run beside anything; checks that touch the
+	// same counter, capture, port, source, destination, or interface are
+	// serialised by the deterministic scheduler.
+	Resources ProbeResourceResolver
+	// LiveObservations is for a check that intentionally compares passive
+	// state on either side of an action it performs. It bypasses the snapshot
+	// rather than accidentally treating its first read as the second.
+	LiveObservations bool
 }
 
 // registry holds every known check. It is populated by init functions in the
@@ -358,6 +435,19 @@ var registry = map[string]*Check{}
 func Register(c *Check) {
 	if c.Name == "" {
 		panic("grade: check with no name")
+	}
+	// Shipped checks written before declarative scheduling receive the same
+	// reviewed dependency declaration at registration time. New checks may
+	// override it explicitly, but none are allowed to silently become an
+	// unbounded per-check observation source.
+	if c.Observations == nil {
+		c.Observations = inferredObservations(c.Name)
+	}
+	if c.Resources == nil {
+		name := c.Name
+		c.Resources = func(env *Env, _ map[string]any) []ProbeResource {
+			return inferredProbeResources(name, env)
+		}
 	}
 	if _, dup := registry[c.Name]; dup {
 		panic("grade: duplicate check " + c.Name)

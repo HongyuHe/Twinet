@@ -7,6 +7,7 @@ import (
 	"github.com/HongyuHe/twinet/internal/expand"
 	"github.com/HongyuHe/twinet/internal/manifest"
 	"github.com/HongyuHe/twinet/internal/model"
+	"github.com/HongyuHe/twinet/internal/render"
 )
 
 func classTopology(t *testing.T) *model.Topology {
@@ -95,6 +96,7 @@ func TestSliceDoesNotMutateTheClassTopology(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	// Mutating the harness is the whole point of a harness; it must not reach
 	// back into the class topology that other submissions are sliced from.
 	for _, d := range h.Devices {
@@ -118,6 +120,61 @@ func TestSliceDoesNotMutateTheClassTopology(t *testing.T) {
 		if d.Image == "mutated" {
 			t.Fatalf("device %s in the class topology was mutated through the harness", d.ID)
 		}
+	}
+}
+
+func TestSyntheticSliceCollapsesReferenceInteriorsWithoutDroppingOrigins(t *testing.T) {
+	full := classTopology(t)
+	before := full.Stats()
+	beforeHash := full.Hash
+	h, err := Slice(full, 3, Options{Synthetic: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(h.ASes); got != len(full.ASes) {
+		t.Fatalf("synthetic slice retained %d ASes, want all %d origins", got, len(full.ASes))
+	}
+	if got := len(h.ASes[3].Devices); got != len(full.ASes[3].Devices) {
+		t.Fatalf("target lost devices: got %d, want %d", got, len(full.ASes[3].Devices))
+	}
+	for asn, as := range h.ASes {
+		if asn == 3 || as.Role == model.RoleIXP {
+			continue
+		}
+		if len(as.Routers) != 1 {
+			t.Errorf("AS %d retained %d synthetic routers, want one", asn, len(as.Routers))
+		}
+		if as.Block == "" {
+			t.Errorf("AS %d lost its origin block", asn)
+		}
+	}
+	if got := len(h.Devices); got > 42 {
+		t.Fatalf("synthetic harness has %d devices, want roughly 40 rather than 121", got)
+	}
+	seen := map[string]bool{}
+	for _, d := range h.SortedDevices() {
+		for _, iface := range d.Ifaces {
+			if len(iface.Name) > 15 {
+				t.Errorf("%s interface %q exceeds IFNAMSIZ", d.ID, iface.Name)
+			}
+			key := d.ID + "/" + iface.Name
+			if seen[key] {
+				t.Errorf("synthetic collapse gave %s two interfaces named %q", d.ID, iface.Name)
+			}
+			seen[key] = true
+		}
+		if !d.IsRouter() {
+			continue
+		}
+		if _, err := render.Router(h, d); err != nil {
+			t.Errorf("synthetic router %s cannot render: %v", d.ID, err)
+		}
+	}
+	t.Logf("synthetic harness %d devices / %d links (from %d devices)",
+		len(h.Devices), len(h.Links), len(full.Devices))
+	if got := full.Stats(); got.Devices != before.Devices || got.Links != before.Links || full.Hash != beforeHash {
+		t.Fatalf("synthetic slicing mutated class topology: got %+v/%s, want %+v/%s",
+			got, full.Hash, before, beforeHash)
 	}
 }
 

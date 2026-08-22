@@ -21,14 +21,16 @@ import (
 
 func init() {
 	Register(&Check{
-		Name:     "bgp.ibgp_full_mesh",
-		Describe: "a BGP session exists between every pair of routers, sourced from loopbacks",
-		Run:      checkIBGPFullMesh,
+		Name:             "bgp.ibgp_full_mesh",
+		Describe:         "a BGP session exists between every pair of routers, sourced from loopbacks",
+		Run:              checkIBGPFullMesh,
+		LiveObservations: true,
 	})
 	Register(&Check{
-		Name:     "bgp.ebgp_established",
-		Describe: "every external BGP session with a neighbour is established",
-		Run:      checkEBGPEstablished,
+		Name:             "bgp.ebgp_established",
+		Describe:         "every external BGP session with a neighbour is established",
+		Run:              checkEBGPEstablished,
+		LiveObservations: true,
 	})
 	Register(&Check{
 		Name:     "bgp.own_prefix_only",

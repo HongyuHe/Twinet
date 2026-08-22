@@ -4190,7 +4190,7 @@ func firstTracerouteHop(out string) string {
 // another one was reported unreachable inside their own network, for an answer
 // the assignment permits.
 func deviceAddr4(ctx context.Context, env *Env, d *model.Device) string {
-	res, err := env.Exec(ctx, d.ID, []string{"sh", "-c",
+	res, err := env.Observe(ctx, d.ID, []string{"sh", "-c",
 		"ip -o -4 addr show scope global 2>/dev/null | awk '{print $4}'"})
 	if err == nil && res.ExitCode == 0 {
 		for _, f := range strings.Fields(res.Stdout) {
@@ -4207,7 +4207,7 @@ func deviceHoldsAddr(ctx context.Context, env *Env, d *model.Device, addr string
 	if d == nil || addr == "" {
 		return false
 	}
-	res, err := env.Exec(ctx, d.ID, []string{"sh", "-c",
+	res, err := env.Observe(ctx, d.ID, []string{"sh", "-c",
 		"ip -o -4 addr show scope global 2>/dev/null | awk '{print $4}'"})
 	if err == nil && res.ExitCode == 0 {
 		for _, f := range strings.Fields(res.Stdout) {

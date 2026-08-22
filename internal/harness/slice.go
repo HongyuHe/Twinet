@@ -76,6 +76,19 @@ type Options struct {
 	// hundred students in their own labs possible at all.
 	Reduce bool
 
+	// Synthetic collapses every retained non-target, non-IXP AS to one
+	// deterministic reference router. Its external interfaces are preserved
+	// and attached to that router, so the renderer still supplies the AS's
+	// relationship policy, prefix origin, RPKI behaviour, and link properties
+	// without paying for an unobservable interior. The target stays whole and
+	// exchanges stay whole because their shared route-server semantics are
+	// observable by the rubric.
+	//
+	// It is deliberately separate from Reduce: callers can retain the older
+	// router-facing slice for an appeal, then compare it to this compact
+	// substrate before releasing a synthetic-harness mark.
+	Synthetic bool
+
 	// Suffix distinguishes harnesses derived from the same target, so a
 	// re-mark can run beside the original instead of replacing it.
 	Suffix string
@@ -98,6 +111,7 @@ func Slice(top *model.Topology, target int, opts Options) (*model.Topology, erro
 
 	keepAS := neighbourhood(top, target, opts.Depth)
 	keepDev := devicesToKeep(top, target, keepAS, opts)
+	collapsed := syntheticDeviceMap(top, target, keepAS, opts)
 
 	name := harnessName(top.Name, target, opts.Suffix)
 	out := &model.Topology{
@@ -186,7 +200,11 @@ func Slice(top *model.Topology, target int, opts Options) (*model.Topology, erro
 			if b == nil || b.Router == nil {
 				continue
 			}
-			if nr, ok := out.Devices[b.Router.ID]; ok {
+			routerID := b.Router.ID
+			if mapped := collapsed[routerID]; mapped != "" {
+				routerID = mapped
+			}
+			if nr, ok := out.Devices[routerID]; ok {
 				dst.ExtPorts[pname] = &model.ExtPortBinding{Name: pname, Router: nr}
 			}
 		}
@@ -209,10 +227,21 @@ func Slice(top *model.Topology, target int, opts Options) (*model.Topology, erro
 		if l.A == nil || l.B == nil {
 			continue
 		}
-		if !keepDev[devID(l.A)] || !keepDev[devID(l.B)] {
+		aID, bID := devID(l.A), devID(l.B)
+		if mapped := collapsed[aID]; mapped != "" {
+			aID = mapped
+		}
+		if mapped := collapsed[bID]; mapped != "" {
+			bID = mapped
+		}
+		// An interior link whose two ends collapsed into one synthetic
+		// router cannot carry an observable inter-AS policy or origin.
+		if aID == bID || !keepDev[aID] || !keepDev[bID] {
 			continue
 		}
 		nl := copyLink(l)
+		nl.A.Device = out.Devices[aID]
+		nl.B.Device = out.Devices[bID]
 		out.Links = append(out.Links, nl)
 		ids = append(ids, nl.ID)
 	}
@@ -225,6 +254,9 @@ func Slice(top *model.Topology, target int, opts Options) (*model.Topology, erro
 		l.VNI = vnis[l.ID]
 	}
 
+	if opts.Synthetic {
+		uniquifySyntheticIfaces(out, target)
+	}
 	rebind(out)
 	out.Hash = hashTopology(out)
 	return out, nil
@@ -282,7 +314,7 @@ func neighbourhood(top *model.Topology, target, depth int) map[int]bool {
 func devicesToKeep(top *model.Topology, target int, keepAS map[int]bool, opts Options) map[string]bool {
 	keep := map[string]bool{}
 
-	if opts.Depth <= 0 && !opts.Reduce {
+	if opts.Depth <= 0 && !opts.Reduce && !opts.Synthetic {
 		// Full breadth keeps every device. A reachability check that ends at a
 		// host, or an IGP check that crosses an interior router, must find the
 		// same network the class lab has.
@@ -290,6 +322,10 @@ func devicesToKeep(top *model.Topology, target int, keepAS map[int]bool, opts Op
 			keep[d.ID] = true
 		}
 		return keep
+	}
+
+	if opts.Synthetic {
+		return syntheticDevicesToKeep(top, target, keepAS)
 	}
 
 	// The target is kept whole: it is the thing under test, and any check that
@@ -395,6 +431,144 @@ func devicesToKeep(top *model.Topology, target int, keepAS map[int]bool, opts Op
 		}
 	}
 	return keep
+}
+
+// syntheticDevicesToKeep retains the submission unchanged and selects one
+// deterministic reference router for every other ordinary AS. Links are
+// rebound to those selected routers in Slice, which retains the real
+// relationship graph and AS-level policy while removing remote interiors.
+func syntheticDevicesToKeep(top *model.Topology, target int, keepAS map[int]bool) map[string]bool {
+	keep := map[string]bool{}
+	for asn := range keepAS {
+		as := top.ASes[asn]
+		if as == nil {
+			continue
+		}
+		switch {
+		case asn == target:
+			for _, device := range as.Devices {
+				keep[device.ID] = true
+			}
+		case as.Role == model.RoleIXP:
+			// A route server's set of members is the observable behaviour;
+			// reducing it changes which policy can fire.
+			for _, device := range as.Devices {
+				keep[device.ID] = true
+			}
+		default:
+			if router := syntheticAnchor(as); router != nil {
+				keep[router.ID] = true
+			}
+		}
+	}
+	// Services are not AS members. Keep only those directly attached to the
+	// target: the target's DNS/RPKI/measurement contract is observable, while
+	// a remote AS's duplicate service attachment is not.
+	for _, link := range top.Links {
+		if link.A == nil || link.B == nil {
+			continue
+		}
+		for _, side := range []*model.Iface{link.A, link.B} {
+			other := link.B
+			if side == link.B {
+				other = link.A
+			}
+			if side.Device == nil || other == nil || other.Device == nil {
+				continue
+			}
+			if side.Device.Kind == model.KindService && other.Device.ASN == target {
+				keep[side.Device.ID] = true
+			}
+		}
+	}
+	return keep
+}
+
+// syntheticDeviceMap maps every remote ordinary-AS device to its selected
+// synthetic router. Target and IXP devices keep their original identity.
+func syntheticDeviceMap(top *model.Topology, target int, keepAS map[int]bool, opts Options) map[string]string {
+	if !opts.Synthetic {
+		return nil
+	}
+	out := map[string]string{}
+	for asn := range keepAS {
+		as := top.ASes[asn]
+		if as == nil || asn == target || as.Role == model.RoleIXP {
+			continue
+		}
+		anchor := syntheticAnchor(as)
+		if anchor == nil {
+			continue
+		}
+		for _, device := range as.Devices {
+			out[device.ID] = anchor.ID
+		}
+	}
+	return out
+}
+
+func syntheticAnchor(as *model.AS) *model.Device {
+	if as == nil {
+		return nil
+	}
+	routers := append([]*model.Device(nil), as.Routers...)
+	sort.Slice(routers, func(i, j int) bool { return routers[i].ID < routers[j].ID })
+	for _, router := range routers {
+		if router != nil && router.IsRouter() {
+			return router
+		}
+	}
+	return nil
+}
+
+// uniquifySyntheticIfaces makes a collapsed router's many inherited external
+// interfaces valid Linux names and derives matching MAC identities. The target
+// and route servers keep their authored names because checks name those
+// interfaces directly.
+func uniquifySyntheticIfaces(top *model.Topology, target int) {
+	if top == nil {
+		return
+	}
+	links := append([]*model.Link(nil), top.Links...)
+	sort.Slice(links, func(i, j int) bool { return links[i].ID < links[j].ID })
+	used := map[string]map[string]bool{}
+	for _, link := range links {
+		for sideIndex, side := range []*model.Iface{link.A, link.B} {
+			if side == nil || side.Device == nil || side.Device.ASN == target {
+				continue
+			}
+			as := top.ASes[side.Device.ASN]
+			if as == nil || as.Role == model.RoleIXP {
+				continue
+			}
+			if used[side.Device.ID] == nil {
+				used[side.Device.ID] = map[string]bool{}
+			}
+			name := side.Name
+			if name == "" || used[side.Device.ID][name] {
+				name = syntheticIfaceName(link.ID, byte('a'+sideIndex), used[side.Device.ID])
+				side.Name = name
+			}
+			used[side.Device.ID][name] = true
+			side.MAC = alloc.MAC(top.Name, side.Device.ID, name)
+		}
+	}
+}
+
+func syntheticIfaceName(linkID string, side byte, used map[string]bool) string {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(linkID))
+	_, _ = h.Write([]byte{side})
+	for salt := 0; ; salt++ {
+		name := fmt.Sprintf("syn%010x", h.Sum64()&0xFFFFFFFFFF)
+		if salt > 0 {
+			name = fmt.Sprintf("s%02x%09x", salt&0xff, h.Sum64()&0x1FFFFFFFFF)
+		}
+		if !used[name] {
+			return name
+		}
+		_, _ = h.Write([]byte{byte(salt + 1)})
+	}
 }
 
 // firstHostAttachedTo finds a host of as directly attached to a router already

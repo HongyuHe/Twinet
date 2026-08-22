@@ -187,6 +187,22 @@ type Report struct {
 	// These are audit provenance; contract compatibility, not source equality,
 	// determines whether a rolling upgrade is safe.
 	Agents map[string]string `json:"agents,omitempty"`
+	// Observation is the one passive, immutable observation set shared by
+	// this grade. Active delivery witnesses are intentionally represented in
+	// check evidence instead: a cached counter/capture is not a witness.
+	Observation *ObservationSnapshot `json:"observation_snapshot,omitempty"`
+	// PhaseTimings is machine-readable timing evidence for capacity planning
+	// and benchmark regression detection. It is ordered by phase start/name,
+	// not by goroutine completion order.
+	PhaseTimings []PhaseTiming `json:"phase_timings,omitempty"`
+}
+
+// PhaseTiming records a bounded phase of one grade.
+type PhaseTiming struct {
+	Name       string    `json:"name"`
+	StartedAt  time.Time `json:"started_at"`
+	FinishedAt time.Time `json:"finished_at"`
+	Duration   string    `json:"duration"`
 }
 
 // Percent returns the score as a percentage.

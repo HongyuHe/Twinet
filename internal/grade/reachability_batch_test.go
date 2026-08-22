@@ -2,6 +2,8 @@ package grade
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"sync"
 	"testing"
 
@@ -21,6 +23,7 @@ func TestBatchedPingFailuresUsesOneExecPerSource(t *testing.T) {
 		if len(command) != 3 || command[0] != "sh" || command[1] != "-c" {
 			t.Fatalf("want agent-side shell batch, got %v", command)
 		}
+
 		if device == a.ID {
 			return rt.ExecResult{Stdout: "@ 0 0\n"}, nil
 		}
@@ -36,6 +39,32 @@ func TestBatchedPingFailuresUsesOneExecPerSource(t *testing.T) {
 	defer mu.Unlock()
 	if calls[a.ID] != 1 || calls[b.ID] != 1 {
 		t.Fatalf("calls=%v, want one exec per source", calls)
+	}
+}
+
+func TestBatchedPingFailuresBoundsSourceSidePressure(t *testing.T) {
+	source := &model.Device{ID: "as3/A", Name: "A"}
+	probes := make([]reachabilityProbe, 0, sourceBatchWidth+1)
+	addresses := map[string]string{}
+	for i := 0; i < sourceBatchWidth+1; i++ {
+		target := &model.Device{ID: "as3/T" + string(rune('A'+i)), Name: "T"}
+		probes = append(probes, reachabilityProbe{from: source, to: target})
+		addresses[target.ID] = "192.0.2." + string(rune('1'+i))
+	}
+	var script string
+	env := &Env{Exec: func(_ context.Context, _ string, command []string) (rt.ExecResult, error) {
+		script = command[2]
+		var out strings.Builder
+		for i := range probes {
+			fmt.Fprintf(&out, "@ %d 0\n", i)
+		}
+		return rt.ExecResult{Stdout: out.String()}, nil
+	}}
+	if _, complete := batchedPingFailures(context.Background(), env, probes, addresses); !complete {
+		t.Fatal("bounded batch was incomplete")
+	}
+	if got := strings.Count(script, "wait\n"); got < 2 {
+		t.Fatalf("source batch did not drain bounded child groups: script=%q", script)
 	}
 }
 

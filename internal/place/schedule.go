@@ -15,6 +15,27 @@ type Workload struct {
 	DemandByNode map[string]Resources
 }
 
+// SafeWorkerCount derives the widest currently admissible grading wave from
+// live inventory. requested is an upper bound, not a promise: a worker count
+// that fits yesterday's reservations is not safe to start today. Callers still
+// re-check admission immediately before deployment.
+func SafeWorkerCount(lab *model.Lab, inventory []NodeInventory, workloads []Workload, requested int) (int, error) {
+	if len(workloads) == 0 {
+		return 0, nil
+	}
+	if requested <= 0 || requested > len(workloads) {
+		requested = len(workloads)
+	}
+	waves, err := ScheduleWaves(lab, inventory, workloads, requested)
+	if err != nil {
+		return 0, err
+	}
+	if len(waves) == 0 {
+		return 0, nil
+	}
+	return len(waves[0]), nil
+}
+
 // ScheduleWaves packs workloads into deterministic capacity-safe waves. max is
 // an upper bound, never a command to use that much concurrency. Existing node
 // reservations are charged to every wave, so other labs and harnesses cannot

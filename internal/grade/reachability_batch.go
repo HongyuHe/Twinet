@@ -18,6 +18,12 @@ type reachabilityProbe struct {
 	srcIface string
 }
 
+// sourceBatchWidth bounds the number of child probes one source-side agent
+// shell may have in flight. Agent-side ExecProbe limits bound calls across the
+// node; this bound prevents one accepted batch from turning into an unbounded
+// process burst inside a single student namespace.
+const sourceBatchWidth = 8
+
 // batchedPingFailures runs all probes from one source in one agent-side shell.
 // It returns complete=false whenever a source could not prove every individual
 // command ran; callers then use the slower per-pair path rather than treating
@@ -45,7 +51,7 @@ func batchedPingFailures(ctx context.Context, env *Env, probes []reachabilityPro
 		go func() {
 			defer wg.Done()
 			var body strings.Builder
-			for _, index := range indexes {
+			for offset, index := range indexes {
 				probe := probes[index]
 				args := "ping -c 2 -W 2 -i 0.2"
 				if probe.srcIface != "" {
@@ -53,6 +59,9 @@ func batchedPingFailures(ctx context.Context, env *Env, probes []reachabilityPro
 				}
 				fmt.Fprintf(&body, "( %s %s >/dev/null 2>&1; echo '@ %d '$? ) &\n",
 					args, addresses[probe.to.ID], index)
+				if (offset+1)%sourceBatchWidth == 0 {
+					body.WriteString("wait\n")
+				}
 			}
 			body.WriteString("wait\n")
 			res, err := env.Probe(ctx, probes[indexes[0]].from.ID, []string{"sh", "-c", body.String()})
@@ -338,7 +347,7 @@ func sendTransportBatch(ctx context.Context, env *Env, attempts []transportAttem
 		go func() {
 			defer wg.Done()
 			var body strings.Builder
-			for _, attempt := range group {
+			for offset, attempt := range group {
 				if udp {
 					src := firstAddr(attempt.from)
 					if _, err := netip.ParseAddr(src); err != nil {
@@ -349,10 +358,13 @@ func sendTransportBatch(ctx context.Context, env *Env, attempts []transportAttem
 					}
 					fmt.Fprintf(&body, `( n=0; for x in 1 2 3; do e=$(printf twinet | nc -u -w 1 -s %s -p %s %s %s 2>&1); [ -z "$e" ] && n=$((n+1)); done; if [ "$n" -gt 0 ]; then echo "@ %d sent"; else echo "@ %d unsent"; fi ) &`+"\n",
 						src, attempt.sourcePort, attempt.address, attempt.destPort, attempt.index, attempt.index)
-					continue
+				} else {
+					fmt.Fprintf(&body, `( e=$(nc -v -w 3 -z -p %s %s %s 2>&1); case "$e" in *bind*) echo "@ %d unsent";; *) echo "@ %d sent";; esac ) &`+"\n",
+						attempt.sourcePort, attempt.address, attempt.destPort, attempt.index, attempt.index)
 				}
-				fmt.Fprintf(&body, `( e=$(nc -v -w 3 -z -p %s %s %s 2>&1); case "$e" in *bind*) echo "@ %d unsent";; *) echo "@ %d sent";; esac ) &`+"\n",
-					attempt.sourcePort, attempt.address, attempt.destPort, attempt.index, attempt.index)
+				if (offset+1)%sourceBatchWidth == 0 {
+					body.WriteString("wait\n")
+				}
 			}
 			body.WriteString("wait\n")
 			res, err := env.Probe(ctx, source, []string{"sh", "-c", body.String()})

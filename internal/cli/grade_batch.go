@@ -58,17 +58,18 @@ type submission struct {
 
 func newGradeBatchCmd(opts *Options) *cobra.Command {
 	var (
-		subDir     string
-		rubricPath string
-		outDir     string
-		parallel   int
-		depth      int
-		reduce     bool
-		keepHosts  bool
-		keepLabs   bool
-		token      string
-		converge   time.Duration
-		settle     time.Duration
+		subDir      string
+		rubricPath  string
+		outDir      string
+		parallel    int
+		depth       int
+		reduce      bool
+		fullHarness bool
+		keepHosts   bool
+		keepLabs    bool
+		token       string
+		converge    time.Duration
+		settle      time.Duration
 	)
 	cmd := &cobra.Command{
 		Use:   "batch",
@@ -86,6 +87,12 @@ unique to that submission so container names, overlay identifiers and addresses
 cannot collide with any other. The harness is destroyed afterwards, whatever the
 mark, unless --keep-labs is given for a dispute.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if fullHarness {
+				if reduce || depth != 0 {
+					return fmt.Errorf("--full-harness cannot be combined with --reduce or --depth")
+				}
+				keepHosts = true
+			}
 			class, err := loadAndPlace(opts)
 			if err != nil {
 				return err
@@ -122,10 +129,6 @@ mark, unless --keep-labs is given for a dispute.`,
 			if err := os.MkdirAll(outDir, 0o755); err != nil {
 				return err
 			}
-			if parallel <= 0 {
-				parallel = 8
-			}
-
 			start := time.Now()
 			reports := make([]*grade.Report, len(subs))
 			plans := make([]*batchHarness, 0, len(subs))
@@ -154,6 +157,13 @@ mark, unless --keep-labs is given for a dispute.`,
 				inventory, err := c.Inventories(cmd.Context())
 				if err != nil {
 					return fmt.Errorf("cannot schedule grading harnesses before marking: %w", err)
+				}
+				parallel, err = place.SafeWorkerCount(class.Lab, inventory, workloads, parallel)
+				if err != nil {
+					return fmt.Errorf("cannot derive a capacity-safe grading worker count: %w", err)
+				}
+				if parallel < 1 {
+					return fmt.Errorf("cannot derive a non-zero capacity-safe grading worker count")
 				}
 				waves, err = place.ScheduleWaves(class.Lab, inventory, workloads, parallel)
 				if err != nil {
@@ -246,10 +256,13 @@ mark, unless --keep-labs is given for a dispute.`,
 	cmd.Flags().StringVarP(&subDir, "submissions", "s", "submissions", "directory of per-group submissions")
 	cmd.Flags().StringVarP(&rubricPath, "rubric", "r", "", "rubric to grade against")
 	cmd.Flags().StringVarP(&outDir, "out", "o", "", "where to write reports")
-	cmd.Flags().IntVarP(&parallel, "parallel", "p", 8, "harnesses deployed concurrently")
+	cmd.Flags().IntVarP(&parallel, "parallel", "p", 0,
+		"maximum harnesses deployed concurrently (0 derives a safe width from live admission)")
 	cmd.Flags().IntVar(&depth, "depth", 0, "AS hops of neighbourhood to keep; 0 keeps the whole topology")
 	cmd.Flags().BoolVar(&reduce, "reduce", false,
 		"keep every autonomous system but only the routers of each that face the target")
+	cmd.Flags().BoolVar(&fullHarness, "full-harness", false,
+		"force the complete reference topology; use with --keep-labs to investigate a disputed mark")
 	cmd.Flags().BoolVar(&keepHosts, "keep-hosts", true, "keep one host per neighbour, for end-to-end checks")
 	cmd.Flags().BoolVar(&keepLabs, "keep-labs", false, "do not destroy harnesses, for investigating a disputed mark")
 	cmd.Flags().StringVar(&token, "token", "", "agent token (or TWINET_TOKEN)")

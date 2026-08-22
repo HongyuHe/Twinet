@@ -21,6 +21,27 @@ is a quarantine condition, not a successful grade. `grade batch` schedules
 workloads against live inventory and retries work that was not admitted rather
 than treating host pressure as a student result.
 
+## Observation and scheduling
+
+One grade builds a shared passive observation snapshot: normalized kernel/NOS
+state, OSPF/BGP/RPKI facts, OVS inventory, and directly relevant service state.
+Identical passive reads are deduplicated; unavailable state remains an
+infrastructure error. Active delivery probes are never cached.
+
+The runner schedules dependency-ready questions and checks concurrently. It
+serializes only declared shared probe counters, captures, ports, interfaces, or
+endpoints, preserving counter attribution and deterministic report order.
+Reports include machine-readable `phase_timings` and `observation_snapshot`
+records. `grade run --check-parallel` controls its per-submission bound.
+
+The compact `harness.Options.Synthetic` substrate keeps the target AS and IXPs
+intact while collapsing each other retained AS to one deterministic
+policy/origin router. Full topology fallback remains available through
+`grade batch --full-harness`, particularly for disputed marks. The batch
+command retains its established reducer until the compact option passes the
+`harness.AuditEquivalence` full-harness comparison (reference plus wrong-answer
+fixtures); a compact result is not release evidence by itself.
+
 ## What a result contains
 
 Checks are registered Go functions that return structured evidence. Reports are

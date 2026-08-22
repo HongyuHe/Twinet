@@ -6,7 +6,6 @@ import (
 	"os"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/HongyuHe/twinet/internal/model"
@@ -272,8 +271,11 @@ type RunOptions struct {
 	// CheckTimeout bounds a single check.
 	CheckTimeout time.Duration
 	// Parallel bounds how many checks of one submission run at once. Checks
-	// within a question are independent, so this is safe.
+	// without active-probe conflicts run at once.
 	Parallel int
+	// ObservationParallel bounds passive collection requests made by the
+	// controller. Node agents independently enforce their ExecProbe budget.
+	ObservationParallel int
 	// Progress receives a line per completed question.
 	Progress func(string)
 }
@@ -281,6 +283,7 @@ type RunOptions struct {
 // Run grades one submission against a rubric.
 func Run(ctx context.Context, r *Rubric, env *Env, opts RunOptions) *Report {
 	start := time.Now()
+	phases := &phaseRecorder{}
 	rep := &Report{
 		AS: env.AS, Lab: env.Topology.Name, Rubric: r.Metadata.Name,
 		Manifest: env.Topology.Hash, GradedAt: time.Now().UTC(),
@@ -298,6 +301,8 @@ func Run(ctx context.Context, r *Rubric, env *Env, opts RunOptions) *Report {
 		rep.Err = err.Error()
 		rep.NeedsReview = true
 		rep.Duration = time.Since(start).Round(time.Millisecond).String()
+		phases.append("grade", start, time.Now())
+		rep.PhaseTimings = phases.list()
 		return rep
 	}
 	if opts.ConvergeTimeout == 0 {
@@ -309,96 +314,93 @@ func Run(ctx context.Context, r *Rubric, env *Env, opts RunOptions) *Report {
 	if opts.Parallel <= 0 {
 		opts.Parallel = 4
 	}
+	if opts.ObservationParallel <= 0 {
+		opts.ObservationParallel = minInt(16, maxGradeWorkers(opts.Parallel*2, 4))
+	}
 
+	// Every declared convergence scope is waited once, concurrently, before
+	// passive collection. Capturing before a later per-question wait would
+	// freeze a transient route table and turn a correct, still-converging
+	// submission into a deterministic false deduction.
+	var convergenceByScope map[string]string
+	phases.measure("convergence", func() {
+		convergenceByScope = waitSnapshotConvergence(ctx, r.Questions, env, opts.ConvergeTimeout)
+	})
+
+	// Passive collection happens once after the convergence boundary. The
+	// snapshot is shared by every copy of Env and later frozen into the
+	// report. Dynamic checks opt out through Check.LiveObservations.
+	var snapshot *ObservationSnapshot
+	phases.measure("observation", func() {
+		snapshot = collectObservationSnapshot(ctx, r, env, opts.ObservationParallel)
+	})
+	runEnv := *env
+	runEnv.snapshot = snapshot
 	earned := map[string]float64{}
+	completed := make([]bool, len(r.Questions))
+	questions := make([]QuestionResult, len(r.Questions))
+	warnings := make([]string, len(r.Questions))
 
-	for _, q := range r.Questions {
-		qr := QuestionResult{ID: q.ID, Title: q.Title, Points: q.Points}
-
-		// A question whose prerequisites failed is skipped with an explanation,
-		// rather than producing a cascade of derived failures.
-		if blocker := unmetDependency(q, earned); blocker != "" {
-			qr.Status = StatusSkipped
-			qr.Skipped = fmt.Sprintf("%s scored nothing, so this cannot be assessed", blocker)
-			rep.Questions = append(rep.Questions, qr)
-			earned[q.ID] = 0
-			continue
-		}
-
-		// Convergence is tracked per question rather than once globally: a
-		// timeout before an early question must not be taken as licence to
-		// skip the wait before a later one that depends on more state.
-		if q.Converge {
-			if err := waitForScope(ctx, env, q.ConvergeScope, opts.ConvergeTimeout); err != nil {
-				// A network that will not settle is usually the submission.
-				//
-				// This flagged the whole report for review, and the release
-				// guard then withheld every mark on it -- so a student whose
-				// OSPF was simply not configured had their entire paper held
-				// back rather than marked, which is a worse answer than the
-				// low mark their work earns. The code elsewhere says exactly
-				// this: student non-convergence is a mark, not an outage.
-				//
-				// It is recorded as a warning on the report either way, so a
-				// marker reading it sees that the network had not settled. Only
-				// an infrastructure failure -- a node that could not be reached
-				// -- withholds the mark, and that is tracked separately.
-				rep.Warnings = append(rep.Warnings,
-					fmt.Sprintf("the network had not settled before %s: %v", q.ID, err))
-				qr.Note = "the control plane had not converged when this was assessed, " +
-					"which is usually the submission's own doing"
+	for done := 0; done < len(r.Questions); {
+		var ready []int
+		for i, q := range r.Questions {
+			if completed[i] {
+				continue
 			}
-		}
-
-		results := runChecks(ctx, q, env, opts)
-
-		var broken []string
-		inapplicable := 0
-		for i := range q.Checks {
-			switch results[i].Status {
-			case StatusError:
-				broken = append(broken, results[i].Check)
-			case StatusNotApplicable:
-				inapplicable++
+			if !dependenciesComplete(q, earned) {
+				continue
 			}
+			if blocker := unmetDependency(q, earned); blocker != "" {
+				questions[i] = QuestionResult{
+					ID: q.ID, Title: q.Title, Points: q.Points, Status: StatusSkipped,
+					Skipped: fmt.Sprintf("%s scored nothing, so this cannot be assessed", blocker),
+				}
+				completed[i] = true
+				earned[q.ID] = 0
+				done++
+				continue
+			}
+			ready = append(ready, i)
 		}
-		qr.Awarded = awardFor(q, results)
-		awarded := 0.0
-		if q.Points > 0 {
-			awarded = qr.Awarded / q.Points
+		if done == len(r.Questions) {
+			break
 		}
-		qr.Results = results
-		qr.Status = statusFor(awarded)
-		if len(broken) > 0 {
-			sort.Strings(broken)
-			qr.NeedsReview = true
-			qr.Note = fmt.Sprintf("%d check(s) could not run (%s); this question needs a human before the mark stands",
-				len(broken), strings.Join(broken, ", "))
+		if len(ready) == 0 {
+			// Validate forbids dependency cycles, so this only happens after
+			// context cancellation. Preserve the ungraded distinction rather
+			// than manufacturing a zero.
+			if err := ctxErr(ctx); err != nil {
+				rep.Err = err.Error()
+				break
+			}
+			rep.Err = "grading dependency scheduler made no progress"
 			rep.NeedsReview = true
-			if len(broken) == len(q.Checks) {
-				// Nothing about this question was actually assessed, so it is
-				// an error rather than a zero.
-				qr.Status = StatusError
-			}
+			break
 		}
-		// A question none of whose checks could be asked has not been answered.
-		//
-		// Awarding it zero would read as a student mistake, and awarding it
-		// full marks would be a mark for nothing; either way the rubric is
-		// wrong about this AS and a person should say what to do.
-		if len(broken)+inapplicable == len(q.Checks) && inapplicable > 0 {
-			qr.NeedsReview = true
-			rep.NeedsReview = true
-			qr.Status = StatusError
-			qr.Note = fmt.Sprintf("none of the %d check(s) apply to this AS, so the question was "+
-				"not assessed; the rubric does not fit this topology", len(q.Checks))
-		}
-		earned[q.ID] = qr.Awarded
 
-		rep.Total += qr.Awarded
-		rep.Questions = append(rep.Questions, qr)
-		if opts.Progress != nil {
-			opts.Progress(fmt.Sprintf("%s %s %.2f/%.2f", q.ID, qr.Status, qr.Awarded, q.Points))
+		var resultSets map[int][]Result
+		phases.measure("checks", func() {
+			resultSets = runChecksAcrossQuestions(ctx, r.Questions, ready, &runEnv, opts)
+		})
+		for _, i := range ready {
+			q := r.Questions[i]
+			qr := questionResult(q, resultSets[i])
+			if note := convergenceNote(q, convergenceByScope); note != "" {
+				warnings[i] = fmt.Sprintf("the network had not settled before %s: %s", q.ID, note)
+				if qr.Note == "" {
+					qr.Note = "the control plane had not converged when this was assessed, " +
+						"which is usually the submission's own doing"
+				} else {
+					qr.Note += "; the control plane had not converged when this was assessed"
+				}
+			}
+			if qr.NeedsReview {
+				rep.NeedsReview = true
+			}
+			questions[i] = qr
+			completed[i] = true
+			earned[q.ID] = qr.Awarded
+			done++
 		}
 		if err := ctxErr(ctx); err != nil {
 			rep.Err = err.Error()
@@ -406,70 +408,27 @@ func Run(ctx context.Context, r *Rubric, env *Env, opts RunOptions) *Report {
 		}
 	}
 
-	rep.Duration = time.Since(start).Round(time.Millisecond).String()
-	return rep
-}
-
-// runChecks executes a question's checks, concurrently where possible.
-func runChecks(ctx context.Context, q QuestionSpec, env *Env, opts RunOptions) []Result {
-	results := make([]Result, len(q.Checks))
-	sem := make(chan struct{}, opts.Parallel)
-	var wg sync.WaitGroup
-
-	for i, cs := range q.Checks {
-		c, ok := Lookup(cs.Check)
-		if !ok {
-			results[i] = Errored(cs.Check, fmt.Errorf("no such check"))
+	for i, q := range questions {
+		if q.ID == "" {
 			continue
 		}
-		wg.Add(1)
-		go func(i int, c *Check, cs CheckSpec) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-
-			cctx, cancel := context.WithTimeout(ctx, opts.CheckTimeout)
-			defer cancel()
-
-			// Each check gets its own environment so its arguments cannot leak
-			// into a sibling running concurrently.
-			e := *env
-			if e.peers == nil {
-				e.peers = &peerCache{addr: map[string]string{}}
-			}
-			e.Args = cs.Args
-			e.infraSeen = &infraTracker{}
-			res := runCheck(cctx, c, &e)
-
-			// A check that concluded anything while the machinery was failing
-			// concluded it about the grader, not about the student. The
-			// verdict is discarded rather than trusted, because a check that
-			// absorbed an unreachable node into a "fail" turns an outage into
-			// a mark and says nothing about it.
-			if fail := e.infraSeen.failure(); fail != nil && res.Status != StatusError {
-				res = Errored(cs.Check, fail)
-			}
-
-			// A check whose own deadline expired did not finish looking.
-			//
-			// Cancellation and deadline errors are deliberately excluded from
-			// the infrastructure tracker, because a convergence predicate
-			// timing out is a legitimate finding about the submission. But the
-			// *check's* context expiring is not: it means the grader ran out
-			// of time, and several checks absorb that into a zero or a partial
-			// score. That is an outage turned into a mark, which is exactly
-			// what the tracker above exists to prevent.
-			if cctx.Err() != nil && res.Status != StatusError {
-				res = Errored(cs.Check, fmt.Errorf(
-					"this check ran out of time after %s, so what it found is what it had "+
-						"managed to look at rather than a judgement about the submission: %w",
-					opts.CheckTimeout, cctx.Err()))
-			}
-			results[i] = res
-		}(i, c, cs)
+		rep.Questions = append(rep.Questions, q)
+		rep.Total += q.Awarded
+		if warnings[i] != "" {
+			rep.Warnings = append(rep.Warnings, warnings[i])
+		}
+		if opts.Progress != nil {
+			opts.Progress(fmt.Sprintf("%s %s %.2f/%.2f", q.ID, q.Status, q.Awarded, q.Points))
+		}
 	}
-	wg.Wait()
-	return results
+	if snapshot != nil {
+		snapshot.Freeze()
+		rep.Observation = snapshot
+	}
+	rep.Duration = time.Since(start).Round(time.Millisecond).String()
+	phases.append("grade", start, time.Now())
+	rep.PhaseTimings = phases.list()
+	return rep
 }
 
 func unmetDependency(q QuestionSpec, earned map[string]float64) string {
@@ -479,6 +438,69 @@ func unmetDependency(q QuestionSpec, earned map[string]float64) string {
 		}
 	}
 	return ""
+}
+
+func dependenciesComplete(q QuestionSpec, earned map[string]float64) bool {
+	for _, dep := range q.DependsOn {
+		if _, ok := earned[dep]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// questionResult applies the pre-existing grading and quarantine rules after a
+// scheduler wave has completed. Keeping it separate from scheduling makes the
+// score independent of completion order.
+func questionResult(q QuestionSpec, results []Result) QuestionResult {
+	qr := QuestionResult{ID: q.ID, Title: q.Title, Points: q.Points, Results: results}
+	var broken []string
+	inapplicable := 0
+	for _, result := range results {
+		switch result.Status {
+		case StatusError:
+			broken = append(broken, result.Check)
+		case StatusNotApplicable:
+			inapplicable++
+		}
+	}
+	qr.Awarded = awardFor(q, results)
+	awarded := 0.0
+	if q.Points > 0 {
+		awarded = qr.Awarded / q.Points
+	}
+	qr.Status = statusFor(awarded)
+	if len(broken) > 0 {
+		sort.Strings(broken)
+		qr.NeedsReview = true
+		qr.Note = fmt.Sprintf("%d check(s) could not run (%s); this question needs a human before the mark stands",
+			len(broken), strings.Join(broken, ", "))
+		if len(broken) == len(q.Checks) {
+			// Nothing about this question was assessed; it is not a zero.
+			qr.Status = StatusError
+		}
+	}
+	if len(broken)+inapplicable == len(q.Checks) && inapplicable > 0 {
+		qr.NeedsReview = true
+		qr.Status = StatusError
+		qr.Note = fmt.Sprintf("none of the %d check(s) apply to this AS, so the question was "+
+			"not assessed; the rubric does not fit this topology", len(q.Checks))
+	}
+	return qr
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func maxGradeWorkers(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 // awardFor scores one question from its check results.

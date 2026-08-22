@@ -2089,7 +2089,7 @@ func rpkiConfigured(ctx context.Context, env *Env) (bool, string) {
 // the check would ping an address nobody had configured and report the
 // datacentre unreachable.
 func deviceAddr6(ctx context.Context, env *Env, d *model.Device) string {
-	res, err := env.Exec(ctx, d.ID, []string{"sh", "-c",
+	res, err := env.Observe(ctx, d.ID, []string{"sh", "-c",
 		"ip -o -6 addr show scope global 2>/dev/null | awk '{print $4}'"})
 	if err == nil && res.ExitCode == 0 {
 		for _, f := range strings.Fields(res.Stdout) {

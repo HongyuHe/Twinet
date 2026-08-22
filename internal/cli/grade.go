@@ -92,13 +92,14 @@ func newGradeValidateCmd() *cobra.Command {
 
 func newGradeRunCmd(opts *Options) *cobra.Command {
 	var (
-		rubricPath string
-		asList     []int
-		outDir     string
-		parallel   int
-		token      string
-		converge   time.Duration
-		quiet      bool
+		rubricPath    string
+		asList        []int
+		outDir        string
+		parallel      int
+		checkParallel int
+		token         string
+		converge      time.Duration
+		quiet         bool
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -210,8 +211,9 @@ reference, and holds the nodes off from repairing anything while it does.`,
 
 					env := &grade.Env{Topology: top, AS: asn, Exec: exec}
 					rep := grade.Run(cmd.Context(), rubric, env, grade.RunOptions{
-						ConvergeTimeout: converge,
-						Parallel:        4,
+						ConvergeTimeout:     converge,
+						Parallel:            checkParallel,
+						ObservationParallel: checkParallel,
 					})
 					rep.Submission = fmt.Sprintf("as%d", asn)
 					if as, ok := top.ASes[asn]; ok && as.OwnerGroup != "" {
@@ -256,6 +258,8 @@ reference, and holds the nodes off from repairing anything while it does.`,
 	cmd.Flags().IntSliceVar(&asList, "as", nil, "AS numbers to grade (default: every student AS)")
 	cmd.Flags().StringVarP(&outDir, "out", "o", "", "directory for reports")
 	cmd.Flags().IntVarP(&parallel, "parallel", "p", 8, "submissions graded concurrently")
+	cmd.Flags().IntVar(&checkParallel, "check-parallel", 16,
+		"maximum non-conflicting checks and passive observations per submission")
 	// Four minutes, not ninety seconds.
 	//
 	// Ninety was a guess and it was wrong: an iBGP session in the 12-AS lab was
