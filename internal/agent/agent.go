@@ -251,6 +251,7 @@ type Server struct {
 	generations     map[string]generationState
 	transactions    map[string]applyTransaction
 	inventories     map[string]transactionInventory
+	overlayLineage  map[string]map[uint32]string
 	now             func() time.Time
 	overlayOwners   func() (map[uint32]string, error)
 	overlayAdopter  func(uint32, string) error
@@ -1212,6 +1213,16 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Phase == "apply" {
 		s.transactionFailpoints(p)
+	}
+	if req.Phase == "apply" && !req.DryRun {
+		// Persist the exact create/recreate and cross-node binding set before
+		// executing destructive steps. A restart during execution must not
+		// infer object lineage from mutable labels.
+		if err := s.recordGenerationTouched(top.Name, req.Fence, req.Generation,
+			eng.DirtyCreateDevices(), eng.DirtyOverlayVNIs(top), true); err != nil {
+			httpError(w, http.StatusConflict, err)
+			return
+		}
 	}
 	execCtx := r.Context()
 	stopFence := func() {}

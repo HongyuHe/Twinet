@@ -318,26 +318,28 @@ func (s *Server) commitAppliedTopology(ctx context.Context, top *model.Topology,
 	if len(resp.Failures) > 0 {
 		return resp, nil
 	}
-	inventory, err := expectedTransactionInventoryFinal(eng, top, s.cfg.Node, tx.Generation)
+	actual, err := s.snapshotTransactionInventory(ctx, top.Name)
+	if err != nil {
+		return ApplyResponse{}, fmt.Errorf("verify committed inventory: %w", err)
+	}
+	inventory, err := expectedTransactionInventoryFinal(eng, top, s.cfg.Node, tx, actual)
 	if err != nil {
 		return ApplyResponse{}, fmt.Errorf("derive committed runtime inventory: %w", err)
 	}
 	if !tx.Prune {
 		// An explicitly non-pruning deployment preserves deliberate extra
-		// objects. Record what it actually left rather than pretending the
-		// manifest removed them, so later status still detects a loss.
-		actual, err := s.snapshotTransactionInventory(ctx, top.Name)
+		// objects, but desired objects still use their expected lineage.
+		// Recording actual labels for desired objects would let an unrecorded
+		// recreate appear committed merely because pruning was disabled.
+		inventory, err = mergePreservedInventory(inventory, actual)
 		if err != nil {
-			return ApplyResponse{}, fmt.Errorf("verify committed inventory: %w", err)
+			return ApplyResponse{}, fmt.Errorf("verify non-pruning committed inventory: %w", err)
 		}
-		inventory = actual
-		inventory.Generation, inventory.TopologyHash = tx.Generation, top.Hash
 	}
-	actual, err := s.snapshotTransactionInventory(ctx, top.Name)
-	if err != nil {
-		return ApplyResponse{}, fmt.Errorf("verify committed inventory: %w", err)
+	if err := s.validateInventoryLineage(top.Name, inventory, tx.Generation); err != nil {
+		return ApplyResponse{}, fmt.Errorf("commit inventory lineage: %w", err)
 	}
-	if err := inventoryMatches(inventory, actual); err != nil {
+	if err := inventoryMatchesCommitted(inventory, actual); err != nil {
 		return ApplyResponse{}, fmt.Errorf("commit inventory is incomplete: %w", err)
 	}
 	if err := s.transactionFail("commit"); err != nil {
@@ -347,6 +349,52 @@ func (s *Server) commitAppliedTopology(ctx context.Context, top *model.Topology,
 		return ApplyResponse{}, err
 	}
 	return resp, nil
+}
+
+func mergePreservedInventory(expected, actual transactionInventory) (transactionInventory, error) {
+	out := actual
+	out.Containers = append([]transactionContainer(nil), actual.Containers...)
+	out.VNIs = append([]uint32(nil), actual.VNIs...)
+	out.Generation, out.TopologyHash = expected.Generation, expected.TopologyHash
+	desired := make(map[string]transactionContainer, len(expected.Containers))
+	for _, container := range expected.Containers {
+		desired[container.DeviceID] = container
+	}
+	seen := map[string]bool{}
+	for i, container := range out.Containers {
+		want, isDesired := desired[container.DeviceID]
+		if !isDesired {
+			continue
+		}
+		if seen[container.DeviceID] {
+			return transactionInventory{}, fmt.Errorf("duplicate desired object %q", container.DeviceID)
+		}
+		seen[container.DeviceID] = true
+		if container.Name != want.Name || container.Spec != want.Spec {
+			return transactionInventory{}, fmt.Errorf("desired object %q is %+v, want %+v",
+				container.DeviceID, container, want)
+		}
+		out.Containers[i] = want
+	}
+	for id := range desired {
+		if !seen[id] {
+			return transactionInventory{}, fmt.Errorf("desired object %q is absent", id)
+		}
+	}
+	wantVNIs := map[uint32]bool{}
+	for _, vni := range expected.VNIs {
+		wantVNIs[vni] = true
+	}
+	haveVNIs := map[uint32]bool{}
+	for _, vni := range actual.VNIs {
+		haveVNIs[vni] = true
+	}
+	for vni := range wantVNIs {
+		if !haveVNIs[vni] {
+			return transactionInventory{}, fmt.Errorf("desired VNI %d is absent", vni)
+		}
+	}
+	return out, nil
 }
 
 func addApplyFailure(resp *ApplyResponse, scope string, err error) {

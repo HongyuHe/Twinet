@@ -232,15 +232,28 @@ func expectedTransactionInventory(top *model.Topology, node, generation string) 
 }
 
 func expectedTransactionInventoryFinal(eng *deploy.Engine, top *model.Topology,
-	node, generation string,
+	node string, tx applyTransaction, observed transactionInventory,
 ) (transactionInventory, error) {
-	out := transactionInventory{Generation: generation, CapturedAt: time.Now()}
+	out := transactionInventory{Generation: tx.Generation, CapturedAt: time.Now()}
 	if top == nil {
 		return out, nil
 	}
 	out.TopologyHash = top.Hash
+	observedByDevice := map[string]transactionContainer{}
+	for _, container := range observed.Containers {
+		observedByDevice[container.DeviceID] = container
+	}
+	prestateByDevice := map[string]transactionContainer{}
+	for _, container := range tx.Prestate.Containers {
+		prestateByDevice[container.DeviceID] = container
+	}
 	for _, device := range top.DevicesOnNode(node) {
 		spec, err := eng.FinalSpecHash(top, device)
+		if err != nil {
+			return transactionInventory{}, err
+		}
+		objectGeneration, err := expectedObjectGeneration(tx, device.ID, device.Container,
+			spec, prestateByDevice, observedByDevice)
 		if err != nil {
 			return transactionInventory{}, err
 		}
@@ -248,7 +261,7 @@ func expectedTransactionInventoryFinal(eng *deploy.Engine, top *model.Topology,
 			Name:       device.Container,
 			DeviceID:   device.ID,
 			Spec:       spec,
-			Generation: generation,
+			Generation: objectGeneration,
 			State:      string(rt.StateRunning),
 		})
 	}
@@ -256,6 +269,39 @@ func expectedTransactionInventoryFinal(eng *deploy.Engine, top *model.Topology,
 	sort.Slice(out.Containers, func(i, j int) bool { return out.Containers[i].Name < out.Containers[j].Name })
 	sort.Slice(out.VNIs, func(i, j int) bool { return out.VNIs[i] < out.VNIs[j] })
 	return out, nil
+}
+
+func expectedObjectGeneration(tx applyTransaction, deviceID, name, spec string,
+	prestate, observed map[string]transactionContainer,
+) (string, error) {
+	touched := map[string]bool{}
+	for _, id := range tx.Touched {
+		touched[id] = true
+	}
+	if touched[deviceID] {
+		return tx.Generation, nil
+	}
+	if tx.TouchedKnown {
+		before, ok := prestate[deviceID]
+		if !ok {
+			return "", fmt.Errorf("%s was not in pre-state and was not marked recreated", deviceID)
+		}
+		if before.Name != name || before.Spec != spec {
+			return "", fmt.Errorf("%s changed runtime identity without being marked recreated", deviceID)
+		}
+		return before.Generation, nil
+	}
+	// Transactions created before touched facts were persisted can still
+	// complete only when their observed object exactly matches the desired
+	// contract. validateInventoryLineage then rejects an unknown label rather
+	// than adopting it as an ancestor.
+	if prior, ok := observed[deviceID]; ok && prior.Name == name && prior.Spec == spec {
+		return prior.Generation, nil
+	}
+	if before, ok := prestate[deviceID]; ok && before.Name == name && before.Spec == spec {
+		return before.Generation, nil
+	}
+	return tx.Generation, nil
 }
 
 func artifactDigest(content []byte) string {
@@ -376,6 +422,53 @@ func inventoryMatches(want, got transactionInventory) error {
 	for i := range want.VNIs {
 		if want.VNIs[i] != got.VNIs[i] {
 			return fmt.Errorf("overlay VNI %d is %d, want %d", i, got.VNIs[i], want.VNIs[i])
+		}
+	}
+	return nil
+}
+
+// inventoryMatchesCommitted additionally requires exact object labels. The
+// generic recovery comparison accepts an unlabeled legacy object, but a
+// current transaction with persisted touched facts must never turn that
+// compatibility exception into an unrecorded recreation.
+func inventoryMatchesCommitted(want, got transactionInventory) error {
+	if err := inventoryMatches(want, got); err != nil {
+		return err
+	}
+	for i := range want.Containers {
+		if want.Containers[i].Generation != got.Containers[i].Generation {
+			return fmt.Errorf("container %s generation is %q, want %q",
+				got.Containers[i].Name, got.Containers[i].Generation, want.Containers[i].Generation)
+		}
+	}
+	return nil
+}
+
+func (s *Server) validateInventoryLineage(lab string, inventory transactionInventory,
+	current string,
+) error {
+	s.mu.Lock()
+	state := s.generations[lab]
+	overlayLineage := make(map[uint32]string, len(s.overlayLineage[lab]))
+	for vni, generation := range s.overlayLineage[lab] {
+		overlayLineage[vni] = generation
+	}
+	s.mu.Unlock()
+	allowed := map[string]bool{current: true, state.Committed: true}
+	for _, generation := range state.Ancestors {
+		allowed[generation] = true
+	}
+	for _, container := range inventory.Containers {
+		if container.Generation == "" {
+			continue // legacy unlabeled object; spec/name still verify it.
+		}
+		if !allowed[container.Generation] {
+			return fmt.Errorf("%s carries unrelated object generation %q", container.Name, container.Generation)
+		}
+	}
+	for _, vni := range inventory.VNIs {
+		if generation := overlayLineage[vni]; generation != "" && !allowed[generation] {
+			return fmt.Errorf("VNI %d carries unrelated overlay generation %q", vni, generation)
 		}
 	}
 	return nil
@@ -731,6 +824,10 @@ func (s *Server) forwardTransaction(ctx context.Context, lab string, fence Fence
 	if err != nil {
 		_ = s.markTransactionPhase(lab, fence, tx.Generation, transactionRollbackFailed, err.Error())
 		return s.transactionInventoryStatus(ctx, lab), err
+	}
+	if err := s.recordGenerationTouched(lab, fence, tx.Generation,
+		eng.DirtyCreateDevices(), eng.DirtyOverlayVNIs(top), current.TouchedKnown); err != nil {
+		return s.transactionInventoryStatus(ctx, lab), fmt.Errorf("persist forward recovery touched set: %w", err)
 	}
 	s.transactionFailpoints(p)
 	rep, err := p.Execute(ctx, plan.Options{

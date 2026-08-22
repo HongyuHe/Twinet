@@ -26,7 +26,12 @@ type BuildDiff struct {
 	ObservedFor time.Duration
 	DiffedFor   time.Duration
 
-	Create    map[string]bool
+	Create map[string]bool
+	// Recreate is the subset of Create whose primary runtime container is
+	// replaced or first-created. Create also includes safe start and internal
+	// sidecar repair work, neither of which changes a primary object's
+	// creation generation.
+	Recreate  map[string]bool
 	Wire      map[string]bool
 	Configure map[string]bool
 	Ready     map[string]bool
@@ -304,6 +309,7 @@ func (e *Engine) observeNode(ctx context.Context, top *model.Topology, devices [
 	diff := BuildDiff{
 		ObservedFor: observedFor,
 		Create:      map[string]bool{},
+		Recreate:    map[string]bool{},
 		Wire:        map[string]bool{},
 		Configure:   map[string]bool{},
 		Ready:       map[string]bool{},
@@ -322,12 +328,13 @@ func (e *Engine) observeNode(ctx context.Context, top *model.Topology, devices [
 		}
 		desired[d.ID] = state
 		container, ok := byName[d.Container]
-		specDirty := !ok || container.State == runtime.StateAbsent || !container.State.Joinable() ||
+		primaryRecreate := !ok || container.State == runtime.StateAbsent ||
 			container.Labels[LabelSpec] != state.runtime.spec.Labels[LabelSpec] ||
 			container.Labels[LabelRuntimeContract] != runtimeSpecContractVersion
 		if e.RecoveryCompatibility && d.Kind == model.KindService {
-			specDirty = true
+			primaryRecreate = true
 		}
+		specDirty := primaryRecreate || !container.State.Joinable()
 		if !specDirty && state.runtime.controlSpec != nil {
 			control, controlOK := byName[FRRControlContainer(d)]
 			specDirty = !controlOK || !control.State.Joinable() ||
@@ -336,6 +343,9 @@ func (e *Engine) observeNode(ctx context.Context, top *model.Topology, devices [
 		}
 		if specDirty {
 			diff.Create[d.ID] = true
+			if primaryRecreate {
+				diff.Recreate[d.ID] = true
+			}
 			if studentOwned(top, d) {
 				diff.Capture[d.ID] = true
 			}
@@ -536,6 +546,7 @@ func (e *Engine) LastBuildDiff() BuildDiff {
 	defer e.observationMu.Unlock()
 	out := e.lastDiff
 	out.Create = cloneBoolMap(out.Create)
+	out.Recreate = cloneBoolMap(out.Recreate)
 	out.Wire = cloneBoolMap(out.Wire)
 	out.Configure = cloneBoolMap(out.Configure)
 	out.Ready = cloneBoolMap(out.Ready)
@@ -560,6 +571,45 @@ func (e *Engine) DirtyCaptureDevices() []string {
 		out = append(out, id)
 	}
 	sort.Strings(out)
+	return out
+}
+
+// DirtyCreateDevices is the exact set whose primary runtime contract was
+// created/recreated by the observed diff. Only these objects receive a new
+// transaction generation label; configure-only work retains creation lineage.
+func (e *Engine) DirtyCreateDevices() []string {
+	diff := e.LastBuildDiff()
+	out := make([]string, 0, len(diff.Recreate))
+	for id := range diff.Recreate {
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// DirtyOverlayVNIs returns the cross-node bindings whose wire plan executes
+// in this deployment. The agent persists these facts with device creates so
+// a shared multiplex trunk can retain an older lineage when it was reused.
+func (e *Engine) DirtyOverlayVNIs(top *model.Topology) []uint32 {
+	if top == nil {
+		return nil
+	}
+	diff := e.LastBuildDiff()
+	seen := map[uint32]bool{}
+	for _, link := range top.Links {
+		if link == nil || !link.CrossNode() || !diff.Wire[link.ID] || link.VNI == 0 {
+			continue
+		}
+		if link.A.Device.Node != e.Node && link.B.Device.Node != e.Node {
+			continue
+		}
+		seen[link.VNI] = true
+	}
+	out := make([]uint32, 0, len(seen))
+	for vni := range seen {
+		out = append(out, vni)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
 	return out
 }
 

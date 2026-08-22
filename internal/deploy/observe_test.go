@@ -27,6 +27,10 @@ type observedRuntime struct {
 
 func (r *observedRuntime) Name() string { return "fake" }
 
+type observedDockerRuntime struct{ observedRuntime }
+
+func (*observedDockerRuntime) Name() string { return "docker" }
+
 func (r *observedRuntime) List(context.Context, rt.Filter) ([]rt.Container, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -153,6 +157,69 @@ func TestObservedNoChangeBuildUsesOneRuntimeListForLargeNode(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 30*time.Second {
 		t.Fatalf("212-device synthetic no-change build took %s, want under 30s", elapsed)
+	}
+}
+
+func TestDirtyCreateDevicesExcludesPrimaryReuseForSidecarAndStartRepair(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		primary     rt.State
+		withControl bool
+	}{
+		{name: "missing-control-sidecar", primary: rt.StateRunning},
+		{name: "stopped-primary", primary: rt.StateExited, withControl: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := &model.Device{
+				ID: "as1/R1", Name: "R1", Container: "tw-r1", Kind: model.KindRouter,
+				Image: "frr:stable", Node: "node-a", ASN: 1,
+			}
+			top := &model.Topology{
+				Name: "lineage", Hash: "lineage-hash", Devices: map[string]*model.Device{d.ID: d},
+				ASes: map[int]*model.AS{1: {ASN: 1, Role: model.RoleStudent}},
+			}
+			runtime := observedDockerRuntime{observedRuntime: observedRuntime{files: map[string][]byte{}}}
+			root := observeTestRoot(t)
+			engine := &Engine{
+				Runtime: &runtime, Node: "node-a", ObservationRoot: root,
+				FRRControlRoot: filepath.Join(root, "frr-control"),
+			}
+			hash, err := engine.FinalSpecHash(top, d)
+			if err != nil {
+				t.Fatal(err)
+			}
+			runtime.containers = append(runtime.containers, rt.Container{
+				Name: d.Container, State: tc.primary,
+				Labels: map[string]string{
+					LabelSpec: hash, LabelHash: top.Hash, LabelRuntimeContract: runtimeSpecContractVersion,
+				},
+			})
+			if tc.withControl {
+				control, err := engine.FinalControlSpecHash(top, d)
+				if err != nil {
+					t.Fatal(err)
+				}
+				runtime.containers = append(runtime.containers, rt.Container{
+					Name: FRRControlContainer(d), State: rt.StateRunning,
+					Labels: map[string]string{
+						LabelSpec: control, LabelHash: top.Hash, LabelRuntimeContract: runtimeSpecContractVersion,
+					},
+				})
+			}
+			if _, err := engine.Build(top); err != nil {
+				t.Fatal(err)
+			}
+			diff := engine.LastBuildDiff()
+			if !diff.Create[d.ID] {
+				t.Fatal("repair did not schedule the device work")
+			}
+			if diff.Recreate[d.ID] {
+				t.Fatal("primary reuse was incorrectly recorded as recreation")
+			}
+			if got := engine.DirtyCreateDevices(); len(got) != 0 {
+				t.Fatalf("primary reuse got recreation lineage %v", got)
+			}
+		})
 	}
 }
 

@@ -105,8 +105,9 @@ type legacyOverlayAdoption struct {
 }
 
 type generationState struct {
-	Committed string `json:"committed,omitempty"`
-	Prepared  string `json:"prepared,omitempty"`
+	Committed string   `json:"committed,omitempty"`
+	Prepared  string   `json:"prepared,omitempty"`
+	Ancestors []string `json:"ancestors,omitempty"`
 }
 
 // transactionPhase is persisted before any destructive work. A transaction
@@ -182,6 +183,9 @@ type applyTransaction struct {
 	StateProofs       []StateProof         `json:"state_proofs,omitempty"`
 	DirtyCapture      []string             `json:"dirty_capture,omitempty"`
 	DirtyCaptureKnown bool                 `json:"dirty_capture_known,omitempty"`
+	Touched           []string             `json:"touched_objects,omitempty"`
+	TouchedVNIs       []uint32             `json:"touched_vnis,omitempty"`
+	TouchedKnown      bool                 `json:"touched_known,omitempty"`
 	StateVerified     bool                 `json:"state_verified,omitempty"`
 	Phase             transactionPhase     `json:"phase,omitempty"`
 	Prestate          transactionInventory `json:"prestate,omitempty"`
@@ -199,6 +203,7 @@ type coordinationState struct {
 	Generations    map[string]generationState      `json:"generations,omitempty"`
 	Transactions   map[string]applyTransaction     `json:"transactions,omitempty"`
 	Inventories    map[string]transactionInventory `json:"inventories,omitempty"`
+	OverlayLineage map[string]map[uint32]string    `json:"overlay_lineage,omitempty"`
 }
 
 func (s *Server) initCoordination() {
@@ -219,6 +224,9 @@ func (s *Server) initCoordination() {
 	}
 	if s.inventories == nil {
 		s.inventories = map[string]transactionInventory{}
+	}
+	if s.overlayLineage == nil {
+		s.overlayLineage = map[string]map[uint32]string{}
 	}
 }
 
@@ -288,6 +296,9 @@ func (s *Server) loadCoordination() {
 	for lab, inventory := range disk.Inventories {
 		s.inventories[lab] = inventory
 	}
+	for lab, lineage := range disk.OverlayLineage {
+		s.overlayLineage[lab] = lineage
+	}
 	_ = s.expireCoordinationLocked(s.nowTime())
 }
 
@@ -303,6 +314,7 @@ func (s *Server) saveCoordinationLocked() error {
 		Generations:    s.generations,
 		Transactions:   s.transactions,
 		Inventories:    s.inventories,
+		OverlayLineage: s.overlayLineage,
 	}
 	raw, err := json.Marshal(disk)
 	if err != nil {
@@ -982,6 +994,54 @@ func (s *Server) recordGenerationDirtyCapture(lab string, fence Fence, generatio
 	return s.saveCoordinationLocked()
 }
 
+func (s *Server) recordGenerationTouched(lab string, fence Fence, generation string,
+	ids []string, vnis []uint32, known bool,
+) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initCoordination()
+	if err := s.fenceErrorLocked(lab, fence, s.nowTime()); err != nil {
+		return err
+	}
+	tx, ok := s.transactions[lab]
+	if !ok || tx.Generation != generation || tx.FenceGeneration != fence.Generation {
+		return fmt.Errorf("generation %q of lab %q was not prepared by this fence", generation, lab)
+	}
+	tx.Touched = appendTouchedStrings(tx.Touched, ids)
+	tx.TouchedVNIs = appendTouchedVNIs(tx.TouchedVNIs, vnis)
+	tx.TouchedKnown = tx.TouchedKnown || known
+	s.transactions[lab] = tx
+	return s.saveCoordinationLocked()
+}
+
+func appendTouchedStrings(existing, added []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(existing)+len(added))
+	for _, id := range append(append([]string(nil), existing...), added...) {
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func appendTouchedVNIs(existing, added []uint32) []uint32 {
+	seen := map[uint32]bool{}
+	out := make([]uint32, 0, len(existing)+len(added))
+	for _, vni := range append(append([]uint32(nil), existing...), added...) {
+		if vni == 0 || seen[vni] {
+			continue
+		}
+		seen[vni] = true
+		out = append(out, vni)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
+
 func (s *Server) transactionForCommit(lab string, fence Fence, generation string) (applyTransaction, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1055,27 +1115,65 @@ func (s *Server) finishCommittedGeneration(lab string, fence Fence, generation s
 		return fmt.Errorf("generation %q of lab %q cannot be committed by this fence", generation, lab)
 	}
 	state := s.generations[lab]
+	oldState := state
+	previousCommitted := state.Committed
 	state.Committed, state.Prepared = generation, ""
+	state.Ancestors = appendGenerationLineage(state.Ancestors, previousCommitted, generation)
 	s.generations[lab] = state
 	previousInventory, hadInventory := s.inventories[lab]
+	previousLineage := s.overlayLineage[lab]
 	if len(inventory) > 0 {
 		s.inventories[lab] = inventory[0]
+		lineage := map[uint32]string{}
+		touchedVNIs := map[uint32]bool{}
+		for _, vni := range tx.TouchedVNIs {
+			touchedVNIs[vni] = true
+		}
+		for _, vni := range inventory[0].VNIs {
+			if tx.TouchedKnown && touchedVNIs[vni] {
+				lineage[vni] = generation
+			} else if previous := s.overlayLineage[lab][vni]; previous != "" {
+				lineage[vni] = previous
+			} else {
+				lineage[vni] = generation
+			}
+		}
+		s.overlayLineage[lab] = lineage
 	}
 	tx.Committed, tx.Phase, tx.Failure = true, transactionCommitted, ""
 	s.transactions[lab] = tx
 	if err := s.saveCoordinationLocked(); err != nil {
 		tx.Committed = false
 		s.transactions[lab] = tx
-		state.Committed, state.Prepared = tx.PreviousGen, generation
-		s.generations[lab] = state
+		s.generations[lab] = oldState
 		if hadInventory {
 			s.inventories[lab] = previousInventory
 		} else {
 			delete(s.inventories, lab)
 		}
+		if previousLineage != nil {
+			s.overlayLineage[lab] = previousLineage
+		} else {
+			delete(s.overlayLineage, lab)
+		}
 		return fmt.Errorf("persisting committed generation: %w", err)
 	}
 	return nil
+}
+
+func appendGenerationLineage(existing []string, previous, current string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(existing)+2)
+	values := append([]string(nil), existing...)
+	values = append(values, previous, current)
+	for _, generation := range values {
+		if generation == "" || seen[generation] {
+			continue
+		}
+		seen[generation] = true
+		out = append(out, generation)
+	}
+	return out
 }
 
 // finalizeCommittedGeneration drops rollback material only after the
