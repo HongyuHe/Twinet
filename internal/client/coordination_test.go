@@ -116,6 +116,34 @@ func (s *coordinationStub) handler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		write(agent.OverlayReservationResponse{Lab: req.Lab, VNIs: req.VNIs})
+	case "/v1/recover":
+		var req agent.RecoveryRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		s.mu.Lock()
+		ok := s.leases[req.Lab] == req.Fence
+		generation := s.generations[req.Lab]
+		s.mu.Unlock()
+		if !ok {
+			fail(http.StatusConflict, fmt.Errorf("stale fence"))
+			return
+		}
+		phase := "idle"
+		if generation != "" {
+			phase = "committed"
+		}
+		write(agent.RecoveryResponse{Status: agent.RecoveryStatus{
+			Lab: req.Lab, Phase: phase, Generation: generation, Consistent: true,
+		}})
+	case "/v1/recovery":
+		lab := r.URL.Query().Get("lab")
+		s.mu.Lock()
+		generation := s.generations[lab]
+		s.mu.Unlock()
+		phase := "idle"
+		if generation != "" {
+			phase = "committed"
+		}
+		write(agent.RecoveryStatus{Lab: lab, Phase: phase, Generation: generation, Consistent: true})
 	case "/v1/apply":
 		var req agent.ApplyRequest
 		_ = json.NewDecoder(r.Body).Decode(&req)
@@ -230,5 +258,38 @@ func TestTwoControllersRaceOneLabAndOnlyOneCommits(t *testing.T) {
 		if generation != "generation-a" {
 			t.Fatalf("%s recorded generation %q, not the sole committed generation", stub.name, generation)
 		}
+	}
+}
+
+func TestRecoverRejectsMixedNodeGenerations(t *testing.T) {
+	a := newCoordinationStub("a", nil)
+	b := newCoordinationStub("b", nil)
+	a.generations["cos461"] = "old-generation"
+	b.generations["cos461"] = "new-generation"
+	na, closeA := stubNode("a", a)
+	defer closeA()
+	nb, closeB := stubNode("b", b)
+	defer closeB()
+
+	report, err := (&Cluster{Nodes: []*Node{na, nb}}).Recover(t.Context(), "cos461")
+	if err == nil {
+		t.Fatalf("mixed generations were reported recovered: %+v", report)
+	}
+	if report.Nodes["a"].Generation == report.Nodes["b"].Generation {
+		t.Fatalf("test setup did not retain mixed node evidence: %+v", report)
+	}
+}
+
+func TestRecoverRejectsLostNode(t *testing.T) {
+	a := newCoordinationStub("a", nil)
+	na, closeA := stubNode("a", a)
+	defer closeA()
+	lost := httptest.NewServer(http.NotFoundHandler())
+	lostURL := lost.URL
+	lost.Close()
+	nb := NewNode("b", lostURL, "")
+
+	if _, err := (&Cluster{Nodes: []*Node{na, nb}}).Recover(t.Context(), "cos461"); err == nil {
+		t.Fatal("recovery accepted a node that could not report its inventory")
 	}
 }

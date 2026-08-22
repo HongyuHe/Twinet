@@ -80,13 +80,50 @@ func (s *Server) handleApplyPrepare(w http.ResponseWriter, r *http.Request, req 
 		httpError(w, http.StatusConflict, err)
 		return
 	}
+	if why := s.recoveryMutationRefusal(top.Name); why != "" {
+		httpError(w, http.StatusConflict, errors.New(why))
+		return
+	}
+	prestate, err := s.snapshotTransactionInventory(r.Context(), top.Name)
+	if err != nil {
+		httpError(w, http.StatusConflict, fmt.Errorf("capture pre-transaction inventory: %w", err))
+		return
+	}
+	s.mu.Lock()
+	previous := s.current[top.Name]
+	s.mu.Unlock()
+	if previous != nil {
+		prestate.TopologyHash = previous.Hash
+	}
+	if len(prestate.Containers) == 0 {
+		prestate.StateSafe = true
+	} else {
+		if previous == nil || s.store == nil {
+			httpError(w, http.StatusConflict, errors.New(
+				"refusing a destructive transaction without the previous topology and durable student state"))
+			return
+		}
+		if _, captureErr := s.captureAndReplicate(r.Context(), previous); captureErr != nil {
+			if boundaryErr := s.durableBoundary(previous, "preparing a destructive transaction", captureErr); boundaryErr != nil {
+				httpError(w, http.StatusConflict, boundaryErr)
+				return
+			}
+			// An explicitly fail-open policy may let the forward request
+			// continue, but it may never call rollback "recovered" without
+			// proof that the prior student state was actually durable.
+			prestate.StateSafe = false
+		} else {
+			prestate.StateSafe = true
+		}
+	}
 	raw, err := json.Marshal(req.Topology)
 	if err != nil {
 		httpError(w, http.StatusBadRequest, fmt.Errorf("encode topology: %w", err))
 		return
 	}
 	if err := s.prepareGeneration(top.Name, req.Fence, req.ExpectedGeneration, req.Generation,
-		raw, req.Mode, req.Ungraded, req.PeerUnderlay, req.Prune, req.OnlySteps, req.StateProofs); err != nil {
+		raw, req.Mode, req.Ungraded, req.PeerUnderlay, req.Prune, req.OnlySteps, req.StateProofs,
+		prestate); err != nil {
 		httpError(w, http.StatusConflict, err)
 		return
 	}
@@ -146,8 +183,14 @@ func (s *Server) handleApplyCommit(w http.ResponseWriter, r *http.Request, req A
 
 	resp, err := s.commitAppliedTopology(fenced, top, &wire, req.Fence, tx)
 	if err != nil {
+		_ = s.markTransactionPhase(lab, req.Fence, req.Generation,
+			transactionRollbackNeeded, "commit failed: "+err.Error())
 		httpError(w, http.StatusInternalServerError, err)
 		return
+	}
+	if len(resp.Failures) > 0 {
+		_ = s.markTransactionPhase(lab, req.Fence, req.Generation,
+			transactionRollbackNeeded, "commit reported failures")
 	}
 	writeJSON(w, resp)
 }
@@ -224,6 +267,9 @@ func (s *Server) commitAppliedTopology(ctx context.Context, top *model.Topology,
 		}
 	}
 	if tx.Prune {
+		if err := s.transactionFail("prune"); err != nil {
+			return ApplyResponse{}, fmt.Errorf("commit prune failpoint: %w", err)
+		}
 		gone, err := eng.PruneOrphans(ctx, top)
 		if err != nil {
 			addApplyFailure(&resp, "prune", err)
@@ -245,7 +291,29 @@ func (s *Server) commitAppliedTopology(ctx context.Context, top *model.Topology,
 	if len(resp.Failures) > 0 {
 		return resp, nil
 	}
-	if err := s.finishCommittedGeneration(top.Name, fence, tx.Generation); err != nil {
+	inventory := expectedTransactionInventory(top, s.cfg.Node, tx.Generation)
+	if !tx.Prune {
+		// An explicitly non-pruning deployment preserves deliberate extra
+		// objects. Record what it actually left rather than pretending the
+		// manifest removed them, so later status still detects a loss.
+		actual, err := s.snapshotTransactionInventory(ctx, top.Name)
+		if err != nil {
+			return ApplyResponse{}, fmt.Errorf("verify committed inventory: %w", err)
+		}
+		inventory = actual
+		inventory.Generation, inventory.TopologyHash = tx.Generation, top.Hash
+	}
+	actual, err := s.snapshotTransactionInventory(ctx, top.Name)
+	if err != nil {
+		return ApplyResponse{}, fmt.Errorf("verify committed inventory: %w", err)
+	}
+	if err := inventoryMatches(inventory, actual); err != nil {
+		return ApplyResponse{}, fmt.Errorf("commit inventory is incomplete: %w", err)
+	}
+	if err := s.transactionFail("commit"); err != nil {
+		return ApplyResponse{}, fmt.Errorf("commit failpoint: %w", err)
+	}
+	if err := s.finishCommittedGeneration(top.Name, fence, tx.Generation, inventory); err != nil {
 		return ApplyResponse{}, err
 	}
 	return resp, nil
@@ -277,6 +345,7 @@ func (s *Server) transactionEngine(top *model.Topology, tx applyTransaction) *de
 		Prune:                  tx.Prune,
 		Generation:             tx.Generation,
 		RequireImmutableImages: top.Lab.Images.RequiresImmutableImages(),
+		RetainLegacyOverlays:   true,
 	}
 }
 
@@ -307,31 +376,12 @@ func (s *Server) handleApplyAbort(w http.ResponseWriter, r *http.Request, req Ap
 		httpError(w, http.StatusBadRequest, errors.New("a lab name is required"))
 		return
 	}
-	tx, err := s.transactionForAbort(lab, req.Fence, req.Generation)
+	status, err := s.recoverTransaction(r.Context(), lab, req.Fence)
 	if err != nil {
 		httpError(w, http.StatusConflict, err)
 		return
 	}
-	if tx.Generation == "" {
-		writeJSON(w, ApplyResponse{Node: s.cfg.Node, Generation: req.Generation, Phase: "abort"})
-		return
-	}
-	if err := s.acquire(lab, "rollback"); err != nil {
-		httpError(w, http.StatusConflict, err)
-		return
-	}
-	defer s.release(lab)
-	fenced, stopFence := s.fencedContext(r.Context(), lab, req.Fence)
-	defer stopFence()
-	if err := s.rollbackPreparedApply(fenced, lab, req.Fence, tx); err != nil {
-		httpError(w, http.StatusInternalServerError, err)
-		return
-	}
-	if err := s.finishAbortedGeneration(lab, req.Fence, tx.Generation); err != nil {
-		httpError(w, http.StatusInternalServerError, err)
-		return
-	}
-	writeJSON(w, ApplyResponse{Node: s.cfg.Node, Generation: tx.Generation, Phase: "abort"})
+	writeJSON(w, ApplyResponse{Node: s.cfg.Node, Generation: status.Generation, Phase: "abort"})
 }
 
 func (s *Server) rollbackPreparedApply(ctx context.Context, lab string, fence Fence,
@@ -379,8 +429,12 @@ func (s *Server) rollbackPreparedApply(ctx context.Context, lab string, fence Fe
 	rollback.Mode = oldWire.Mode
 	rollback.Ungraded = oldWire.Ungraded
 	rollback.PeerUnderlay = oldWire.PeerUnderlay
-	rollback.Prune = true
+	// The old topology is rebuilt first. Pruning happens only after every old
+	// device has its interfaces and restored student state back, never as the
+	// mechanism that tries to make a failed forward apply disappear.
+	rollback.Prune = false
 	eng := s.transactionEngine(oldTop, rollback)
+	eng.RecoveryCompatibility = true
 	p, err := eng.Build(oldTop)
 	if err != nil {
 		return fmt.Errorf("build rollback plan: %w", err)
@@ -393,6 +447,9 @@ func (s *Server) rollbackPreparedApply(ctx context.Context, lab string, fence Fe
 	}
 	if rep.Failed() {
 		return fmt.Errorf("rollback plan failed: %w", rep.Err())
+	}
+	if err := s.transactionFail("prune"); err != nil {
+		return fmt.Errorf("rollback prune failpoint: %w", err)
 	}
 	if _, err := eng.PruneOrphans(ctx, oldTop); err != nil {
 		return fmt.Errorf("prune after rollback: %w", err)

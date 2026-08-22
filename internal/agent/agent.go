@@ -250,10 +250,17 @@ type Server struct {
 	overlayClaims   map[uint32]overlayClaim
 	generations     map[string]generationState
 	transactions    map[string]applyTransaction
+	inventories     map[string]transactionInventory
 	now             func() time.Time
 	overlayOwners   func() (map[uint32]string, error)
 	overlayAdopter  func(uint32, string) error
 	overlayReverter func(uint32, string) error
+	// Transaction seams let focused tests force failures at destructive
+	// boundaries without touching a host runtime or netlink namespace.
+	transactionFailpoint func(string) error
+	recoveryContainers   func(context.Context, string) ([]rt.Container, error)
+	recoveryOverlays     func(string) ([]uint32, error)
+	recoveryRollback     func(context.Context, string, Fence, applyTransaction) error
 
 	// holds are labs an external operation has asked this node to leave alone.
 	holds map[string]*hold
@@ -535,6 +542,12 @@ func (s *Server) Serve(ctx context.Context) error {
 	mux.HandleFunc("POST /v1/overlay/reserve", s.authorize(endpointPolicy{
 		Action: authz.ActionDeploy, Mutation: true, ResolveRequest: scopeFromJSONLab(authz.ActionDeploy),
 	}, s.handleOverlayReserve))
+	mux.HandleFunc("GET /v1/recovery", s.authorize(endpointPolicy{
+		Action: authz.ActionObserve, AllowCluster: true, ResolveRequest: scopeFromQuery(authz.ActionObserve, false),
+	}, s.observedHandler("recovery", s.handleRecoveryStatus)))
+	mux.HandleFunc("POST /v1/recover", s.authorize(endpointPolicy{
+		Action: authz.ActionDeploy, Mutation: true, ResolveRequest: scopeFromJSONLab(authz.ActionDeploy),
+	}, s.observedHandler("recover", s.handleRecovery)))
 	mux.HandleFunc("POST /v1/exec", s.authorize(endpointPolicy{
 		Action: authz.ActionExec, Mutation: true, ResolveRequest: scopeForContainer(authz.ActionExec),
 	}, s.observedHandler("exec", s.handleExec)))
@@ -688,6 +701,10 @@ func (s *Server) Serve(ctx context.Context) error {
 	// Capturing and replicating state belongs to the long-running agent, not
 	// the CLI invocation that happened to deploy the lab.
 	go s.durabilityLoop(ctx)
+	// Interrupted transactions are durable recovery work, not abandoned
+	// partial applies. The loop obtains a new internal fence only after a
+	// controller lease lapses and keeps retrying rollback after node recovery.
+	go s.recoveryLoop(ctx)
 
 	errc := make(chan error, 1)
 	go func() {
@@ -764,6 +781,10 @@ type StatusResponse struct {
 	// Generations are the only committed deployment generations. A prepared
 	// transaction is deliberately absent: it is not a cluster commit.
 	Generations map[string]string `json:"generations,omitempty"`
+	// Recoveries exposes durable transaction state and inventory verification.
+	// A controller must not read an HTTP 200 status as proof that a failed
+	// apply preserved services; Consistent is the proof boundary.
+	Recoveries map[string]RecoveryStatus `json:"recoveries,omitempty"`
 	// Inventory distinguishes observed physical and allocatable capacity from
 	// Twinet's own reservations. Unknown values are nil and named explicitly
 	// in Inventory.Unknown; they are never reported as zero capacity.
@@ -853,6 +874,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Unlock()
 	resp.Generations = s.committedGenerations()
+	resp.Recoveries = s.recoveryStatuses(r.Context())
 
 	if owners, err := netx.OverlayOwners(); err == nil {
 		resp.Overlays = owners
@@ -874,6 +896,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		resp.Hash = ""
 		resp.Lab = ""
 		resp.Generations = nil
+		resp.Recoveries = nil
 		// Aggregates carry no tenant identifiers and remain useful to a
 		// diagnostic caller, but a count of every active lab is not needed.
 		// Reservations name other labs, which is cluster business a
@@ -1156,22 +1179,18 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		Prune:                  req.Prune,
 		Generation:             req.Generation,
 		RequireImmutableImages: top.Lab.Images.RequiresImmutableImages(),
+		RetainLegacyOverlays:   req.Phase == "apply",
 	}
-	// The plan may replace a container before its own capture hook returns.
-	// Establish a fresh durable quorum from the *currently hosted* topology
-	// before any create step can make that boundary destructive. Commit later
-	// captures again for the post-apply state and topology record.
-	if !req.DryRun && req.Phase == "apply" && s.store != nil {
-		s.mu.Lock()
-		previous := s.current[top.Name]
-		s.mu.Unlock()
-		if previous != nil {
-			if _, captureErr := s.captureAndReplicate(r.Context(), previous); captureErr != nil {
-				if boundaryErr := s.durableBoundary(previous, "replacing containers in this deployment", captureErr); boundaryErr != nil {
-					httpError(w, http.StatusConflict, boundaryErr)
-					return
-				}
-			}
+	if !req.DryRun && req.Phase == "apply" {
+		if err := s.markGenerationApplying(top.Name, req.Fence, req.Generation); err != nil {
+			httpError(w, http.StatusConflict, err)
+			return
+		}
+		if err := s.transactionFail("apply"); err != nil {
+			_ = s.markTransactionPhase(top.Name, req.Fence, req.Generation,
+				transactionRollbackNeeded, err.Error())
+			httpError(w, http.StatusConflict, err)
+			return
 		}
 	}
 	p, err := eng.Build(top)
@@ -1186,6 +1205,9 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		}
 		p = p.Restrict(func(st *plan.Step) bool { return want[st.Scope] })
 	}
+	if req.Phase == "apply" {
+		s.transactionFailpoints(p)
+	}
 	execCtx := r.Context()
 	stopFence := func() {}
 	if req.Phase == "apply" {
@@ -1199,6 +1221,10 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 	})
 	s.recordPlanMetrics(rep)
 	if err != nil {
+		if req.Phase == "apply" && !req.DryRun {
+			_ = s.markTransactionPhase(top.Name, req.Fence, req.Generation,
+				transactionRollbackNeeded, "forward apply execution failed: "+err.Error())
+		}
 		httpError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -1206,6 +1232,10 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 	if !req.DryRun {
 		imageDigests, err = s.pulledImageDigests(r.Context(), top)
 		if err != nil {
+			if req.Phase == "apply" {
+				_ = s.markTransactionPhase(top.Name, req.Fence, req.Generation,
+					transactionRollbackNeeded, "post-apply image verification failed: "+err.Error())
+			}
 			httpError(w, http.StatusInternalServerError, err)
 			return
 		}
@@ -1223,6 +1253,8 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		}
 		if rep.Failed() {
 			resp.Failures = reportFailures(rep)
+			_ = s.markTransactionPhase(top.Name, req.Fence, req.Generation,
+				transactionRollbackNeeded, fmt.Sprintf("forward apply failed: %v", rep.Err()))
 			s.recordEvent(top.Name, req.Generation, "deploy", s.requestCorrelation(r),
 				"apply", "error", fmt.Sprintf("%d degraded scope(s)", len(resp.Failures)))
 			writeJSON(w, resp)
@@ -1466,6 +1498,10 @@ func (s *Server) handleDestroy(w http.ResponseWriter, r *http.Request) {
 	s.recordEvent(req.Lab, "", "deploy", s.requestCorrelation(r), "destroy_requested", "scheduled", "")
 	if err := s.requireMutationFence(req.Lab, req.Fence); err != nil {
 		httpError(w, http.StatusConflict, err)
+		return
+	}
+	if why := s.recoveryMutationRefusal(req.Lab); why != "" {
+		httpError(w, http.StatusConflict, errors.New(why))
 		return
 	}
 	if why := s.refuseMutationIfHeld(req.Lab, req.Hold, "removing it"); why != "" {

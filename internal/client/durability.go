@@ -66,6 +66,10 @@ func (c *Cluster) ApplyDurable(ctx context.Context, top *model.Topology,
 	if req.DryRun || len(nodes) == 0 {
 		return c.coordinatedApply(ctx, top, req), DurabilityReport{}
 	}
+	if _, err := c.Recover(ctx, top.Name); err != nil {
+		return transactionFailure(nodes, nil, fmt.Errorf(
+			"refusing deploy while prior transaction recovery is incomplete: %w", err)), DurabilityReport{}
+	}
 
 	lease, err := c.AcquireMutationLease(ctx, top.Name)
 	if err != nil {

@@ -498,9 +498,17 @@ func tunnelReplay(body string) []string {
 			continue
 		}
 		out = append(out,
-			fmt.Sprintf("ip link show %s >/dev/null 2>&1 || ip tunnel add %s mode sit remote %s local %s ttl 64",
-				name, name, remote, local),
+			fmt.Sprintf("if ip link show %s >/dev/null 2>&1; then ip tunnel del %s; fi; "+
+				"ip tunnel add %s mode sit remote %s local %s ttl 64",
+				name, name, name, remote, local),
 			fmt.Sprintf("ip link set %s up", name))
+	}
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || (!strings.HasPrefix(line, "default") && !strings.Contains(line, " via ")) {
+			continue
+		}
+		out = append(out, "ip -6 route replace "+line)
 	}
 	return out
 }

@@ -10,6 +10,9 @@ import (
 	"net"
 	"os"
 	goruntime "runtime"
+	"slices"
+	"sort"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -63,6 +66,10 @@ func TestMultiplexOverlaySharesTunnelAndIsolatesFrames(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	vxlanPort, err := MultiplexOverlayPort("mux-test", "host-a", "host-b")
+	if err != nil {
+		t.Fatal(err)
+	}
 	bridgeA := ensureIntegrationOverlay(t, hostA, MultiplexOverlaySpec{
 		Lab: "mux-test", LocalNode: "host-a", RemoteNode: "host-b",
 		LocalIP: "198.18.0.1", RemoteIP: "198.18.0.2", UnderlayDev: "tmuxua",
@@ -110,8 +117,8 @@ func TestMultiplexOverlaySharesTunnelAndIsolatesFrames(t *testing.T) {
 	}
 	vxlanTXReady, vxlanRXReady := make(chan error, 1), make(chan error, 1)
 	vxlanTX, vxlanRX := make(chan bool, 1), make(chan bool, 1)
-	go captureVXLANPacket(hostA, "tmuxua", vxlanTXReady, vxlanTX)
-	go captureVXLANPacket(hostB, "tmuxub", vxlanRXReady, vxlanRX)
+	go captureVXLANPacket(hostA, "tmuxua", vxlanPort, vxlanTXReady, vxlanTX)
+	go captureVXLANPacket(hostB, "tmuxub", vxlanPort, vxlanRXReady, vxlanRX)
 	if err := <-vxlanTXReady; err != nil {
 		t.Fatalf("start underlay transmitter capture: %v", err)
 	}
@@ -136,6 +143,508 @@ func TestMultiplexOverlaySharesTunnelAndIsolatesFrames(t *testing.T) {
 		t.Fatalf("frame leaked from VNI 5001 into VNI 5002: %v", err)
 	}
 
+}
+
+// This deliberately disables the in-process pair lock. It models independent
+// controller/CLI processes racing against the same host namespace, so EEXIST
+// recovery rather than the local lock is what makes this pass.
+func TestMultiplexEnsureConcurrentRequestsAndPartialRecovery(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root and CAP_NET_ADMIN")
+	}
+	goruntime.LockOSThread()
+	defer goruntime.UnlockOSThread()
+	origin, err := netns.Get()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer origin.Close()
+	hostA := integrationNS(t, origin, "concurrent-host-a")
+	hostB := integrationNS(t, origin, "concurrent-host-b")
+	root, err := netlink.NewHandle()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	if err := createUnderlay(root, hostA, hostB, "tmuxca", "tmuxcb"); err != nil {
+		integrationSupport(t, err)
+		t.Fatal(err)
+	}
+	if err := configureUnderlay(hostA, "tmuxca", "198.19.0.1/24"); err != nil {
+		t.Fatal(err)
+	}
+	if err := configureUnderlay(hostB, "tmuxcb", "198.19.0.2/24"); err != nil {
+		t.Fatal(err)
+	}
+
+	type request struct {
+		scope string
+		vni   uint32
+	}
+	requests := make([]request, 24)
+	for i := range requests {
+		requests[i] = request{scope: "same-pair", vni: uint32(6100 + i)}
+	}
+	// The first two are the real-world collision that triggered the live
+	// failure: service and peering wires become runnable together for one
+	// shared pair. The remaining requests make the race high fan-out.
+	requests[0].scope, requests[1].scope = "service", "peering"
+	vnis := make([]uint32, len(requests))
+	for i, request := range requests {
+		vnis[i] = request.vni
+	}
+	vlans, err := AssignOverlayVLANs(vnis)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setMultiplexLockOverride(t, noMultiplexLock)
+	var wg sync.WaitGroup
+	errs := make(chan error, len(vnis))
+	for _, request := range requests {
+		request := request
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			err := hostA.Do(func() error {
+				_, err := EnsureMultiplexOverlay(MultiplexOverlaySpec{
+					Lab: "mux-concurrent", LocalNode: "host-a", RemoteNode: "host-b",
+					LocalIP: "198.19.0.1", RemoteIP: "198.19.0.2", UnderlayDev: "tmuxca",
+					MTU: 1400, VNI: request.vni, VLAN: vlans[request.vni],
+				})
+				return err
+			})
+			if err != nil {
+				errs <- fmt.Errorf("%s VNI %d: %w", request.scope, request.vni, err)
+				return
+			}
+			errs <- nil
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent EnsureMultiplexOverlay: %v", err)
+		}
+	}
+	assertMultiplexVNIs(t, hostA, "mux-concurrent", vnis)
+
+	// One more matching request must be a no-op reconciliation, not a second
+	// object or an EEXIST failure.
+	if err := hostA.Do(func() error {
+		_, err := EnsureMultiplexOverlay(MultiplexOverlaySpec{
+			Lab: "mux-concurrent", LocalNode: "host-b", RemoteNode: "host-a",
+			LocalIP: "198.19.0.1", RemoteIP: "198.19.0.2", UnderlayDev: "tmuxca",
+			MTU: 1400, VNI: vnis[0], VLAN: vlans[vnis[0]],
+		})
+		return err
+	}); err != nil {
+		t.Fatalf("matching reconciliation: %v", err)
+	}
+
+	for i, step := range []string{
+		"bridge-created", "vxlan-created", "vxlan-attached", "trunk-ready",
+		"binding-vlan", "binding-mapped", "binding-fdb",
+	} {
+		t.Run(step, func(t *testing.T) {
+			lab := fmt.Sprintf("mux-partial-%d", i)
+			vni := uint32(7000 + i)
+			fired := false
+			setMultiplexStepHook(t, func(got string) error {
+				if !fired && got == step {
+					fired = true
+					return errors.New("injected interruption")
+				}
+				return nil
+			})
+			spec := MultiplexOverlaySpec{
+				Lab: lab, LocalNode: "host-a", RemoteNode: "host-b",
+				LocalIP: "198.19.0.1", RemoteIP: "198.19.0.2", UnderlayDev: "tmuxca",
+				MTU: 1400, VNI: vni, VLAN: uint16(1000 + i),
+			}
+			err := hostA.Do(func() error {
+				_, err := EnsureMultiplexOverlay(spec)
+				return err
+			})
+			if err == nil || !fired {
+				t.Fatalf("step %s did not leave an interrupted partial object: err=%v fired=%t", step, err, fired)
+			}
+			if err := hostA.Do(func() error {
+				_, err := EnsureMultiplexOverlay(spec)
+				return err
+			}); err != nil {
+				t.Fatalf("recover %s partial object: %v", step, err)
+			}
+			assertMultiplexVNIs(t, hostA, lab, []uint32{vni})
+		})
+	}
+
+	t.Run("conflicting-owner-selects-salted-name", func(t *testing.T) {
+		lab := "mux-conflict-salt"
+		_, vxName, err := MultiplexOverlayNames(lab, "host-a", "host-b")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := hostA.Do(func() error {
+			h, err := netlink.NewHandle()
+			if err != nil {
+				return err
+			}
+			defer h.Close()
+			if err := h.LinkAdd(&netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: vxName}}); err != nil {
+				return err
+			}
+			link, err := h.LinkByName(vxName)
+			if err != nil {
+				return err
+			}
+			return h.LinkSetAlias(link, "foreign-owner")
+		}); err != nil {
+			t.Fatal(err)
+		}
+		var bridge string
+		if err := hostA.Do(func() error {
+			var err error
+			bridge, err = EnsureMultiplexOverlay(MultiplexOverlaySpec{
+				Lab: lab, LocalNode: "host-a", RemoteNode: "host-b",
+				LocalIP: "198.19.0.1", RemoteIP: "198.19.0.2", UnderlayDev: "tmuxca",
+				MTU: 1400, VNI: 7501, VLAN: 1201,
+			})
+			return err
+		}); err != nil {
+			t.Fatalf("ensure around conflicting owner: %v", err)
+		}
+		if bridge == "" {
+			t.Fatal("ensure returned no bridge")
+		}
+		if err := hostA.Do(func() error {
+			h, err := netlink.NewHandle()
+			if err != nil {
+				return err
+			}
+			defer h.Close()
+			link, err := h.LinkByName(vxName)
+			if err != nil {
+				return err
+			}
+			if link.Type() != "dummy" || link.Attrs().Alias != "foreign-owner" {
+				return fmt.Errorf("conflicting object was adopted or changed: %s %q", link.Type(), link.Attrs().Alias)
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("owned-bridge-plus-conflicting-vxlan-fails-closed", func(t *testing.T) {
+		lab := "mux-conflict-paired"
+		bridgeName, vxName, err := MultiplexOverlayNames(lab, "host-a", "host-b")
+		if err != nil {
+			t.Fatal(err)
+		}
+		key, err := newPairKey(lab, "host-a", "host-b")
+		if err != nil {
+			t.Fatal(err)
+		}
+		alias, err := key.alias()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := hostA.Do(func() error {
+			h, err := netlink.NewHandle()
+			if err != nil {
+				return err
+			}
+			defer h.Close()
+			if err := h.LinkAdd(&netlink.Bridge{LinkAttrs: netlink.LinkAttrs{Name: bridgeName}}); err != nil {
+				return err
+			}
+			bridge, err := h.LinkByName(bridgeName)
+			if err != nil {
+				return err
+			}
+			if err := h.LinkSetAlias(bridge, alias); err != nil {
+				return err
+			}
+			if err := h.LinkAdd(&netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: vxName}}); err != nil {
+				return err
+			}
+			vx, err := h.LinkByName(vxName)
+			if err != nil {
+				return err
+			}
+			return h.LinkSetAlias(vx, "foreign-owner")
+		}); err != nil {
+			t.Fatal(err)
+		}
+		err = hostA.Do(func() error {
+			_, err := EnsureMultiplexOverlay(MultiplexOverlaySpec{
+				Lab: lab, LocalNode: "host-a", RemoteNode: "host-b",
+				LocalIP: "198.19.0.1", RemoteIP: "198.19.0.2", UnderlayDev: "tmuxca",
+				MTU: 1400, VNI: 7502, VLAN: 1202,
+			})
+			return err
+		})
+		if err == nil {
+			t.Fatal("ensure adopted a conflicting VXLAN beside an owned bridge")
+		}
+	})
+
+	t.Run("active-standard-port-survives-port-allocation-upgrade", func(t *testing.T) {
+		const lab = "mux-legacy-port"
+		spec := MultiplexOverlaySpec{
+			Lab: lab, LocalNode: "host-a", RemoteNode: "host-b",
+			LocalIP: "198.19.0.1", RemoteIP: "198.19.0.2", UnderlayDev: "tmuxca",
+			MTU: 1400, Port: VXLANPort, VNI: 7601, VLAN: 1301,
+		}
+		if err := hostA.Do(func() error {
+			_, err := EnsureMultiplexOverlay(spec)
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		spec.Port = 0 // New topology-wide allocator would choose another port.
+		if err := hostA.Do(func() error {
+			_, err := EnsureMultiplexOverlay(spec)
+			return err
+		}); err != nil {
+			t.Fatalf("active legacy-port reconciliation: %v", err)
+		}
+		_, vxName, err := MultiplexOverlayNames(lab, "host-a", "host-b")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := hostA.Do(func() error {
+			h, err := netlink.NewHandle()
+			if err != nil {
+				return err
+			}
+			defer h.Close()
+			link, err := h.LinkByName(vxName)
+			if err != nil {
+				return err
+			}
+			vx, ok := link.(*netlink.Vxlan)
+			if !ok || vx.Port != VXLANPort {
+				return fmt.Errorf("legacy active trunk port = %#v, want %d", link, VXLANPort)
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+func TestMultiplexUpgradeLegacyNoChangeAndRollback(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root and CAP_NET_ADMIN")
+	}
+	goruntime.LockOSThread()
+	defer goruntime.UnlockOSThread()
+	origin, err := netns.Get()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer origin.Close()
+	hostA := integrationNS(t, origin, "upgrade-host-a")
+	hostB := integrationNS(t, origin, "upgrade-host-b")
+	root, err := netlink.NewHandle()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	if err := createUnderlay(root, hostA, hostB, "tmuxla", "tmuxlb"); err != nil {
+		integrationSupport(t, err)
+		t.Fatal(err)
+	}
+	if err := configureUnderlay(hostA, "tmuxla", "198.20.0.1/24"); err != nil {
+		t.Fatal(err)
+	}
+	if err := configureUnderlay(hostB, "tmuxlb", "198.20.0.2/24"); err != nil {
+		t.Fatal(err)
+	}
+	const lab = "mux-upgrade"
+	vnis := []uint32{8001, 8002}
+	vlans, err := AssignOverlayVLANs(vnis)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, vni := range vnis {
+		ensureLegacyUpgradeSide(t, hostA, lab, "198.20.0.1", "198.20.0.2", "tmuxla",
+			fmt.Sprintf("tmula%d", i), vni)
+		ensureLegacyUpgradeSide(t, hostB, lab, "198.20.0.2", "198.20.0.1", "tmuxlb",
+			fmt.Sprintf("tmulb%d", i), vni)
+	}
+	for i, vni := range vnis {
+		upgradeLegacySide(t, hostA, lab, "host-a", "host-b", "198.20.0.1", "198.20.0.2",
+			"tmuxla", fmt.Sprintf("tmula%d", i), vni, vlans[vni])
+		upgradeLegacySide(t, hostB, lab, "host-b", "host-a", "198.20.0.2", "198.20.0.1",
+			"tmuxlb", fmt.Sprintf("tmulb%d", i), vni, vlans[vni])
+	}
+	assertMultiplexVNIs(t, hostA, lab, vnis)
+	assertMultiplexVNIs(t, hostB, lab, vnis)
+	assertLegacyGone(t, hostA, vnis)
+	assertLegacyGone(t, hostB, vnis)
+
+	// Re-applying the exact desired state must reuse the trunk and mappings.
+	for i, vni := range vnis {
+		upgradeLegacySide(t, hostA, lab, "host-a", "host-b", "198.20.0.1", "198.20.0.2",
+			"tmuxla", fmt.Sprintf("tmula%d", i), vni, vlans[vni])
+		upgradeLegacySide(t, hostB, lab, "host-b", "host-a", "198.20.0.2", "198.20.0.1",
+			"tmuxlb", fmt.Sprintf("tmulb%d", i), vni, vlans[vni])
+	}
+	assertMultiplexVNIs(t, hostA, lab, vnis)
+	assertMultiplexVNIs(t, hostB, lab, vnis)
+
+	// Model a forward apply that added a new cross-node wire, then roll it
+	// back to the previous topology. Existing trunks and their old VNIs must
+	// survive; only the forward binding and its access port may disappear.
+	const forwardVNI = 8003
+	forwardVLAN := uint16(1203)
+	for _, side := range []struct {
+		ns                                                   *NS
+		localNode, remoteNode, local, remote, underlay, port string
+	}{
+		{hostA, "host-a", "host-b", "198.20.0.1", "198.20.0.2", "tmuxla", "tmulfa"},
+		{hostB, "host-b", "host-a", "198.20.0.2", "198.20.0.1", "tmuxlb", "tmulfb"},
+	} {
+		if err := side.ns.Do(func() error {
+			bridge, err := EnsureMultiplexOverlay(MultiplexOverlaySpec{
+				Lab: lab, LocalNode: side.localNode, RemoteNode: side.remoteNode,
+				LocalIP: side.local, RemoteIP: side.remote, UnderlayDev: side.underlay,
+				MTU: 1400, VNI: forwardVNI, VLAN: forwardVLAN,
+			})
+			if err != nil {
+				return err
+			}
+			h, err := netlink.NewHandle()
+			if err != nil {
+				return err
+			}
+			defer h.Close()
+			if err := h.LinkAdd(&netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: side.port}}); err != nil {
+				return err
+			}
+			return AttachToMultiplexOverlay(side.port, bridge, forwardVLAN)
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, side := range []struct {
+		ns   *NS
+		port string
+	}{
+		{hostA, "tmulfa"}, {hostB, "tmulfb"},
+	} {
+		if err := side.ns.Do(func() error {
+			h, err := netlink.NewHandle()
+			if err != nil {
+				return err
+			}
+			defer h.Close()
+			port, err := h.LinkByName(side.port)
+			if err != nil {
+				return err
+			}
+			if err := h.LinkDel(port); err != nil {
+				return err
+			}
+			return RemoveOverlay(forwardVNI)
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	assertMultiplexVNIs(t, hostA, lab, vnis)
+	assertMultiplexVNIs(t, hostB, lab, vnis)
+}
+
+func ensureLegacyUpgradeSide(t *testing.T, ns *NS, lab, local, remote, underlay, port string, vni uint32) {
+	t.Helper()
+	if err := ns.Do(func() error {
+		bridge, err := EnsureOverlay(OverlaySpec{
+			Lab: lab, VNI: vni, LocalIP: local, RemoteIP: remote, UnderlayDev: underlay, MTU: 1400,
+		})
+		if err != nil {
+			return err
+		}
+		h, err := netlink.NewHandle()
+		if err != nil {
+			return err
+		}
+		defer h.Close()
+		if err := h.LinkAdd(&netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: port}}); err != nil {
+			return err
+		}
+		return AttachToBridgeByName(port, bridge)
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func upgradeLegacySide(t *testing.T, ns *NS, lab, localNode, remoteNode, local, remote, underlay,
+	port string, vni uint32, vlan uint16) {
+	t.Helper()
+	if err := ns.Do(func() error {
+		bridge, err := EnsureMultiplexOverlay(MultiplexOverlaySpec{
+			Lab: lab, LocalNode: localNode, RemoteNode: remoteNode,
+			LocalIP: local, RemoteIP: remote, UnderlayDev: underlay, MTU: 1400,
+			VNI: vni, VLAN: vlan,
+		})
+		if err != nil {
+			return err
+		}
+		if err := AttachToMultiplexOverlay(port, bridge, vlan); err != nil {
+			return err
+		}
+		return RemoveLegacyOverlayForLab(vni, lab)
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertLegacyGone(t *testing.T, ns *NS, vnis []uint32) {
+	t.Helper()
+	if err := ns.Do(func() error {
+		h, err := netlink.NewHandle()
+		if err != nil {
+			return err
+		}
+		defer h.Close()
+		for _, vni := range vnis {
+			for _, name := range []string{VxlanName(vni), BridgeName(vni)} {
+				if _, err := h.LinkByName(name); err == nil {
+					return fmt.Errorf("legacy object %s remains after migration", name)
+				} else if !IsNotFound(err) {
+					return err
+				}
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertMultiplexVNIs(t *testing.T, ns *NS, lab string, want []uint32) {
+	t.Helper()
+	want = append([]uint32(nil), want...)
+	sort.Slice(want, func(i, j int) bool { return want[i] < want[j] })
+	err := ns.Do(func() error {
+		overlays, err := ListMultiplexOverlaysOfLab(lab)
+		if err != nil {
+			return err
+		}
+		if len(overlays) != 1 {
+			return fmt.Errorf("%s has %d shared overlays, want one: %#v", lab, len(overlays), overlays)
+		}
+		if !slices.Equal(overlays[0].VNIs, want) {
+			return fmt.Errorf("%s VNIs = %v, want %v", lab, overlays[0].VNIs, want)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 }
 
 func dumpIntegrationState(t *testing.T, namespaces ...*NS) {
@@ -433,7 +942,7 @@ func sendIntegrationUDP(ns *NS, ip string, port int, body []byte) error {
 	})
 }
 
-func captureVXLANPacket(ns *NS, iface string, ready chan<- error, result chan<- bool) {
+func captureVXLANPacket(ns *NS, iface string, vxlanPort int, ready chan<- error, result chan<- bool) {
 	readySent := false
 	err := ns.Do(func() error {
 		h, err := netlink.NewHandle()
@@ -466,13 +975,16 @@ func captureVXLANPacket(ns *NS, iface string, ready chan<- error, result chan<- 
 		for {
 			n, _, err := unix.Recvfrom(fd, buf, 0)
 			if err != nil {
+				if errors.Is(err, unix.EINTR) {
+					continue
+				}
 				if errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EWOULDBLOCK) {
 					result <- false
 					return nil
 				}
 				return err
 			}
-			if isVXLANUDP(buf[:n]) {
+			if isVXLANUDP(buf[:n], vxlanPort) {
 				result <- true
 				return nil
 			}
@@ -487,7 +999,7 @@ func captureVXLANPacket(ns *NS, iface string, ready chan<- error, result chan<- 
 	}
 }
 
-func isVXLANUDP(frame []byte) bool {
+func isVXLANUDP(frame []byte, vxlanPort int) bool {
 	if len(frame) < 14+20+8 || binary.BigEndian.Uint16(frame[12:14]) != 0x0800 {
 		return false
 	}
@@ -497,8 +1009,8 @@ func isVXLANUDP(frame []byte) bool {
 		return false
 	}
 	udpStart := ipStart + ihl
-	return binary.BigEndian.Uint16(frame[udpStart:udpStart+2]) == VXLANPort ||
-		binary.BigEndian.Uint16(frame[udpStart+2:udpStart+4]) == VXLANPort
+	return binary.BigEndian.Uint16(frame[udpStart:udpStart+2]) == uint16(vxlanPort) ||
+		binary.BigEndian.Uint16(frame[udpStart+2:udpStart+4]) == uint16(vxlanPort)
 }
 
 func receiveForeignFrame(ns *NS, iface string, foreignMAC net.HardwareAddr, ready chan<- error, result chan<- error) {
@@ -534,6 +1046,9 @@ func receiveForeignFrame(ns *NS, iface string, foreignMAC net.HardwareAddr, read
 		for {
 			n, _, err := unix.Recvfrom(fd, buf, 0)
 			if err != nil {
+				if errors.Is(err, unix.EINTR) {
+					continue
+				}
 				if errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EWOULDBLOCK) {
 					result <- nil
 					return nil

@@ -62,9 +62,16 @@ func (birdProvider) Apply(request RenderRequest) ([]Command, error) {
 	return []Command{{
 		Describe: "start BIRD 2",
 		Args: []string{"sh", "-c", strings.Join([]string{
-			"for p in $(ps -ef | awk '/[b]ird( |$)/ {print $1}'); do kill $p 2>/dev/null || true; done",
+			// Match the executable column, not a regex over the shell command:
+			// this script itself contains `bird -c`, and the old grep pattern
+			// killed its own exec shell with SIGTERM (143).
+			"for p in $(ps -eo pid=,comm= | awk '$2 == \"bird\" {print $1}'); do kill $p 2>/dev/null || true; done",
 			"rm -f " + birdSocketPath,
-			"bird -c " + birdConfigPath + " -s " + birdSocketPath,
+			// bird stays in the foreground by default. Launch it in the
+			// container background before probing, or the deployment exec is
+			// eventually cancelled and reports SIGTERM (143) even though the
+			// configuration itself was valid.
+			"bird -c " + birdConfigPath + " -s " + birdSocketPath + " >/tmp/bird.log 2>&1 &",
 			"for i in 1 2 3 4 5 6 7 8 9 10; do birdc -r -s " + birdSocketPath +
 				" show status >/dev/null 2>&1 && exit 0; sleep 1; done",
 			"echo 'BIRD did not become ready' >&2; exit 1",

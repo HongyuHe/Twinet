@@ -23,6 +23,12 @@ const (
 	maxVNI    = 1<<24 - 1
 
 	pairAliasPrefix = aliasPrefix + "pair:"
+
+	// Flow-based VXLAN devices are keyed by their receive socket. Linux
+	// permits only one unfiltered external VNI-0 device for a local
+	// address/UDP port tuple, so node-pair trunks must not all bind 4789.
+	multiplexPortFirst = 20_000
+	multiplexPortLast  = 60_999
 )
 
 // MultiplexOverlaySpec describes a VLAN-to-VNI binding on the one external
@@ -36,9 +42,15 @@ type MultiplexOverlaySpec struct {
 	LocalIP, RemoteIP     string
 	UnderlayDev           string
 	MTU                   int
-	Port                  int
-	VNI                   uint32
-	VLAN                  uint16
+	// Port is the pair-specific VXLAN UDP destination port. Zero derives a
+	// deterministic port from the lab/node-pair identity.
+	Port int
+	VNI  uint32
+	VLAN uint16
+	// PreserveActive keeps an already forwarding trunk untouched during
+	// transactional rollback. It may retain a legacy port/MTU long enough to
+	// restore service; ordinary apply still converges to the requested values.
+	PreserveActive bool
 }
 
 // MultiplexOverlay is one shared bridge/VXLAN pair and its active VNIs.
@@ -63,7 +75,18 @@ var multiplexLocks = struct {
 	byKey map[string]*multiplexLock
 }{byKey: map[string]*multiplexLock{}}
 
+var multiplexLockOverrides = struct {
+	sync.RWMutex
+	override func([]string) func()
+}{}
+
 func lockMultiplexKeys(keys []string) func() {
+	multiplexLockOverrides.RLock()
+	override := multiplexLockOverrides.override
+	multiplexLockOverrides.RUnlock()
+	if override != nil {
+		return override(keys)
+	}
 	keys = append([]string(nil), keys...)
 	sort.Strings(keys)
 	keys = dedupStrings(keys)
@@ -167,6 +190,79 @@ func pairDeviceName(prefix string, k pairKey, salt int) string {
 	return prefix + hex.EncodeToString(sum[:])[:11]
 }
 
+func pairPortCandidate(k pairKey, probe int) int {
+	sum := sha256.Sum256([]byte("port\x00" + k.identity() + "\x00" + strconv.Itoa(probe)))
+	span := multiplexPortLast - multiplexPortFirst + 1
+	return multiplexPortFirst + int(binaryBigEndianUint32(sum[:4])%uint32(span))
+}
+
+func binaryBigEndianUint32(in []byte) uint32 {
+	return uint32(in[0])<<24 | uint32(in[1])<<16 | uint32(in[2])<<8 | uint32(in[3])
+}
+
+// MultiplexPairID is the canonical, lab-independent key for a node pair.
+// It is suitable for indexing a result from AssignMultiplexPorts.
+func MultiplexPairID(first, second string) (string, error) {
+	if first == "" || second == "" || first == second {
+		return "", fmt.Errorf("multiplex overlay: invalid node pair %q/%q", first, second)
+	}
+	if first > second {
+		first, second = second, first
+	}
+	return first + "\x00" + second, nil
+}
+
+// AssignMultiplexPorts deterministically assigns a distinct UDP destination
+// port to every active node pair in one lab. This avoids Linux's one
+// flow-based-VNI-0-device-per-local-port socket constraint while preserving
+// identical assignments on both endpoint nodes.
+func AssignMultiplexPorts(lab string, pairs [][2]string) (map[string]int, error) {
+	keys := map[string]pairKey{}
+	for _, pair := range pairs {
+		k, err := newPairKey(lab, pair[0], pair[1])
+		if err != nil {
+			return nil, err
+		}
+		id, _ := MultiplexPairID(k.a, k.b)
+		keys[id] = k
+	}
+	ordered := make([]string, 0, len(keys))
+	for id := range keys {
+		ordered = append(ordered, id)
+	}
+	sort.Strings(ordered)
+	used := map[int]bool{}
+	out := make(map[string]int, len(ordered))
+	for _, id := range ordered {
+		k := keys[id]
+		port := 0
+		for probe := 0; probe <= multiplexPortLast-multiplexPortFirst; probe++ {
+			candidate := pairPortCandidate(k, probe)
+			if !used[candidate] {
+				port = candidate
+				used[port] = true
+				break
+			}
+		}
+		if port == 0 {
+			return nil, fmt.Errorf("multiplex overlay: no UDP port available for node pair %q/%q", k.a, k.b)
+		}
+		out[id] = port
+	}
+	return out, nil
+}
+
+// MultiplexOverlayPort returns the default deterministic port for callers
+// that have only one pair. Deploy uses AssignMultiplexPorts to deconflict all
+// pairs in a topology before calling EnsureMultiplexOverlay.
+func MultiplexOverlayPort(lab, first, second string) (int, error) {
+	k, err := newPairKey(lab, first, second)
+	if err != nil {
+		return 0, err
+	}
+	return pairPortCandidate(k, 0), nil
+}
+
 // MultiplexOverlayNames returns deterministic names for the first candidate
 // of a lab/node pair. EnsureMultiplexOverlay probes salted candidates if this
 // name is already occupied by another complete owner identity.
@@ -246,7 +342,7 @@ func EnsureMultiplexOverlay(spec MultiplexOverlaySpec) (string, error) {
 		spec.MTU = 1500
 	}
 	if spec.Port == 0 {
-		spec.Port = VXLANPort
+		spec.Port = pairPortCandidate(k, 0)
 	}
 
 	h, err := netlink.NewHandle()
@@ -272,44 +368,6 @@ func ensureMultiplexPair(h *netlink.Handle, k pairKey, spec MultiplexOverlaySpec
 	if err != nil {
 		return nil, nil, err
 	}
-	bridgeName, vxlanName, br, vx, err := multiplexPairCandidate(h, k, alias)
-	if err != nil {
-		return nil, nil, err
-	}
-	if br == nil {
-		filtering := true
-		defaultPVID := uint16(0)
-		wantMTU := spec.MTU + 50
-		br = &netlink.Bridge{LinkAttrs: netlink.LinkAttrs{
-			Name: bridgeName, MTU: wantMTU, Alias: alias,
-		}, VlanFiltering: &filtering, VlanDefaultPVID: &defaultPVID}
-		if err := h.LinkAdd(br); err != nil {
-			return nil, nil, fmt.Errorf("create multiplex bridge %s: %w", bridgeName, err)
-		}
-		link, err := h.LinkByName(bridgeName)
-		if err != nil {
-			return nil, nil, fmt.Errorf("re-resolve multiplex bridge %s: %w", bridgeName, err)
-		}
-		var ok bool
-		br, ok = link.(*netlink.Bridge)
-		if !ok {
-			return nil, nil, fmt.Errorf("multiplex bridge %s became %s", bridgeName, link.Type())
-		}
-		if br.Attrs().Alias != alias {
-			if err := h.LinkSetAlias(br, alias); err != nil {
-				return nil, nil, fmt.Errorf("stamp multiplex bridge %s owner: %w", bridgeName, err)
-			}
-			link, err = h.LinkByName(bridgeName)
-			if err != nil {
-				return nil, nil, fmt.Errorf("re-resolve multiplex bridge %s: %w", bridgeName, err)
-			}
-			br = link.(*netlink.Bridge)
-		}
-	}
-	if err := reconcileMultiplexBridge(h, br, spec.MTU+50, alias); err != nil {
-		return nil, nil, err
-	}
-
 	vtepIndex := 0
 	if spec.UnderlayDev != "" {
 		underlay, err := h.LinkByName(spec.UnderlayDev)
@@ -319,72 +377,414 @@ func ensureMultiplexPair(h *netlink.Handle, k pairKey, spec MultiplexOverlaySpec
 		}
 		vtepIndex = underlay.Attrs().Index
 	}
-	if vx != nil && multiplexVXLANReason(vx, local, vtepIndex, spec.Port, spec.MTU) != "" {
-		if err := h.LinkDel(vx); err != nil {
-			return nil, nil, fmt.Errorf("replace multiplex VXLAN %s: %w", vxlanName, err)
+	// The keyed in-process lock covers plan fan-out. EEXIST handling below is
+	// still mandatory: controller retries and a local CLI can be separate
+	// processes sharing the same kernel namespace.
+	last := ""
+	for retry := 0; retry < 16; retry++ {
+		bridgeName, vxlanName, _, _, err := multiplexPairCandidate(h, k, alias)
+		if err != nil {
+			return nil, nil, err
 		}
-		vx = nil
+		br, raced, err := ensurePairBridge(h, bridgeName, alias, spec.MTU+50)
+		if err != nil {
+			return nil, nil, err
+		}
+		if raced {
+			last = "bridge creation raced"
+			continue
+		}
+		if err := reconcileMultiplexBridge(h, br, spec.MTU+50, alias, spec.PreserveActive); err != nil {
+			return nil, nil, err
+		}
+
+		vx, raced, err := ensurePairVXLAN(h, vxlanName, alias, spec.MTU, local, vtepIndex, spec.Port)
+		if err != nil {
+			return nil, nil, err
+		}
+		if raced {
+			last = "VXLAN creation raced"
+			continue
+		}
+		if reason := multiplexVXLANReason(vx, local, vtepIndex, spec.Port, spec.MTU); reason != "" {
+			if spec.PreserveActive && canKeepRecoveryTrunk(vx, local, vtepIndex) {
+				// Recovery must never tear down a known pair merely because
+				// the old generation used a legacy MTU/port. The subsequent
+				// binding reconciliation is idempotent and proves the trunk
+				// can carry the restored VNI before recovery succeeds.
+				reason = ""
+			}
+			if reason == "" {
+				// Keep the existing recovery trunk.
+			} else {
+				active, err := multiplexPairActive(h, br, vx)
+				if err != nil {
+					return nil, nil, err
+				}
+				if active {
+					if canKeepRecoveryTrunk(vx, local, vtepIndex) ||
+						canKeepActivePort(vx, local, vtepIndex, spec.MTU) {
+						// Keep a previously allocated (including the first
+						// rollout's standard) port while it carries links.
+						// Pair sets can change between generations, so replacing
+						// an active trunk merely to reshuffle a collision probe
+						// would cut student traffic and make rollback impossible.
+						reason = ""
+					} else {
+						return nil, nil, fmt.Errorf(
+							"multiplex VXLAN %s conflicts with the requested pair configuration (%s) while active; refusing to replace it",
+							vxlanName, reason)
+					}
+				}
+				if reason == "" {
+					// The legacy standard-port trunk is otherwise identical and
+					// may continue through the ordinary binding reconciliation.
+				} else {
+					if err := h.LinkDel(vx); err != nil && !IsNotFound(err) {
+						return nil, nil, fmt.Errorf("replace inactive multiplex VXLAN %s: %w", vxlanName, err)
+					}
+					last = "replacing inactive VXLAN: " + reason
+					continue
+				}
+			}
+		}
+		if vx.Attrs().MasterIndex != 0 && vx.Attrs().MasterIndex != br.Attrs().Index {
+			return nil, nil, fmt.Errorf("multiplex VXLAN %s is attached to an unexpected bridge", vxlanName)
+		}
+		if err := attachToBridgeHandle(h, vx, br); err != nil {
+			return nil, nil, err
+		}
+		if err := multiplexCreatedStep("vxlan-attached"); err != nil {
+			return nil, nil, err
+		}
+		if vx.Attrs().Flags&net.FlagUp == 0 {
+			if err := h.LinkSetUp(vx); err != nil {
+				return nil, nil, fmt.Errorf("set multiplex VXLAN %s up: %w", vxlanName, err)
+			}
+		}
+		prot, err := h.LinkGetProtinfo(vx)
+		if err != nil {
+			return nil, nil, fmt.Errorf("multiplex VXLAN %s needs bridge VLAN tunnel support: %w", vxlanName, err)
+		}
+		if !prot.VlanTunnel {
+			if err := h.LinkSetVlanTunnel(vx, true); err != nil {
+				return nil, nil, fmt.Errorf(
+					"multiplex VXLAN %s requires Linux bridge VLAN tunnel mapping (kernel >= 4.11): %w",
+					vxlanName, err)
+			}
+		}
+		if err := multiplexCreatedStep("trunk-ready"); err != nil {
+			return nil, nil, err
+		}
+		return br, vx, nil
 	}
-	if vx == nil {
-		vx = &netlink.Vxlan{
-			LinkAttrs: netlink.LinkAttrs{Name: vxlanName, MTU: spec.MTU, Alias: alias},
+	return nil, nil, fmt.Errorf("multiplex overlay %q/%q did not converge after concurrent object creation (%s)",
+		k.a, k.b, last)
+}
+
+// ensurePairBridge creates or adopts an inactive matching bridge. raced means
+// a different process won LinkAdd, so the caller must re-select and validate
+// the candidate instead of assuming the object it just observed is unchanged.
+func ensurePairBridge(h *netlink.Handle, name, alias string, mtu int) (*netlink.Bridge, bool, error) {
+	link, err := h.LinkByName(name)
+	created := false
+	if err != nil {
+		if !IsNotFound(err) {
+			return nil, false, fmt.Errorf("look up multiplex bridge %s: %w", name, err)
+		}
+		filtering := true
+		defaultPVID := uint16(0)
+		bridge := &netlink.Bridge{LinkAttrs: netlink.LinkAttrs{
+			Name: name, MTU: mtu, Alias: alias,
+		}, VlanFiltering: &filtering, VlanDefaultPVID: &defaultPVID}
+		if err := h.LinkAdd(bridge); err != nil {
+			if isExist(err) {
+				return nil, true, nil
+			}
+			return nil, false, fmt.Errorf("create multiplex bridge %s: %w", name, err)
+		}
+		created = true
+		link, err = h.LinkByName(name)
+		if err != nil {
+			return nil, false, fmt.Errorf("re-resolve multiplex bridge %s: %w", name, err)
+		}
+	}
+	bridge, ok := link.(*netlink.Bridge)
+	if !ok {
+		return nil, false, fmt.Errorf("multiplex bridge %s exists as %s", name, link.Type())
+	}
+	if err := adoptInactivePairLink(h, bridge, alias, "bridge"); err != nil {
+		return nil, false, err
+	}
+	link, err = h.LinkByName(name)
+	if err != nil {
+		return nil, false, fmt.Errorf("re-resolve multiplex bridge %s: %w", name, err)
+	}
+	bridge, ok = link.(*netlink.Bridge)
+	if !ok {
+		return nil, false, fmt.Errorf("multiplex bridge %s became %s", name, link.Type())
+	}
+	if created {
+		if err := multiplexCreatedStep("bridge-created"); err != nil {
+			return bridge, false, err
+		}
+	}
+	return bridge, false, nil
+}
+
+func ensurePairVXLAN(h *netlink.Handle, name, alias string, mtu int, local net.IP,
+	vtepIndex, port int) (*netlink.Vxlan, bool, error) {
+
+	link, err := h.LinkByName(name)
+	created := false
+	if err != nil {
+		if !IsNotFound(err) {
+			return nil, false, fmt.Errorf("look up multiplex VXLAN %s: %w", name, err)
+		}
+		vxlan := &netlink.Vxlan{
+			LinkAttrs: netlink.LinkAttrs{Name: name, MTU: mtu, Alias: alias},
 			// FlowBased is iproute2's `external` VXLAN. The bridge's VLAN
 			// tunnel map supplies the VNI for each frame, rather than one
 			// netdev carrying exactly one VNI.
 			FlowBased:    true,
 			VtepDevIndex: vtepIndex,
 			SrcAddr:      local,
-			Port:         spec.Port,
+			Port:         port,
 			Learning:     false,
 			L2miss:       false,
 			L3miss:       false,
 		}
-		if err := h.LinkAdd(vx); err != nil {
-			return nil, nil, fmt.Errorf("create multiplex VXLAN %s: %w", vxlanName, err)
+		if err := h.LinkAdd(vxlan); err != nil {
+			if isExist(err) {
+				if existing, lookupErr := h.LinkByName(name); lookupErr == nil && existing != nil {
+					return nil, true, nil
+				}
+				return nil, false, fmt.Errorf(
+					"create multiplex VXLAN %s: UDP port %d is already bound by another external VXLAN; "+
+						"assign a distinct pair port: %w", name, port, err)
+			}
+			return nil, false, fmt.Errorf("create multiplex VXLAN %s: %w", name, err)
 		}
-		link, err := h.LinkByName(vxlanName)
+		created = true
+		link, err = h.LinkByName(name)
 		if err != nil {
-			return nil, nil, fmt.Errorf("re-resolve multiplex VXLAN %s: %w", vxlanName, err)
-		}
-		var ok bool
-		vx, ok = link.(*netlink.Vxlan)
-		if !ok {
-			return nil, nil, fmt.Errorf("multiplex VXLAN %s became %s", vxlanName, link.Type())
-		}
-		if vx.Attrs().Alias != alias {
-			if err := h.LinkSetAlias(vx, alias); err != nil {
-				return nil, nil, fmt.Errorf("stamp multiplex VXLAN %s owner: %w", vxlanName, err)
-			}
-			link, err = h.LinkByName(vxlanName)
-			if err != nil {
-				return nil, nil, fmt.Errorf("re-resolve multiplex VXLAN %s: %w", vxlanName, err)
-			}
-			vx = link.(*netlink.Vxlan)
+			return nil, false, fmt.Errorf("re-resolve multiplex VXLAN %s: %w", name, err)
 		}
 	}
-	if vx.Attrs().MasterIndex != 0 && vx.Attrs().MasterIndex != br.Attrs().Index {
-		return nil, nil, fmt.Errorf("multiplex VXLAN %s is attached to an unexpected bridge", vxlanName)
+	vxlan, ok := link.(*netlink.Vxlan)
+	if !ok {
+		return nil, false, fmt.Errorf("multiplex VXLAN %s exists as %s", name, link.Type())
 	}
-	if err := attachToBridgeHandle(h, vx, br); err != nil {
-		return nil, nil, err
+	if err := adoptInactivePairLink(h, vxlan, alias, "VXLAN"); err != nil {
+		return nil, false, err
 	}
-	if vx.Attrs().Flags&net.FlagUp == 0 {
-		if err := h.LinkSetUp(vx); err != nil {
-			return nil, nil, fmt.Errorf("set multiplex VXLAN %s up: %w", vxlanName, err)
-		}
-	}
-	prot, err := h.LinkGetProtinfo(vx)
+	link, err = h.LinkByName(name)
 	if err != nil {
-		return nil, nil, fmt.Errorf("multiplex VXLAN %s needs bridge VLAN tunnel support: %w", vxlanName, err)
+		return nil, false, fmt.Errorf("re-resolve multiplex VXLAN %s: %w", name, err)
 	}
-	if !prot.VlanTunnel {
-		if err := h.LinkSetVlanTunnel(vx, true); err != nil {
-			return nil, nil, fmt.Errorf(
-				"multiplex VXLAN %s requires Linux bridge VLAN tunnel mapping (kernel >= 4.11): %w",
-				vxlanName, err)
+	vxlan, ok = link.(*netlink.Vxlan)
+	if !ok {
+		return nil, false, fmt.Errorf("multiplex VXLAN %s became %s", name, link.Type())
+	}
+	if created {
+		if err := multiplexCreatedStep("vxlan-created"); err != nil {
+			return vxlan, false, err
 		}
 	}
-	return br, vx, nil
+	return vxlan, false, nil
+}
+
+var multiplexStepHooks = struct {
+	sync.RWMutex
+	hook func(string) error
+}{}
+
+// multiplexCreatedStep is deliberately unexported. Focused netx tests use it
+// to leave a bridge, a VXLAN, or an attached trunk behind at each interruption
+// boundary and prove a later Ensure converges it safely.
+func multiplexCreatedStep(step string) error {
+	multiplexStepHooks.RLock()
+	hook := multiplexStepHooks.hook
+	multiplexStepHooks.RUnlock()
+	if hook == nil {
+		return nil
+	}
+	return hook(step)
+}
+
+func adoptInactivePairLink(h *netlink.Handle, link netlink.Link, alias, kind string) error {
+	switch link.Attrs().Alias {
+	case alias:
+		return nil
+	case "":
+		active, err := multiplexLinkActive(h, link)
+		if err != nil {
+			return err
+		}
+		if active && !recognizablePartialPair(h, link, alias) {
+			return fmt.Errorf("refusing to adopt active unowned multiplex %s %s",
+				kind, link.Attrs().Name)
+		}
+		if err := h.LinkSetAlias(link, alias); err != nil {
+			return fmt.Errorf("stamp multiplex %s %s owner: %w", kind, link.Attrs().Name, err)
+		}
+		return nil
+	default:
+		return fmt.Errorf("multiplex %s %s is owned by another pair", kind, link.Attrs().Name)
+	}
+}
+
+// recognizablePartialPair permits recovery from the narrow, unavoidable
+// window between LinkAdd and LinkSetAlias in another process. It never adopts
+// a bridge carrying a host-side port: that could be a live foreign lab. The
+// only active partial shape accepted is the deterministic bridge/VXLAN pair
+// itself, with no access ports attached yet.
+func recognizablePartialPair(h *netlink.Handle, link netlink.Link, alias string) bool {
+	key, ok := pairKeyFromAlias(alias)
+	if !ok {
+		return false
+	}
+	matches := func(prefix, name string) bool {
+		for salt := 0; salt < 16; salt++ {
+			if pairDeviceName(prefix, key, salt) == name {
+				return true
+			}
+		}
+		return false
+	}
+	switch typed := link.(type) {
+	case *netlink.Bridge:
+		if !matches("twbp", typed.Attrs().Name) {
+			return false
+		}
+		links, err := h.LinkList()
+		if err != nil {
+			return false
+		}
+		foundVXLAN := false
+		for _, child := range links {
+			if child.Attrs().MasterIndex != typed.Attrs().Index {
+				continue
+			}
+			vx, ok := child.(*netlink.Vxlan)
+			if !ok || !matches("twvp", vx.Attrs().Name) {
+				return false
+			}
+			if vx.Attrs().Alias != "" && vx.Attrs().Alias != alias {
+				return false
+			}
+			foundVXLAN = true
+		}
+		return foundVXLAN
+	case *netlink.Vxlan:
+		if !matches("twvp", typed.Attrs().Name) || typed.Attrs().MasterIndex == 0 {
+			return false
+		}
+		master, err := h.LinkByIndex(typed.Attrs().MasterIndex)
+		if err != nil {
+			return false
+		}
+		bridge, ok := master.(*netlink.Bridge)
+		if !ok || !matches("twbp", bridge.Attrs().Name) {
+			return false
+		}
+		if bridge.Attrs().Alias != "" && bridge.Attrs().Alias != alias {
+			return false
+		}
+		links, err := h.LinkList()
+		if err != nil {
+			return false
+		}
+		for _, child := range links {
+			if child.Attrs().MasterIndex == bridge.Attrs().Index &&
+				child.Attrs().Index != typed.Attrs().Index {
+				return false
+			}
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+func multiplexLinkActive(h *netlink.Handle, link netlink.Link) (bool, error) {
+	switch typed := link.(type) {
+	case *netlink.Vxlan:
+		active, err := vxlanHasActiveBindings(typed)
+		if err != nil || active || typed.Attrs().MasterIndex == 0 {
+			return active, err
+		}
+		links, err := h.LinkList()
+		if err != nil {
+			return false, fmt.Errorf("list host interfaces: %w", err)
+		}
+		for _, child := range links {
+			if child.Attrs().MasterIndex == typed.Attrs().MasterIndex &&
+				child.Attrs().Index != typed.Attrs().Index {
+				return true, nil
+			}
+		}
+		return false, nil
+	case *netlink.Bridge:
+		links, err := h.LinkList()
+		if err != nil {
+			return false, fmt.Errorf("list host interfaces: %w", err)
+		}
+		for _, child := range links {
+			if child.Attrs().MasterIndex != typed.Attrs().Index {
+				continue
+			}
+			if vx, ok := child.(*netlink.Vxlan); ok {
+				active, err := vxlanHasActiveBindings(vx)
+				if err != nil {
+					return false, err
+				}
+				if active {
+					return true, nil
+				}
+				continue
+			}
+			return true, nil
+		}
+		return false, nil
+	default:
+		return false, fmt.Errorf("multiplex object %s has unsupported type %s",
+			link.Attrs().Name, link.Type())
+	}
+}
+
+func vxlanHasActiveBindings(vx *netlink.Vxlan) (bool, error) {
+	entries, err := listExternalFDB(vx)
+	if err != nil {
+		return false, err
+	}
+	zero := net.HardwareAddr{0, 0, 0, 0, 0, 0}
+	for _, entry := range entries {
+		if !bytesEqual(entry.HardwareAddr, zero) || entry.IP == nil {
+			continue
+		}
+		if entry.SourceVNI != 0 || entry.VNI != 0 {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func multiplexPairActive(h *netlink.Handle, bridge *netlink.Bridge, vxlan *netlink.Vxlan) (bool, error) {
+	if active, err := vxlanHasActiveBindings(vxlan); err != nil || active {
+		return active, err
+	}
+	links, err := h.LinkList()
+	if err != nil {
+		return false, fmt.Errorf("list host interfaces: %w", err)
+	}
+	for _, child := range links {
+		if child.Attrs().MasterIndex == bridge.Attrs().Index &&
+			child.Attrs().Index != vxlan.Attrs().Index {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func multiplexPairCandidate(h *netlink.Handle, k pairKey, alias string) (
@@ -401,7 +801,8 @@ func multiplexPairCandidate(h *netlink.Handle, k pairKey, alias string) (
 			return "", "", nil, nil, err
 		}
 		if brState == pairLinkConflict || vxState == pairLinkConflict {
-			if brState == pairLinkOwned || vxState == pairLinkOwned {
+			if brState == pairLinkOwned || brState == pairLinkPartial ||
+				vxState == pairLinkOwned || vxState == pairLinkPartial {
 				return "", "", nil, nil, fmt.Errorf(
 					"multiplex overlay name collision for %q/%q: one of %s or %s belongs to another object",
 					k.a, k.b, bridgeName, vxlanName)
@@ -432,6 +833,7 @@ type pairLinkState uint8
 const (
 	pairLinkMissing pairLinkState = iota
 	pairLinkOwned
+	pairLinkPartial
 	pairLinkConflict
 )
 
@@ -443,9 +845,6 @@ func ownedPairLink(h *netlink.Handle, name, alias, kind string) (netlink.Link, p
 		}
 		return nil, pairLinkConflict, fmt.Errorf("look up multiplex %s %s: %w", kind, name, err)
 	}
-	if link.Attrs().Alias != alias {
-		return link, pairLinkConflict, nil
-	}
 	switch kind {
 	case "bridge":
 		if _, ok := link.(*netlink.Bridge); !ok {
@@ -456,14 +855,23 @@ func ownedPairLink(h *netlink.Handle, name, alias, kind string) (netlink.Link, p
 			return link, pairLinkConflict, nil
 		}
 	}
-	return link, pairLinkOwned, nil
+	switch link.Attrs().Alias {
+	case alias:
+		return link, pairLinkOwned, nil
+	case "":
+		return link, pairLinkPartial, nil
+	default:
+		return link, pairLinkConflict, nil
+	}
 }
 
-func reconcileMultiplexBridge(h *netlink.Handle, br *netlink.Bridge, mtu int, alias string) error {
+func reconcileMultiplexBridge(h *netlink.Handle, br *netlink.Bridge, mtu int, alias string,
+	preserveActive bool,
+) error {
 	if br.Attrs().Alias != alias {
 		return fmt.Errorf("multiplex bridge %s has an unexpected owner", br.Attrs().Name)
 	}
-	if br.Attrs().MTU != mtu {
+	if br.Attrs().MTU != mtu && !preserveActive {
 		if err := h.LinkSetMTU(br, mtu); err != nil {
 			return fmt.Errorf("set multiplex bridge %s MTU: %w", br.Attrs().Name, err)
 		}
@@ -503,11 +911,30 @@ func multiplexVXLANReason(vx *netlink.Vxlan, local net.IP, vtepIndex, port, mtu 
 	case vx.Learning:
 		return "it has MAC learning enabled"
 	}
+
 	return ""
+}
+
+func canKeepActivePort(vx *netlink.Vxlan, local net.IP, vtepIndex, mtu int) bool {
+	if vx.Port <= 0 || !vx.FlowBased || vx.VxlanId != 0 || vx.Learning ||
+		!vx.SrcAddr.Equal(local) || vx.Attrs().MTU != mtu {
+		return false
+	}
+	return vtepIndex == 0 || vx.VtepDevIndex == vtepIndex
+}
+
+func canKeepRecoveryTrunk(vx *netlink.Vxlan, local net.IP, vtepIndex int) bool {
+	if !vx.FlowBased || vx.VxlanId != 0 || vx.Learning || !vx.SrcAddr.Equal(local) {
+		return false
+	}
+	return vtepIndex == 0 || vx.VtepDevIndex == vtepIndex
 }
 
 func ensureMultiplexBinding(h *netlink.Handle, vx *netlink.Vxlan, vlan uint16, vni uint32, remote net.IP) error {
 	if err := ensureVLANMembership(h, vx, vlan, false, false, false); err != nil {
+		return err
+	}
+	if err := multiplexCreatedStep("binding-vlan"); err != nil {
 		return err
 	}
 	if err := reconcileTunnelMapping(h, vx, vlan, vni); err != nil {
@@ -522,7 +949,13 @@ func ensureMultiplexBinding(h *netlink.Handle, vx *netlink.Vxlan, vlan uint16, v
 	}
 	for _, tunnel := range tunnels {
 		if tunnel.Vid == vlan && tunnel.TunId == vni {
+			if err := multiplexCreatedStep("binding-mapped"); err != nil {
+				return err
+			}
 			if err := ensureVNIForwarding(vx, vni, remote); err != nil {
+				return err
+			}
+			if err := multiplexCreatedStep("binding-fdb"); err != nil {
 				return err
 			}
 			return nil

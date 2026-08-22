@@ -13,6 +13,7 @@ func TestMultiplexNamesArePairStableAndBounded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	brBA, vxBA, err := MultiplexOverlayNames("cos461", "node-b", "node-a")
 	if err != nil {
 		t.Fatal(err)
@@ -36,6 +37,38 @@ func TestMultiplexNamesArePairStableAndBounded(t *testing.T) {
 	}
 	if pairDeviceName("twbp", key, 0) == pairDeviceName("twbp", key, 1) {
 		t.Fatal("name collision retry salt did not produce a distinct bridge candidate")
+	}
+}
+
+func TestAssignMultiplexPortsIsStableAndPairUnique(t *testing.T) {
+	pairs := [][2]string{{"node-a", "node-b"}, {"node-a", "node-c"}, {"node-b", "node-c"}}
+	first, err := AssignMultiplexPorts("cos461", pairs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := AssignMultiplexPorts("cos461", [][2]string{
+		{"node-b", "node-c"}, {"node-a", "node-b"}, {"node-a", "node-c"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[int]bool{}
+	for _, pair := range pairs {
+		id, err := MultiplexPairID(pair[0], pair[1])
+		if err != nil {
+			t.Fatal(err)
+		}
+		port := first[id]
+		if port < multiplexPortFirst || port > multiplexPortLast {
+			t.Fatalf("pair %q got out-of-range port %d", id, port)
+		}
+		if seen[port] {
+			t.Fatalf("multiple pairs received UDP port %d: %#v", port, first)
+		}
+		seen[port] = true
+		if second[id] != port {
+			t.Fatalf("pair %q port changed from %d to %d with input order", id, port, second[id])
+		}
 	}
 }
 
@@ -174,3 +207,31 @@ func TestMultiplexLocksArePairScoped(t *testing.T) {
 		t.Fatal("same-pair lock was not released")
 	}
 }
+
+func setMultiplexLockOverride(t *testing.T, override func([]string) func()) {
+	t.Helper()
+	multiplexLockOverrides.Lock()
+	previous := multiplexLockOverrides.override
+	multiplexLockOverrides.override = override
+	multiplexLockOverrides.Unlock()
+	t.Cleanup(func() {
+		multiplexLockOverrides.Lock()
+		multiplexLockOverrides.override = previous
+		multiplexLockOverrides.Unlock()
+	})
+}
+
+func setMultiplexStepHook(t *testing.T, hook func(string) error) {
+	t.Helper()
+	multiplexStepHooks.Lock()
+	previous := multiplexStepHooks.hook
+	multiplexStepHooks.hook = hook
+	multiplexStepHooks.Unlock()
+	t.Cleanup(func() {
+		multiplexStepHooks.Lock()
+		multiplexStepHooks.hook = previous
+		multiplexStepHooks.Unlock()
+	})
+}
+
+func noMultiplexLock([]string) func() { return func() {} }

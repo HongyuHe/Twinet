@@ -109,32 +109,90 @@ type generationState struct {
 	Prepared  string `json:"prepared,omitempty"`
 }
 
+// transactionPhase is persisted before any destructive work. A transaction
+// never disappears merely because a controller lost its request: recovery can
+// resume from this durable phase record after an agent restart.
+type transactionPhase string
+
+const (
+	transactionPrepared       transactionPhase = "prepared"
+	transactionApplying       transactionPhase = "applying"
+	transactionApplied        transactionPhase = "applied"
+	transactionRollbackNeeded transactionPhase = "rollback_needed"
+	transactionRecovering     transactionPhase = "recovering"
+	transactionRollbackFailed transactionPhase = "rollback_failed"
+	transactionCommitted      transactionPhase = "committed"
+)
+
+// transactionContainer is the observed service inventory of one managed
+// workload before a transaction may replace it.
+type transactionContainer struct {
+	Name       string `json:"name"`
+	DeviceID   string `json:"device_id,omitempty"`
+	Spec       string `json:"spec,omitempty"`
+	Generation string `json:"generation,omitempty"`
+	State      string `json:"state"`
+}
+
+// transactionInventory is both rollback evidence and the post-recovery
+// verifier. Overlay VNIs cover legacy and multiplex objects uniformly.
+type transactionInventory struct {
+	TopologyHash string                 `json:"topology_hash,omitempty"`
+	Generation   string                 `json:"generation,omitempty"`
+	Containers   []transactionContainer `json:"containers,omitempty"`
+	VNIs         []uint32               `json:"vnis,omitempty"`
+	CapturedAt   time.Time              `json:"captured_at"`
+	StateSafe    bool                   `json:"state_safe"`
+}
+
+// RecoveryStatus is safe to expose in node status and recovery responses. It
+// names a phase and inventory counts, never student configuration content.
+type RecoveryStatus struct {
+	Lab                string `json:"lab"`
+	Phase              string `json:"phase"`
+	Generation         string `json:"generation,omitempty"`
+	PreviousGeneration string `json:"previous_generation,omitempty"`
+	ExpectedContainers int    `json:"expected_containers"`
+	ObservedContainers int    `json:"observed_containers"`
+	ExpectedVNIs       int    `json:"expected_vnis"`
+	ObservedVNIs       int    `json:"observed_vnis"`
+	Consistent         bool   `json:"consistent"`
+	Attempts           int    `json:"attempts,omitempty"`
+	Error              string `json:"error,omitempty"`
+}
+
 // applyTransaction persists enough information to fail closed after a crashed
 // coordinator. It intentionally excludes the opaque token: after restart no
 // old caller can continue or finish this transaction.
 type applyTransaction struct {
-	Generation      string            `json:"generation"`
-	Expected        string            `json:"expected,omitempty"`
-	FenceGeneration uint64            `json:"fence_generation"`
-	Requested       json.RawMessage   `json:"requested"`
-	Previous        json.RawMessage   `json:"previous,omitempty"`
-	PreviousGen     string            `json:"previous_generation,omitempty"`
-	Mode            string            `json:"mode,omitempty"`
-	Ungraded        int               `json:"ungraded_as,omitempty"`
-	PeerUnderlay    map[string]string `json:"peer_underlay,omitempty"`
-	Prune           bool              `json:"prune,omitempty"`
-	OnlySteps       []string          `json:"only_steps,omitempty"`
-	StateProofs     []StateProof      `json:"state_proofs,omitempty"`
-	StateVerified   bool              `json:"state_verified,omitempty"`
-	Applied         bool              `json:"applied"`
-	Committed       bool              `json:"committed"`
+	Generation       string               `json:"generation"`
+	Expected         string               `json:"expected,omitempty"`
+	FenceGeneration  uint64               `json:"fence_generation"`
+	Requested        json.RawMessage      `json:"requested"`
+	Previous         json.RawMessage      `json:"previous,omitempty"`
+	PreviousGen      string               `json:"previous_generation,omitempty"`
+	Mode             string               `json:"mode,omitempty"`
+	Ungraded         int                  `json:"ungraded_as,omitempty"`
+	PeerUnderlay     map[string]string    `json:"peer_underlay,omitempty"`
+	Prune            bool                 `json:"prune,omitempty"`
+	OnlySteps        []string             `json:"only_steps,omitempty"`
+	StateProofs      []StateProof         `json:"state_proofs,omitempty"`
+	StateVerified    bool                 `json:"state_verified,omitempty"`
+	Phase            transactionPhase     `json:"phase,omitempty"`
+	Prestate         transactionInventory `json:"prestate,omitempty"`
+	Failure          string               `json:"failure,omitempty"`
+	RecoveryAttempts int                  `json:"recovery_attempts,omitempty"`
+	LastRecovery     time.Time            `json:"last_recovery,omitempty"`
+	Applied          bool                 `json:"applied"`
+	Committed        bool                 `json:"committed"`
 }
 
 type coordinationState struct {
-	FenceHighWater map[string]uint64           `json:"fence_high_water,omitempty"`
-	Overlays       map[uint32]overlayClaim     `json:"overlays,omitempty"`
-	Generations    map[string]generationState  `json:"generations,omitempty"`
-	Transactions   map[string]applyTransaction `json:"transactions,omitempty"`
+	FenceHighWater map[string]uint64               `json:"fence_high_water,omitempty"`
+	Overlays       map[uint32]overlayClaim         `json:"overlays,omitempty"`
+	Generations    map[string]generationState      `json:"generations,omitempty"`
+	Transactions   map[string]applyTransaction     `json:"transactions,omitempty"`
+	Inventories    map[string]transactionInventory `json:"inventories,omitempty"`
 }
 
 func (s *Server) initCoordination() {
@@ -152,6 +210,9 @@ func (s *Server) initCoordination() {
 	}
 	if s.transactions == nil {
 		s.transactions = map[string]applyTransaction{}
+	}
+	if s.inventories == nil {
+		s.inventories = map[string]transactionInventory{}
 	}
 }
 
@@ -211,7 +272,15 @@ func (s *Server) loadCoordination() {
 		s.generations[lab] = generation
 	}
 	for lab, transaction := range disk.Transactions {
+		if transaction.Phase == "" {
+			// Older prepared records were never safe to resume forward after a
+			// restart. Treat them as rollback work rather than guessing.
+			transaction.Phase = transactionRollbackNeeded
+		}
 		s.transactions[lab] = transaction
+	}
+	for lab, inventory := range disk.Inventories {
+		s.inventories[lab] = inventory
 	}
 	_ = s.expireCoordinationLocked(s.nowTime())
 }
@@ -227,6 +296,7 @@ func (s *Server) saveCoordinationLocked() error {
 		Overlays:       s.overlayClaims,
 		Generations:    s.generations,
 		Transactions:   s.transactions,
+		Inventories:    s.inventories,
 	}
 	raw, err := json.Marshal(disk)
 	if err != nil {
@@ -772,7 +842,7 @@ func (s *Server) releaseOverlayClaims(lab string, vnis []uint32) error {
 
 func (s *Server) prepareGeneration(lab string, fence Fence, expected, generation string,
 	requested json.RawMessage, mode string, ungraded int, peers map[string]string, prune bool,
-	onlySteps []string, stateProofs []StateProof,
+	onlySteps []string, stateProofs []StateProof, prestate ...transactionInventory,
 ) error {
 	if generation == "" {
 		return errors.New("a deployment generation is required")
@@ -813,12 +883,17 @@ func (s *Server) prepareGeneration(lab string, fence Fence, expected, generation
 		return fmt.Errorf("generation compare-and-swap for lab %q failed: expected %q, node has %q",
 			lab, expected, state.Committed)
 	}
+	before := transactionInventory{}
+	if len(prestate) > 0 {
+		before = prestate[0]
+	}
 	s.transactions[lab] = applyTransaction{
 		Generation: generation, Expected: expected, FenceGeneration: fence.Generation,
 		Requested: append(json.RawMessage(nil), requested...), Previous: previous,
 		PreviousGen: state.Committed, Mode: mode, Ungraded: ungraded,
 		PeerUnderlay: peers, Prune: prune, OnlySteps: append([]string(nil), onlySteps...),
 		StateProofs: append([]StateProof(nil), stateProofs...),
+		Phase:       transactionPrepared, Prestate: before,
 	}
 	state.Prepared = generation
 	s.generations[lab] = state
@@ -845,6 +920,22 @@ func (s *Server) checkPreparedGeneration(lab string, fence Fence, generation str
 	return nil
 }
 
+func (s *Server) markGenerationApplying(lab string, fence Fence, generation string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initCoordination()
+	if err := s.fenceErrorLocked(lab, fence, s.nowTime()); err != nil {
+		return err
+	}
+	tx, ok := s.transactions[lab]
+	if !ok || tx.Generation != generation || tx.FenceGeneration != fence.Generation {
+		return fmt.Errorf("generation %q of lab %q was not prepared by this fence", generation, lab)
+	}
+	tx.Phase, tx.Failure = transactionApplying, ""
+	s.transactions[lab] = tx
+	return s.saveCoordinationLocked()
+}
+
 func (s *Server) markGenerationApplied(lab string, fence Fence, generation string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -856,7 +947,7 @@ func (s *Server) markGenerationApplied(lab string, fence Fence, generation strin
 	if !ok || tx.Generation != generation || tx.FenceGeneration != fence.Generation {
 		return fmt.Errorf("generation %q of lab %q was not prepared by this fence", generation, lab)
 	}
-	tx.Applied = true
+	tx.Applied, tx.Phase, tx.Failure = true, transactionApplied, ""
 	s.transactions[lab] = tx
 	if err := s.saveCoordinationLocked(); err != nil {
 		return fmt.Errorf("persisting applied generation: %w", err)
@@ -872,7 +963,9 @@ func (s *Server) transactionForCommit(lab string, fence Fence, generation string
 		return applyTransaction{}, err
 	}
 	tx, ok := s.transactions[lab]
-	if !ok || tx.Generation != generation || tx.FenceGeneration != fence.Generation || !tx.Applied {
+	if !ok || tx.Generation != generation || tx.FenceGeneration != fence.Generation || !tx.Applied ||
+		tx.Phase == transactionRollbackNeeded || tx.Phase == transactionRecovering ||
+		tx.Phase == transactionRollbackFailed {
 		return applyTransaction{}, fmt.Errorf("generation %q of lab %q was not fully applied by this fence",
 			generation, lab)
 	}
@@ -921,7 +1014,9 @@ func (s *Server) markStateVerified(lab string, fence Fence, generation string) e
 	return nil
 }
 
-func (s *Server) finishCommittedGeneration(lab string, fence Fence, generation string) error {
+func (s *Server) finishCommittedGeneration(lab string, fence Fence, generation string,
+	inventory ...transactionInventory,
+) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.initCoordination()
@@ -935,13 +1030,22 @@ func (s *Server) finishCommittedGeneration(lab string, fence Fence, generation s
 	state := s.generations[lab]
 	state.Committed, state.Prepared = generation, ""
 	s.generations[lab] = state
-	tx.Committed = true
+	previousInventory, hadInventory := s.inventories[lab]
+	if len(inventory) > 0 {
+		s.inventories[lab] = inventory[0]
+	}
+	tx.Committed, tx.Phase, tx.Failure = true, transactionCommitted, ""
 	s.transactions[lab] = tx
 	if err := s.saveCoordinationLocked(); err != nil {
 		tx.Committed = false
 		s.transactions[lab] = tx
 		state.Committed, state.Prepared = tx.PreviousGen, generation
 		s.generations[lab] = state
+		if hadInventory {
+			s.inventories[lab] = previousInventory
+		} else {
+			delete(s.inventories, lab)
+		}
 		return fmt.Errorf("persisting committed generation: %w", err)
 	}
 	return nil
@@ -1009,6 +1113,33 @@ func (s *Server) finishAbortedGeneration(lab string, fence Fence, generation str
 	delete(s.transactions, lab)
 	if err := s.saveCoordinationLocked(); err != nil {
 		return fmt.Errorf("persisting aborted generation: %w", err)
+	}
+	return nil
+}
+
+// finishRecoveredGeneration is deliberately less strict than normal abort:
+// an agent restart or controller loss invalidates the original fence, so the
+// newer recovery fence is the only authority that can finish restoring the
+// pre-state.
+func (s *Server) finishRecoveredGeneration(lab string, fence Fence, generation string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initCoordination()
+	if err := s.fenceErrorLocked(lab, fence, s.nowTime()); err != nil {
+		return err
+	}
+	tx, ok := s.transactions[lab]
+	if !ok || tx.Generation != generation {
+		return fmt.Errorf("generation %q of lab %q has no recovery transaction", generation, lab)
+	}
+	state := s.generations[lab]
+	state.Committed, state.Prepared = tx.PreviousGen, ""
+	s.generations[lab] = state
+	s.inventories[lab] = tx.Prestate
+	delete(s.transactions, lab)
+	if err := s.saveCoordinationLocked(); err != nil {
+		s.transactions[lab] = tx
+		return fmt.Errorf("persisting recovered generation: %w", err)
 	}
 	return nil
 }

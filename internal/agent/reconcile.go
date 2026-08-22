@@ -376,6 +376,11 @@ func (s *Server) reconcileOnce(ctx context.Context) {
 				"lab", name, "holder", who)
 			continue
 		}
+		if why := s.recoveryMutationRefusal(name); why != "" {
+			slog.Debug("leaving lab alone while durable recovery owns it",
+				"lab", name, "reason", why)
+			continue
+		}
 		// The survey runs without the lab lock. Holding it for the whole scan
 		// made a background maintenance task block the operator: a deploy
 		// arriving mid-sweep was refused with "another operation is already

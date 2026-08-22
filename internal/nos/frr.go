@@ -301,17 +301,26 @@ func readFRROSPF(ctx context.Context, d *model.Device, exec netstate.Executor) (
 	if err != nil {
 		return nil, err
 	}
-	var document map[string][]struct {
+	type neighbor struct {
 		Address   string `json:"address"`
 		Interface string `json:"ifaceName"`
 		State     string `json:"nbrState"`
+	}
+	var wrapped struct {
+		Neighbors map[string][]neighbor `json:"neighbors"`
 	}
 	documentJSON, err := jsonOutput(raw)
 	if err != nil {
 		return nil, fmt.Errorf("parse OSPF neighbours on %s: %w", d.ID, err)
 	}
-	if err := json.Unmarshal(documentJSON, &document); err != nil {
+	if err := json.Unmarshal(documentJSON, &wrapped); err != nil {
 		return nil, fmt.Errorf("parse OSPF neighbours on %s: %w", d.ID, err)
+	}
+	document := wrapped.Neighbors
+	if document == nil {
+		if err := json.Unmarshal(documentJSON, &document); err != nil {
+			return nil, fmt.Errorf("parse OSPF neighbours on %s: %w", d.ID, err)
+		}
 	}
 	var out []netstate.OSPFPeer
 	for routerID, peers := range document {

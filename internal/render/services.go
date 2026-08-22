@@ -172,6 +172,10 @@ func (r *Renderer) serviceCommands(d *model.Device) []deploy.Command {
 			Args: []string{"sh", "-c", strings.Join([]string{
 				"pkill -x named 2>/dev/null || true",
 				"rm -f /var/run/named/named.pid 2>/dev/null || true",
+				// Files arrive through the runtime API as root-owned. named
+				// deliberately drops privilege, so make its generated config
+				// and zones readable before asking it to become authoritative.
+				"chown -R named:named /etc/bind /var/named",
 				"named -c /etc/bind/named.conf -u named",
 				// A resolver that started but answers nothing is worse than
 				// one that failed to start, because nothing reports it.

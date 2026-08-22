@@ -371,6 +371,19 @@ func (c *Cluster) abortApply(ctx context.Context, lease *MutationLease, wire *ag
 	return errs
 }
 
+func (c *Cluster) recoverFailedApply(ctx context.Context, lease *MutationLease, lab string,
+	cause error,
+) error {
+	if lease == nil {
+		return cause
+	}
+	_, recoveryErr := c.recoverWithLease(context.WithoutCancel(ctx), lab, lease)
+	if recoveryErr != nil {
+		return fmt.Errorf("%w; recovery failed: %v", cause, recoveryErr)
+	}
+	return fmt.Errorf("%w; prior generation was recovered and inventory verified", cause)
+}
+
 func transactionFailure(nodes []*Node, values map[string]agent.ApplyResponse, cause error,
 ) []NodeResult[agent.ApplyResponse] {
 	out := make([]NodeResult[agent.ApplyResponse], 0, len(nodes))
@@ -403,6 +416,10 @@ func (c *Cluster) coordinatedApply(ctx context.Context, top *model.Topology,
 	nodes := c.sortedNodes()
 	if req.DryRun || len(nodes) == 0 {
 		return c.unfencedApply(ctx, top, req)
+	}
+	if _, err := c.Recover(ctx, top.Name); err != nil {
+		return transactionFailure(nodes, nil, fmt.Errorf(
+			"prior transaction recovery is incomplete: %w", err))
 	}
 	lease, err := c.AcquireMutationLease(ctx, top.Name)
 	if err != nil {
@@ -451,11 +468,9 @@ func (c *Cluster) coordinatedApplyWithLease(ctx context.Context, top *model.Topo
 			prepare.StateProofs = append([]agent.StateProof(nil), proofs[node.Name]...)
 		}
 		if _, err := node.Apply(lease.Context(), prepare); err != nil {
-			rollbackErrs := c.abortApply(context.WithoutCancel(ctx), lease, wire, peers, generation, req)
-			if len(rollbackErrs) > 0 {
-				err = fmt.Errorf("%w; rollback: %v", err, rollbackErrs[0])
-			}
-			return transactionFailure(nodes, nil, fmt.Errorf("prepare %s: %w", node.Name, err))
+			cause := c.recoverFailedApply(ctx, lease, top.Name,
+				fmt.Errorf("prepare %s: %w", node.Name, err))
+			return transactionFailure(nodes, nil, cause)
 		}
 	}
 
@@ -488,19 +503,13 @@ func (c *Cluster) coordinatedApplyWithLease(ctx context.Context, top *model.Topo
 		applyErr = lease.Err()
 	}
 	if applyErr != nil {
-		rollbackErrs := c.abortApply(context.WithoutCancel(ctx), lease, wire, peers, generation, req)
-		if len(rollbackErrs) > 0 {
-			applyErr = fmt.Errorf("%w; rollback: %v", applyErr, rollbackErrs[0])
-		}
-		return transactionFailure(nodes, values, applyErr)
+		return transactionFailure(nodes, values,
+			c.recoverFailedApply(ctx, lease, top.Name, applyErr))
 	}
 	for _, node := range nodes {
 		if err := verifyAppliedImageDigests(top, node.Name, values[node.Name]); err != nil {
-			rollbackErrs := c.abortApply(context.WithoutCancel(ctx), lease, wire, peers, generation, req)
-			if len(rollbackErrs) > 0 {
-				err = fmt.Errorf("%w; rollback: %v", err, rollbackErrs[0])
-			}
-			return transactionFailure(nodes, values, fmt.Errorf("verify post-pull images on %s: %w", node.Name, err))
+			return transactionFailure(nodes, values, c.recoverFailedApply(ctx, lease, top.Name,
+				fmt.Errorf("verify post-pull images on %s: %w", node.Name, err)))
 		}
 	}
 
@@ -518,11 +527,8 @@ func (c *Cluster) coordinatedApplyWithLease(ctx context.Context, top *model.Topo
 		if _, err := node.VerifyStateRestore(lease.Context(), agent.StateVerifyRequest{
 			Lab: top.Name, Fence: fence, Generation: generation,
 		}); err != nil {
-			rollbackErrs := c.abortApply(context.WithoutCancel(ctx), lease, wire, peers, generation, req)
-			if len(rollbackErrs) > 0 {
-				err = fmt.Errorf("%w; rollback: %v", err, rollbackErrs[0])
-			}
-			return transactionFailure(nodes, values, fmt.Errorf("verify restored state on %s: %w", node.Name, err))
+			return transactionFailure(nodes, values, c.recoverFailedApply(ctx, lease, top.Name,
+				fmt.Errorf("verify restored state on %s: %w", node.Name, err)))
 		}
 	}
 
@@ -535,11 +541,8 @@ func (c *Cluster) coordinatedApplyWithLease(ctx context.Context, top *model.Topo
 			err = responseFailure(resp)
 		}
 		if err != nil {
-			rollbackErrs := c.abortApply(context.WithoutCancel(ctx), lease, wire, peers, generation, req)
-			if len(rollbackErrs) > 0 {
-				err = fmt.Errorf("%w; rollback: %v", err, rollbackErrs[0])
-			}
-			return transactionFailure(nodes, values, fmt.Errorf("commit %s: %w", node.Name, err))
+			return transactionFailure(nodes, values, c.recoverFailedApply(ctx, lease, top.Name,
+				fmt.Errorf("commit %s: %w", node.Name, err)))
 		}
 		if applied, ok := values[node.Name]; ok {
 			resp.AgentVersion, resp.ControllerVersion = applied.AgentVersion, applied.ControllerVersion
@@ -564,12 +567,12 @@ func (c *Cluster) coordinatedApplyWithLease(ctx context.Context, top *model.Topo
 				fmt.Errorf("finalize %s: %w", node.Name, err))
 		}
 	}
-	if err := lease.Err(); err != nil {
-		rollbackErrs := c.abortApply(context.WithoutCancel(ctx), lease, wire, peers, generation, req)
-		if len(rollbackErrs) > 0 {
-			err = fmt.Errorf("%w; rollback: %v", err, rollbackErrs[0])
-		}
+	if err := c.verifyCommittedRecovery(lease.Context(), top.Name, generation); err != nil {
 		return transactionFailure(nodes, values, err)
+	}
+	if err := lease.Err(); err != nil {
+		return transactionFailure(nodes, values,
+			c.recoverFailedApply(ctx, lease, top.Name, err))
 	}
 
 	out := make([]NodeResult[agent.ApplyResponse], 0, len(nodes))
@@ -577,6 +580,27 @@ func (c *Cluster) coordinatedApplyWithLease(ctx context.Context, top *model.Topo
 		out = append(out, NodeResult[agent.ApplyResponse]{Node: node.Name, Value: values[node.Name]})
 	}
 	return out
+}
+
+func (c *Cluster) verifyCommittedRecovery(ctx context.Context, lab, generation string) error {
+	var problems []string
+	for _, node := range c.sortedNodes() {
+		status, err := node.RecoveryStatus(ctx, lab)
+		if err != nil {
+			problems = append(problems, fmt.Sprintf("%s recovery status: %v", node.Name, err))
+			continue
+		}
+		if !status.Consistent || status.Generation != generation {
+			problems = append(problems, fmt.Sprintf("%s reports %s generation %q: %s",
+				node.Name, status.Phase, status.Generation, status.Error))
+		}
+	}
+	if len(problems) == 0 {
+		return nil
+	}
+	sort.Strings(problems)
+	return fmt.Errorf("cluster generation %q did not verify exact inventory on every node: %s",
+		generation, strings.Join(problems, "; "))
 }
 
 func mutationFailure[T any](nodes []*Node, values map[string]T, cause error) []NodeResult[T] {

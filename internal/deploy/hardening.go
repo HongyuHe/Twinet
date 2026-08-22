@@ -17,11 +17,29 @@ func (e *Engine) hardenedRuntimeSpec(d *model.Device, binds []runtime.Bind) (*ru
 	if d == nil {
 		return nil, fmt.Errorf("cannot harden a nil device")
 	}
-	h := model.EffectiveRuntimeHardening(d.Kind, d.Hardening)
-	if d.EffectiveNOS() == "bird" {
+	device := d
+	if e.RecoveryCompatibility {
+		clone := *d
+		clone.Capabilities = clone.Capabilities[:0:0]
+		for _, capability := range d.Capabilities {
+			if normalizeCapability(capability) != "SYS_ADMIN" {
+				clone.Capabilities = append(clone.Capabilities, capability)
+			}
+		}
+		device = &clone
+	}
+	h := model.EffectiveRuntimeHardening(device.Kind, device.Hardening)
+	if device.EffectiveNOS() == "bird" {
 		h.WritablePaths = append(h.WritablePaths, "/etc/bird")
 	}
-	if err := validateRuntimeHardening(d, h); err != nil {
+	if device.Kind == model.KindService {
+		// Service renderers materialize generated zones and daemon state after
+		// creation. A read-only root is retained, with only these explicit
+		// service-state directories supplied as tmpfs mounts.
+		h.WritablePaths = append(h.WritablePaths,
+			"/etc/bind", "/var/named", "/var/run/named", "/var/log")
+	}
+	if err := validateRuntimeHardening(device, h); err != nil {
 		return nil, err
 	}
 	tmpfs := map[string]string{}
@@ -48,7 +66,7 @@ func (e *Engine) hardenedRuntimeSpec(d *model.Device, binds []runtime.Bind) (*ru
 	}
 	return &runtime.Spec{
 		CapDrop:        []string{"ALL"},
-		Capabilities:   effectiveCapabilities(d),
+		Capabilities:   effectiveCapabilities(device),
 		SecurityOpt:    security,
 		ReadOnlyRootfs: *h.ReadOnlyRootfs,
 		RuntimeClass:   h.RuntimeClass,

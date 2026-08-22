@@ -143,6 +143,15 @@ type Engine struct {
 	// to match a registry manifest digest. It is set for release and grading
 	// image policies; development remains explicitly tag-capable.
 	RequireImmutableImages bool
+	// RetainLegacyOverlays keeps a live legacy per-link tunnel during a
+	// fenced forward apply. The transaction commits cleanup only after the
+	// replacement multiplex trunk and service inventory are verified.
+	RetainLegacyOverlays bool
+	// RecoveryCompatibility reconstructs a previously committed lab under a
+	// fenced rollback. It strips only legacy SYS_ADMIN requests from student
+	// containers; the internal FRR control sidecar retains that capability.
+	// This permits service recovery without reintroducing the old privilege.
+	RecoveryCompatibility bool
 
 	// pendingRestore records devices whose captured configuration must be
 	// replayed once their interfaces exist.
@@ -380,11 +389,12 @@ func (e *Engine) ensureContainer(ctx context.Context, top *model.Topology, d *mo
 	want := SpecHash(d)
 
 	if cur.State != runtime.StateAbsent {
+		forceRecoveryRecreate := e.RecoveryCompatibility && d.Kind == model.KindService
 		// Only a change to *this* container's own specification justifies
 		// replacing it. Anything else -- a neighbour's address, another AS's
 		// link delay -- must leave it alone, because replacing it would throw
 		// away whatever the student had configured inside.
-		if cur.Labels[LabelSpec] == want {
+		if cur.Labels[LabelSpec] == want && !forceRecoveryRecreate {
 			if cur.State.Joinable() {
 				if err := e.ensureFRRControl(ctx, top, d, controlBinds); err != nil {
 					return err
@@ -1199,20 +1209,22 @@ func (e *Engine) wireCrossNode(ctx context.Context, top *model.Topology, l *mode
 	if remoteIP == "" {
 		return fmt.Errorf("link %s: no underlay address known for node %s", l.ID, remote.Device.Node)
 	}
-	vlan, mtu, err := multiplexParameters(top, e.Node, remote.Device.Node, l.VNI)
+	vlan, mtu, port, err := multiplexParameters(top, e.Node, remote.Device.Node, l.VNI)
 	if err != nil {
 		return fmt.Errorf("link %s: %w", l.ID, err)
 	}
 	bridge, err := netx.EnsureMultiplexOverlay(netx.MultiplexOverlaySpec{
-		Lab:         top.Name,
-		LocalNode:   e.Node,
-		RemoteNode:  remote.Device.Node,
-		LocalIP:     e.UnderlayIP,
-		RemoteIP:    remoteIP,
-		UnderlayDev: e.UnderlayDev,
-		MTU:         mtu,
-		VNI:         l.VNI,
-		VLAN:        vlan,
+		Lab:            top.Name,
+		LocalNode:      e.Node,
+		RemoteNode:     remote.Device.Node,
+		LocalIP:        e.UnderlayIP,
+		RemoteIP:       remoteIP,
+		UnderlayDev:    e.UnderlayDev,
+		MTU:            mtu,
+		Port:           port,
+		VNI:            l.VNI,
+		VLAN:           vlan,
+		PreserveActive: e.RecoveryCompatibility,
 	})
 	if err != nil {
 		return fmt.Errorf("link %s: %w", l.ID, err)
@@ -1245,8 +1257,10 @@ func (e *Engine) wireCrossNode(ctx context.Context, top *model.Topology, l *mode
 	// bridge, so the legacy per-link pair is now safe to remove. If this step
 	// failed, the old path remains intact for a retry instead of cutting a
 	// running lab over half way through migration.
-	if err := netx.RemoveLegacyOverlayForLab(l.VNI, top.Name); err != nil {
-		return fmt.Errorf("link %s: remove legacy overlay: %w", l.ID, err)
+	if !e.RetainLegacyOverlays {
+		if err := netx.RemoveLegacyOverlayForLab(l.VNI, top.Name); err != nil {
+			return fmt.Errorf("link %s: remove legacy overlay: %w", l.ID, err)
+		}
 	}
 	return nil
 }
@@ -1255,24 +1269,30 @@ func (e *Engine) wireCrossNode(ctx context.Context, top *model.Topology, l *mode
 // It must fit IFNAMSIZ-1 and be unique per VNI, which it is because the VNI is.
 func hostSideName(vni uint32) string { return fmt.Sprintf("twp%d", vni) }
 
-// multiplexParameters computes the one bridge VLAN for a link and the one
-// outer MTU for all links between a pair of nodes. Both endpoint agents run
-// this against the same topology, so collision resolution stays symmetric.
-func multiplexParameters(top *model.Topology, first, second string, target uint32) (uint16, int, error) {
+// multiplexParameters computes the one bridge VLAN, outer MTU, and UDP port
+// for a link's node pair. Both endpoint agents run this against the same full
+// topology, so VLAN and port collision resolution stays symmetric.
+func multiplexParameters(top *model.Topology, first, second string, target uint32) (uint16, int, int, error) {
 	var vnis []uint32
 	mtu := 1500
 	found := false
+	pairs := map[string][2]string{}
 	for _, link := range top.Links {
 		if link == nil || !link.CrossNode() || link.A == nil || link.B == nil ||
 			link.A.Device == nil || link.B.Device == nil {
 			continue
 		}
 		a, b := link.A.Device.Node, link.B.Device.Node
+		pairID, err := netx.MultiplexPairID(a, b)
+		if err != nil {
+			return 0, 0, 0, fmt.Errorf("cross-node link %s: %w", link.ID, err)
+		}
+		pairs[pairID] = [2]string{a, b}
 		if !sameNodePair(a, b, first, second) {
 			continue
 		}
 		if link.VNI == 0 {
-			return 0, 0, fmt.Errorf("cross-node link %s has no VNI", link.ID)
+			return 0, 0, 0, fmt.Errorf("cross-node link %s has no VNI", link.ID)
 		}
 		vnis = append(vnis, link.VNI)
 		if linkMTU(link) > mtu {
@@ -1283,18 +1303,34 @@ func multiplexParameters(top *model.Topology, first, second string, target uint3
 		}
 	}
 	if !found {
-		return 0, 0, fmt.Errorf("VNI %d is not a cross-node link between %s and %s",
+		return 0, 0, 0, fmt.Errorf("VNI %d is not a cross-node link between %s and %s",
 			target, first, second)
 	}
 	vlans, err := netx.AssignOverlayVLANs(vnis)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
 	vlan := vlans[target]
 	if vlan == 0 {
-		return 0, 0, fmt.Errorf("no VLAN assigned to VNI %d", target)
+		return 0, 0, 0, fmt.Errorf("no VLAN assigned to VNI %d", target)
 	}
-	return vlan, mtu, nil
+	allPairs := make([][2]string, 0, len(pairs))
+	for _, pair := range pairs {
+		allPairs = append(allPairs, pair)
+	}
+	ports, err := netx.AssignMultiplexPorts(top.Name, allPairs)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	pairID, err := netx.MultiplexPairID(first, second)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	port := ports[pairID]
+	if port == 0 {
+		return 0, 0, 0, fmt.Errorf("no UDP port assigned to node pair %s/%s", first, second)
+	}
+	return vlan, mtu, port, nil
 }
 
 func sameNodePair(a, b, first, second string) bool {
@@ -1402,7 +1438,7 @@ func (e *Engine) configure(ctx context.Context, d *model.Device) error {
 		return fmt.Errorf("render commands for %s: %w", d.ID, err)
 	}
 	hash := ConfigHash(files, cmds)
-	if e.configurationCurrent(ctx, d, files, hash) {
+	if !e.RecoveryCompatibility && e.configurationCurrent(ctx, d, files, hash) {
 		return nil
 	}
 	for _, path := range sortedKeys(files) {
