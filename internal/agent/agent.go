@@ -435,6 +435,7 @@ func (s *Server) rehydrate() {
 			}
 			s.peers[top.Name] = wt.PeerUnderlay
 		}
+		s.loadPersistedPeerReplicationHealth(top)
 	}
 	if len(s.current) > 0 {
 		slog.Info("reloaded labs from the state store", "count", len(s.current))
@@ -706,6 +707,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	// accept only a node certificate with peer-state scope. A node key is not
 	// a controller key.
 	mux.HandleFunc("GET /v1/peer/state/inventory", s.peerAuth(s.handlePeerStateInventory))
+	mux.HandleFunc("GET /v1/peer/state", s.peerAuth(s.handlePeerStateRead))
 	mux.HandleFunc("POST /v1/peer/state", s.peerAuth(s.handlePeerStateImport))
 	mux.HandleFunc("POST /v1/sweep", s.authorize(endpointPolicy{
 		Action: authz.ActionAdmin, Mutation: true, AllowCluster: true,
@@ -822,6 +824,10 @@ func (s *Server) Serve(ctx context.Context) error {
 	// Capturing and replicating state belongs to the long-running agent, not
 	// the CLI invocation that happened to deploy the lab.
 	go s.durabilityLoop(ctx)
+	// Peer quorum health is a live authenticated handshake, not a side effect
+	// of periodic state mutation. It remains active while recovery suppresses
+	// periodic capture so simultaneously restarted nodes can bootstrap safely.
+	go s.peerHealthLoop(ctx)
 	// Interrupted transactions are durable recovery work, not abandoned
 	// partial applies. The loop obtains a new internal fence only after a
 	// controller lease lapses and keeps retrying rollback after node recovery.

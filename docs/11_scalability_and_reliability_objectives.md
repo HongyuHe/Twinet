@@ -266,6 +266,11 @@ disk disappears.
 - Exact rollback uses a small shared lifecycle worker budget, reuses an
   inspected matching/exited container, and resolves duplicate-name errors by
   re-inspection rather than blindly creating another container.
+- Peer acknowledgement history survives restart as stale evidence; startup and
+  recovery establish fresh mutual-TLS inventory handshakes independently of
+  periodic capture. Peer inventory/read APIs remain read-only and available
+  during recovery so simultaneous node restarts can authenticate, fetch an
+  exact missing replica, and then restore.
 - Kernel-created tunnel defaults (`sit0`, `tunl0`, GRE/GRETAP/ERSPAN, IP6
   tunnel, and VTI defaults) are excluded from captures and never deleted by
   restore; named student 6in4 tunnels remain durable facts.

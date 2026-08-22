@@ -1215,6 +1215,156 @@ func (s *Server) recoverTransaction(ctx context.Context, lab string, fence Fence
 	return s.recoverTransactionStrategy(ctx, lab, fence, "rollback")
 }
 
+func recoveryPreviousTopology(lab string, tx applyTransaction) (*model.Topology, error) {
+	if len(tx.Previous) == 0 {
+		return nil, nil
+	}
+	var wire Wire
+	if err := json.Unmarshal(tx.Previous, &wire); err != nil {
+		return nil, fmt.Errorf("read recovery pre-state topology: %w", err)
+	}
+	top, err := wire.Rehydrate()
+	if err != nil {
+		return nil, fmt.Errorf("rehydrate recovery pre-state topology: %w", err)
+	}
+	if top.Name != lab {
+		return nil, fmt.Errorf("recovery pre-state topology belongs to %q, not %q", top.Name, lab)
+	}
+	return top, nil
+}
+
+func peerHandshakePermanent(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "bad certificate") ||
+		strings.Contains(message, "certificate") ||
+		strings.Contains(message, "unauthorized") ||
+		strings.Contains(message, "forbidden") ||
+		strings.Contains(message, "peer-state")
+}
+
+// waitForRecoveryPeerQuorum keeps one recovery attempt active while peers are
+// rolling back/restarting. The old design returned after one periodic-ack
+// miss, so three recovering nodes incremented retry counters every five
+// seconds without ever giving their read-only peer APIs time to form quorum.
+func (s *Server) waitForRecoveryPeerQuorum(ctx context.Context, top *model.Topology) error {
+	if top == nil || top.Lab == nil || top.Lab.State.ReplicationFactor < 2 {
+		return nil
+	}
+	delay := peerRetryMin
+	var last error
+	for {
+		if err := s.ensurePeerQuorumReachable(ctx, top); err == nil {
+			return nil
+		} else {
+			last = err
+			if peerHandshakePermanent(err) {
+				return err
+			}
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			if last != nil {
+				return fmt.Errorf("live peer quorum did not form: %w", last)
+			}
+			return ctx.Err()
+		case <-timer.C:
+		}
+		delay *= 2
+		if delay > peerRetryMax {
+			delay = peerRetryMax
+		}
+	}
+}
+
+// fetchRecoveryReplicas reconstructs only the exact snapshot digests recorded
+// before the failed transaction. It never substitutes a newer-looking peer
+// snapshot, and it runs after live peer authentication but before rollback can
+// replace the runtime carrying the old state.
+func (s *Server) fetchRecoveryReplicas(ctx context.Context, top *model.Topology, tx applyTransaction) error {
+	if len(tx.Prestate.Snapshots) == 0 {
+		return nil
+	}
+	if s.store == nil {
+		return errors.New("recovery snapshot manifest exists but the state store is unavailable")
+	}
+	if top == nil {
+		return errors.New("recovery has snapshot evidence but no previous topology for peer lookup")
+	}
+	missing := map[string]transactionSnapshot{}
+	for _, expected := range tx.Prestate.Snapshots {
+		snapshot, err := s.store.Current(top.Name, expected.Device, state.Kind(expected.Kind))
+		if err == nil && snapshot.Digest == expected.Digest {
+			continue
+		}
+		missing[expected.Device+"/"+expected.Kind] = expected
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	targets, err := s.replicaTargets(top)
+	if err != nil {
+		return err
+	}
+	for _, target := range targets {
+		var response PeerStateReadResponse
+		peerErr, nextRetry := retryPeer(ctx, func() error {
+			peer, err := s.peerFor(ctx, target)
+			if err != nil {
+				return fmt.Errorf("dial recovery replica %s: %w", target.Name, err)
+			}
+			response, err = peer.Read(ctx, top.Name)
+			if err != nil {
+				return fmt.Errorf("read recovery replica %s: %w", target.Name, err)
+			}
+			if response.Lab != top.Name {
+				return fmt.Errorf("read recovery replica %s returned lab %q, want %q",
+					target.Name, response.Lab, top.Name)
+			}
+			return nil
+		})
+		if peerErr != nil {
+			s.recordPeerReplication(top.Name, target.Name, peerErr, nextRetry)
+			continue
+		}
+		s.recordPeerReplication(top.Name, target.Name, nil, time.Time{})
+		for _, wire := range response.Snapshots {
+			key := wire.Snapshot.Device + "/" + string(wire.Snapshot.Kind)
+			expected, needed := missing[key]
+			if !needed || wire.Snapshot.Lab != top.Name || wire.Snapshot.Digest != expected.Digest {
+				continue
+			}
+			snapshot := wire.Snapshot
+			snapshot.Content = wire.Content
+			if _, err := s.store.Put(snapshot); err != nil {
+				return fmt.Errorf("store verified replica %s/%s from %s: %w",
+					snapshot.Device, snapshot.Kind, target.Name, err)
+			}
+			current, err := s.store.Current(top.Name, expected.Device, state.Kind(expected.Kind))
+			if err == nil && current.Digest == expected.Digest {
+				delete(missing, key)
+			}
+		}
+		if len(missing) == 0 {
+			return nil
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(missing))
+	for key := range missing {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return fmt.Errorf("verified recovery replica is missing required snapshot digest(s): %s",
+		strings.Join(keys, ", "))
+}
+
 func (s *Server) recoverTransactionStrategy(ctx context.Context, lab string, fence Fence,
 	strategy string,
 ) (RecoveryStatus, error) {
@@ -1308,6 +1458,29 @@ func (s *Server) recoverTransactionStrategyOptions(ctx context.Context, lab stri
 		return s.transactionInventoryStatus(ctx, lab), errors.New(
 			"refusing recovery before durable student state capture")
 	}
+	previousTop, err := recoveryPreviousTopology(lab, tx)
+	if err != nil {
+		s.failRecovery(lab, fence, tx.Generation, err)
+		return s.transactionInventoryStatus(ctx, lab), err
+	}
+	if previousTop != nil {
+		if err := s.runRecoveryPhaseLimit(fencedCtx, lab, fence, tx.Generation,
+			"peer", "authenticated live peer quorum", s.recoveryArtifactLimit(),
+			func(phaseCtx context.Context) error {
+				return s.waitForRecoveryPeerQuorum(phaseCtx, previousTop)
+			}); err != nil {
+			s.failRecovery(lab, fence, tx.Generation, err)
+			return s.transactionInventoryStatus(ctx, lab), err
+		}
+		if err := s.runRecoveryPhaseLimit(fencedCtx, lab, fence, tx.Generation,
+			"replica", "verify and fetch durable replicas", s.recoveryArtifactLimit(),
+			func(phaseCtx context.Context) error {
+				return s.fetchRecoveryReplicas(phaseCtx, previousTop, tx)
+			}); err != nil {
+			s.failRecovery(lab, fence, tx.Generation, err)
+			return s.transactionInventoryStatus(ctx, lab), err
+		}
+	}
 	rollback := s.rollbackPreparedApply
 	if s.recoveryRollback != nil {
 		rollback = s.recoveryRollback
@@ -1343,6 +1516,13 @@ func (s *Server) recoverTransactionStrategyOptions(ctx context.Context, lab stri
 	}
 	if err := s.runRecoveryPhase(fencedCtx, lab, fence, tx.Generation,
 		"verify", "restored student state and runtime semantics", verify); err != nil {
+		s.failRecovery(lab, fence, tx.Generation, err)
+		return s.transactionInventoryStatus(ctx, lab), err
+	}
+	if err := s.runRecoveryPhase(fencedCtx, lab, fence, tx.Generation,
+		"verify", "expected FRR control sidecars", func(phaseCtx context.Context) error {
+			return s.verifyRecoveredControls(phaseCtx, tx)
+		}); err != nil {
 		s.failRecovery(lab, fence, tx.Generation, err)
 		return s.transactionInventoryStatus(ctx, lab), err
 	}
@@ -1437,6 +1617,42 @@ func (s *Server) replicateRecoveredDurability(ctx context.Context, tx applyTrans
 		return fmt.Errorf("recovery peer quorum: %w", err)
 	}
 	return nil
+}
+
+func (s *Server) verifyRecoveredControls(ctx context.Context, tx applyTransaction) error {
+	var controls []transactionRuntimeSpec
+	for _, entry := range tx.Prestate.RuntimeSpecs {
+		if entry.Control != nil {
+			controls = append(controls, entry)
+		}
+	}
+	if len(controls) == 0 {
+		return nil
+	}
+	if s.rt == nil {
+		return errors.New("no runtime for recovered control verification")
+	}
+	return runBoundedDeviceChecks(ctx, s.recoveryWorkerCount(), controls, s.recoveryArtifactLimit(),
+		func(entry transactionRuntimeSpec) string { return "FRR control " + entry.DeviceID },
+		func(checkCtx context.Context, entry transactionRuntimeSpec) error {
+			control := entry.Control
+			var current rt.Container
+			err := s.workLimiter().Run(checkCtx, []limiter.Kind{limiter.Apply, limiter.Lifecycle}, func() error {
+				var inspectErr error
+				current, inspectErr = s.rt.Inspect(checkCtx, control.Name)
+				return inspectErr
+			})
+			if err != nil {
+				return fmt.Errorf("inspect expected control %s: %w", control.Name, err)
+			}
+			if current.State != rt.StateRunning {
+				return fmt.Errorf("expected control %s is %s, want running", control.Name, current.State)
+			}
+			if !exactRuntimeSpecMatches(current, control) {
+				return fmt.Errorf("expected control %s does not match its recovered runtime contract", control.Name)
+			}
+			return nil
+		})
 }
 
 func (s *Server) verifyRecoveredStudentState(ctx context.Context, tx applyTransaction) error {

@@ -66,13 +66,26 @@ type PeerStateInventoryResponse struct {
 	Artifacts []state.ArtifactMeta `json:"artifacts"`
 }
 
+// PeerStateReadResponse carries verified current artifact bodies to a
+// recovering peer. It is peer-authenticated and read-only: recovery may fetch
+// a lost local replica without granting a node controller authority.
+type PeerStateReadResponse struct {
+	Lab       string         `json:"lab"`
+	Snapshots []WireSnapshot `json:"snapshots,omitempty"`
+	Records   []WireRecord   `json:"records,omitempty"`
+}
+
 // PeerReplicationStatus is a bounded, operator-visible replication health
 // record. It deliberately reports no state content: the actionable fact is
 // whether a failure-domain peer acknowledged the current digest quorum.
 type PeerReplicationStatus struct {
-	Lab                 string    `json:"lab"`
-	Peer                string    `json:"peer"`
-	Healthy             bool      `json:"healthy"`
+	Lab     string `json:"lab"`
+	Peer    string `json:"peer"`
+	Healthy bool   `json:"healthy"`
+	// Fresh means this process completed a live authenticated inventory
+	// handshake. Persisted acknowledgements survive restart as LastSuccess but
+	// are deliberately not called fresh until the peer is reachable again.
+	Fresh               bool      `json:"fresh"`
 	ConsecutiveFailures int       `json:"consecutive_failures,omitempty"`
 	LastSuccess         time.Time `json:"last_success,omitempty"`
 	LastFailure         time.Time `json:"last_failure,omitempty"`
@@ -82,6 +95,7 @@ type PeerReplicationStatus struct {
 
 type peerStateClient interface {
 	Inventory(context.Context, string) (PeerStateInventoryResponse, error)
+	Read(context.Context, string) (PeerStateReadResponse, error)
 	Import(context.Context, PeerStateRequest) (PeerStateResponse, error)
 }
 
@@ -91,6 +105,8 @@ const (
 	peerRetryMin      = 100 * time.Millisecond
 	peerRetryMax      = 2 * time.Second
 	peerRetryAttempts = 5
+	peerHealthEvery   = 5 * time.Second
+	peerHealthTimeout = 15 * time.Second
 )
 
 type httpPeerStateClient struct {
@@ -136,6 +152,12 @@ func (c *httpPeerStateClient) request(ctx context.Context, method, path string, 
 func (c *httpPeerStateClient) Inventory(ctx context.Context, lab string) (PeerStateInventoryResponse, error) {
 	var out PeerStateInventoryResponse
 	err := c.request(ctx, http.MethodGet, "/v1/peer/state/inventory?lab="+url.QueryEscape(lab), nil, &out)
+	return out, err
+}
+
+func (c *httpPeerStateClient) Read(ctx context.Context, lab string) (PeerStateReadResponse, error) {
+	var out PeerStateReadResponse
+	err := c.request(ctx, http.MethodGet, "/v1/peer/state?lab="+url.QueryEscape(lab), nil, &out)
 	return out, err
 }
 
@@ -236,6 +258,36 @@ func (s *Server) handlePeerStateInventory(w http.ResponseWriter, r *http.Request
 		return
 	}
 	writeJSON(w, PeerStateInventoryResponse{Lab: lab, Artifacts: artifacts})
+}
+
+func (s *Server) handlePeerStateRead(w http.ResponseWriter, r *http.Request) {
+	if s.store == nil {
+		httpError(w, http.StatusServiceUnavailable, errors.New("this node has no durable state store"))
+		return
+	}
+	lab := r.URL.Query().Get("lab")
+	if lab == "" {
+		httpError(w, http.StatusBadRequest, errors.New("a lab name is required"))
+		return
+	}
+	snapshots, err := s.store.CurrentSnapshots(lab)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, err)
+		return
+	}
+	records, err := s.store.CurrentRecords(lab)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, err)
+		return
+	}
+	out := PeerStateReadResponse{Lab: lab}
+	for _, snapshot := range snapshots {
+		out.Snapshots = append(out.Snapshots, WireSnapshot{Snapshot: snapshot, Content: snapshot.Content})
+	}
+	for _, record := range records {
+		out.Records = append(out.Records, WireRecord{Record: record, Content: record.Content})
+	}
+	writeJSON(w, out)
 }
 
 func (s *Server) handlePeerStateImport(w http.ResponseWriter, r *http.Request) {
@@ -601,24 +653,29 @@ func (s *Server) replicaTargets(top *model.Topology) ([]model.NodeSpec, error) {
 		policy.ReplicationFactor, want, local.Domain(), len(out))
 }
 
-// ensurePeerQuorumReachable proves the replication transport before a
-// transaction creates or replaces anything. Commit still verifies per-object
-// digest acknowledgements, but a known-broken peer TLS quorum must not allow a
-// destructive plan to begin and then discover the problem after containers
-// were removed.
+// ensurePeerQuorumReachable proves a live authenticated peer quorum before a
+// transaction creates or replaces anything. This is intentionally an
+// inventory-only handshake: it establishes transport/auth freshness without
+// waiting for the periodic replication loop to run.
 func (s *Server) ensurePeerQuorumReachable(ctx context.Context, top *model.Topology) error {
 	targets, err := s.replicaTargets(top)
 	if err != nil {
 		return err
 	}
 	for _, target := range targets {
+		var inventory PeerStateInventoryResponse
 		err, nextRetry := retryPeer(ctx, func() error {
 			peer, err := s.peerFor(ctx, target)
 			if err != nil {
 				return fmt.Errorf("dial durable peer %s: %w", target.Name, err)
 			}
-			if _, err := peer.Inventory(ctx, top.Name); err != nil {
+			inventory, err = peer.Inventory(ctx, top.Name)
+			if err != nil {
 				return fmt.Errorf("probe durable peer %s: %w", target.Name, err)
+			}
+			if inventory.Lab != top.Name {
+				return fmt.Errorf("probe durable peer %s returned inventory for %q, want %q",
+					target.Name, inventory.Lab, top.Name)
 			}
 			return nil
 		})
@@ -626,6 +683,7 @@ func (s *Server) ensurePeerQuorumReachable(ctx context.Context, top *model.Topol
 			s.recordPeerReplication(top.Name, target.Name, err, nextRetry)
 			return err
 		}
+		s.recordPeerReplication(top.Name, target.Name, nil, time.Time{})
 	}
 	return nil
 }
@@ -650,12 +708,14 @@ func (s *Server) recordPeerReplication(lab, peer string, err error, nextRetry ti
 	status.Lab, status.Peer = lab, peer
 	if err == nil {
 		status.Healthy = true
+		status.Fresh = true
 		status.ConsecutiveFailures = 0
 		status.LastSuccess = time.Now().UTC()
 		status.Error = ""
 		status.NextRetry = time.Time{}
 	} else {
 		status.Healthy = false
+		status.Fresh = false
 		status.ConsecutiveFailures++
 		status.LastFailure = time.Now().UTC()
 		status.NextRetry = nextRetry.UTC()
@@ -704,6 +764,84 @@ func (s *Server) peerReplicationStatuses() map[string]PeerReplicationStatus {
 		return nil
 	}
 	return out
+}
+
+// loadPersistedPeerReplicationHealth retains the last verified acknowledgement
+// across an agent restart without falsely treating it as a live connection.
+// A fresh inventory handshake is required before Healthy becomes true.
+func (s *Server) loadPersistedPeerReplicationHealth(top *model.Topology) {
+	if s.store == nil || top == nil {
+		return
+	}
+	replicas, err := s.store.ReplicaStatus(top.Name)
+	if err != nil {
+		return
+	}
+	targets, err := s.replicaTargets(top)
+	if err != nil {
+		return
+	}
+	s.peerHealthMu.Lock()
+	defer s.peerHealthMu.Unlock()
+	if s.peerHealth == nil {
+		s.peerHealth = map[string]PeerReplicationStatus{}
+	}
+	for _, target := range targets {
+		var last time.Time
+		for _, acks := range replicas.Acks {
+			for _, ack := range acks {
+				if ack.Node == target.Name && ack.Acknowledged.After(last) {
+					last = ack.Acknowledged
+				}
+			}
+		}
+		if last.IsZero() {
+			continue
+		}
+		key := peerHealthKey(top.Name, target.Name)
+		if live := s.peerHealth[key]; live.Fresh {
+			continue
+		}
+		s.peerHealth[key] = PeerReplicationStatus{
+			Lab: top.Name, Peer: target.Name, LastSuccess: last,
+			Error: "persisted acknowledgement awaiting live peer handshake",
+		}
+	}
+}
+
+// peerHealthLoop establishes authenticated inventory handshakes independently
+// of periodic capture. It intentionally includes recovering labs: peer read
+// APIs are safe during recovery and simultaneous node restarts must be able to
+// form a quorum before any node restores destructively.
+func (s *Server) peerHealthLoop(ctx context.Context) {
+	s.bootstrapPeerHealth(ctx)
+	ticker := time.NewTicker(peerHealthEvery)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.bootstrapPeerHealth(ctx)
+		}
+	}
+}
+
+func (s *Server) bootstrapPeerHealth(ctx context.Context) {
+	s.mu.Lock()
+	tops := make([]*model.Topology, 0, len(s.current))
+	for _, top := range s.current {
+		tops = append(tops, top)
+	}
+	s.mu.Unlock()
+	for _, top := range tops {
+		if top == nil || top.Lab == nil || top.Lab.State.ReplicationFactor < 2 {
+			continue
+		}
+		probeCtx, cancel := context.WithTimeout(ctx, peerHealthTimeout)
+		_ = s.ensurePeerQuorumReachable(probeCtx, top)
+		cancel()
+	}
 }
 
 func (s *Server) peerReplicationRetryDue(lab string) bool {

@@ -31,6 +31,25 @@ func (p *durablePeerFake) Inventory(_ context.Context, lab string) (PeerStateInv
 	return PeerStateInventoryResponse{Lab: lab, Artifacts: artifacts}, err
 }
 
+func (p *durablePeerFake) Read(_ context.Context, lab string) (PeerStateReadResponse, error) {
+	snapshots, err := p.store.CurrentSnapshots(lab)
+	if err != nil {
+		return PeerStateReadResponse{}, err
+	}
+	records, err := p.store.CurrentRecords(lab)
+	if err != nil {
+		return PeerStateReadResponse{}, err
+	}
+	out := PeerStateReadResponse{Lab: lab}
+	for _, snapshot := range snapshots {
+		out.Snapshots = append(out.Snapshots, WireSnapshot{Snapshot: snapshot, Content: snapshot.Content})
+	}
+	for _, record := range records {
+		out.Records = append(out.Records, WireRecord{Record: record, Content: record.Content})
+	}
+	return out, nil
+}
+
 func (p *durablePeerFake) Import(_ context.Context, req PeerStateRequest) (PeerStateResponse, error) {
 	p.mu.Lock()
 	p.imports++
@@ -258,6 +277,7 @@ func TestFreshExportRefusesStaleFallbackUnlessExplicitlyRequested(t *testing.T) 
 		}
 		mux := http.NewServeMux()
 		mux.HandleFunc("GET /v1/peer/state/inventory", receiver.peerAuth(receiver.handlePeerStateInventory))
+		mux.HandleFunc("GET /v1/peer/state", receiver.peerAuth(receiver.handlePeerStateRead))
 		mux.HandleFunc("POST /v1/peer/state", receiver.peerAuth(receiver.handlePeerStateImport))
 		peerServer := httptest.NewUnstartedServer(mux)
 		peerServer.TLS = &tls.Config{
@@ -298,6 +318,20 @@ func TestFreshExportRefusesStaleFallbackUnlessExplicitlyRequested(t *testing.T) 
 		}
 		if _, err := receiverStore.Current(top.Name, device.ID, state.KindFRR); err != nil {
 			t.Fatalf("peer did not receive verified state: %v", err)
+		}
+		// Peer reads remain available while the receiver is in durable
+		// recovery; they are authenticated read-only state access, not a
+		// periodic replication mutation.
+		receiver.transactions = map[string]applyTransaction{
+			top.Name: {Generation: "failed", Phase: transactionRecovering},
+		}
+		peerClient, err := source.peerFor(t.Context(), top.Lab.Placement.Nodes[1])
+		if err != nil {
+			t.Fatal(err)
+		}
+		read, err := peerClient.Read(t.Context(), top.Name)
+		if err != nil || len(read.Snapshots) == 0 {
+			t.Fatalf("peer read during recovery = %+v, %v", read, err)
 		}
 
 		// Same-CA leaf rotation is safe during a rolling restart: dialPeer reloads
