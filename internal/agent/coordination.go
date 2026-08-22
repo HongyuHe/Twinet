@@ -179,12 +179,18 @@ type RecoveryStatus struct {
 // coordinator. It intentionally excludes the opaque token: after restart no
 // old caller can continue or finish this transaction.
 type applyTransaction struct {
-	Generation        string               `json:"generation"`
-	Expected          string               `json:"expected,omitempty"`
-	FenceGeneration   uint64               `json:"fence_generation"`
-	Requested         json.RawMessage      `json:"requested"`
-	Previous          json.RawMessage      `json:"previous,omitempty"`
-	PreviousGen       string               `json:"previous_generation,omitempty"`
+	Generation      string          `json:"generation"`
+	Expected        string          `json:"expected,omitempty"`
+	FenceGeneration uint64          `json:"fence_generation"`
+	Requested       json.RawMessage `json:"requested"`
+	Previous        json.RawMessage `json:"previous,omitempty"`
+	PreviousGen     string          `json:"previous_generation,omitempty"`
+	// PreviousMode and PreviousUngraded are persisted independently of the
+	// legacy topology blob. Recovery must know whether old runtime state was
+	// reference/solve, a harness submission AS, or teaching mode before it
+	// decides whether a student snapshot may be replayed.
+	PreviousMode      string               `json:"previous_mode,omitempty"`
+	PreviousUngraded  int                  `json:"previous_ungraded_as,omitempty"`
 	Mode              string               `json:"mode,omitempty"`
 	Ungraded          int                  `json:"ungraded_as,omitempty"`
 	PeerUnderlay      map[string]string    `json:"peer_underlay,omitempty"`
@@ -915,10 +921,22 @@ func (s *Server) prepareGeneration(lab string, fence Fence, expected, generation
 	if len(prestate) > 0 {
 		before = prestate[0]
 	}
+	previousMode, previousUngraded := "", 0
+	if len(previous) > 0 {
+		var previousWire Wire
+		if json.Unmarshal(previous, &previousWire) == nil {
+			previousMode, previousUngraded = previousWire.Mode, previousWire.Ungraded
+		}
+	}
+	if previousMode == "" {
+		previousMode, previousUngraded = s.modes[lab], s.ungraded[lab]
+	}
 	s.transactions[lab] = applyTransaction{
 		Generation: generation, Expected: expected, FenceGeneration: fence.Generation,
 		Requested: append(json.RawMessage(nil), requested...), Previous: previous,
-		PreviousGen: state.Committed, Mode: mode, Ungraded: ungraded,
+		PreviousGen:  state.Committed,
+		PreviousMode: previousMode, PreviousUngraded: previousUngraded,
+		Mode: mode, Ungraded: ungraded,
 		PeerUnderlay: peers, Prune: prune, OnlySteps: append([]string(nil), onlySteps...),
 		StateProofs: append([]StateProof(nil), stateProofs...),
 		Phase:       transactionPrepared, Prestate: before,

@@ -118,13 +118,13 @@ func newNodeCmd(opts *Options) *cobra.Command {
 				if why != "" {
 					lab = why
 				}
-				fmt.Fprintf(w, "%s\t%s\t%s\t%s %s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\n",
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s %s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 					r.Node, state, v.Version, v.Runtime, v.RuntimeVer, contractSummary(v.Compatibility),
 					dash(v.RuntimeSocket),
 					inventorySummary(v.Inventory.Allocatable), inventorySummary(v.Inventory.Reserved),
 					loadSummary(v.Inventory.Load), limiterPressureSummary(v.Backpressure),
 					imageCacheSummary(v.Inventory.ImageCache),
-					dash(v.UnderlayIP), peerReplicationSummary(v.PeerReplication), v.Containers, lab)
+					dash(v.UnderlayIP), peerReplicationSummary(v.PeerReplication), containerSummary(v), lab)
 			}
 			if err := w.Flush(); err != nil {
 				return err
@@ -799,7 +799,11 @@ func nodeState(v agent.StatusResponse, controller contract.Set) (state, why stri
 		return "no-runtime", "the container runtime did not answer"
 	}
 	if statusUnknown(v.Unknown, "containers") {
-		return "unknown", "managed container inventory could not be read"
+		why := "managed container inventory could not be read"
+		if v.ContainerListError != "" {
+			why += ": " + firstLine(v.ContainerListError)
+		}
+		return "unknown", why
 	}
 	if v.Compatibility.Empty() {
 		return "incompatible", "agent does not advertise protocol, renderer, and state contracts"
@@ -828,6 +832,7 @@ func peerReplicationSummary(values map[string]agent.PeerReplicationStatus) strin
 	if len(values) == 0 {
 		return "-"
 	}
+
 	healthy, failed := 0, 0
 	for _, status := range values {
 		if status.Healthy {
@@ -840,6 +845,14 @@ func peerReplicationSummary(values map[string]agent.PeerReplicationStatus) strin
 		return fmt.Sprintf("%d ok/%d failed", healthy, failed)
 	}
 	return fmt.Sprintf("%d ok", healthy)
+}
+
+func containerSummary(v agent.StatusResponse) string {
+	if v.ManagedContainers > 0 || v.ControlContainers > 0 {
+		return fmt.Sprintf("%d primary + %d control (%d managed)",
+			v.PrimaryContainers, v.ControlContainers, v.ManagedContainers)
+	}
+	return fmt.Sprintf("%d", v.Containers)
 }
 
 func contractSummary(value contract.Set) string {

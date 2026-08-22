@@ -814,7 +814,7 @@ func (e *Engine) ensureFRRControl(ctx context.Context, top *model.Topology, fina
 	want := spec.Labels[LabelSpec]
 	if current.State != runtime.StateAbsent {
 		if current.Labels[LabelSpec] == want && current.State.Joinable() {
-			return nil
+			return e.stopPrimaryFRRDaemons(ctx, final.device)
 		}
 		if err := e.Runtime.Remove(ctx, name, true); err != nil {
 			return fmt.Errorf("replace FRR control %s: %w", name, err)
@@ -828,6 +828,34 @@ func (e *Engine) ensureFRRControl(ctx context.Context, top *model.Topology, fina
 	}
 	if err := e.Runtime.Start(ctx, name); err != nil {
 		return fmt.Errorf("start FRR control %s: %w", name, err)
+	}
+	return e.stopPrimaryFRRDaemons(ctx, final.device)
+}
+
+// stopPrimaryFRRDaemons migrates legacy routers to the split control-plane
+// contract. The primary container remains the student shell, but it must never
+// retain a second zebra/bgpd set after the sidecar owns /etc/frr and /run/frr:
+// duplicate daemons compete for vty/netlink state and leave routes apparently
+// configured but absent from the kernel.
+func (e *Engine) stopPrimaryFRRDaemons(ctx context.Context, d *model.Device) error {
+	if !e.usesFRRControl(d) {
+		return nil
+	}
+	const processes = `watchfrr|zebra|bgpd|ospfd|ospf6d|isisd|ldpd|pimd|staticd|bfdd|ripd|ripngd|pathd|sharpd|mgmtd`
+	script := strings.Join([]string{
+		`find_frr() { ps -eo pid=,args= | awk '$0 ~ /\/usr\/lib\/frr\/(` + processes + `)( |$)/ || $0 ~ /(^|[[:space:]])watchfrr( |$)/ {print $1}'; }`,
+		`pids="$(find_frr)"`,
+		`if [ -n "$pids" ]; then kill $pids 2>/dev/null || true; sleep 1; fi`,
+		`pids="$(find_frr)"`,
+		`if [ -n "$pids" ]; then kill -9 $pids 2>/dev/null || true; sleep 1; fi`,
+		`test -z "$(find_frr)"`,
+	}, "\n")
+	result, err := e.Runtime.Exec(ctx, d.Container, runtime.ExecCmd{Cmd: []string{"sh", "-c", script}})
+	if err != nil {
+		return fmt.Errorf("stop legacy primary FRR daemons for %s: %w", d.ID, err)
+	}
+	if err := result.Err(); err != nil {
+		return fmt.Errorf("legacy primary FRR daemons remain for %s: %w", d.ID, err)
 	}
 	return nil
 }
@@ -2026,6 +2054,13 @@ func (e *Engine) RewireDevice(ctx context.Context, top *model.Topology, d *model
 	}
 	if len(failed) > 0 {
 		return fmt.Errorf("rewiring %s: %s", d.ID, strings.Join(failed, "; "))
+	}
+	final, err := e.finalRuntimeSpecs(top, d)
+	if err != nil {
+		return err
+	}
+	if err := e.ensureFRRControl(ctx, top, final); err != nil {
+		return err
 	}
 	// Interfaces are only half the device. The daemons were started against a
 	// namespace that no longer exists, so they are pointed at the new one.

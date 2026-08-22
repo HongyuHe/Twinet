@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/HongyuHe/twinet/internal/render"
 	"github.com/HongyuHe/twinet/internal/runtime"
 	"github.com/HongyuHe/twinet/internal/state"
 )
@@ -15,6 +16,7 @@ func TestPreparedTransactionPersistsExactRollbackContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := coordinationTestServer(t, st)
+	s.rememberHow("cos461", string(render.ModeSolve), 7)
 	lease, err := s.acquireMutationLease(LeaseAcquireRequest{Lab: "cos461"})
 	if err != nil {
 		t.Fatal(err)
@@ -46,6 +48,10 @@ func TestPreparedTransactionPersistsExactRollbackContract(t *testing.T) {
 	if len(got) != 1 || got[0].Spec.Tmpfs["/etc/bind"] == "" ||
 		string(got[0].Artifacts[0].Content) != "zone old {}" {
 		t.Fatalf("rollback contract did not survive restart: %+v", got)
+	}
+	tx := after.transactions["cos461"]
+	if tx.PreviousMode != string(render.ModeSolve) || tx.PreviousUngraded != 7 {
+		t.Fatalf("previous recovery mode was not persisted: %+v", tx)
 	}
 }
 

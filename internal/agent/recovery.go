@@ -57,6 +57,23 @@ type transactionRuntimeSpec struct {
 const recoveryRetryEvery = 5 * time.Second
 const recoveryRetryBackoff = 30 * time.Second
 
+func recoveredMode(tx applyTransaction, wire Wire) (render.Mode, int) {
+	if tx.PreviousMode != "" || tx.PreviousUngraded != 0 {
+		return render.Mode(tx.PreviousMode), tx.PreviousUngraded
+	}
+	if wire.Mode != "" || wire.Ungraded != 0 {
+		return render.Mode(wire.Mode), wire.Ungraded
+	}
+	// Transactions written before previous-mode persistence cannot safely
+	// infer "teaching" merely because the old wire omitted mode. The forward
+	// request's solve/harness source is the only durable authority left; using
+	// it prevents replaying stale student snapshots over a reference device.
+	if tx.Mode != "" {
+		return render.Mode(tx.Mode), tx.Ungraded
+	}
+	return render.ModePlatform, 0
+}
+
 func (s *Server) recoveryLoop(ctx context.Context) {
 	ticker := time.NewTicker(recoveryRetryEvery)
 	defer ticker.Stop()
@@ -770,7 +787,8 @@ func (s *Server) restoreRecoveredTopology(lab string, tx applyTransaction) error
 		s.current = map[string]*model.Topology{}
 	}
 	s.current[lab] = top
-	s.rememberHow(lab, wire.Mode, wire.Ungraded)
+	mode, ungraded := recoveredMode(tx, wire)
+	s.rememberHow(lab, string(mode), ungraded)
 	if s.peers == nil {
 		s.peers = map[string]map[string]string{}
 	}
@@ -831,8 +849,9 @@ func (s *Server) verifyRecoveredStudentState(ctx context.Context, tx applyTransa
 			expectedByDevice[expected.Device] = append(expectedByDevice[expected.Device], snapshot)
 		}
 	}
+	mode, ungraded := recoveredMode(tx, wire)
 	for _, device := range top.DevicesOnNode(s.cfg.Node) {
-		if renderModeForDevice(render.Mode(wire.Mode), wire.Ungraded, device) == render.ModeSolve {
+		if renderModeForDevice(mode, ungraded, device) == render.ModeSolve {
 			// A solved reference device intentionally does not replay student
 			// snapshots. An ungraded AS in a private harness reaches the
 			// platform path above and is preserved normally.
@@ -855,7 +874,7 @@ func (s *Server) verifyRecoveredStudentState(ctx context.Context, tx applyTransa
 			}
 		}
 	}
-	if err := s.verifyRecoveredSemantics(ctx, top, render.Mode(wire.Mode), wire.Ungraded,
+	if err := s.verifyRecoveredSemantics(ctx, top, mode, ungraded,
 		tx.Prestate.RuntimeSpecs); err != nil {
 		return fmt.Errorf("verify recovered rendered/network semantics: %w", err)
 	}
@@ -982,8 +1001,9 @@ func (s *Server) rollbackExactContracts(ctx context.Context, lab string,
 	// the failed forward mode can leave a solved host without its reference
 	// address/default route (or install one on an ungraded submission AS)
 	// before the persisted commands are replayed.
-	rollback.Mode = oldWire.Mode
-	rollback.Ungraded = oldWire.Ungraded
+	previousMode, previousUngraded := recoveredMode(tx, oldWire)
+	rollback.Mode = string(previousMode)
+	rollback.Ungraded = previousUngraded
 	rollback.PeerUnderlay = oldWire.PeerUnderlay
 	eng := s.transactionEngine(top, rollback)
 	expected := map[string]bool{}
@@ -1070,7 +1090,7 @@ func (s *Server) rollbackExactContracts(ctx context.Context, lab string,
 				return fmt.Errorf("run rollback command for %s: %w", entry.DeviceID, err)
 			}
 		}
-		if renderModeForDevice(render.Mode(oldWire.Mode), oldWire.Ungraded, device) != render.ModeSolve {
+		if renderModeForDevice(previousMode, previousUngraded, device) != render.ModeSolve {
 			if _, err := deploy.Restore(ctx, s.rt, device, lab, s.store); err != nil {
 				return fmt.Errorf("restore student state for %s: %w", entry.DeviceID, err)
 			}

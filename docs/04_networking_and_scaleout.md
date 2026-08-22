@@ -82,6 +82,12 @@ device. A solved host regains its reference address and route; a teaching-mode
 student-owned interface remains deliberately blank unless a saved student
 snapshot requires it.
 
+FRR routers use a private control sidecar: legacy daemons in the student shell
+are stopped before the sidecar owns the daemon set, and recovery refuses
+duplicate sidecar daemons. `twinet node status` reports primary topology
+containers separately from internal control sidecars and includes a concrete
+container-list error when Docker inventory cannot be read.
+
 This is a shipped implementation path. It does not justify an unconditional
 claim that every failure mode has passed live acceptance: the known recovery
 limits and remaining acceptance work are listed in [09](09_status.md).

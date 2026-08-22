@@ -572,8 +572,9 @@ func (s *Server) rollbackPreparedApply(ctx context.Context, lab string, fence Fe
 	}
 	rollback := tx
 	rollback.Generation = tx.PreviousGen
-	rollback.Mode = oldWire.Mode
-	rollback.Ungraded = oldWire.Ungraded
+	previousMode, previousUngraded := recoveredMode(tx, oldWire)
+	rollback.Mode = string(previousMode)
+	rollback.Ungraded = previousUngraded
 	rollback.PeerUnderlay = oldWire.PeerUnderlay
 	// The old topology is rebuilt first. Pruning happens only after every old
 	// device has its interfaces and restored student state back, never as the
@@ -613,7 +614,7 @@ func (s *Server) rollbackPreparedApply(ctx context.Context, lab string, fence Fe
 		s.current = map[string]*model.Topology{}
 	}
 	s.current[lab] = oldTop
-	s.rememberHow(lab, oldWire.Mode, oldWire.Ungraded)
+	s.rememberHow(lab, string(previousMode), previousUngraded)
 	if s.peers == nil {
 		s.peers = map[string]map[string]string{}
 	}

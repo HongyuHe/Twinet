@@ -779,6 +779,62 @@ func (s *Server) frrContainer(ctx context.Context, d *model.Device) string {
 	return d.Container
 }
 
+func (s *Server) requiresFRRControl(d *model.Device) bool {
+	if !deploy.UsesFRRControl(d) {
+		return false
+	}
+	switch runtimeNameForReconcile(s.rt) {
+	case "docker", "podman":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Server) primaryFRRDaemonCount(ctx context.Context, d *model.Device) (int, error) {
+	if !s.requiresFRRControl(d) {
+		return 0, nil
+	}
+	const processes = `watchfrr|zebra|bgpd|ospfd|ospf6d|isisd|ldpd|pimd|staticd|bfdd|ripd|ripngd|pathd|sharpd|mgmtd`
+	script := `ps -eo args= | awk '$0 ~ /\/usr\/lib\/frr\/(` + processes +
+		`)( |$)/ || $0 ~ /(^|[[:space:]])watchfrr( |$)/ {n++} END {print n+0}'`
+	result, err := s.probeExec(ctx, d.Container, rt.ExecCmd{Cmd: []string{"sh", "-c", script}})
+	if err != nil {
+		return 0, err
+	}
+	if result.ExitCode != 0 {
+		return 0, fmt.Errorf("primary FRR daemon probe exited %d", result.ExitCode)
+	}
+	count, err := strconv.Atoi(strings.TrimSpace(result.Stdout))
+	if err != nil {
+		return 0, fmt.Errorf("parse primary FRR daemon count: %w", err)
+	}
+	return count, nil
+}
+
+func (s *Server) stopPrimaryFRRDaemons(ctx context.Context, d *model.Device) error {
+	if !s.requiresFRRControl(d) {
+		return nil
+	}
+	const processes = `watchfrr|zebra|bgpd|ospfd|ospf6d|isisd|ldpd|pimd|staticd|bfdd|ripd|ripngd|pathd|sharpd|mgmtd`
+	script := strings.Join([]string{
+		`find_frr() { ps -eo pid=,args= | awk '$0 ~ /\/usr\/lib\/frr\/(` + processes + `)( |$)/ || $0 ~ /(^|[[:space:]])watchfrr( |$)/ {print $1}'; }`,
+		`pids="$(find_frr)"`,
+		`if [ -n "$pids" ]; then kill $pids 2>/dev/null || true; sleep 1; fi`,
+		`pids="$(find_frr)"`,
+		`if [ -n "$pids" ]; then kill -9 $pids 2>/dev/null || true; sleep 1; fi`,
+		`test -z "$(find_frr)"`,
+	}, "\n")
+	result, err := s.probeExec(ctx, d.Container, rt.ExecCmd{Cmd: []string{"sh", "-c", script}})
+	if err != nil {
+		return err
+	}
+	if err := result.Err(); err != nil {
+		return fmt.Errorf("primary FRR daemon cleanup failed: %w", err)
+	}
+	return nil
+}
+
 // missingDaemons names the routing processes a router should be running and is
 // not, or "" when they are all there.
 func (s *Server) missingDaemons(ctx context.Context, d *model.Device, as *model.AS) string {
@@ -964,6 +1020,25 @@ func (s *Server) observeDevice(ctx context.Context, lab string, d *model.Device,
 	// NOSes still receive runtime/wiring health, but must not be declared
 	// broken merely because they do not run bgpd or ospfd binaries.
 	if d.Kind == model.KindRouter && d.EffectiveNOS() == model.DefaultNOS {
+		if s.requiresFRRControl(d) {
+			control := deploy.FRRControlContainer(d)
+			sidecar, err := s.rt.Inspect(ctx, control)
+			if err != nil {
+				return deviceObservation{Health: healthUnknown, State: c.State, SpecMatches: specMatches,
+					Reason: "FRR control sidecar inspect unreadable: " + err.Error()}
+			}
+			if !sidecar.State.Joinable() {
+				return deviceObservation{Health: healthBroken, State: c.State, SpecMatches: specMatches,
+					Reason: "FRR control sidecar is absent or not running"}
+			}
+			if primary, err := s.primaryFRRDaemonCount(ctx, d); err != nil {
+				return deviceObservation{Health: healthUnknown, State: c.State, SpecMatches: specMatches,
+					Reason: "primary FRR daemon probe unreadable: " + err.Error()}
+			} else if primary > 0 {
+				return deviceObservation{Health: healthBroken, State: c.State, SpecMatches: specMatches,
+					Reason: fmt.Sprintf("primary router container still runs %d FRR daemon(s)", primary)}
+			}
+		}
 		as := s.asOf(lab, d)
 		if missing, probeErr := s.missingDaemonsResult(ctx, d, as); probeErr != nil {
 			return deviceObservation{Health: healthUnknown, State: c.State, SpecMatches: specMatches,
@@ -1047,6 +1122,19 @@ func (s *Server) peerUnderlay(lab string) map[string]string {
 // it was given, so starting a dead daemon restores what was there rather than
 // replacing it.
 func (s *Server) startDaemons(ctx context.Context, lab string, d *model.Device) error {
+	if s.requiresFRRControl(d) {
+		control := deploy.FRRControlContainer(d)
+		sidecar, err := s.rt.Inspect(ctx, control)
+		if err != nil {
+			return fmt.Errorf("inspect FRR control sidecar: %w", err)
+		}
+		if !sidecar.State.Joinable() {
+			return fmt.Errorf("FRR control sidecar %s is not running; refusing to start daemons in primary", control)
+		}
+		if err := s.stopPrimaryFRRDaemons(ctx, d); err != nil {
+			return fmt.Errorf("stop legacy primary FRR daemons: %w", err)
+		}
+	}
 	// Stopped properly before being started.
 	//
 	// This used to kill watchfrr, delete the pid files, and start. Deleting the
@@ -1084,7 +1172,14 @@ func (s *Server) startDaemons(ctx context.Context, lab string, d *model.Device) 
 	for i := 0; i < 20; i++ {
 		missing = s.missingDaemons(ctx, d, as)
 		if missing == "" {
-			return nil
+			duplicate, err := s.duplicateDaemonsResult(ctx, d, as)
+			if err != nil {
+				return err
+			}
+			if duplicate == "" {
+				return nil
+			}
+			return fmt.Errorf("FRR control sidecar has duplicate daemons: %s", duplicate)
 		}
 		select {
 		case <-ctx.Done():

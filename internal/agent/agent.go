@@ -770,12 +770,22 @@ type StatusResponse struct {
 	UnderlayDev   string `json:"underlay_dev,omitempty"`
 	UnderlayMTU   int    `json:"underlay_mtu,omitempty"`
 	Containers    int    `json:"containers"`
+	// PrimaryContainers deliberately excludes internal FRR control sidecars;
+	// it is the topology-device count operators compare with placement.
+	PrimaryContainers int `json:"primary_containers"`
+	// ControlContainers reports the private sidecars separately so 81
+	// routers plus 24 FRR controls never looks like an unexplained inventory
+	// mismatch.
+	ControlContainers int `json:"control_containers"`
+	// ManagedContainers is the physical runtime count including controls.
+	ManagedContainers int `json:"managed_containers"`
 	// ContainerCount is nil when the runtime list could not be read. Containers
 	// is retained for older clients, but must not make an unreadable runtime
 	// look like an empty node.
-	ContainerCount *int   `json:"container_count,omitempty"`
-	Lab            string `json:"lab,omitempty"`
-	Hash           string `json:"topology_hash,omitempty"`
+	ContainerCount     *int   `json:"container_count,omitempty"`
+	ContainerListError string `json:"container_list_error,omitempty"`
+	Lab                string `json:"lab,omitempty"`
+	Hash               string `json:"topology_hash,omitempty"`
 	// Labs is every lab this node currently hosts, and Busy every lab with an
 	// operation in flight. A node that hosts a class lab and a dozen grading
 	// harnesses at once cannot be described by a single name.
@@ -825,10 +835,28 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	cs, listErr := s.rt.List(r.Context(), rt.Filter{All: true,
 		Labels: map[string]string{deploy.LabelManaged: "true"}})
+	if listErr != nil {
+		// Docker list can race a daemon reconnect. One immediate retry avoids
+		// reporting a healthy 105-container node as unknown/zero because of a
+		// transient client socket reset; a persistent error is retained in
+		// both status and the structured log rather than silently folded into
+		// an empty inventory.
+		retry, retryErr := s.rt.List(r.Context(), rt.Filter{All: true,
+			Labels: map[string]string{deploy.LabelManaged: "true"}})
+		if retryErr == nil {
+			cs, listErr = retry, nil
+		} else {
+			slog.Error("managed container inventory is unavailable", "node", s.cfg.Node,
+				"err", listErr, "retry_err", retryErr)
+		}
+	}
 	visibleCount := 0
+	controlCount := 0
 	for _, container := range cs {
 		if !isInternalControlContainer(container) {
 			visibleCount++
+		} else {
+			controlCount++
 		}
 	}
 
@@ -836,11 +864,14 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		Node: s.cfg.Node, Version: Version, Compatibility: Compatibility(),
 		Uptime:  time.Since(s.started).Round(time.Second).String(),
 		Runtime: s.rt.Name(), RuntimeVer: ver, RuntimeSocket: rt.Endpoint(s.rt),
-		CPUs:        runtime.NumCPU(),
-		UnderlayIP:  s.cfg.UnderlayIP,
-		UnderlayDev: s.cfg.UnderlayDev,
-		UnderlayMTU: s.configuredUnderlayMTU(),
-		Containers:  visibleCount,
+		CPUs:              runtime.NumCPU(),
+		UnderlayIP:        s.cfg.UnderlayIP,
+		UnderlayDev:       s.cfg.UnderlayDev,
+		UnderlayMTU:       s.configuredUnderlayMTU(),
+		Containers:        visibleCount,
+		PrimaryContainers: visibleCount,
+		ControlContainers: controlCount,
+		ManagedContainers: len(cs),
 	}
 	resp.Inventory = s.observeHostInventory(cs, listErr)
 	resp.Backpressure = s.workLimiter().Snapshot()
@@ -853,6 +884,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		resp.ContainerCount = &count
 	} else {
 		resp.Unknown = append(resp.Unknown, "containers")
+		resp.ContainerListError = listErr.Error()
 	}
 	for _, unknown := range resp.Inventory.Unknown {
 		resp.Unknown = append(resp.Unknown, "inventory."+unknown)
@@ -927,12 +959,20 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		ownContainers := 0
+		ownControls := 0
 		for _, container := range cs {
-			if container.Labels[deploy.LabelLab] == scope.Lab && !isInternalControlContainer(container) {
-				ownContainers++
+			if container.Labels[deploy.LabelLab] == scope.Lab {
+				if isInternalControlContainer(container) {
+					ownControls++
+				} else {
+					ownContainers++
+				}
 			}
 		}
 		resp.Containers = ownContainers
+		resp.PrimaryContainers = ownContainers
+		resp.ControlContainers = ownControls
+		resp.ManagedContainers = ownContainers + ownControls
 		if resp.ContainerCount != nil {
 			resp.ContainerCount = &ownContainers
 		}
