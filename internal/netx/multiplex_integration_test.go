@@ -228,6 +228,7 @@ func TestMultiplexEnsureConcurrentRequestsAndPartialRecovery(t *testing.T) {
 		}
 	}
 	assertMultiplexVNIs(t, hostA, "mux-concurrent", vnis)
+	assertPhysicalInventory(t, hostA, "mux-concurrent", len(vnis), 1)
 
 	// One more matching request must be a no-op reconciliation, not a second
 	// object or an EEXIST failure.
@@ -634,6 +635,7 @@ func assertMultiplexVNIs(t *testing.T, ns *NS, lab string, want []uint32) {
 		if err != nil {
 			return err
 		}
+
 		if len(overlays) != 1 {
 			return fmt.Errorf("%s has %d shared overlays, want one: %#v", lab, len(overlays), overlays)
 		}
@@ -643,6 +645,23 @@ func assertMultiplexVNIs(t *testing.T, ns *NS, lab string, want []uint32) {
 		return nil
 	})
 	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertPhysicalInventory(t *testing.T, ns *NS, lab string, bindings, trunks int) {
+	t.Helper()
+	if err := ns.Do(func() error {
+		inventory, err := InspectOverlayInventory(lab)
+		if err != nil {
+			return err
+		}
+		if len(inventory.Bindings) != bindings || len(inventory.Trunks) != trunks {
+			return fmt.Errorf("%s inventory = %d bindings / %d trunks, want %d / %d",
+				lab, len(inventory.Bindings), len(inventory.Trunks), bindings, trunks)
+		}
+		return nil
+	}); err != nil {
 		t.Fatal(err)
 	}
 }

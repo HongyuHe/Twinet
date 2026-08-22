@@ -475,11 +475,30 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	if owners, err := netx.OverlayOwners(); err == nil {
 		overlayCount = len(owners)
 	}
+	physicalTrunks := -1
+	if overlays, err := netx.InspectOverlayInventory(""); err == nil {
+		overlayCount = len(overlays.Bindings)
+		physicalTrunks = len(overlays.Trunks)
+	}
 	writeMetricHeader(&b, "twinet_overlays", "Active Twinet overlay bindings observed on this node.", "gauge")
 	if overlayCount >= 0 {
 		writeMetricLine(&b, "twinet_overlays", nil, strconv.Itoa(overlayCount))
 	} else {
 		writeMetricLine(&b, "twinet_overlays", nil, "NaN")
+	}
+	writeMetricHeader(&b, "twinet_overlay_logical_bindings",
+		"Logical VNI/VLAN bindings observed on this node.", "gauge")
+	if overlayCount >= 0 {
+		writeMetricLine(&b, "twinet_overlay_logical_bindings", nil, strconv.Itoa(overlayCount))
+	} else {
+		writeMetricLine(&b, "twinet_overlay_logical_bindings", nil, "NaN")
+	}
+	writeMetricHeader(&b, "twinet_overlay_physical_trunks",
+		"Physical bridge/VXLAN overlay trunks observed on this node.", "gauge")
+	if physicalTrunks >= 0 {
+		writeMetricLine(&b, "twinet_overlay_physical_trunks", nil, strconv.Itoa(physicalTrunks))
+	} else {
+		writeMetricLine(&b, "twinet_overlay_physical_trunks", nil, "NaN")
 	}
 
 	s.mu.Lock()

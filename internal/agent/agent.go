@@ -925,6 +925,11 @@ type StatusResponse struct {
 	// owns it, so an orchestrator can avoid handing a second lab an identifier
 	// the first is already using.
 	Overlays map[uint32]string `json:"overlays,omitempty"`
+	// LogicalOverlayBindings counts VNI/VLAN mappings; PhysicalOverlayTrunks
+	// counts bridge/VXLAN carriers. They intentionally diverge under
+	// multiplexing.
+	LogicalOverlayBindings int `json:"logical_overlay_bindings"`
+	PhysicalOverlayTrunks  int `json:"physical_overlay_trunks"`
 	// Generations are the only committed deployment generations. A prepared
 	// transaction is deliberately absent: it is not a cluster commit.
 	Generations map[string]string `json:"generations,omitempty"`
@@ -1096,6 +1101,10 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 	if owners, err := netx.OverlayOwners(); err == nil {
 		resp.Overlays = owners
+	}
+	if overlays, err := netx.InspectOverlayInventory(""); err == nil {
+		resp.LogicalOverlayBindings = len(overlays.Bindings)
+		resp.PhysicalOverlayTrunks = len(overlays.Trunks)
 	}
 	// A lab-scoped operator or diagnostic caller is told about the node it is
 	// looking at and nothing about the rest of the cluster's business. The
@@ -2662,11 +2671,13 @@ type SweepRequest struct {
 
 // SweepResponse is what the node found.
 type SweepResponse struct {
-	Node    string        `json:"node"`
-	Orphans []netx.Orphan `json:"orphans,omitempty"`
-	Removed []uint32      `json:"removed,omitempty"`
-	InUse   []netx.Orphan `json:"in_use,omitempty"`
-	Errs    []string      `json:"errors,omitempty"`
+	Node            string        `json:"node"`
+	Orphans         []netx.Orphan `json:"orphans,omitempty"`
+	Removed         []uint32      `json:"removed,omitempty"`
+	InUse           []netx.Orphan `json:"in_use,omitempty"`
+	LogicalBindings int           `json:"logical_bindings"`
+	PhysicalTrunks  int           `json:"physical_trunks"`
+	Errs            []string      `json:"errors,omitempty"`
 }
 
 // handleSweep finds overlays belonging to no lab this node hosts.
@@ -2709,6 +2720,12 @@ func (s *Server) handleSweep(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp := SweepResponse{Node: s.cfg.Node}
+	if inventory, err := netx.InspectOverlayInventory(""); err == nil {
+		resp.LogicalBindings = len(inventory.Bindings)
+		resp.PhysicalTrunks = len(inventory.Trunks)
+	} else {
+		resp.Errs = append(resp.Errs, "inspect overlay inventory: "+err.Error())
+	}
 	for _, o := range found {
 		if o.Ports > 0 {
 			resp.InUse = append(resp.InUse, o)

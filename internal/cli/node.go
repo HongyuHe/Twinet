@@ -1149,12 +1149,12 @@ func newNodeSweepCmd(opts *Options) *cobra.Command {
 			results := c.Sweep(cmd.Context(), remove)
 
 			w := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
-			fmt.Fprintln(w, "NODE\tORPHANS\tREMOVED\tIN USE\tNOTE")
+			fmt.Fprintln(w, "NODE\tLOGICAL\tTRUNKS\tORPHANS\tREMOVED\tIN USE\tNOTE")
 			bad, total := 0, 0
 			for _, r := range results {
 				if r.Err != nil {
 					bad++
-					fmt.Fprintf(w, "%s\t-\t-\t-\t%s\n", r.Node, firstLine(r.Err.Error()))
+					fmt.Fprintf(w, "%s\t-\t-\t-\t-\t-\t%s\n", r.Node, firstLine(r.Err.Error()))
 					continue
 				}
 				v := r.Value
@@ -1163,8 +1163,9 @@ func newNodeSweepCmd(opts *Options) *cobra.Command {
 				if len(v.Errs) > 0 {
 					note = strings.Join(v.Errs, "; ")
 				}
-				fmt.Fprintf(w, "%s\t%d\t%d\t%d\t%s\n",
-					r.Node, len(v.Orphans), len(v.Removed), len(v.InUse), note)
+				fmt.Fprintf(w, "%s\t%d\t%d\t%d\t%d\t%d\t%s\n",
+					r.Node, v.LogicalBindings, v.PhysicalTrunks,
+					len(v.Orphans), len(v.Removed), len(v.InUse), note)
 			}
 			if err := w.Flush(); err != nil {
 				return err

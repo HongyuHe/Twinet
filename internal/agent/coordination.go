@@ -147,50 +147,57 @@ type transactionSnapshot struct {
 // transactionInventory is both rollback evidence and the post-recovery
 // verifier. Overlay VNIs cover legacy and multiplex objects uniformly.
 type transactionInventory struct {
-	TopologyHash string                   `json:"topology_hash,omitempty"`
-	Generation   string                   `json:"generation,omitempty"`
-	Containers   []transactionContainer   `json:"containers,omitempty"`
-	VNIs         []uint32                 `json:"vnis,omitempty"`
-	CapturedAt   time.Time                `json:"captured_at"`
-	StateSafe    bool                     `json:"state_safe"`
-	Snapshots    []transactionSnapshot    `json:"snapshots,omitempty"`
-	RuntimeSpecs []transactionRuntimeSpec `json:"runtime_specs,omitempty"`
-	OverlayState []netx.MultiplexOverlay  `json:"overlay_state,omitempty"`
+	Schema          int                      `json:"schema,omitempty"`
+	TopologyHash    string                   `json:"topology_hash,omitempty"`
+	Generation      string                   `json:"generation,omitempty"`
+	Containers      []transactionContainer   `json:"containers,omitempty"`
+	VNIs            []uint32                 `json:"vnis,omitempty"`
+	LogicalBindings []netx.LogicalBinding    `json:"logical_bindings,omitempty"`
+	PhysicalTrunks  []netx.PhysicalTrunk     `json:"physical_trunks,omitempty"`
+	CapturedAt      time.Time                `json:"captured_at"`
+	StateSafe       bool                     `json:"state_safe"`
+	Snapshots       []transactionSnapshot    `json:"snapshots,omitempty"`
+	RuntimeSpecs    []transactionRuntimeSpec `json:"runtime_specs,omitempty"`
+	OverlayState    []netx.MultiplexOverlay  `json:"overlay_state,omitempty"`
 }
 
 // RecoveryStatus is safe to expose in node status and recovery responses. It
 // names a phase and inventory counts, never student configuration content.
 type RecoveryStatus struct {
-	Lab                 string    `json:"lab"`
-	Phase               string    `json:"phase"`
-	Generation          string    `json:"generation,omitempty"`
-	PreviousGeneration  string    `json:"previous_generation,omitempty"`
-	Mode                string    `json:"mode,omitempty"`
-	Ungraded            int       `json:"ungraded_as,omitempty"`
-	PreviousMode        string    `json:"previous_mode,omitempty"`
-	PreviousUngraded    int       `json:"previous_ungraded_as,omitempty"`
-	Owner               string    `json:"owner,omitempty"`
-	Strategy            string    `json:"strategy,omitempty"`
-	StartedAt           time.Time `json:"started_at,omitempty"`
-	LastProgressAt      time.Time `json:"last_progress_at,omitempty"`
-	Deadline            time.Time `json:"deadline,omitempty"`
-	TotalDeadline       time.Time `json:"total_deadline,omitempty"`
-	LeaseExpiresAt      time.Time `json:"lease_expires_at,omitempty"`
-	CurrentTarget       string    `json:"current_target,omitempty"`
-	LastError           string    `json:"last_error,omitempty"`
-	RetryCount          int       `json:"retry_count,omitempty"`
-	TakeoverAllowed     bool      `json:"takeover_allowed,omitempty"`
-	ForwardAcknowledged bool      `json:"forward_acknowledged,omitempty"`
-	ForwardPhase        string    `json:"forward_phase,omitempty"`
-	DataLossScope       []string  `json:"data_loss_scope,omitempty"`
-	ExpectedContainers  int       `json:"expected_containers"`
-	ObservedContainers  int       `json:"observed_containers"`
-	ExpectedVNIs        int       `json:"expected_vnis"`
-	ObservedVNIs        int       `json:"observed_vnis"`
-	Consistent          bool      `json:"consistent"`
-	Attempts            int       `json:"attempts,omitempty"`
-	Error               string    `json:"error,omitempty"`
-	AllowedStrategies   []string  `json:"allowed_strategies,omitempty"`
+	Lab                     string    `json:"lab"`
+	Phase                   string    `json:"phase"`
+	Generation              string    `json:"generation,omitempty"`
+	PreviousGeneration      string    `json:"previous_generation,omitempty"`
+	Mode                    string    `json:"mode,omitempty"`
+	Ungraded                int       `json:"ungraded_as,omitempty"`
+	PreviousMode            string    `json:"previous_mode,omitempty"`
+	PreviousUngraded        int       `json:"previous_ungraded_as,omitempty"`
+	Owner                   string    `json:"owner,omitempty"`
+	Strategy                string    `json:"strategy,omitempty"`
+	StartedAt               time.Time `json:"started_at,omitempty"`
+	LastProgressAt          time.Time `json:"last_progress_at,omitempty"`
+	Deadline                time.Time `json:"deadline,omitempty"`
+	TotalDeadline           time.Time `json:"total_deadline,omitempty"`
+	LeaseExpiresAt          time.Time `json:"lease_expires_at,omitempty"`
+	CurrentTarget           string    `json:"current_target,omitempty"`
+	LastError               string    `json:"last_error,omitempty"`
+	RetryCount              int       `json:"retry_count,omitempty"`
+	TakeoverAllowed         bool      `json:"takeover_allowed,omitempty"`
+	ForwardAcknowledged     bool      `json:"forward_acknowledged,omitempty"`
+	ForwardPhase            string    `json:"forward_phase,omitempty"`
+	DataLossScope           []string  `json:"data_loss_scope,omitempty"`
+	ExpectedContainers      int       `json:"expected_containers"`
+	ObservedContainers      int       `json:"observed_containers"`
+	ExpectedVNIs            int       `json:"expected_vnis"`
+	ObservedVNIs            int       `json:"observed_vnis"`
+	ExpectedLogicalBindings int       `json:"expected_logical_bindings"`
+	ObservedLogicalBindings int       `json:"observed_logical_bindings"`
+	ExpectedPhysicalTrunks  int       `json:"expected_physical_trunks"`
+	ObservedPhysicalTrunks  int       `json:"observed_physical_trunks"`
+	Consistent              bool      `json:"consistent"`
+	Attempts                int       `json:"attempts,omitempty"`
+	Error                   string    `json:"error,omitempty"`
+	AllowedStrategies       []string  `json:"allowed_strategies,omitempty"`
 }
 
 // applyTransaction persists enough information to fail closed after a crashed

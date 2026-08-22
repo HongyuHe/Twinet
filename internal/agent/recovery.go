@@ -65,6 +65,7 @@ type transactionRuntimeSpec struct {
 }
 
 const (
+	overlayInventorySchema         = 2
 	recoveryRetryEvery             = 5 * time.Second
 	recoveryRetryBackoff           = 30 * time.Second
 	defaultRecoveryPhaseTimeout    = 90 * time.Second
@@ -87,6 +88,21 @@ const (
 	// it smaller on constrained nodes.
 	recoveryLifecycleWorkers = 4
 )
+
+func bindingVNIs(bindings []netx.LogicalBinding) []uint32 {
+	seen := map[uint32]bool{}
+	for _, binding := range bindings {
+		if binding.VNI != 0 {
+			seen[binding.VNI] = true
+		}
+	}
+	out := make([]uint32, 0, len(seen))
+	for vni := range seen {
+		out = append(out, vni)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
 
 type recoveryRunOptions struct {
 	takeover            bool
@@ -825,11 +841,23 @@ func (s *Server) snapshotTransactionInventory(ctx context.Context, lab string) (
 	if err != nil {
 		return transactionInventory{}, fmt.Errorf("list pre-transaction containers: %w", err)
 	}
-	vnis, err := s.recoveryOverlayList(lab)
-	if err != nil {
-		return transactionInventory{}, fmt.Errorf("list pre-transaction overlays: %w", err)
+	out := transactionInventory{CapturedAt: s.nowTime()}
+	if s.recoveryOverlays != nil {
+		vnis, err := s.recoveryOverlayList(lab)
+		if err != nil {
+			return transactionInventory{}, fmt.Errorf("list pre-transaction overlays: %w", err)
+		}
+		out.VNIs = append([]uint32(nil), vnis...)
+	} else {
+		overlays, err := netx.InspectOverlayInventory(lab)
+		if err != nil {
+			return transactionInventory{}, fmt.Errorf("inspect pre-transaction overlays: %w", err)
+		}
+		out.Schema = overlayInventorySchema
+		out.LogicalBindings = overlays.Bindings
+		out.PhysicalTrunks = overlays.Trunks
+		out.VNIs = bindingVNIs(overlays.Bindings)
 	}
-	out := transactionInventory{CapturedAt: s.nowTime(), VNIs: append([]uint32(nil), vnis...)}
 	for _, container := range containers {
 		if isInternalControlContainer(container) {
 			continue
@@ -905,10 +933,40 @@ func expectedTransactionInventoryFinal(eng *deploy.Engine, top *model.Topology,
 			State:      string(rt.StateRunning),
 		})
 	}
-	out.VNIs = overlayVNIsOnNode(top, node)
+	overlays, err := eng.ExpectedOverlayInventory(top)
+	if err != nil {
+		return transactionInventory{}, err
+	}
+	preserveLegacyTrunkPort(&overlays, observed)
+	out.Schema = overlayInventorySchema
+	out.LogicalBindings = overlays.Bindings
+	out.PhysicalTrunks = overlays.Trunks
+	out.VNIs = bindingVNIs(overlays.Bindings)
 	sort.Slice(out.Containers, func(i, j int) bool { return out.Containers[i].Name < out.Containers[j].Name })
 	sort.Slice(out.VNIs, func(i, j int) bool { return out.VNIs[i] < out.VNIs[j] })
 	return out, nil
+}
+
+func preserveLegacyTrunkPort(expected *netx.OverlayInventory, observed transactionInventory) {
+	if expected == nil || observed.Schema < overlayInventorySchema {
+		return
+	}
+	for i := range expected.Trunks {
+		for _, actual := range observed.PhysicalTrunks {
+			if actual.Legacy || actual.NodeA != expected.Trunks[i].NodeA ||
+				actual.NodeB != expected.Trunks[i].NodeB || actual.Port != netx.VXLANPort ||
+				actual.MTU != expected.Trunks[i].MTU {
+				continue
+			}
+			expected.Trunks[i].Port = actual.Port
+			for j := range expected.Bindings {
+				if expected.Bindings[j].NodeA == actual.NodeA && expected.Bindings[j].NodeB == actual.NodeB {
+					expected.Bindings[j].Port = actual.Port
+				}
+			}
+			break
+		}
+	}
 }
 
 func expectedObjectGeneration(tx applyTransaction, deviceID, name, spec string,
@@ -1056,15 +1114,67 @@ func inventoryMatches(want, got transactionInventory) error {
 			return fmt.Errorf("container %s is %s, want a joinable service", b.Name, b.State)
 		}
 	}
-	if len(want.VNIs) != len(got.VNIs) {
-		return fmt.Errorf("overlay inventory is %d, want %d", len(got.VNIs), len(want.VNIs))
-	}
-	for i := range want.VNIs {
-		if want.VNIs[i] != got.VNIs[i] {
-			return fmt.Errorf("overlay VNI %d is %d, want %d", i, got.VNIs[i], want.VNIs[i])
+	if want.Schema >= overlayInventorySchema && got.Schema >= overlayInventorySchema {
+		if err := overlayInventoryMatches(want, got); err != nil {
+			return err
+		}
+	} else {
+		if len(want.VNIs) != len(got.VNIs) {
+			return fmt.Errorf("overlay inventory is %d, want %d", len(got.VNIs), len(want.VNIs))
+		}
+		for i := range want.VNIs {
+			if want.VNIs[i] != got.VNIs[i] {
+				return fmt.Errorf("overlay VNI %d is %d, want %d", i, got.VNIs[i], want.VNIs[i])
+			}
 		}
 	}
 	return nil
+}
+
+func overlayInventoryMatches(want, got transactionInventory) error {
+	if len(want.LogicalBindings) != len(got.LogicalBindings) {
+		return fmt.Errorf("logical overlay bindings are %d, want %d",
+			len(got.LogicalBindings), len(want.LogicalBindings))
+	}
+	for i := range want.LogicalBindings {
+		a, b := want.LogicalBindings[i], got.LogicalBindings[i]
+		if a.VNI != b.VNI || a.VLAN != b.VLAN || a.Peer != b.Peer ||
+			a.MTU != b.MTU || a.Port != b.Port || a.NodeA != b.NodeA || a.NodeB != b.NodeB {
+			return fmt.Errorf("logical binding %d is %+v, want %+v", i, b, a)
+		}
+	}
+	wantTrunks := nonLegacyTrunks(want.PhysicalTrunks)
+	gotTrunks := nonLegacyTrunks(got.PhysicalTrunks)
+	if len(wantTrunks) != len(gotTrunks) {
+		return fmt.Errorf("physical multiplex trunks are %d, want %d",
+			len(gotTrunks), len(wantTrunks))
+	}
+	for i := range wantTrunks {
+		a, b := wantTrunks[i], gotTrunks[i]
+		if a.NodeA != b.NodeA || a.NodeB != b.NodeB || a.MTU != b.MTU || a.Port != b.Port {
+			return fmt.Errorf("physical trunk %d is %+v, want %+v", i, b, a)
+		}
+	}
+	return nil
+}
+
+func nonLegacyTrunks(in []netx.PhysicalTrunk) []netx.PhysicalTrunk {
+	out := make([]netx.PhysicalTrunk, 0, len(in))
+	for _, trunk := range in {
+		if !trunk.Legacy {
+			out = append(out, trunk)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].NodeA != out[j].NodeA {
+			return out[i].NodeA < out[j].NodeA
+		}
+		if out[i].NodeB != out[j].NodeB {
+			return out[i].NodeB < out[j].NodeB
+		}
+		return out[i].Vxlan < out[j].Vxlan
+	})
+	return out
 }
 
 // inventoryMatchesCommitted additionally requires exact object labels. The
@@ -1217,6 +1327,8 @@ func (s *Server) transactionInventoryStatus(ctx context.Context, lab string) Rec
 		return status
 	}
 	status.ExpectedContainers, status.ExpectedVNIs = len(want.Containers), len(want.VNIs)
+	status.ExpectedLogicalBindings = len(want.LogicalBindings)
+	status.ExpectedPhysicalTrunks = len(want.PhysicalTrunks)
 	observeCtx, cancel := context.WithTimeout(ctx, s.recoveryStatusLimit())
 	defer cancel()
 	got, err := s.snapshotTransactionInventory(observeCtx, lab)
@@ -1227,6 +1339,8 @@ func (s *Server) transactionInventoryStatus(ctx context.Context, lab string) Rec
 		return status
 	}
 	status.ObservedContainers, status.ObservedVNIs = len(got.Containers), len(got.VNIs)
+	status.ObservedLogicalBindings = len(got.LogicalBindings)
+	status.ObservedPhysicalTrunks = len(got.PhysicalTrunks)
 	if err := inventoryMatches(want, got); err != nil {
 		if status.Error == "" {
 			status.Error = err.Error()
