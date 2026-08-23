@@ -179,10 +179,16 @@ placement:
       ephemeral_storage: 20Gi
       file_descriptors: 16384
       netdevs: 256
-      # Retain only front-end service headroom. Containerd view snapshots
-      # removed the old local-storage penalty; larger object reservations left
-      # node-0 idle while both peers remained on the convergence critical path.
-      containers: 32
+      # The front node also runs the controller and its measured initial-apply
+      # throughput is about two thirds of either worker. Reserve object
+      # headroom so all three finish together rather than leaving the peers
+      # idle for the final three minutes.
+      containers: 600
+    node-2:
+      # This secondary reservation avoids a placement-fragmentation cliff and
+      # yields the measured 479/756/785 primary split (roughly
+      # 631/997/1036 including FRR controls).
+      containers: 185
   nodes:
     - name: node-0
       addr: "10.0.1.1:7200"
