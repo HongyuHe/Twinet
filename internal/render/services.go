@@ -176,12 +176,19 @@ func (r *Renderer) serviceCommands(d *model.Device) []deploy.Command {
 				// deliberately drops privilege, so make its generated config
 				// and zones readable before asking it to become authoritative.
 				"chown -R named:named /etc/bind /var/named",
-				"named -c /etc/bind/named.conf -u named",
+				// Keep named in the foreground of its own redirected background
+				// process. Daemon mode can retain an exec transport's pipes or
+				// outlive an ambiguous fork boundary; explicit redirection is
+				// reliable for Docker, Podman, and the containerd exec broker.
+				"mkdir -p /var/log/named",
+				"nohup named -g -c /etc/bind/named.conf -u named " +
+					">/var/log/named/twinet.log 2>&1 &",
 				// A resolver that started but answers nothing is worse than
 				// one that failed to start, because nothing reports it.
 				fmt.Sprintf("for i in 1 2 3 4 5 6 7 8 9 10; do "+
 					"dig +time=1 +tries=1 @127.0.0.1 %s SOA 2>/dev/null | grep -q 'status: NOERROR' && exit 0; "+
 					"sleep 1; done", probe),
+				"tail -n 50 /var/log/named/twinet.log >&2 2>/dev/null || true",
 				"echo 'named started but is not authoritative for its own zones' >&2; exit 1",
 			}, "\n")},
 		},

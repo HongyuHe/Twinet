@@ -3,6 +3,7 @@ package render
 import (
 	"bytes"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/HongyuHe/twinet/internal/deploy"
@@ -16,6 +17,7 @@ func TestReplicatedDNSAndRTRRenderEquivalentDeclaredData(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	result, err := expand.Expand(loaded.Lab)
 	if err != nil {
 		t.Fatal(err)
@@ -44,6 +46,7 @@ func TestReplicatedDNSAndRTRRenderEquivalentDeclaredData(t *testing.T) {
 				t.Fatalf("%s replica %s rendered data different from its peers", name, replica.ID)
 			}
 		}
+
 	}
 }
 
@@ -73,4 +76,37 @@ func sameFiles(a, b map[string][]byte) bool {
 		}
 	}
 	return true
+}
+
+func TestDNSDaemonDoesNotRetainExecTransportPipes(t *testing.T) {
+	loaded, err := manifest.Load("../../examples/scale")
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := expand.Expand(loaded.Lab)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := place.Place(result.Topology, place.Options{}); err != nil {
+		t.Fatal(err)
+	}
+	service := result.Topology.Services["dns"]
+	if service == nil || len(service.Replicas) == 0 {
+		t.Fatal("scale topology has no DNS replica")
+	}
+	commands, err := New(result.Topology, ModePlatform).Commands(service.SortedReplicas()[0].Device)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var start string
+	for _, command := range commands {
+		if command.Describe == "start the authoritative resolver" {
+			start = strings.Join(command.Args, " ")
+			break
+		}
+	}
+	if !strings.Contains(start, "named -g") ||
+		!strings.Contains(start, ">/var/log/named/twinet.log 2>&1 &") {
+		t.Fatalf("DNS start command does not detach from its exec transport:\n%s", start)
+	}
 }
