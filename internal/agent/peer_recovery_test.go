@@ -229,6 +229,10 @@ func TestRecoveredControlsMustBeRunningAndExact(t *testing.T) {
 		Labels: map[string]string{
 			deploy.LabelSpec:            "control-spec",
 			deploy.LabelRuntimeContract: deploy.RuntimeSpecContractVersion,
+			deploy.LabelManaged:         "true",
+			deploy.LabelInternal:        "true",
+			deploy.LabelFRRControl:      "true",
+			deploy.LabelLab:             "lab",
 		},
 	}
 	runtime := &controlRecoveryRuntime{containers: map[string]rt.Container{
@@ -238,12 +242,25 @@ func TestRecoveredControlsMustBeRunningAndExact(t *testing.T) {
 	tx := applyTransaction{Prestate: transactionInventory{RuntimeSpecs: []transactionRuntimeSpec{{
 		DeviceID: "as1/R", Control: &control,
 	}}}}
-	if err := server.verifyRecoveredControls(context.Background(), tx); err != nil {
+	if err := server.verifyRecoveredControls(context.Background(), "lab", tx); err != nil {
 		t.Fatal(err)
 	}
 	runtime.containers[control.Name] = rt.Container{Name: control.Name, State: rt.StateAbsent}
-	if err := server.verifyRecoveredControls(context.Background(), tx); err == nil {
+	if err := server.verifyRecoveredControls(context.Background(), "lab", tx); err == nil {
 		t.Fatal("missing expected FRR control sidecar passed recovery verification")
+	}
+	runtime.containers[control.Name] = rt.Container{
+		Name: control.Name, State: rt.StateRunning, Labels: control.Labels,
+	}
+	runtime.containers["orphan-frr"] = rt.Container{
+		Name: "orphan-frr", State: rt.StateRunning,
+		Labels: map[string]string{
+			deploy.LabelManaged: "true", deploy.LabelInternal: "true",
+			deploy.LabelFRRControl: "true", deploy.LabelLab: "lab",
+		},
+	}
+	if err := server.verifyRecoveredControls(context.Background(), "lab", tx); err == nil {
+		t.Fatal("unexpected FRR control sidecar passed recovery verification")
 	}
 }
 
@@ -257,4 +274,15 @@ func (r *controlRecoveryRuntime) Inspect(_ context.Context, name string) (rt.Con
 		return container, nil
 	}
 	return rt.Container{Name: name, State: rt.StateAbsent}, nil
+}
+
+func (r *controlRecoveryRuntime) List(_ context.Context, _ rt.Filter) ([]rt.Container, error) {
+	out := make([]rt.Container, 0, len(r.containers))
+	for _, container := range r.containers {
+		if container.State != rt.StateAbsent {
+			out = append(out, container)
+		}
+	}
+	rt.SortContainers(out)
+	return out, nil
 }

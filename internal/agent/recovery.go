@@ -2275,7 +2275,7 @@ func (s *Server) recoverTransactionStrategyOptions(ctx context.Context, lab stri
 	if err := s.runRecoveryPhaseLimit(fencedCtx, lab, fence, tx.Generation,
 		"verify", "expected FRR control sidecars", s.recoveryVerifyLimit(tx),
 		func(phaseCtx context.Context) error {
-			return s.verifyRecoveredControls(phaseCtx, tx)
+			return s.verifyRecoveredControls(phaseCtx, lab, tx)
 		}); err != nil {
 		s.failRecovery(lab, fence, tx.Generation, err)
 		return s.transactionInventoryStatus(ctx, lab), err
@@ -2296,7 +2296,13 @@ func (s *Server) recoverTransactionStrategyOptions(ctx context.Context, lab stri
 			if err != nil {
 				return err
 			}
-			return inventoryMatches(tx.Prestate, got)
+			if err := inventoryMatches(tx.Prestate, got); err != nil {
+				return err
+			}
+			// Primary inventory deliberately excludes implementation sidecars.
+			// Recheck their exact set immediately before commit so a control
+			// created during cancellation cannot survive an "empty" rollback.
+			return s.verifyRecoveredControls(phaseCtx, lab, tx)
 		}); err != nil {
 		err = fmt.Errorf("rollback inventory verification failed: %w", err)
 		s.failRecovery(lab, fence, tx.Generation, err)
@@ -2374,40 +2380,57 @@ func (s *Server) replicateRecoveredDurability(ctx context.Context, tx applyTrans
 	return nil
 }
 
-func (s *Server) verifyRecoveredControls(ctx context.Context, tx applyTransaction) error {
-	var controls []transactionRuntimeSpec
+func (s *Server) verifyRecoveredControls(ctx context.Context, lab string, tx applyTransaction) error {
+	expected := map[string]*rt.Spec{}
 	for _, entry := range tx.Prestate.RuntimeSpecs {
 		if entry.Control != nil {
-			controls = append(controls, entry)
+			expected[entry.Control.Name] = entry.Control
 		}
 	}
-	if len(controls) == 0 {
-		return nil
-	}
 	if s.rt == nil {
+		if len(expected) == 0 {
+			return nil
+		}
 		return errors.New("no runtime for recovered control verification")
 	}
-	return runBoundedDeviceChecks(ctx, s.recoveryWorkerCount(), controls, s.recoveryArtifactLimit(),
-		func(entry transactionRuntimeSpec) string { return "FRR control " + entry.DeviceID },
-		func(checkCtx context.Context, entry transactionRuntimeSpec) error {
-			control := entry.Control
-			var current rt.Container
-			err := s.workLimiter().Run(checkCtx, []limiter.Kind{limiter.Apply, limiter.Lifecycle}, func() error {
-				var inspectErr error
-				current, inspectErr = s.rt.Inspect(checkCtx, control.Name)
-				return inspectErr
-			})
-			if err != nil {
-				return fmt.Errorf("inspect expected control %s: %w", control.Name, err)
-			}
-			if current.State != rt.StateRunning {
-				return fmt.Errorf("expected control %s is %s, want running", control.Name, current.State)
-			}
-			if !exactRuntimeSpecMatches(current, control) {
-				return fmt.Errorf("expected control %s does not match its recovered runtime contract", control.Name)
-			}
-			return nil
-		})
+	containers, err := s.recoveryContainerList(ctx, lab)
+	if err != nil {
+		return fmt.Errorf("list recovered FRR controls: %w", err)
+	}
+	actual := map[string]rt.Container{}
+	for _, container := range containers {
+		if isInternalControlContainer(container) {
+			actual[container.Name] = container
+		}
+	}
+	var problems []string
+	for _, name := range sortedStringMapKeys(expected) {
+		control := expected[name]
+		current, ok := actual[name]
+		if !ok {
+			problems = append(problems, fmt.Sprintf("expected control %s is absent", name))
+			continue
+		}
+		if current.State != rt.StateRunning {
+			problems = append(problems,
+				fmt.Sprintf("expected control %s is %s, want running", name, current.State))
+			continue
+		}
+		if !exactRuntimeSpecMatches(current, control) {
+			problems = append(problems,
+				fmt.Sprintf("expected control %s does not match its recovered runtime contract", name))
+		}
+	}
+	for _, name := range sortedStringMapKeys(actual) {
+		if expected[name] == nil {
+			problems = append(problems, "unexpected recovered control "+name)
+		}
+	}
+	if len(problems) > 0 {
+		return fmt.Errorf("recovered FRR control inventory is not exact: %s",
+			strings.Join(problems, "; "))
+	}
+	return nil
 }
 
 func (s *Server) verifyRecoveredStudentState(ctx context.Context, tx applyTransaction) error {

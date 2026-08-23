@@ -106,7 +106,7 @@ JSON
 fi
 if [[ "$args" == *" --json node status "* ]]; then
     labs=${FAKE_LABS_JSON:-[]}
-    printf '[{"node":"node-a","status":{"node":"node-a","runtime":"docker","runtime_version":"test","cpus":4,"containers":0,"labs":%s,"overlays":{}}},{"node":"node-b","status":{"node":"node-b","runtime":"docker","runtime_version":"test","cpus":4,"containers":0,"labs":%s,"overlays":{}}}]\n' \
+    printf '[{"node":"node-a","status":{"node":"node-a","runtime":"docker","runtime_version":"test","cpus":4,"containers":0,"primary_containers":0,"control_containers":0,"managed_containers":0,"labs":%s,"overlays":{}}},{"node":"node-b","status":{"node":"node-b","runtime":"docker","runtime_version":"test","cpus":4,"containers":0,"primary_containers":0,"control_containers":0,"managed_containers":0,"labs":%s,"overlays":{}}}]\n' \
         "$labs" "$labs"
     exit 0
 fi

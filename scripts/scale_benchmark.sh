@@ -388,13 +388,17 @@ for row in rows:
     status = row.get("status")
     if not isinstance(status, dict):
         raise SystemExit(f"node {node} has no status/resource payload")
-    for key in ("node", "runtime", "runtime_version", "cpus", "containers"):
+    for key in (
+        "node", "runtime", "runtime_version", "cpus", "containers",
+        "primary_containers", "control_containers", "managed_containers",
+    ):
         if key not in status:
             raise SystemExit(f"node {node} status lacks required resource field {key!r}")
     if not isinstance(status["cpus"], int) or status["cpus"] < 1:
         raise SystemExit(f"node {node} has invalid CPU capacity")
-    if not isinstance(status["containers"], int) or status["containers"] < 0:
-        raise SystemExit(f"node {node} has invalid container count")
+    for key in ("containers", "primary_containers", "control_containers", "managed_containers"):
+        if not isinstance(status[key], int) or status[key] < 0:
+            raise SystemExit(f"node {node} has invalid {key} count")
 PY
 }
 
@@ -491,12 +495,21 @@ import sys
 rows = json.loads(pathlib.Path(sys.argv[1]).read_text())
 lab = pathlib.Path(sys.argv[2]).read_text().strip()
 owners = []
+residue = []
 for row in rows:
     status = row.get("status", {}) if isinstance(row, dict) else {}
     if lab in status.get("labs", []):
         owners.append(row.get("node", "<unknown>"))
+    counts = {
+        key: status.get(key)
+        for key in ("containers", "primary_containers", "control_containers", "managed_containers")
+    }
+    if any(value != 0 for value in counts.values()):
+        residue.append(f"{row.get('node', '<unknown>')}={counts}")
 if owners:
     raise SystemExit(f"cleanup left lab {lab!r} active on {', '.join(owners)}")
+if residue:
+    raise SystemExit("cleanup left managed runtime objects: " + ", ".join(residue))
 PY
 }
 
