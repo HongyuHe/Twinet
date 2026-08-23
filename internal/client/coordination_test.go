@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/HongyuHe/twinet/internal/agent"
 	"github.com/HongyuHe/twinet/internal/model"
@@ -15,19 +16,21 @@ import (
 type coordinationStub struct {
 	mu sync.Mutex
 
-	name         string
-	failAcquire  bool
-	next         uint64
-	leases       map[string]agent.Fence
-	generations  map[string]string
-	prepared     map[string]string
-	releases     int
-	applyCalls   int
-	applied      []string
-	order        *[]string
-	firstAcquire chan struct{}
-	blockAcquire chan struct{}
-	didBlock     bool
+	name          string
+	failAcquire   bool
+	next          uint64
+	leases        map[string]agent.Fence
+	generations   map[string]string
+	prepared      map[string]string
+	releases      int
+	applyCalls    int
+	applied       []string
+	order         *[]string
+	firstAcquire  chan struct{}
+	blockAcquire  chan struct{}
+	didBlock      bool
+	commitStarted chan<- string
+	releaseCommit <-chan struct{}
 }
 
 func newCoordinationStub(name string, order *[]string) *coordinationStub {
@@ -205,6 +208,16 @@ func (s *coordinationStub) handler(w http.ResponseWriter, r *http.Request) {
 			s.applyCalls++
 		case "commit":
 			s.generations[req.Lab] = req.Generation
+			started, release := s.commitStarted, s.releaseCommit
+			s.mu.Unlock()
+			if started != nil {
+				started <- s.name
+			}
+			if release != nil {
+				<-release
+			}
+			write(agent.ApplyResponse{Node: s.name, Generation: req.Generation, Phase: req.Phase})
+			return
 		case "finalize":
 			delete(s.prepared, req.Lab)
 		case "abort":
@@ -220,6 +233,45 @@ func (s *coordinationStub) handler(w http.ResponseWriter, r *http.Request) {
 func stubNode(name string, stub *coordinationStub) (*Node, func()) {
 	server := httptest.NewServer(http.HandlerFunc(stub.handler))
 	return NewNode(name, server.URL, ""), server.Close
+}
+
+func TestCoordinatedApplyCommitsNodesConcurrently(t *testing.T) {
+	started := make(chan string, 2)
+	release := make(chan struct{})
+	a := newCoordinationStub("a", nil)
+	b := newCoordinationStub("b", nil)
+	a.commitStarted, b.commitStarted = started, started
+	a.releaseCommit, b.releaseCommit = release, release
+	na, closeA := stubNode("a", a)
+	defer closeA()
+	nb, closeB := stubNode("b", b)
+	defer closeB()
+
+	done := make(chan []NodeResult[agent.ApplyResponse], 1)
+	go func() {
+		done <- (&Cluster{Nodes: []*Node{na, nb}}).Apply(t.Context(),
+			&model.Topology{Name: "scale", Lab: &model.Lab{}},
+			agent.ApplyRequest{Generation: "parallel-commit", Mode: "solve"})
+	}()
+
+	seen := map[string]bool{}
+	for range 2 {
+		select {
+		case node := <-started:
+			seen[node] = true
+		case <-time.After(2 * time.Second):
+			t.Fatal("node commits were serialized")
+		}
+	}
+	close(release)
+	for _, result := range <-done {
+		if result.Err != nil {
+			t.Fatalf("commit on %s: %v", result.Node, result.Err)
+		}
+	}
+	if !seen["a"] || !seen["b"] {
+		t.Fatalf("commit starters = %v, want both nodes", seen)
+	}
 }
 
 func TestLeaseAcquisitionRollsBackAPartialPrefixInReverseOrder(t *testing.T) {

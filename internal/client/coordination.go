@@ -571,18 +571,26 @@ func (c *Cluster) coordinatedApplyWithLeaseTimed(ctx context.Context, top *model
 	}
 
 	if err := measure("commit", func() error {
-		for _, node := range nodes {
+		results := fanOut(lease.Context(), nodes, func(commitCtx context.Context, node *Node) (agent.ApplyResponse, error) {
 			commit := applyRequestForNode(req, wire, peers, lease, node.Name,
 				"commit", expected, generation)
 			commit.Topology = nil
-			resp, err := node.Apply(lease.Context(), commit)
+			resp, err := node.Apply(commitCtx, commit)
 			if err == nil {
 				err = responseFailure(resp)
 			}
 			if err != nil {
-				return fmt.Errorf("commit %s: %w", node.Name, err)
+				return resp, err
 			}
-			if applied, ok := values[node.Name]; ok {
+			return resp, nil
+		})
+		for _, result := range results {
+			if result.Err != nil {
+				return fmt.Errorf("commit %s: %w", result.Node, result.Err)
+			}
+			resp := result.Value
+			nodeName := result.Node
+			if applied, ok := values[nodeName]; ok {
 				resp.AgentVersion, resp.ControllerVersion = applied.AgentVersion, applied.ControllerVersion
 				resp.ImageDigests = applied.ImageDigests
 				resp.Steps, resp.Planned = applied.Steps, applied.Planned
@@ -592,7 +600,7 @@ func (c *Cluster) coordinatedApplyWithLeaseTimed(ctx context.Context, top *model
 				resp.WantDevice, resp.WantLinks = applied.WantDevice, applied.WantLinks
 				resp.DurationMS = applied.DurationMS
 			}
-			values[node.Name] = resp
+			values[nodeName] = resp
 		}
 		return nil
 	}); err != nil {
