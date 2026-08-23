@@ -138,16 +138,16 @@ func Main(ctx context.Context, args []string) error {
 			"how often to scan safely collectible abandoned objects")
 		eventCapacity = fs.Int("event-capacity", defaultEventCapacity,
 			"maximum structured events retained locally")
-		applyLimit = fs.Int("limit-apply", defaultLimits.Apply,
-			"node-wide apply concurrency (default up to 48 on large hosts)")
-		lifecycleLimit = fs.Int("limit-lifecycle", defaultLimits.Lifecycle,
-			"node-wide container lifecycle concurrency (default up to 48 on large hosts)")
+		applyLimit = fs.Int("limit-apply", 0,
+			"node-wide apply concurrency (0 selects the runtime default)")
+		lifecycleLimit = fs.Int("limit-lifecycle", 0,
+			"node-wide container lifecycle concurrency (0 selects the runtime default)")
 		containerCreateLimit = fs.Int("limit-container-create", 0,
 			"concurrent container creates (0 selects measured runtime default: Docker 4, Podman 8)")
 		containerStartLimit = fs.Int("limit-container-start", 0,
 			"concurrent container starts (0 selects measured runtime default: Docker 4, Podman 8)")
-		execProbeLimit = fs.Int("limit-exec-probe", defaultLimits.ExecProbe,
-			"node-wide exec and probe concurrency")
+		execProbeLimit = fs.Int("limit-exec-probe", 0,
+			"node-wide exec and probe concurrency (0 selects the runtime default)")
 		netlinkLimit = fs.Int("limit-netlink", 0,
 			"node-wide netlink mutation concurrency (0 selects the runtime default)")
 		imagePullLimit = fs.Int("limit-image-pull", defaultLimits.ImagePull,

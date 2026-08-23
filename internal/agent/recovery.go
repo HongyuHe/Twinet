@@ -182,6 +182,11 @@ func (s *Server) recoveryWorkerCount() int {
 	return s.workLimiter().ClampWorkers(limiter.Apply, workers)
 }
 
+func (s *Server) semanticWorkerCount() int {
+	workers := s.workLimiter().ClampWorkers(limiter.ExecProbe, 0)
+	return s.workLimiter().ClampWorkers(limiter.Apply, workers)
+}
+
 func recoveryWorkBudget(items, workers int, perItem time.Duration) time.Duration {
 	if workers < 1 {
 		workers = 1

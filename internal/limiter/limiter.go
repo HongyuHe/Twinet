@@ -66,7 +66,10 @@ func DefaultConfigForRuntime(name string) Config {
 }
 
 func defaultConfigForRuntime(n int, name string) Config {
+	apply := bounded(n*2, 4, 48)
+	lifecycle := bounded(n*2, 8, 48)
 	create, start := 4, 4
+	execProbe := bounded(n*4, 8, 48)
 	convergence := bounded(n, 2, 8)
 	netlink := bounded(n, 2, 12)
 	switch strings.ToLower(strings.TrimSpace(name)) {
@@ -74,29 +77,32 @@ func defaultConfigForRuntime(n int, name string) Config {
 		create, start = 8, 8
 	case "containerd":
 		// Hardened containerd creation performs independent host-side state
-		// preparation before entering the daemon. At class scale all 16 create
-		// slots remained occupied with 28 queued while a 56-core worker used
-		// fewer than two CPUs. Widen creation only; starts stay at the measured
-		// 16-slot ceiling and the outer lifecycle pool still caps both at 48.
-		create, start = 32, 16
-		convergence = bounded(n, 8, 48)
+		// preparation before entering the daemon. At class scale all create
+		// slots remained occupied while a 56-core worker used fewer than ten
+		// CPUs. Containerd therefore gets one bounded worker per host CPU;
+		// starts retain their independently measured 16-slot ceiling.
+		apply = bounded(n, 16, 64)
+		lifecycle = bounded(n, 16, 64)
+		create, start = bounded(n, 16, 48), 16
+		execProbe = bounded(n, 16, 64)
+		convergence = bounded(n, 8, 64)
 		// Native containerd reaches wiring with substantially more lifecycle
 		// work already complete. A 56-core, 84-AS run held all 12 generic
 		// netlink slots with 36 additional operations queued while host CPU
-		// remained below 30 cores; a bounded 24-slot pool removes that
+		// remained below 30 cores; a bounded 32-slot pool removes that
 		// artificial serialization without changing other runtimes.
-		netlink = bounded(n, 8, 24)
+		netlink = bounded(n, 8, 32)
 	}
 	return Config{
 		// The outer pools remain broad enough to pipeline unrelated work.
 		// Isolated Docker API measurements on a 56-core node showed create and
 		// start throughput already saturated at width four (~1.0 combined
 		// containers/s); widths 24-48 doubled tail latency for negligible gain.
-		Apply:           bounded(n*2, 4, 48),
-		Lifecycle:       bounded(n*2, 8, 48),
+		Apply:           apply,
+		Lifecycle:       lifecycle,
 		ContainerCreate: create,
 		ContainerStart:  start,
-		ExecProbe:       bounded(n*4, 8, 48),
+		ExecProbe:       execProbe,
 		Netlink:         netlink,
 		ImagePull:       2,
 		Capture:         bounded(n, 2, 8),
