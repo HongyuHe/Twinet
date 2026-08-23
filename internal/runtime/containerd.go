@@ -379,10 +379,18 @@ func (c *Containerd) Create(ctx context.Context, spec *Spec) (string, error) {
 	labels[containerdImageLabel] = spec.Image
 	labels[containerdImageDigestLabel] = image.Target().Digest.String()
 	labels[containerdStopSignalLabel] = spec.StopSignal
+	snapshot := cd.WithNewSnapshot(spec.Name, image)
+	if spec.ReadOnlyRootfs {
+		// A writable overlay is both redundant and expensive when OCI already
+		// mounts the root read-only and every legitimate write target is an
+		// explicit tmpfs/bind. View snapshots preserve those semantics while
+		// avoiding one mutable upper layer per primary and FRR sidecar.
+		snapshot = cd.WithNewSnapshotView(spec.Name, image)
+	}
 	options := []cd.NewContainerOpts{
 		cd.WithImage(image),
 		cd.WithSnapshotter(defaultSnapshotter),
-		cd.WithNewSnapshot(spec.Name, image),
+		snapshot,
 		cd.WithContainerLabels(labels),
 		cd.WithNewSpec(oci.WithImageConfig(image),
 			containerdSpecOption(spec, imageSpec.Config, namespacePaths, runtimeMounts)),
