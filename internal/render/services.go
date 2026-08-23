@@ -172,23 +172,25 @@ func (r *Renderer) serviceCommands(d *model.Device) []deploy.Command {
 			Args: []string{"sh", "-c", strings.Join([]string{
 				"pkill -x named 2>/dev/null || true",
 				"rm -f /var/run/named/named.pid 2>/dev/null || true",
-				// Files arrive through the runtime API as root-owned. named
-				// deliberately drops privilege, so make its generated config
-				// and zones readable before asking it to become authoritative.
-				"chown -R named:named /etc/bind /var/named",
+				// Generated files are read-only 0644 artifacts. Only named's
+				// writable directories need ownership; recursively chowning the
+				// class-scale zone tree needlessly copies every overlay inode.
+				"mkdir -p /var/run/named /var/named",
+				"chown named:named /var/run/named /var/named",
 				// Keep named in the foreground of its own redirected background
 				// process. Daemon mode can retain an exec transport's pipes or
 				// outlive an ambiguous fork boundary; explicit redirection is
 				// reliable for Docker, Podman, and the containerd exec broker.
-				"mkdir -p /var/log/named",
-				"nohup named -g -c /etc/bind/named.conf -u named " +
-					">/var/log/named/twinet.log 2>&1 &",
+				// Bound worker/listener fan-out rather than inheriting all CPUs
+				// from a large worker for this small authoritative replica.
+				"nohup named -g -n 2 -U 2 -c /etc/bind/named.conf -u named " +
+					">/var/run/named/twinet.log 2>&1 &",
 				// A resolver that started but answers nothing is worse than
 				// one that failed to start, because nothing reports it.
-				fmt.Sprintf("for i in 1 2 3 4 5 6 7 8 9 10; do "+
+				fmt.Sprintf("for i in $(seq 1 30); do "+
 					"dig +time=1 +tries=1 @127.0.0.1 %s SOA 2>/dev/null | grep -q 'status: NOERROR' && exit 0; "+
 					"sleep 1; done", probe),
-				"tail -n 50 /var/log/named/twinet.log >&2 2>/dev/null || true",
+				"tail -n 8 /var/run/named/twinet.log >&2 2>/dev/null || true",
 				"echo 'named started but is not authoritative for its own zones' >&2; exit 1",
 			}, "\n")},
 		},
