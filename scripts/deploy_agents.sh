@@ -22,11 +22,15 @@ cd "$(dirname "$0")/.."
 # one to answer anybody outside the fabric.
 PKI=""
 BIND_UNDERLAY=""
+RUNTIME=""
+RUNTIME_SOCKET=""
 ARGS=()
 while [ $# -gt 0 ]; do
     case "$1" in
         --pki) PKI="$2"; shift 2 ;;
         --bind-underlay) BIND_UNDERLAY=1; shift ;;
+        --runtime) RUNTIME="$2"; shift 2 ;;
+        --runtime-socket) RUNTIME_SOCKET="$2"; shift 2 ;;
         *) ARGS+=("$1"); shift ;;
     esac
 done
@@ -34,9 +38,33 @@ set -- "${ARGS[@]+"${ARGS[@]}"}"
 
 NODES=("$@")
 if [ ${#NODES[@]} -eq 0 ]; then
-    echo "usage: $0 <node> [node...]" >&2
+    echo "usage: $0 [--pki DIR] [--bind-underlay] [--runtime docker|podman|containerd] [--runtime-socket ENDPOINT] <node> [node...]" >&2
     exit 2
 fi
+case "$RUNTIME" in
+    "")
+        [ -z "$RUNTIME_SOCKET" ] || {
+            echo "--runtime-socket requires --runtime" >&2
+            exit 2
+        }
+        ;;
+    docker)
+        : "${RUNTIME_SOCKET:=unix:///var/run/docker.sock}"
+        ;;
+    podman)
+        : "${RUNTIME_SOCKET:=unix:///run/podman/podman.sock}"
+        ;;
+    containerd)
+        : "${RUNTIME_SOCKET:=unix:///run/containerd/containerd.sock}"
+        ;;
+    *)
+        echo "unsupported runtime $RUNTIME (docker, podman, containerd)" >&2
+        exit 2
+        ;;
+esac
+case "$RUNTIME_SOCKET" in
+    *[[:space:]]*) echo "runtime socket must not contain whitespace" >&2; exit 2 ;;
+esac
 
 make build
 WANT=$(md5sum bin/twinetd | cut -d' ' -f1)
@@ -141,6 +169,21 @@ chmod 0644 "$u"'
         # shellcheck disable=SC2016  # runs on the far node, expands there
         bind_cmd='u=/etc/systemd/system/twinetd.service; ip=$(sed -n "s#.*-underlay-ip \([^ ]*\).*#\1#p" $u); port=$(sed -n "s#.*-listen [^ ]*:\([0-9]*\).*#\1#p" $u); if [ -n "$ip" ] && [ -n "$port" ]; then sed -i "s#-listen [^ ]*#-listen $ip:$port#" $u; fi'
         unit_cmd="$unit_cmd; $bind_cmd"
+    fi
+
+    if [ -n "$RUNTIME" ]; then
+        runtime_strip='s# -runtime [^ ]*##; s# -runtime-socket [^ ]*##; s# -runtime-namespace [^ ]*##'
+        runtime_add=" -runtime $RUNTIME -runtime-socket $RUNTIME_SOCKET"
+        runtime_service="docker.service"
+        if [ "$RUNTIME" = "podman" ]; then
+            runtime_service="podman.socket"
+        elif [ "$RUNTIME" = "containerd" ]; then
+            runtime_service="containerd.service"
+            runtime_add="$runtime_add -runtime-namespace twinet-$n"
+        fi
+        runtime_cmd="sed -i -e '$runtime_strip' -e '\#^ExecStart=#s#\$#$runtime_add#' /etc/systemd/system/twinetd.service"
+        runtime_cmd="$runtime_cmd; sed -i -e 's#^After=.*#After=$runtime_service#' -e 's#^Requires=.*#Requires=$runtime_service#' /etc/systemd/system/twinetd.service"
+        unit_cmd="$unit_cmd; $runtime_cmd"
     fi
 
     if [ "$n" = "$(hostname -s)" ]; then
