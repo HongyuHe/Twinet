@@ -73,7 +73,12 @@ func defaultConfigForRuntime(n int, name string) Config {
 	case "podman":
 		create, start = 8, 8
 	case "containerd":
-		create, start = 16, 16
+		// Hardened containerd creation performs independent host-side state
+		// preparation before entering the daemon. At class scale all 16 create
+		// slots remained occupied with 28 queued while a 56-core worker used
+		// fewer than two CPUs. Widen creation only; starts stay at the measured
+		// 16-slot ceiling and the outer lifecycle pool still caps both at 48.
+		create, start = 32, 16
 		convergence = bounded(n, 8, 48)
 		// Native containerd reaches wiring with substantially more lifecycle
 		// work already complete. A 56-core, 84-AS run held all 12 generic

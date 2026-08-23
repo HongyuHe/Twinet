@@ -78,9 +78,9 @@ func TestScaleDefaultsAndPartialOverrides(t *testing.T) {
 			podman.ContainerCreate, podman.ContainerStart)
 	}
 	containerd := defaultConfigForRuntime(56, "containerd")
-	if containerd.ContainerCreate != 16 || containerd.ContainerStart != 16 ||
+	if containerd.ContainerCreate != 32 || containerd.ContainerStart != 16 ||
 		containerd.Convergence != 48 || containerd.Netlink != 24 {
-		t.Fatalf("containerd defaults = create %d start %d convergence %d netlink %d, want 16/16/48/24",
+		t.Fatalf("containerd defaults = create %d start %d convergence %d netlink %d, want 32/16/48/24",
 			containerd.ContainerCreate, containerd.ContainerStart,
 			containerd.Convergence, containerd.Netlink)
 	}

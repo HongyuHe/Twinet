@@ -165,11 +165,12 @@ placement:
   # Resource-aware spreading keeps the heterogeneous transit/IXP systems
   # below the 80% steady reservation target on all three workers.
   strategy: spread-by-as
+  runtime: containerd
   # Steady-state upper bounds for the measured three-worker teaching cluster.
   # Live agent allocatable inventory remains authoritative when it is lower.
   # node-0 additionally reserves front-end/service headroom.
   convergence:
-    max_concurrent: 6
+    max_concurrent: 48
   reserve:
     node-0:
       cpus: 1
@@ -178,7 +179,15 @@ placement:
       ephemeral_storage: 20Gi
       file_descriptors: 16384
       netdevs: 256
-      containers: 32
+      # The front node also runs the controller and uses the cluster's slower
+      # local storage. Live initial-deploy traces showed it remained in create
+      # after the two workers reached convergence, so reserve object headroom
+      # and place the critical path on the equal worker pair instead.
+      containers: 600
+    node-2:
+      # Keep the two non-front workers within one AS-sized placement unit of
+      # each other under the measured runtime object contract.
+      containers: 185
   nodes:
     - name: node-0
       addr: "10.0.1.1:7200"
