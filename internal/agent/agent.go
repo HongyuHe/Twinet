@@ -148,8 +148,8 @@ func Main(ctx context.Context, args []string) error {
 			"concurrent container starts (0 selects measured runtime default: Docker 4, Podman 8)")
 		execProbeLimit = fs.Int("limit-exec-probe", defaultLimits.ExecProbe,
 			"node-wide exec and probe concurrency")
-		netlinkLimit = fs.Int("limit-netlink", defaultLimits.Netlink,
-			"node-wide netlink mutation concurrency")
+		netlinkLimit = fs.Int("limit-netlink", 0,
+			"node-wide netlink mutation concurrency (0 selects the runtime default)")
 		imagePullLimit = fs.Int("limit-image-pull", defaultLimits.ImagePull,
 			"node-wide image pull concurrency")
 		captureLimit = fs.Int("limit-capture", defaultLimits.Capture,
