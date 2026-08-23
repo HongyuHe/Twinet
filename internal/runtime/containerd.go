@@ -1230,11 +1230,11 @@ func (c *Containerd) reloadFRR(ctx context.Context, name string) error {
 }
 
 func (c *Containerd) runFRRReload(ctx context.Context, name string) error {
-	result, err := c.execRaw(ctx, name, ExecCmd{Cmd: []string{
+	result, err := c.execTaskRaw(ctx, name, ExecCmd{Cmd: []string{
 		"/usr/lib/frr/frr-reload.py", "--reload",
-		"--bindir", "/usr/lib/frr", "--confdir", "/etc/frr", "--rundir", "/run/frr",
+		"--bindir", "/usr/bin", "--confdir", "/etc/frr", "--rundir", "/run/frr",
 		"/etc/frr/frr.conf",
-	}})
+	}, Env: map[string]string{"PYTHONWARNINGS": "ignore"}})
 	if err != nil {
 		return fmt.Errorf("containerd reload FRR in %s: %w", name, err)
 	}
@@ -1750,7 +1750,7 @@ exit "$status"
 	}
 	for range 300 {
 		if ready, readyErr := c.frrSocketsReady(ctx, name, daemons); readyErr == nil && ready {
-			return c.runFRRReload(ctx, name)
+			return c.bootFRRConfiguration(ctx, name)
 		}
 		timer := time.NewTimer(100 * time.Millisecond)
 		select {
@@ -1763,6 +1763,40 @@ exit "$status"
 	log, _ := os.ReadFile(logPath)
 	return fmt.Errorf("FRR daemons did not become ready in %s: %s", name,
 		trim(string(log)))
+}
+
+func (c *Containerd) bootFRRConfiguration(ctx context.Context, name string) error {
+	timer := time.NewTimer(500 * time.Millisecond)
+	select {
+	case <-ctx.Done():
+		timer.Stop()
+		return ctx.Err()
+	case <-timer.C:
+	}
+	var lastErr error
+	for attempt := range 3 {
+		result, err := c.execTaskRaw(ctx, name, ExecCmd{
+			Cmd: []string{"timeout", "-s", "KILL", "30", "vtysh", "-b"},
+		})
+		if err == nil {
+			err = result.Err()
+		}
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if attempt == 2 {
+			break
+		}
+		timer = time.NewTimer(500 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return fmt.Errorf("boot integrated FRR configuration in %s: %w", name, lastErr)
 }
 
 func (c *Containerd) frrConfiguration(ctx context.Context, name string) (
