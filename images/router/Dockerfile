@@ -21,7 +21,7 @@
 FROM alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
 
 RUN apk add --no-cache \
-        frr=~10.0 frr-rpki=~10.0 \
+        frr=~10.0 frr-rpki=~10.0 frr-pythontools=~10.0 \
         iproute2 iproute2-tc iptables ip6tables \
         iputils bind-tools traceroute mtr tcpdump \
         bash curl jq wireguard-tools openssl \

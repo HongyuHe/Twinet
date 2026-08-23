@@ -1226,7 +1226,11 @@ func (c *Containerd) reloadFRR(ctx context.Context, name string) error {
 		// a success-shaped no-op, so use the native bounded stop/start path.
 		return c.startFRR(ctx, name)
 	}
-	result, err := c.execTaskRaw(ctx, name, ExecCmd{Cmd: []string{
+	return c.runFRRReload(ctx, name)
+}
+
+func (c *Containerd) runFRRReload(ctx context.Context, name string) error {
+	result, err := c.execRaw(ctx, name, ExecCmd{Cmd: []string{
 		"/usr/lib/frr/frr-reload.py", "--reload",
 		"--bindir", "/usr/lib/frr", "--confdir", "/etc/frr", "--rundir", "/run/frr",
 		"/etc/frr/frr.conf",
@@ -1742,12 +1746,11 @@ exit "$status"
 	_ = os.WriteFile(logPath, []byte(result.Stderr), 0o600)
 	if err := result.Err(); err != nil {
 		_ = c.stopFRR(context.WithoutCancel(ctx), name)
-		_ = os.WriteFile(logPath, []byte(result.Stderr), 0o600)
 		return fmt.Errorf("start FRR daemons in %s: %w", name, err)
 	}
-	for range 600 {
+	for range 300 {
 		if ready, readyErr := c.frrSocketsReady(ctx, name, daemons); readyErr == nil && ready {
-			return c.applyFRRConfiguration(ctx, name)
+			return c.runFRRReload(ctx, name)
 		}
 		timer := time.NewTimer(100 * time.Millisecond)
 		select {
@@ -1760,28 +1763,6 @@ exit "$status"
 	log, _ := os.ReadFile(logPath)
 	return fmt.Errorf("FRR daemons did not become ready in %s: %s", name,
 		trim(string(log)))
-}
-
-func (c *Containerd) applyFRRConfiguration(ctx context.Context, name string) error {
-	var lastErr error
-	for range 100 {
-		result, err := c.execTaskRaw(ctx, name, ExecCmd{Cmd: []string{"vtysh", "-b"}})
-		if err == nil {
-			err = result.Err()
-		}
-		if err == nil {
-			return nil
-		}
-		lastErr = err
-		timer := time.NewTimer(100 * time.Millisecond)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return ctx.Err()
-		case <-timer.C:
-		}
-	}
-	return fmt.Errorf("apply integrated FRR configuration in %s: %w", name, lastErr)
 }
 
 func (c *Containerd) frrConfiguration(ctx context.Context, name string) (
