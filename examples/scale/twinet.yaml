@@ -179,15 +179,10 @@ placement:
       ephemeral_storage: 20Gi
       file_descriptors: 16384
       netdevs: 256
-      # The front node also runs the controller and uses the cluster's slower
-      # local storage. Live initial-deploy traces showed it remained in create
-      # after the two workers reached convergence, so reserve object headroom
-      # and place the critical path on the equal worker pair instead.
-      containers: 600
-    node-2:
-      # Keep the two non-front workers within one AS-sized placement unit of
-      # each other under the measured runtime object contract.
-      containers: 185
+      # Retain only front-end service headroom. Containerd view snapshots
+      # removed the old local-storage penalty; larger object reservations left
+      # node-0 idle while both peers remained on the convergence critical path.
+      containers: 32
   nodes:
     - name: node-0
       addr: "10.0.1.1:7200"
