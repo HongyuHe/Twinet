@@ -178,7 +178,14 @@ func (s *Server) recoveryArtifactLimit() time.Duration {
 }
 
 func (s *Server) recoveryWorkerCount() int {
-	workers := s.workLimiter().ClampWorkers(limiter.Lifecycle, recoveryLifecycleWorkers)
+	requested := recoveryLifecycleWorkers
+	if strings.EqualFold(s.cfg.Runtime, "containerd") {
+		// Native containerd deletion and view-snapshot cleanup remain bounded
+		// by the node lifecycle limiter, but eight workers left two scale nodes
+		// hundreds of objects behind long after cancellation had quiesced.
+		requested = 32
+	}
+	workers := s.workLimiter().ClampWorkers(limiter.Lifecycle, requested)
 	return s.workLimiter().ClampWorkers(limiter.Apply, workers)
 }
 

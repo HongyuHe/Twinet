@@ -11,8 +11,21 @@ import (
 	"testing"
 	"time"
 
+	"github.com/HongyuHe/twinet/internal/limiter"
 	rt "github.com/HongyuHe/twinet/internal/runtime"
 )
+
+func TestContainerdRecoveryUsesWiderLifecyclePool(t *testing.T) {
+	limits := limiter.Config{Apply: 56, Lifecycle: 56}
+	docker := &Server{cfg: Config{Runtime: "docker", WorkLimits: limits}}
+	containerd := &Server{cfg: Config{Runtime: "containerd", WorkLimits: limits}}
+	if got := docker.recoveryWorkerCount(); got != recoveryLifecycleWorkers {
+		t.Fatalf("Docker recovery workers = %d, want %d", got, recoveryLifecycleWorkers)
+	}
+	if got := containerd.recoveryWorkerCount(); got != 32 {
+		t.Fatalf("containerd recovery workers = %d, want 32", got)
+	}
+}
 
 type bulkRecoveryRuntime struct {
 	rt.Runtime
