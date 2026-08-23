@@ -137,6 +137,10 @@ func Main(ctx context.Context, args []string) error {
 			"node-wide apply concurrency (default up to 48 on large hosts)")
 		lifecycleLimit = fs.Int("limit-lifecycle", defaultLimits.Lifecycle,
 			"node-wide container lifecycle concurrency (default up to 48 on large hosts)")
+		containerCreateLimit = fs.Int("limit-container-create", 0,
+			"concurrent container creates (0 selects measured runtime default: Docker 4, Podman 8)")
+		containerStartLimit = fs.Int("limit-container-start", 0,
+			"concurrent container starts (0 selects measured runtime default: Docker 4, Podman 8)")
 		execProbeLimit = fs.Int("limit-exec-probe", defaultLimits.ExecProbe,
 			"node-wide exec and probe concurrency")
 		netlinkLimit = fs.Int("limit-netlink", defaultLimits.Netlink,
@@ -188,8 +192,10 @@ func Main(ctx context.Context, args []string) error {
 		PeerTLSCert: *peerCert, PeerTLSKey: *peerKey, LegacyPeerCertUntil: peerMigrationUntil,
 		GCInterval: *gcInterval, EventCapacity: *eventCapacity,
 		WorkLimits: limiter.Config{
-			Apply: *applyLimit, Lifecycle: *lifecycleLimit, ExecProbe: *execProbeLimit,
-			Netlink: *netlinkLimit, ImagePull: *imagePullLimit, Capture: *captureLimit,
+			Apply: *applyLimit, Lifecycle: *lifecycleLimit,
+			ContainerCreate: *containerCreateLimit, ContainerStart: *containerStartLimit,
+			ExecProbe: *execProbeLimit,
+			Netlink:   *netlinkLimit, ImagePull: *imagePullLimit, Capture: *captureLimit,
 			Convergence: *convergenceLimit,
 		},
 		RecoveryMaxTimeout: *recoveryMaxTimeout,
@@ -341,7 +347,7 @@ func (s *Server) workLimiter() *limiter.Limiter {
 	s.workMu.Lock()
 	defer s.workMu.Unlock()
 	if s.work == nil {
-		s.work = limiter.New(limiter.WithDefaults(s.cfg.WorkLimits))
+		s.work = limiter.New(limiter.WithDefaultsForRuntime(s.cfg.WorkLimits, s.cfg.Runtime))
 	}
 	return s.work
 }
@@ -378,6 +384,7 @@ func New(cfg Config) (*Server, error) {
 	if _, err := engine.Ping(context.Background()); err != nil {
 		return nil, fmt.Errorf("cannot reach selected %s container engine: %w", runtimeName, err)
 	}
+	cfg.Runtime = runtimeName
 	srv := &Server{
 		cfg: cfg, started: time.Now(), metrics: newAgentMetrics(),
 		current: map[string]*model.Topology{},
@@ -399,7 +406,7 @@ func New(cfg Config) (*Server, error) {
 	if source, ok := interface{}(engine).(rt.EventSource); ok {
 		srv.eventSource = source
 	}
-	srv.rt = &observedRuntime{runtime: engine, metrics: srv.metrics}
+	srv.rt = &observedRuntime{runtime: engine, metrics: srv.metrics, limiter: srv.workLimiter()}
 	srv.initCoordination()
 	if cfg.StateDir != "" {
 		st, err := state.Open(cfg.StateDir)

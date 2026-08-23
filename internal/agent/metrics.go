@@ -632,7 +632,8 @@ func appendLimiterMetrics(b *strings.Builder, stats map[string]limiter.Stats) {
 
 func boundedLimiterKind(value string) string {
 	switch value {
-	case "apply", "lifecycle", "exec_probe", "netlink", "image_pull", "capture", "convergence":
+	case "apply", "lifecycle", "container_create", "container_start",
+		"exec_probe", "netlink", "image_pull", "capture", "convergence":
 		return value
 	default:
 		return "other"

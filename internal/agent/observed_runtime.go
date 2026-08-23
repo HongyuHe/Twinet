@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/HongyuHe/twinet/internal/limiter"
 	rt "github.com/HongyuHe/twinet/internal/runtime"
 )
 
@@ -13,6 +14,7 @@ import (
 type observedRuntime struct {
 	runtime rt.Runtime
 	metrics *agentMetrics
+	limiter *limiter.Limiter
 }
 
 func observeRuntimeCall[T any](m *agentMetrics, method string, fn func() (T, error)) (T, error) {
@@ -53,11 +55,20 @@ func (r *observedRuntime) ImageExists(ctx context.Context, ref string) (bool, er
 }
 
 func (r *observedRuntime) Create(ctx context.Context, spec *rt.Spec) (string, error) {
-	return observeRuntimeCall(r.metrics, "create", func() (string, error) { return r.runtime.Create(ctx, spec) })
+	var id string
+	err := r.limiter.Run(ctx, []limiter.Kind{limiter.ContainerCreate}, func() error {
+		var createErr error
+		id, createErr = observeRuntimeCall(r.metrics, "create",
+			func() (string, error) { return r.runtime.Create(ctx, spec) })
+		return createErr
+	})
+	return id, err
 }
 
 func (r *observedRuntime) Start(ctx context.Context, name string) error {
-	return observeRuntimeError(r.metrics, "start", func() error { return r.runtime.Start(ctx, name) })
+	return r.limiter.Run(ctx, []limiter.Kind{limiter.ContainerStart}, func() error {
+		return observeRuntimeError(r.metrics, "start", func() error { return r.runtime.Start(ctx, name) })
+	})
 }
 
 func (r *observedRuntime) Stop(ctx context.Context, name string, timeout time.Duration) error {

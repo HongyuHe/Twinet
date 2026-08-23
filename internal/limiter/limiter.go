@@ -6,6 +6,7 @@ import (
 	"context"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -16,47 +17,73 @@ type Kind string
 const (
 	Apply     Kind = "apply"
 	Lifecycle Kind = "lifecycle"
-	ExecProbe Kind = "exec_probe"
-	Netlink   Kind = "netlink"
-	ImagePull Kind = "image_pull"
-	Capture   Kind = "capture"
+	// ContainerCreate and ContainerStart split the two Docker operations whose
+	// throughput plateaus independently. Keeping separate gates permits a
+	// bounded pipeline without sending one large synchronized burst.
+	ContainerCreate Kind = "container_create"
+	ContainerStart  Kind = "container_start"
+	ExecProbe       Kind = "exec_probe"
+	Netlink         Kind = "netlink"
+	ImagePull       Kind = "image_pull"
+	Capture         Kind = "capture"
 	// Convergence bounds router daemon starts/configuration bursts. It is
 	// intentionally distinct from steady-state admission requests.
 	Convergence Kind = "convergence"
 )
 
-var allKinds = []Kind{Apply, Lifecycle, ExecProbe, Netlink, ImagePull, Capture, Convergence}
+var allKinds = []Kind{
+	Apply, Lifecycle, ContainerCreate, ContainerStart,
+	ExecProbe, Netlink, ImagePull, Capture, Convergence,
+}
 
 // Config configures one node-wide budget per operation class.
 type Config struct {
-	Apply       int
-	Lifecycle   int
-	ExecProbe   int
-	Netlink     int
-	ImagePull   int
-	Capture     int
-	Convergence int
+	Apply           int
+	Lifecycle       int
+	ContainerCreate int
+	ContainerStart  int
+	ExecProbe       int
+	Netlink         int
+	ImagePull       int
+	Capture         int
+	Convergence     int
 }
 
 // DefaultConfig is conservative enough for a node that hosts multiple labs,
 // rather than assuming one controller owns every worker on the machine.
 func DefaultConfig() Config {
-	return defaultConfig(runtime.NumCPU())
+	return defaultConfigForRuntime(runtime.NumCPU(), "docker")
 }
 
 func defaultConfig(n int) Config {
+	return defaultConfigForRuntime(n, "docker")
+}
+
+// DefaultConfigForRuntime applies measured runtime-specific lifecycle widths
+// while retaining the same outer node pressure budgets.
+func DefaultConfigForRuntime(name string) Config {
+	return defaultConfigForRuntime(runtime.NumCPU(), name)
+}
+
+func defaultConfigForRuntime(n int, name string) Config {
+	create, start := 4, 4
+	if strings.EqualFold(strings.TrimSpace(name), "podman") {
+		create, start = 8, 8
+	}
 	return Config{
-		// The 84-AS trace saturated 16 lifecycle slots for 16k-24k aggregate
-		// queue seconds while a 56-core node used only 23 CPUs. A ceiling of
-		// 48 keeps work below the host CPU count there; the narrower netlink,
-		// image, capture, and convergence budgets retain subsystem backpressure.
-		Apply:       bounded(n*2, 4, 48),
-		Lifecycle:   bounded(n*2, 8, 48),
-		ExecProbe:   bounded(n*4, 8, 48),
-		Netlink:     bounded(n, 2, 12),
-		ImagePull:   2,
-		Capture:     bounded(n, 2, 8),
-		Convergence: bounded(n, 2, 8),
+		// The outer pools remain broad enough to pipeline unrelated work.
+		// Isolated Docker API measurements on a 56-core node showed create and
+		// start throughput already saturated at width four (~1.0 combined
+		// containers/s); widths 24-48 doubled tail latency for negligible gain.
+		Apply:           bounded(n*2, 4, 48),
+		Lifecycle:       bounded(n*2, 8, 48),
+		ContainerCreate: create,
+		ContainerStart:  start,
+		ExecProbe:       bounded(n*4, 8, 48),
+		Netlink:         bounded(n, 2, 12),
+		ImagePull:       2,
+		Capture:         bounded(n, 2, 8),
+		Convergence:     bounded(n, 2, 8),
 	}
 }
 
@@ -64,12 +91,24 @@ func defaultConfig(n int) Config {
 // flags can therefore tune one pressure class without accidentally reducing
 // every unspecified class to New's fail-safe limit of one.
 func WithDefaults(cfg Config) Config {
-	defaults := DefaultConfig()
+	return WithDefaultsForRuntime(cfg, "docker")
+}
+
+// WithDefaultsForRuntime fills unspecified limits from the measured defaults
+// for the selected runtime.
+func WithDefaultsForRuntime(cfg Config, runtimeName string) Config {
+	defaults := DefaultConfigForRuntime(runtimeName)
 	if cfg.Apply <= 0 {
 		cfg.Apply = defaults.Apply
 	}
 	if cfg.Lifecycle <= 0 {
 		cfg.Lifecycle = defaults.Lifecycle
+	}
+	if cfg.ContainerCreate <= 0 {
+		cfg.ContainerCreate = defaults.ContainerCreate
+	}
+	if cfg.ContainerStart <= 0 {
+		cfg.ContainerStart = defaults.ContainerStart
 	}
 	if cfg.ExecProbe <= 0 {
 		cfg.ExecProbe = defaults.ExecProbe
@@ -126,8 +165,10 @@ type Limiter struct {
 // that can never advance.
 func New(cfg Config) *Limiter {
 	limits := map[Kind]int{
-		Apply: cfg.Apply, Lifecycle: cfg.Lifecycle, ExecProbe: cfg.ExecProbe,
-		Netlink: cfg.Netlink, ImagePull: cfg.ImagePull, Capture: cfg.Capture,
+		Apply: cfg.Apply, Lifecycle: cfg.Lifecycle,
+		ContainerCreate: cfg.ContainerCreate, ContainerStart: cfg.ContainerStart,
+		ExecProbe: cfg.ExecProbe,
+		Netlink:   cfg.Netlink, ImagePull: cfg.ImagePull, Capture: cfg.Capture,
 		Convergence: cfg.Convergence,
 	}
 	out := &Limiter{buckets: map[Kind]*bucket{}}

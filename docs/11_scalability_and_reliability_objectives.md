@@ -144,13 +144,26 @@ limit.
   concurrency number.
 
 `twinetd` sizes those shared budgets from host CPU count and exposes
-`-limit-apply`, `-limit-lifecycle`, `-limit-exec-probe`, `-limit-netlink`,
+`-limit-apply`, `-limit-lifecycle`, `-limit-container-create`,
+`-limit-container-start`, `-limit-exec-probe`, `-limit-netlink`,
 `-limit-image-pull`, `-limit-capture`, and `-limit-convergence` overrides.
-The lifecycle ceiling is 48 on large hosts: the 84-AS trace saturated 16
-workers for 16k-24k aggregate queue seconds while using only 23 of 56 CPUs;
-the matching apply ceiling lets that lifecycle fan-out run while the narrower
-netlink, image-pull, capture, and convergence limits retain subsystem
-backpressure.
+The outer apply/lifecycle ceilings remain 48 so independent stages can
+pipeline. Isolated Docker API measurements on node-0 found combined
+create+start throughput effectively flat from width 4 through 48
+(0.86-1.00 containers/s), while p95 latency rose from 5.4s to 53.2s. Separate
+create and start batches sustained 1.03 containers/s at width 4 versus 1.00 at
+48; therefore each Docker operation has its own four-slot gate while the
+broader DAG continues scheduling wiring and configuration work.
+
+The same isolated 64-container sweep measured rootful Podman at
+1.81-1.88 containers/s per node (best at width 8), an extrapolated
+5.63 containers/s across three equal nodes. Direct containerd in a dedicated
+namespace measured 7.13 containers/s at width 4. Podman is therefore the
+low-risk existing backend for a first scale rerun; native containerd has much
+more headroom but still needs Twinet's complete exec/copy/events/netns and
+recovery contract rather than a benchmark-only `ctr` path.
+Runtime-specific defaults use four create/start slots for Docker and eight for
+Podman; both remain independently tunable.
 
 **Shipped admission contract.** `cpus`, `memory`, and `pids` are container
 limits; `requests` are independent scheduler reservations for CPU, memory,
@@ -461,6 +474,11 @@ another lab; all course exercises still work without `CAP_SYS_ADMIN`.
   listing, attach, exec, lifecycle, reshape, and MPLS routes reject internal
   sidecars. Cross-node applies require fence-bound VNI reservations, and
   multiplex pairs include lab ownership in their kernel alias.
+- The 84-AS topology has 2,020 primary devices and 644 FRR control sidecars:
+  removing sidecars would reduce runtime objects by 24.2% and save about
+  1.9 minutes at the measured three-node Podman rate. It is not currently a
+  safe optimization: Alpine FRR 10 requires `SYS_ADMIN`, and merging the daemon
+  back into the student router would grant that capability to student code.
 - Privileged API mutations append immutable structured events containing
   identity, certificate serial, lab, action, deployment generation, fence,
   target, and result. Event text redacts bearer/token/secret/PEM material.

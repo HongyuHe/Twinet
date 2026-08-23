@@ -68,6 +68,15 @@ func TestScaleDefaultsAndPartialOverrides(t *testing.T) {
 		t.Fatalf("56-core defaults = apply %d lifecycle %d, want 48/48",
 			cfg.Apply, cfg.Lifecycle)
 	}
+	if cfg.ContainerCreate != 4 || cfg.ContainerStart != 4 {
+		t.Fatalf("Docker lifecycle split defaults = create %d start %d, want 4/4",
+			cfg.ContainerCreate, cfg.ContainerStart)
+	}
+	podman := defaultConfigForRuntime(56, "podman")
+	if podman.ContainerCreate != 8 || podman.ContainerStart != 8 {
+		t.Fatalf("Podman lifecycle split defaults = create %d start %d, want 8/8",
+			podman.ContainerCreate, podman.ContainerStart)
+	}
 	overridden := WithDefaults(Config{Lifecycle: 24})
 	defaults := DefaultConfig()
 	if overridden.Lifecycle != 24 || overridden.Apply != defaults.Apply ||

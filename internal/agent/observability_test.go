@@ -241,6 +241,11 @@ func TestEventScopeOrderAndBoundedMetrics(t *testing.T) {
 	if got := boundedLimiterKind("convergence"); got != "convergence" {
 		t.Fatalf("convergence limiter label = %q, want convergence", got)
 	}
+	for _, kind := range []string{"container_create", "container_start"} {
+		if got := boundedLimiterKind(kind); got != kind {
+			t.Fatalf("lifecycle limiter label = %q, want %q", got, kind)
+		}
+	}
 	metricsServer := &Server{cfg: Config{Node: "node-0"}, rt: &gcRuntime{}}
 	metricsResponse := httptest.NewRecorder()
 	metricsServer.handleMetrics(metricsResponse, httptest.NewRequest(http.MethodGet, "/metrics", nil))
