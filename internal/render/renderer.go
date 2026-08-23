@@ -372,13 +372,15 @@ func (r *Renderer) routerCommands(d *model.Device) []deploy.Command {
 		}
 	}
 	// Loopback addresses are configured on the interface rather than through
-	// FRR when the platform owns them, so the address exists even if FRR is
-	// still starting.
-	if lo, ok := d.IfaceByName("lo"); ok && lo.Owner == model.OwnerPlatform && lo.Addr4 != "" {
-		cmds = append([]deploy.Command{{
+	// FRR when the platform owns them. Apply them after daemon startup/reload:
+	// native FRR initialization can reconcile interface state, and placing the
+	// address first left otherwise-successful routers without their loopback.
+	if lo, ok := d.IfaceByName("lo"); ok && lo.Addr4 != "" &&
+		(lo.Owner == model.OwnerPlatform || r.modeFor(d) == ModeSolve) {
+		cmds = append(cmds, deploy.Command{
 			Args:     []string{"sh", "-c", fmt.Sprintf("ip addr replace %s brd + dev lo && ip link set lo up", lo.Addr4)},
 			Describe: "configure loopback",
-		}}, cmds...)
+		})
 	}
 	return cmds
 }
