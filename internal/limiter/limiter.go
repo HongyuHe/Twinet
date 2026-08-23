@@ -89,9 +89,9 @@ func defaultConfigForRuntime(n int, name string) Config {
 		// Native containerd reaches wiring with substantially more lifecycle
 		// work already complete. A 56-core, 84-AS run held all 12 generic
 		// netlink slots with 36 additional operations queued while host CPU
-		// remained below 30 cores; a bounded 32-slot pool removes that
-		// artificial serialization without changing other runtimes.
-		netlink = bounded(n, 8, 32)
+		// remained below 30 cores. Twenty-four removed that serialization;
+		// 32 oversubscribed a 56-core worker (load >90) and regressed wiring.
+		netlink = bounded(n, 8, 24)
 	}
 	return Config{
 		// The outer pools remain broad enough to pipeline unrelated work.
