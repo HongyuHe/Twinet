@@ -200,7 +200,9 @@ func checkNextHopSelf(ctx context.Context, env *Env) Result {
 	// and every packet for that destination dropped -- measured, and worth
 	// nothing at all before this. The point of carrying external routes is
 	// that traffic reaches the networks they name.
-	if dark := unreachedOutside(ctx, env, routers); len(dark) > 0 {
+	if dark, err := unreachedOutside(ctx, env, routers); err != nil {
+		return Errored("bgp.next_hop_self", err)
+	} else if len(dark) > 0 {
 		return Partial("bgp.next_hop_self", ratio(maxInt(readable-len(dark), 0), maxInt(readable, 1)),
 			Evidence{
 				Expected: "every router able to send a packet to the networks it has learned",
@@ -316,7 +318,7 @@ func resolveNextHopsBatched(ctx context.Context, env *Env, uses []nextHopUse) (
 // makes them answer, and a router that has the route and drops the traffic --
 // a policy rule, an alternate table, a firewall -- is the difference between a
 // routing table and a network.
-func unreachedOutside(ctx context.Context, env *Env, routers []*model.Device) []string {
+func unreachedOutside(ctx context.Context, env *Env, routers []*model.Device) ([]string, error) {
 	type target struct {
 		asn    int
 		addr   string
@@ -339,7 +341,7 @@ func unreachedOutside(ctx context.Context, env *Env, routers []*model.Device) []
 	}
 	sort.Slice(targets, func(a, b int) bool { return targets[a].asn < targets[b].asn })
 	if len(targets) == 0 {
-		return nil
+		return nil, nil
 	}
 	addresses := map[string]string{}
 	for _, target := range targets {
@@ -363,20 +365,70 @@ func unreachedOutside(ctx context.Context, env *Env, routers []*model.Device) []
 			continue
 		}
 		for _, t := range targets {
-			probes = append(probes, reachabilityProbe{from: r, to: t.device, srcIface: "lo"})
+			// Match the established witness exactly: ping -I is given the
+			// loopback address, not merely its interface name. On routers
+			// with policy routing the two can select different source rules.
+			probes = append(probes, reachabilityProbe{from: r, to: t.device, srcIface: src})
 		}
 	}
 	if len(probes) == 0 {
-		return nil
+		return nil, nil
 	}
 	failed, complete := batchedPingFailures(ctx, env, probes, addresses)
+	if env.ShadowBatches {
+		legacy := legacyPingFailures(ctx, env, probes, addresses)
+		if !complete || !sameStrings(failed, legacy) {
+			return nil, fmt.Errorf("batched external-reachability witness differs from legacy witness; "+
+				"refusing to change the verdict until they agree (batched=%v legacy=%v)", failed, legacy)
+		}
+		return summarizeOutsideFailures(legacy, len(targets), routers), nil
+	}
 	if complete {
-		return failed
+		return summarizeOutsideFailures(failed, len(targets), routers), nil
 	}
 	// A missing source-side marker is a grader problem, not a failed path.
 	// The legacy path retains its per-pair error accounting rather than
 	// guessing which probe a partial batch omitted.
-	return legacyPingFailures(ctx, env, probes, addresses)
+	return summarizeOutsideFailures(legacyPingFailures(ctx, env, probes, addresses), len(targets), routers), nil
+}
+
+func summarizeOutsideFailures(failed []string, targetCount int, routers []*model.Device) []string {
+	byRouter := map[string][]string{}
+	for _, failure := range failed {
+		for _, router := range routers {
+			if strings.HasPrefix(failure, router.ID+" ") || strings.HasPrefix(failure, router.ID+" (") ||
+				strings.HasPrefix(failure, router.Name+" ") {
+				byRouter[router.Name] = append(byRouter[router.Name], failure)
+				break
+			}
+		}
+	}
+	var out []string
+	for _, router := range routers {
+		missing := byRouter[router.Name]
+		if len(missing) == 0 {
+			continue
+		}
+		sort.Strings(missing)
+		out = append(out, fmt.Sprintf("%s cannot reach %d of %d other system(s) it has routes for: %s",
+			router.Name, len(missing), targetCount, strings.Join(truncate(missing, 3), "; ")))
+	}
+	return out
+}
+
+func sameStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	left, right := append([]string(nil), a...), append([]string(nil), b...)
+	sort.Strings(left)
+	sort.Strings(right)
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }
 
 // resolves reports whether a router has a route to an address that would

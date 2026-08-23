@@ -98,6 +98,7 @@ func newGradeRunCmd(opts *Options) *cobra.Command {
 		parallel       int
 		checkParallel  int
 		activeParallel int
+		shadowBatches  bool
 		token          string
 		converge       time.Duration
 		quiet          bool
@@ -221,6 +222,7 @@ reference, and holds the nodes off from repairing anything while it does.`,
 						ReadParallel:        checkParallel,
 						ActiveParallel:      activeParallel,
 						ObservationParallel: checkParallel,
+						ShadowBatches:       shadowBatches,
 					})
 					rep.Submission = fmt.Sprintf("as%d", asn)
 					if as, ok := top.ASes[asn]; ok && as.OwnerGroup != "" {
@@ -269,6 +271,8 @@ reference, and holds the nodes off from repairing anything while it does.`,
 		"maximum checks/passive observations per submission")
 	cmd.Flags().IntVar(&activeParallel, "active-check-parallel", 4,
 		"maximum packet/capture/control-refresh checks per submission")
+	cmd.Flags().BoolVar(&shadowBatches, "shadow-batches", false,
+		"compare batched active witnesses with legacy per-target witnesses")
 	// Four minutes, not ninety seconds.
 	//
 	// Ninety was a guess and it was wrong: an iBGP session in the 12-AS lab was

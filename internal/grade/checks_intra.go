@@ -1502,6 +1502,69 @@ func udpNoPortsV4(ctx context.Context, env *Env, device string) (counterWitness,
 // by, the address it is handed to, or both.
 type installedHop struct{ iface, ip string }
 
+// kernelLPM returns the selected/installed main-table route set that Linux
+// would use for target. Kernel snapshots contain route prefixes rather than a
+// daemon's exact /32 lookup, so requiring string equality made a valid OSPF
+// aggregate look like no route at all. Equal-prefix/equal-metric routes are
+// retained together so ECMP evidence is not collapsed to one next hop.
+func kernelLPM(routes []netstate.Route, target string) []netstate.Route {
+	dst, err := netip.ParseAddr(addrOnly(target))
+	if err != nil {
+		return nil
+	}
+	family := "ipv4"
+	if dst.Is6() {
+		family = "ipv6"
+	}
+	bestBits, bestMetric := -1, 0
+	var out []netstate.Route
+	for _, route := range routes {
+		if !mainKernelTable(route.Table) || (!route.Selected && !route.Installed) {
+			continue
+		}
+		if route.Family != "" && route.Family != family {
+			continue
+		}
+		prefix, ok := routePrefix(route.Prefix, family)
+		if !ok || !prefix.Contains(dst) {
+			continue
+		}
+		bits := prefix.Bits()
+		switch {
+		case bits > bestBits:
+			bestBits, bestMetric = bits, route.Metric
+			out = []netstate.Route{route}
+		case bits == bestBits && route.Metric < bestMetric:
+			bestMetric = route.Metric
+			out = []netstate.Route{route}
+		case bits == bestBits && route.Metric == bestMetric:
+			out = append(out, route)
+		}
+	}
+	return out
+}
+
+func mainKernelTable(table string) bool {
+	switch strings.TrimSpace(table) {
+	case "", "main", "254":
+		return true
+	default:
+		return false
+	}
+}
+
+func routePrefix(raw, family string) (netip.Prefix, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "default" {
+		if family == "ipv6" {
+			return netip.PrefixFrom(netip.IPv6Unspecified(), 0), true
+		}
+		return netip.PrefixFrom(netip.IPv4Unspecified(), 0), true
+	}
+	prefix, err := netip.ParsePrefix(raw)
+	return prefix, err == nil
+}
+
 func (h installedHop) label() string {
 	switch {
 	case h.iface != "" && h.ip != "":
@@ -1613,10 +1676,7 @@ func checkECMP(ctx context.Context, env *Env) Result {
 			return nil, err
 		}
 		var hops []installedHop
-		for _, route := range state.Kernel.Routes {
-			if route.Prefix != target || (!route.Selected && !route.Installed) {
-				continue
-			}
+		for _, route := range kernelLPM(state.Kernel.Routes, target) {
 			// The protocol is what the question is about.
 			//
 			// It was decoded and then ignored, so three static routes over the

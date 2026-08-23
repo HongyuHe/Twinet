@@ -278,6 +278,9 @@ type RunOptions struct {
 	// ActiveParallel bounds packet/capture/control-refresh checks. Zero uses a
 	// conservative share of Parallel; node agents remain the final limiter.
 	ActiveParallel int
+	// ShadowBatches compares batched active witnesses against the previous
+	// per-target witness before trusting the fast path.
+	ShadowBatches bool
 	// ObservationParallel bounds passive collection requests made by the
 	// controller. Node agents independently enforce their ExecProbe budget.
 	ObservationParallel int
@@ -340,6 +343,7 @@ func Run(ctx context.Context, r *Rubric, env *Env, opts RunOptions) *Report {
 	// report what it saw rather than serially waiting behind one another.
 	execs := &execTracker{}
 	runEnv := *env
+	runEnv.ShadowBatches = opts.ShadowBatches
 	if runEnv.Exec != nil {
 		runEnv.Exec = execs.wrap(runEnv.Exec)
 	}

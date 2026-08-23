@@ -64,6 +64,10 @@ type Env struct {
 	// same per-device state shell, avoiding a second runtime exec for RPKI or
 	// OSPF evidence.
 	observationExtras map[string][][]string
+	// ShadowBatches compares a new source-side batch witness to the established
+	// per-target witness. Any mismatch is an infrastructure error rather than
+	// silently changing a student verdict.
+	ShadowBatches bool
 }
 
 type BatchExecRequest struct {
