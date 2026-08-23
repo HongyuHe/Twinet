@@ -318,8 +318,9 @@ func resolveNextHopsBatched(ctx context.Context, env *Env, uses []nextHopUse) (
 // routing table and a network.
 func unreachedOutside(ctx context.Context, env *Env, routers []*model.Device) []string {
 	type target struct {
-		asn  int
-		addr string
+		asn    int
+		addr   string
+		device *model.Device
 	}
 	var targets []target
 	for asn, as := range env.Topology.ASes {
@@ -331,7 +332,7 @@ func unreachedOutside(ctx context.Context, env *Env, routers []*model.Device) []
 				continue
 			}
 			if a := firstAddr(d); a != "" {
-				targets = append(targets, target{asn, a})
+				targets = append(targets, target{asn: asn, addr: a, device: d})
 				break
 			}
 		}
@@ -340,12 +341,11 @@ func unreachedOutside(ctx context.Context, env *Env, routers []*model.Device) []
 	if len(targets) == 0 {
 		return nil
 	}
-	var (
-		mu   sync.Mutex
-		lost = map[string][]string{}
-		wg   sync.WaitGroup
-	)
-	sem := make(chan struct{}, 16)
+	addresses := map[string]string{}
+	for _, target := range targets {
+		addresses[target.device.ID] = target.addr
+	}
+	var probes []reachabilityProbe
 	for _, r := range routers {
 		// From the loopback, always.
 		//
@@ -363,31 +363,20 @@ func unreachedOutside(ctx context.Context, env *Env, routers []*model.Device) []
 			continue
 		}
 		for _, t := range targets {
-			wg.Add(1)
-			go func(r *model.Device, t target) {
-				defer wg.Done()
-				sem <- struct{}{}
-				defer func() { <-sem }()
-				res, err := env.Probe(ctx, r.ID,
-					[]string{"ping", "-c", "2", "-W", "2", "-i", "0.2", "-I", src, t.addr})
-				if err == nil && res.ExitCode == 0 {
-					return
-				}
-				mu.Lock()
-				lost[r.Name] = append(lost[r.Name], fmt.Sprintf("AS %d at %s", t.asn, t.addr))
-				mu.Unlock()
-			}(r, t)
+			probes = append(probes, reachabilityProbe{from: r, to: t.device, srcIface: "lo"})
 		}
 	}
-	wg.Wait()
-	var out []string
-	for name, misses := range lost {
-		sort.Strings(misses)
-		out = append(out, fmt.Sprintf("%s cannot reach %d of %d other system(s) it has routes "+
-			"for: %s", name, len(misses), len(targets), strings.Join(truncate(misses, 3), ", ")))
+	if len(probes) == 0 {
+		return nil
 	}
-	sort.Strings(out)
-	return out
+	failed, complete := batchedPingFailures(ctx, env, probes, addresses)
+	if complete {
+		return failed
+	}
+	// A missing source-side marker is a grader problem, not a failed path.
+	// The legacy path retains its per-pair error accounting rather than
+	// guessing which probe a partial batch omitted.
+	return legacyPingFailures(ctx, env, probes, addresses)
 }
 
 // resolves reports whether a router has a route to an address that would

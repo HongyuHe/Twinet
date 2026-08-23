@@ -2703,65 +2703,125 @@ func crossDatacentreGaps(ctx context.Context, env *Env, hostsIn map[string][]*mo
 			if i == j {
 				continue
 			}
+			var probes []ipv6PairProbe
 			for _, src := range hostsIn[from] {
 				for _, dst := range hostsIn[to] {
 					addr := deviceAddr6(ctx, env, dst)
 					if addr == "" {
-						gaps = append(gaps, fmt.Sprintf("%s (%s) has no IPv6 address",
-							dst.Name, to))
+						gaps = append(gaps, fmt.Sprintf("%s (%s) has no IPv6 address", dst.Name, to))
 						continue
 					}
-					// The tunnel counter is bracketed around every pair, not
-					// only the first one.
-					//
-					// Reachability alone was the test here, and it does not
-					// distinguish encapsulated traffic from native IPv6: a
-					// system with a /128 tunnel route for the one pair the
-					// check happened to measure and native IPv6 for the rest
-					// scored the whole mark for an answer that does not use the
-					// tunnel at all.
-					gw, tun := gateways[from], tunnels[from]
-					before := -1
-					if gw != nil {
-						before = tunnelTx(ctx, env, gw.ID, tun)
-					}
-					res, err := env.Probe(ctx, src.ID,
-						[]string{"ping6", "-c", strconv.Itoa(packets), "-W", "4", "-i", "0.3", addr})
-					if err != nil {
-						gaps = append(gaps, fmt.Sprintf("%s could not be asked to reach %s: %v",
-							src.Name, dst.Name, err))
-						continue
-					}
-					if res.ExitCode != 0 {
-						gaps = append(gaps, fmt.Sprintf("%s (%s) cannot reach %s (%s) at %s",
-							src.Name, from, dst.Name, to, addr))
-						continue
-					}
-					if gw == nil || tun == "" || before < 0 {
-						continue
-					}
-					after := tunnelTx(ctx, env, gw.ID, tun)
-					if after < 0 {
-						gaps = append(gaps, fmt.Sprintf(
-							"%s reaches %s (%s), but %s could not be read on %s, so there is "+
-								"no evidence the traffic was encapsulated",
-							src.Name, dst.Name, to, tun, gw.Name))
-						continue
-					}
-					if after-before < packets {
-						gaps = append(gaps, fmt.Sprintf(
-							"%s (%s) reaches %s (%s) at %s, but %s on %s carried %d packet(s) "+
-								"while %d were sent, so that traffic is routed natively rather "+
-								"than through the tunnel",
-							src.Name, from, dst.Name, to, addr, tun, gw.Name,
-							after-before, packets))
-					}
+					probes = append(probes, ipv6PairProbe{src: src, dst: dst, addr: addr})
 				}
+			}
+			if len(probes) == 0 {
+				continue
+			}
+			gw, tun := gateways[from], tunnels[from]
+			before := -1
+			if gw != nil && tun != "" {
+				before = tunnelTx(ctx, env, gw.ID, tun)
+			}
+			failed, complete := batchedIPv6Pairs(ctx, env, probes)
+			if !complete {
+				gaps = append(gaps, fmt.Sprintf("%s-to-%s IPv6 probe batch could not account for every pair",
+					from, to))
+				continue
+			}
+			gaps = append(gaps, failed...)
+			if gw == nil || tun == "" || before < 0 {
+				continue
+			}
+			after := tunnelTx(ctx, env, gw.ID, tun)
+			if after < 0 {
+				gaps = append(gaps, fmt.Sprintf(
+					"%s could not be read on %s, so encapsulation of %d %s-to-%s probe(s) is unknown",
+					tun, gw.Name, len(probes), from, to))
+				continue
+			}
+			if after-before < packets*len(probes) {
+				gaps = append(gaps, fmt.Sprintf(
+					"%s on %s carried %d packet(s) while %d tagged %s-to-%s packets were sent; "+
+						"at least one reachable pair bypassed the tunnel",
+					tun, gw.Name, after-before, packets*len(probes), from, to))
 			}
 		}
 	}
 	sort.Strings(gaps)
 	return gaps
+}
+
+type ipv6PairProbe struct {
+	src, dst *model.Device
+	addr     string
+}
+
+// batchedIPv6Pairs uses one source-side shell per host and records a marker
+// for every requested pair. A missing marker is infrastructure uncertainty,
+// never evidence that a student's tunnel dropped a packet.
+func batchedIPv6Pairs(ctx context.Context, env *Env, probes []ipv6PairProbe) ([]string, bool) {
+	bySource := map[string][]int{}
+	for index, probe := range probes {
+		bySource[probe.src.ID] = append(bySource[probe.src.ID], index)
+	}
+	results := make([]bool, len(probes))
+	seen := make([]bool, len(probes))
+	var (
+		mu       sync.Mutex
+		wg       sync.WaitGroup
+		complete = true
+	)
+	for source, indexes := range bySource {
+		source, indexes := source, append([]int(nil), indexes...)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			var script strings.Builder
+			for offset, index := range indexes {
+				fmt.Fprintf(&script, "( ping6 -c 2 -W 4 -i 0.3 %s >/dev/null 2>&1; echo '@ %d '$? ) &\n",
+					shellWord(probes[index].addr), index)
+				if (offset+1)%sourceBatchWidth == 0 {
+					script.WriteString("wait\n")
+				}
+			}
+			script.WriteString("wait\n")
+			res, err := env.Probe(ctx, source, []string{"sh", "-c", script.String()})
+			if err != nil || res.ExitCode != 0 {
+				mu.Lock()
+				complete = false
+				mu.Unlock()
+				return
+			}
+			for _, line := range strings.Split(res.Stdout, "\n") {
+				fields := strings.Fields(line)
+				if len(fields) != 3 || fields[0] != "@" {
+					continue
+				}
+				index, ierr := strconv.Atoi(fields[1])
+				code, cerr := strconv.Atoi(fields[2])
+				if ierr != nil || cerr != nil || index < 0 || index >= len(probes) {
+					continue
+				}
+				mu.Lock()
+				seen[index], results[index] = true, code == 0
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	var failed []string
+	for index, probe := range probes {
+		if !seen[index] {
+			complete = false
+			continue
+		}
+		if !results[index] {
+			failed = append(failed, fmt.Sprintf("%s cannot reach %s at %s over IPv6",
+				probe.src.Name, probe.dst.Name, probe.addr))
+		}
+	}
+	sort.Strings(failed)
+	return failed, complete
 }
 
 // sortedInts returns the keys of a set in order.

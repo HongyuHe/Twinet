@@ -1608,13 +1608,13 @@ func checkECMP(ctx context.Context, env *Env) Result {
 		if read[router] {
 			return nextHops[router], nil
 		}
-		var routes ospfRouteJSON
-		if err := env.VtyshJSON(ctx, router, "show ip route json", &routes); err != nil {
+		state, err := env.RouterState(ctx, router, netstate.QueryKernel)
+		if err != nil {
 			return nil, err
 		}
 		var hops []installedHop
-		for _, e := range routes[target] {
-			if !e.Selected && !e.Installed {
+		for _, route := range state.Kernel.Routes {
+			if route.Prefix != target || (!route.Selected && !route.Installed) {
 				continue
 			}
 			// The protocol is what the question is about.
@@ -1624,15 +1624,15 @@ func checkECMP(ctx context.Context, env *Env) Result {
 			// for equal-cost paths produced by OSPF costs. Hand-installed
 			// routes do not react to a link failing, which is the entire point
 			// of the exercise, and the two were indistinguishable in the mark.
-			if e.Protocol != "" && e.Protocol != "ospf" {
-				other[e.Protocol] = true
+			if route.Protocol != "" && route.Protocol != "ospf" {
+				other[route.Protocol] = true
 				continue
 			}
-			for _, nh := range e.Nexthops {
-				if nh.InterfaceName == "" && nh.IP == "" {
+			for _, nh := range route.NextHops {
+				if nh.Device == "" && nh.Address == "" {
 					continue
 				}
-				hops = append(hops, installedHop{iface: nh.InterfaceName, ip: nh.IP})
+				hops = append(hops, installedHop{iface: nh.Device, ip: nh.Address})
 			}
 		}
 		nextHops[router] = hops

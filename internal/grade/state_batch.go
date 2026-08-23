@@ -33,11 +33,12 @@ type stateBatchExecutor struct {
 }
 
 func newStateBatchExecutor(device *model.Device, query netstate.Query,
+	extra [][]string,
 	batch func(context.Context, string, [][]string) ([]rt.ExecResult, error),
 	fallback netstate.Executor,
 ) *stateBatchExecutor {
 	return &stateBatchExecutor{
-		device: device, query: query, commands: stateCommands(device, query),
+		device: device, query: query, commands: uniqueCommands(append(stateCommands(device, query), extra...)),
 		batch: batch, fallback: fallback, results: map[string]rt.ExecResult{},
 	}
 }

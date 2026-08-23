@@ -60,6 +60,10 @@ type Env struct {
 	// observationBatcher coalesces simultaneous state surveys during snapshot
 	// construction. It is nil for direct/library callers and active checks.
 	observationBatcher *observationBatcher
+	// observationExtras are rubric-specific passive commands folded into the
+	// same per-device state shell, avoiding a second runtime exec for RPKI or
+	// OSPF evidence.
+	observationExtras map[string][][]string
 }
 
 type BatchExecRequest struct {
@@ -147,7 +151,7 @@ func (e *Env) readDeviceState(ctx context.Context, deviceID string, query netsta
 				return e.observationBatcher.run(ctx, "netstate-batch", deviceID, commands)
 			}
 		}
-		executor = newStateBatchExecutor(d, query,
+		executor = newStateBatchExecutor(d, query, e.observationExtras[d.ID],
 			func(ctx context.Context, deviceID string, commands [][]string) ([]rt.ExecResult, error) {
 				return batch(ctx, deviceID, commands)
 			}, fallback)

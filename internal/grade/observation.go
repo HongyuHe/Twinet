@@ -418,15 +418,17 @@ func cloneNetstate(in netstate.State) netstate.State {
 // declarations. It never runs student code while deciding what to inspect.
 type observationPlan struct {
 	state map[string]netstate.Query
+	raw   map[string][][]string
 	ovs   []*model.Device
 	svc   []*model.Device
 }
 
 func buildObservationPlan(r *Rubric, env *Env) observationPlan {
-	out := observationPlan{state: map[string]netstate.Query{}}
+	out := observationPlan{state: map[string]netstate.Query{}, raw: map[string][][]string{}}
 	if r == nil || env == nil || env.Topology == nil {
 		return out
 	}
+	var needRPKI, needOSPFRoutes bool
 	for _, q := range r.Questions {
 		for _, spec := range q.Checks {
 			check, ok := Lookup(spec.Check)
@@ -452,6 +454,12 @@ func buildObservationPlan(r *Rubric, env *Env) observationPlan {
 					if device.Kind == model.KindSwitch {
 						out.ovs = append(out.ovs, device)
 					}
+					switch check.Name {
+					case "rpki.invalid_rejected", "rpki.notfound_preserved":
+						needRPKI = true
+					case "ospf.subnets_advertised", "config.no_forbidden_ospf":
+						needOSPFRoutes = true
+					}
 				}
 			}
 		}
@@ -466,6 +474,23 @@ func buildObservationPlan(r *Rubric, env *Env) observationPlan {
 	}
 	for _, device := range targetAttachedServices(env) {
 		out.svc = append(out.svc, device)
+	}
+	for _, router := range env.Routers() {
+		if needRPKI {
+			out.raw[router.ID] = append(out.raw[router.ID],
+				[]string{"vtysh", "-c", "show rpki cache-connection"},
+				[]string{"vtysh", "-c", "show rpki prefix-table"},
+				[]string{"vtysh", "-c", "show bgp ipv4 unicast rpki invalid"},
+				[]string{"vtysh", "-c", "show bgp ipv4 unicast rpki valid"},
+			)
+		}
+		if needOSPFRoutes {
+			out.raw[router.ID] = append(out.raw[router.ID],
+				[]string{"vtysh", "-c", "show ip ospf route json"},
+				[]string{"vtysh", "-c", "show ip ospf interface json"},
+				[]string{"vtysh", "-c", "show ip route vrf all ospf json"},
+			)
+		}
 	}
 	out.ovs = uniqueDevices(out.ovs)
 	out.svc = uniqueDevices(out.svc)
@@ -623,6 +648,7 @@ func collectObservationSnapshot(ctx context.Context, r *Rubric, env *Env, parall
 	batcher := newObservationBatcher(ctx, snapshot, observed.BatchExec)
 	observed.observationBatcher = batcher
 	plan := buildObservationPlan(r, &observed)
+	observed.observationExtras = plan.raw
 
 	type task struct {
 		name string
@@ -633,6 +659,15 @@ func collectObservationSnapshot(ctx context.Context, r *Rubric, env *Env, parall
 		deviceID, query := deviceID, query
 		tasks = append(tasks, task{name: "netstate/" + deviceID, run: func() {
 			_, _ = observed.DeviceState(ctx, deviceID, query)
+		}})
+	}
+	for deviceID, commands := range plan.raw {
+		if _, covered := plan.state[deviceID]; covered {
+			continue // folded into the device's state batch above
+		}
+		deviceID, commands := deviceID, commands
+		tasks = append(tasks, task{name: "rubric/" + deviceID, run: func() {
+			_, _ = runObservationBatch(ctx, snapshot, batcher, "rubric-batch", deviceID, commands)
 		}})
 	}
 	for _, device := range plan.ovs {
