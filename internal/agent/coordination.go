@@ -988,6 +988,73 @@ func (s *Server) releaseOverlayClaims(lab string, vnis []uint32) error {
 	return nil
 }
 
+// finishDestroyedLab removes every durable coordination record that could
+// make an empty lab look like a committed deployment. Runtime and topology
+// cleanup happen first; this is the terminal, fenced commit for destroy.
+func (s *Server) finishDestroyedLab(lab string, fence Fence) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initCoordination()
+	if err := s.fenceErrorLocked(lab, fence, s.nowTime()); err != nil {
+		return err
+	}
+
+	generation, hadGeneration := s.generations[lab]
+	tx, hadTransaction := s.transactions[lab]
+	inventory, hadInventory := s.inventories[lab]
+	lineage, hadLineage := s.overlayLineage[lab]
+	claims := map[uint32]overlayClaim{}
+	for vni, claim := range s.overlayClaims {
+		if claim.Lab == lab {
+			claims[vni] = claim
+			delete(s.overlayClaims, vni)
+		}
+	}
+	delete(s.generations, lab)
+	delete(s.transactions, lab)
+	delete(s.inventories, lab)
+	delete(s.overlayLineage, lab)
+	if err := s.saveCoordinationLocked(); err != nil {
+		if hadGeneration {
+			s.generations[lab] = generation
+		}
+		if hadTransaction {
+			s.transactions[lab] = tx
+		}
+		if hadInventory {
+			s.inventories[lab] = inventory
+		}
+		if hadLineage {
+			s.overlayLineage[lab] = lineage
+		}
+		for vni, claim := range claims {
+			s.overlayClaims[vni] = claim
+		}
+		return fmt.Errorf("persisting destroyed lab coordination: %w", err)
+	}
+
+	delete(s.current, lab)
+	delete(s.modes, lab)
+	delete(s.ungraded, lab)
+	delete(s.peers, lab)
+	for key := range s.repairFails {
+		if strings.HasPrefix(key, lab+"|") {
+			delete(s.repairFails, key)
+		}
+	}
+	for key := range s.repairNext {
+		if strings.HasPrefix(key, lab+"|") {
+			delete(s.repairNext, key)
+		}
+	}
+	for key := range s.partial {
+		if strings.HasPrefix(key, lab+"|") {
+			delete(s.partial, key)
+		}
+	}
+	return nil
+}
+
 func (s *Server) prepareGeneration(lab string, fence Fence, expected, generation string,
 	requested json.RawMessage, mode string, ungraded int, peers map[string]string, prune bool,
 	onlySteps []string, stateProofs []StateProof, prestate ...transactionInventory,

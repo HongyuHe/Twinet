@@ -668,7 +668,7 @@ func recognizablePartialPair(h *netlink.Handle, link netlink.Link, alias string)
 		if !matches("twbp", typed.Attrs().Name) {
 			return false
 		}
-		links, err := h.LinkList()
+		links, err := listHandleLinks(h)
 		if err != nil {
 			return false
 		}
@@ -702,7 +702,7 @@ func recognizablePartialPair(h *netlink.Handle, link netlink.Link, alias string)
 		if bridge.Attrs().Alias != "" && bridge.Attrs().Alias != alias {
 			return false
 		}
-		links, err := h.LinkList()
+		links, err := listHandleLinks(h)
 		if err != nil {
 			return false
 		}
@@ -725,7 +725,7 @@ func multiplexLinkActive(h *netlink.Handle, link netlink.Link) (bool, error) {
 		if err != nil || active || typed.Attrs().MasterIndex == 0 {
 			return active, err
 		}
-		links, err := h.LinkList()
+		links, err := listHandleLinks(h)
 		if err != nil {
 			return false, fmt.Errorf("list host interfaces: %w", err)
 		}
@@ -737,7 +737,7 @@ func multiplexLinkActive(h *netlink.Handle, link netlink.Link) (bool, error) {
 		}
 		return false, nil
 	case *netlink.Bridge:
-		links, err := h.LinkList()
+		links, err := listHandleLinks(h)
 		if err != nil {
 			return false, fmt.Errorf("list host interfaces: %w", err)
 		}
@@ -785,7 +785,7 @@ func multiplexPairActive(h *netlink.Handle, bridge *netlink.Bridge, vxlan *netli
 	if active, err := vxlanHasActiveBindings(vxlan); err != nil || active {
 		return active, err
 	}
-	links, err := h.LinkList()
+	links, err := listHandleLinks(h)
 	if err != nil {
 		return false, fmt.Errorf("list host interfaces: %w", err)
 	}
@@ -1229,7 +1229,7 @@ type multiplexDevice struct {
 }
 
 func multiplexDevices(h *netlink.Handle, lab string) ([]multiplexDevice, error) {
-	links, err := h.LinkList()
+	links, err := listHandleLinks(h)
 	if err != nil {
 		return nil, fmt.Errorf("list host interfaces: %w", err)
 	}
@@ -1481,7 +1481,7 @@ func cleanupEmptyMultiplexDevice(h *netlink.Handle, device multiplexDevice) erro
 		}
 		return nil
 	}
-	links, err := h.LinkList()
+	links, err := listHandleLinks(h)
 	if err != nil {
 		return fmt.Errorf("list host interfaces: %w", err)
 	}
@@ -1553,7 +1553,7 @@ func RemoveEmptyMultiplexOverlays(lab string) ([]string, error) {
 }
 
 func removeOrphanMultiplexBridges(h *netlink.Handle, lab string) ([]string, error) {
-	links, err := h.LinkList()
+	links, err := listHandleLinks(h)
 	if err != nil {
 		return nil, fmt.Errorf("list host interfaces: %w", err)
 	}
@@ -1581,7 +1581,7 @@ func removeOrphanMultiplexBridges(h *netlink.Handle, lab string) ([]string, erro
 			unlock()
 			continue
 		}
-		currentLinks, err := h.LinkList()
+		currentLinks, err := listHandleLinks(h)
 		if err != nil {
 			unlock()
 			return removed, fmt.Errorf("list host interfaces: %w", err)

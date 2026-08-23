@@ -92,11 +92,19 @@ type Config struct {
 	GCInterval time.Duration
 	// EventCapacity bounds in-memory and persisted node event history.
 	EventCapacity int
+	// WorkLimits optionally overrides host-sized node-wide backpressure.
+	// Non-positive fields retain limiter.DefaultConfig.
+	WorkLimits limiter.Config
+	// RecoveryMaxTimeout caps workload-derived rollback transactions. Zero
+	// uses the two-hour default; values above the hard two-hour client/server
+	// contract are clamped.
+	RecoveryMaxTimeout time.Duration
 }
 
 // Main is the agent entry point.
 func Main(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("twinetd", flag.ContinueOnError)
+	defaultLimits := limiter.DefaultConfig()
 	var (
 		node        = fs.String("node", hostShortName(), "this node's name, as used in the manifest")
 		listen      = fs.String("listen", ":7200", "address to serve the agent API on")
@@ -125,6 +133,22 @@ func Main(ctx context.Context, args []string) error {
 			"how often to scan safely collectible abandoned objects")
 		eventCapacity = fs.Int("event-capacity", defaultEventCapacity,
 			"maximum structured events retained locally")
+		applyLimit = fs.Int("limit-apply", defaultLimits.Apply,
+			"node-wide apply concurrency (default up to 48 on large hosts)")
+		lifecycleLimit = fs.Int("limit-lifecycle", defaultLimits.Lifecycle,
+			"node-wide container lifecycle concurrency (default up to 48 on large hosts)")
+		execProbeLimit = fs.Int("limit-exec-probe", defaultLimits.ExecProbe,
+			"node-wide exec and probe concurrency")
+		netlinkLimit = fs.Int("limit-netlink", defaultLimits.Netlink,
+			"node-wide netlink mutation concurrency")
+		imagePullLimit = fs.Int("limit-image-pull", defaultLimits.ImagePull,
+			"node-wide image pull concurrency")
+		captureLimit = fs.Int("limit-capture", defaultLimits.Capture,
+			"node-wide state capture concurrency")
+		convergenceLimit = fs.Int("limit-convergence", defaultLimits.Convergence,
+			"node-wide routing convergence concurrency")
+		recoveryMaxTimeout = fs.Duration("recovery-max-timeout", MaximumRecoveryTotalTimeout,
+			"maximum workload-derived recovery duration (hard cap 2h)")
 		verbose = fs.Bool("verbose", false, "debug logging")
 		version = fs.Bool("version", false, "print the version and exit")
 	)
@@ -163,6 +187,12 @@ func Main(ctx context.Context, args []string) error {
 		TLSCert: *cert, TLSKey: *key, ClientCA: *cacert, GCGrace: *gcGrace,
 		PeerTLSCert: *peerCert, PeerTLSKey: *peerKey, LegacyPeerCertUntil: peerMigrationUntil,
 		GCInterval: *gcInterval, EventCapacity: *eventCapacity,
+		WorkLimits: limiter.Config{
+			Apply: *applyLimit, Lifecycle: *lifecycleLimit, ExecProbe: *execProbeLimit,
+			Netlink: *netlinkLimit, ImagePull: *imagePullLimit, Capture: *captureLimit,
+			Convergence: *convergenceLimit,
+		},
+		RecoveryMaxTimeout: *recoveryMaxTimeout,
 	})
 	if err != nil {
 		return err
@@ -271,6 +301,7 @@ type Server struct {
 	recoveryTotalTimeout     time.Duration
 	recoveryLeaseTTL         time.Duration
 	recoveryStatusTimeout    time.Duration
+	recoveryHeartbeat        time.Duration
 	opSequence               uint64
 
 	// holds are labs an external operation has asked this node to leave alone.
@@ -310,7 +341,7 @@ func (s *Server) workLimiter() *limiter.Limiter {
 	s.workMu.Lock()
 	defer s.workMu.Unlock()
 	if s.work == nil {
-		s.work = limiter.New(limiter.DefaultConfig())
+		s.work = limiter.New(limiter.WithDefaults(s.cfg.WorkLimits))
 	}
 	return s.work
 }
@@ -495,9 +526,9 @@ func (s *Server) acquire(lab, kind string) error {
 }
 
 // acquireOperation records a cancellable local operation. Recovery may
-// preempt only reconciliation: a persisted rollback is stronger authority than
-// opportunistic repair, and the returned ID prevents the canceled repair from
-// deleting the recovery lease while it unwinds.
+// preempt apply or reconciliation, but must wait for its done channel before
+// publishing a new owner. The returned ID prevents an old goroutine from
+// deleting a newer operation while it unwinds.
 func (s *Server) acquireOperation(lab, kind string, cancel context.CancelFunc) (uint64, chan struct{}, error) {
 	if lab == "" {
 		return 0, nil, errors.New("an operation must name the lab it acts on")
@@ -522,61 +553,64 @@ func (s *Server) acquireOperation(lab, kind string, cancel context.CancelFunc) (
 }
 
 // acquireRecoveryOperation gives durable recovery priority over cancellable
-// reconciliation, and permits a newer fence to cancel only a recovery whose
-// persisted deadline has expired. Its ID prevents an old goroutine from
-// deleting a newer operation's lease while it unwinds.
-func (s *Server) acquireRecoveryOperation(lab string, deadline time.Time,
+// apply/reconciliation work, and permits a newer fence to cancel only a
+// recovery whose persisted deadline has expired. It does not publish the new
+// recovery owner until the previous operation has fully unwound.
+func (s *Server) acquireRecoveryOperation(ctx context.Context, lab string, deadline time.Time,
 	cancel context.CancelFunc, takeover bool,
-) (uint64, error) {
+) (uint64, chan struct{}, error) {
 	if lab == "" {
-		return 0, errors.New("a recovery must name the lab it acts on")
+		return 0, nil, errors.New("a recovery must name the lab it acts on")
 	}
-	s.mu.Lock()
-	if s.ops == nil {
-		s.ops = map[string]*lease{}
-	}
-	var reconcileDone chan struct{}
-	if held := s.ops[lab]; held != nil {
-		if held.kind == "reconcile" && held.cancel != nil {
-			held.cancel()
-			reconcileDone = held.done
-			delete(s.ops, lab)
-		} else {
-			stale := held.kind == "recovery" && !held.deadline.IsZero() && !s.nowTime().Before(held.deadline)
-			if !stale || !takeover {
-				s.mu.Unlock()
-				return 0, fmt.Errorf("another operation is already running on lab %q: %s, started %s ago",
-					lab, held.kind, s.nowTime().Sub(held.at).Round(time.Second))
-			}
-			if held.cancel != nil {
-				held.cancel()
-			}
-			delete(s.ops, lab)
+	for {
+		s.mu.Lock()
+		if s.ops == nil {
+			s.ops = map[string]*lease{}
 		}
-	}
-	s.opSequence++
-	id := s.opSequence
-	s.ops[lab] = &lease{id: id, kind: "recovery", at: s.nowTime(), deadline: deadline, cancel: cancel}
-	s.mu.Unlock()
-	if reconcileDone != nil {
-		timer := time.NewTimer(recoveryReconcileHandoffTimeout)
-		defer timer.Stop()
+		held := s.ops[lab]
+		if held == nil {
+			s.opSequence++
+			id := s.opSequence
+			done := make(chan struct{})
+			s.ops[lab] = &lease{
+				id: id, kind: "recovery", at: s.nowTime(), deadline: deadline,
+				cancel: cancel, done: done,
+			}
+			s.mu.Unlock()
+			return id, done, nil
+		}
+		staleRecovery := held.kind == "recovery" && !held.deadline.IsZero() &&
+			!s.nowTime().Before(held.deadline)
+		preemptible := held.cancel != nil && held.done != nil &&
+			(held.kind == "reconcile" || held.kind == "apply" || (staleRecovery && takeover))
+		if !preemptible {
+			s.mu.Unlock()
+			return 0, nil, fmt.Errorf("another operation is already running on lab %q: %s, started %s ago",
+				lab, held.kind, s.nowTime().Sub(held.at).Round(time.Second))
+		}
+		held.cancel()
+		done := held.done
+		kind := held.kind
+		s.mu.Unlock()
+
 		select {
-		case <-reconcileDone:
-		case <-timer.C:
-			s.releaseRecoveryOperation(lab, id)
-			return 0, fmt.Errorf("reconcile did not yield to durable recovery within %s",
-				recoveryReconcileHandoffTimeout)
+		case <-done:
+			// Recheck under the lock. Another caller may have acquired the
+			// lab after the old owner released it.
+		case <-ctx.Done():
+			return 0, nil, fmt.Errorf("%s did not yield to durable recovery: %w", kind, ctx.Err())
 		}
 	}
-	return id, nil
 }
 
-func (s *Server) releaseRecoveryOperation(lab string, id uint64) {
+func (s *Server) releaseRecoveryOperation(lab string, id uint64, done chan struct{}) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if held := s.ops[lab]; held != nil && held.id == id {
 		delete(s.ops, lab)
+	}
+	s.mu.Unlock()
+	if done != nil {
+		close(done)
 	}
 }
 
@@ -1292,7 +1326,8 @@ func (s *Server) handleContainers(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, visible)
 }
 
-// ApplyRequest carries the slice of a topology this node is responsible for.
+// ApplyRequest carries the complete topology plus an explicit witness of the
+// subset this node is responsible for.
 type ApplyRequest struct {
 	// ControllerVersion is the exact source build that requested the mutation.
 	// It is audit provenance only; Compatibility is checked by the client
@@ -1310,6 +1345,14 @@ type ApplyRequest struct {
 	// Lab is used by commit and abort, whose request need not repeat a large
 	// topology payload.
 	Lab string `json:"lab,omitempty"`
+	// TargetNode and AssignedDevices are the controller's explicit placement
+	// witness for this request. New agents reject a payload whose serialized
+	// Device.Node fields disagree, rather than silently applying another
+	// node's subset. AssignmentKnown distinguishes an intentional empty subset
+	// from requests made by older controllers.
+	TargetNode      string   `json:"target_node,omitempty"`
+	AssignedDevices []string `json:"assigned_devices,omitempty"`
+	AssignmentKnown bool     `json:"assignment_known,omitempty"`
 	// ExpectedGeneration is the compare-and-swap value observed before
 	// prepare. Generation is committed only after every node applied.
 	ExpectedGeneration string `json:"expected_generation,omitempty"`
@@ -1418,6 +1461,10 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, fmt.Errorf("rehydrate topology: %w", err))
 		return
 	}
+	if err := validateApplyAssignment(req, top, s.cfg.Node); err != nil {
+		httpError(w, http.StatusConflict, err)
+		return
+	}
 	if !req.DryRun && req.Phase == "apply" {
 		s.auditDevelopmentHardeningOverrides(r, top, req.Generation, req.Fence.Generation)
 	}
@@ -1453,11 +1500,17 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 				"lab", top.Name, "generation", req.Generation, "node", s.cfg.Node)
 		}
 	}
-	if err := s.acquire(top.Name, "apply"); err != nil {
+	operationCtx, cancelOperation := context.WithCancel(r.Context())
+	opID, opDone, err := s.acquireOperation(top.Name, "apply", cancelOperation)
+	if err != nil {
+		cancelOperation()
 		httpError(w, http.StatusConflict, err)
 		return
 	}
-	defer s.release(top.Name)
+	defer func() {
+		cancelOperation()
+		s.releaseOperation(top.Name, opID, opDone)
+	}()
 
 	requestedMode, modeErr := requiredTransactionMode(req.Mode)
 	if modeErr != nil {
@@ -1470,6 +1523,10 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 	if !req.DryRun && req.Phase == "apply" {
 		tx, err := s.transactionForApply(top.Name, req.Fence, req.Generation)
 		if err != nil {
+			httpError(w, http.StatusConflict, err)
+			return
+		}
+		if err := validatePreparedPlacement(tx, top); err != nil {
 			httpError(w, http.StatusConflict, err)
 			return
 		}
@@ -1537,7 +1594,7 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	p, err := eng.BuildContext(r.Context(), top)
+	p, err := eng.BuildContext(operationCtx, top)
 	if err != nil {
 		httpError(w, http.StatusBadRequest, err)
 		return
@@ -1562,7 +1619,7 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	execCtx := r.Context()
+	execCtx := operationCtx
 	stopFence := func() {}
 	if req.Phase == "apply" {
 		execCtx, stopFence = s.fencedContext(execCtx, top.Name, req.Fence)
@@ -1588,7 +1645,7 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 	}
 	imageDigests := map[string]string(nil)
 	if !req.DryRun {
-		imageDigests, err = s.pulledImageDigests(r.Context(), top)
+		imageDigests, err = s.pulledImageDigests(operationCtx, top)
 		if err != nil {
 			if req.Phase == "apply" {
 				_ = s.markTransactionPhase(top.Name, req.Fence, req.Generation,
@@ -1851,6 +1908,10 @@ type DestroyRequest struct {
 	// a later lab of the same name starts from the manifest and not from
 	// whatever the previous run happened to leave behind.
 	Ephemeral bool `json:"ephemeral,omitempty"`
+	// WorkItems is a controller-side timeout hint derived from observed or
+	// expected inventory. The agent never trusts it for authorization or
+	// correctness.
+	WorkItems int `json:"work_items,omitempty"`
 }
 
 // DestroyResponse reports what was removed and what could not be.
@@ -2036,24 +2097,23 @@ func (s *Server) destroyLab(w http.ResponseWriter, r *http.Request,
 	if s.store != nil {
 		if req.Ephemeral {
 			if err := s.store.Forget(req.Lab); err != nil {
-				slog.Warn("discarding ephemeral lab state", "lab", req.Lab, "err", err)
+				problems = append(problems, fmt.Sprintf("%s: discard ephemeral lab state: %v",
+					s.cfg.Node, err))
 			}
 		} else if err := s.store.ForgetTopology(req.Lab); err != nil {
 			// The snapshots of student work are kept; only the record that
 			// this node hosts the lab is dropped, or a restart would resurrect
 			// a lab that no longer exists.
-			slog.Warn("clearing the lab's topology record", "lab", req.Lab, "err", err)
+			problems = append(problems, fmt.Sprintf("%s: clear lab topology record: %v",
+				s.cfg.Node, err))
 		}
 	}
-	s.mu.Lock()
-	delete(s.current, req.Lab)
-	s.mu.Unlock()
 	status := "destroyed"
 	if len(problems) > 0 {
 		status = "incomplete"
-	} else if err := s.releaseOverlayClaims(req.Lab, nil); err != nil {
+	} else if err := s.finishDestroyedLab(req.Lab, req.Fence); err != nil {
 		status = "incomplete"
-		problems = append(problems, fmt.Sprintf("%s: could not release overlay claims: %v",
+		problems = append(problems, fmt.Sprintf("%s: could not commit empty destroyed state: %v",
 			s.cfg.Node, err))
 	}
 	result := "success"

@@ -136,7 +136,7 @@ func InspectOverlayInventory(lab string) (OverlayInventory, error) {
 		}
 	}
 
-	links, err := h.LinkList()
+	links, err := listHandleLinks(h)
 	if err != nil {
 		return OverlayInventory{}, fmt.Errorf("list host interfaces: %w", err)
 	}

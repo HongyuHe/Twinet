@@ -143,6 +143,15 @@ limit.
 - Schedule grading harnesses from available capacity rather than a fixed
   concurrency number.
 
+`twinetd` sizes those shared budgets from host CPU count and exposes
+`-limit-apply`, `-limit-lifecycle`, `-limit-exec-probe`, `-limit-netlink`,
+`-limit-image-pull`, `-limit-capture`, and `-limit-convergence` overrides.
+The lifecycle ceiling is 48 on large hosts: the 84-AS trace saturated 16
+workers for 16k-24k aggregate queue seconds while using only 23 of 56 CPUs;
+the matching apply ceiling lets that lifecycle fan-out run while the narrower
+netlink, image-pull, capture, and convergence limits retain subsystem
+backpressure.
+
 **Shipped admission contract.** `cpus`, `memory`, and `pids` are container
 limits; `requests` are independent scheduler reservations for CPU, memory,
 PIDs, ephemeral storage, file descriptors, and netdevs. Agents report
@@ -559,6 +568,10 @@ declared Kubernetes delegation. Every native fault injects, manifests,
 verifies, resolves, and restores its baseline. NIKA runs unchanged scenarios
 for every substrate and agrees with its reference backend. One hundred
 concurrent mixed-substrate episodes remain isolated and reset cleanly.
+The delegated Kubernetes gate uses a marked disposable multi-node cluster and
+checks the same worker-scoped node filters, `NotReady` transition, stale-work
+behavior, healthy surviving workload, and per-node ClusterIP contrast as
+NIKA's reference implementations before accepting restoration.
 
 ## 5. Implementation order
 

@@ -73,8 +73,17 @@ type Node struct {
 	tls *tls.Config
 	// cfgErr is a credential that could not be loaded, surfaced on first use
 	// rather than swallowed at construction.
-	cfgErr error
+	cfgErr         error
+	requestTimeout time.Duration
 }
+
+const (
+	defaultNodeRequestTimeout = 2 * time.Minute
+	mutationRequestBase       = 10 * time.Minute
+	mutationRequestPerBatch   = 2 * time.Minute
+	maxMutationRequestTimeout = agent.MaximumRecoveryTotalTimeout
+	mutationRequestWorkers    = 48
+)
 
 // TLS carries the client's mutual-TLS material.
 type TLS struct {
@@ -135,17 +144,29 @@ func NewNodeTLS(name, addr, token string, t TLS) *Node {
 	}
 	return &Node{
 		Name: name, Addr: strings.TrimRight(addr, "/"), Token: token,
-		tls: streamCfg, cfgErr: cfgErr,
-		http: &http.Client{
-			Timeout:   30 * time.Minute, // a large apply legitimately takes a while
-			Transport: tr,
-		},
+		tls: streamCfg, cfgErr: cfgErr, requestTimeout: defaultNodeRequestTimeout,
+		http: &http.Client{Transport: tr},
 	}
 }
 
 func (n *Node) do(ctx context.Context, method, path string, body, out any) error {
+	timeout := n.requestTimeout
+	if timeout <= 0 {
+		timeout = defaultNodeRequestTimeout
+	}
+	return n.doWithTimeout(ctx, method, path, body, out, timeout)
+}
+
+func (n *Node) doWithTimeout(ctx context.Context, method, path string, body, out any,
+	timeout time.Duration,
+) error {
 	if n.cfgErr != nil {
 		return fmt.Errorf("node %s: %w", n.Name, n.cfgErr)
+	}
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
 	}
 	var rdr io.Reader
 	if body != nil {
@@ -188,6 +209,32 @@ func (n *Node) do(ctx context.Context, method, path string, body, out any) error
 		return nil
 	}
 	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+func workloadRequestTimeout(items, workers int) time.Duration {
+	if workers <= 0 {
+		workers = mutationRequestWorkers
+	}
+	if workers > mutationRequestWorkers {
+		workers = mutationRequestWorkers
+	}
+	if items < 1 {
+		items = 1
+	}
+	timeout := mutationRequestBase +
+		time.Duration((items+workers-1)/workers)*mutationRequestPerBatch
+	if timeout > maxMutationRequestTimeout {
+		return maxMutationRequestTimeout
+	}
+	return timeout
+}
+
+func applyRequestTimeout(req agent.ApplyRequest) time.Duration {
+	items := len(req.AssignedDevices)
+	if !req.AssignmentKnown && req.Topology != nil {
+		items = len(req.Topology.Devices)
+	}
+	return workloadRequestTimeout(items, req.Workers)
 }
 
 // Status queries the agent.
@@ -326,7 +373,8 @@ func (n *Node) WatchEvents(ctx context.Context, lab string, after uint64) (<-cha
 // Apply asks the node to converge its slice of the topology.
 func (n *Node) Apply(ctx context.Context, req agent.ApplyRequest) (agent.ApplyResponse, error) {
 	var resp agent.ApplyResponse
-	err := n.do(ctx, http.MethodPost, "/v1/apply", req, &resp)
+	err := n.doWithTimeout(ctx, http.MethodPost, "/v1/apply", req, &resp,
+		applyRequestTimeout(req))
 	return resp, err
 }
 
@@ -364,7 +412,8 @@ func (n *Node) DestroyEphemeral(ctx context.Context, lab string, vnis []uint32) 
 // to be gone.
 func (n *Node) destroy(ctx context.Context, req agent.DestroyRequest) error {
 	var resp agent.DestroyResponse
-	if err := n.do(ctx, http.MethodPost, "/v1/destroy", req, &resp); err != nil {
+	if err := n.doWithTimeout(ctx, http.MethodPost, "/v1/destroy", req, &resp,
+		workloadRequestTimeout(req.WorkItems, mutationRequestWorkers)); err != nil {
 		return err
 	}
 	if len(resp.Problems) > 0 {
@@ -1019,10 +1068,7 @@ func (c *Cluster) unfencedApply(ctx context.Context, top *model.Topology,
 		}
 	}
 	return fanOut(ctx, c.Nodes, func(ctx context.Context, n *Node) (agent.ApplyResponse, error) {
-		r := req
-		r.Topology = wire
-		r.PeerUnderlay = peers
-		r.Phase = ""
+		r := applyRequestForNode(req, wire, peers, nil, n.Name, "", "", req.Generation)
 		return n.Apply(ctx, r)
 	})
 }

@@ -7,11 +7,12 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"slices"
+	"sort"
 	"time"
 
 	"github.com/HongyuHe/twinet/internal/deploy"
 	"github.com/HongyuHe/twinet/internal/model"
-	"github.com/HongyuHe/twinet/internal/netx"
 	"github.com/HongyuHe/twinet/internal/plan"
 	"github.com/HongyuHe/twinet/internal/render"
 )
@@ -66,6 +67,10 @@ func (s *Server) handleApplyPrepare(w http.ResponseWriter, r *http.Request, req 
 	top, err := req.Topology.Rehydrate()
 	if err != nil {
 		httpError(w, http.StatusBadRequest, fmt.Errorf("rehydrate topology: %w", err))
+		return
+	}
+	if err := validateApplyAssignment(req, top, s.cfg.Node); err != nil {
+		httpError(w, http.StatusConflict, err)
 		return
 	}
 	if req.Lab != "" && req.Lab != top.Name {
@@ -254,6 +259,10 @@ func (s *Server) handleApplyCommit(w http.ResponseWriter, r *http.Request, req A
 	top, err := wire.Rehydrate()
 	if err != nil {
 		httpError(w, http.StatusInternalServerError, fmt.Errorf("rehydrate prepared topology: %w", err))
+		return
+	}
+	if err := validateApplyAssignment(req, top, s.cfg.Node); err != nil {
+		httpError(w, http.StatusConflict, err)
 		return
 	}
 	if top.Name != lab {
@@ -574,6 +583,53 @@ func overlayVNIsOnNode(top *model.Topology, node string) []uint32 {
 	return out
 }
 
+func validateApplyAssignment(req ApplyRequest, top *model.Topology, node string) error {
+	if !req.AssignmentKnown {
+		return nil
+	}
+	if req.TargetNode != node {
+		return fmt.Errorf("apply placement target %q reached agent %q", req.TargetNode, node)
+	}
+	got := make([]string, 0)
+	for _, device := range top.DevicesOnNode(node) {
+		got = append(got, device.ID)
+	}
+	want := append([]string(nil), req.AssignedDevices...)
+	sort.Strings(got)
+	sort.Strings(want)
+	if !slices.Equal(got, want) {
+		return fmt.Errorf("apply placement for node %q contains devices %v, controller assigned %v",
+			node, got, want)
+	}
+	return nil
+}
+
+func validatePreparedPlacement(tx applyTransaction, top *model.Topology) error {
+	var prepared Wire
+	if err := json.Unmarshal(tx.Requested, &prepared); err != nil {
+		return fmt.Errorf("decode prepared topology placement: %w", err)
+	}
+	want := make(map[string]string, len(prepared.Devices))
+	for _, device := range prepared.Devices {
+		want[device.ID] = device.Node
+	}
+	if len(want) != len(top.Devices) {
+		return fmt.Errorf("apply topology has %d devices, prepared placement has %d",
+			len(top.Devices), len(want))
+	}
+	for id, device := range top.Devices {
+		node, ok := want[id]
+		if !ok {
+			return fmt.Errorf("apply topology device %q was not in the prepared placement", id)
+		}
+		if device.Node != node {
+			return fmt.Errorf("apply topology moved device %q from prepared node %q to %q",
+				id, node, device.Node)
+		}
+	}
+	return nil
+}
+
 func (s *Server) handleApplyAbort(w http.ResponseWriter, r *http.Request, req ApplyRequest) {
 	lab := req.Lab
 	if lab == "" && req.Topology != nil {
@@ -595,15 +651,18 @@ func (s *Server) rollbackPreparedApply(ctx context.Context, lab string, fence Fe
 	tx applyTransaction,
 ) error {
 	if len(tx.Previous) == 0 {
-		eng := &deploy.Engine{Runtime: s.rt, Node: s.cfg.Node, State: s.store, Limiter: s.workLimiter()}
+		eng := &deploy.Engine{
+			Runtime: s.rt, Node: s.cfg.Node, State: s.store, Limiter: s.workLimiter(),
+			Workers: s.recoveryWorkerCount(),
+		}
 		if err := eng.Destroy(ctx, lab); err != nil {
 			return fmt.Errorf("removing partially applied lab %q: %w", lab, err)
 		}
-		owned, err := netx.ListOverlaysOfLab(lab)
+		owned, err := s.recoveryOverlayList(lab)
 		if err != nil {
 			return fmt.Errorf("listing partially applied overlays: %w", err)
 		}
-		if err := eng.DestroyOverlays(owned); err != nil {
+		if err := eng.DestroyOverlaysContext(ctx, owned); err != nil {
 			return fmt.Errorf("removing partially applied overlays: %w", err)
 		}
 		if err := s.releaseOverlayClaims(lab, nil); err != nil {

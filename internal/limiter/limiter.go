@@ -41,16 +41,52 @@ type Config struct {
 // DefaultConfig is conservative enough for a node that hosts multiple labs,
 // rather than assuming one controller owns every worker on the machine.
 func DefaultConfig() Config {
-	n := runtime.NumCPU()
+	return defaultConfig(runtime.NumCPU())
+}
+
+func defaultConfig(n int) Config {
 	return Config{
-		Apply:       bounded(n*2, 4, 32),
-		Lifecycle:   bounded(n*2, 4, 16),
+		// The 84-AS trace saturated 16 lifecycle slots for 16k-24k aggregate
+		// queue seconds while a 56-core node used only 23 CPUs. A ceiling of
+		// 48 keeps work below the host CPU count there; the narrower netlink,
+		// image, capture, and convergence budgets retain subsystem backpressure.
+		Apply:       bounded(n*2, 4, 48),
+		Lifecycle:   bounded(n*2, 8, 48),
 		ExecProbe:   bounded(n*4, 8, 48),
 		Netlink:     bounded(n, 2, 12),
 		ImagePull:   2,
 		Capture:     bounded(n, 2, 8),
 		Convergence: bounded(n, 2, 8),
 	}
+}
+
+// WithDefaults fills non-positive fields from the host-sized defaults. Agent
+// flags can therefore tune one pressure class without accidentally reducing
+// every unspecified class to New's fail-safe limit of one.
+func WithDefaults(cfg Config) Config {
+	defaults := DefaultConfig()
+	if cfg.Apply <= 0 {
+		cfg.Apply = defaults.Apply
+	}
+	if cfg.Lifecycle <= 0 {
+		cfg.Lifecycle = defaults.Lifecycle
+	}
+	if cfg.ExecProbe <= 0 {
+		cfg.ExecProbe = defaults.ExecProbe
+	}
+	if cfg.Netlink <= 0 {
+		cfg.Netlink = defaults.Netlink
+	}
+	if cfg.ImagePull <= 0 {
+		cfg.ImagePull = defaults.ImagePull
+	}
+	if cfg.Capture <= 0 {
+		cfg.Capture = defaults.Capture
+	}
+	if cfg.Convergence <= 0 {
+		cfg.Convergence = defaults.Convergence
+	}
+	return cfg
 }
 
 func bounded(value, low, high int) int {

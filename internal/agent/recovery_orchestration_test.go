@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -145,31 +146,52 @@ func TestRecoveryOperationTakeoverDoesNotReleaseNewLease(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	s.now = func() time.Time { return now }
 	cancelled := make(chan struct{})
-	first, err := s.acquireRecoveryOperation("lab", now.Add(-time.Second), func() { close(cancelled) }, false)
+	first, firstDone, err := s.acquireRecoveryOperation(
+		context.Background(), "lab", now.Add(-time.Second), func() { close(cancelled) }, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if _, err := s.acquireRecoveryOperation("lab", now.Add(time.Minute), nil, false); err == nil {
+	if _, _, err := s.acquireRecoveryOperation(
+		context.Background(), "lab", now.Add(time.Minute), nil, false); err == nil {
 		t.Fatal("healthy operation was replaced without takeover")
 	}
-	second, err := s.acquireRecoveryOperation("lab", now.Add(time.Minute), nil, true)
-	if err != nil {
-		t.Fatal(err)
-	}
+	secondResult := make(chan struct {
+		id   uint64
+		done chan struct{}
+		err  error
+	}, 1)
+	go func() {
+		id, done, acquireErr := s.acquireRecoveryOperation(
+			context.Background(), "lab", now.Add(time.Minute), nil, true)
+		secondResult <- struct {
+			id   uint64
+			done chan struct{}
+			err  error
+		}{id: id, done: done, err: acquireErr}
+	}()
 	select {
 	case <-cancelled:
 	case <-time.After(time.Second):
 		t.Fatal("stale recovery was not cancelled")
 	}
-	s.releaseRecoveryOperation("lab", first)
+	select {
+	case <-secondResult:
+		t.Fatal("takeover acquired before the stale recovery quiesced")
+	default:
+	}
+	s.releaseRecoveryOperation("lab", first, firstDone)
+	second := <-secondResult
+	if second.err != nil {
+		t.Fatal(second.err)
+	}
 	s.mu.Lock()
 	held := s.ops["lab"]
 	s.mu.Unlock()
-	if held == nil || held.id != second {
+	if held == nil || held.id != second.id {
 		t.Fatal("old recovery release removed the new operation")
 	}
-	s.releaseRecoveryOperation("lab", second)
+	s.releaseRecoveryOperation("lab", second.id, second.done)
 	s.mu.Lock()
 	_, busy := s.ops["lab"]
 	s.mu.Unlock()
@@ -239,6 +261,69 @@ func TestRecoveryProgressSurvivesAgentRestart(t *testing.T) {
 		!status.LastProgressAt.Equal(tx.RecoveryProgress) || !status.Deadline.Equal(tx.RecoveryDeadline) ||
 		!status.TotalDeadline.Equal(tx.RecoveryTotal) {
 		t.Fatalf("restart lost persisted recovery progress: %+v", status)
+	}
+}
+
+func TestRecoveryHeartbeatAdvancesProgressAndTakeoverDeadline(t *testing.T) {
+	s, _ := recoveryServer(t, nil)
+	s.recoveryTotalTimeout = 5 * time.Minute
+	s.recoveryHeartbeat = 10 * time.Millisecond
+	tx := s.transactions["cos461"]
+	tx.Prestate.RuntimeSpecs = make([]transactionRuntimeSpec, 600)
+	s.transactions["cos461"] = tx
+	now := time.Unix(1_700_000_000, 0)
+	var nowMu sync.Mutex
+	s.now = func() time.Time {
+		nowMu.Lock()
+		defer nowMu.Unlock()
+		return now
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	s.recoveryRollback = func(context.Context, string, Fence, applyTransaction) error {
+		close(started)
+		<-release
+		return nil
+	}
+	lease, err := s.acquireMutationLease(LeaseAcquireRequest{Lab: "cos461", Holder: "operator"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.releaseMutationLease(LeaseReleaseRequest{Lab: "cos461", Fence: lease.Fence}) }()
+
+	result := make(chan error, 1)
+	go func() {
+		_, recoverErr := s.recoverTransaction(context.Background(), "cos461", lease.Fence)
+		result <- recoverErr
+	}()
+	<-started
+	s.mu.Lock()
+	firstProgress := s.transactions["cos461"].RecoveryProgress
+	firstDeadline := s.transactions["cos461"].RecoveryDeadline
+	s.mu.Unlock()
+	nowMu.Lock()
+	now = now.Add(20 * time.Second)
+	nowMu.Unlock()
+	deadline := time.Now().Add(100 * time.Millisecond)
+	var nextProgress, nextDeadline time.Time
+	for time.Now().Before(deadline) {
+		s.mu.Lock()
+		nextProgress = s.transactions["cos461"].RecoveryProgress
+		nextDeadline = s.transactions["cos461"].RecoveryDeadline
+		s.mu.Unlock()
+		if nextProgress.After(firstProgress) && nextDeadline.After(firstDeadline) {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if !nextProgress.After(firstProgress) || !nextDeadline.After(firstDeadline) {
+		close(release)
+		t.Fatalf("heartbeat did not advance durable progress: first=%s/%s next=%s/%s",
+			firstProgress, firstDeadline, nextProgress, nextDeadline)
+	}
+	close(release)
+	if err := <-result; err != nil {
+		t.Fatal(err)
 	}
 }
 

@@ -70,23 +70,34 @@ const (
 	recoveryRetryBackoff           = 30 * time.Second
 	defaultRecoveryPhaseTimeout    = 90 * time.Second
 	defaultRecoveryArtifactTimeout = 4 * time.Minute
+	// Scale traces on the 84-AS lab measured about twelve seconds of
+	// create/wire/configure work and under three seconds of pure removal per
+	// item at the deliberately smaller recovery worker width.
+	recoveryPhaseBaseBudget    = 45 * time.Second
+	recoveryRollbackItemBudget = 12 * time.Second
+	recoveryDestroyItemBudget  = 3 * time.Second
+	recoveryVerifyItemBudget   = 4 * time.Second
+	recoveryHeartbeatEvery     = 10 * time.Second
 	// Exact rollback restores primary contracts, sidecars, artifacts,
-	// readiness, and student snapshots one fenced target at a time. A
-	// class-scale node legitimately needs longer than a single controller
-	// lease, while every target remains independently deadline-bounded and
-	// visible to a joining operator.
-	defaultRecoveryTotalTimeout     = 30 * time.Minute
-	forwardRecoverySLAMax           = 9*time.Minute + 30*time.Second
-	defaultRecoveryLeaseTTL         = 90 * time.Second
-	recoveryLeaseRenewEvery         = 15 * time.Second
-	recoveryStatusObserveLimit      = 2 * time.Second
-	recoveryReconcileHandoffTimeout = 5 * time.Second
-	recoveryProgressPersistEvery    = 2 * time.Second
+	// readiness, and student snapshots one fenced target at a time. The
+	// transaction floor covers small labs; large labs sum their phase budgets
+	// up to the configurable cap below.
+	minimumRecoveryTotalTimeout = 30 * time.Minute
+	// MaximumRecoveryTotalTimeout is shared with the controller's recovery
+	// request deadline. The client must never abandon a healthy server-side
+	// recovery before this authoritative cap.
+	MaximumRecoveryTotalTimeout  = 2 * time.Hour
+	recoveryTotalSlack           = time.Minute
+	forwardRecoverySLAMax        = 9*time.Minute + 30*time.Second
+	defaultRecoveryLeaseTTL      = 90 * time.Second
+	recoveryLeaseRenewEvery      = 15 * time.Second
+	recoveryStatusObserveLimit   = 2 * time.Second
+	recoveryProgressPersistEvery = 2 * time.Second
 	// Recovering every primary and FRR sidecar at the normal apply worker
 	// limit can saturate Docker precisely when it is already restarting
 	// namespaces. Keep this intentionally small; the shared limiter can make
 	// it smaller on constrained nodes.
-	recoveryLifecycleWorkers = 4
+	recoveryLifecycleWorkers = 8
 )
 
 func bindingVNIs(bindings []netx.LogicalBinding) []uint32 {
@@ -117,11 +128,31 @@ func (s *Server) recoveryPhaseLimit() time.Duration {
 	return defaultRecoveryPhaseTimeout
 }
 
-func (s *Server) recoveryTotalLimit() time.Duration {
+func (s *Server) recoveryTotalLimit(tx ...applyTransaction) time.Duration {
 	if s.recoveryTotalTimeout > 0 {
 		return s.recoveryTotalTimeout
 	}
-	return defaultRecoveryTotalTimeout
+	limit := minimumRecoveryTotalTimeout
+	if len(tx) > 0 {
+		limit = s.recoveryRequiredPhaseBudget(tx[0])
+		if limit < minimumRecoveryTotalTimeout {
+			limit = minimumRecoveryTotalTimeout
+		}
+	}
+	cap := s.cfg.RecoveryMaxTimeout
+	if cap <= 0 {
+		cap = MaximumRecoveryTotalTimeout
+	}
+	if cap < minimumRecoveryTotalTimeout {
+		cap = minimumRecoveryTotalTimeout
+	}
+	if cap > MaximumRecoveryTotalTimeout {
+		cap = MaximumRecoveryTotalTimeout
+	}
+	if limit > cap {
+		return cap
+	}
+	return limit
 }
 
 func (s *Server) recoveryLeaseLimit() time.Duration {
@@ -150,6 +181,113 @@ func (s *Server) recoveryWorkerCount() int {
 	return s.workLimiter().ClampWorkers(limiter.Apply, workers)
 }
 
+func recoveryWorkBudget(items, workers int, perItem time.Duration) time.Duration {
+	if workers < 1 {
+		workers = 1
+	}
+	if items < 1 {
+		return defaultRecoveryPhaseTimeout
+	}
+	limit := recoveryPhaseBaseBudget +
+		time.Duration((items+workers-1)/workers)*perItem
+	if limit < defaultRecoveryPhaseTimeout {
+		return defaultRecoveryPhaseTimeout
+	}
+	return limit
+}
+
+func (s *Server) recoveryWorkItems(tx applyTransaction) int {
+	items := len(tx.Prestate.RuntimeSpecs)
+	if n := len(tx.Prestate.Containers); n > items {
+		items = n
+	}
+	for _, raw := range []json.RawMessage{tx.Requested, tx.Previous} {
+		if len(raw) == 0 {
+			continue
+		}
+		var wire Wire
+		if json.Unmarshal(raw, &wire) != nil {
+			continue
+		}
+		top, err := wire.Rehydrate()
+		if err != nil {
+			continue
+		}
+		n := 0
+		for _, device := range top.DevicesOnNode(s.cfg.Node) {
+			n++
+			if deploy.UsesFRRControl(device) {
+				n++
+			}
+		}
+		if n > items {
+			items = n
+		}
+	}
+	return items
+}
+
+func (s *Server) recoveryRollbackBudget(tx applyTransaction) time.Duration {
+	if s.recoveryPhaseTimeout > 0 {
+		return s.recoveryPhaseTimeout
+	}
+	perItem := recoveryRollbackItemBudget
+	if len(tx.Previous) == 0 {
+		perItem = recoveryDestroyItemBudget
+	}
+	return recoveryWorkBudget(s.recoveryWorkItems(tx), s.recoveryWorkerCount(), perItem)
+}
+
+func (s *Server) recoveryRollbackLimit(tx applyTransaction) time.Duration {
+	limit := s.recoveryRollbackBudget(tx)
+	if total := s.recoveryTotalLimit(tx); limit > total {
+		return total
+	}
+	return limit
+}
+
+func (s *Server) recoveryVerifyBudget(tx applyTransaction) time.Duration {
+	if s.recoveryPhaseTimeout > 0 {
+		return s.recoveryPhaseTimeout
+	}
+	return recoveryWorkBudget(s.recoveryWorkItems(tx), s.recoveryWorkerCount(),
+		recoveryVerifyItemBudget)
+}
+
+func (s *Server) recoveryVerifyLimit(tx applyTransaction) time.Duration {
+	limit := s.recoveryVerifyBudget(tx)
+	if total := s.recoveryTotalLimit(tx); limit > total {
+		return total
+	}
+	return limit
+}
+
+func (s *Server) recoveryRequiredPhaseBudget(tx applyTransaction) time.Duration {
+	// Rollback is followed by peer/replica acquisition, topology persistence,
+	// four potentially inventory-sized verification/replication passes, and
+	// the terminal commit. Budget the transaction for the sum, not merely its
+	// largest phase.
+	return recoveryTotalSlack +
+		s.recoveryRollbackBudget(tx) +
+		2*s.recoveryArtifactLimit() +
+		4*s.recoveryVerifyBudget(tx) +
+		2*s.recoveryPhaseLimit()
+}
+
+func (s *Server) recoveryHeartbeatInterval() time.Duration {
+	if s.recoveryHeartbeat > 0 {
+		return s.recoveryHeartbeat
+	}
+	interval := recoveryHeartbeatEvery
+	if phase := s.recoveryPhaseLimit(); phase > 0 && phase/3 < interval {
+		interval = phase / 3
+	}
+	if interval < time.Millisecond {
+		return time.Millisecond
+	}
+	return interval
+}
+
 func forwardDataLossScope(tx applyTransaction) []string {
 	seen := map[string]bool{}
 	for _, snapshot := range tx.Prestate.Snapshots {
@@ -167,9 +305,10 @@ func forwardDataLossScope(tx applyTransaction) []string {
 }
 
 // forwardRecoveryLimit budgets the recorded desired apply from its actual
-// node-local work set. Four lifecycle workers have measured roughly 12 seconds
-// of worst-case create/wire/configure work per device under a saturated Docker
-// daemon; the bound is deliberately below the operator-facing ten minute SLA.
+// node-local work set. Bounded lifecycle workers have measured roughly 12
+// seconds of worst-case create/wire/configure work per device under a
+// saturated Docker daemon; the bound remains below the operator-facing ten
+// minute SLA.
 func (s *Server) forwardRecoveryLimit(tx applyTransaction) time.Duration {
 	var devices int
 	var wire Wire
@@ -426,6 +565,9 @@ func (s *Server) beginRecovery(lab string, fence Fence, generation, strategy str
 	tx.RecoveryTarget = fmt.Sprintf("starting recovery %s/%d -> %s/%d",
 		tx.PreviousMode, tx.PreviousUngraded, tx.Mode, tx.Ungraded)
 	s.transactions[lab] = tx
+	if held := s.ops[lab]; held != nil && held.kind == "recovery" {
+		held.deadline = tx.RecoveryDeadline
+	}
 	if err := s.saveCoordinationLocked(); err != nil {
 		return applyTransaction{}, err
 	}
@@ -439,12 +581,6 @@ func (s *Server) recoveryOwnerLocked(lab string, fence Fence) string {
 		return lease.holder
 	}
 	return "recovery"
-}
-
-func (s *Server) updateRecoveryProgress(lab string, fence Fence, generation, target string,
-	deadline time.Time,
-) error {
-	return s.recordRecoveryProgress(lab, fence, generation, target, deadline, true)
 }
 
 func (s *Server) markForwardPhase(lab string, fence Fence, generation, phase string) error {
@@ -508,9 +644,14 @@ func (s *Server) recordRecoveryProgress(lab string, fence Fence, generation, tar
 		now.Sub(priorProgress) >= recoveryProgressPersistEvery ||
 		priorDeadline.IsZero() || deadline.After(priorDeadline.Add(recoveryProgressPersistEvery))
 	tx.RecoveryTarget = target
-	tx.RecoveryProgress = now
+	if !tx.RecoveryProgress.After(now) {
+		tx.RecoveryProgress = now
+	}
 	tx.RecoveryDeadline = deadline
 	s.transactions[lab] = tx
+	if held := s.ops[lab]; held != nil && held.kind == "recovery" {
+		held.deadline = deadline
+	}
 	if persist {
 		if err := s.saveCoordinationLocked(); err != nil {
 			return err
@@ -519,6 +660,62 @@ func (s *Server) recordRecoveryProgress(lab string, fence Fence, generation, tar
 	slog.Info("recovery phase progress", "lab", lab, "generation", generation,
 		"action_target", target, "deadline", deadline)
 	return nil
+}
+
+func recoveryProgressDeadline(now, hardDeadline time.Time, stall time.Duration) time.Time {
+	deadline := now.Add(stall)
+	if !hardDeadline.IsZero() && hardDeadline.Before(deadline) {
+		return hardDeadline
+	}
+	return deadline
+}
+
+func (s *Server) heartbeatRecoveryProgress(lab string, fence Fence, generation string,
+	hardDeadline time.Time,
+) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initCoordination()
+	now := s.nowTime()
+	if err := s.fenceErrorLocked(lab, fence, now); err != nil {
+		return err
+	}
+	tx, ok := s.transactions[lab]
+	if !ok {
+		// Successful finalization removes the transaction atomically while
+		// the commit callback is still returning.
+		return nil
+	}
+	if tx.Generation != generation {
+		return fmt.Errorf("generation %q of lab %q has no recovery transaction", generation, lab)
+	}
+	if !tx.RecoveryProgress.After(now) {
+		tx.RecoveryProgress = now
+	}
+	tx.RecoveryDeadline = recoveryProgressDeadline(now, hardDeadline, s.recoveryPhaseLimit())
+	s.transactions[lab] = tx
+	if held := s.ops[lab]; held != nil && held.kind == "recovery" {
+		held.deadline = tx.RecoveryDeadline
+	}
+	return s.saveCoordinationLocked()
+}
+
+func (s *Server) boundedRecoveryPhaseLimit(lab, generation string, limit time.Duration) time.Duration {
+	s.mu.Lock()
+	tx, ok := s.transactions[lab]
+	now := s.nowTime()
+	s.mu.Unlock()
+	if !ok || tx.Generation != generation || tx.RecoveryTotal.IsZero() {
+		return limit
+	}
+	remaining := tx.RecoveryTotal.Sub(now)
+	if remaining <= 0 {
+		return 0
+	}
+	if limit <= 0 || remaining < limit {
+		return remaining
+	}
+	return limit
 }
 
 func (s *Server) runRecoveryPhase(ctx context.Context, lab string, fence Fence,
@@ -531,13 +728,55 @@ func (s *Server) runRecoveryPhase(ctx context.Context, lab string, fence Fence,
 func (s *Server) runRecoveryPhaseLimit(ctx context.Context, lab string, fence Fence,
 	generation, action, target string, limit time.Duration, fn func(context.Context) error,
 ) error {
+	limit = s.boundedRecoveryPhaseLimit(lab, generation, limit)
+	if limit <= 0 {
+		return fmt.Errorf("%s %s: %w", action, target, context.DeadlineExceeded)
+	}
 	phaseCtx, cancel := context.WithTimeout(ctx, limit)
 	defer cancel()
-	deadline := s.nowTime().Add(limit)
-	if err := s.recordRecoveryProgress(lab, fence, generation, action+": "+target, deadline, false); err != nil {
+	hardDeadline := s.nowTime().Add(limit)
+	deadline := recoveryProgressDeadline(s.nowTime(), hardDeadline, s.recoveryPhaseLimit())
+	progressTarget := action + ": " + target
+	if err := s.recordRecoveryProgress(lab, fence, generation, progressTarget, deadline, false); err != nil {
 		return err
 	}
-	if err := fn(phaseCtx); err != nil {
+	stopHeartbeat := make(chan struct{})
+	heartbeatDone := make(chan struct{})
+	heartbeatErr := make(chan error, 1)
+	go func() {
+		defer close(heartbeatDone)
+		ticker := time.NewTicker(s.recoveryHeartbeatInterval())
+		defer ticker.Stop()
+		for {
+			select {
+			case <-phaseCtx.Done():
+				return
+			case <-stopHeartbeat:
+				return
+			case <-ticker.C:
+				if err := s.heartbeatRecoveryProgress(lab, fence, generation, hardDeadline); err != nil {
+					select {
+					case heartbeatErr <- err:
+					default:
+					}
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	err := fn(phaseCtx)
+	close(stopHeartbeat)
+	<-heartbeatDone
+	var progressErr error
+	select {
+	case progressErr = <-heartbeatErr:
+	default:
+	}
+	if progressErr != nil {
+		return fmt.Errorf("%s %s: persist recovery heartbeat: %w", action, target, progressErr)
+	}
+	if err != nil {
 		if phaseCtx.Err() != nil {
 			return fmt.Errorf("%s %s: %w", action, target, phaseCtx.Err())
 		}
@@ -573,24 +812,8 @@ func (s *Server) runRecoveryLongPhase(ctx context.Context, lab string, fence Fen
 	if !ok || deadline.IsZero() {
 		deadline = s.nowTime().Add(s.recoveryTotalLimit())
 	}
-	if err := s.updateRecoveryProgress(lab, fence, generation, action+": "+target, deadline); err != nil {
-		return err
-	}
-	if err := fn(ctx); err != nil {
-		if ctx.Err() != nil {
-			return fmt.Errorf("%s %s: %w", action, target, ctx.Err())
-		}
-		return fmt.Errorf("%s %s: %w", action, target, err)
-	}
-	s.mu.Lock()
-	current, active := s.transactions[lab]
-	s.mu.Unlock()
-	if !active || current.Generation != generation {
-		return nil
-	}
-	// See runRecoveryPhase: phase entry is durable progress; completion is
-	// either followed by the next durable phase or terminal finalization.
-	return nil
+	return s.runRecoveryPhaseLimit(ctx, lab, fence, generation, action, target,
+		deadline.Sub(s.nowTime()), fn)
 }
 
 // runBoundedDeviceChecks runs independent device operations concurrently while
@@ -665,6 +888,70 @@ feed:
 	wg.Wait()
 	if firstErr != nil {
 		return firstErr
+	}
+	return ctx.Err()
+}
+
+// runBoundedRecoveryItems attempts every item that can start before
+// cancellation and reports failures in input order. Destructive cleanup uses
+// this form so one bad object does not prevent the same recovery attempt from
+// monotonically removing every other independent stale object.
+func runBoundedRecoveryItems[T any](ctx context.Context, workers int, items []T,
+	limit time.Duration, label func(T) string, fn func(context.Context, T) error,
+) error {
+	if len(items) == 0 {
+		return nil
+	}
+	if workers <= 0 {
+		workers = 1
+	}
+	if workers > len(items) {
+		workers = len(items)
+	}
+	jobs := make(chan int)
+	started := make([]bool, len(items))
+	errs := make([]error, len(items))
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for index := range jobs {
+				if ctx.Err() != nil {
+					continue
+				}
+				started[index] = true
+				itemCtx, cancel := context.WithTimeout(ctx, limit)
+				errs[index] = fn(itemCtx, items[index])
+				if errs[index] == nil && itemCtx.Err() != nil {
+					errs[index] = itemCtx.Err()
+				}
+				cancel()
+			}
+		}()
+	}
+feed:
+	for index := range items {
+		select {
+		case <-ctx.Done():
+			break feed
+		case jobs <- index:
+		}
+	}
+	close(jobs)
+	wg.Wait()
+	var problems []string
+	for index, item := range items {
+		if !started[index] || errs[index] == nil {
+			continue
+		}
+		problems = append(problems, fmt.Sprintf("%s: %v", label(item), errs[index]))
+	}
+	if len(problems) > 0 {
+		if ctx.Err() != nil {
+			return fmt.Errorf("%w: %s", ctx.Err(), strings.Join(problems, "; "))
+		}
+		return errors.New(strings.Join(problems, "; "))
 	}
 	return ctx.Err()
 }
@@ -1898,7 +2185,7 @@ func (s *Server) recoverTransactionStrategyOptions(ctx context.Context, lab stri
 		}
 		return status, nil
 	}
-	recoveryLimit := s.recoveryTotalLimit()
+	recoveryLimit := s.recoveryTotalLimit(tx)
 	if strategy == "forward" {
 		recoveryLimit = s.forwardRecoveryLimit(tx)
 	}
@@ -1907,11 +2194,11 @@ func (s *Server) recoverTransactionStrategyOptions(ctx context.Context, lab stri
 	totalDeadline := s.nowTime().Add(recoveryLimit)
 	fencedCtx, stopFence := s.fencedContext(totalCtx, lab, fence)
 	defer stopFence()
-	opID, err := s.acquireRecoveryOperation(lab, totalDeadline, totalCancel, options.takeover)
+	opID, opDone, err := s.acquireRecoveryOperation(fencedCtx, lab, totalDeadline, totalCancel, options.takeover)
 	if err != nil {
 		return s.transactionInventoryStatus(ctx, lab), err
 	}
-	defer s.releaseRecoveryOperation(lab, opID)
+	defer s.releaseRecoveryOperation(lab, opID, opDone)
 	tx, err = s.beginRecovery(lab, fence, tx.Generation, strategy, totalDeadline, options)
 	if err != nil {
 		return s.transactionInventoryStatus(ctx, lab), err
@@ -1963,12 +2250,9 @@ func (s *Server) recoverTransactionStrategyOptions(ctx context.Context, lab stri
 	if s.recoveryRollback != nil {
 		rollback = s.recoveryRollback
 	}
-	runRollback := s.runRecoveryPhase
-	if s.recoveryRollback == nil && len(tx.Prestate.RuntimeSpecs) > 0 {
-		runRollback = s.runRecoveryLongPhase
-	}
-	if err := runRollback(fencedCtx, lab, fence, tx.Generation,
-		"rollback", "restore prior runtime inventory", func(phaseCtx context.Context) error {
+	if err := s.runRecoveryPhaseLimit(fencedCtx, lab, fence, tx.Generation,
+		"rollback", "restore prior runtime inventory", s.recoveryRollbackLimit(tx),
+		func(phaseCtx context.Context) error {
 			if err := s.transactionFail("rollback"); err != nil {
 				return err
 			}
@@ -1992,13 +2276,14 @@ func (s *Server) recoverTransactionStrategyOptions(ctx context.Context, lab stri
 	if s.recoveryVerify != nil {
 		verify = func(phaseCtx context.Context) error { return s.recoveryVerify(phaseCtx, tx) }
 	}
-	if err := s.runRecoveryPhase(fencedCtx, lab, fence, tx.Generation,
-		"verify", "restored student state and runtime semantics", verify); err != nil {
+	if err := s.runRecoveryPhaseLimit(fencedCtx, lab, fence, tx.Generation,
+		"verify", "restored student state and runtime semantics", s.recoveryVerifyLimit(tx), verify); err != nil {
 		s.failRecovery(lab, fence, tx.Generation, err)
 		return s.transactionInventoryStatus(ctx, lab), err
 	}
-	if err := s.runRecoveryPhase(fencedCtx, lab, fence, tx.Generation,
-		"verify", "expected FRR control sidecars", func(phaseCtx context.Context) error {
+	if err := s.runRecoveryPhaseLimit(fencedCtx, lab, fence, tx.Generation,
+		"verify", "expected FRR control sidecars", s.recoveryVerifyLimit(tx),
+		func(phaseCtx context.Context) error {
 			return s.verifyRecoveredControls(phaseCtx, tx)
 		}); err != nil {
 		s.failRecovery(lab, fence, tx.Generation, err)
@@ -2008,13 +2293,14 @@ func (s *Server) recoverTransactionStrategyOptions(ctx context.Context, lab stri
 	if s.recoveryReplicate != nil {
 		replicate = func(phaseCtx context.Context) error { return s.recoveryReplicate(phaseCtx, tx) }
 	}
-	if err := s.runRecoveryPhase(fencedCtx, lab, fence, tx.Generation,
-		"replicate", "durable peer quorum", replicate); err != nil {
+	if err := s.runRecoveryPhaseLimit(fencedCtx, lab, fence, tx.Generation,
+		"replicate", "durable peer quorum", s.recoveryVerifyLimit(tx), replicate); err != nil {
 		s.failRecovery(lab, fence, tx.Generation, err)
 		return s.transactionInventoryStatus(ctx, lab), err
 	}
-	if err := s.runRecoveryPhase(fencedCtx, lab, fence, tx.Generation,
-		"verify", "exact prior inventory", func(phaseCtx context.Context) error {
+	if err := s.runRecoveryPhaseLimit(fencedCtx, lab, fence, tx.Generation,
+		"verify", "exact prior inventory", s.recoveryVerifyLimit(tx),
+		func(phaseCtx context.Context) error {
 			got, err := s.snapshotTransactionInventory(phaseCtx, lab)
 			if err != nil {
 				return err
@@ -2362,6 +2648,9 @@ func (s *Server) rollbackExactContracts(ctx context.Context, lab string, fence F
 	expected := map[string]bool{}
 	for _, entry := range tx.Prestate.RuntimeSpecs {
 		expected[entry.Spec.Name] = true
+		if entry.Control != nil {
+			expected[entry.Control.Name] = true
+		}
 	}
 	if err := runBoundedDeviceChecks(ctx, s.recoveryWorkerCount(),
 		tx.Prestate.RuntimeSpecs, s.recoveryArtifactLimit(),
@@ -2541,19 +2830,33 @@ func (s *Server) rollbackExactContracts(ctx context.Context, lab string, fence F
 		}); err != nil {
 		return err
 	}
-	if err := s.runRecoveryPhase(ctx, lab, fence, tx.Generation,
-		"prune", "forward-only runtime objects and overlays", func(phaseCtx context.Context) error {
+	if err := s.runRecoveryPhaseLimit(ctx, lab, fence, tx.Generation,
+		"prune", "forward-only runtime objects and overlays", s.recoveryRollbackLimit(tx),
+		func(phaseCtx context.Context) error {
 			containers, err := s.recoveryContainerList(phaseCtx, lab)
 			if err != nil {
 				return err
 			}
+			var stale []rt.Container
 			for _, container := range containers {
-				if isInternalControlContainer(container) || expected[container.Name] {
+				if expected[container.Name] {
 					continue
 				}
-				if err := s.rt.Remove(phaseCtx, container.Name, true); err != nil {
-					return fmt.Errorf("remove forward-only rollback container %s: %w", container.Name, err)
-				}
+				stale = append(stale, container)
+			}
+			sort.Slice(stale, func(i, j int) bool { return stale[i].Name < stale[j].Name })
+			if err := runBoundedRecoveryItems(phaseCtx, s.recoveryWorkerCount(), stale,
+				s.recoveryArtifactLimit(),
+				func(container rt.Container) string {
+					return "remove forward-only rollback container " + container.Name
+				},
+				func(itemCtx context.Context, container rt.Container) error {
+					return s.workLimiter().Run(itemCtx,
+						[]limiter.Kind{limiter.Apply, limiter.Lifecycle}, func() error {
+							return s.rt.Remove(itemCtx, container.Name, true)
+						})
+				}); err != nil {
+				return err
 			}
 			if err := s.transactionFail("prune"); err != nil {
 				return fmt.Errorf("exact rollback prune failpoint: %w", err)

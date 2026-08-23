@@ -61,3 +61,17 @@ func TestSharedLimiterBoundsConcurrentLabsAndReportsQueueing(t *testing.T) {
 		t.Fatalf("queue metrics lost contention: %+v", stats)
 	}
 }
+
+func TestScaleDefaultsAndPartialOverrides(t *testing.T) {
+	cfg := defaultConfig(56)
+	if cfg.Apply != 48 || cfg.Lifecycle != 48 {
+		t.Fatalf("56-core defaults = apply %d lifecycle %d, want 48/48",
+			cfg.Apply, cfg.Lifecycle)
+	}
+	overridden := WithDefaults(Config{Lifecycle: 24})
+	defaults := DefaultConfig()
+	if overridden.Lifecycle != 24 || overridden.Apply != defaults.Apply ||
+		overridden.Netlink != defaults.Netlink {
+		t.Fatalf("partial limiter override lost defaults: %+v", overridden)
+	}
+}

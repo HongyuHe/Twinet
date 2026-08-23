@@ -346,9 +346,26 @@ func applyRequestForNode(req agent.ApplyRequest, wire *agent.Wire, peers map[str
 	out.Phase = phase
 	out.ExpectedGeneration = expected
 	out.Generation = generation
+	out.TargetNode = node
+	out.AssignmentKnown = true
+	out.AssignedDevices = assignedWireDevices(wire, node)
 	if lease != nil {
 		out.Fence, _ = lease.Fence(node)
 	}
+	return out
+}
+
+func assignedWireDevices(wire *agent.Wire, node string) []string {
+	if wire == nil {
+		return nil
+	}
+	var out []string
+	for _, device := range wire.Devices {
+		if device.Node == node {
+			out = append(out, device.ID)
+		}
+	}
+	sort.Strings(out)
 	return out
 }
 
@@ -681,6 +698,15 @@ func (c *Cluster) coordinatedDestroy(ctx context.Context, lab string, vnis []uin
 	defer lease.Release()
 
 	values := map[string]struct{}{}
+	workItems := map[string]int{}
+	for _, result := range fanOut(lease.Context(), nodes,
+		func(ctx context.Context, node *Node) (agent.RecoveryStatus, error) {
+			return node.RecoveryStatus(ctx, lab)
+		}) {
+		if result.Err == nil {
+			workItems[result.Node] = recoveryStatusWorkItems(result.Value)
+		}
+	}
 	results := fanOut(lease.Context(), nodes, func(ctx context.Context, node *Node) (struct{}, error) {
 		fence, ok := lease.Fence(node.Name)
 		if !ok {
@@ -688,6 +714,7 @@ func (c *Cluster) coordinatedDestroy(ctx context.Context, lab string, vnis []uin
 		}
 		return struct{}{}, node.destroy(ctx, agent.DestroyRequest{
 			Lab: lab, VNIs: vnis, Ephemeral: ephemeral, Fence: fence,
+			WorkItems: workItems[node.Name],
 		})
 	})
 	var failure error

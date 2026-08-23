@@ -427,7 +427,7 @@ func ListOverlaysOfLab(lab string) ([]uint32, error) {
 
 // OverlayOwners maps every Twinet overlay on this host to the lab that owns it.
 func OverlayOwners() (map[uint32]string, error) {
-	links, err := netlink.LinkList()
+	links, err := listHostLinks()
 	if err != nil {
 		return nil, fmt.Errorf("list host interfaces: %w", err)
 	}
@@ -557,7 +557,7 @@ func legacyOverlayLinks(vni uint32, lab string) (*netlink.Vxlan, *netlink.Bridge
 }
 
 func listOverlays(lab string) ([]uint32, error) {
-	links, err := netlink.LinkList()
+	links, err := listHostLinks()
 	if err != nil {
 		return nil, fmt.Errorf("list host interfaces: %w", err)
 	}
@@ -642,7 +642,7 @@ type Orphan struct {
 // deconfliction that stops two labs picking the same identifier reads exactly
 // this ownership record.
 func FindOrphans(live map[string]bool) ([]Orphan, error) {
-	links, err := netlink.LinkList()
+	links, err := listHostLinks()
 	if err != nil {
 		return nil, fmt.Errorf("list host interfaces: %w", err)
 	}

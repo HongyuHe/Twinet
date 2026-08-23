@@ -238,6 +238,9 @@ func TestEventScopeOrderAndBoundedMetrics(t *testing.T) {
 	if stringCount(text, "unbounded-user-supplied-operation") != 0 {
 		t.Fatal("unbounded operation name leaked into Prometheus labels")
 	}
+	if got := boundedLimiterKind("convergence"); got != "convergence" {
+		t.Fatalf("convergence limiter label = %q, want convergence", got)
+	}
 	metricsServer := &Server{cfg: Config{Node: "node-0"}, rt: &gcRuntime{}}
 	metricsResponse := httptest.NewRecorder()
 	metricsServer.handleMetrics(metricsResponse, httptest.NewRequest(http.MethodGet, "/metrics", nil))

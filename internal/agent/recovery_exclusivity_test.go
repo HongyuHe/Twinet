@@ -121,7 +121,8 @@ func TestRecoveryPreemptsCancelableReconcileLease(t *testing.T) {
 	}()
 	_, cancelRecovery := context.WithCancel(context.Background())
 	defer cancelRecovery()
-	recoveryID, err := server.acquireRecoveryOperation("lab", time.Now().Add(time.Minute), cancelRecovery, true)
+	recoveryID, recoveryDone, err := server.acquireRecoveryOperation(
+		context.Background(), "lab", time.Now().Add(time.Minute), cancelRecovery, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,7 +137,116 @@ func TestRecoveryPreemptsCancelableReconcileLease(t *testing.T) {
 	if held == nil || held.id != recoveryID || held.kind != "recovery" {
 		t.Fatalf("canceled reconcile released recovery lease: %+v", held)
 	}
-	server.releaseRecoveryOperation("lab", recoveryID)
+	server.releaseRecoveryOperation("lab", recoveryID, recoveryDone)
+}
+
+func TestRecoveryWaitsForCancelledApplyToQuiesce(t *testing.T) {
+	server := coordinationTestServer(t, nil)
+	applyCtx, cancelApply := context.WithCancel(context.Background())
+	applyID, applyDone, err := server.acquireOperation("lab", "apply", cancelApply)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lateCreateStarted := make(chan struct{})
+	allowLateCreateToFinish := make(chan struct{})
+	applyFinished := make(chan struct{})
+	go func() {
+		<-applyCtx.Done()
+		close(lateCreateStarted)
+		<-allowLateCreateToFinish
+		server.releaseOperation("lab", applyID, applyDone)
+		close(applyFinished)
+	}()
+
+	recoveryAcquired := make(chan struct{})
+	var recoveryID uint64
+	var recoveryDone chan struct{}
+	go func() {
+		recoveryID, recoveryDone, err = server.acquireRecoveryOperation(
+			context.Background(), "lab", time.Now().Add(time.Minute), func() {}, true)
+		close(recoveryAcquired)
+	}()
+	select {
+	case <-lateCreateStarted:
+	case <-time.After(time.Second):
+		t.Fatal("recovery did not cancel the apply")
+	}
+	select {
+	case <-recoveryAcquired:
+		t.Fatal("recovery started before the late runtime mutation quiesced")
+	default:
+	}
+	close(allowLateCreateToFinish)
+	select {
+	case <-applyFinished:
+	case <-time.After(time.Second):
+		t.Fatal("cancelled apply did not finish")
+	}
+	select {
+	case <-recoveryAcquired:
+	case <-time.After(time.Second):
+		t.Fatal("recovery did not acquire after apply quiesced")
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.releaseRecoveryOperation("lab", recoveryID, recoveryDone)
+}
+
+func TestRecoveryCannotObserveZeroThenAllowLateScaleRecreation(t *testing.T) {
+	server := coordinationTestServer(t, nil)
+	runtime := newBulkRecoveryRuntime(0)
+	applyCtx, cancelApply := context.WithCancel(context.Background())
+	applyID, applyDone, err := server.acquireOperation("scale", "apply", cancelApply)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lateCreateReady := make(chan struct{})
+	allowLateCreate := make(chan struct{})
+	go func() {
+		<-applyCtx.Done()
+		close(lateCreateReady)
+		<-allowLateCreate
+		runtime.create(626)
+		server.releaseOperation("scale", applyID, applyDone)
+	}()
+
+	recoveryDone := make(chan error, 1)
+	go func() {
+		recoveryID, done, acquireErr := server.acquireRecoveryOperation(
+			context.Background(), "scale", time.Now().Add(time.Minute), func() {}, true)
+		if acquireErr != nil {
+			recoveryDone <- acquireErr
+			return
+		}
+		defer server.releaseRecoveryOperation("scale", recoveryID, done)
+		containers, listErr := runtime.List(context.Background(), rt.Filter{})
+		if listErr != nil {
+			recoveryDone <- listErr
+			return
+		}
+		recoveryDone <- runBoundedRecoveryItems(context.Background(), 8, containers, time.Second,
+			func(container rt.Container) string { return container.Name },
+			func(ctx context.Context, container rt.Container) error {
+				return runtime.Remove(ctx, container.Name, true)
+			})
+	}()
+	<-lateCreateReady
+	if got := runtime.count(); got != 0 {
+		t.Fatalf("pre-quiescence inventory=%d, want initial zero", got)
+	}
+	select {
+	case err := <-recoveryDone:
+		t.Fatalf("recovery observed the transient zero before late creates quiesced: %v", err)
+	default:
+	}
+	close(allowLateCreate)
+	if err := <-recoveryDone; err != nil {
+		t.Fatal(err)
+	}
+	if got := runtime.count(); got != 0 {
+		t.Fatalf("late apply recreation survived recovery: %d containers", got)
+	}
 }
 
 func TestExactRecoveryContainerReusesExitedAndConflictContracts(t *testing.T) {

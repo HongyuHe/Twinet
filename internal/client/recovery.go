@@ -33,8 +33,27 @@ const defaultRecoveryWait = 2 * time.Minute
 // Recover asks one agent to restore its durable pre-transaction inventory.
 func (n *Node) Recover(ctx context.Context, req agent.RecoveryRequest) (agent.RecoveryResponse, error) {
 	var out agent.RecoveryResponse
-	err := n.do(ctx, "POST", "/v1/recover", req, &out)
+	err := n.doWithTimeout(ctx, "POST", "/v1/recover", req, &out,
+		agent.MaximumRecoveryTotalTimeout)
 	return out, err
+}
+
+func recoveryStatusWorkItems(status agent.RecoveryStatus) int {
+	items := status.ExpectedContainers
+	for _, value := range []int{
+		status.ObservedContainers,
+		status.ExpectedLogicalBindings,
+		status.ObservedLogicalBindings,
+		status.ExpectedPhysicalTrunks,
+		status.ObservedPhysicalTrunks,
+		status.ExpectedVNIs,
+		status.ObservedVNIs,
+	} {
+		if value > items {
+			items = value
+		}
+	}
+	return items
 }
 
 // RecoveryStatus reads one node's independently verified recovery state.
