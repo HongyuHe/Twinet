@@ -314,11 +314,13 @@ func (c *Checker) readImage(ctx context.Context, image string) (map[string]resol
 	name := "twinet-integrity-" + hex.EncodeToString(sum[:8])
 	_ = c.rt.Remove(ctx, name, true)
 	command := []string{"/bin/true"}
-	if c.rt.Name() == "podman" {
-		// Podman 4.x does not mount an unstarted created container for its
-		// archive API. Start an isolated, network-less pristine image long
-		// enough to read it; the command has no input, mounts, credentials, or
-		// route to a student container and is removed immediately afterwards.
+	startPristine := integrityContainerNeedsStart(c.rt.Name())
+	if startPristine {
+		// Podman does not mount an unstarted container for its archive API,
+		// while containerd's safe copy path executes inside the mount
+		// namespace and therefore needs a running task. Start an isolated,
+		// network-less pristine image long enough to read it; the command has
+		// no input, mounts, credentials, or route to a student container.
 		command = []string{"sh", "-c", "sleep infinity"}
 	}
 	if _, err := c.rt.Create(ctx, &rt.Spec{Name: name, Image: image,
@@ -339,10 +341,10 @@ func (c *Checker) readImage(ctx context.Context, image string) (map[string]resol
 			"against: %w", image, err)
 	}
 	defer func() { _ = c.rt.Remove(context.WithoutCancel(ctx), name, true) }()
-	if c.rt.Name() == "podman" {
+	if startPristine {
 		if err := c.rt.Start(ctx, name); err != nil {
-			return nil, fmt.Errorf("a pristine Podman container of %s could not be started for integrity comparison: %w",
-				image, err)
+			return nil, fmt.Errorf("a pristine %s container of %s could not be started for integrity comparison: %w",
+				c.rt.Name(), image, err)
 		}
 	}
 
@@ -353,4 +355,8 @@ func (c *Checker) readImage(ctx context.Context, image string) (map[string]resol
 			"built from it can be checked (probe /bin/sh: %v)", image, probeErr)
 	}
 	return m, nil
+}
+
+func integrityContainerNeedsStart(runtimeName string) bool {
+	return runtimeName == "podman" || runtimeName == "containerd"
 }

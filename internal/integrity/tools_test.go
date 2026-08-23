@@ -154,4 +154,18 @@ func TestTheErrorNamesTheContainerAndTheProgram(t *testing.T) {
 			t.Errorf("the message does not mention %q: %s", want, msg)
 		}
 	}
+
+}
+
+func TestIntegrityContainerStartRequirement(t *testing.T) {
+	for _, runtimeName := range []string{"podman", "containerd"} {
+		if !integrityContainerNeedsStart(runtimeName) {
+			t.Fatalf("%s pristine container was left unstarted", runtimeName)
+		}
+	}
+	for _, runtimeName := range []string{"docker", "memory"} {
+		if integrityContainerNeedsStart(runtimeName) {
+			t.Fatalf("%s pristine container was started unnecessarily", runtimeName)
+		}
+	}
 }
