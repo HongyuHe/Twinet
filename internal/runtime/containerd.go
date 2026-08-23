@@ -42,7 +42,9 @@ const (
 	defaultSnapshotter         = "overlayfs"
 	defaultContainerdStateRoot = "/run/twinet/containerd"
 	defaultContainerdInit      = "/usr/local/bin/twinet-init"
-	containerdInitSocket       = "/.twinet-control/exec.sock"
+	containerdInitDestination  = "/run/.twinet-init"
+	containerdControlRoot      = "/run/.twinet-control"
+	containerdInitSocket       = containerdControlRoot + "/exec.sock"
 
 	containerdStartedLabel     = "twinet.containerd.started"
 	containerdImageLabel       = "twinet.containerd.image"
@@ -422,7 +424,7 @@ func containerdSpecOption(spec *Spec, image ocispec.ImageConfig,
 		}
 		args = append(args, command...)
 		if spec.Init {
-			args = append([]string{"/.twinet-init", "--"}, args...)
+			args = append([]string{containerdInitDestination, "--"}, args...)
 		}
 		if len(args) == 0 {
 			return fmt.Errorf("container %s has no command or image entrypoint", spec.Name)
@@ -485,12 +487,6 @@ func containerdSpecOption(spec *Spec, image ocispec.ImageConfig,
 			}
 			out.Mounts = append(out.Mounts, specs.Mount{
 				Destination: target, Type: "tmpfs", Source: "tmpfs", Options: options,
-			})
-		}
-		if spec.Labels["twinet.frr-control"] == "true" {
-			out.Mounts = append(out.Mounts, specs.Mount{
-				Destination: "/lib/frr", Type: "tmpfs", Source: "tmpfs",
-				Options: []string{"rw", "nosuid", "nodev", "mode=0755"},
 			})
 		}
 		for _, bind := range spec.Binds {
@@ -570,7 +566,7 @@ func (c *Containerd) runtimeConfigMounts(spec *Spec) ([]specs.Mount, error) {
 			return nil, fmt.Errorf("containerd init binary %s is not executable", source)
 		}
 		mounts = append(mounts, specs.Mount{
-			Destination: "/.twinet-init", Type: "bind", Source: source,
+			Destination: containerdInitDestination, Type: "bind", Source: source,
 			Options: []string{"rbind", "rprivate", "ro"},
 		})
 		controlRoot := filepath.Join(root, "control")
@@ -578,7 +574,7 @@ func (c *Containerd) runtimeConfigMounts(spec *Spec) ([]specs.Mount, error) {
 			return nil, err
 		}
 		mounts = append(mounts, specs.Mount{
-			Destination: "/.twinet-control", Type: "bind", Source: controlRoot,
+			Destination: containerdControlRoot, Type: "bind", Source: controlRoot,
 			Options: []string{"rbind", "rprivate", "rw"},
 		})
 	}
