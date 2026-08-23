@@ -398,6 +398,13 @@ func (n *Node) Destroy(ctx context.Context, lab string, vnis []uint32) error {
 	return n.destroy(ctx, agent.DestroyRequest{Lab: lab, VNIs: vnis})
 }
 
+// DestroyForce removes a lab without capturing student state first. It is an
+// operator recovery escape hatch for an orphaned runtime whose topology record
+// is unavailable; normal destroys must use Destroy.
+func (n *Node) DestroyForce(ctx context.Context, lab string, vnis []uint32) error {
+	return n.destroy(ctx, agent.DestroyRequest{Lab: lab, VNIs: vnis, Force: true})
+}
+
 // DestroyEphemeral removes a disposable lab and discards its saved state.
 func (n *Node) DestroyEphemeral(ctx context.Context, lab string, vnis []uint32) error {
 	return n.destroy(ctx, agent.DestroyRequest{Lab: lab, VNIs: vnis, Ephemeral: true})
@@ -1247,13 +1254,19 @@ func short(id string) string {
 
 // Destroy removes the lab from every node.
 func (c *Cluster) Destroy(ctx context.Context, lab string, vnis []uint32) []NodeResult[struct{}] {
-	return c.coordinatedDestroy(ctx, lab, vnis, false)
+	return c.coordinatedDestroy(ctx, lab, vnis, false, false)
+}
+
+// DestroyForce removes an orphaned lab under the normal cluster mutation
+// fence, but deliberately skips state capture.
+func (c *Cluster) DestroyForce(ctx context.Context, lab string, vnis []uint32) []NodeResult[struct{}] {
+	return c.coordinatedDestroy(ctx, lab, vnis, false, true)
 }
 
 // DestroyEphemeral removes a disposable lab from every node and discards its
 // saved state, so a lab of the same name later starts from the manifest.
 func (c *Cluster) DestroyEphemeral(ctx context.Context, lab string, vnis []uint32) []NodeResult[struct{}] {
-	return c.coordinatedDestroy(ctx, lab, vnis, true)
+	return c.coordinatedDestroy(ctx, lab, vnis, true, false)
 }
 
 // Hold asks every node to leave a lab alone. Failures are returned per node so

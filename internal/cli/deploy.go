@@ -447,6 +447,7 @@ func newDestroyCmd(opts *Options) *cobra.Command {
 		yes   bool
 		lab   string
 		keep  bool
+		force bool
 		token string
 	)
 	cmd := &cobra.Command{
@@ -492,8 +493,12 @@ if the manifest that created it is no longer available.`,
 					return nil
 				}
 				c := client.NewCluster(top.Lab, tok)
+				destroy := c.Destroy
+				if force {
+					destroy = c.DestroyForce
+				}
 				var bad int
-				for _, r := range c.Destroy(cmd.Context(), name, vnis) {
+				for _, r := range destroy(cmd.Context(), name, vnis) {
 					if r.Err != nil {
 						bad++
 						fmt.Fprintf(cmd.ErrOrStderr(), "  %s: %v\n", r.Node, r.Err)
@@ -668,6 +673,8 @@ if the manifest that created it is no longer available.`,
 	cmd.Flags().BoolVarP(&yes, "yes", "y", false, "do not ask for confirmation")
 	cmd.Flags().StringVar(&lab, "lab", "", "lab name, when no manifest is available")
 	cmd.Flags().BoolVar(&keep, "keep-overlays", false, "leave VXLAN bridges and tunnels in place")
+	cmd.Flags().BoolVar(&force, "force", false,
+		"skip state capture and irreversibly remove an orphaned cluster lab")
 	cmd.Flags().StringVar(&token, "token", "", "agent token for cluster deployments (or set TWINET_TOKEN)")
 	return cmd
 }
