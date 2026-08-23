@@ -549,7 +549,7 @@ var RPKIRefreshScript = strings.Join([]string{
 	"[ -f $pid ] && kill -0 \"$(cat $pid)\" 2>/dev/null && exit 0",
 	"echo $$ > $pid",
 	"while :; do",
-	"  sleep 60",
+	"  delay=60",
 	// A session that is configured and not connected does not repair
 	// itself, and nothing else was looking.
 	//
@@ -567,25 +567,27 @@ var RPKIRefreshScript = strings.Join([]string{
 	"    if [ -n \"$line\" ]; then",
 	"      vtysh -c 'configure terminal' -c 'rpki' -c \"no $line\" -c \"$line\" -c 'end' >/dev/null 2>&1",
 	"    fi",
-	"    continue",
-	"  fi",
+	"    delay=5",
 	// Nothing to validate against yet.
-	"  vtysh -c 'show rpki prefix-table' 2>/dev/null | grep -qE '^[0-9]+[.]' || continue",
+	"  elif ! vtysh -c 'show rpki prefix-table' 2>/dev/null | grep -qE '^[0-9]+[.]'; then",
+	"    delay=5",
 	// Only a route this router learned for itself, and only while one is
 	// there. A router cannot refresh away an invalid route it heard over
 	// iBGP -- the border that accepted it is the only one that can -- and
 	// FRR marks an iBGP path with an "i" directly after the status field:
 	// "I*>i10.128.0.0/9" came from inside, "I*> 10.128.0.0/9" came from a
 	// neighbour of this router.
-	"  vtysh -c 'show bgp ipv4 unicast rpki invalid' 2>/dev/null |",
-	"    grep -E '^[A-Za-z]*[*]' | grep -qv '>i' || continue",
+	"  elif vtysh -c 'show bgp ipv4 unicast rpki invalid' 2>/dev/null |",
+	"    grep -E '^[A-Za-z]*[*]' | grep -qv '>i'; then",
 	// A route refresh, not a soft replay. Storing the received
 	// announcements and replaying them was tried: FRR replays each stored
 	// entry with the validation state it was given when it arrived, which
 	// is precisely the stale answer being corrected. Asking the neighbour
 	// to send its routes again re-validates them against the ROA table as
 	// it stands now.
-	"  vtysh -c 'clear bgp ipv4 unicast * in' >/dev/null 2>&1 || true",
+	"    vtysh -c 'clear bgp ipv4 unicast * in' >/dev/null 2>&1 || true",
+	"  fi",
+	"  sleep \"$delay\"",
 	"done",
 	"TWINET_RPKI",
 	// Started before anything is waited for, and with every descriptor
@@ -599,25 +601,12 @@ var RPKIRefreshScript = strings.Join([]string{
 	// had never existed. A plain `&` does not survive either: the exec's
 	// session ends with the command and the child is signalled before its
 	// first sleep is over.
+	// The watcher performs its first check immediately and retries a missing
+	// validator every five seconds. Waiting here as well occupied every
+	// convergence slot for 32 seconds per router at class scale, while adding
+	// no correctness: this command is intentionally soft-failing and the
+	// persistent watcher is the mechanism that establishes the session.
 	"setsid sh /etc/twinet/rpki_refresh.sh </dev/null >/dev/null 2>&1 &",
-	"for i in 1 2 3 4 5 6 7 8; do",
-	"  if vtysh -c 'show rpki cache-connection' 2>/dev/null | grep -q Connected; then",
-	"    exit 0",
-	"  fi",
-	// Re-entering the cache line, not `rpki reset`: reset was measured on
-	// a live router with the session down and left it down, as did
-	// `rpki start`.
-	"  line=$(vtysh -c 'show running-config' 2>/dev/null | sed -n 's/^ *\\(rpki cache .*\\)$/\\1/p' | head -1)",
-	"  if [ -n \"$line\" ]; then",
-	"    vtysh -c 'configure terminal' -c 'rpki' -c \"no $line\" -c \"$line\" -c 'end' >/dev/null 2>&1",
-	"  fi",
-	"  sleep 4",
-	"done",
-	// Not a hard failure: a lab without a working validator is still a
-	// usable lab, and refusing to deploy over it would turn a degraded
-	// service into an outage. The grading check for origin validation is
-	// what makes the degradation visible where it matters.
-	"echo 'the origin validator did not answer; routes will be treated as not-found' >&2",
 }, "\n")
 
 // p4Files copies the declared BMv2 pipeline under a fixed in-container name.

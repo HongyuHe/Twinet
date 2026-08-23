@@ -68,20 +68,20 @@ func TestTheRefreshOnlyChasesWhatThisRouterLearnedItself(t *testing.T) {
 	}
 }
 
-// The watcher used to be started only after the validator answered, which it
-// does not do within thirty seconds of an FRR restart -- which is exactly when
-// this runs. So on a deployment it was never started at all, and what was
-// measured five times as "the watcher ran and did nothing" was a watcher that
-// had never existed.
-func TestTheWatcherIsStartedWhateverTheValidatorIsDoing(t *testing.T) {
+// The persistent watcher owns connection establishment. Waiting in the
+// deployment command as well occupied every convergence slot for 32 seconds
+// per router without adding a stronger proof.
+func TestTheWatcherStartsWithoutBlockingDeployment(t *testing.T) {
 	start := strings.Index(RPKIRefreshScript, "setsid sh /etc/twinet/rpki_refresh.sh")
-	wait := strings.Index(RPKIRefreshScript, "for i in 1 2 3 4 5 6 7 8")
-	if start < 0 || wait < 0 {
-		t.Fatal("the watcher is not started, or the validator is never waited for")
+	if start < 0 {
+		t.Fatal("the watcher is not started")
 	}
-	if start > wait {
-		t.Error("the watcher is started inside the loop that waits for the validator, so " +
-			"on a deployment -- where FRR has just restarted and the validator answers " +
-			"minutes later -- it is never started at all")
+	if strings.Contains(RPKIRefreshScript, "for i in 1 2 3 4 5 6 7 8") {
+		t.Error("deployment still waits synchronously for the validator after starting its watcher")
+	}
+	check := strings.Index(RPKIRefreshScript, "No connection")
+	sleep := strings.Index(RPKIRefreshScript, `sleep "$delay"`)
+	if check < 0 || sleep < check || !strings.Contains(RPKIRefreshScript, "delay=5") {
+		t.Error("the watcher does not check immediately and retry a missing validator after five seconds")
 	}
 }
