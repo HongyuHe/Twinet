@@ -11,13 +11,13 @@ digest() {
 
 base=$(digest "$fixture_root/base")
 base_again=$(digest "$fixture_root/base")
-docs_only=$(digest "$fixture_root/docs_only")
-source_changed=$(digest "$fixture_root/source_changed")
-module_changed=$(digest "$fixture_root/module_changed")
-sum_changed=$(digest "$fixture_root/sum_changed")
+docs_only=$(digest "$fixture_root/docs-only")
+source_changed=$(digest "$fixture_root/source-changed")
+module_changed=$(digest "$fixture_root/module-changed")
+sum_changed=$(digest "$fixture_root/sum-changed")
 # The fixture roots deliberately have no Git metadata: this extra .go file
 # models a compiled source file that is present but untracked.
-untracked_go=$(digest "$fixture_root/untracked_go")
+untracked_go=$(digest "$fixture_root/untracked-go")
 
 printf '%s\n' "$base" | grep -Eq '^[0-9a-f]{64}$' || {
     printf 'test_source_digest: invalid SHA-256 digest %q\n' "$base" >&2
