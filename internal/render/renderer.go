@@ -473,6 +473,18 @@ func (r *Renderer) roaPublishCommands(d *model.Device) []deploy.Command {
 			}
 		}
 	}
+	publisher := ""
+	for _, router := range as.Routers {
+		if !hasRPKICache(r.Top, router) {
+			continue
+		}
+		if publisher == "" || router.ID < publisher {
+			publisher = router.ID
+		}
+	}
+	if d.ID != publisher {
+		return nil
+	}
 	addr := svc.RPKIAddrFor(r.Top, d.ASN)
 	if addr == "" {
 		return nil
@@ -480,20 +492,27 @@ func (r *Renderer) roaPublishCommands(d *model.Device) []deploy.Command {
 	body := fmt.Sprintf(`{"prefix":%q,"asn":%d}`, as.Block, d.ASN)
 	return []deploy.Command{{
 		Describe: "authorise this system's prefix with the lab's trust anchor",
-		// Retried, because the validator and this router come up together and
-		// the publication interface may not be listening yet. Failing softly:
-		// a lab whose trust anchor is briefly unreachable is still a usable
-		// lab, and the graded check is what makes a missing authorisation
-		// visible where it matters.
+		// One deterministic router publishes for the AS. The operation is
+		// idempotent and eventually depends on IGP reachability, so holding an
+		// apply slot while every router retries only serializes convergence.
+		// The detached worker keeps retrying; the graded RPKI check remains the
+		// fail-closed proof that the authority accepted it.
 		Args: []string{"sh", "-c", strings.Join([]string{
-			"for i in 1 2 3 4 5 6 7 8 9 10; do",
-			fmt.Sprintf("  curl -sf -m 5 -X POST http://%s%s/roas -d '%s' >/dev/null 2>&1 && exit 0",
+			"pid=/run/twinet_roa_publish.pid",
+			"[ -f \"$pid\" ] && kill \"$(cat \"$pid\")\" 2>/dev/null || true",
+			"rm -f \"$pid\"",
+			"cat > /etc/twinet/roa_publish.sh <<'TWINET_ROA'",
+			"echo $$ > /run/twinet_roa_publish.pid",
+			"for i in $(seq 1 120); do",
+			fmt.Sprintf("  curl -sf -m 2 -X POST http://%s%s/roas -d '%s' >/dev/null 2>&1 && exit 0",
 				addr, svc.PublishListen, body),
-			"  sleep 3",
+			"  sleep 2",
 			"done",
-			"echo 'the trust anchor did not accept this authorisation' >&2",
+			"echo 'the trust anchor did not accept this authorisation' >&2; exit 1",
+			"TWINET_ROA",
+			"umask 077",
+			"setsid sh /etc/twinet/roa_publish.sh </dev/null >/tmp/twinet-roa-publish.log 2>&1 &",
 		}, "\n")},
-		IgnoreError: true,
 	}}
 }
 
