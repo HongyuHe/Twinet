@@ -1505,49 +1505,6 @@ func (s *Server) finalizeCommittedGeneration(lab string, fence Fence, generation
 	return nil
 }
 
-func (s *Server) transactionForAbort(lab string, fence Fence, generation string) (applyTransaction, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.initCoordination()
-	if err := s.fenceErrorLocked(lab, fence, s.nowTime()); err != nil {
-		return applyTransaction{}, err
-	}
-	tx, ok := s.transactions[lab]
-	if !ok {
-		return applyTransaction{}, nil
-	}
-	if tx.Generation != generation || tx.FenceGeneration != fence.Generation {
-		return applyTransaction{}, fmt.Errorf("generation %q of lab %q is not owned by this fence",
-			generation, lab)
-	}
-	return tx, nil
-}
-
-func (s *Server) finishAbortedGeneration(lab string, fence Fence, generation string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.initCoordination()
-	if err := s.fenceErrorLocked(lab, fence, s.nowTime()); err != nil {
-		return err
-	}
-	tx, ok := s.transactions[lab]
-	if !ok {
-		return nil
-	}
-	if tx.Generation != generation || tx.FenceGeneration != fence.Generation {
-		return fmt.Errorf("generation %q of lab %q is not owned by this fence",
-			generation, lab)
-	}
-	state := s.generations[lab]
-	state.Committed, state.Prepared = tx.PreviousGen, ""
-	s.generations[lab] = state
-	delete(s.transactions, lab)
-	if err := s.saveCoordinationLocked(); err != nil {
-		return fmt.Errorf("persisting aborted generation: %w", err)
-	}
-	return nil
-}
-
 // finishRecoveredGeneration is deliberately less strict than normal abort:
 // an agent restart or controller loss invalidates the original fence, so the
 // newer recovery fence is the only authority that can finish restoring the

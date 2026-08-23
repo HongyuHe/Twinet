@@ -226,6 +226,8 @@ assert cleanup["succeeded"] and cleanup["recovered_empty"], cleanup
 assert cleanup["attempts"]["cleanup_destroy_1"]["exit_code"] != 0
 assert cleanup["attempts"]["cleanup_recover_join_1"]["exit_code"] == 0
 assert cleanup["attempts"]["cleanup_destroy_2"]["exit_code"] == 0
+for name in ("cleanup_destroy_1", "cleanup_destroy_2"):
+    assert "--lab scale" in cleanup["attempts"][name]["command"], cleanup["attempts"][name]
 PY
 then
     fail "benchmark cleanup retry evidence was incomplete"

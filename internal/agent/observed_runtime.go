@@ -42,6 +42,12 @@ func (r *observedRuntime) SetRuntimeEndpoint(endpoint string) error {
 	return rt.ConfigureEndpoint(r.runtime, endpoint)
 }
 
+func (r *observedRuntime) RuntimeNamespace() string { return rt.Namespace(r.runtime) }
+
+func (r *observedRuntime) SetRuntimeNamespace(namespace string) error {
+	return rt.ConfigureNamespace(r.runtime, namespace)
+}
+
 func (r *observedRuntime) Ping(ctx context.Context) (string, error) {
 	return observeRuntimeCall(r.metrics, "ping", func() (string, error) { return r.runtime.Ping(ctx) })
 }
@@ -125,3 +131,4 @@ func (r *observedRuntime) Close() error {
 
 var _ rt.Runtime = (*observedRuntime)(nil)
 var _ rt.EndpointRuntime = (*observedRuntime)(nil)
+var _ rt.NamespaceRuntime = (*observedRuntime)(nil)

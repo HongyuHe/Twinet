@@ -1247,7 +1247,7 @@ type Placement struct {
 	// Runtime is the lab-wide container runtime default. A node can override
 	// it when a mixed Docker/Podman cluster is deliberate. Empty retains the
 	// historic Docker default.
-	Runtime string `yaml:"runtime,omitempty" json:"runtime,omitempty" jsonschema:"enum=docker,enum=podman"`
+	Runtime string `yaml:"runtime,omitempty" json:"runtime,omitempty" jsonschema:"enum=docker,enum=podman,enum=containerd"`
 	// NodePool restricts this lab to nodes carrying the named hardened worker
 	// pool. It is a placement constraint, not a label that merely appears in a
 	// report after an unsafe assignment was already made.
@@ -1286,7 +1286,7 @@ type NodeSpec struct {
 	// Runtime overrides placement.runtime for this node. It is intentionally a
 	// backend name, not a free-form command, so validation can compare it with
 	// the runtime registry before a deployment acquires a mutation lease.
-	Runtime string `yaml:"runtime,omitempty" json:"runtime,omitempty" jsonschema:"enum=docker,enum=podman"`
+	Runtime string `yaml:"runtime,omitempty" json:"runtime,omitempty" jsonschema:"enum=docker,enum=podman,enum=containerd"`
 	// RuntimeSocket is an optional Unix socket or TCP endpoint for the selected
 	// engine. It is a node-local transport address, never a container mount.
 	RuntimeSocket string `yaml:"runtime_socket,omitempty" json:"runtime_socket,omitempty"`

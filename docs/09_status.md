@@ -27,6 +27,7 @@ complete: change the implementation or regenerate the facts through the test.
   "binaries": [
     "twinet",
     "twinet-dhcpd",
+    "twinet-init",
     "twinet-mcast",
     "twinet-openflow-controller",
     "twinet-rtr",
@@ -34,10 +35,11 @@ complete: change the implementation or regenerate the facts through the test.
     "twinetd"
   ],
   "runtime_backends": [
+    "containerd",
     "docker",
     "podman"
   ],
-  "runtime_backend_count": 2,
+  "runtime_backend_count": 3,
   "network_operating_systems": [
     "bird",
     "frr"
@@ -127,7 +129,7 @@ claim.
 | Template expansion and generator registry | source-verified | `internal/expand` covers tiered peerings plus `explicit`, `ring`, `two-tier`, and `clos` interiors |
 | Netlink wiring and shared overlays | source-verified | `internal/netx` tests cover veths, shaping, and one external VXLAN/bridge per lab/node pair with VLAN-to-VNI bindings |
 | Docker Engine API runtime | source-verified | `internal/runtime` registers `docker`; API-client tests cover runtime operations and cancellation |
-| Docker/Podman runtime selection | source-verified; measured, bounded | Typed `placement.runtime` plus per-node overrides select registered backends before mutation; agents report backend/version/socket and controllers refuse a mismatch. Node-0 ran the source-built Podman 4.9.3 routed lifecycle gate (`make podman-integration`): agent status/events, deploy/wire/configure/exec/save/destroy, and cleanup all completed. |
+| Docker/Podman/containerd runtime selection | source-verified; measured, bounded | Typed `placement.runtime` plus per-node overrides select registered backends before mutation; agents report backend/version/socket/namespace and controllers refuse a mismatch. Node-0 ran the source-built Podman 4.9.3 routed lifecycle gate and the native containerd lifecycle/routed gate (`make podman-integration`, `make containerd-integration`): events, create/start/stop/remove, exec/stdin/output, copy, netns wiring, FRR control, and cleanup completed. |
 | Image locks and rolling contracts | source-verified | `twinet images lock|verify` records registry manifest digests; release/grading mode requires a checked lock and agents verify after pull before create. Status separates exact source build from protocol, renderer, and state ranges, allowing compatible rolling bug-fix upgrades while refusing incompatible render/state contracts. |
 | BIRD NOS provider and capability validation | source-verified | `internal/nos` registers FRR/BIRD and tests refuse unsupported requests; this is not a blanket live mixed-NOS acceptance claim |
 | Service/state replication and endpoint policy | source-verified | model, expansion, placement, and durability tests cover replica identity, failure domains, and endpoint selection |

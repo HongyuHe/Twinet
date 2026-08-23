@@ -148,7 +148,7 @@ func (e *Engine) loadObservation(lab string) (*observationTracker, error) {
 	if err := json.Unmarshal(raw, &decoded); err != nil {
 		// A corrupted cache must never be trusted as proof that a mutation is
 		// unnecessary. Start with an empty observation and converge again.
-		return tracker, nil
+		return tracker, nil //nolint:nilerr // an empty cache is the safe, self-repairing fallback
 	}
 	if decoded.Version != observationVersion || decoded.Lab != lab || decoded.Node != e.Node {
 		return tracker, nil
@@ -227,17 +227,6 @@ func (t *observationTracker) markMode() error {
 		t.state.Mode = t.e.ModeKey
 		t.changed = true
 	}
-	err := t.saveLocked()
-	t.mu.Unlock()
-	return err
-}
-
-func (t *observationTracker) clearDeviceConfig(id string) error {
-	t.mu.Lock()
-	value := t.state.Devices[id]
-	value.ConfigHash, value.FileHash, value.CommandHash, value.ReadyHash = "", "", "", ""
-	t.state.Devices[id] = value
-	t.changed = true
 	err := t.saveLocked()
 	t.mu.Unlock()
 	return err
@@ -794,10 +783,4 @@ func (e *Engine) DeploymentStats(report *plan.Report) DeploymentStats {
 	stats.Mutations["planned_configure"] = report.Completed(plan.StageConfigure)
 	stats.Mutations["planned_ready"] = report.Completed(plan.StageReady)
 	return stats
-}
-
-func (e *Engine) currentObservation() *observationTracker {
-	e.observationMu.Lock()
-	defer e.observationMu.Unlock()
-	return e.observation
 }

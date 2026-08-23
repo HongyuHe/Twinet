@@ -80,10 +80,10 @@ func (s *Server) metricRegistry() *agentMetrics {
 }
 
 func metricResult(err error) string {
-	switch {
-	case err == nil:
+	switch err {
+	case nil:
 		return "success"
-	case err == context.Canceled || err == context.DeadlineExceeded:
+	case context.Canceled, context.DeadlineExceeded:
 		return "canceled"
 	default:
 		return "error"

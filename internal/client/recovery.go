@@ -308,12 +308,6 @@ func (c *Cluster) recoverWithLease(ctx context.Context, lab string, lease *Mutat
 	return c.recoverWithLeaseStrategyOptions(ctx, lab, lease, "rollback", RecoveryOptions{})
 }
 
-func (c *Cluster) recoverWithLeaseStrategy(ctx context.Context, lab string, lease *MutationLease,
-	strategy string,
-) (RecoveryReport, error) {
-	return c.recoverWithLeaseStrategyOptions(ctx, lab, lease, strategy, RecoveryOptions{})
-}
-
 func (c *Cluster) recoverWithLeaseStrategyOptions(ctx context.Context, lab string, lease *MutationLease,
 	strategy string, options RecoveryOptions,
 ) (RecoveryReport, error) {

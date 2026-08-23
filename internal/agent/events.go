@@ -178,11 +178,11 @@ func (r *eventRing) after(after uint64, lab string, limit int) ([]Event, uint64)
 	return out, next
 }
 
-func (r *eventRing) subscribe(after uint64, lab string, limit int) ([]Event, uint64, <-chan Event, func()) {
+func (r *eventRing) subscribe(after uint64, lab string) ([]Event, uint64, <-chan Event, func()) {
 	// A follow subscription must bridge the retained history and live events
 	// without a cursor hole. Pages are capped at maxEventPage, but follow
 	// emits every retained matching event before registering its watcher.
-	limit = r.capacity
+	limit := r.capacity
 	r.mu.Lock()
 	initial := make([]Event, 0, limit)
 	next := after
@@ -419,7 +419,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	initial, next, stream, cancel := s.eventLog().subscribe(after, lab, limit)
+	initial, next, stream, cancel := s.eventLog().subscribe(after, lab)
 	defer cancel()
 	w.Header().Set("Content-Type", "application/x-ndjson")
 	w.Header().Set("Cache-Control", "no-cache")

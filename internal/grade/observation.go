@@ -472,9 +472,7 @@ func buildObservationPlan(r *Rubric, env *Env) observationPlan {
 			out.svc = append(out.svc, device)
 		}
 	}
-	for _, device := range targetAttachedServices(env) {
-		out.svc = append(out.svc, device)
-	}
+	out.svc = append(out.svc, targetAttachedServices(env)...)
 	for _, router := range env.Routers() {
 		if needRPKI {
 			out.raw[router.ID] = append(out.raw[router.ID],

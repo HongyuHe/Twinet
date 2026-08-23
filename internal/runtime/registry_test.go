@@ -19,6 +19,32 @@ func TestDockerRuntimeIsExplicitlyRegistered(t *testing.T) {
 	}
 }
 
+func TestContainerdRuntimeIsExplicitlyRegistered(t *testing.T) {
+	runtime, err := NewRuntime("containerd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.Name() != "containerd" {
+		t.Fatalf("runtime name = %q, want containerd", runtime.Name())
+	}
+	capabilities, ok := CapabilitiesFor("containerd")
+	if !ok || !capabilities.SupportsRoutedLab() {
+		t.Fatalf("containerd capabilities = %#v", capabilities)
+	}
+	if err := ConfigureEndpoint(runtime, "unix:///run/containerd/containerd.sock"); err != nil {
+		t.Fatal(err)
+	}
+	if err := ConfigureNamespace(runtime, "twinet-node-0"); err != nil {
+		t.Fatal(err)
+	}
+	if got := Endpoint(runtime); got != "unix:///run/containerd/containerd.sock" {
+		t.Fatalf("containerd endpoint = %q", got)
+	}
+	if got := Namespace(runtime); got != "twinet-node-0" {
+		t.Fatalf("containerd namespace = %q", got)
+	}
+}
+
 func TestRoutedLabCapabilityValidationRejectsUnknownBackend(t *testing.T) {
 	err := RequireRoutedLabCapabilities("not-a-runtime")
 	if err == nil {

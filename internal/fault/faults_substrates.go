@@ -42,7 +42,7 @@ func registerP4Faults() {
 				return "the BMv2 container is " + state, nil
 			}
 			if err := p4Probe(ctx, e, t); err != nil {
-				return "the declared P4 forwarding probe is not healthy: " + err.Error(), nil
+				return "the declared P4 forwarding probe is not healthy: " + err.Error(), nil //nolint:nilerr // failed precondition, not injector failure
 			}
 			return "", nil
 		},
@@ -188,7 +188,7 @@ func registerP4Faults() {
 				return "the P4 program declares no threshold_register", nil
 			}
 			if err := p4Probe(ctx, e, t); err != nil {
-				return "the declared P4 forwarding probe is not healthy: " + err.Error(), nil
+				return "the declared P4 forwarding probe is not healthy: " + err.Error(), nil //nolint:nilerr // failed precondition, not injector failure
 			}
 			return "", nil
 		},
@@ -351,10 +351,10 @@ func p4TablePrecondition(ctx context.Context, e *Env, t Target) (string, error) 
 		return "", err
 	}
 	if _, _, err := p4BaselineEntry(ctx, e, t, d); err != nil {
-		return err.Error(), nil
+		return err.Error(), nil //nolint:nilerr // failed precondition, not injector failure
 	}
 	if err := p4Probe(ctx, e, t); err != nil {
-		return "the declared P4 forwarding probe is not healthy: " + err.Error(), nil
+		return "the declared P4 forwarding probe is not healthy: " + err.Error(), nil //nolint:nilerr // failed precondition, not injector failure
 	}
 	return "", nil
 }
@@ -462,7 +462,7 @@ func registerP4CompileFault(name, invalid, describe string) {
 				return "", err
 			}
 			if err := p4Probe(ctx, e, t); err != nil {
-				return "the declared P4 forwarding probe is not healthy: " + err.Error(), nil
+				return "the declared P4 forwarding probe is not healthy: " + err.Error(), nil //nolint:nilerr // failed precondition, not injector failure
 			}
 			return "", nil
 		},
@@ -859,7 +859,7 @@ func registerLoadBalancerFault() {
 				return "", err
 			}
 			if _, err := trafficGeneratorDevice(e.Topology); err != nil {
-				return err.Error(), nil
+				return err.Error(), nil //nolint:nilerr // failed precondition, not injector failure
 			}
 			if _, _, err := e.TryE(ctx, lb.ID, "curl -fsS http://127.0.0.1:8080/metrics"); err != nil {
 				return "", err

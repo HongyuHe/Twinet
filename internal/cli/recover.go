@@ -26,7 +26,11 @@ func newRecoverCmd(opts *Options) *cobra.Command {
 		Use:   "recover",
 		Short: "Resume and verify a failed cluster transaction",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			top, err := loadAndPlace(opts)
+			// Recovery is transaction-scoped and contacts every configured
+			// agent; it does not route device work. Loading a placement record
+			// here made the documented recovery path reject the staged record
+			// left by an interrupted cluster deployment.
+			top, err := load(opts)
 			if err != nil {
 				return err
 			}

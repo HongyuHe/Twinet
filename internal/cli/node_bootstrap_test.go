@@ -68,3 +68,26 @@ func TestBootstrapSelectsSecurePodmanServiceAndSocket(t *testing.T) {
 		}
 	}
 }
+
+func TestBootstrapSelectsContainerdServiceAndSocket(t *testing.T) {
+	script := bootstrapScriptForRuntime(model.NodeSpec{
+		Name: "node-c", Addr: "10.0.1.4:7200", UnderlayIP: "10.0.1.4",
+		Runtime: "containerd", RuntimeSocket: "unix:///run/containerd/containerd.sock",
+	}, "containerd", "unix:///run/containerd/containerd.sock", "/project/pki",
+		"/secure/token.env", nil)
+
+	for _, want := range []string{
+		"-runtime containerd",
+		"-runtime-socket unix:///run/containerd/containerd.sock",
+		"install_package containerd containerd",
+		"After=containerd.service",
+		"Requires=containerd.service",
+		"test -S \"/run/containerd/containerd.sock\"",
+		"scp bin/twinet-init",
+		"chmod 0755 /usr/local/bin/twinet-init",
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("containerd bootstrap script does not contain %q", want)
+		}
+	}
+}

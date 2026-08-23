@@ -475,20 +475,6 @@ func waitForHarnessCapacity(ctx context.Context, c *client.Cluster, lab *model.L
 	}
 }
 
-// gradeOne deploys a harness, loads the submission into it, grades it and tears
-// it down. A failure at any stage produces a report explaining the failure
-// rather than an absent mark, because a submission that crashes the grader
-// still needs a defensible answer for the student.
-func gradeOne(ctx context.Context, class *model.Topology, rubric *grade.Rubric,
-	s submission, o batchOpts) *grade.Report {
-	h, err := harness.Slice(class, s.AS,
-		batchHarnessOptions(o.depth, o.reduce, o.fullHarness, o.compact, o.keepHosts, s.Group))
-	if err != nil {
-		return ungradeableReport(s, rubric, "building the harness", err)
-	}
-	return gradeOneHarness(ctx, class, rubric, s, h, o)
-}
-
 func gradeOneHarness(ctx context.Context, class *model.Topology, rubric *grade.Rubric,
 	s submission, h *model.Topology, o batchOpts,
 ) *grade.Report {

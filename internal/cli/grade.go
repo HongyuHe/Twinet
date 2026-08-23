@@ -297,14 +297,6 @@ func execFunc(ctx context.Context, top *model.Topology, token string) (
 	return execFuncWithHoldProvider(ctx, top, token, currentHoldToken, 0)
 }
 
-// execFuncWithHold routes one harness through the lease that protects its
-// namespace. Warm full and compact harnesses coexist, so they cannot share the
-// process-global grade hold token.
-func execFuncWithHold(ctx context.Context, top *model.Topology, token, hold string) (
-	func(context.Context, string, []string) (runtime.ExecResult, error), error) {
-	return execFuncWithHoldProvider(ctx, top, token, func() string { return hold }, 0)
-}
-
 func execFuncWithHoldTimeout(ctx context.Context, top *model.Topology, token, hold string,
 	timeout time.Duration,
 ) (

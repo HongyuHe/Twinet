@@ -21,6 +21,7 @@ func (s *Server) controlDaemonCounts(ctx context.Context, d *model.Device, as *m
 		return counts, nil
 	}
 	var script strings.Builder
+	containerd := runtimeNameForReconcile(s.rt) == "containerd"
 	script.WriteString("for p in")
 	for _, name := range names {
 		script.WriteByte(' ')
@@ -29,7 +30,11 @@ func (s *Server) controlDaemonCounts(ctx context.Context, d *model.Device, as *m
 	// ldpd intentionally forks -L and -E privilege-separated children. The
 	// daemon health contract is the one main `-d` process, not every child
 	// whose comm happens to be ldpd.
-	script.WriteString(`; do n=$(ps -eo comm=,args= | awk -v want="$p" '$1 == want && $0 ~ /[[:space:]]-d([[:space:]]|$)/ {n++} END {print n+0}'); printf '__TWINET_DAEMON__%s\t%s\n' "$p" "$n"; done`)
+	if containerd {
+		script.WriteString(`; do n=$(ps -eo comm=,args= | awk -v want="$p" '$1 == want && (want != "ldpd" || $0 !~ /[[:space:]]-[LE]([[:space:]]|$)/) {n++} END {print n+0}'); printf '__TWINET_DAEMON__%s\t%s\n' "$p" "$n"; done`)
+	} else {
+		script.WriteString(`; do n=$(ps -eo comm=,args= | awk -v want="$p" '$1 == want && $0 ~ /[[:space:]]-d([[:space:]]|$)/ {n++} END {print n+0}'); printf '__TWINET_DAEMON__%s\t%s\n' "$p" "$n"; done`)
+	}
 	result, err := s.probeExec(ctx, s.frrContainer(ctx, d), rt.ExecCmd{
 		Cmd: []string{"sh", "-c", script.String()},
 	})

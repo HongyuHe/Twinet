@@ -499,16 +499,6 @@ func (s *Server) keepRecoveryFence(ctx context.Context, lab string, fence Fence)
 	}
 }
 
-func (s *Server) recoveryOwner(lab string, fence Fence) string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if lease := s.mutations[lab]; lease != nil && lease.fence.Generation == fence.Generation &&
-		subtle.ConstantTimeCompare([]byte(lease.fence.Token), []byte(fence.Token)) == 1 {
-		return lease.holder
-	}
-	return "recovery"
-}
-
 func (s *Server) beginRecovery(lab string, fence Fence, generation, strategy string,
 	totalDeadline time.Time, options recoveryRunOptions,
 ) (applyTransaction, error) {
@@ -2092,9 +2082,9 @@ func (s *Server) fetchRecoveryReplicas(ctx context.Context, top *model.Topology,
 		}
 		s.recordPeerReplication(top.Name, target.Name, nil, time.Time{})
 		for _, wire := range response.Snapshots {
-			key := wire.Snapshot.Device + "/" + string(wire.Snapshot.Kind)
+			key := wire.Device + "/" + string(wire.Kind)
 			expected, needed := missing[key]
-			if !needed || wire.Snapshot.Lab != top.Name || wire.Snapshot.Digest != expected.Digest {
+			if !needed || wire.Lab != top.Name || wire.Digest != expected.Digest {
 				continue
 			}
 			snapshot := wire.Snapshot

@@ -131,6 +131,14 @@ type EndpointRuntime interface {
 	RuntimeEndpoint() string
 }
 
+// NamespaceRuntime is implemented by runtimes whose daemon serves multiple
+// isolated metadata namespaces.
+type NamespaceRuntime interface {
+	Runtime
+	SetRuntimeNamespace(string) error
+	RuntimeNamespace() string
+}
+
 // ConfigureEndpoint binds a selected runtime to an explicit Unix socket or
 // TCP endpoint. An empty endpoint retains the backend's ordinary default.
 func ConfigureEndpoint(r Runtime, endpoint string) error {
@@ -168,6 +176,26 @@ func Endpoint(r Runtime) string {
 	return ""
 }
 
+// ConfigureNamespace selects an isolated runtime namespace when supported.
+func ConfigureNamespace(r Runtime, namespace string) error {
+	if strings.TrimSpace(namespace) == "" {
+		return nil
+	}
+	configurable, ok := r.(NamespaceRuntime)
+	if !ok {
+		return fmt.Errorf("runtime backend %q does not support an explicit namespace", r.Name())
+	}
+	return configurable.SetRuntimeNamespace(namespace)
+}
+
+// Namespace returns the isolated metadata namespace reported by a backend.
+func Namespace(r Runtime) string {
+	if configurable, ok := r.(NamespaceRuntime); ok {
+		return configurable.RuntimeNamespace()
+	}
+	return ""
+}
+
 func init() {
 	Register("docker", BackendCapabilities{
 		Lifecycle: true, Exec: true, Copy: true, NetworkNamespaces: true, Events: true,
@@ -175,4 +203,7 @@ func init() {
 	Register("podman", BackendCapabilities{
 		Lifecycle: true, Exec: true, Copy: true, NetworkNamespaces: true, Events: true,
 	}, func() Runtime { return NewPodman() })
+	Register("containerd", BackendCapabilities{
+		Lifecycle: true, Exec: true, Copy: true, NetworkNamespaces: true, Events: true,
+	}, func() Runtime { return NewContainerd() })
 }

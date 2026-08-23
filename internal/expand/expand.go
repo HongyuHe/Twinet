@@ -478,7 +478,7 @@ func (e *expander) expandOneAS(asn int, spec model.ASSpec) error {
 				Prescribed: true, Subnet: subnet}
 			host.AddIface(hIf)
 			leaf.AddIface(lIf)
-			l := e.link(hIf, lIf, model.LinkVeth, tpl.Interior.LinkProps.Merge(e.lab.LinkDefaults), subnet, owner)
+			l := e.link(hIf, lIf, model.LinkVeth, tpl.Interior.Merge(e.lab.LinkDefaults), subnet, owner)
 			l.Class, l.AddressingField = model.LinkClassLeafHost, field
 		}
 	}

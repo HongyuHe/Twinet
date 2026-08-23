@@ -149,18 +149,6 @@ func Generate(dir string, nodes map[string][]string) (*Bundle, error) {
 	return b, nil
 }
 
-func issue(dir, name string, caCert *x509.Certificate, caKey *ecdsa.PrivateKey,
-	sans []string, usage []x509.ExtKeyUsage) (Material, error) {
-	return issueFor(dir, name, caCert, caKey, sans, usage, leafValidity)
-}
-
-// issueFor is issue with an explicit lifetime, so a credential handed to
-// something under evaluation can be short-lived.
-func issueFor(dir, name string, caCert *x509.Certificate, caKey *ecdsa.PrivateKey,
-	sans []string, usage []x509.ExtKeyUsage, valid time.Duration) (Material, error) {
-	return issueForClaims(dir, name, caCert, caKey, sans, nil, usage, valid)
-}
-
 func issueForClaims(dir, name string, caCert *x509.Certificate, caKey *ecdsa.PrivateKey,
 	sans []string, uris []*url.URL, usage []x509.ExtKeyUsage, valid time.Duration) (Material, error) {
 	return issueForClaimsSubject(dir, name, name, caCert, caKey, sans, uris, usage, valid)
@@ -451,8 +439,8 @@ func validateMaterialName(name string) error {
 		return fmt.Errorf("credential name must be a single safe path component")
 	}
 	for _, r := range name {
-		if !(r >= 'a' && r <= 'z') && !(r >= 'A' && r <= 'Z') &&
-			!(r >= '0' && r <= '9') && r != '.' && r != '_' && r != '-' {
+		if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') &&
+			(r < '0' || r > '9') && r != '.' && r != '_' && r != '-' {
 			return fmt.Errorf("credential name %q contains unsafe characters", name)
 		}
 	}

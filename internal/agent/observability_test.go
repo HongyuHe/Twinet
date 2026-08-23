@@ -6,7 +6,6 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"sync"
 	"testing"
 	"time"
 
@@ -30,7 +29,6 @@ func (r *eventRepairRuntime) Inspect(context.Context, string) (rt.Container, err
 }
 
 type rotatingEventSource struct {
-	mu      sync.Mutex
 	streams chan *rt.Memory
 }
 

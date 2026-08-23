@@ -369,25 +369,6 @@ func assignedWireDevices(wire *agent.Wire, node string) []string {
 	return out
 }
 
-func (c *Cluster) abortApply(ctx context.Context, lease *MutationLease, wire *agent.Wire,
-	peers map[string]string, generation string, req agent.ApplyRequest,
-) []error {
-	if lease == nil {
-		return nil
-	}
-	var errs []error
-	nodes := c.sortedNodes()
-	for i := len(nodes) - 1; i >= 0; i-- {
-		node := nodes[i]
-		abort := applyRequestForNode(req, wire, peers, lease, node.Name, "abort", "", generation)
-		abort.Topology = nil
-		if _, err := node.Apply(ctx, abort); err != nil {
-			errs = append(errs, fmt.Errorf("%s rollback: %w", node.Name, err))
-		}
-	}
-	return errs
-}
-
 func (c *Cluster) recoverFailedApply(ctx context.Context, lease *MutationLease, lab string,
 	cause error,
 ) error {

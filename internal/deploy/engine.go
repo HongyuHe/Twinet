@@ -707,7 +707,7 @@ func (e *Engine) usesFRRControl(d *model.Device) bool {
 	// deliberately stay single-container fakes; they test planning without
 	// creating host directories or a second process namespace.
 	switch runtimeName(e.Runtime) {
-	case "docker", "podman":
+	case "docker", "podman", "containerd":
 		return true
 	default:
 		return false
@@ -999,14 +999,6 @@ func (e *Engine) removeFRRControl(ctx context.Context, d *model.Device) error {
 	return e.Runtime.Remove(ctx, name, true)
 }
 
-func frrControlSpecHash(d *model.Device) string {
-	h := sha256.New()
-	fmt.Fprintf(h, "%s\n%s\n%s\n", frrControlContractVersion, d.ID, d.Image)
-	fmt.Fprintf(h, "imageid=%s\nrestart=%s\n", d.ImageID, d.Restart)
-	fmt.Fprintf(h, "device=%s\n", SpecHash(d))
-	return hex.EncodeToString(h.Sum(nil))[:24]
-}
-
 // captureBeforeReplace snapshots a student-owned device before it is destroyed.
 func (e *Engine) captureBeforeReplace(ctx context.Context, top *model.Topology, d *model.Device) error {
 	if e.State == nil || !studentOwned(top, d) {
@@ -1257,25 +1249,6 @@ func (e *Engine) PruneOrphans(ctx context.Context, top *model.Topology) ([]strin
 		removed = append(removed, c.Name)
 	}
 	return removed, deterministicError(ctxErr, problems)
-}
-
-// captureOrphan snapshots a container that is about to be removed.
-//
-// A container with no state store configured is removed without capture,
-// because there is nowhere to put the snapshot and blocking every prune on a
-// store nobody configured would make the platform unusable. That is a
-// deliberate trade and it is recorded here rather than left implicit.
-func (e *Engine) captureOrphan(ctx context.Context, top *model.Topology, c runtime.Container) error {
-	snaps, err := e.orphanSnapshots(ctx, top, c)
-	if err != nil {
-		return err
-	}
-	for _, snap := range snaps {
-		if _, err := e.State.Put(snap); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 func (e *Engine) orphanSnapshots(ctx context.Context, top *model.Topology, c runtime.Container) ([]state.Snapshot, error) {
@@ -1813,10 +1786,45 @@ func (e *Engine) configureDesired(ctx context.Context, d *model.Device, state de
 		}
 		e.recordMutation("copy", 1)
 	}
-	for _, c := range state.commands {
+	for index := 0; index < len(state.commands); {
+		c := state.commands[index]
 		container := d.Container
 		if c.FRRControl && e.usesFRRControl(d) {
 			container = FRRControlContainer(d)
+		}
+		if batcher, ok := e.Runtime.(runtime.BatchExecRuntime); ok {
+			end := index + 1
+			var batch []runtime.ExecCmd
+			var commands []Command
+			for end <= len(state.commands) {
+				candidate := state.commands[end-1]
+				candidateContainer := d.Container
+				if candidate.FRRControl && e.usesFRRControl(d) {
+					candidateContainer = FRRControlContainer(d)
+				}
+				if candidateContainer != container {
+					break
+				}
+				batch = append(batch, runtime.ExecCmd{Cmd: candidate.Args})
+				commands = append(commands, candidate)
+				end++
+			}
+			results, err := batcher.ExecBatch(ctx, container, batch)
+			if err != nil {
+				return fmt.Errorf("%s: %s: %w", d.ID, c.Describe, err)
+			}
+			if len(results) != len(commands) {
+				return fmt.Errorf("%s: runtime returned %d batch results for %d commands",
+					d.ID, len(results), len(commands))
+			}
+			for i, result := range results {
+				if err := result.Err(); err != nil && !commands[i].IgnoreError {
+					return fmt.Errorf("%s: %s: %w", d.ID, commands[i].Describe, err)
+				}
+				e.recordMutation("command", 1)
+			}
+			index = end - 1
+			continue
 		}
 		res, err := e.Runtime.Exec(ctx, container, runtime.ExecCmd{Cmd: c.Args})
 		if err != nil {
@@ -1826,6 +1834,7 @@ func (e *Engine) configureDesired(ctx context.Context, d *model.Device, state de
 			return fmt.Errorf("%s: %s: %w", d.ID, c.Describe, err)
 		}
 		e.recordMutation("command", 1)
+		index++
 	}
 	if e.shouldForceStudentReset(d) && d.Kind == model.KindRouter {
 		if err := e.restartPlatformRouting(ctx, d); err != nil {

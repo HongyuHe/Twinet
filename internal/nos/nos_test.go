@@ -17,12 +17,12 @@ type nosExecutor struct {
 
 func (e nosExecutor) Exec(_ context.Context, _ string, command []string) (runtime.ExecResult, error) {
 	joined := strings.Join(command, " ")
-	switch {
-	case joined == "vtysh -c show ip bgp summary json":
+	switch joined {
+	case "vtysh -c show ip bgp summary json":
 		return runtime.ExecResult{Stdout: `{"ipv4Unicast":{"peers":{"192.0.2.2":{"remoteAs":2,"state":"Established","pfxRcd":3,"pfxSnt":4,"msgRcvd":5,"msgSent":6}}}}`}, nil
-	case joined == "birdc -r -s /run/bird.ctl show protocols all":
+	case "birdc -r -s /run/bird.ctl show protocols all":
 		return runtime.ExecResult{Stdout: "peer1 BGP --- up\n  Neighbor address: 192.0.2.2\n  Neighbor AS: 2\n"}, nil
-	case joined == "cat /etc/bird/bird.conf":
+	case "cat /etc/bird/bird.conf":
 		return runtime.ExecResult{Stdout: e.birdConfig}, nil
 	default:
 		return runtime.ExecResult{ExitCode: 1, Stderr: "unexpected command " + joined}, nil

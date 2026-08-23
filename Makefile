@@ -47,7 +47,7 @@ TWINET_K8S_HELPER_IMAGE ?= docker.io/nicolaka/netshoot:v0.13@sha256:a20c2531bf35
 TWINET_K8S_WORKLOAD_IMAGE ?= docker.io/library/busybox:1.36.1@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662
 TWINET_NIKA_KUBERNETES_BRIDGE ?= python3 $(CURDIR)/contrib/nika/kubernetes_bridge.py --kubectl $(KUBECTL)$(if $(strip $(KUBECONFIG)), --kubeconfig $(abspath $(KUBECONFIG)),) --helper-image $(TWINET_K8S_HELPER_IMAGE) --workload-image $(TWINET_K8S_WORKLOAD_IMAGE)
 
-.PHONY: all build release-build source-identity-stamp source-identity-check test-source-identity test lint fmt vet images push digests image-lock image-verify podman-images podman-integration clean install e2e ci ci-tools tidy-check naming \
+.PHONY: all build release-build source-identity-stamp source-identity-check test-source-identity test lint fmt vet images push digests image-lock image-verify podman-images podman-integration containerd-integration clean install e2e ci ci-tools tidy-check naming \
 	script-tests benchmark chaos soak-short soak-24h nos-images substrate-images substrate-integration \
 	fault-integration k8s-fault-integration fault-stress fault-stress-release o12-integration
 
@@ -56,6 +56,7 @@ all: build
 build: source-identity-stamp
 	$(GO) build -trimpath -ldflags '$(LDFLAGS)' -o $(BIN)/twinet ./cmd/twinet
 	$(GO) build -trimpath -ldflags '$(LDFLAGS)' -o $(BIN)/twinetd ./cmd/twinetd
+	CGO_ENABLED=0 $(GO) build -trimpath -ldflags '-s -w' -o $(BIN)/twinet-init ./cmd/twinet-init
 	CGO_ENABLED=0 $(GO) build -trimpath -ldflags '$(LDFLAGS)' -o $(BIN)/twinet-rtr ./cmd/twinet-rtr
 	CGO_ENABLED=0 $(GO) build -trimpath -ldflags '$(LDFLAGS)' -o $(BIN)/twinet-dhcpd ./cmd/twinet-dhcpd
 	CGO_ENABLED=0 $(GO) build -trimpath -ldflags '$(LDFLAGS)' -o $(BIN)/twinet-mcast ./cmd/twinet-mcast
@@ -255,9 +256,17 @@ podman-integration:
 	REGISTRY="$(REGISTRY)" TAG="$(TAG)" \
 	$(GO) test -count=1 -tags=podman_integration -timeout 15m ./test/integration/ -run '^TestPodmanRoutedLabLifecycle$$'
 
+containerd-integration: build
+	sudo -n env PATH="$$PATH" \
+	TWINET_CONTAINERD_INTEGRATION=1 \
+	TWINET_CONTAINERD_HOST="$${TWINET_CONTAINERD_HOST:-unix:///run/containerd/containerd.sock}" \
+	TWINET_INIT_BINARY="$(CURDIR)/bin/twinet-init" \
+	$(GO) test -count=1 -tags=containerd_integration -timeout 10m ./test/integration/ -run '^TestContainerdRuntimeLifecycle$$'
+
 install: build
 	install -m 0755 $(BIN)/twinet /usr/local/bin/twinet
 	install -m 0755 $(BIN)/twinetd /usr/local/bin/twinetd
+	install -m 0755 $(BIN)/twinet-init /usr/local/bin/twinet-init
 
 # The test binary is version-stamped exactly like the real one. Without this it
 # reports itself as "dev" and every test that talks to a cluster refuses on

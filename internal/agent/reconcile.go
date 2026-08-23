@@ -124,7 +124,6 @@ func (s *Server) runtimeEventLoop(ctx context.Context) {
 		})
 		s.metricRegistry().observeRuntime("subscribe", time.Since(start), nil)
 		s.recordEvent("", "", "runtime", "", "event_subscription", "success", "connected")
-		retry = reconcileRetryMin
 
 		events, errs := subscription.Events, subscription.Errors
 		terminal := error(nil)
@@ -158,6 +157,9 @@ func (s *Server) runtimeEventLoop(ctx context.Context) {
 		}
 		s.metricRegistry().observeRuntime("subscribe", 0, terminal)
 		s.recordEvent("", "", "runtime", "", "event_subscription", "error", terminal.Error())
+		if time.Since(start) >= reconcileRetryMax {
+			retry = reconcileRetryMin
+		}
 		select {
 		case <-ctx.Done():
 			return
@@ -995,7 +997,7 @@ func (s *Server) requiresFRRControl(d *model.Device) bool {
 		return false
 	}
 	switch runtimeNameForReconcile(s.rt) {
-	case "docker", "podman":
+	case "docker", "podman", "containerd":
 		return true
 	default:
 		return false
@@ -1079,19 +1081,6 @@ func (s *Server) missingDaemonsResult(ctx context.Context, d *model.Device, as *
 	return strings.TrimRight(strings.TrimLeft(r.Stdout, " "), " \n"), nil
 }
 
-// hasLostItsWiring reports whether a running container is missing something the
-// lab says it should have.
-//
-// Counting interfaces is not enough, and believing it was hid a real failure:
-// a repaired router had its cables back and nothing else -- no addresses, no
-// VLAN sub-interfaces, no tunnel, and no routing daemon -- but the count said
-// it was fine, so it was never looked at again. The check therefore asks for
-// each thing separately and reports a device as broken if any of them is
-// missing.
-func (s *Server) hasLostItsWiring(ctx context.Context, lab string, d *model.Device) bool {
-	return s.observeDevice(ctx, lab, d, true).Health == healthBroken
-}
-
 // brokenBecause names the first thing a device is missing, or "" if it is well.
 func (s *Server) brokenBecause(ctx context.Context, lab string, d *model.Device) string {
 	observation := s.observeDevice(ctx, lab, d, true)
@@ -1115,10 +1104,8 @@ func (s *Server) observeDevice(ctx context.Context, lab string, d *model.Device,
 			want[i.Name] = true
 		}
 	}
-	if len(want) == 0 {
-		// A device without modelled wires is still required to have a readable,
-		// running runtime state. It is otherwise handled below.
-	}
+	// A device without modelled wires is still required to have a readable,
+	// running runtime state. It is otherwise handled below.
 	c, err := s.rt.Inspect(ctx, d.Container)
 	if err != nil {
 		return deviceObservation{Health: healthUnknown, Reason: "runtime inspect unreadable: " + err.Error()}
@@ -1692,19 +1679,6 @@ func (s *Server) forgetLab(name string) {
 // wire one device and far shorter than the "until somebody notices" that this
 // replaced.
 const partialWiringGrace = 3
-
-// partiallyWiredFor counts consecutive surveys in which a device has been
-// missing some of its interfaces.
-// Keyed by lab and device, like the repair counter beside it.
-//
-// Device identifiers repeat by design: every private grading harness contains
-// as3/ATL and so does the class lab. Keyed on the device alone, one lab's
-// surveys advanced another's count and one lab's recovery cleared it, so a
-// device could be rewired during its own deployment or never repaired at all,
-// depending on what else the node happened to be running.
-func (s *Server) partiallyWiredFor(lab, id string) int {
-	return s.partialCount(lab, id, true)
-}
 
 func (s *Server) partialCount(lab, id string, advance bool) int {
 	s.mu.Lock()

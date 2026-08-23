@@ -508,12 +508,6 @@ func (s *Server) verifyReferenceBGPControl(ctx context.Context, device *model.De
 	return nil
 }
 
-// verifyReferenceBGPSessions remains a source-compatible helper for callers
-// that only need session/RIB control-plane health.
-func (s *Server) verifyReferenceBGPSessions(ctx context.Context, device *model.Device) error {
-	return s.verifyReferenceBGPControl(ctx, device)
-}
-
 func bgpPeerState(value any, peer string) string {
 	switch current := value.(type) {
 	case map[string]any:

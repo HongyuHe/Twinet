@@ -261,38 +261,6 @@ func WaitLDP(ctx context.Context, env *Env, timeout time.Duration) error {
 	})
 }
 
-// waitForScope waits for whichever part of the control plane a question is
-// about.
-//
-// Waiting for more than the question needs is not conservative, it is wrong: a
-// question about the interior that waits for external sessions reports a
-// student whose OSPF is perfect as ungradeable because their BGP is not written
-// yet, and an ungradeable report is a mark nobody receives.
-//
-// "ospf" means the interior control plane, which includes label distribution
-// where a submission runs it: the advnet rubric asks for this scope and then
-// marks mpls.ldp_adjacencies inside it. Waiting for LDP costs nothing in a lab
-// that does not run it, because the wait reads the configuration first and
-// returns immediately when no router speaks LDP.
-func waitForScope(ctx context.Context, env *Env, scope string, timeout time.Duration) error {
-	switch scope {
-	case "ospf":
-		deadline := time.Now().Add(timeout)
-		if err := WaitOSPF(ctx, env, timeout); err != nil {
-			return err
-		}
-		return WaitLDP(ctx, env, time.Until(deadline))
-	case "bgp":
-		deadline := time.Now().Add(timeout)
-		if err := WaitBGPSessions(ctx, env, timeout); err != nil {
-			return err
-		}
-		return WaitRIBStable(ctx, env, time.Until(deadline))
-	default:
-		return WaitConverged(ctx, env, timeout)
-	}
-}
-
 // WaitConverged waits for the whole control plane of the AS to settle.
 func WaitConverged(ctx context.Context, env *Env, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)

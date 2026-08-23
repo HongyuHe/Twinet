@@ -360,11 +360,18 @@ func Run(ctx context.Context, r *Rubric, env *Env, opts RunOptions) *Report {
 	var snapshot *ObservationSnapshot
 	observationStarted := time.Now().UTC()
 	snapshot = collectObservationSnapshot(ctx, r, &runEnv, opts.ObservationParallel)
+	if snapshot == nil {
+		snapshot = newObservationSnapshot(runEnv.Exec)
+	}
 	observationFinished := time.Now().UTC()
+	cache := ObservationStats{}
+	if snapshot != nil {
+		cache = snapshot.Stats
+	}
 	phases.appendDetail(PhaseTiming{
 		Name: "observation", StartedAt: observationStarted, FinishedAt: observationFinished,
 		Duration: observationFinished.Sub(observationStarted).Round(time.Millisecond).String(),
-		Cache:    snapshot.Stats,
+		Cache:    cache,
 	})
 	runEnv.snapshot = snapshot
 	earned := map[string]float64{}

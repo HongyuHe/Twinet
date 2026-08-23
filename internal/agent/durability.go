@@ -234,14 +234,6 @@ func peerNodeName(r *http.Request) string {
 	return r.TLS.PeerCertificates[0].Subject.CommonName
 }
 
-func peerClient(r *http.Request) bool {
-	if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
-		return false
-	}
-	id, err := authz.FromCertificate(r.TLS.PeerCertificates[0])
-	return err == nil && id.Role == authz.RolePeer
-}
-
 func (s *Server) handlePeerStateInventory(w http.ResponseWriter, r *http.Request) {
 	if s.store == nil {
 		httpError(w, http.StatusServiceUnavailable, errors.New("this node has no durable state store"))
@@ -439,12 +431,6 @@ func (s *Server) durabilityTopology(lab string) (*model.Topology, model.StatePol
 		return nil, model.StatePolicy{}, false
 	}
 	return top, top.Lab.State, true
-}
-
-func (s *Server) modeOf(lab string) string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.modes[lab]
 }
 
 func (s *Server) modeAndUngraded(lab string) (render.Mode, int) {
@@ -859,7 +845,7 @@ func (s *Server) peerReplicationRetryDue(lab string) bool {
 	return false
 }
 
-func retryPeer(ctx context.Context, fn func() error) (error, time.Time) {
+func retryPeer(ctx context.Context, fn func() error) (error, time.Time) { //nolint:staticcheck // callers branch on the error before scheduling its retry time
 	delay := peerRetryMin
 	var last error
 	for attempt := 0; attempt < peerRetryAttempts; attempt++ {

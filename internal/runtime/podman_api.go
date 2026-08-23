@@ -70,7 +70,7 @@ func (p *podmanAPI) PullImage(ctx context.Context, ref string, policy PullPolicy
 	if err != nil {
 		return fmt.Errorf("podman pull %s: %w", ref, err)
 	}
-	defer stream.Close()
+	defer func() { _ = stream.Close() }()
 	if err := stream.Wait(ctx); err != nil {
 		return fmt.Errorf("podman pull %s: %w", ref, err)
 	}
@@ -286,7 +286,7 @@ func (p *podmanAPI) CopyFromFollow(ctx context.Context, name, src string) ([]byt
 		// to the path itself for some regular BusyBox hardlinks. Its archive
 		// endpoint already follows that link and returns the regular file, so
 		// retrying without client-side link walking is both safe and faithful.
-		content, err = p.dockerAPI.copyFrom(ctx, name, src, false)
+		content, err = p.copyFrom(ctx, name, src, false)
 	}
 	if err != nil && cerrdefs.IsNotImplemented(err) {
 		return nil, fmt.Errorf("%w: Podman archive API does not expose symlink metadata: %w", ErrUnsupported, err)

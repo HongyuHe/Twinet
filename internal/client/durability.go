@@ -66,10 +66,12 @@ func (c *Cluster) ApplyDurable(ctx context.Context, top *model.Topology,
 			return transactionFailure(nodes, nil, err), report
 		}
 	}
-	report.Phases.measure("image_resolution", func() error {
+	if err := report.Phases.measure("image_resolution", func() error {
 		c.stampImageIDs(ctx, top)
 		return nil
-	})
+	}); err != nil {
+		return transactionFailure(nodes, nil, err), report
+	}
 	if req.DryRun || len(nodes) == 0 {
 		start := time.Now()
 		results := c.coordinatedApply(ctx, top, req)
@@ -210,9 +212,7 @@ func (c *Cluster) prepareMigration(ctx context.Context, top *model.Topology,
 			if err := verifyImportAcks(response.Acks, snapshots, records); err != nil {
 				return plan, fmt.Errorf("import durable state on %s: %w", destination, err)
 			}
-			for _, proof := range proofsForDestination(snapshots) {
-				plan.proofs[destination] = append(plan.proofs[destination], proof)
-			}
+			plan.proofs[destination] = append(plan.proofs[destination], proofsForDestination(snapshots)...)
 		}
 		plan.report.Moved += len(devices)
 	}

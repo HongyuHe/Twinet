@@ -40,7 +40,7 @@ func tryClusterNoop(ctx context.Context, top *model.Topology, token, mode string
 	fmt.Fprintln(w, "NODE\tSTEPS\tDURATION\tSTATUS")
 	for _, result := range results {
 		if result.Err != nil {
-			return false, nil
+			return false, nil //nolint:nilerr // a failed witness falls back to normal deployment
 		}
 		duration := time.Duration(result.Value.Stats.ObserveMS+result.Value.Stats.DiffMS) * time.Millisecond
 		fmt.Fprintf(w, "%s\t0\t%s\tok\n", result.Node, duration)

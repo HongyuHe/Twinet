@@ -223,7 +223,7 @@ default via 3.101.0.1 dev eth0
 	reset, address, ready, load := commandIndex(commands, "ip addr flush"),
 		commandIndex(commands, "ip addr replace"), commandIndex(commands, "vtysh -c show version"),
 		commandIndex(commands, "vtysh -f /etc/twinet/restore.conf")
-	if reset < 0 || address < 0 || ready < 0 || load < 0 || !(reset < address && address < ready && ready < load) {
+	if reset < 0 || address < 0 || ready < 0 || load < 0 || (reset >= address || address >= ready || ready >= load) {
 		t.Fatalf("router restore order = %q", commands)
 	}
 }

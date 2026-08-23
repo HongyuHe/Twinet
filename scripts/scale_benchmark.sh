@@ -501,11 +501,12 @@ PY
 }
 
 cleanup_lab() {
-    local attempt phase
+    local attempt phase lab_name
     local -a recover_args
+    lab_name=$(<"${scratch_dir}/lab_name")
     cleanup_attempted=1
     if run_capture cleanup_destroy_1 timeout --signal=TERM --kill-after=30s \
-        "$cleanup_destroy_wait" "$binary" destroy -m "$run_manifest" --yes; then
+        "$cleanup_destroy_wait" "$binary" destroy -m "$run_manifest" --lab "$lab_name" --yes; then
         cleanup_succeeded=1
         printf '%s\n' cleanup_destroy_1 >"${scratch_dir}/cleanup_result_phase"
         return 0
@@ -528,7 +529,7 @@ cleanup_lab() {
         fi
         if run_capture "cleanup_destroy_$((attempt + 1))" \
             timeout --signal=TERM --kill-after=30s "$cleanup_destroy_wait" \
-            "$binary" destroy -m "$run_manifest" --yes; then
+            "$binary" destroy -m "$run_manifest" --lab "$lab_name" --yes; then
             cleanup_succeeded=1
             printf 'cleanup_destroy_%s\n' "$((attempt + 1))" >"${scratch_dir}/cleanup_result_phase"
             return 0
@@ -538,7 +539,10 @@ cleanup_lab() {
             printf '%s\n' "$phase" >"${scratch_dir}/cleanup_result_phase"
             return 0
         fi
-        sleep 2
+        # A disconnected deploy can spend tens of seconds quiescing in-flight
+        # runtime calls before its lease becomes recoverable. Do not burn every
+        # bounded takeover attempt during that legitimate cancellation window.
+        sleep 15
     done
     return 1
 }

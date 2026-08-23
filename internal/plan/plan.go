@@ -466,7 +466,6 @@ func (p *Plan) Execute(ctx context.Context, opts Options) (*Report, error) {
 	var stopErr error
 	for len(results) < p.Len() && !stopScheduling {
 		if err := ctx.Err(); err != nil {
-			stopScheduling = true
 			stopErr = err
 			cancel()
 			break
@@ -518,7 +517,6 @@ func (p *Plan) Execute(ctx context.Context, opts Options) (*Report, error) {
 				}
 			}
 			stopErr = fmt.Errorf("plan deadlocked; unrunnable steps: %s", strings.Join(pending, ", "))
-			stopScheduling = true
 			cancel()
 			break
 		}

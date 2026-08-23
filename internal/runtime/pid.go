@@ -26,8 +26,8 @@ func NormalizePIDMode(mode string) (string, error) {
 		return "", fmt.Errorf("PID mode %q has no container name", mode)
 	}
 	for _, r := range name {
-		if !(r >= 'a' && r <= 'z') && !(r >= 'A' && r <= 'Z') &&
-			!(r >= '0' && r <= '9') && r != '.' && r != '_' && r != '-' {
+		if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') &&
+			(r < '0' || r > '9') && r != '.' && r != '_' && r != '-' {
 			return "", fmt.Errorf("PID mode %q has an unsafe container name", mode)
 		}
 	}

@@ -61,8 +61,11 @@ type Config struct {
 	// RuntimeSocket optionally binds the selected backend to a particular
 	// local Engine API endpoint rather than relying on process environment.
 	RuntimeSocket string
-	UnderlayIP    string
-	UnderlayDev   string
+	// RuntimeNamespace isolates containerd metadata from Docker's moby
+	// namespace and from any other agent sharing the daemon.
+	RuntimeNamespace string
+	UnderlayIP       string
+	UnderlayDev      string
 	// StateDir holds student-owned configuration snapshots. It must survive
 	// container replacement and node reboots, because it is the only copy of
 	// work a class cannot recreate.
@@ -110,9 +113,11 @@ func Main(ctx context.Context, args []string) error {
 		listen      = fs.String("listen", ":7200", "address to serve the agent API on")
 		token       = fs.String("token", os.Getenv("TWINET_TOKEN"), "shared secret the control plane must present")
 		runtimeName = fs.String("runtime", os.Getenv("TWINET_RUNTIME"),
-			"registered container runtime (docker or podman; default docker)")
+			"registered container runtime (docker, podman, or containerd; default docker)")
 		runtimeSocket = fs.String("runtime-socket", os.Getenv("TWINET_RUNTIME_SOCKET"),
 			"optional Unix socket or TCP endpoint for the selected runtime")
+		runtimeNamespace = fs.String("runtime-namespace", os.Getenv("TWINET_RUNTIME_NAMESPACE"),
+			"containerd metadata namespace (default twinet-<node>)")
 		uip      = fs.String("underlay-ip", "", "VTEP source address for cross-node links")
 		udev     = fs.String("underlay-dev", "", "interface to source tunnels from")
 		sdir     = fs.String("state-dir", "/var/lib/twinet/state", "where student configuration snapshots are kept")
@@ -149,8 +154,8 @@ func Main(ctx context.Context, args []string) error {
 			"node-wide image pull concurrency")
 		captureLimit = fs.Int("limit-capture", defaultLimits.Capture,
 			"node-wide state capture concurrency")
-		convergenceLimit = fs.Int("limit-convergence", defaultLimits.Convergence,
-			"node-wide routing convergence concurrency")
+		convergenceLimit = fs.Int("limit-convergence", 0,
+			"node-wide routing convergence concurrency (0 selects the measured runtime default)")
 		recoveryMaxTimeout = fs.Duration("recovery-max-timeout", MaximumRecoveryTotalTimeout,
 			"maximum workload-derived recovery duration (hard cap 2h)")
 		verbose = fs.Bool("verbose", false, "debug logging")
@@ -187,7 +192,8 @@ func Main(ctx context.Context, args []string) error {
 	s, err := New(Config{
 		Node: *node, Listen: *listen, Token: *token,
 		Runtime: *runtimeName, RuntimeSocket: *runtimeSocket,
-		UnderlayIP: *uip, UnderlayDev: *udev, StateDir: *sdir, Insecure: *insec,
+		RuntimeNamespace: *runtimeNamespace,
+		UnderlayIP:       *uip, UnderlayDev: *udev, StateDir: *sdir, Insecure: *insec,
 		TLSCert: *cert, TLSKey: *key, ClientCA: *cacert, GCGrace: *gcGrace,
 		PeerTLSCert: *peerCert, PeerTLSKey: *peerKey, LegacyPeerCertUntil: peerMigrationUntil,
 		GCInterval: *gcInterval, EventCapacity: *eventCapacity,
@@ -380,6 +386,12 @@ func New(cfg Config) (*Server, error) {
 	}
 	if err := rt.ConfigureEndpoint(engine, cfg.RuntimeSocket); err != nil {
 		return nil, fmt.Errorf("configure %s runtime socket: %w", runtimeName, err)
+	}
+	if runtimeName == "containerd" && strings.TrimSpace(cfg.RuntimeNamespace) == "" {
+		cfg.RuntimeNamespace = "twinet-" + cfg.Node
+	}
+	if err := rt.ConfigureNamespace(engine, cfg.RuntimeNamespace); err != nil {
+		return nil, fmt.Errorf("configure %s runtime namespace: %w", runtimeName, err)
 	}
 	if _, err := engine.Ping(context.Background()); err != nil {
 		return nil, fmt.Errorf("cannot reach selected %s container engine: %w", runtimeName, err)
@@ -989,11 +1001,13 @@ type StatusResponse struct {
 	// controller to distinguish a Podman selection from a Docker-compatible
 	// socket accidentally pointed at a different daemon.
 	RuntimeSocket string `json:"runtime_socket,omitempty"`
-	CPUs          int    `json:"cpus"`
-	UnderlayIP    string `json:"underlay_ip,omitempty"`
-	UnderlayDev   string `json:"underlay_dev,omitempty"`
-	UnderlayMTU   int    `json:"underlay_mtu,omitempty"`
-	Containers    int    `json:"containers"`
+	// RuntimeNamespace identifies the isolated containerd metadata namespace.
+	RuntimeNamespace string `json:"runtime_namespace,omitempty"`
+	CPUs             int    `json:"cpus"`
+	UnderlayIP       string `json:"underlay_ip,omitempty"`
+	UnderlayDev      string `json:"underlay_dev,omitempty"`
+	UnderlayMTU      int    `json:"underlay_mtu,omitempty"`
+	Containers       int    `json:"containers"`
 	// PrimaryContainers deliberately excludes internal FRR control sidecars;
 	// it is the topology-device count operators compare with placement.
 	PrimaryContainers int `json:"primary_containers"`
@@ -1116,6 +1130,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		Node: s.cfg.Node, Version: Version, Compatibility: Compatibility(),
 		Uptime:  time.Since(s.started).Round(time.Second).String(),
 		Runtime: s.rt.Name(), RuntimeVer: ver, RuntimeSocket: rt.Endpoint(s.rt),
+		RuntimeNamespace:  rt.Namespace(s.rt),
 		CPUs:              runtime.NumCPU(),
 		UnderlayIP:        s.cfg.UnderlayIP,
 		UnderlayDev:       s.cfg.UnderlayDev,
@@ -1687,6 +1702,9 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		}
 		if rep.Failed() {
 			resp.Failures = reportFailures(rep)
+			slog.Error("apply plan reported degraded scopes",
+				"lab", top.Name, "generation", req.Generation, "node", s.cfg.Node,
+				"failures", resp.Failures)
 			_ = s.markTransactionPhase(top.Name, req.Fence, req.Generation,
 				transactionRollbackNeeded, fmt.Sprintf("forward apply failed: %v", rep.Err()))
 			s.recordEvent(top.Name, req.Generation, "deploy", s.requestCorrelation(r),

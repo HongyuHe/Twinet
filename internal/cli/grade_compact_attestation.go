@@ -74,7 +74,7 @@ func graderSourceIdentity() (string, bool) {
 		return "", false
 	}
 	for _, ch := range SourceDigest {
-		if !(ch >= '0' && ch <= '9' || ch >= 'a' && ch <= 'f') {
+		if (ch < '0' || ch > '9') && (ch < 'a' || ch > 'f') {
 			return "", false
 		}
 	}

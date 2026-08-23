@@ -534,9 +534,12 @@ func bootstrapScriptForRuntime(n model.NodeSpec, selectedRuntime, socket, pkiDir
 		selectedRuntime = model.DefaultRuntime
 	}
 	if socket == "" {
-		if selectedRuntime == "podman" {
+		switch selectedRuntime {
+		case "podman":
 			socket = "unix:///run/podman/podman.sock"
-		} else {
+		case "containerd":
+			socket = "unix:///run/containerd/containerd.sock"
+		default:
 			socket = "unix:///var/run/docker.sock"
 		}
 	}
@@ -562,6 +565,9 @@ func bootstrapScriptForRuntime(n model.NodeSpec, selectedRuntime, socket, pkiDir
 	b.WriteString("grep -Eq '^TWINET_TOKEN=[^[:space:]]+' \"$TWINET_TOKEN_FILE\" || { echo 'token file must contain TWINET_TOKEN=...' >&2; exit 1; }\n")
 	fmt.Fprintf(&b, "ssh root@%s 'install -d -m 0700 /etc/twinet/pki /var/lib/twinet/state'\n", n.Name)
 	fmt.Fprintf(&b, "scp bin/twinetd root@%s:/usr/local/bin/twinetd\n", n.Name)
+	if selectedRuntime == "containerd" {
+		fmt.Fprintf(&b, "scp bin/twinet-init root@%s:/usr/local/bin/twinet-init\n", n.Name)
+	}
 	fmt.Fprintf(&b, "scp %q root@%s:/etc/twinet/pki/server_cert.pem\n", serverCert, n.Name)
 	fmt.Fprintf(&b, "scp %q root@%s:/etc/twinet/pki/server_key.pem\n", serverKey, n.Name)
 	fmt.Fprintf(&b, "scp %q root@%s:/etc/twinet/pki/peer_cert.pem\n", peerCert, n.Name)
@@ -576,22 +582,34 @@ func bootstrapScriptForRuntime(n model.NodeSpec, selectedRuntime, socket, pkiDir
 	b.WriteString("  command -v \"$1\" >/dev/null 2>&1 && return 0\n")
 	b.WriteString("  command -v apt-get >/dev/null 2>&1 || { echo \"missing $1; automatic install needs apt-get\" >&2; exit 1; }\n")
 	b.WriteString("  export DEBIAN_FRONTEND=noninteractive\n  apt-get update\n  apt-get install -y \"$2\"\n}\n")
-	if selectedRuntime == "podman" {
+	switch selectedRuntime {
+	case "podman":
 		b.WriteString("install_package podman podman\nsystemctl enable --now podman.socket\npodman info >/dev/null\n")
 		if socketPath := strings.TrimPrefix(socket, "unix://"); strings.HasPrefix(socket, "unix://") || strings.HasPrefix(socket, "/") {
 			fmt.Fprintf(&b, "test -S %q || { echo 'Podman API socket is unavailable' >&2; exit 1; }\n", socketPath)
 		}
-	} else {
+	case "containerd":
+		b.WriteString("install_package containerd containerd\nsystemctl enable --now containerd.service\n")
+		if socketPath := strings.TrimPrefix(socket, "unix://"); strings.HasPrefix(socket, "unix://") || strings.HasPrefix(socket, "/") {
+			fmt.Fprintf(&b, "test -S %q || { echo 'containerd socket is unavailable' >&2; exit 1; }\n", socketPath)
+		}
+	default:
 		b.WriteString("install_package docker docker.io\nsystemctl enable --now docker.service\ndocker info >/dev/null\n")
 	}
 	b.WriteString("install -d -m 0700 /etc/twinet /var/lib/twinet/state\n")
 	b.WriteString("chmod 0755 /usr/local/bin/twinetd\n")
+	if selectedRuntime == "containerd" {
+		b.WriteString("chmod 0755 /usr/local/bin/twinet-init\n")
+	}
 	b.WriteString("chmod 0600 /etc/twinet/agent.env /etc/twinet/pki/server_key.pem /etc/twinet/pki/peer_key.pem\n")
 	b.WriteString("chmod 0644 /etc/twinet/pki/server_cert.pem /etc/twinet/pki/peer_cert.pem /etc/twinet/pki/ca_cert.pem\n")
 	b.WriteString("cat > /etc/systemd/system/twinetd.service <<'UNIT'\n[Unit]\nDescription=Twinet node agent\n")
-	if selectedRuntime == "podman" {
+	switch selectedRuntime {
+	case "podman":
 		b.WriteString("After=podman.socket\nRequires=podman.socket\n\n")
-	} else {
+	case "containerd":
+		b.WriteString("After=containerd.service\nRequires=containerd.service\n\n")
+	default:
 		b.WriteString("After=docker.service\nRequires=docker.service\n\n")
 	}
 	b.WriteString("[Service]\nType=simple\nEnvironmentFile=/etc/twinet/agent.env\n")
@@ -606,8 +624,8 @@ func bootstrapScriptForRuntime(n model.NodeSpec, selectedRuntime, socket, pkiDir
 	b.WriteString(" -tls-cert /etc/twinet/pki/server_cert.pem -tls-key /etc/twinet/pki/server_key.pem")
 	b.WriteString(" -client-ca /etc/twinet/pki/ca_cert.pem -peer-tls-cert /etc/twinet/pki/peer_cert.pem -peer-tls-key /etc/twinet/pki/peer_key.pem\n")
 	b.WriteString("Restart=always\nRestartSec=2\n")
-	b.WriteString("AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_NET_RAW\n")
-	b.WriteString("CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_NET_RAW CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER CAP_SETUID CAP_SETGID\n")
+	b.WriteString("AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SYS_PTRACE CAP_NET_RAW\n")
+	b.WriteString("CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SYS_PTRACE CAP_NET_RAW CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER CAP_SETUID CAP_SETGID\n")
 	b.WriteString("NoNewPrivileges=true\nPrivateTmp=true\nProtectHome=true\nLimitNOFILE=1048576\nTasksMax=infinity\n\n")
 	b.WriteString("[Install]\nWantedBy=multi-user.target\nUNIT\n")
 	b.WriteString("systemctl daemon-reload && systemctl enable --now twinetd\n")

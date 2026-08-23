@@ -146,6 +146,7 @@ chmod 0644 "$u"'
     if [ "$n" = "$(hostname -s)" ]; then
         sudo systemctl stop twinetd || true
         sudo install -m 0755 bin/twinetd /usr/local/bin/twinetd
+        sudo install -m 0755 bin/twinet-init /usr/local/bin/twinet-init
         install_tls local
         sudo sh -c "$unit_cmd"
         sudo systemctl daemon-reload
@@ -153,8 +154,9 @@ chmod 0644 "$u"'
     else
         sudo ssh -o BatchMode=yes "$n" 'systemctl stop twinetd || true; rm -f /usr/local/bin/twinetd'
         sudo scp -q bin/twinetd "root@$n:/usr/local/bin/twinetd"
+        sudo scp -q bin/twinet-init "root@$n:/usr/local/bin/twinet-init"
         install_tls remote
-        sudo ssh -o BatchMode=yes "$n" "chmod 0755 /usr/local/bin/twinetd; $unit_cmd; systemctl daemon-reload; systemctl start twinetd"
+        sudo ssh -o BatchMode=yes "$n" "chmod 0755 /usr/local/bin/twinetd /usr/local/bin/twinet-init; $unit_cmd; systemctl daemon-reload; systemctl start twinetd"
     fi
 
     got=$(if [ "$n" = "$(hostname -s)" ]; then md5sum /usr/local/bin/twinetd; else sudo ssh -o BatchMode=yes "$n" 'md5sum /usr/local/bin/twinetd'; fi | cut -d' ' -f1)

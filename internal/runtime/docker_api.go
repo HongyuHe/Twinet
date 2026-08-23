@@ -196,7 +196,7 @@ func (d *dockerAPI) PullImage(ctx context.Context, ref string, policy PullPolicy
 	if err != nil {
 		return fmt.Errorf("%s pull %s: %w", d.engineName(), ref, err)
 	}
-	defer stream.Close()
+	defer func() { _ = stream.Close() }()
 	if err := stream.Wait(ctx); err != nil {
 		return fmt.Errorf("%s pull %s: %w", d.engineName(), ref, err)
 	}

@@ -22,7 +22,7 @@ func (s *Server) rollbackCanKeepWiring(ctx context.Context, tx applyTransaction,
 		return false, err
 	}
 	if err := json.Unmarshal(tx.Requested, &requested); err != nil {
-		return false, nil
+		return false, err
 	}
 	if previous.Hash == "" || previous.Hash != requested.Hash ||
 		canonicalMode(tx.PreviousMode) != canonicalMode(tx.Mode) ||
@@ -33,7 +33,7 @@ func (s *Server) rollbackCanKeepWiring(ctx context.Context, tx applyTransaction,
 		current, err := s.rt.Inspect(ctx, entry.Spec.Name)
 		if err != nil || !current.State.Joinable() ||
 			current.Label(deploy.LabelSpec) != entry.Spec.Labels[deploy.LabelSpec] {
-			return false, nil
+			return false, nil //nolint:nilerr // uncertainty requires a full rewire, not failed recovery
 		}
 		// A missing FRR sidecar does not remove a primary namespace interface.
 		// Exact rollback restores controls after the optional rewire phase, so
@@ -53,7 +53,10 @@ func (s *Server) rollbackCanKeepWiring(ctx context.Context, tx applyTransaction,
 		result, err := s.probeExec(ctx, device.Container, rt.ExecCmd{
 			Cmd: []string{"sh", "-c", `ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1`},
 		})
-		if err != nil || result.ExitCode != 0 {
+		if err != nil {
+			return false, nil //nolint:nilerr // inability to prove intact wiring selects full rewire
+		}
+		if result.ExitCode != 0 {
 			return false, nil
 		}
 		have := map[string]bool{}

@@ -656,5 +656,5 @@ func writeReferenceConfig(w io.Writer, top *model.Topology, id string) error {
 		return fmt.Errorf("%s (%s) rendered no configuration at %s", d.ID, d.EffectiveNOS(), path)
 	}
 	_, err = w.Write(config.Content)
-	return nil
+	return err
 }

@@ -592,9 +592,9 @@ func (c *Cluster) VersionSkew(ctx context.Context) error {
 		return nil
 	}
 	sort.Strings(odd)
-	return fmt.Errorf("rolling upgrade contracts are incompatible before mutation: controller source %s; %s.\n"+
+	return fmt.Errorf("rolling upgrade contracts are incompatible before mutation: controller source %s; %s; "+
 		"Exact source builds are retained for audit, but a renderer or state contract "+
-		"mismatch can make the same manifest produce different configuration or unreadable state.",
+		"mismatch can make the same manifest produce different configuration or unreadable state",
 		sourceVersion(c.RequireVersion), strings.Join(odd, ", "))
 }
 

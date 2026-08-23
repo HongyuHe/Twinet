@@ -2,7 +2,6 @@ package deploy
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"strings"
 	"sync"
@@ -189,6 +188,6 @@ func TestConfigHashIncludesFileContentAndCommands(t *testing.T) {
 	files["/x"] = FileSpec{Content: []byte("one"), Mode: 0o644}
 	cmds[0].Args = append(cmds[0].Args, "--changed")
 	if got := ConfigHash(files, cmds); got == first {
-		t.Fatal(fmt.Sprintf("different rendered command produced the same hash %s", got))
+		t.Fatalf("different rendered command produced the same hash %s", got)
 	}
 }

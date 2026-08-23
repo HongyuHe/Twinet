@@ -83,16 +83,17 @@ func (s *Server) handleAttach(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	tty := q.Get("tty") == "1"
+	rows, _ := strconv.Atoi(q.Get("rows"))
+	cols, _ := strconv.Atoi(q.Get("cols"))
+	if rows <= 0 {
+		rows = 24
+	}
+	if cols <= 0 {
+		cols = 80
+	}
 	args := []string{"exec", "--interactive"}
-	if q.Get("tty") == "1" {
-		rows, _ := strconv.Atoi(q.Get("rows"))
-		cols, _ := strconv.Atoi(q.Get("cols"))
-		if rows <= 0 {
-			rows = 24
-		}
-		if cols <= 0 {
-			cols = 80
-		}
+	if tty {
 		args = append(args, "--tty",
 			"--env", fmt.Sprintf("LINES=%d", rows),
 			"--env", fmt.Sprintf("COLUMNS=%d", cols),
@@ -100,10 +101,15 @@ func (s *Server) handleAttach(w http.ResponseWriter, r *http.Request) {
 	}
 	args = append(args, container)
 	args = append(args, cmd...)
-	cli, cliArgs, cliEnv, err := s.attachCLI(args)
-	if err != nil {
-		httpError(w, http.StatusNotImplemented, err)
-		return
+	stream, nativeStream := s.rt.(rt.StreamExecRuntime)
+	var cli string
+	var cliArgs, cliEnv []string
+	if !nativeStream {
+		cli, cliArgs, cliEnv, err = s.attachCLI(args)
+		if err != nil {
+			httpError(w, http.StatusNotImplemented, err)
+			return
+		}
 	}
 
 	conn, buf, err := hj.Hijack()
@@ -115,6 +121,27 @@ func (s *Server) handleAttach(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := buf.Flush(); err != nil {
+		return
+	}
+
+	if nativeStream {
+		env := map[string]string(nil)
+		if tty {
+			env = map[string]string{
+				"LINES": strconv.Itoa(rows), "COLUMNS": strconv.Itoa(cols),
+				"TERM": "xterm-256color",
+			}
+		}
+		code, streamErr := stream.StreamExec(r.Context(), container, rt.ExecCmd{
+			Cmd: cmd, Env: env, Stdin: buf.Reader, TTY: tty,
+		}, uint32(rows), uint32(cols), conn, conn)
+		if streamErr != nil {
+			fmt.Fprintf(conn, "twinet: %v\r\n", streamErr)
+			code = 1
+		}
+		if q.Get("status") == "1" {
+			fmt.Fprintf(conn, "%s%d\n", attachExitTrailer, code)
+		}
 		return
 	}
 
@@ -185,7 +212,7 @@ func (s *Server) attachCLI(args []string) (string, []string, []string, error) {
 	case "podman":
 		endpoint := rt.Endpoint(s.rt)
 		if endpoint == "" {
-			return "", nil, nil, errors.New("Podman attach needs a runtime socket")
+			return "", nil, nil, errors.New("podman attach needs a runtime socket")
 		}
 		podmanArgs := append([]string{"--remote", "--url", endpoint}, args...)
 		return "podman", podmanArgs, nil, nil

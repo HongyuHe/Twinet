@@ -67,8 +67,13 @@ func DefaultConfigForRuntime(name string) Config {
 
 func defaultConfigForRuntime(n int, name string) Config {
 	create, start := 4, 4
-	if strings.EqualFold(strings.TrimSpace(name), "podman") {
+	convergence := bounded(n, 2, 8)
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "podman":
 		create, start = 8, 8
+	case "containerd":
+		create, start = 16, 16
+		convergence = bounded(n, 8, 48)
 	}
 	return Config{
 		// The outer pools remain broad enough to pipeline unrelated work.
@@ -83,7 +88,7 @@ func defaultConfigForRuntime(n int, name string) Config {
 		Netlink:         bounded(n, 2, 12),
 		ImagePull:       2,
 		Capture:         bounded(n, 2, 8),
-		Convergence:     bounded(n, 2, 8),
+		Convergence:     convergence,
 	}
 }
 

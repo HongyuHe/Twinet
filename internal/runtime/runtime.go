@@ -278,6 +278,22 @@ type Runtime interface {
 	Close() error
 }
 
+// BatchExecRuntime can amortize substrate-specific exec setup across ordered
+// commands for one container. Results retain input order and exit status.
+type BatchExecRuntime interface {
+	Runtime
+	ExecBatch(ctx context.Context, nameOrID string, commands []ExecCmd) ([]ExecResult, error)
+}
+
+// StreamExecRuntime runs one bidirectional command for interactive access.
+// It is optional because Docker and Podman expose their own attach CLIs, while
+// native containerd must stream directly through its task API.
+type StreamExecRuntime interface {
+	Runtime
+	StreamExec(ctx context.Context, nameOrID string, command ExecCmd,
+		rows, cols uint32, stdout, stderr io.Writer) (int, error)
+}
+
 // EventRuntime is a Runtime that can subscribe to container lifecycle events.
 type EventRuntime interface {
 	Runtime

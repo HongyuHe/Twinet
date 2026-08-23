@@ -160,10 +160,21 @@ The same isolated 64-container sweep measured rootful Podman at
 5.63 containers/s across three equal nodes. Direct containerd in a dedicated
 namespace measured 7.13 containers/s at width 4. Podman is therefore the
 low-risk existing backend for a first scale rerun; native containerd has much
-more headroom but still needs Twinet's complete exec/copy/events/netns and
-recovery contract rather than a benchmark-only `ctr` path.
-Runtime-specific defaults use four create/start slots for Docker and eight for
-Podman; both remain independently tunable.
+more headroom. Twinet now uses the native containerd gRPC API in a dedicated
+per-agent namespace, with OCI hardening/resources/mounts, a root-only PID-1
+exec broker, lifecycle/events/netns/copy support, and exact cleanup rather than
+a benchmark-only `ctr` path.
+Runtime-specific defaults use four create/start slots for Docker, eight for
+Podman, and sixteen for containerd. Containerd's simple lifecycle ceiling was
+flat through width 48, while real hardened specs spend additional independent
+time materializing bind/init state; sixteen pipelines that work without
+exceeding the measured daemon ceiling. A live 84-AS run then showed all sixteen
+containerd convergence slots continuously occupied: about 60 routers completed
+configuration per node in two minutes, while CPU remained below the 56-core
+host ceiling. Containerd therefore uses up to 48 convergence slots on large
+hosts, still bounded by the independent 48-slot apply/exec budgets; smaller
+hosts scale that default from their CPU count. All limits remain independently
+tunable.
 
 **Shipped admission contract.** `cpus`, `memory`, and `pids` are container
 limits; `requests` are independent scheduler reservations for CPU, memory,

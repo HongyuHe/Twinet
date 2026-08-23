@@ -433,60 +433,6 @@ func shellQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", `'"'"'`) + "'"
 }
 
-// prober adapts the lab's exec to what the matrix builder wants.
-func (s *Server) prober() svc.Prober {
-	return func(ctx context.Context, deviceID, target string) (bool, float64, error) {
-		out, code, err := s.Exec(ctx, deviceID,
-			[]string{"ping", "-c", "2", "-W", "3", "-i", "0.3", target})
-		if err != nil {
-			return false, 0, err
-		}
-		if code != 0 {
-			return false, 0, nil
-		}
-		return true, parseRTT(out), nil
-	}
-}
-
-// parseRTT reads the average round trip out of ping's summary.
-func parseRTT(out string) float64 {
-	for _, line := range strings.Split(out, "\n") {
-		if !strings.Contains(line, "min/avg/max") {
-			continue
-		}
-		parts := strings.Split(line, "=")
-		if len(parts) < 2 {
-			continue
-		}
-		f := strings.Split(strings.TrimSpace(parts[1]), "/")
-		if len(f) < 2 {
-			continue
-		}
-		if v, err := strconv.ParseFloat(strings.TrimSpace(f[1]), 64); err == nil {
-			return v
-		}
-	}
-	return 0
-}
-
-// pathProbe asks a router which AS path it uses to reach another system, so a
-// cell can say "reachable, but not by a path anybody should be carrying".
-func (s *Server) pathProbe() svc.PathProbe {
-	targets := svc.MatrixTargets(s.Top)
-	return func(ctx context.Context, deviceID string, to int) ([]int, error) {
-		addr, ok := targets[to]
-		if !ok {
-			return nil, nil
-		}
-		out, code, err := s.Exec(ctx, deviceID,
-			[]string{"vtysh", "-c", "show ip bgp " + addr})
-		if err != nil || code != 0 {
-			return nil, err
-		}
-		return firstASPath(out), nil
-	}
-}
-
 // firstASPath reads the path of the selected route out of `show ip bgp <addr>`.
 //
 // FRR prints each path as a line of AS numbers, then the next hop indented

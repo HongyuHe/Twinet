@@ -2,7 +2,6 @@ package grade
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/netip"
 	"sort"
@@ -431,105 +430,6 @@ func sameStrings(a, b []string) bool {
 	return true
 }
 
-// resolves reports whether a router has a route to an address that would
-// actually carry a packet, and if not, why.
-//
-// "Has a route" was the whole test: any answer that was not "{}" and mentioned
-// a prefix counted. A blackhole route is an answer of exactly that shape --
-// selected, installed, and discarding everything sent to it -- so a submission
-// that pointed the next hop of every externally learned route at Null0 kept
-// full marks while that part of the AS could not reach the internet at all.
-// The check is named for a fault whose entire symptom is "the route is
-// everywhere and the traffic is dropped", which is what this was.
-//
-// So the entry is parsed: it must be the one the kernel installed, and it must
-// have a next hop that forwards -- in the FIB, active, with somewhere to send
-// the packet, and not a discard of any of the three kinds FRR can express.
-func (e *Env) resolves(ctx context.Context, deviceID, addr string) (bool, string, error) {
-	res, err := e.Probe(ctx, deviceID, []string{"vtysh", "-c",
-		fmt.Sprintf("show ip route %s json", addr)})
-	if err != nil {
-		return false, "", fmt.Errorf("asking %s for its route to %s: %w", deviceID, addr, err)
-	}
-	if res.ExitCode != 0 {
-		return false, "", fmt.Errorf("asking %s for its route to %s: exited %d: %s",
-			deviceID, addr, res.ExitCode, firstLine(res.Stderr))
-	}
-	body := strings.TrimSpace(res.Stdout)
-	// FRR prints "{}" when it has no route, and a keyed object when it has one.
-	if body == "" || body == "{}" {
-		return false, "no route at all", nil
-	}
-	if i := strings.IndexByte(body, '{'); i > 0 {
-		body = body[i:]
-	}
-	var doc map[string][]routeEntryJSON
-	if err := json.Unmarshal([]byte(body), &doc); err != nil {
-		return false, "", fmt.Errorf("reading %s's route to %s: %w", deviceID, addr, err)
-	}
-	discard := ""
-	for _, entries := range doc {
-		for _, entry := range entries {
-			if !entry.Selected && !entry.Installed {
-				continue
-			}
-			for _, nh := range entry.Nexthops {
-				switch {
-				case nh.Blackhole || nh.Unreachable || nh.Reject:
-					discard = fmt.Sprintf("a %s route (%s) that discards it",
-						discardKind(nh), entry.Protocol)
-				case !nh.Fib || !nh.Active:
-					if discard == "" {
-						discard = fmt.Sprintf("a %s route that is not in the forwarding table",
-							entry.Protocol)
-					}
-				case nh.IP == "" && nh.InterfaceName == "":
-					if discard == "" {
-						discard = fmt.Sprintf("a %s route with nowhere to send the packet",
-							entry.Protocol)
-					}
-				default:
-					// FRR is not the forwarding plane. A policy rule sending
-					// this destination to another table, with a discard in it,
-					// leaves the route in zebra's main table exactly as it
-					// should be while the kernel drops the packet: `ip rule
-					// add to X lookup 123` and a blackhole in 123 was measured
-					// as a fully resolved next hop. Asking the kernel how it
-					// would actually forward is the same question the packet
-					// asks.
-					if why, ok := e.kernelForwards(ctx, deviceID, addr); !ok {
-						if discard == "" {
-							discard = why
-						}
-						continue
-					}
-					return true, "", nil
-				}
-			}
-		}
-	}
-	if discard == "" {
-		discard = "no route the kernel installed"
-	}
-	return false, discard, nil
-}
-
-// kernelForwards asks the kernel what it would do with a packet for this
-// address, which is a different question from what the routing daemon believes:
-// policy rules, alternate tables and anything else installed outside the
-// daemon's view all take effect here and nowhere else.
-func (e *Env) kernelForwards(ctx context.Context, deviceID, addr string) (string, bool) {
-	results, err := e.kernelForwardsMany(ctx, deviceID, []string{addr})
-	if err != nil {
-		return "", true // the machinery failed; that is not the submission's fault
-	}
-	result, ok := results[addr]
-	if !ok {
-		return "a route the routing daemon installed, which the kernel did not answer for", false
-	}
-	return result.why, result.ok
-}
-
 // kernelForwardsMany runs all route lookups inside one agent-side shell. Each
 // address is passed as an argv element after netip validation, never interpolated
 // into the script, so a route attribute cannot become shell syntax.
@@ -615,40 +515,4 @@ done`
 		}
 	}
 	return out, nil
-}
-
-// routeEntryJSON is one entry of `show ip route <addr> json`.
-type routeEntryJSON struct {
-	Prefix    string `json:"prefix"`
-	Protocol  string `json:"protocol"`
-	Selected  bool   `json:"selected"`
-	Installed bool   `json:"installed"`
-	Nexthops  []struct {
-		Fib           bool   `json:"fib"`
-		Active        bool   `json:"active"`
-		Blackhole     bool   `json:"blackhole"`
-		Unreachable   bool   `json:"unreachable"`
-		Reject        bool   `json:"reject"`
-		IP            string `json:"ip"`
-		InterfaceName string `json:"interfaceName"`
-	} `json:"nexthops"`
-}
-
-func discardKind(nh struct {
-	Fib           bool   `json:"fib"`
-	Active        bool   `json:"active"`
-	Blackhole     bool   `json:"blackhole"`
-	Unreachable   bool   `json:"unreachable"`
-	Reject        bool   `json:"reject"`
-	IP            string `json:"ip"`
-	InterfaceName string `json:"interfaceName"`
-}) string {
-	switch {
-	case nh.Blackhole:
-		return "blackhole"
-	case nh.Reject:
-		return "prohibit"
-	default:
-		return "unreachable"
-	}
 }

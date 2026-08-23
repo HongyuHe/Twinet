@@ -468,7 +468,7 @@ if the manifest that created it is no longer available.`,
 				for _, l := range top.Links {
 					vnis = append(vnis, l.VNI)
 				}
-			} else if t, err := loadAndPlace(opts); err == nil && clustered(t) {
+			} else if t, err := load(opts); err == nil && clustered(t) {
 				// A name and a manifest together: the name says which lab, the
 				// manifest says which machines. Without this, naming a lab fell
 				// straight through to the local container runtime and tried to
@@ -1390,12 +1390,6 @@ func adoptRunningPlacement(ctx context.Context, top *model.Topology, token strin
 			strings.Join(parts, "\n  "))
 	}
 	return r, nil
-}
-
-// serviceNameOf maps a service device name back to the service that owns it.
-func serviceNameOf(top *model.Topology, device string) string {
-	service, _ := serviceRecordKeyOf(top, device)
-	return service
 }
 
 // serviceRecordKeyOf maps a service container name to its service and stable

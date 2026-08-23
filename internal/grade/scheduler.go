@@ -649,25 +649,6 @@ func sortedReasonKeys(reasons map[string]bool) []string {
 	return out
 }
 
-// runChecks remains the package-local convenience used by focused tests and
-// callers that grade one question. Run uses the same scheduler across every
-// currently independent question, so active resources are also protected
-// across question boundaries.
-func runChecks(ctx context.Context, q QuestionSpec, env *Env, opts RunOptions) []Result {
-	jobs := make([]scheduledCheck, 0, len(q.Checks))
-	for i, spec := range q.Checks {
-		check, ok := Lookup(spec.Check)
-		if !ok {
-			jobs = append(jobs, scheduledCheck{order: i, spec: spec,
-				instance: checkInstanceFor(q.ID, spec.Check, i)})
-			continue
-		}
-		jobs = append(jobs, scheduledCheck{order: i, check: check, spec: spec, env: env,
-			instance: checkInstanceFor(q.ID, spec.Check, i)})
-	}
-	return scheduleChecks(ctx, jobs, opts)
-}
-
 // runChecksAcrossQuestions schedules a dependency-ready question wave as one
 // job list. Results are split back into question order after all active probe
 // conflicts have been resolved.

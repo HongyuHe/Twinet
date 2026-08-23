@@ -67,7 +67,7 @@ func (b *nikaKubernetesBackend) Available(ctx context.Context) (bool, string, er
 		return false, "both TWINET_NIKA_KUBERNETES_ENDPOINT and TWINET_NIKA_KUBERNETES_CONTEXT are required", nil
 	}
 	if err := validateKubernetesEndpoint(b.endpoint); err != nil {
-		return false, err.Error(), nil
+		return false, err.Error(), nil //nolint:nilerr // invalid configuration is an unavailable capability reason
 	}
 	if len(b.command) == 0 {
 		return false, "TWINET_NIKA_KUBERNETES_BRIDGE is not configured", nil
