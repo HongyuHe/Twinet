@@ -181,16 +181,20 @@ func (r *Renderer) serviceCommands(d *model.Device) []deploy.Command {
 				// process. Daemon mode can retain an exec transport's pipes or
 				// outlive an ambiguous fork boundary; explicit redirection is
 				// reliable for Docker, Podman, and the containerd exec broker.
+				// /tmp is mode 1777: after the root broker gives the daemon's
+				// state directories to named, its deliberately narrow
+				// capability set cannot open a new file inside them.
+				"umask 077",
 				// Bound worker/listener fan-out rather than inheriting all CPUs
 				// from a large worker for this small authoritative replica.
 				"nohup named -g -n 2 -U 2 -c /etc/bind/named.conf -u named " +
-					">/var/run/named/twinet.log 2>&1 &",
+					">/tmp/twinet-named.log 2>&1 &",
 				// A resolver that started but answers nothing is worse than
 				// one that failed to start, because nothing reports it.
 				fmt.Sprintf("for i in $(seq 1 30); do "+
 					"dig +time=1 +tries=1 @127.0.0.1 %s SOA 2>/dev/null | grep -q 'status: NOERROR' && exit 0; "+
 					"sleep 1; done", probe),
-				"tail -n 8 /var/run/named/twinet.log >&2 2>/dev/null || true",
+				"tail -n 8 /tmp/twinet-named.log >&2 2>/dev/null || true",
 				"echo 'named started but is not authoritative for its own zones' >&2; exit 1",
 			}, "\n")},
 		},

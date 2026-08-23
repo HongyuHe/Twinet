@@ -106,7 +106,8 @@ func TestDNSDaemonDoesNotRetainExecTransportPipes(t *testing.T) {
 		}
 	}
 	if !strings.Contains(start, "named -g -n 2 -U 2") ||
-		!strings.Contains(start, ">/var/run/named/twinet.log 2>&1 &") {
+		!strings.Contains(start, "umask 077") ||
+		!strings.Contains(start, ">/tmp/twinet-named.log 2>&1 &") {
 		t.Fatalf("DNS start command does not detach from its exec transport:\n%s", start)
 	}
 }
