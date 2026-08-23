@@ -1773,30 +1773,20 @@ func (c *Containerd) bootFRRConfiguration(ctx context.Context, name string) erro
 		return ctx.Err()
 	case <-timer.C:
 	}
-	var lastErr error
-	for attempt := range 3 {
-		result, err := c.execTaskRaw(ctx, name, ExecCmd{
-			Cmd: []string{"timeout", "-s", "KILL", "30", "vtysh", "-b"},
-		})
-		if err == nil {
-			err = result.Err()
-		}
-		if err == nil {
-			return nil
-		}
-		lastErr = err
-		if attempt == 2 {
-			break
-		}
-		timer = time.NewTimer(500 * time.Millisecond)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return ctx.Err()
-		case <-timer.C:
-		}
+	result, err := c.execTaskRaw(ctx, name, ExecCmd{Cmd: []string{
+		"sh", "-c", `for i in $(seq 1 20); do
+  timeout -s KILL 10 vtysh -b && exit 0
+  sleep 0.5
+done
+exit 1`,
+	}})
+	if err != nil {
+		return fmt.Errorf("boot integrated FRR configuration in %s: %w", name, err)
 	}
-	return fmt.Errorf("boot integrated FRR configuration in %s: %w", name, lastErr)
+	if err := result.Err(); err != nil {
+		return fmt.Errorf("boot integrated FRR configuration in %s: %w", name, err)
+	}
+	return nil
 }
 
 func (c *Containerd) frrConfiguration(ctx context.Context, name string) (
