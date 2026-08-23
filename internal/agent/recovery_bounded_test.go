@@ -213,6 +213,30 @@ func TestRecoveryRollbackBudgetScalesPastNinetySeconds(t *testing.T) {
 	}
 }
 
+func TestDestroyRecoveryBudgetIncludesLiveDockerContentionMargin(t *testing.T) {
+	s, _ := recoveryServer(t, nil)
+	tx := s.transactions["cos461"]
+	tx.Previous = nil
+	tx.Prestate.Containers = make([]transactionContainer, 880)
+
+	const minimumMeasuredMargin = 8 * time.Second
+	if recoveryDestroyItemBudget < minimumMeasuredMargin {
+		t.Fatalf("destroy per-item budget = %s, want at least %s",
+			recoveryDestroyItemBudget, minimumMeasuredMargin)
+	}
+	limit := s.recoveryRollbackBudget(tx)
+	minimum := recoveryPhaseBaseBudget +
+		time.Duration((len(tx.Prestate.Containers)+s.recoveryWorkerCount()-1)/
+			s.recoveryWorkerCount())*minimumMeasuredMargin
+	if limit < minimum {
+		t.Fatalf("880-item destroy budget = %s, want at least measured-margin budget %s",
+			limit, minimum)
+	}
+	if limit <= 6*time.Minute+15*time.Second {
+		t.Fatalf("880-item destroy budget = %s, still permits the observed 6m15s cutoff", limit)
+	}
+}
+
 func TestLargeRecoveryTotalCoversRequiredPhaseBudgets(t *testing.T) {
 	s, _ := recoveryServer(t, nil)
 	tx := s.transactions["cos461"]

@@ -71,11 +71,12 @@ const (
 	defaultRecoveryPhaseTimeout    = 90 * time.Second
 	defaultRecoveryArtifactTimeout = 4 * time.Minute
 	// Scale traces on the 84-AS lab measured about twelve seconds of
-	// create/wire/configure work and under three seconds of pure removal per
-	// item at the deliberately smaller recovery worker width.
+	// create/wire/configure work per item. Destruction also needs that margin:
+	// a three-second budget expired after 6m15s with hundreds of Docker
+	// objects still present under daemon contention.
 	recoveryPhaseBaseBudget    = 45 * time.Second
 	recoveryRollbackItemBudget = 12 * time.Second
-	recoveryDestroyItemBudget  = 3 * time.Second
+	recoveryDestroyItemBudget  = 12 * time.Second
 	recoveryVerifyItemBudget   = 4 * time.Second
 	recoveryHeartbeatEvery     = 10 * time.Second
 	// Exact rollback restores primary contracts, sidecars, artifacts,
