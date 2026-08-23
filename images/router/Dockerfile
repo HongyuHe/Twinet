@@ -27,6 +27,7 @@ RUN apk add --no-cache \
         bash curl jq wireguard-tools openssl \
         ethtool socat nftables \
     && install -m 0755 -o frr -g frr -d /var/log/frr /var/run/frr \
+    && install -m 0755 -d /lib/frr \
     && install -m 0775 -o frr -g frrvty -d /etc/frr \
     && install -m 0640 -o frr -g frrvty /dev/null /etc/frr/vtysh.conf \
     && install -m 0640 -o frr -g frr /dev/null /etc/frr/frr.conf \

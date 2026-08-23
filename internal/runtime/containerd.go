@@ -489,6 +489,16 @@ func containerdSpecOption(spec *Spec, image ocispec.ImageConfig,
 				Destination: target, Type: "tmpfs", Source: "tmpfs", Options: options,
 			})
 		}
+		if spec.Labels["twinet.frr-control"] == "true" {
+			// Alpine FRR writes transient zebra state under /lib/frr. The
+			// router image supplies this otherwise-empty mountpoint so a view
+			// snapshot can retain a read-only root while the sidecar gets only
+			// the narrow writable directory it needs.
+			out.Mounts = append(out.Mounts, specs.Mount{
+				Destination: "/lib/frr", Type: "tmpfs", Source: "tmpfs",
+				Options: []string{"rw", "nosuid", "nodev", "mode=0755"},
+			})
+		}
 		for _, bind := range spec.Binds {
 			options := []string{"rbind", "rprivate", "rw"}
 			if bind.ReadOnly {
@@ -1178,7 +1188,7 @@ func (c *Containerd) Exec(ctx context.Context, name string, cmd ExecCmd) (ExecRe
 }
 
 func (c *Containerd) reloadFRR(ctx context.Context, name string) error {
-	available, err := c.execRaw(ctx, name, ExecCmd{Cmd: []string{
+	available, err := c.execTaskRaw(ctx, name, ExecCmd{Cmd: []string{
 		"test", "-x", "/usr/lib/frr/frr-reload.py",
 	}})
 	if err != nil {
@@ -1190,7 +1200,7 @@ func (c *Containerd) reloadFRR(ctx context.Context, name string) error {
 		// a success-shaped no-op, so use the native bounded stop/start path.
 		return c.startFRR(ctx, name)
 	}
-	result, err := c.execRaw(ctx, name, ExecCmd{Cmd: []string{
+	result, err := c.execTaskRaw(ctx, name, ExecCmd{Cmd: []string{
 		"/usr/lib/frr/frr-reload.py", "--reload",
 		"--bindir", "/usr/lib/frr", "--confdir", "/etc/frr", "--rundir", "/run/frr",
 		"/etc/frr/frr.conf",
@@ -1328,6 +1338,14 @@ func (c *Containerd) execRaw(ctx context.Context, name string, cmd ExecCmd) (Exe
 	if result, ok, err := c.execViaInit(ctx, name, cmd); ok {
 		return result, err
 	}
+	return c.execTaskRaw(ctx, name, cmd)
+}
+
+// execTaskRaw bypasses the PID-1 broker for daemon lifecycle work. FRR
+// deliberately daemonizes and manipulates process groups; keeping that control
+// boundary in containerd's native task-exec path prevents a daemon transition
+// from taking the long-lived broker down with its calling shell.
+func (c *Containerd) execTaskRaw(ctx context.Context, name string, cmd ExecCmd) (ExecResult, error) {
 	container, err := c.load(ctx, name)
 	if err != nil {
 		return ExecResult{}, fmt.Errorf("containerd exec %s: %w", name, err)
@@ -1688,7 +1706,7 @@ for pid in $pids; do wait "$pid" || status=1; done
 exit "$status"
 `)
 	logPath := filepath.Join(c.containerRoot(name), "frr-supervisor.log")
-	result, err := c.execRaw(ctx, name, ExecCmd{
+	result, err := c.execTaskRaw(ctx, name, ExecCmd{
 		Cmd: []string{"/bin/bash", "-c", starter.String()},
 	})
 	if err != nil {
@@ -1721,7 +1739,7 @@ exit "$status"
 func (c *Containerd) frrConfiguration(ctx context.Context, name string) (
 	string, []frrDaemon, error,
 ) {
-	result, err := c.execRaw(ctx, name, ExecCmd{
+	result, err := c.execTaskRaw(ctx, name, ExecCmd{
 		Cmd: []string{"cat", "/etc/frr/daemons"},
 	})
 	if err != nil {
@@ -1772,7 +1790,7 @@ func (c *Containerd) frrSocketsReady(ctx context.Context, name string,
 		script.WriteString(shellQuote("/run/frr/" + daemon.name + ".vty"))
 		script.WriteString(" || exit 1\n")
 	}
-	result, err := c.execRaw(ctx, name, ExecCmd{
+	result, err := c.execTaskRaw(ctx, name, ExecCmd{
 		Cmd: []string{"sh", "-c", script.String()},
 	})
 	if err != nil {
@@ -1786,7 +1804,7 @@ func shellQuote(value string) string {
 }
 
 func (c *Containerd) stopFRR(ctx context.Context, name string) error {
-	result, err := c.execRaw(ctx, name, ExecCmd{Cmd: []string{
+	result, err := c.execTaskRaw(ctx, name, ExecCmd{Cmd: []string{
 		"sh", "-c", `
 processes="watchfrr zebra mgmtd bgpd ripd ripngd ospfd ospf6d isisd babeld pimd pim6d ldpd nhrpd eigrpd sharpd pbrd staticd bfdd fabricd vrrpd pathd"
 pids="$(pidof $processes 2>/dev/null)"

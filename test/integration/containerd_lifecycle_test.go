@@ -353,6 +353,15 @@ placement:
 	if err != nil || result.Err() != nil {
 		t.Fatalf("containerd routed link: %+v, %v", result, err)
 	}
+	loopback, ok := device.IfaceByName("lo")
+	if !ok || loopback.Addr4 == "" {
+		t.Fatal("containerd routed fixture lost its loopback contract")
+	}
+	result, err = runtime.Exec(ctx, device.Container,
+		rt.ExecCmd{Cmd: []string{"ip", "-o", "addr", "show", "dev", "lo"}})
+	if err != nil || result.Err() != nil || !strings.Contains(result.Stdout, loopback.Addr4) {
+		t.Fatalf("containerd routed loopback %s is absent: %+v, %v", loopback.Addr4, result, err)
+	}
 	control := deploy.FRRControlContainer(device)
 	result, err = runtime.Exec(ctx, control, rt.ExecCmd{
 		Cmd: []string{"sh", "-c", "/usr/lib/frr/frrinit.sh restart"},
