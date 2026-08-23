@@ -379,6 +379,11 @@ placement:
 	if err != nil || result.Err() != nil || !strings.Contains(result.Stdout, loopback.Addr4) {
 		t.Fatalf("containerd routed loopback %s is absent: %+v, %v", loopback.Addr4, result, err)
 	}
+	result, err = runtime.Exec(ctx, device.Container,
+		rt.ExecCmd{Cmd: []string{"vtysh", "-c", "show running-config"}})
+	if err != nil || result.Err() != nil || !strings.Contains(result.Stdout, "router ospf") {
+		t.Fatalf("containerd routed FRR configuration was not loaded: %+v, %v", result, err)
+	}
 	control := deploy.FRRControlContainer(device)
 	result, err = runtime.Exec(ctx, control, rt.ExecCmd{
 		Cmd: []string{"sh", "-c", "/usr/lib/frr/frrinit.sh restart"},

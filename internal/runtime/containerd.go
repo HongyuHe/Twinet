@@ -1747,6 +1747,15 @@ exit "$status"
 	}
 	for range 600 {
 		if ready, readyErr := c.frrSocketsReady(ctx, name, daemons); readyErr == nil && ready {
+			result, err := c.execTaskRaw(ctx, name, ExecCmd{
+				Cmd: []string{"vtysh", "-b"},
+			})
+			if err != nil {
+				return fmt.Errorf("apply integrated FRR configuration in %s: %w", name, err)
+			}
+			if err := result.Err(); err != nil {
+				return fmt.Errorf("apply integrated FRR configuration in %s: %w", name, err)
+			}
 			return nil
 		}
 		timer := time.NewTimer(100 * time.Millisecond)
