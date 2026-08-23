@@ -78,3 +78,67 @@ establish. Two disagreements were found exactly this way — `bgp_asn_misconfig`
 changed a neighbour's remote AS where NIKA changes the router's own, and
 `host_crash` took interfaces down where NIKA freezes the machine — and both were
 corrected here rather than left as a footnote.
+
+## Kubernetes delegation bridge
+
+`kubernetes_bridge.py` is the concrete controller-host bridge for NIKA's four
+Kubernetes faults. It accepts exactly one `nikaKubernetesRequest` JSON object on
+stdin and writes exactly one `nikaKubernetesResponse` JSON object on stdout.
+It shells out only to `kubectl`, verifies that the requested context selects
+the named API endpoint, and never copies kubectl diagnostics or credential
+environment variables into its response.
+
+This bridge is intentionally **not** a production-cluster fault tool. Before it
+will mutate a node, the cluster must have a `kube-system/`
+`twinet-nika-disposable-cluster` marker naming the exact endpoint, context, and
+cluster ID; every node and the fixture namespace must carry that same ownership
+label. The real gate creates those markers only after both destructive and
+disposable-cluster acknowledgements, and removes them afterwards.
+
+Within that boundary the mechanisms match NIKA's Kubernetes implementations:
+
+- ClusterIP routing installs owner-tagged raw-table drops on the named worker;
+  pods on that worker lose the Service VIP while pod-IP traffic and an
+  independent worker's Service path remain healthy.
+- CoreDNS isolation installs the same port-53 drops on the nodes actually
+  hosting CoreDNS; CoreDNS pods/endpoints remain healthy and direct IP traffic
+  continues.
+- NetworkPolicy deny applies a real deny-ingress policy to the selected
+  disposable workload and checks an unaffected control Service.
+- Worker/API partition blocks the named worker's API-server path. The node
+  becomes `NotReady`, logs stop, a new pinned pod stays stale, and the existing
+  pod keeps serving by pod IP.
+
+Capability-scoped host-network helper pods hold only `NET_ADMIN`/`NET_RAW`.
+Their raw-table rules contain a unique owner comment and are removed through an
+independent-worker relay, so resolution remains possible after the target
+worker loses its API path. The test audits every node for rule residue and
+compares the fixture object set before and after each lifecycle. A
+NetworkPolicy-capable CNI is required.
+
+The destructive acceptance gate discovers the current context and endpoint:
+
+```sh
+TWINET_K8S_FAULT_INTEGRATION_ALLOW_DESTRUCTIVE=1 \
+TWINET_K8S_DISPOSABLE_CLUSTER=1 \
+  make k8s-fault-integration
+```
+
+For a non-default kubeconfig, export `KUBECONFIG` before invoking Make. To use a
+different kubectl binary, mirror, or kubeconfig path, override the bridge
+command without putting credentials in it. Both images must retain an
+`@sha256:<64 hex>` digest; mutable tags are rejected before fixture creation:
+
+```sh
+TWINET_NIKA_KUBERNETES_BRIDGE='python3 contrib/nika/kubernetes_bridge.py --kubectl kubectl --kubeconfig /safe/path/config --helper-image registry.example/netshoot@sha256:<digest> --workload-image registry.example/busybox@sha256:<digest>'
+```
+
+The bundled defaults are immutable multi-platform digests for
+`nicolaka/netshoot:v0.13` and `busybox:1.36.1`, not mutable tags. The pinned
+helper already contains Python, `iptables`, and `ip6tables`; pods perform no
+package installation or repository access at startup.
+
+The endpoint URL must not contain user information, query credentials, or a
+fragment. The controller starts the bridge with only `PATH`; kubeconfig content,
+tokens, cloud credentials, and certificates are never passed through the JSON
+protocol or persisted in delegated state/evidence.

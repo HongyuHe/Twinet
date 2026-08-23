@@ -150,6 +150,39 @@ backend. They are refused before injection unless
 `TWINET_NIKA_KUBERNETES_ENDPOINT`,
 `TWINET_NIKA_KUBERNETES_CONTEXT`, and a NIKA bridge are configured. No
 kubeconfig, token, or certificate enters a lab container or episode record.
+The bundled `contrib/nika/kubernetes_bridge.py` supplies that bridge using
+`kubectl`. It validates the endpoint selected by the named context and refuses
+node mutation unless the endpoint, every node, and an owned `twinet-nika-*`
+fixture carry the same short-lived disposable-cluster marker.
+
+Run the real four-fault lifecycle against the current kubectl context with:
+
+```sh
+TWINET_K8S_FAULT_INTEGRATION_ALLOW_DESTRUCTIVE=1 \
+TWINET_K8S_DISPOSABLE_CLUSTER=1 \
+  make k8s-fault-integration
+```
+
+The gate requires one control plane and at least two workers. It creates an
+owned fixture, then uses host-network helpers with only `NET_ADMIN`/`NET_RAW`
+to install NIKA-equivalent, owner-tagged node filters. ClusterIP routing fails
+only on the named worker while pod-IP and independent-worker paths remain
+healthy. CoreDNS is filtered on its serving nodes while its pods stay Ready.
+The worker/API fault makes the named worker `NotReady`, blocks logs and new
+work, but proves its existing pod still serves by pod IP. The NetworkPolicy
+fault uses a real deny policy and an unaffected control Service.
+
+Resolve removes the exact tagged rules through a relay on another worker,
+waits for worker/API recovery, removes every bridge-owned object, rechecks all
+fixture paths, compares the object set, and audits every node for residue. A
+CNI that enforces NetworkPolicy is required.
+The helper and workload images are pinned multi-platform digest references.
+The helper image is proven to contain Python, `iptables`, and `ip6tables`;
+there is no runtime package installation or package-repository dependency.
+Overrides that do not end in `@sha256:<64 hex>` are rejected before the gate
+creates its fixture.
+`KUBECONFIG` is converted into a bridge command-line path by the Make target;
+credential environment and kubectl diagnostics never cross the JSON protocol.
 
 P4 programs declare their BMv2 table/action ABI and forwarding probe; OpenFlow
 controllers declare their OVS switch IDs and create separate control links;
@@ -211,8 +244,10 @@ All **60** shared taxonomy types are registered with their taxonomy
 name/category/schema. The **56 native NIKA types** and two Twinet-only types
 run in the dedicated Docker/root-gated round-trip target: each injects,
 manifests, verifies, resolves, and fingerprints back to baseline. The four
-delegated Kubernetes types run against a fake NIKA backend contract by default
-and a real backend only under its explicit release gate.
+delegated Kubernetes types use a fake contract in ordinary unit tests and the
+bundled kubectl bridge under the explicit real-backend release gate. That gate
+exercises all four, restores the owned fixture exactly, and audits every node
+for owner-tagged filter residue.
 
 - **End-host failures.** `host_incorrect_ip`, `host_missing_ip`,
   `host_incorrect_netmask`, `host_incorrect_gateway`, `host_incorrect_dns`,

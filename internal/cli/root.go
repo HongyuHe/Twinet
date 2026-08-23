@@ -14,7 +14,11 @@ import (
 var (
 	Version = "dev"
 	Commit  = "none"
-	Date    = "unknown"
+	// SourceDigest is a deterministic SHA-256 over the grader's Go build
+	// inputs. Unlike Version/git-describe and Commit it is independent of Git
+	// tags and remains available in source release tarballs.
+	SourceDigest = "none"
+	Date         = "unknown"
 )
 
 // Options are the flags shared by every subcommand.

@@ -5,5 +5,10 @@ metadata:
 requirements: [kubernetes]
 faults:
   - type: k8s_coredns_isolated
-    target: {device: k8s/default/coredns}
+    target:
+      device: k8s/twinet-nika-fixture-example/worker-example
+      params:
+        namespace: twinet-nika-fixture-example
+        cluster_id: twinet-nika-cluster-example
+        node_name: worker-example
 brief: Pods report that service DNS names time out.

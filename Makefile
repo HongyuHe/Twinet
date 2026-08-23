@@ -1,12 +1,21 @@
 # Twinet build and test targets.
 GO      ?= go
 BIN     ?= bin
+KUBECTL ?= kubectl
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo none)
+# The grader identity is content-addressed, not Git-addressed: it captures
+# modified and untracked compiled source, works from a release tarball, and
+# ignores non-build inputs such as documentation and reports. Commit and
+# Version remain separate signed audit provenance.
+SOURCE_DIGEST_REQUESTED := $(strip $(SOURCE_DIGEST))
+SOURCE_DIGEST_COMPUTED := $(shell python3 "$(CURDIR)/scripts/source_digest.py" --root "$(CURDIR)" 2>/dev/null)
+override SOURCE_DIGEST := $(SOURCE_DIGEST_COMPUTED)
 DATE    ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 LDFLAGS := -s -w \
 	-X github.com/HongyuHe/twinet/internal/cli.Version=$(VERSION) \
 	-X github.com/HongyuHe/twinet/internal/cli.Commit=$(COMMIT) \
+	-X github.com/HongyuHe/twinet/internal/cli.SourceDigest=$(SOURCE_DIGEST) \
 	-X github.com/HongyuHe/twinet/internal/cli.Date=$(DATE) \
 	-X github.com/HongyuHe/twinet/internal/agent.Version=$(VERSION)
 
@@ -31,14 +40,19 @@ IMAGE_LOCK_SOURCE_TAG ?= 0.1
 PODMAN_ROOT ?= sudo -n podman
 # Must match .github/workflows/ci.yml, or local lint and CI can disagree.
 GOLANGCI_VERSION ?= v2.5.0
+TWINET_NIKA_KUBERNETES_CONTEXT ?= $(shell $(KUBECTL) config current-context 2>/dev/null)
+TWINET_NIKA_KUBERNETES_ENDPOINT ?= $(shell $(KUBECTL) --context "$(TWINET_NIKA_KUBERNETES_CONTEXT)" config view --minify -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null)
+TWINET_K8S_HELPER_IMAGE ?= docker.io/nicolaka/netshoot:v0.13@sha256:a20c2531bf35436ed3766cd6cfe89d352b050ccc4d7005ce6400adf97503da1b
+TWINET_K8S_WORKLOAD_IMAGE ?= docker.io/library/busybox:1.36.1@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662
+TWINET_NIKA_KUBERNETES_BRIDGE ?= python3 $(CURDIR)/contrib/nika/kubernetes_bridge.py --kubectl $(KUBECTL)$(if $(strip $(KUBECONFIG)), --kubeconfig $(abspath $(KUBECONFIG)),) --helper-image $(TWINET_K8S_HELPER_IMAGE) --workload-image $(TWINET_K8S_WORKLOAD_IMAGE)
 
-.PHONY: all build test lint fmt vet images push digests image-lock image-verify podman-images podman-integration clean install e2e ci ci-tools tidy-check naming \
+.PHONY: all build release-build source-identity-stamp source-identity-check test-source-identity test lint fmt vet images push digests image-lock image-verify podman-images podman-integration clean install e2e ci ci-tools tidy-check naming \
 	script-tests benchmark chaos soak-short soak-24h nos-images substrate-images substrate-integration \
 	fault-integration k8s-fault-integration fault-stress fault-stress-release o12-integration
 
 all: build
 
-build:
+build: source-identity-stamp
 	$(GO) build -trimpath -ldflags '$(LDFLAGS)' -o $(BIN)/twinet ./cmd/twinet
 	$(GO) build -trimpath -ldflags '$(LDFLAGS)' -o $(BIN)/twinetd ./cmd/twinetd
 	CGO_ENABLED=0 $(GO) build -trimpath -ldflags '$(LDFLAGS)' -o $(BIN)/twinet-rtr ./cmd/twinet-rtr
@@ -46,6 +60,35 @@ build:
 	CGO_ENABLED=0 $(GO) build -trimpath -ldflags '$(LDFLAGS)' -o $(BIN)/twinet-mcast ./cmd/twinet-mcast
 	CGO_ENABLED=0 $(GO) build -trimpath -ldflags '$(LDFLAGS)' -o $(BIN)/twinet-traffic ./cmd/twinet-traffic
 	CGO_ENABLED=0 $(GO) build -trimpath -ldflags '$(LDFLAGS)' -o $(BIN)/twinet-openflow-controller ./cmd/twinet-openflow-controller
+
+# Never let a caller stamp a Git SHA or arbitrary value in place of the
+# canonical content digest. A matching explicit value is harmless and supports
+# release tooling that records the computed digest before invoking make.
+source-identity-stamp:
+	@actual="$(SOURCE_DIGEST)"; requested="$(SOURCE_DIGEST_REQUESTED)"; \
+	if ! printf '%s' "$$actual" | grep -Eq '^[0-9a-f]{64}$$'; then \
+		echo "could not compute a valid SHA-256 source digest" >&2; \
+		exit 2; \
+	fi; \
+	if [ -n "$$requested" ] && [ "$$requested" != "$$actual" ]; then \
+		echo "SOURCE_DIGEST is computed from build inputs and cannot be overridden" >&2; \
+		exit 2; \
+	fi
+
+# Kept as the release entry point: content identity is valid from a clean
+# checkout, a dirty worktree, or a source release tarball.
+source-identity-check: source-identity-stamp
+	@printf 'source digest: %s\n' "$(SOURCE_DIGEST)"
+
+release-build: source-identity-check build
+
+# Proves source edits and untracked compiled files change identity while
+# documentation-only changes do not, and that attestation verification binds
+# the exact resulting digest.
+test-source-identity:
+	bash scripts/test_source_digest.sh
+	$(GO) test ./internal/cli ./internal/harness \
+		-run 'TestGraderSourceIdentityRequiresSHA256|TestAttestationUsesStableCompactContractAndExactBuild'
 
 test:
 	$(GO) test -race -count=1 ./...
@@ -234,6 +277,8 @@ script-tests:
 	bash scripts/test_release_runners.sh
 	bash scripts/test_remote_image_digest.sh
 	bash scripts/test_push_images.sh
+	bash scripts/test_source_digest.sh
+	python3 contrib/nika/test_kubernetes_bridge.py
 
 # Cluster evidence is never part of ordinary CI: it mutates a real cluster and
 # must be run by an explicitly configured self-hosted runner. Every target
@@ -325,15 +370,38 @@ fault-stress:
 fault-stress-release:
 	TWINET_FAULT_STRESS_EPISODES=100 $(GO) test -race -count=1 -run TestConcurrentEpisodeIsolation ./internal/fault/...
 
-# Kubernetes is delegated to NIKA rather than emulated in Docker. This is an
-# opt-in real-backend gate; its tag never turns an unconfigured cluster into a
-# skip or a green result.
+# Kubernetes is delegated through the bundled strict kubectl bridge. The bridge
+# accepts only a transiently marked disposable cluster, installs owner-tagged
+# node filters through capability-scoped helper pods, and restores the fixture
+# objects and worker dataplanes exactly. Never point this target at production.
 k8s-fault-integration:
-	@test -n "$${TWINET_NIKA_KUBERNETES_ENDPOINT:-}" && \
-		test -n "$${TWINET_NIKA_KUBERNETES_CONTEXT:-}" && \
-		test -n "$${TWINET_NIKA_KUBERNETES_BRIDGE:-}" || \
-		{ echo "make k8s-fault-integration requires NIKA endpoint, context, and bridge"; exit 2; }
-	$(GO) test -count=1 -tags k8sbackend ./internal/cli/...
+	@test "$${TWINET_K8S_FAULT_INTEGRATION_ALLOW_DESTRUCTIVE:-}" = "1" || \
+		{ echo "make k8s-fault-integration requires TWINET_K8S_FAULT_INTEGRATION_ALLOW_DESTRUCTIVE=1"; exit 2; }
+	@test "$${TWINET_K8S_DISPOSABLE_CLUSTER:-}" = "1" || \
+		{ echo "make k8s-fault-integration requires TWINET_K8S_DISPOSABLE_CLUSTER=1 and must never target production"; exit 2; }
+	@command -v $(KUBECTL) >/dev/null 2>&1 || \
+		{ echo "make k8s-fault-integration requires $(KUBECTL)"; exit 2; }
+	@command -v python3 >/dev/null 2>&1 || \
+		{ echo "make k8s-fault-integration requires python3"; exit 2; }
+	@printf '%s\n' "$(TWINET_K8S_HELPER_IMAGE)" | grep -Eq '@sha256:[0-9a-f]{64}$$' || \
+		{ echo "TWINET_K8S_HELPER_IMAGE must be an immutable @sha256 reference"; exit 2; }
+	@printf '%s\n' "$(TWINET_K8S_WORKLOAD_IMAGE)" | grep -Eq '@sha256:[0-9a-f]{64}$$' || \
+		{ echo "TWINET_K8S_WORKLOAD_IMAGE must be an immutable @sha256 reference"; exit 2; }
+	@test -n "$(TWINET_NIKA_KUBERNETES_ENDPOINT)" && \
+		test -n "$(TWINET_NIKA_KUBERNETES_CONTEXT)" && \
+		test -n "$(TWINET_NIKA_KUBERNETES_BRIDGE)" || \
+		{ echo "make k8s-fault-integration could not discover a Kubernetes endpoint/context/bridge"; exit 2; }
+	TWINET_NIKA_KUBERNETES_ENDPOINT="$(TWINET_NIKA_KUBERNETES_ENDPOINT)" \
+		TWINET_NIKA_KUBERNETES_CONTEXT="$(TWINET_NIKA_KUBERNETES_CONTEXT)" \
+		TWINET_NIKA_KUBERNETES_BRIDGE="$(TWINET_NIKA_KUBERNETES_BRIDGE)" \
+		TWINET_K8S_KUBECTL="$(KUBECTL)" \
+		TWINET_K8S_KUBECONFIG="$(KUBECONFIG)" \
+		TWINET_K8S_HELPER_IMAGE="$(TWINET_K8S_HELPER_IMAGE)" \
+		TWINET_K8S_WORKLOAD_IMAGE="$(TWINET_K8S_WORKLOAD_IMAGE)" \
+		TWINET_K8S_FAULT_INTEGRATION_ALLOW_DESTRUCTIVE=1 \
+		TWINET_K8S_DISPOSABLE_CLUSTER=1 \
+		$(GO) test -count=1 -tags k8sbackend -timeout 40m ./internal/cli/... \
+		-run '^TestRealNIKAKubernetesBackendLifecycle$$'
 
 substrate-integration: substrate-images fault-integration
 

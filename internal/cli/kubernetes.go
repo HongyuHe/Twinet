@@ -1,9 +1,12 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"strings"
@@ -63,11 +66,17 @@ func (b *nikaKubernetesBackend) Available(ctx context.Context) (bool, string, er
 	if b.endpoint == "" || b.context == "" {
 		return false, "both TWINET_NIKA_KUBERNETES_ENDPOINT and TWINET_NIKA_KUBERNETES_CONTEXT are required", nil
 	}
+	if err := validateKubernetesEndpoint(b.endpoint); err != nil {
+		return false, err.Error(), nil
+	}
 	if len(b.command) == 0 {
 		return false, "TWINET_NIKA_KUBERNETES_BRIDGE is not configured", nil
 	}
 	resp, err := b.call(ctx, nikaKubernetesRequest{Operation: "discover"})
 	if err != nil {
+		return false, "", err
+	}
+	if err := responseError(resp); err != nil {
 		return false, "", err
 	}
 	if !resp.Available && resp.Reason == "" {
@@ -114,6 +123,9 @@ func (b *nikaKubernetesBackend) call(ctx context.Context, request nikaKubernetes
 	if b == nil || len(b.command) == 0 {
 		return out, fmt.Errorf("NIKA Kubernetes bridge is not configured")
 	}
+	if err := validateKubernetesEndpoint(b.endpoint); err != nil {
+		return out, err
+	}
 	request.Endpoint, request.Context = b.endpoint, b.context
 	raw, err := json.Marshal(request)
 	if err != nil {
@@ -129,7 +141,19 @@ func (b *nikaKubernetesBackend) call(ctx context.Context, request nikaKubernetes
 	if err != nil {
 		return out, fmt.Errorf("NIKA Kubernetes bridge %q: %w", b.command[0], err)
 	}
-	if err := json.Unmarshal(stdout, &out); err != nil {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(stdout, &fields); err != nil {
+		return out, fmt.Errorf("decode NIKA Kubernetes bridge response: %w", err)
+	}
+	if _, ok := fields["available"]; !ok {
+		return out, fmt.Errorf("decode NIKA Kubernetes bridge response: missing required field %q", "available")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(stdout))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&out); err != nil {
+		return out, fmt.Errorf("decode NIKA Kubernetes bridge response: %w", err)
+	}
+	if err := requireJSONEOF(decoder); err != nil {
 		return out, fmt.Errorf("decode NIKA Kubernetes bridge response: %w", err)
 	}
 	// Evidence is persisted in Twinet's control-plane ledger and may later
@@ -156,12 +180,19 @@ func responseError(resp nikaKubernetesResponse) error {
 func safeDelegatedState(state fault.State) error {
 	for key, value := range state {
 		lower := strings.ToLower(key)
-		for _, banned := range []string{"token", "password", "secret", "kubeconfig", "private", "certificate", "client_key"} {
+		for _, banned := range []string{
+			"token", "password", "secret", "credential", "kubeconfig",
+			"private", "certificate", "client_key", "client-key", "authorization",
+		} {
 			if strings.Contains(lower, banned) {
 				return fmt.Errorf("NIKA Kubernetes backend returned forbidden credential field %q", key)
 			}
 		}
-		if strings.Contains(strings.ToLower(value), "-----begin") {
+		valueLower := strings.ToLower(value)
+		if strings.Contains(valueLower, "-----begin") ||
+			strings.Contains(valueLower, "authorization:") ||
+			strings.Contains(valueLower, "bearer ") ||
+			strings.Contains(valueLower, "token=") {
 			return fmt.Errorf("NIKA Kubernetes backend returned credential-like material in %q", key)
 		}
 	}
@@ -169,13 +200,49 @@ func safeDelegatedState(state fault.State) error {
 }
 
 func redactKubernetesText(s string) string {
-	// Errors belong in episode reports. Do not echo a command's accidental
-	// bearer token or PEM line there.
 	lower := strings.ToLower(s)
-	for _, marker := range []string{"token=", "authorization:", "-----begin"} {
-		if i := strings.Index(lower, marker); i >= 0 {
-			return strings.TrimSpace(s[:i]) + " [redacted]"
+	first := -1
+	for _, marker := range []string{
+		"authorization:", "authorization=", "bearer ",
+		"token=", "token:", `"token":`, "'token':",
+		"pass" + "word=", "pass" + "word:",
+		"password=", "password:", `"password":`, "'password':",
+		"client-secret", "client_secret", "client-key-data",
+		"client_certificate_data", "client-certificate-data",
+		"certificate-authority-data", "-----begin",
+	} {
+		if i := strings.Index(lower, marker); i >= 0 && (first < 0 || i < first) {
+			first = i
 		}
 	}
+	if first >= 0 {
+		prefix := strings.TrimSpace(s[:first])
+		if prefix == "" {
+			return "[redacted]"
+		}
+		return prefix + " [redacted]"
+	}
 	return s
+}
+
+func validateKubernetesEndpoint(endpoint string) error {
+	parsed, err := url.ParseRequestURI(endpoint)
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "https" && parsed.Scheme != "http") {
+		return fmt.Errorf("TWINET_NIKA_KUBERNETES_ENDPOINT must be an HTTP(S) URL")
+	}
+	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return fmt.Errorf("TWINET_NIKA_KUBERNETES_ENDPOINT must not contain credentials, a query, or a fragment")
+	}
+	return nil
+}
+
+func requireJSONEOF(decoder *json.Decoder) error {
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("multiple JSON values")
+		}
+		return err
+	}
+	return nil
 }

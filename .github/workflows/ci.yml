@@ -67,8 +67,8 @@ jobs:
       - name: Test
         run: go test -race -count=1 ./...
 
-      - name: Build
-        run: make build
+      - name: Build content-addressed release identity
+        run: make release-build
 
       - name: Validate the bundled labs
         run: |
