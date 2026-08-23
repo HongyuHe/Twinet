@@ -68,12 +68,19 @@ func DefaultConfigForRuntime(name string) Config {
 func defaultConfigForRuntime(n int, name string) Config {
 	create, start := 4, 4
 	convergence := bounded(n, 2, 8)
+	netlink := bounded(n, 2, 12)
 	switch strings.ToLower(strings.TrimSpace(name)) {
 	case "podman":
 		create, start = 8, 8
 	case "containerd":
 		create, start = 16, 16
 		convergence = bounded(n, 8, 48)
+		// Native containerd reaches wiring with substantially more lifecycle
+		// work already complete. A 56-core, 84-AS run held all 12 generic
+		// netlink slots with 36 additional operations queued while host CPU
+		// remained below 30 cores; a bounded 24-slot pool removes that
+		// artificial serialization without changing other runtimes.
+		netlink = bounded(n, 8, 24)
 	}
 	return Config{
 		// The outer pools remain broad enough to pipeline unrelated work.
@@ -85,7 +92,7 @@ func defaultConfigForRuntime(n int, name string) Config {
 		ContainerCreate: create,
 		ContainerStart:  start,
 		ExecProbe:       bounded(n*4, 8, 48),
-		Netlink:         bounded(n, 2, 12),
+		Netlink:         netlink,
 		ImagePull:       2,
 		Capture:         bounded(n, 2, 8),
 		Convergence:     convergence,

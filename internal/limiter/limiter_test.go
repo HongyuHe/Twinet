@@ -79,9 +79,10 @@ func TestScaleDefaultsAndPartialOverrides(t *testing.T) {
 	}
 	containerd := defaultConfigForRuntime(56, "containerd")
 	if containerd.ContainerCreate != 16 || containerd.ContainerStart != 16 ||
-		containerd.Convergence != 48 {
-		t.Fatalf("containerd defaults = create %d start %d convergence %d, want 16/16/48",
-			containerd.ContainerCreate, containerd.ContainerStart, containerd.Convergence)
+		containerd.Convergence != 48 || containerd.Netlink != 24 {
+		t.Fatalf("containerd defaults = create %d start %d convergence %d netlink %d, want 16/16/48/24",
+			containerd.ContainerCreate, containerd.ContainerStart,
+			containerd.Convergence, containerd.Netlink)
 	}
 	overridden := WithDefaults(Config{Lifecycle: 24})
 	defaults := DefaultConfig()
