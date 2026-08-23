@@ -19,8 +19,9 @@ import (
 // verifyCommittedSemantics is the proof boundary that inventory alone cannot
 // provide. A joinable container with the right labels can still be an empty
 // host namespace, a router with no usable configuration, or a service with
-// stale files. Commit therefore verifies the exact rendered artifacts and the
-// observable network semantics for every device the transaction touched.
+// stale files. Commit therefore verifies exact rendered artifacts and local
+// network semantics for every touched device. Distributed BGP reachability is
+// asynchronous and belongs to the controller's post-commit convergence gate.
 func (s *Server) verifyCommittedSemantics(ctx context.Context, top *model.Topology,
 	mode render.Mode, ungraded int, touched []string,
 ) error {
@@ -148,7 +149,7 @@ func (s *Server) verifyTopologyRecoveryContracts(ctx context.Context, top *model
 
 func (s *Server) verifyTopologyChecks(ctx context.Context, top *model.Topology,
 	mode render.Mode, ungraded int, ids []string, artifacts map[string][]transactionArtifact,
-	verifyRemote bool,
+	repairSolve bool,
 ) error {
 	if top == nil {
 		return fmt.Errorf("semantic verification needs a topology")
@@ -169,7 +170,7 @@ func (s *Server) verifyTopologyChecks(ctx context.Context, top *model.Topology,
 		devices = append(devices, device)
 	}
 	workers := s.recoveryWorkerCount()
-	if verifyRemote {
+	if repairSolve {
 		// Normal commit follows a successful apply and has the full exec
 		// pressure budget available. Reusing the conservative eight-worker
 		// rollback pool serialized thousands of already-ready device proofs.
@@ -195,11 +196,10 @@ func (s *Server) verifyTopologyChecks(ctx context.Context, top *model.Topology,
 				if err := s.verifyRenderedArtifacts(verifyCtx, top, device, deviceMode, expected); err != nil {
 					return err
 				}
-				if verifyRemote {
-					if err := s.semanticProbe(verifyCtx, top, mode, ungraded, device); err != nil {
-						return err
-					}
-				} else if err := s.verifyNetworkSemantics(verifyCtx, top, device, deviceMode); err != nil {
+				// Commit proves only local contracts. Cross-node BGP routes
+				// form after every node commits and are proven by the
+				// controller's convergence-aware grade gate.
+				if err := s.verifyNetworkSemantics(verifyCtx, top, device, deviceMode); err != nil {
 					return err
 				}
 				if waiter := r.Ready(device, s.rt); waiter != nil {
@@ -214,7 +214,7 @@ func (s *Server) verifyTopologyChecks(ctx context.Context, top *model.Topology,
 				return nil
 			}
 			firstErr := verify()
-			if firstErr == nil || !verifyRemote || deviceMode != render.ModeSolve {
+			if firstErr == nil || !repairSolve || deviceMode != render.ModeSolve {
 				return firstErr
 			}
 			repair := &deploy.Engine{

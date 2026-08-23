@@ -57,6 +57,32 @@ func TestSolveHostSemanticVerificationRequiresAddressAndDefaultRoute(t *testing.
 	}
 }
 
+func TestCommitSemanticProofDoesNotRequirePrematureRemoteBGP(t *testing.T) {
+	top, host := semanticHostTopology(model.OwnerStudent)
+	remote := &model.Device{
+		ID: "as6/MSP_host", Name: "MSP_host", Kind: model.KindHost,
+		ASN: 6, Node: "node-1", Container: "twinet-lab-as6-msp-host",
+	}
+	remote.Ifaces = []*model.Iface{{
+		Device: remote, Name: "host", Owner: model.OwnerStudent,
+		Role: model.RoleHostLink, Addr4: "10.6.0.2/24",
+	}}
+	top.Devices[remote.ID] = remote
+	top.ASes[6] = &model.AS{ASN: 6, Role: model.RoleStudent, Devices: []*model.Device{remote}}
+	server := &Server{
+		cfg: Config{Node: "node-0"},
+		rt: &semanticRuntime{output: map[string]rt.ExecResult{
+			"ip\x00-o\x00addr\x00show":  {Stdout: "2: host inet 10.5.0.2/24 scope global host\n"},
+			"ip\x00-o\x00route\x00show": {Stdout: "default via 10.5.0.1 dev host\n"},
+		}},
+	}
+	artifacts := map[string][]transactionArtifact{host.ID: {}}
+	if err := server.verifyTopologyChecks(context.Background(), top, render.ModeSolve, 0,
+		[]string{host.ID}, artifacts, true); err != nil {
+		t.Fatalf("commit required remote BGP before all nodes could commit: %v", err)
+	}
+}
+
 func TestTeachingHostBlankStudentStartIsNotInvented(t *testing.T) {
 	top, host := semanticHostTopology(model.OwnerStudent)
 	server := &Server{rt: &semanticRuntime{output: map[string]rt.ExecResult{
