@@ -353,6 +353,13 @@ placement:
 	if err != nil || result.Err() != nil {
 		t.Fatalf("containerd routed link: %+v, %v", result, err)
 	}
+	control := deploy.FRRControlContainer(device)
+	result, err = runtime.Exec(ctx, control, rt.ExecCmd{
+		Cmd: []string{"sh", "-c", "/usr/lib/frr/frrinit.sh restart"},
+	})
+	if err != nil || result.Err() != nil {
+		t.Fatalf("containerd ready FRR restart fallback: %+v, %v", result, err)
+	}
 	if err := engine.Destroy(ctx, lab); err != nil {
 		t.Fatal(err)
 	}

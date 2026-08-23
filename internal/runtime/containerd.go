@@ -1178,6 +1178,18 @@ func (c *Containerd) Exec(ctx context.Context, name string, cmd ExecCmd) (ExecRe
 }
 
 func (c *Containerd) reloadFRR(ctx context.Context, name string) error {
+	available, err := c.execRaw(ctx, name, ExecCmd{Cmd: []string{
+		"test", "-x", "/usr/lib/frr/frr-reload.py",
+	}})
+	if err != nil {
+		return fmt.Errorf("containerd inspect FRR reload support in %s: %w", name, err)
+	}
+	if available.ExitCode != 0 {
+		// Alpine's FRR package omits frr-pythontools. A solved-reference
+		// reconfiguration still needs exact replacement semantics rather than
+		// a success-shaped no-op, so use the native bounded stop/start path.
+		return c.startFRR(ctx, name)
+	}
 	result, err := c.execRaw(ctx, name, ExecCmd{Cmd: []string{
 		"/usr/lib/frr/frr-reload.py", "--reload",
 		"--bindir", "/usr/lib/frr", "--confdir", "/etc/frr", "--rundir", "/run/frr",
