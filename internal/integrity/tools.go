@@ -27,12 +27,14 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path"
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	rt "github.com/HongyuHe/twinet/internal/runtime"
 )
@@ -309,7 +311,7 @@ func (c *Checker) imageTools(ctx context.Context, image string) (map[string]reso
 	}
 }
 
-func (c *Checker) readImage(ctx context.Context, image string) (map[string]resolved, error) {
+func (c *Checker) readImage(ctx context.Context, image string) (out map[string]resolved, retErr error) {
 	sum := sha256.Sum256([]byte(image))
 	name := "twinet-integrity-" + hex.EncodeToString(sum[:8])
 	_ = c.rt.Remove(ctx, name, true)
@@ -340,7 +342,12 @@ func (c *Checker) readImage(ctx context.Context, image string) (map[string]resol
 		return nil, fmt.Errorf("a pristine container of %s could not be made to compare "+
 			"against: %w", image, err)
 	}
-	defer func() { _ = c.rt.Remove(context.WithoutCancel(ctx), name, true) }()
+	defer func() {
+		if err := removeIntegrityContainer(ctx, c.rt, name); err != nil {
+			out = nil
+			retErr = errors.Join(retErr, fmt.Errorf("remove pristine integrity container %s: %w", name, err))
+		}
+	}()
 	if startPristine {
 		if err := c.rt.Start(ctx, name); err != nil {
 			return nil, fmt.Errorf("a pristine %s container of %s could not be started for integrity comparison: %w",
@@ -359,4 +366,28 @@ func (c *Checker) readImage(ctx context.Context, image string) (map[string]resol
 
 func integrityContainerNeedsStart(runtimeName string) bool {
 	return runtimeName == "podman" || runtimeName == "containerd"
+}
+
+func removeIntegrityContainer(ctx context.Context, runtime rt.Runtime, name string) error {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	var lastErr error
+	for attempt := range 4 {
+		if err := runtime.Remove(cleanupCtx, name, true); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+		if attempt == 3 {
+			break
+		}
+		timer := time.NewTimer(50 * time.Millisecond)
+		select {
+		case <-cleanupCtx.Done():
+			timer.Stop()
+			return errors.Join(lastErr, cleanupCtx.Err())
+		case <-timer.C:
+		}
+	}
+	return lastErr
 }

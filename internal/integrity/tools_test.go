@@ -2,10 +2,13 @@ package integrity
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	rt "github.com/HongyuHe/twinet/internal/runtime"
 )
 
 // mapSource is a filesystem of known files.
@@ -167,5 +170,28 @@ func TestIntegrityContainerStartRequirement(t *testing.T) {
 		if integrityContainerNeedsStart(runtimeName) {
 			t.Fatalf("%s pristine container was started unnecessarily", runtimeName)
 		}
+	}
+}
+
+type flakyIntegrityRemoval struct {
+	rt.Runtime
+	attempts int
+}
+
+func (r *flakyIntegrityRemoval) Remove(context.Context, string, bool) error {
+	r.attempts++
+	if r.attempts < 3 {
+		return errors.New("snapshot is still busy")
+	}
+	return nil
+}
+
+func TestIntegrityCleanupRetriesTransientRemoval(t *testing.T) {
+	runtime := &flakyIntegrityRemoval{}
+	if err := removeIntegrityContainer(context.Background(), runtime, "pristine"); err != nil {
+		t.Fatal(err)
+	}
+	if runtime.attempts != 3 {
+		t.Fatalf("cleanup attempts = %d, want 3", runtime.attempts)
 	}
 }
