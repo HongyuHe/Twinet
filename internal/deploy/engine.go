@@ -2284,6 +2284,7 @@ func (e *Engine) RewireDevice(ctx context.Context, top *model.Topology, d *model
 		if l.A == nil || l.B == nil || l.A.Device == nil || l.B.Device == nil {
 			continue
 		}
+
 		if l.A.Device.ID != d.ID && l.B.Device.ID != d.ID {
 			continue
 		}
@@ -2322,4 +2323,18 @@ func (e *Engine) RewireDevice(ctx context.Context, top *model.Topology, d *model
 		}
 		return e.configureDesired(ctx, d, state)
 	})
+}
+
+// ReconfigureDevice reapplies one device's desired rendered contract without
+// replacing its container or rewiring healthy links. Commit uses this narrow
+// repair only for a solved-reference semantic mismatch discovered after apply.
+func (e *Engine) ReconfigureDevice(ctx context.Context, d *model.Device) error {
+	if e == nil || e.Renderer == nil || d == nil {
+		return errors.New("reconfigure needs an engine, renderer, and device")
+	}
+	state, err := e.renderDesired(d)
+	if err != nil {
+		return err
+	}
+	return e.configureDesired(ctx, d, state)
 }

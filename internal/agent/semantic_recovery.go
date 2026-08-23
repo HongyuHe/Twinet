@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/HongyuHe/twinet/internal/deploy"
 	"github.com/HongyuHe/twinet/internal/model"
 	"github.com/HongyuHe/twinet/internal/netstate"
 	"github.com/HongyuHe/twinet/internal/nos"
@@ -167,7 +168,14 @@ func (s *Server) verifyTopologyChecks(ctx context.Context, top *model.Topology,
 		}
 		devices = append(devices, device)
 	}
-	return runBoundedDeviceChecks(ctx, s.recoveryWorkerCount(),
+	workers := s.recoveryWorkerCount()
+	if verifyRemote {
+		// Normal commit follows a successful apply and has the full exec
+		// pressure budget available. Reusing the conservative eight-worker
+		// rollback pool serialized thousands of already-ready device proofs.
+		workers = s.semanticWorkerCount()
+	}
+	return runBoundedDeviceChecks(ctx, workers,
 		devices, s.recoveryArtifactLimit(),
 		func(device *model.Device) string { return "semantic verification " + device.ID },
 		func(verifyCtx context.Context, device *model.Device) error {
@@ -183,24 +191,44 @@ func (s *Server) verifyTopologyChecks(ctx context.Context, top *model.Topology,
 				}
 			}
 			deviceMode := renderModeForDevice(mode, ungraded, device)
-			if err := s.verifyRenderedArtifacts(verifyCtx, top, device, deviceMode, expected); err != nil {
-				return err
-			}
-			if verifyRemote {
-				if err := s.semanticProbe(verifyCtx, top, mode, ungraded, device); err != nil {
+			verify := func() error {
+				if err := s.verifyRenderedArtifacts(verifyCtx, top, device, deviceMode, expected); err != nil {
 					return err
 				}
-			} else if err := s.verifyNetworkSemantics(verifyCtx, top, device, deviceMode); err != nil {
-				return err
+				if verifyRemote {
+					if err := s.semanticProbe(verifyCtx, top, mode, ungraded, device); err != nil {
+						return err
+					}
+				} else if err := s.verifyNetworkSemantics(verifyCtx, top, device, deviceMode); err != nil {
+					return err
+				}
+				if waiter := r.Ready(device, s.rt); waiter != nil {
+					ready, err := waiter.Check(verifyCtx)
+					if err != nil {
+						return fmt.Errorf("semantic readiness of %s: %w", device.ID, err)
+					}
+					if !ready {
+						return fmt.Errorf("semantic readiness of %s is false", device.ID)
+					}
+				}
+				return nil
 			}
-			if waiter := r.Ready(device, s.rt); waiter != nil {
-				ready, err := waiter.Check(verifyCtx)
-				if err != nil {
-					return fmt.Errorf("semantic readiness of %s: %w", device.ID, err)
-				}
-				if !ready {
-					return fmt.Errorf("semantic readiness of %s is false", device.ID)
-				}
+			firstErr := verify()
+			if firstErr == nil || !verifyRemote || deviceMode != render.ModeSolve {
+				return firstErr
+			}
+			repair := &deploy.Engine{
+				Runtime: s.rt, Node: s.cfg.Node, State: s.store, Limiter: s.workLimiter(),
+				Renderer: r, Authoritative: true, WritesReference: true,
+				UnderlayIP: s.cfg.UnderlayIP, UnderlayDev: s.cfg.UnderlayDev,
+				PeerUnderlay: s.peerUnderlay(top.Name),
+			}
+			if err := repair.ReconfigureDevice(verifyCtx, device); err != nil {
+				return fmt.Errorf("%w; solved-reference reconfiguration also failed: %v", firstErr, err)
+			}
+			if err := verify(); err != nil {
+				return fmt.Errorf("%w; solved-reference reconfiguration did not repair it: %v",
+					firstErr, err)
 			}
 			return nil
 		})

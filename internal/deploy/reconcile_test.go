@@ -147,6 +147,32 @@ func TestCommandHashChangeRunsOnlyCommandsWhenFilesMatch(t *testing.T) {
 	}
 }
 
+func TestReconfigureDeviceReappliesCommandsDespiteCurrentMarker(t *testing.T) {
+	renderer := reconcilerRenderer{
+		files: map[string]FileSpec{
+			"/etc/twinet/platform.conf": {Content: []byte("platform=true\n"), Mode: 0o644},
+		},
+		cmds: []Command{{Args: []string{"ip", "addr", "replace"}, Describe: "repair address"}},
+	}
+	hash := ConfigHash(renderer.files, renderer.cmds)
+	runtime := &reconcilerRuntime{
+		files: map[string][]byte{
+			"/etc/twinet/platform.conf": []byte("platform=true\n"),
+		},
+		marker: hash, expectedMarker: hash,
+	}
+	engine := &Engine{Runtime: runtime, Renderer: renderer}
+	device := &model.Device{ID: "as1/R1", Container: "twinet-as1-r1"}
+
+	if err := engine.ReconfigureDevice(context.Background(), device); err != nil {
+		t.Fatal(err)
+	}
+	if copies, commands := runtime.mutations(); copies != 0 || commands != 1 {
+		t.Fatalf("semantic reconfiguration mutations = copies %d, commands %d; want 0, 1",
+			copies, commands)
+	}
+}
+
 func TestConfigureNeverOverwritesStudentOwnedFile(t *testing.T) {
 	renderer := reconcilerRenderer{
 		files: map[string]FileSpec{
