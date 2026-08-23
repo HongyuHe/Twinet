@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/containerd/containerd/v2/core/containers"
@@ -81,6 +82,7 @@ func TestContainerdRejectsUnsafeNamespaceAndUnsupportedPorts(t *testing.T) {
 	if err := runtime.SetRuntimeNamespace("../moby"); err == nil {
 		t.Fatal("unsafe containerd namespace was accepted")
 	}
+
 	out := &specs.Spec{Process: &specs.Process{}, Root: &specs.Root{}, Linux: &specs.Linux{}}
 	err := containerdSpecOption(&Spec{
 		Name: "service", Ports: []PortMap{{HostPort: 8080, Container: 80}},
@@ -96,6 +98,21 @@ func TestContainerdRejectsUnsafeNamespaceAndUnsupportedPorts(t *testing.T) {
 		context.Background(), nil, &containers.Container{}, out)
 	if err == nil {
 		t.Fatal("unsupported native containerd healthcheck was silently ignored")
+	}
+}
+
+func TestContainerdRecognizesDigestOnlyImageIDs(t *testing.T) {
+	if !containerdDigestOnly("sha256:" + strings.Repeat("a", 64)) {
+		t.Fatal("valid digest-only image ID was rejected")
+	}
+	for _, invalid := range []string{
+		"sha256:" + strings.Repeat("a", 63),
+		"sha256:" + strings.Repeat("A", 64),
+		"docker.io/example/image@sha256:" + strings.Repeat("a", 64),
+	} {
+		if containerdDigestOnly(invalid) {
+			t.Fatalf("invalid digest-only image ID %q was accepted", invalid)
+		}
 	}
 }
 

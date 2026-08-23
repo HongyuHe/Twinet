@@ -76,7 +76,8 @@ func TestContainerdRuntimeLifecycle(t *testing.T) {
 	if ok, err := runtime.ImageExists(ctx, image); err != nil || !ok {
 		t.Fatalf("containerd image exists = %t, %v", ok, err)
 	}
-	if digest, err := runtime.ImageDigest(ctx, image); err != nil || digest == "" {
+	digest, err := runtime.ImageDigest(ctx, image)
+	if err != nil || digest == "" {
 		t.Fatalf("containerd image digest = %q, %v", digest, err)
 	}
 
@@ -216,6 +217,22 @@ func TestContainerdRuntimeLifecycle(t *testing.T) {
 	}
 	if absent, err := runtime.Inspect(ctx, name); err != nil || absent.State != rt.StateAbsent {
 		t.Fatalf("containerd absent state = %+v, %v", absent, err)
+	}
+	digestSpec := *spec
+	digestSpec.Name = lab + "-digest"
+	digestSpec.Image = digest
+	digestSpec.Labels = map[string]string{
+		deploy.LabelManaged: "true", deploy.LabelLab: lab,
+		deploy.LabelSpec: "digest-spec",
+	}
+	if _, err := runtime.Create(ctx, &digestSpec); err != nil {
+		t.Fatalf("containerd create by digest-only image ID: %v", err)
+	}
+	if err := runtime.Start(ctx, digestSpec.Name); err != nil {
+		t.Fatalf("containerd start by digest-only image ID: %v", err)
+	}
+	if err := runtime.Remove(ctx, digestSpec.Name, true); err != nil {
+		t.Fatalf("containerd remove digest-only image container: %v", err)
 	}
 	waitForContainerdEvents(t, events)
 	runContainerdRoutedEngine(t, ctx, runtime, workRoot(t), image)

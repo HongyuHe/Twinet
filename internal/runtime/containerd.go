@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -284,6 +285,19 @@ func (c *Containerd) image(ctx context.Context, ref string) (cd.Image, error) {
 	if err != nil {
 		return nil, err
 	}
+	if containerdDigestOnly(ref) {
+		images, err := client.ListImages(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("containerd list images for digest %s: %w", ref, err)
+		}
+		sort.Slice(images, func(i, j int) bool { return images[i].Name() < images[j].Name() })
+		for _, image := range images {
+			if image.Target().Digest.String() == ref {
+				return image, nil
+			}
+		}
+		return nil, fmt.Errorf("containerd image %q: %w", ref, cerrdefs.ErrNotFound)
+	}
 	normalized, err := normalizeContainerdImage(ref)
 	if err != nil {
 		return nil, err
@@ -293,6 +307,18 @@ func (c *Containerd) image(ctx context.Context, ref string) (cd.Image, error) {
 		return nil, err
 	}
 	return image, nil
+}
+
+func containerdDigestOnly(ref string) bool {
+	if len(ref) != len("sha256:")+64 || !strings.HasPrefix(ref, "sha256:") {
+		return false
+	}
+	for _, char := range ref[len("sha256:"):] {
+		if !((char >= '0' && char <= '9') || (char >= 'a' && char <= 'f')) {
+			return false
+		}
+	}
+	return true
 }
 
 func (c *Containerd) ImageExists(ctx context.Context, ref string) (bool, error) {
@@ -316,7 +342,7 @@ func (c *Containerd) PullImage(ctx context.Context, ref string, policy PullPolic
 	case PullNever:
 		return nil
 	case PullIfMissing, "":
-		if _, err := client.GetImage(ctx, normalized); err == nil {
+		if _, err := c.image(ctx, ref); err == nil {
 			return nil
 		} else if !containerdNotFound(err) {
 			return fmt.Errorf("containerd inspect image %s: %w", normalized, err)
