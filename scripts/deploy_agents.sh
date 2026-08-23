@@ -195,11 +195,22 @@ chmod 0644 "$u"'
         sudo systemctl daemon-reload
         sudo systemctl start twinetd
     else
-        sudo ssh -o BatchMode=yes "$n" 'systemctl stop twinetd || true; rm -f /usr/local/bin/twinetd'
-        sudo scp -q bin/twinetd "root@$n:/usr/local/bin/twinetd"
-        sudo scp -q bin/twinet-init "root@$n:/usr/local/bin/twinet-init"
+        # scp opens its destination in place. That fails for twinet-init while
+        # any container still bind-mounts the old inode, and can leave twinetd
+        # truncated if transport fails mid-copy. Stage both files beside their
+        # destinations, then replace each inode atomically.
+        stage="/usr/local/bin/.twinet-rollout-$$"
+        if ! sudo scp -q bin/twinetd "root@$n:${stage}-agent" ||
+            ! sudo scp -q bin/twinet-init "root@$n:${stage}-init"; then
+            sudo ssh -o BatchMode=yes "$n" "rm -f '${stage}-agent' '${stage}-init'"
+            exit 1
+        fi
         install_tls remote
-        sudo ssh -o BatchMode=yes "$n" "chmod 0755 /usr/local/bin/twinetd /usr/local/bin/twinet-init; $unit_cmd; systemctl daemon-reload; systemctl start twinetd"
+        sudo ssh -o BatchMode=yes "$n" \
+            "systemctl stop twinetd || true; chmod 0755 '${stage}-agent' '${stage}-init'; \
+             mv -f '${stage}-agent' /usr/local/bin/twinetd; \
+             mv -f '${stage}-init' /usr/local/bin/twinet-init; \
+             $unit_cmd; systemctl daemon-reload; systemctl start twinetd"
     fi
 
     got=$(if [ "$n" = "$(hostname -s)" ]; then md5sum /usr/local/bin/twinetd; else sudo ssh -o BatchMode=yes "$n" 'md5sum /usr/local/bin/twinetd'; fi | cut -d' ' -f1)
