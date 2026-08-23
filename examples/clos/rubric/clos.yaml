@@ -9,5 +9,7 @@ questions:
   - id: ospf
     title: Clos interior converges
     points: 1
+    converge: true
+    converge_scope: ospf
     checks:
       - check: ospf.full_adjacency

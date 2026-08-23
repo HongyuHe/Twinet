@@ -51,6 +51,19 @@ func TestDevelopmentTagsNeedAnExplicitMode(t *testing.T) {
 	}
 }
 
+func TestApplyRejectsMissingDeviceImageBeforeDeployment(t *testing.T) {
+	top := &model.Topology{
+		Lab: &model.Lab{Images: model.ImagePolicy{Mode: model.ImageModeDevelopment}},
+		Devices: map[string]*model.Device{
+			"as42/leaf1": {ID: "as42/leaf1", Kind: model.KindRouter},
+		},
+	}
+	_, err := Apply(top)
+	if err == nil || !strings.Contains(err.Error(), "device as42/leaf1 has no image") {
+		t.Fatalf("missing device image was accepted: %v", err)
+	}
+}
+
 func TestLockRoundTripBindsReleaseTopology(t *testing.T) {
 	dir, err := os.MkdirTemp(".", ".test-lock-")
 	if err != nil {

@@ -204,6 +204,12 @@ func Apply(top *model.Topology) (*Lock, error) {
 	if err := ValidatePolicy(policy); err != nil {
 		return nil, err
 	}
+	for _, device := range top.SortedDevices() {
+		if strings.TrimSpace(device.Image) == "" {
+			return nil, fmt.Errorf("device %s has no image; set it under kinds.%s.image",
+				device.ID, device.Kind)
+		}
+	}
 	refs := topologyRefs(top)
 	if policy.RequiresImmutableImages() {
 		lockPath := LockPath(top.Lab)
