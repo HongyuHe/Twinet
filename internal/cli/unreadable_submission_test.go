@@ -260,6 +260,66 @@ func TestAnUncontestedSetIsUntouched(t *testing.T) {
 	}
 }
 
+func TestAllAttemptsPermitsOnlyDistinctSignedAttemptClaims(t *testing.T) {
+	subs := []submission{
+		{Group: "group3", AS: 3, Attempt: "benchmark-000", Dir: "/s/one"},
+		{Group: "group3", AS: 3, Attempt: "benchmark-001", Dir: "/s/two"},
+		{Group: "group4", AS: 4, Dir: "/s/group4"},
+	}
+	kept, held := withdrawContestedWithAttempts(subs, nil, true)
+	if len(kept) != 3 || len(held) != 0 {
+		t.Fatalf("distinct signed attempts were not admitted: kept=%+v held=%+v", kept, held)
+	}
+	if kept[0].Identity() == kept[1].Identity() {
+		t.Fatalf("attempt identities collide: %+v", kept)
+	}
+
+	subs[1].Attempt = "benchmark-000"
+	kept, held = withdrawContestedWithAttempts(subs, nil, true)
+	if len(kept) != 1 || len(held) != 1 {
+		t.Fatalf("duplicate attempt was not contested: kept=%+v held=%+v", kept, held)
+	}
+	if !strings.Contains(held[0].Reason, "--all-attempts") {
+		t.Fatalf("contest reason does not explain attempt gate: %q", held[0].Reason)
+	}
+
+	subs[1].Attempt = ""
+	kept, held = withdrawContestedWithAttempts(subs, nil, true)
+	if len(kept) != 1 || len(held) != 1 {
+		t.Fatalf("missing attempt was not contested: kept=%+v held=%+v", kept, held)
+	}
+}
+
+func TestAttemptReportsUseCollisionFreeFilesAndCSVIdentity(t *testing.T) {
+	dir := t.TempDir()
+	s := grade.Summarise("r", []*grade.Report{
+		{Submission: "group3", Attempt: "benchmark-000", AS: 3, Total: 10, MaxTotal: 10},
+		{Submission: "group3", Attempt: "benchmark-001", AS: 3, Total: 9, MaxTotal: 10},
+	}, 0)
+	if err := writeReports(dir, s); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{
+		(&grade.Report{Submission: "group3", Attempt: "benchmark-000"}).FileIdentity() + ".json",
+		(&grade.Report{Submission: "group3", Attempt: "benchmark-001"}).FileIdentity() + ".json",
+		(&grade.Report{Submission: "group3", Attempt: "benchmark-000"}).FileIdentity() + ".txt",
+		(&grade.Report{Submission: "group3", Attempt: "benchmark-001"}).FileIdentity() + ".txt",
+	} {
+		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+			t.Fatalf("missing collision-free report file %s: %v", name, err)
+		}
+	}
+	csv, err := os.ReadFile(filepath.Join(dir, "summary.csv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(csv), "submission,attempt,as,status") ||
+		!strings.Contains(string(csv), "group3,benchmark-000") ||
+		!strings.Contains(string(csv), "group3,benchmark-001") {
+		t.Fatalf("CSV lost attempt identities:\n%s", csv)
+	}
+}
+
 func TestTwoReportsForOneNameAreRefusedRatherThanOverwritten(t *testing.T) {
 	dir := t.TempDir()
 	s := grade.Summarise("r", []*grade.Report{

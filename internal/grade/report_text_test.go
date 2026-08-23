@@ -30,4 +30,16 @@ func TestAGradedReportStillShowsItsScore(t *testing.T) {
 	if !strings.Contains(got, "8.50 / 10.00") {
 		t.Fatalf("a graded report lost its score line:\n%s", got)
 	}
+
+}
+
+func TestAttemptFileIdentityCannotCollideWithDelimiterNames(t *testing.T) {
+	left := (&Report{Submission: "group--attempt", Attempt: "one"}).FileIdentity()
+	right := (&Report{Submission: "group", Attempt: "attempt--one"}).FileIdentity()
+	if left == right {
+		t.Fatalf("attempt report filenames collide: %q", left)
+	}
+	if !strings.HasPrefix(left, "attempt-") || !strings.HasPrefix(right, "attempt-") {
+		t.Fatalf("attempt report filenames are not explicitly framed: %q, %q", left, right)
+	}
 }

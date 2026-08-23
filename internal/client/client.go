@@ -449,6 +449,18 @@ func (n *Node) Exec(ctx context.Context, req agent.ExecRequest) (agent.ExecRespo
 	return resp, err
 }
 
+// ExecWithTimeout runs a bounded control operation whose caller has already
+// separated it from ordinary probe/check deadlines. It is used for warm
+// harness baseline restoration, which may restart several FRR daemons on a
+// loaded node; grading checks continue to use Exec and their own contexts.
+func (n *Node) ExecWithTimeout(ctx context.Context, req agent.ExecRequest,
+	timeout time.Duration,
+) (agent.ExecResponse, error) {
+	var resp agent.ExecResponse
+	err := n.doWithTimeout(ctx, http.MethodPost, "/v1/exec", req, &resp, timeout)
+	return resp, err
+}
+
 // ExecBatch groups same-lab device observations into one authenticated HTTP
 // request. Per-device failures stay explicit in the response so a grader can
 // classify them as infrastructure errors rather than false network facts.

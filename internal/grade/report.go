@@ -20,12 +20,18 @@ package grade
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
 	"time"
 )
+
+// GraderSource is stamped by release builds with the exact deterministic
+// SourceDigest. It is separate from presentation version metadata so every
+// Report can bind a score to the code that produced it.
+var GraderSource = "none"
 
 // Status is the outcome of a check or a question.
 type Status string
@@ -140,8 +146,26 @@ type QuestionResult struct {
 // Report is one student's complete result.
 type Report struct {
 	Submission string `json:"submission"`
-	AS         int    `json:"as"`
-	Lab        string `json:"lab"`
+	// Attempt is empty for ordinary final submissions. Benchmark/regrade runs
+	// carry a signed unique attempt so reports, CSV rows, and filenames cannot
+	// overwrite another submission from the same group and AS.
+	Attempt string `json:"attempt,omitempty"`
+	// ArchiveSHA256 binds this result to the exact signed archive consumed by
+	// the grader. It is required by benchmark score plans.
+	ArchiveSHA256 string `json:"archive_sha256,omitempty"`
+	AS            int    `json:"as"`
+	Lab           string `json:"lab"`
+	// HarnessType names the isolated substrate that produced the mark:
+	// compact, legacy-reduced, or full.
+	HarnessType string `json:"harness_type,omitempty"`
+	// EquivalenceAuditHash identifies the compact/full comparison gate that
+	// allowed this harness type to be used.
+	EquivalenceAuditHash string `json:"equivalence_audit_hash,omitempty"`
+	// Warm worker provenance distinguishes a compact cold deployment from a
+	// reset/reuse iteration in class-scale timing reports.
+	WarmWorker     string `json:"warm_worker,omitempty"`
+	WarmReuseCount int    `json:"warm_reuse_count,omitempty"`
+	WarmColdDeploy bool   `json:"warm_cold_deploy,omitempty"`
 	// Course and Term identify the class a mark belongs to.
 	//
 	// The manifest has carried them since the first version and nothing read
@@ -156,17 +180,21 @@ type Report struct {
 	// why the absence of BGP in the core is the larger share -- and the field
 	// was read by nothing, so none of it ever reached the person being marked.
 	// A student disputing a grade is entitled to the reasoning.
-	RubricNotes string           `json:"rubric_notes,omitempty"`
-	Term        string           `json:"term,omitempty"`
-	Rubric      string           `json:"rubric"`
-	Manifest    string           `json:"manifest_hash"`
-	GradedAt    time.Time        `json:"graded_at"`
-	Duration    string           `json:"duration"`
-	Total       float64          `json:"total"`
-	MaxTotal    float64          `json:"max_total"`
-	Questions   []QuestionResult `json:"questions"`
-	Warnings    []string         `json:"warnings,omitempty"`
-	Err         string           `json:"error,omitempty"`
+	RubricNotes string `json:"rubric_notes,omitempty"`
+	Term        string `json:"term,omitempty"`
+	Rubric      string `json:"rubric"`
+	// RubricHash and GraderSource bind a release benchmark report to the
+	// exact score plan and controller content, not a presentation version.
+	RubricHash   string           `json:"rubric_hash,omitempty"`
+	GraderSource string           `json:"grader_source,omitempty"`
+	Manifest     string           `json:"manifest_hash"`
+	GradedAt     time.Time        `json:"graded_at"`
+	Duration     string           `json:"duration"`
+	Total        float64          `json:"total"`
+	MaxTotal     float64          `json:"max_total"`
+	Questions    []QuestionResult `json:"questions"`
+	Warnings     []string         `json:"warnings,omitempty"`
+	Err          string           `json:"error,omitempty"`
 	// NeedsReview marks a report that must not be released without a human
 	// looking at it, because some part of the grading did not run correctly.
 	NeedsReview bool `json:"needs_review,omitempty"`
@@ -230,13 +258,38 @@ func (r *Report) Percent() float64 {
 	return 100 * r.Total / r.MaxTotal
 }
 
+// Identity is a human-readable multi-attempt identity while preserving the
+// ordinary group name in existing gradebooks.
+func (r *Report) Identity() string {
+	if r == nil || r.Attempt == "" {
+		if r == nil {
+			return ""
+		}
+		return r.Submission
+	}
+	return r.Submission + "@" + r.Attempt
+}
+
+// FileIdentity is injective and filename-safe for attempt reports. A visible
+// delimiter alone is ambiguous when a signed group name contains it; framing
+// group and attempt in URL-safe base64 prevents a report overwrite.
+func (r *Report) FileIdentity() string {
+	if r == nil {
+		return ""
+	}
+	if r.Attempt == "" {
+		return r.Submission
+	}
+	return "attempt-" + base64.RawURLEncoding.EncodeToString([]byte(r.Submission+"\x00"+r.Attempt))
+}
+
 // JSON renders the report.
 func (r *Report) JSON() ([]byte, error) { return json.MarshalIndent(r, "", "  ") }
 
 // Text renders the report for a human.
 func (r *Report) Text() string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s (AS %d)\n", r.Submission, r.AS)
+	fmt.Fprintf(&b, "%s (AS %d)\n", r.Identity(), r.AS)
 	// A report that was never completed carries no score line.
 	//
 	// It used to print "0.00 / 10.00 (0%)" across the top, which is what a
@@ -380,7 +433,7 @@ func Summarise(rubric string, reports []*Report, dur time.Duration) *Summary {
 		// Every submission was quarantined. There is no distribution to report,
 		// and inventing zeros would describe the platform rather than the class.
 		// The reports themselves are still attached: they are the whole point.
-		sort.Slice(reports, func(i, j int) bool { return reports[i].Submission < reports[j].Submission })
+		sort.Slice(reports, func(i, j int) bool { return reports[i].FileIdentity() < reports[j].FileIdentity() })
 		s.Reports = reports
 		return s
 	}
@@ -394,7 +447,7 @@ func Summarise(rubric string, reports []*Report, dur time.Duration) *Summary {
 	if len(scores)%2 == 0 {
 		s.Median = (scores[len(scores)/2-1] + scores[len(scores)/2]) / 2
 	}
-	sort.Slice(reports, func(i, j int) bool { return reports[i].Submission < reports[j].Submission })
+	sort.Slice(reports, func(i, j int) bool { return reports[i].FileIdentity() < reports[j].FileIdentity() })
 	s.Reports = reports
 	return s
 }
@@ -441,7 +494,7 @@ func (s *Summary) CSV() string {
 			}
 		}
 	}
-	b.WriteString("submission,as,status,total,max")
+	b.WriteString("submission,attempt,as,status,total,max")
 	for _, q := range qids {
 		b.WriteString("," + q)
 	}
@@ -453,14 +506,16 @@ func (s *Summary) CSV() string {
 		if r.NeedsReview || r.Err != "" {
 			// No total, no per-question marks: there is nothing here that may
 			// be pasted into a gradebook by accident.
-			fmt.Fprintf(&b, "%s,%d,needs-review,,%.2f", r.Submission, r.AS, r.MaxTotal)
+			fmt.Fprintf(&b, "%s,%s,%d,needs-review,,%.2f",
+				csvField(r.Submission), csvField(r.Attempt), r.AS, r.MaxTotal)
 			for range qids {
 				b.WriteString(",")
 			}
 			fmt.Fprintf(&b, ",%s\n", csvField(firstProblem(r)))
 			continue
 		}
-		fmt.Fprintf(&b, "%s,%d,graded,%.2f,%.2f", r.Submission, r.AS, r.Total, r.MaxTotal)
+		fmt.Fprintf(&b, "%s,%s,%d,graded,%.2f,%.2f",
+			csvField(r.Submission), csvField(r.Attempt), r.AS, r.Total, r.MaxTotal)
 		byID := map[string]float64{}
 		for _, q := range r.Questions {
 			byID[q.ID] = q.Awarded

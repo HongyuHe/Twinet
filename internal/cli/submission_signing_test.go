@@ -54,6 +54,11 @@ func TestAnEditedSubmissionIsRefused(t *testing.T) {
 			with: func(b *Bundle) { b.AS = 7 },
 		},
 		{
+			what: "changing signed benchmark attempt",
+			why:  "an attempt decides whether a repeated AS is an allowed benchmark item",
+			with: func(b *Bundle) { b.Attempt = "benchmark-999" },
+		},
+		{
 			what: "swapping a file's checksum",
 			why:  "the checksum is the only thing tying the archive to its contents",
 			with: func(b *Bundle) { b.Files["ATL.conf"] = "cccc" },
@@ -137,10 +142,25 @@ func TestTheSignedBytesCoverTheIdentity(t *testing.T) {
 	if string(bundleBytes(a)) == string(bundleBytes(b)) {
 		t.Error("the group is not part of what gets signed, so it can be rewritten freely")
 	}
+
 	c := a
 	c.AS = 9
 	if string(bundleBytes(a)) == string(bundleBytes(c)) {
 		t.Error("the AS is not part of what gets signed")
+	}
+}
+
+func TestEmptyAttemptPreservesLegacySignaturePayload(t *testing.T) {
+	bundle := Bundle{
+		Lab: "l", AS: 3, Group: "group3", Topology: "top",
+		TakenAt: time.Unix(123, 0).UTC(), Files: map[string]string{"x": "1"},
+	}
+	if strings.Contains(string(bundleBytes(bundle)), "attempt=") {
+		t.Fatal("empty attempt changed legacy signed archive payloads")
+	}
+	bundle.Attempt = "benchmark-000"
+	if !strings.Contains(string(bundleBytes(bundle)), "attempt=benchmark-000") {
+		t.Fatal("non-empty attempt is not covered by the signed payload")
 	}
 }
 

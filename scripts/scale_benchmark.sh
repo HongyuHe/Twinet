@@ -23,7 +23,15 @@ Options:
   --binary PATH             Controller binary (default: bin/twinet).
   --output FILE             Evidence JSON path (default: reports/scale_benchmark/<UTC>.json).
   --submissions DIR         Grade submissions with 'twinet grade batch' and record throughput.
+  --compact-attestation F   Signed compact/full equivalence attestation.
+  --compact-attestation-key F
+                            PEM public key verifying the compact attestation.
+  --expected-score-plan F   JSON expected totals/classes/provenance for every submission.
+  --expected-submissions N  Required submission count when grading (default: 100).
   --grade-parallel N        Batch-grading concurrency (default: 8).
+  --deploy-budget D         Maximum initial deployment duration (default: 10m).
+  --grade-budget D          Maximum batch-grading duration (default: 15m).
+  --allow-other-labs        Permit unrelated managed labs to remain on the cluster.
   --convergence-as N        Solved AS used by the convergence-aware grade probe (default: 3).
   --converge-timeout D      Grade convergence timeout (default: 10m).
   --help                    Show this help.
@@ -34,6 +42,10 @@ Required environment:
 The runner refuses an already-running copy of the target lab. It owns only the
 lab it starts, records cleanup even when a phase fails, and removes its own
 scratch directory before returning.
+
+When --submissions is set, the archives must be signed benchmark attempts from
+'twinet grade benchmark generate'; the runner passes --all-attempts narrowly to
+the actual batch command and verifies archive-SHA identities against the plan.
 EOF
 }
 
@@ -56,12 +68,29 @@ is_positive_integer() {
     esac
 }
 
+is_positive_duration() {
+    python3 - "$1" <<'PY'
+import re
+import sys
+
+match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)(ms|s|m|h)", sys.argv[1].strip().lower())
+raise SystemExit(0 if match and float(match.group(1)) > 0 else 1)
+PY
+}
+
 argv=("$0" "$@")
 binary="bin/twinet"
 manifest="examples/scale"
 output=""
 submissions=""
+compact_attestation=""
+compact_attestation_key=""
+expected_score_plan=""
+expected_submissions=100
 grade_parallel=8
+deploy_budget="10m"
+grade_budget="15m"
+allow_other_labs=0
 convergence_as=3
 converge_timeout="10m"
 allow_destructive=0
@@ -92,10 +121,44 @@ while [ "$#" -gt 0 ]; do
             submissions=$2
             shift 2
             ;;
+        --compact-attestation)
+            require_value "$@"
+            compact_attestation=$2
+            shift 2
+            ;;
+        --compact-attestation-key)
+            require_value "$@"
+            compact_attestation_key=$2
+            shift 2
+            ;;
+        --expected-score-plan)
+            require_value "$@"
+            expected_score_plan=$2
+            shift 2
+            ;;
+        --expected-submissions)
+            require_value "$@"
+            expected_submissions=$2
+            shift 2
+            ;;
         --grade-parallel)
             require_value "$@"
             grade_parallel=$2
             shift 2
+            ;;
+        --deploy-budget)
+            require_value "$@"
+            deploy_budget=$2
+            shift 2
+            ;;
+        --grade-budget)
+            require_value "$@"
+            grade_budget=$2
+            shift 2
+            ;;
+        --allow-other-labs)
+            allow_other_labs=1
+            shift
             ;;
         --convergence-as)
             require_value "$@"
@@ -123,8 +186,17 @@ fi
 if ! is_positive_integer "$grade_parallel"; then
     die_usage "--grade-parallel must be a positive integer"
 fi
+if ! is_positive_integer "$expected_submissions"; then
+    die_usage "--expected-submissions must be a positive integer"
+fi
 if ! is_positive_integer "$convergence_as"; then
     die_usage "--convergence-as must be a positive integer"
+fi
+if ! is_positive_duration "$deploy_budget"; then
+    die_usage "--deploy-budget must be a positive duration using ms, s, m, or h"
+fi
+if ! is_positive_duration "$grade_budget"; then
+    die_usage "--grade-budget must be a positive duration using ms, s, m, or h"
 fi
 
 cd "$repo_root" || {
@@ -150,6 +222,17 @@ if [ -z "${TWINET_TOKEN:-}" ]; then
 fi
 if [ -n "$submissions" ] && [ ! -d "$submissions" ]; then
     die_usage "submissions directory ${submissions} does not exist"
+fi
+if [ -n "$submissions" ]; then
+    if [ -z "$compact_attestation" ] || [ ! -r "$compact_attestation" ]; then
+        die_usage "--compact-attestation is required and must be readable when grading"
+    fi
+    if [ -z "$compact_attestation_key" ] || [ ! -r "$compact_attestation_key" ]; then
+        die_usage "--compact-attestation-key is required and must be readable when grading"
+    fi
+    if [ -z "$expected_score_plan" ] || [ ! -r "$expected_score_plan" ]; then
+        die_usage "--expected-score-plan is required and must be readable when grading"
+    fi
 fi
 
 if [ -z "$output" ]; then
@@ -198,8 +281,15 @@ start_epoch_ns=$(date +%s%N)
 failure=""
 deployment_started=0
 cleanup_attempted=0
+cleanup_succeeded=0
+cleanup_recovered_empty=0
 submission_count=0
 grade_reports=""
+
+cleanup_recovery_attempts=6
+cleanup_recovery_wait=3m
+cleanup_recovery_command_wait=4m
+cleanup_destroy_wait=10m
 
 command_string=""
 for argument in "${argv[@]}"; do
@@ -329,7 +419,71 @@ PY
 }
 
 lab_is_absent() {
-    python3 - "${scratch_dir}/node_status_before.stdout" "${scratch_dir}/lab_name" <<'PY'
+    python3 - "${scratch_dir}/node_status_before.stdout" "${scratch_dir}/lab_name" \
+        "$allow_other_labs" <<'PY'
+import json
+import pathlib
+import sys
+
+rows = json.loads(pathlib.Path(sys.argv[1]).read_text())
+lab = pathlib.Path(sys.argv[2]).read_text().strip()
+allow_other_labs = sys.argv[3] == "1"
+owners = []
+other_labs = set()
+for row in rows:
+    status = row.get("status", {})
+    labs = status.get("labs", [])
+    if isinstance(labs, list) and lab in labs:
+        owners.append(row.get("node", "<unknown>"))
+    if isinstance(labs, list):
+        other_labs.update(item for item in labs if isinstance(item, str) and item != lab)
+if owners:
+    raise SystemExit(
+        f"lab {lab!r} already exists on {', '.join(owners)}; refusing to destroy a lab this run did not create"
+    )
+if other_labs and not allow_other_labs:
+    raise SystemExit(
+        "cluster is not clean; unrelated managed labs are active: "
+        + ", ".join(sorted(other_labs))
+        + " (use --allow-other-labs only for an explicitly co-tenant benchmark)"
+    )
+PY
+}
+
+recovery_inventory_is_empty() {
+    local file=$1
+    python3 - "$file" <<'PY'
+import json
+import pathlib
+import sys
+
+raw = pathlib.Path(sys.argv[1]).read_text().lstrip()
+try:
+    report, _ = json.JSONDecoder().raw_decode(raw)
+except Exception as exc:
+    raise SystemExit(f"recovery report cannot be read: {exc}")
+nodes = report.get("nodes") if isinstance(report, dict) else None
+if not isinstance(nodes, dict) or not nodes:
+    raise SystemExit("recovery report contains no nodes")
+for node, status in nodes.items():
+    if not isinstance(status, dict):
+        raise SystemExit(f"recovery status for {node} is not an object")
+    if status.get("consistent") is not True:
+        raise SystemExit(f"recovery status for {node} is not consistent")
+    for key in (
+        "expected_containers", "observed_containers",
+        "expected_vnis", "observed_vnis",
+        "expected_logical_bindings", "observed_logical_bindings",
+        "expected_physical_trunks", "observed_physical_trunks",
+    ):
+        if key not in status or status[key] != 0:
+            raise SystemExit(f"recovery status for {node} has non-empty {key}={status.get(key)!r}")
+PY
+}
+
+cleanup_status_is_absent() {
+    local file=$1
+    python3 - "$file" "${scratch_dir}/lab_name" <<'PY'
 import json
 import pathlib
 import sys
@@ -338,26 +492,99 @@ rows = json.loads(pathlib.Path(sys.argv[1]).read_text())
 lab = pathlib.Path(sys.argv[2]).read_text().strip()
 owners = []
 for row in rows:
-    status = row.get("status", {})
-    labs = status.get("labs", [])
-    if isinstance(labs, list) and lab in labs:
+    status = row.get("status", {}) if isinstance(row, dict) else {}
+    if lab in status.get("labs", []):
         owners.append(row.get("node", "<unknown>"))
 if owners:
-    raise SystemExit(
-        f"lab {lab!r} already exists on {', '.join(owners)}; refusing to destroy a lab this run did not create"
-    )
+    raise SystemExit(f"cleanup left lab {lab!r} active on {', '.join(owners)}")
+PY
+}
+
+cleanup_lab() {
+    local attempt phase
+    local -a recover_args
+    cleanup_attempted=1
+    if run_capture cleanup_destroy_1 timeout --signal=TERM --kill-after=30s \
+        "$cleanup_destroy_wait" "$binary" destroy -m "$run_manifest" --yes; then
+        cleanup_succeeded=1
+        printf '%s\n' cleanup_destroy_1 >"${scratch_dir}/cleanup_result_phase"
+        return 0
+    fi
+
+    for ((attempt = 1; attempt <= cleanup_recovery_attempts; attempt++)); do
+        phase="cleanup_recover_join_${attempt}"
+        recover_args=(
+            timeout --signal=TERM --kill-after=30s "$cleanup_recovery_command_wait"
+            "$binary" --json recover -m "$run_manifest" --strategy rollback
+            --wait "$cleanup_recovery_wait"
+        )
+        if [ "$attempt" -gt 1 ]; then
+            phase="cleanup_recover_takeover_${attempt}"
+            recover_args+=(--takeover)
+        fi
+        run_capture "$phase" "${recover_args[@]}" || true
+        if recovery_inventory_is_empty "${scratch_dir}/${phase}.stdout" 2>/dev/null; then
+            cleanup_recovered_empty=1
+        fi
+        if run_capture "cleanup_destroy_$((attempt + 1))" \
+            timeout --signal=TERM --kill-after=30s "$cleanup_destroy_wait" \
+            "$binary" destroy -m "$run_manifest" --yes; then
+            cleanup_succeeded=1
+            printf 'cleanup_destroy_%s\n' "$((attempt + 1))" >"${scratch_dir}/cleanup_result_phase"
+            return 0
+        fi
+        if [ "$cleanup_recovered_empty" -eq 1 ]; then
+            cleanup_succeeded=1
+            printf '%s\n' "$phase" >"${scratch_dir}/cleanup_result_phase"
+            return 0
+        fi
+        sleep 2
+    done
+    return 1
+}
+
+interval_within_budget() {
+    local start_phase=$1
+    local end_phase=$2
+    local budget=$3
+    python3 - "${scratch_dir}/${start_phase}.started_epoch_ns" \
+        "${scratch_dir}/${end_phase}.ended_epoch_ns" "$budget" <<'PY'
+import pathlib
+import re
+import sys
+
+started = int(pathlib.Path(sys.argv[1]).read_text().strip())
+ended = int(pathlib.Path(sys.argv[2]).read_text().strip())
+raw = sys.argv[3].strip().lower()
+match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)(ms|s|m|h)", raw)
+if not match:
+    raise SystemExit(f"invalid duration budget {raw!r}; use ms, s, m, or h")
+scale = {"ms": 0.001, "s": 1.0, "m": 60.0, "h": 3600.0}[match.group(2)]
+budget = float(match.group(1)) * scale
+elapsed = (ended - started) / 1_000_000_000
+if elapsed > budget:
+    raise SystemExit(f"{elapsed:.3f}s exceeded the {budget:.3f}s budget")
 PY
 }
 
 count_submissions() {
-    python3 - "$submissions" "${scratch_dir}/submission_count" <<'PY'
+    python3 - "$submissions" "${scratch_dir}/submission_count" "$expected_submissions" <<'PY'
 import pathlib
 import sys
 
 root = pathlib.Path(sys.argv[1])
-entries = [p for p in root.iterdir() if not p.name.startswith(".")]
+entries = [
+    p for p in root.iterdir()
+    if not p.name.startswith(".")
+    and (p.is_dir() or p.name.endswith(".tar.gz") or p.name.endswith(".tgz"))
+]
 if not entries:
     raise SystemExit(f"no submissions found under {root}")
+expected = int(sys.argv[3])
+if len(entries) != expected:
+    raise SystemExit(
+        f"found {len(entries)} submissions under {root}, expected exactly {expected}"
+    )
 pathlib.Path(sys.argv[2]).write_text(str(len(entries)))
 PY
 }
@@ -382,6 +609,156 @@ if doc.get("count") != expected:
     raise SystemExit(
         f"grade summary count {doc.get('count')!r} does not match {expected} supplied submissions"
     )
+for report in doc["reports"]:
+    if not isinstance(report, dict):
+        raise SystemExit("grade summary contains a non-object report")
+    if report.get("needs_review") or report.get("error"):
+        raise SystemExit(
+            f"submission {report.get('submission', '<unknown>')} requires infrastructure review"
+        )
+    if not isinstance(report.get("total"), (int, float)):
+        raise SystemExit(
+            f"submission {report.get('submission', '<unknown>')} has no numeric total"
+        )
+PY
+}
+
+validate_expected_score_plan() {
+    python3 - "${grade_reports}/summary.json" "$expected_score_plan" "$submission_count" <<'PY'
+import json
+import math
+import pathlib
+import re
+import sys
+
+summary_path = pathlib.Path(sys.argv[1])
+plan_path = pathlib.Path(sys.argv[2])
+expected_count = int(sys.argv[3])
+try:
+    summary = json.loads(summary_path.read_text())
+    plan = json.loads(plan_path.read_text())
+except Exception as exc:
+    raise SystemExit(f"cannot read expected-score evidence: {exc}")
+if not isinstance(plan, dict) or not isinstance(plan.get("archives"), dict):
+    raise SystemExit("expected score plan must contain an archives object keyed by SHA-256")
+if plan.get("schema_version") != 1:
+    raise SystemExit("expected score plan has an unsupported schema_version")
+for key in ("topology_hash", "rubric_hash", "image_lock", "mutation_suite_sha256", "grader_source", "reference_archive_sha256"):
+    if not isinstance(plan.get(key), str) or not plan[key]:
+        raise SystemExit(f"expected score plan lacks {key}")
+for key in ("mutation_suite_sha256", "grader_source", "reference_archive_sha256"):
+    if not re.fullmatch(r"[0-9a-f]{64}", plan[key]):
+        raise SystemExit(f"expected score plan has invalid {key}")
+expected_hash = plan.get("equivalence_audit_hash")
+if not isinstance(expected_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
+    raise SystemExit("expected score plan has an invalid equivalence_audit_hash")
+entries = plan["archives"]
+if len(entries) != expected_count:
+    raise SystemExit(f"expected score plan has {len(entries)} archives, want {expected_count}")
+reports = summary.get("reports")
+if not isinstance(reports, list) or len(reports) != expected_count:
+    raise SystemExit(f"grade summary has {len(reports) if isinstance(reports, list) else 'no'} reports, want {expected_count}")
+
+def score_class(report):
+    total = report.get("total")
+    maximum = report.get("max_total")
+    if not isinstance(total, (int, float)) or not isinstance(maximum, (int, float)):
+        raise SystemExit(f"{report.get('submission', '<unknown>')}: non-numeric total/max_total")
+    if maximum <= 0 or total <= 0:
+        return "zero"
+    if math.isclose(float(total), float(maximum), rel_tol=0, abs_tol=1e-6):
+        return "full"
+    return "partial"
+
+def check_status(report, expected):
+    question_id = expected.get("question_id")
+    check_id = expected.get("check_id")
+    check_index = expected.get("check_index")
+    want = expected.get("status")
+    if not isinstance(question_id, str) or not isinstance(check_id, str) or not isinstance(check_index, int) or not isinstance(want, str):
+        raise SystemExit("expected_checks contains an invalid check identity")
+    questions = report.get("questions")
+    if not isinstance(questions, list):
+        raise SystemExit(f"{report.get('submission', '<unknown>')}: no questions in report")
+    question = next((q for q in questions if isinstance(q, dict) and q.get("id") == question_id), None)
+    if question is None:
+        raise SystemExit(f"{report.get('submission', '<unknown>')}: missing question {question_id}")
+    results = question.get("results")
+    if not isinstance(results, list) or check_index < 0 or check_index >= len(results):
+        raise SystemExit(f"{report.get('submission', '<unknown>')}: missing check index {question_id}/{check_id}[{check_index}]")
+    result = results[check_index]
+    if not isinstance(result, dict) or result.get("check") != check_id or result.get("status") != want:
+        got = result.get("status") if isinstance(result, dict) else None
+        raise SystemExit(
+            f"{report.get('submission', '<unknown>')}: {question_id}/{check_id}[{check_index}] "
+            f"status={got!r}, want {want!r}"
+        )
+
+seen_archives = set()
+seen_identities = set()
+observed_hashes = set()
+for report in reports:
+    if not isinstance(report, dict):
+        raise SystemExit("grade summary contains a non-object report")
+    if report.get("needs_review") or report.get("error"):
+        raise SystemExit(f"submission {report.get('submission', '<unknown>')} requires review")
+    archive = report.get("archive_sha256")
+    attempt = report.get("attempt")
+    submission = report.get("submission")
+    asn = report.get("as")
+    if not isinstance(archive, str) or not re.fullmatch(r"[0-9a-f]{64}", archive):
+        raise SystemExit(f"{submission!r}: report lacks exact archive_sha256")
+    if not isinstance(attempt, str) or not attempt:
+        raise SystemExit(f"{submission!r}: benchmark report lacks a signed attempt")
+    identity = (submission, attempt, asn)
+    if identity in seen_identities:
+        raise SystemExit(f"duplicate benchmark report identity {identity!r}")
+    if archive in seen_archives:
+        raise SystemExit(f"duplicate benchmark report archive {archive}")
+    seen_identities.add(identity)
+    seen_archives.add(archive)
+    expected = entries.get(archive)
+    if not isinstance(expected, dict):
+        raise SystemExit(f"report archive {archive} is absent from expected score plan")
+    for field, actual in (("submission", submission), ("attempt", attempt), ("as", asn)):
+        if expected.get(field) != actual:
+            raise SystemExit(f"{archive}: {field}={actual!r}, want {expected.get(field)!r}")
+    if report.get("harness_type") != "compact-synthetic-warm":
+        raise SystemExit(f"{submission}: harness provenance {report.get('harness_type')!r} is not compact warm")
+    for field, plan_field in (
+        ("manifest_hash", "topology_hash"),
+        ("rubric_hash", "rubric_hash"),
+        ("image_lock", "image_lock"),
+        ("grader_source", "grader_source"),
+    ):
+        if report.get(field) != plan.get(plan_field):
+            raise SystemExit(f"{submission}: {field}={report.get(field)!r}, want plan {plan_field}={plan.get(plan_field)!r}")
+    audit_hash = report.get("equivalence_audit_hash")
+    if not isinstance(audit_hash, str) or not audit_hash:
+        raise SystemExit(f"{submission}: equivalence audit hash is missing")
+    observed_hashes.add(audit_hash)
+    if audit_hash != expected_hash:
+        raise SystemExit(f"{submission}: equivalence audit hash is mismatched")
+    actual_class = score_class(report)
+    if actual_class != expected.get("expected_total_class"):
+        raise SystemExit(f"{submission}: total class {actual_class!r}, want {expected.get('expected_total_class')!r}")
+    expected_total = expected.get("expected_total")
+    if expected_total is not None:
+        actual_total = report.get("total")
+        if not isinstance(expected_total, (int, float)) or not math.isclose(float(actual_total), float(expected_total), rel_tol=0, abs_tol=1e-6):
+            raise SystemExit(f"{submission}: total={actual_total!r}, want {expected_total!r}")
+    checks = expected.get("expected_checks")
+    if not isinstance(checks, list) or not checks:
+        raise SystemExit(f"{archive}: expected score plan has no check expectations")
+    for expected_check in checks:
+        check_status(report, expected_check)
+
+if set(entries) != seen_archives:
+    raise SystemExit("grade reports and expected score plan have different archive SHA-256 identities")
+if len(observed_hashes) != 1:
+    raise SystemExit("benchmark reports do not share one equivalence audit hash")
+if observed_hashes != {expected_hash}:
+    raise SystemExit("benchmark reports do not carry the plan's equivalence audit hash")
 PY
 }
 
@@ -431,7 +808,9 @@ write_report() {
     python3 - "$output" "$scratch_dir" "$manifest_file" "$manifest_hash" \
         "$source_revision" "$git_status" "$command_string" "$start_at" "$end_at" \
         "$start_epoch_ns" "$end_epoch_ns" "$failure" "$deployment_started" \
-        "$cleanup_attempted" "$submission_count" "$grade_reports" "$convergence_as" <<'PY'
+        "$cleanup_attempted" "$submission_count" "$grade_reports" "$convergence_as" \
+        "$deploy_budget" "$grade_budget" "$allow_other_labs" "$expected_submissions" \
+        "$cleanup_succeeded" "$cleanup_recovered_empty" <<'PY'
 import json
 import pathlib
 import sys
@@ -454,6 +833,12 @@ import sys
     submission_count,
     grade_reports,
     convergence_as,
+    deploy_budget,
+    grade_budget,
+    allow_other_labs,
+    expected_submissions,
+    cleanup_succeeded,
+    cleanup_recovered_empty,
 ) = sys.argv[1:]
 
 root = pathlib.Path(scratch)
@@ -505,6 +890,14 @@ def json_file(path):
 def phase_ok(name):
     p = phase(name)
     return p is not None and p["exit_code"] == 0
+
+def interval_seconds(start_name, end_name):
+    try:
+        start = int(text(f"{start_name}.started_epoch_ns").strip())
+        end = int(text(f"{end_name}.ended_epoch_ns").strip())
+        return (end - start) / 1_000_000_000
+    except ValueError:
+        return None
 
 topology_phase = decoded_phase("topology")
 topology = topology_phase.get("json", {}) if topology_phase else {}
@@ -563,7 +956,7 @@ required = {
     "deploy": phase_ok("deploy"),
     "convergence": phase_ok("convergence"),
     "node_status_after_deploy": phase_ok("node_status_after_deploy"),
-    "cleanup": phase_ok("cleanup") if cleanup_attempted == "1" else False,
+    "cleanup": cleanup_succeeded == "1" if cleanup_attempted == "1" else False,
     "node_status_after_cleanup": phase_ok("node_status_after_cleanup") if cleanup_attempted == "1" else False,
 }
 if submission_count != "0":
@@ -584,6 +977,12 @@ if submission_count != "0":
         "summary": json_file(pathlib.Path(grade_reports, "summary.json")),
         "result": grade_phase,
     }
+
+cleanup_attempts = {
+    path.name.removesuffix(".exit_code"): decoded_phase(path.name.removesuffix(".exit_code"))
+    for path in sorted(root.glob("cleanup_*.exit_code"))
+}
+cleanup_result_phase = text("cleanup_result_phase").strip()
 
 try:
     total_duration = (int(ended_epoch_ns) - int(started_epoch_ns)) / 1_000_000_000
@@ -618,11 +1017,24 @@ report = {
         "after_cleanup": decoded_phase("node_status_after_cleanup"),
     },
     "deploy": decoded_phase("deploy"),
+    "budgets": {
+        "deploy": deploy_budget,
+        "grade": grade_budget,
+        "expected_submissions": int(expected_submissions),
+        "allow_other_labs": allow_other_labs == "1",
+    },
+    "acceptance": {
+        "deploy_and_convergence_seconds": interval_seconds("deploy", "convergence"),
+        "grade_seconds": interval_seconds("grade", "grade") if submission_count != "0" else None,
+    },
     "convergence": decoded_phase("convergence"),
     "grade": grade,
     "cleanup": {
         "attempted": cleanup_attempted == "1",
-        "result": decoded_phase("cleanup"),
+        "succeeded": cleanup_succeeded == "1",
+        "recovered_empty": cleanup_recovered_empty == "1",
+        "result": cleanup_attempts.get(cleanup_result_phase),
+        "attempts": cleanup_attempts,
     },
     "required_measurements": required,
     "missing_measurements": missing,
@@ -640,14 +1052,15 @@ finish() {
     trap - EXIT INT TERM
 
     if [ "$deployment_started" -eq 1 ]; then
-        cleanup_attempted=1
-        if ! run_capture cleanup "$binary" destroy -m "$run_manifest" --yes; then
+        if ! cleanup_lab; then
             record_failure "cleanup could not remove the benchmark lab"
         fi
         if ! run_capture node_status_after_cleanup "$binary" --json node status -m "$run_manifest"; then
             record_failure "could not collect per-node status/resources after cleanup"
         elif ! validate_node_status "${scratch_dir}/node_status_after_cleanup.stdout"; then
             record_failure "per-node status/resources after cleanup were incomplete"
+        elif ! cleanup_status_is_absent "${scratch_dir}/node_status_after_cleanup.stdout"; then
+            record_failure "benchmark lab remained active after cleanup"
         fi
     fi
 
@@ -707,6 +1120,10 @@ if ! run_capture deploy "$binary" deploy -m "$run_manifest" --solve --quiet; the
     record_failure "scale deployment did not converge"
     exit 1
 fi
+if ! interval_within_budget deploy deploy "$deploy_budget"; then
+    record_failure "scale deployment exceeded the ${deploy_budget} acceptance budget"
+    exit 1
+fi
 
 if ! run_capture convergence "$binary" --json grade run -m "$run_manifest" --as "$convergence_as" \
     --out "${scratch_dir}/convergence_reports" --converge-timeout "$converge_timeout"; then
@@ -715,6 +1132,10 @@ if ! run_capture convergence "$binary" --json grade run -m "$run_manifest" --as 
 fi
 if ! validate_convergence; then
     record_failure "convergence-aware grade probe returned incomplete evidence"
+    exit 1
+fi
+if ! interval_within_budget deploy convergence "$deploy_budget"; then
+    record_failure "scale deployment and convergence exceeded the ${deploy_budget} acceptance budget"
     exit 1
 fi
 
@@ -739,12 +1160,22 @@ if [ -n "$submissions" ]; then
         exit 1
     fi
     if ! run_capture grade "$binary" grade batch -m "$run_manifest" --submissions "$submissions" \
-        --out "$grade_reports" --parallel "$grade_parallel"; then
+        --out "$grade_reports" --parallel "$grade_parallel" --all-attempts \
+        --compact-attestation "$compact_attestation" \
+        --compact-attestation-key "$compact_attestation_key"; then
         record_failure "batch grading did not complete without infrastructure review"
+        exit 1
+    fi
+    if ! interval_within_budget grade grade "$grade_budget"; then
+        record_failure "batch grading exceeded the ${grade_budget} acceptance budget"
         exit 1
     fi
     if ! validate_grade_summary; then
         record_failure "batch grading did not write a complete machine-readable summary"
+        exit 1
+    fi
+    if ! validate_expected_score_plan; then
+        record_failure "batch grading reports did not match compact attestation provenance and expected scores"
         exit 1
     fi
 fi

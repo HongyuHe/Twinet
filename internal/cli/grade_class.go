@@ -466,6 +466,9 @@ The lab must already be deployed with --solve.`,
 			}
 
 			reports = append(reports, quarantineUnreadable(unread, rubric, top.Name)...)
+			for _, report := range reports {
+				applyBatchReportProvenance(report, top, rubric)
+			}
 			summary := grade.Summarise(rubric.Metadata.Name, reports, time.Since(start))
 			if err := writeReports(outDir, summary); err != nil {
 				return err

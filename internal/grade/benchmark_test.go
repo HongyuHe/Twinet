@@ -64,7 +64,30 @@ func TestBenchmarkReportsUnexpectedScoreClass(t *testing.T) {
 	if report.Passed {
 		t.Fatalf("unexpected score class passed: %#v", report)
 	}
+
 	if err := BenchmarkFailure(report); err == nil {
 		t.Fatal("unexpected score class did not produce a release-gate error")
+	}
+}
+
+func TestRunStampsExactGraderSource(t *testing.T) {
+	const checkName = "test.report_grader_source"
+	registerTestCheck(checkName, func(_ context.Context, _ *Env) Result {
+		return Pass(checkName, Evidence{})
+	}, nil)
+	original := GraderSource
+	GraderSource = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	t.Cleanup(func() { GraderSource = original })
+	report := Run(context.Background(), &Rubric{
+		Metadata:  RubricMeta{Name: "source"},
+		Questions: []QuestionSpec{{ID: "q", Points: 1, Checks: []CheckSpec{{Check: checkName}}}},
+	}, &Env{
+		Topology: observationTestTopology(), AS: 3, StateReader: &countingStateReader{},
+		Exec: func(context.Context, string, []string) (rt.ExecResult, error) {
+			return rt.ExecResult{}, nil
+		},
+	}, RunOptions{Parallel: 1})
+	if report.GraderSource != GraderSource {
+		t.Fatalf("report grader_source=%q, want %q", report.GraderSource, GraderSource)
 	}
 }

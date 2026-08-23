@@ -39,11 +39,73 @@ path. `grade run --check-parallel` bounds total/passive checks; the smaller
 
 The compact `harness.Options.Synthetic` substrate keeps the target AS and IXPs
 intact while collapsing each other retained AS to one deterministic
-policy/origin router. Full topology fallback remains available through
-`grade batch --full-harness`, particularly for disputed marks. The batch
-command retains its established reducer until the compact option passes the
-`harness.AuditEquivalence` full-harness comparison (reference plus wrong-answer
-fixtures); a compact result is not release evidence by itself.
+policy/origin router. It is enabled only by a signed release attestation keyed
+to the topology hash, rubric hash, compiler version, exact grader-source
+digest, and verified image lock; an unattested development lab falls back to a
+full isolated harness. The source digest is a deterministic SHA-256 over
+`cmd/**/*.go`, `internal/**/*.go`, `go.mod`, and `go.sum`, so source edits and
+untracked compiled files receive a distinct identity while documentation does
+not. Commit and version remain signed audit provenance. Full
+topology fallback remains available through `grade batch --full-harness`,
+particularly for disputed marks. The attestation's
+`harness.AuditEquivalence` suite must include reference and wrong-answer
+fixtures; a compact result is not release evidence by itself.
+
+`grade attest compact` requires a separate, existing submission-signing
+private key to derive and re-sign each mutation. It writes a sibling
+`<attestation>.evidence/` directory containing the exact suite, reference and
+mutation bundles, plus deterministic per-case full/compact report paths,
+SHA-256 digests, and timings. The signed artifact binds suite/reference
+digests and runtime compact admission verifies the retained evidence. One
+isolated full warm harness and one compact warm harness are reset between
+cases; a reset or reference-peer undo failure taints and destroys the slot,
+causing the audit to fail rather than reusing state.
+
+Release attestations and scale benchmarks read `TWINET_TOKEN` only from the
+environment (normally populated from a root-readable credential file). Never
+place a bearer token in a command flag: process listings and captured command
+traces expose argv.
+
+Harness deployment still verifies rendered files, platform addresses, default
+routes, and local readiness. Cross-AS BGP/forwarding is deliberately checked
+after the fenced transaction commits, by a whole solved-reference baseline
+gate before any submission is loaded, followed by convergence and grading
+witnesses. Those routes form concurrently and are not a safe synchronous
+transaction predicate. A failed baseline is infrastructure review, never a
+student mark; this does not relax any delivery or anti-cheating check.
+
+Ordinary `grade batch` accepts one final submission per group/AS and withdraws
+duplicates as contested. Release benchmarks are the narrow exception:
+`grade benchmark generate` emits signed archives with unique `attempt`
+identities, and `grade batch --all-attempts` is required before repeated
+group/AS work is accepted. Each benchmark report retains its attempt and exact
+archive SHA-256; the expected-score plan maps that SHA to a score class and
+designated check outcomes. This is not a late-work policy or an ordinary
+gradebook mode.
+
+For release capacity evidence, run `grade benchmark generate` with the signed
+reference archive, mutation suite, and submission key. It cycles the reference
+and every deterministic wrong-answer mutation into byte-identical tarballs and
+writes an archive-SHA-keyed expected score/check-class plan. Pass that plan,
+the compact attestation/key, and the generated directory to
+`scripts/scale_benchmark.sh`; its real `grade batch --all-attempts` invocation
+requires exactly the planned attempts, one shared attestation hash, compact
+warm provenance, no review rows, and the planned score/check classes.
+
+The plan also binds the mutation-suite SHA-256, image lock, topology/rubric
+hashes, and grader-source digest. Generation requires the exact non-empty
+compact attestation hash expected during the later batch; the runner rejects
+any report whose topology, rubric, image, source, or attestation provenance
+does not match.
+
+Every emitted grade report carries the build-stamped deterministic
+`grader_source` digest. Controller version/commit remain human provenance only
+and cannot satisfy the benchmark plan source binding.
+
+The generator, attestation command, and scale runner intentionally have no
+token flag in their release invocation examples. Export `TWINET_TOKEN` only
+for the process that runs them (from a protected credential file); do not put
+it in argv, shell history, report command strings, or logs.
 
 ## What a result contains
 

@@ -31,6 +31,21 @@ func TestReferenceReachabilityTargetsCoverRemoteASHosts(t *testing.T) {
 	}
 }
 
+func TestHarnessSemanticCommitDefersRemoteForwarding(t *testing.T) {
+	if !verifyReferenceForwardingAtCommit(0) {
+		t.Fatal("ordinary solved lab stopped checking reference forwarding at commit")
+	}
+	if verifyReferenceForwardingAtCommit(3) {
+		t.Fatal("ungraded harness held its apply transaction for asynchronous remote forwarding")
+	}
+	if !verifyReferenceBGPAtCommit(0) {
+		t.Fatal("ordinary solved lab stopped checking reference BGP at commit")
+	}
+	if verifyReferenceBGPAtCommit(3) {
+		t.Fatal("ungraded harness held its apply transaction for asynchronous reference BGP")
+	}
+}
+
 func TestSemanticHealthRequirementsUseRoleAndNOSCapabilities(t *testing.T) {
 	makeRouter := func(asn int, role model.ASRole, nosName string) (*model.Topology, *model.Device) {
 		peer := &model.Device{ID: "peer", Kind: model.KindRouter}

@@ -563,7 +563,6 @@ var _ = model.DeviceID
 // runs with, so a harness outside this repository can drive an agent itself
 // without handing it the cluster.
 func newIncidentCredentialCmd(opts *Options) *cobra.Command {
-	var token string
 	cmd := &cobra.Command{
 		Use:   "credential",
 		Short: "mint a read-only, single-lab credential for an agent under evaluation",
@@ -579,17 +578,14 @@ func newIncidentCredentialCmd(opts *Options) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if token == "" {
-				token = os.Getenv("TWINET_TOKEN")
-			}
+			token := os.Getenv("TWINET_TOKEN")
 			if token == "" {
 				return errors.New("the cluster token is needed to derive a credential from it: " +
-					"pass --token or set TWINET_TOKEN")
+					"set TWINET_TOKEN from a protected credential file")
 			}
 			fmt.Fprintln(cmd.OutOrStdout(), agent.DiagnosticToken(token, top.Name))
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&token, "token", "", "cluster agent token")
 	return cmd
 }

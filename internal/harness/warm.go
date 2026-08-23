@@ -27,6 +27,14 @@ type WarmHarness interface {
 	Destroy(context.Context) error
 }
 
+// TaintedWarmHarness reports state outside the target reset boundary that
+// could not be restored. A pool must destroy rather than recycle it: resetting
+// only the submission AS cannot erase a peer adaptation left on a reference
+// neighbour.
+type TaintedWarmHarness interface {
+	WarmTaint() error
+}
+
 // WarmFactory deploys one substrate exactly once for a worker. The factory is
 // where a cluster adapter acquires the fenced hold and image lock.
 type WarmFactory func(context.Context, int) (WarmHarness, error)
@@ -42,6 +50,12 @@ type WarmPool struct {
 	closed   bool
 	closeErr error
 	active   sync.WaitGroup
+	failure  error
+
+	unavailable     chan struct{}
+	unavailableOnce sync.Once
+	closeOnce       sync.Once
+	closeDone       chan struct{}
 }
 
 // NewWarmPool deploys and validates every worker substrate before admitting a
@@ -54,7 +68,10 @@ func NewWarmPool(ctx context.Context, workers int, factory WarmFactory) (*WarmPo
 	if factory == nil {
 		return nil, fmt.Errorf("warm pool needs a factory")
 	}
-	pool := &WarmPool{slots: make(chan WarmHarness, workers), all: map[string]WarmHarness{}}
+	pool := &WarmPool{
+		slots: make(chan WarmHarness, workers), all: map[string]WarmHarness{},
+		unavailable: make(chan struct{}), closeDone: make(chan struct{}),
+	}
 	for worker := 0; worker < workers; worker++ {
 		harness, err := factory(ctx, worker)
 		if err == nil {
@@ -102,8 +119,9 @@ func (p *WarmPool) With(ctx context.Context, grade func(context.Context, WarmHar
 	}
 	p.mu.Lock()
 	if p.closed {
+		err := p.unavailableErrorLocked()
 		p.mu.Unlock()
-		return fmt.Errorf("warm pool is closed")
+		return err
 	}
 	p.mu.Unlock()
 	select {
@@ -113,14 +131,20 @@ func (p *WarmPool) With(ctx context.Context, grade func(context.Context, WarmHar
 		}
 		p.mu.Lock()
 		if p.closed {
+			err := p.unavailableErrorLocked()
 			p.mu.Unlock()
 			p.discard(context.WithoutCancel(ctx), harness)
-			return fmt.Errorf("warm pool is closed")
+			return err
 		}
 		p.active.Add(1)
 		p.mu.Unlock()
 		defer p.active.Done()
 		return p.use(ctx, harness, grade)
+	case <-p.unavailable:
+		p.mu.Lock()
+		err := p.unavailableErrorLocked()
+		p.mu.Unlock()
+		return err
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -135,6 +159,17 @@ func (p *WarmPool) use(ctx context.Context, harness WarmHarness,
 			harness.WarmIdentity().Namespace, err)
 	}
 	gradeErr := grade(ctx, harness)
+	if tainted, ok := harness.(TaintedWarmHarness); ok {
+		if taint := tainted.WarmTaint(); taint != nil {
+			p.discard(context.WithoutCancel(ctx), harness)
+			if gradeErr != nil {
+				return fmt.Errorf("%v; warm harness %s is tainted: %w",
+					gradeErr, harness.WarmIdentity().Namespace, taint)
+			}
+			return fmt.Errorf("warm harness %s is tainted: %w",
+				harness.WarmIdentity().Namespace, taint)
+		}
+	}
 	if err := harness.Reset(context.WithoutCancel(ctx)); err != nil {
 		p.discard(context.WithoutCancel(ctx), harness)
 		if gradeErr != nil {
@@ -146,10 +181,11 @@ func (p *WarmPool) use(ctx context.Context, harness WarmHarness,
 	}
 	p.mu.Lock()
 	closed := p.closed
+	closedErr := p.unavailableErrorLocked()
 	p.mu.Unlock()
 	if closed {
 		p.discard(context.WithoutCancel(ctx), harness)
-		return fmt.Errorf("warm pool closed while grading %s", harness.WarmIdentity().Namespace)
+		return fmt.Errorf("%w while grading %s", closedErr, harness.WarmIdentity().Namespace)
 	}
 	p.slots <- harness
 	return gradeErr
@@ -159,10 +195,28 @@ func (p *WarmPool) discard(ctx context.Context, harness WarmHarness) {
 	if harness == nil {
 		return
 	}
+	p.markUnavailable(fmt.Errorf("warm slot %s was discarded", harness.WarmIdentity().Namespace))
 	_ = harness.Destroy(ctx)
 	p.mu.Lock()
 	delete(p.all, harness.WarmIdentity().Namespace)
 	p.mu.Unlock()
+}
+
+func (p *WarmPool) markUnavailable(reason error) {
+	p.mu.Lock()
+	if !p.closed {
+		p.closed = true
+		p.failure = reason
+		p.unavailableOnce.Do(func() { close(p.unavailable) })
+	}
+	p.mu.Unlock()
+}
+
+func (p *WarmPool) unavailableErrorLocked() error {
+	if p.failure != nil {
+		return p.failure
+	}
+	return fmt.Errorf("warm pool is closed")
 }
 
 // Close destroys every substrate, including currently idle slots. Callers
@@ -171,13 +225,24 @@ func (p *WarmPool) Close(ctx context.Context) error {
 	if p == nil {
 		return nil
 	}
-	p.mu.Lock()
-	if p.closed {
+	p.closeOnce.Do(func() { go p.finishClose(ctx) })
+	select {
+	case <-p.closeDone:
+		p.mu.Lock()
 		err := p.closeErr
 		p.mu.Unlock()
 		return err
+	case <-ctx.Done():
+		return ctx.Err()
 	}
-	p.closed = true
+}
+
+func (p *WarmPool) finishClose(ctx context.Context) {
+	p.mu.Lock()
+	if !p.closed {
+		p.closed = true
+		p.unavailableOnce.Do(func() { close(p.unavailable) })
+	}
 	p.mu.Unlock()
 	p.active.Wait()
 	p.mu.Lock()
@@ -199,5 +264,5 @@ func (p *WarmPool) Close(ctx context.Context) error {
 	p.mu.Lock()
 	p.closeErr = first
 	p.mu.Unlock()
-	return first
+	close(p.closeDone)
 }

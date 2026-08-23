@@ -32,6 +32,7 @@ type labHold struct {
 	Reason func() string
 
 	release func()
+	token   string
 }
 
 // Release hands the lab back.
@@ -148,7 +149,8 @@ func holdLab(ctx context.Context, top *model.Topology, token string, out io.Writ
 	}()
 
 	return &labHold{
-		Lost: lost,
+		Lost:  lost,
+		token: id,
 		Reason: func() string {
 			if p := reason.Load(); p != nil {
 				return *p

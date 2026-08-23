@@ -33,9 +33,13 @@ import (
 // student could not have known. The hash is what lets a grader say which of
 // those happened.
 type Bundle struct {
-	Lab        string            `json:"lab"`
-	AS         int               `json:"as"`
-	Group      string            `json:"group"`
+	Lab   string `json:"lab"`
+	AS    int    `json:"as"`
+	Group string `json:"group"`
+	// Attempt is an optional signed submission identity used only by an
+	// explicitly opted-in benchmark/regrade batch. Ordinary grading remains
+	// one final submission per group and AS.
+	Attempt    string            `json:"attempt,omitempty"`
 	Topology   string            `json:"topology_hash"`
 	Controller string            `json:"controller"`
 	ImageLock  string            `json:"image_lock,omitempty"`

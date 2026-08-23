@@ -298,7 +298,8 @@ func Run(ctx context.Context, r *Rubric, env *Env, opts RunOptions) *Report {
 	rep := &Report{
 		AS: env.AS, Lab: env.Topology.Name, Rubric: r.Metadata.Name,
 		Manifest: env.Topology.Hash, GradedAt: time.Now().UTC(),
-		MaxTotal: r.MaxTotal(),
+		GraderSource: GraderSource,
+		MaxTotal:     r.MaxTotal(),
 	}
 	rep.RubricNotes = r.Metadata.Notes
 	if lab := env.Topology.Lab; lab != nil {

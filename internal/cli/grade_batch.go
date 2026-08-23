@@ -2,7 +2,9 @@ package cli
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -35,6 +37,19 @@ type submission struct {
 	Group string
 	AS    int
 	Dir   string
+	// Attempt is a signed benchmark/regrade identity. It is empty for normal
+	// student submissions, which retain the one-final-submission policy.
+	Attempt string
+	// ArchiveSHA256 identifies an archive plan entry and remains in its report
+	// so a benchmark cannot associate an expected score with another bundle.
+	ArchiveSHA256 string
+	// Controller is preserved when a signed reference archive is transformed
+	// into benchmark/attestation mutations, so archive bytes do not depend on
+	// a presentation-version tag added after collection.
+	Controller string
+	// TakenAt is retained when an attestation mutation is re-signed so a
+	// deterministic fixture differs only in its declared transformation.
+	TakenAt time.Time
 	// Files maps a router's short name to the FRR configuration submitted for
 	// it. A submission that names a router the AS does not have is a mistake
 	// worth reporting rather than ignoring: silently dropping it would mark
@@ -56,24 +71,40 @@ type submission struct {
 	Scripts map[string]string
 }
 
+func (s submission) Identity() string {
+	if s.Attempt == "" {
+		return s.Group
+	}
+	return s.Group + "--" + s.Attempt
+}
+
+var attemptIdentity = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+
+func validAttempt(value string) bool {
+	return attemptIdentity.MatchString(value)
+}
+
 func newGradeBatchCmd(opts *Options) *cobra.Command {
 	var (
-		subDir      string
-		rubricPath  string
-		outDir      string
-		parallel    int
-		depth       int
-		reduce      bool
-		fullHarness bool
-		keepHosts   bool
-		keepLabs    bool
-		token       string
-		converge    time.Duration
-		settle      time.Duration
+		subDir          string
+		rubricPath      string
+		outDir          string
+		parallel        int
+		depth           int
+		reduce          bool
+		fullHarness     bool
+		allAttempts     bool
+		attestationPath string
+		attestationKey  string
+		keepHosts       bool
+		keepLabs        bool
+		token           string
+		converge        time.Duration
+		settle          time.Duration
 	)
 	cmd := &cobra.Command{
 		Use:   "batch",
-		Short: "Grade every submission in its own disposable lab",
+		Short: "Grade every submission in a compact isolated harness",
 		Long: `Batch grading gives each submission a private network.
 
 Grading a whole class in one shared lab is convenient and wrong: a group that
@@ -82,11 +113,18 @@ re-run after one group resubmits silently re-marks everyone. Nothing in the
 output distinguishes "this student was wrong" from "someone else was".
 
 Each submission is instead graded in a harness: its own AS in full, surrounded
-by the smallest neighbourhood that still exercises it, deployed under a lab name
-unique to that submission so container names, overlay identifiers and addresses
-cannot collide with any other. The harness is destroyed afterwards, whatever the
-mark, unless --keep-labs is given for a dispute.`,
+by deterministic synthetic reference peers. The default compact harness retains
+the target and IXPs while collapsing remote interiors; the first compact result
+is compared with a full isolated harness before compact marks are released.
+
+Warm workers reuse only a reset, uniquely named harness for the same target AS:
+every lease restores the exact student baseline before and after loading one
+submission. Use --full-harness (normally with --keep-labs) for a dispute, or
+--reduce/--depth to select legacy slicing explicitly.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if allAttempts && token != "" {
+				return fmt.Errorf("--all-attempts release batches require TWINET_TOKEN from the environment; --token is forbidden")
+			}
 			if fullHarness {
 				if reduce || depth != 0 {
 					return fmt.Errorf("--full-harness cannot be combined with --reduce or --depth")
@@ -111,7 +149,11 @@ mark, unless --keep-labs is given for a dispute.`,
 			if err := rubric.ValidateTopology(class); err != nil {
 				return err
 			}
-			subs, unread, err := readSubmissions(subDir, class)
+			compact, auditHash, auditNote := compactEligibility(class, rubric, attestationPath, attestationKey)
+			if !fullHarness && !reduce && depth == 0 && !compact {
+				fmt.Fprintf(cmd.ErrOrStderr(), "compact harness disabled: %s; using full isolated fallback\n", auditNote)
+			}
+			subs, unread, err := readSubmissionsWithAttempts(subDir, class, allAttempts)
 			if err != nil {
 				return err
 			}
@@ -133,9 +175,8 @@ mark, unless --keep-labs is given for a dispute.`,
 			reports := make([]*grade.Report, len(subs))
 			plans := make([]*batchHarness, 0, len(subs))
 			for i, sub := range subs {
-				h, err := harness.Slice(class, sub.AS, harness.Options{
-					Depth: depth, KeepHosts: keepHosts, Reduce: reduce, Suffix: sub.Group,
-				})
+				h, err := harness.Slice(class, sub.AS,
+					batchHarnessOptions(depth, reduce, fullHarness, compact, keepHosts, sub.Identity()))
 				if err != nil {
 					reports[i] = ungradeableReport(sub, rubric, "building the harness", err)
 					continue
@@ -149,7 +190,7 @@ mark, unless --keep-labs is given for a dispute.`,
 			workloads := make([]place.Workload, 0, len(plans))
 			for _, plan := range plans {
 				workloads = append(workloads, place.Workload{
-					Name: plan.submission.Group, DemandByNode: place.TopologyDemandByNode(plan.topology),
+					Name: plan.submission.Identity(), DemandByNode: place.TopologyDemandByNode(plan.topology),
 				})
 			}
 			var waves [][]int
@@ -174,6 +215,23 @@ mark, unless --keep-labs is given for a dispute.`,
 				"grading %d submission(s) in %d capacity-safe wave(s), at most %d at a time\n",
 				len(plans), len(waves), parallel)
 
+			var warm *warmBatchManager
+			if !keepLabs && compact {
+				workersByASN := map[int]int{}
+				for _, plan := range plans {
+					workersByASN[plan.submission.AS]++
+				}
+				for asn, workers := range workersByASN {
+					if workers > parallel {
+						workersByASN[asn] = parallel
+					}
+				}
+				warm = newWarmBatchManager(class, rubric, batchOpts{
+					token: tok, depth: depth, keepHosts: keepHosts, reduce: reduce, fullHarness: fullHarness,
+					compact: compact, auditHash: auditHash,
+					keepLab: false, converge: converge, settle: settle, outDir: outDir,
+				}, workersByASN)
+			}
 			var mu sync.Mutex
 			done := 0
 			for waveIndex := 0; waveIndex < len(waves); waveIndex++ {
@@ -194,11 +252,16 @@ mark, unless --keep-labs is given for a dispute.`,
 					wg.Add(1)
 					go func(plan *batchHarness) {
 						defer wg.Done()
-						rep := gradeOneHarness(cmd.Context(), class, rubric, plan.submission, plan.topology, batchOpts{
-							token: tok, depth: depth, keepHosts: keepHosts, reduce: reduce,
-							keepLab: keepLabs, converge: converge, settle: settle,
-							outDir: outDir,
-						})
+						var rep *grade.Report
+						if warm != nil {
+							rep = warm.grade(cmd.Context(), plan.submission)
+						} else {
+							rep = gradeOneHarness(cmd.Context(), class, rubric, plan.submission, plan.topology, batchOpts{
+								token: tok, depth: depth, keepHosts: keepHosts, reduce: reduce, fullHarness: fullHarness,
+								keepLab: keepLabs, converge: converge, settle: settle,
+								outDir: outDir,
+							})
+						}
 						if capacityBlockedReport(rep) {
 							retryMu.Lock()
 							retry = append(retry, plan.queueIndex)
@@ -210,7 +273,7 @@ mark, unless --keep-labs is given for a dispute.`,
 						mu.Lock()
 						done++
 						fmt.Fprintf(cmd.ErrOrStderr(), "  [%d/%d] %-12s %.2f / %.2f\n",
-							done, len(subs), rep.Submission, rep.Total, rep.MaxTotal)
+							done, len(subs), rep.Identity(), rep.Total, rep.MaxTotal)
 						mu.Unlock()
 					}(plan)
 				}
@@ -228,8 +291,20 @@ mark, unless --keep-labs is given for a dispute.`,
 						len(retry))
 				}
 			}
+			if warm != nil {
+				tctx, cancel := context.WithTimeout(context.WithoutCancel(cmd.Context()), 3*time.Minute)
+				err := warm.close(tctx)
+				cancel()
+				if err != nil {
+					teardownFailed.Store(true)
+					return fmt.Errorf("destroying warm grading harnesses: %w", err)
+				}
+			}
 
 			reports = append(reports, quarantineUnreadable(unread, rubric, class.Name)...)
+			for _, report := range reports {
+				applyBatchReportProvenance(report, class, rubric)
+			}
 			summary := grade.Summarise(rubric.Metadata.Name, reports, time.Since(start))
 			if err := writeReports(outDir, summary); err != nil {
 				return err
@@ -258,12 +333,18 @@ mark, unless --keep-labs is given for a dispute.`,
 	cmd.Flags().StringVarP(&outDir, "out", "o", "", "where to write reports")
 	cmd.Flags().IntVarP(&parallel, "parallel", "p", 0,
 		"maximum harnesses deployed concurrently (0 derives a safe width from live admission)")
-	cmd.Flags().IntVar(&depth, "depth", 0, "AS hops of neighbourhood to keep; 0 keeps the whole topology")
+	cmd.Flags().IntVar(&depth, "depth", 0, "legacy AS hops of neighbourhood to keep (disables compact harness)")
 	cmd.Flags().BoolVar(&reduce, "reduce", false,
-		"keep every autonomous system but only the routers of each that face the target")
+		"use the legacy router-facing reducer instead of the compact synthetic harness")
 	cmd.Flags().BoolVar(&fullHarness, "full-harness", false,
 		"force the complete reference topology; use with --keep-labs to investigate a disputed mark")
+	cmd.Flags().BoolVar(&allAttempts, "all-attempts", false,
+		"accept repeated group/AS archives only when every duplicate has a distinct signed attempt identity")
 	cmd.Flags().BoolVar(&keepHosts, "keep-hosts", true, "keep one host per neighbour, for end-to-end checks")
+	cmd.Flags().StringVar(&attestationPath, "compact-attestation", "",
+		"signed compact/full equivalence attestation required to enable compact harnesses")
+	cmd.Flags().StringVar(&attestationKey, "compact-attestation-key", "",
+		"PEM public key that verifies --compact-attestation")
 	cmd.Flags().BoolVar(&keepLabs, "keep-labs", false, "do not destroy harnesses, for investigating a disputed mark")
 	cmd.Flags().StringVar(&token, "token", "", "agent token (or TWINET_TOKEN)")
 	cmd.Flags().BoolVar(&allowUnsignedBundles, "allow-unsigned", false,
@@ -275,14 +356,43 @@ mark, unless --keep-labs is given for a dispute.`,
 }
 
 type batchOpts struct {
-	token     string
-	depth     int
-	reduce    bool
-	keepHosts bool
-	keepLab   bool
-	converge  time.Duration
-	settle    time.Duration
-	outDir    string
+	token         string
+	depth         int
+	reduce        bool
+	fullHarness   bool
+	compact       bool
+	auditHash     string
+	keepHosts     bool
+	keepLab       bool
+	converge      time.Duration
+	settle        time.Duration
+	outDir        string
+	warmNamespace string
+}
+
+// batchHarnessOptions makes compact synthetic reference peers the normal
+// isolated grading substrate. The target AS remains whole; --full-harness is
+// the dispute path, while --reduce/--depth explicitly retain legacy slicing
+// behavior for audits and migration comparisons.
+func batchHarnessOptions(depth int, reduce, full, compact, keepHosts bool, suffix string) harness.Options {
+	options := harness.Options{Depth: depth, KeepHosts: keepHosts, Reduce: reduce, Suffix: suffix}
+	switch {
+	case full:
+		options.Depth = 0
+		options.Reduce = false
+		options.Synthetic = false
+		options.KeepHosts = true
+	case reduce || depth > 0:
+		options.Synthetic = false
+	case compact:
+		options.Depth = 0
+		options.Synthetic = true
+	default:
+		options.Depth = 0
+		options.Reduce = false
+		options.Synthetic = false
+	}
+	return options
 }
 
 type batchHarness struct {
@@ -294,12 +404,33 @@ type batchHarness struct {
 
 func ungradeableReport(s submission, rubric *grade.Rubric, stage string, err error) *grade.Report {
 	return &grade.Report{
-		Submission:  s.Group,
-		MaxTotal:    rubric.MaxTotal(),
-		AS:          s.AS,
-		Err:         fmt.Sprintf("%s: %v", stage, err),
-		NeedsReview: true,
+		Submission:    s.Group,
+		Attempt:       s.Attempt,
+		ArchiveSHA256: s.ArchiveSHA256,
+		GraderSource:  grade.GraderSource,
+		MaxTotal:      rubric.MaxTotal(),
+		AS:            s.AS,
+		Err:           fmt.Sprintf("%s: %v", stage, err),
+		NeedsReview:   true,
 	}
+}
+
+func applyBatchReportProvenance(report *grade.Report, class *model.Topology, rubric *grade.Rubric) {
+	if report == nil {
+		return
+	}
+	if class != nil {
+		report.Manifest = class.Hash
+		if class.Lab != nil {
+			report.ImageLock = class.Lab.Images.LockDigest
+		}
+	}
+	if rubric != nil {
+		report.Rubric = rubric.Metadata.Name
+		report.RubricHash = compactRubricHash(rubric)
+	}
+	report.Controller = Version
+	report.GraderSource = grade.GraderSource
 }
 
 const capacityAdmissionPrefix = "capacity admission: "
@@ -350,9 +481,8 @@ func waitForHarnessCapacity(ctx context.Context, c *client.Cluster, lab *model.L
 // still needs a defensible answer for the student.
 func gradeOne(ctx context.Context, class *model.Topology, rubric *grade.Rubric,
 	s submission, o batchOpts) *grade.Report {
-	h, err := harness.Slice(class, s.AS, harness.Options{
-		Depth: o.depth, KeepHosts: o.keepHosts, Reduce: o.reduce, Suffix: s.Group,
-	})
+	h, err := harness.Slice(class, s.AS,
+		batchHarnessOptions(o.depth, o.reduce, o.fullHarness, o.compact, o.keepHosts, s.Group))
 	if err != nil {
 		return ungradeableReport(s, rubric, "building the harness", err)
 	}
@@ -365,6 +495,7 @@ func gradeOneHarness(ctx context.Context, class *model.Topology, rubric *grade.R
 
 	fail := func(stage string, err error) *grade.Report {
 		rep := ungradeableReport(s, rubric, stage, err)
+		rep.HarnessType = batchHarnessType(o)
 		var capacityErr *capacityAdmissionError
 		if errors.As(err, &capacityErr) {
 			rep.Err = capacityAdmissionPrefix + err.Error()
@@ -493,7 +624,10 @@ func gradeOneHarness(ctx context.Context, class *model.Topology, rubric *grade.R
 	rep := grade.Run(ctx, rubric, &grade.Env{Topology: h, AS: s.AS, Exec: exec},
 		grade.RunOptions{ConvergeTimeout: o.converge, Parallel: 4})
 	rep.Submission = s.Group
+	rep.Attempt = s.Attempt
+	rep.ArchiveSHA256 = s.ArchiveSHA256
 	rep.Lab = h.Name
+	rep.HarnessType = batchHarnessType(o)
 	// Provenance, so a mark can be traced to exact software. An image tag is
 	// not an identity: rebuilt later it is different software, and a regrade
 	// against it is not comparable with the first.
@@ -530,6 +664,19 @@ func gradeOneHarness(ctx context.Context, class *model.Topology, rubric *grade.R
 				"(--depth 0) before releasing this mark", joinInts(missing)))
 	}
 	return rep
+}
+
+func batchHarnessType(o batchOpts) string {
+	switch {
+	case o.fullHarness:
+		return "full"
+	case o.reduce || o.depth > 0:
+		return "legacy-reduced"
+	case o.compact:
+		return "compact-synthetic"
+	default:
+		return "full-audit-fallback"
+	}
 }
 
 // imageDigests resolves every image the lab uses to the digest in use, for the
@@ -768,6 +915,21 @@ func applySubmission(ctx context.Context, exec execFn, h *model.Topology, s subm
 // reflects the file the student submitted rather than that file layered on top
 // of whatever the router was already running.
 func loadFRRConfig(ctx context.Context, exec execFn, d *model.Device, body string) error {
+	return loadFRRConfigWithDaemonCheck(ctx, exec, d, body, true)
+}
+
+// loadPlatformFRRConfig restores a student's empty platform baseline. It must
+// restart FRR, but deliberately does not require all routing daemons to remain
+// up: the student has not supplied the OSPF/BGP configuration that starts
+// their routing exercise yet. Every actual submission still uses
+// loadFRRConfig, which rejects a daemon that dies on its submitted file.
+func loadPlatformFRRConfig(ctx context.Context, exec execFn, d *model.Device, body string) error {
+	return loadFRRConfigWithDaemonCheck(ctx, exec, d, body, false)
+}
+
+func loadFRRConfigWithDaemonCheck(ctx context.Context, exec execFn, d *model.Device, body string,
+	requireDaemons bool,
+) error {
 	// The configuration is base64-encoded rather than written through a shell
 	// heredoc. A submission is a file a student controls, and a line reading
 	// exactly TWINET_EOF ends the heredoc early -- everything after it becomes
@@ -794,6 +956,9 @@ func loadFRRConfig(ctx context.Context, exec execFn, d *model.Device, body strin
 	if res.ExitCode != 0 {
 		return fmt.Errorf("installing the configuration: %s",
 			firstLine(res.Stdout+res.Stderr))
+	}
+	if !requireDaemons {
+		return nil
 	}
 
 	// A daemon that rejected the file exits, and FRR's own start script does
@@ -897,9 +1062,18 @@ func submissionFromArchive(p string, class *model.Topology) (submission, error) 
 				"attribute to the student failures they could not have avoided",
 			filepath.Base(p), short(b.Topology), short(class.Hash))
 	}
+	if b.Attempt != "" && !validAttempt(b.Attempt) {
+		return submission{}, fmt.Errorf("%s has unsafe attempt identity %q", filepath.Base(p), b.Attempt)
+	}
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		return submission{}, fmt.Errorf("%s: digest archive: %w", filepath.Base(p), err)
+	}
+	archiveDigest := sha256.Sum256(raw)
 
 	sub := submission{
-		Group: group, AS: b.AS, Dir: p,
+		Group: group, AS: b.AS, Dir: p, Attempt: b.Attempt,
+		ArchiveSHA256: hex.EncodeToString(archiveDigest[:]), Controller: b.Controller, TakenAt: b.TakenAt,
 		Files: map[string]string{}, Scripts: map[string]string{},
 	}
 	m, err := classifyBundle(files)
@@ -1014,7 +1188,7 @@ func resetToStudentStart(ctx context.Context, exec execFn, top *model.Topology, 
 		if err != nil {
 			return fmt.Errorf("%s: rendering the starting configuration: %w", d.ID, err)
 		}
-		if err := loadFRRConfig(ctx, exec, d, cfg.Platform); err != nil {
+		if err := loadPlatformFRRConfig(ctx, exec, d, cfg.Platform); err != nil {
 			return fmt.Errorf("%s: restoring the starting configuration: %w", d.ID, err)
 		}
 	}
@@ -1402,6 +1576,12 @@ type unreadable struct {
 // the same AS, still stops everything, because in those cases there is no way
 // to know which students would be silently skipped.
 func readSubmissions(dir string, class *model.Topology) ([]submission, []unreadable, error) {
+	return readSubmissionsWithAttempts(dir, class, false)
+}
+
+func readSubmissionsWithAttempts(dir string, class *model.Topology,
+	allAttempts bool,
+) ([]submission, []unreadable, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, nil, fmt.Errorf("reading submissions: %w", err)
@@ -1507,9 +1687,9 @@ func readSubmissions(dir string, class *model.Topology) ([]submission, []unreada
 		}
 		subs = append(subs, sub)
 	}
-	sort.Slice(subs, func(i, j int) bool { return subs[i].Group < subs[j].Group })
+	sort.Slice(subs, func(i, j int) bool { return subs[i].Identity() < subs[j].Identity() })
 	sort.Slice(bad, func(i, j int) bool { return bad[i].Name < bad[j].Name })
-	subs, bad = withdrawContested(subs, bad)
+	subs, bad = withdrawContestedWithAttempts(subs, bad, allAttempts)
 	return subs, bad, nil
 }
 
@@ -1533,6 +1713,19 @@ func readSubmissions(dir string, class *model.Topology) ([]submission, []unreada
 // report saying they had not been graded at all and the CSV carried two
 // contradictory rows for them. One name yields one report, always.
 func withdrawContested(subs []submission, bad []unreadable) ([]submission, []unreadable) {
+	return withdrawContestedWithAttempts(subs, bad, false)
+}
+
+func withdrawContestedWithAttempts(subs []submission, bad []unreadable,
+	allAttempts bool,
+) ([]submission, []unreadable) {
+	if allAttempts {
+		return withdrawContestedAttempts(subs, bad)
+	}
+	return withdrawContestedLegacy(subs, bad)
+}
+
+func withdrawContestedLegacy(subs []submission, bad []unreadable) ([]submission, []unreadable) {
 	byName := map[string][]string{}
 	byAS := map[int]map[string]bool{}
 	note := func(name string, asn int, what string) {
@@ -1623,6 +1816,148 @@ func withdrawContested(subs []submission, bad []unreadable) ([]submission, []unr
 	}
 	sort.Slice(held, func(i, j int) bool { return held[i].Name < held[j].Name })
 	return kept, held
+}
+
+// withdrawContestedAttempts admits a narrow benchmark/regrade exception to
+// the one-final-submission rule. A repeated group or AS is safe only when
+// every claimant is a readable signed archive with a non-empty, unique
+// attempt. Any directory submission, unreadable archive, missing attempt, or
+// duplicate attempt remains contested exactly like an ordinary class run.
+func withdrawContestedAttempts(subs []submission, bad []unreadable) ([]submission, []unreadable) {
+	type claim struct {
+		subIndex int
+		badIndex int
+		name     string
+		asn      int
+		attempt  string
+		source   string
+	}
+	byGroup := map[string][]claim{}
+	byAS := map[int][]claim{}
+	for index, sub := range subs {
+		value := claim{
+			subIndex: index, badIndex: -1, name: sub.Group, asn: sub.AS,
+			attempt: sub.Attempt, source: describeClaim(sub.Group, sub.Dir),
+		}
+		key := strings.ToLower(sub.Group)
+		byGroup[key] = append(byGroup[key], value)
+		if sub.AS > 0 {
+			byAS[sub.AS] = append(byAS[sub.AS], value)
+		}
+	}
+	for index, unread := range bad {
+		value := claim{
+			subIndex: -1, badIndex: index, name: unread.Name, asn: unread.AS,
+			source: describeClaim(unread.Name, ""),
+		}
+		key := strings.ToLower(unread.Name)
+		byGroup[key] = append(byGroup[key], value)
+		if unread.AS > 0 {
+			byAS[unread.AS] = append(byAS[unread.AS], value)
+		}
+	}
+
+	accepted := func(values []claim) bool {
+		if len(values) < 2 {
+			return true
+		}
+		seen := map[string]bool{}
+		for _, value := range values {
+			if value.subIndex < 0 || value.attempt == "" || !validAttempt(value.attempt) {
+				return false
+			}
+			key := strings.ToLower(value.attempt)
+			if seen[key] {
+				return false
+			}
+			seen[key] = true
+		}
+		return true
+	}
+
+	heldSubs := map[int]bool{}
+	heldBad := map[int]bool{}
+	reasons := map[string]string{}
+	mark := func(values []claim, reason string) {
+		for _, value := range values {
+			if value.subIndex >= 0 {
+				heldSubs[value.subIndex] = true
+			}
+			if value.badIndex >= 0 {
+				heldBad[value.badIndex] = true
+			}
+			key := strings.ToLower(value.name)
+			if _, exists := reasons[key]; !exists {
+				reasons[key] = reason
+			}
+		}
+	}
+	for group, values := range byGroup {
+		if accepted(values) {
+			continue
+		}
+		var sources []string
+		for _, value := range values {
+			sources = append(sources, value.source)
+		}
+		sort.Strings(sources)
+		mark(values, fmt.Sprintf(
+			"%d submissions claim to be %q (%s), but repeated submissions require "+
+				"--all-attempts and a distinct signed non-empty attempt on every item",
+			len(values), group, strings.Join(sources, ", ")))
+	}
+	for asn, values := range byAS {
+		if accepted(values) {
+			continue
+		}
+		var sources []string
+		for _, value := range values {
+			sources = append(sources, value.source)
+		}
+		sort.Strings(sources)
+		mark(values, fmt.Sprintf(
+			"AS %d is claimed by %s, but repeated submissions require --all-attempts "+
+				"and a distinct signed non-empty attempt on every item",
+			asn, strings.Join(sources, ", ")))
+	}
+	if len(heldSubs) == 0 && len(heldBad) == 0 {
+		return subs, bad
+	}
+
+	keptSubs := make([]submission, 0, len(subs)-len(heldSubs))
+	for index, sub := range subs {
+		if !heldSubs[index] {
+			keptSubs = append(keptSubs, sub)
+		}
+	}
+	keptBad := make([]unreadable, 0, len(bad)-len(heldBad)+len(reasons))
+	for index, unread := range bad {
+		if !heldBad[index] {
+			keptBad = append(keptBad, unread)
+		}
+	}
+	asByName := map[string]int{}
+	for index, sub := range subs {
+		if heldSubs[index] {
+			asByName[strings.ToLower(sub.Group)] = sub.AS
+		}
+	}
+	for index, unread := range bad {
+		if heldBad[index] && unread.AS > 0 {
+			asByName[strings.ToLower(unread.Name)] = unread.AS
+		}
+	}
+	var names []string
+	for name := range reasons {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		keptBad = append(keptBad, unreadable{Name: name, AS: asByName[name], Reason: reasons[name]})
+	}
+	sort.Slice(keptSubs, func(i, j int) bool { return keptSubs[i].Identity() < keptSubs[j].Identity() })
+	sort.Slice(keptBad, func(i, j int) bool { return keptBad[i].Name < keptBad[j].Name })
+	return keptSubs, keptBad
 }
 
 // describeClaim names where a claim on a group name came from, so an operator

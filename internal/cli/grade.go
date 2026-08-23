@@ -38,6 +38,8 @@ can quote the routing-table entry that was wrong rather than saying "FAIL".`,
 		newGradeRunCmd(opts),
 		newGradeBatchCmd(opts),
 		newGradeClassCmd(opts),
+		newGradeAttestCmd(opts),
+		newGradeBenchmarkCmd(opts),
 		newGradeChecksCmd(opts),
 		newGradeValidateCmd(),
 	)
@@ -292,6 +294,28 @@ reference, and holds the nodes off from repairing anything while it does.`,
 // node agents when the lab spans a cluster.
 func execFunc(ctx context.Context, top *model.Topology, token string) (
 	func(context.Context, string, []string) (runtime.ExecResult, error), error) {
+	return execFuncWithHoldProvider(ctx, top, token, currentHoldToken, 0)
+}
+
+// execFuncWithHold routes one harness through the lease that protects its
+// namespace. Warm full and compact harnesses coexist, so they cannot share the
+// process-global grade hold token.
+func execFuncWithHold(ctx context.Context, top *model.Topology, token, hold string) (
+	func(context.Context, string, []string) (runtime.ExecResult, error), error) {
+	return execFuncWithHoldProvider(ctx, top, token, func() string { return hold }, 0)
+}
+
+func execFuncWithHoldTimeout(ctx context.Context, top *model.Topology, token, hold string,
+	timeout time.Duration,
+) (
+	func(context.Context, string, []string) (runtime.ExecResult, error), error) {
+	return execFuncWithHoldProvider(ctx, top, token, func() string { return hold }, timeout)
+}
+
+func execFuncWithHoldProvider(ctx context.Context, top *model.Topology, token string,
+	hold func() string, timeout time.Duration,
+) (
+	func(context.Context, string, []string) (runtime.ExecResult, error), error) {
 
 	if !clustered(top) {
 		rt, err := localRuntime(top)
@@ -338,8 +362,14 @@ func execFunc(ctx context.Context, top *model.Topology, token string) (
 		if !ok {
 			return runtime.ExecResult{}, fmt.Errorf("device %s is on unknown node %q", deviceID, d.Node)
 		}
-		r, err := n.Exec(ctx, agent.ExecRequest{
-			Container: d.Container, Cmd: cmd, Hold: currentHoldToken(), Grading: true})
+		request := agent.ExecRequest{Container: d.Container, Cmd: cmd, Hold: hold(), Grading: true}
+		var r agent.ExecResponse
+		var err error
+		if timeout > 0 {
+			r, err = n.ExecWithTimeout(ctx, request, timeout)
+		} else {
+			r, err = n.Exec(ctx, request)
+		}
 		return runtime.ExecResult{ExitCode: r.ExitCode, Stdout: r.Stdout, Stderr: r.Stderr}, err
 	}, nil
 }
@@ -581,12 +611,13 @@ func quarantineUnreadable(bad []unreadable, rubric *grade.Rubric, lab string) []
 	out := make([]*grade.Report, 0, len(bad))
 	for _, u := range bad {
 		out = append(out, &grade.Report{
-			Submission: u.Name,
-			AS:         u.AS,
-			Lab:        lab,
-			Rubric:     rubric.Metadata.Name,
-			MaxTotal:   rubric.MaxTotal(),
-			GradedAt:   time.Now().UTC(),
+			Submission:   u.Name,
+			AS:           u.AS,
+			Lab:          lab,
+			Rubric:       rubric.Metadata.Name,
+			GraderSource: grade.GraderSource,
+			MaxTotal:     rubric.MaxTotal(),
+			GradedAt:     time.Now().UTC(),
 			// The reason is written where the decision was made and used
 			// verbatim. It used to be prefixed here with "this submission
 			// could not be read", which was wrong for a submission that read
@@ -632,7 +663,7 @@ func releaseGuard(s *grade.Summary, out io.Writer) error {
 	fmt.Fprintf(out, "\n%d of %d submission(s) could not be graded and are quarantined:\n",
 		len(q), len(s.Reports))
 	for _, r := range q {
-		fmt.Fprintf(out, "  %-14s %s\n", r.Submission, firstLine(reportProblem(r)))
+		fmt.Fprintf(out, "  %-14s %s\n", r.Identity(), firstLine(reportProblem(r)))
 	}
 	fmt.Fprintln(out, "\nTheir rows carry no total, so they cannot be imported as marks by accident.")
 	fmt.Fprintln(out, "Re-run those submissions once the cause is fixed.")
@@ -664,21 +695,22 @@ func writeReports(dir string, s *grade.Summary) error {
 		if r == nil {
 			continue
 		}
-		key := strings.ToLower(r.Submission)
+		identity := r.FileIdentity()
+		key := strings.ToLower(identity)
 		if prev, dup := seen[key]; dup {
 			return fmt.Errorf("two reports were produced for %q (%s, and again %s), and "+
 				"writing both would leave only one of them; no reports were written",
-				r.Submission, prev, describeReport(r))
+				r.Identity(), prev, describeReport(r))
 		}
 		seen[key] = describeReport(r)
 		raw, err := r.JSON()
 		if err != nil {
 			return err
 		}
-		if err := os.WriteFile(filepath.Join(dir, r.Submission+".json"), raw, 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(dir, identity+".json"), raw, 0o644); err != nil {
 			return err
 		}
-		if err := os.WriteFile(filepath.Join(dir, r.Submission+".txt"), []byte(r.Text()), 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(dir, identity+".txt"), []byte(r.Text()), 0o644); err != nil {
 			return err
 		}
 	}

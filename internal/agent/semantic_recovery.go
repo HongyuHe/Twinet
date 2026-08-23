@@ -300,17 +300,36 @@ func (s *Server) semanticProbe(ctx context.Context, top *model.Topology,
 	if err != nil {
 		return err
 	}
-	if requirements.BGPControl {
+	// Reference peering forms concurrently with the rest of a harness. It is
+	// verified by the harness convergence and grading witnesses after commit;
+	// holding a fenced deployment open for it produces a rollback loop before
+	// the remote side has even finished its own transaction.
+	if requirements.BGPControl && verifyReferenceBGPAtCommit(ungraded) {
 		if err := s.verifyReferenceBGPControl(ctx, device); err != nil {
 			return err
 		}
 	}
-	if requirements.Forwarding {
+	// A harness leaves one target AS in platform mode. Its surrounding
+	// reference ASes are configured correctly, but their remote BGP routes
+	// converge asynchronously after the transaction commits. Requiring every
+	// reference router to forward to every remote host while the transaction
+	// is still open turns a correct private harness into a rollback loop.
+	// Grade convergence and delivery checks remain the witness for that
+	// asynchronous path; ordinary solved labs retain this deployment check.
+	if requirements.Forwarding && verifyReferenceForwardingAtCommit(ungraded) {
 		if err := s.verifyReferenceReachability(ctx, top, device); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func verifyReferenceForwardingAtCommit(ungraded int) bool {
+	return ungraded == 0
+}
+
+func verifyReferenceBGPAtCommit(ungraded int) bool {
+	return ungraded == 0
 }
 
 type semanticHealthPlan struct {

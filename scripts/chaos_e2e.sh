@@ -18,6 +18,7 @@ Options:
   --manifest PATH           Manifest directory or twinet.yaml (default: examples/scale).
   --binary PATH             Controller binary (default: bin/twinet).
   --output FILE             Evidence JSON (default: reports/chaos/<UTC>.json).
+  --allow-other-labs        Permit unrelated managed labs to remain on the cluster.
   --help                    Show this help.
 
 Required environment:
@@ -47,6 +48,7 @@ binary="bin/twinet"
 manifest="examples/scale"
 output=""
 allow_destructive=0
+allow_other_labs=0
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -68,6 +70,10 @@ while [ "$#" -gt 0 ]; do
             require_value "$@"
             output=$2
             shift 2
+            ;;
+        --allow-other-labs)
+            allow_other_labs=1
+            shift
             ;;
         --help|-h)
             usage
@@ -207,6 +213,13 @@ start_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 failure=""
 deployment_started=0
 cleanup_attempted=0
+cleanup_succeeded=0
+cleanup_recovered_empty=0
+
+cleanup_recovery_attempts=6
+cleanup_recovery_wait=3m
+cleanup_recovery_command_wait=4m
+cleanup_destroy_wait=10m
 
 run_capture() {
     local phase=$1
@@ -249,7 +262,8 @@ PY
 }
 
 lab_is_absent() {
-    python3 - "${scratch_dir}/status_before.stdout" "${scratch_dir}/lab_name" <<'PY'
+    python3 - "${scratch_dir}/status_before.stdout" "${scratch_dir}/lab_name" \
+        "$allow_other_labs" <<'PY'
 import json
 import pathlib
 import sys
@@ -259,7 +273,9 @@ try:
 except Exception as exc:
     raise SystemExit(f"node status JSON cannot be read: {exc}")
 lab = pathlib.Path(sys.argv[2]).read_text().strip()
+allow_other_labs = sys.argv[3] == "1"
 owners = []
+other_labs = set()
 for row in rows:
     if not isinstance(row, dict):
         raise SystemExit("node status contains a non-object entry")
@@ -270,20 +286,135 @@ for row in rows:
         raise SystemExit("node status has no status payload")
     if lab in status.get("labs", []):
         owners.append(row.get("node", "<unknown>"))
+    other_labs.update(
+        item for item in status.get("labs", [])
+        if isinstance(item, str) and item != lab
+    )
 if owners:
     raise SystemExit(f"lab {lab!r} already exists on {', '.join(owners)}")
+if other_labs and not allow_other_labs:
+    raise SystemExit(
+        "cluster is not clean; unrelated managed labs are active: "
+        + ", ".join(sorted(other_labs))
+        + " (use --allow-other-labs only for an explicitly co-tenant chaos run)"
+    )
 PY
+}
+
+recovery_inventory_is_empty() {
+    local file=$1
+    python3 - "$file" <<'PY'
+import json
+import pathlib
+import sys
+
+raw = pathlib.Path(sys.argv[1]).read_text().lstrip()
+try:
+    report, _ = json.JSONDecoder().raw_decode(raw)
+except Exception as exc:
+    raise SystemExit(f"recovery report cannot be read: {exc}")
+nodes = report.get("nodes") if isinstance(report, dict) else None
+if not isinstance(nodes, dict) or not nodes:
+    raise SystemExit("recovery report contains no nodes")
+for node, status in nodes.items():
+    if not isinstance(status, dict):
+        raise SystemExit(f"recovery status for {node} is not an object")
+    if status.get("consistent") is not True:
+        raise SystemExit(f"recovery status for {node} is not consistent")
+    for key in (
+        "expected_containers", "observed_containers",
+        "expected_vnis", "observed_vnis",
+        "expected_logical_bindings", "observed_logical_bindings",
+        "expected_physical_trunks", "observed_physical_trunks",
+    ):
+        if key not in status or status[key] != 0:
+            raise SystemExit(f"recovery status for {node} has non-empty {key}={status.get(key)!r}")
+PY
+}
+
+cleanup_status_is_absent() {
+    local file=$1
+    python3 - "$file" "${scratch_dir}/lab_name" <<'PY'
+import json
+import pathlib
+import sys
+
+rows = json.loads(pathlib.Path(sys.argv[1]).read_text())
+lab = pathlib.Path(sys.argv[2]).read_text().strip()
+owners = []
+for row in rows:
+    status = row.get("status", {}) if isinstance(row, dict) else {}
+    if lab in status.get("labs", []):
+        owners.append(row.get("node", "<unknown>"))
+if owners:
+    raise SystemExit(f"cleanup left lab {lab!r} active on {', '.join(owners)}")
+PY
+}
+
+cleanup_lab() {
+    local attempt phase
+    local -a recover_args
+    cleanup_attempted=1
+    if run_capture cleanup_destroy_1 timeout --signal=TERM --kill-after=30s \
+        "$cleanup_destroy_wait" "$binary" destroy -m "$run_manifest" --yes; then
+        cleanup_succeeded=1
+        printf '%s\n' cleanup_destroy_1 >"${scratch_dir}/cleanup_result_phase"
+        return 0
+    fi
+
+    for ((attempt = 1; attempt <= cleanup_recovery_attempts; attempt++)); do
+        phase="cleanup_recover_join_${attempt}"
+        recover_args=(
+            timeout --signal=TERM --kill-after=30s "$cleanup_recovery_command_wait"
+            "$binary" --json recover -m "$run_manifest" --strategy rollback
+            --wait "$cleanup_recovery_wait"
+        )
+        if [ "$attempt" -gt 1 ]; then
+            phase="cleanup_recover_takeover_${attempt}"
+            recover_args+=(--takeover)
+        fi
+        run_capture "$phase" "${recover_args[@]}" || true
+        if recovery_inventory_is_empty "${scratch_dir}/${phase}.stdout" 2>/dev/null; then
+            cleanup_recovered_empty=1
+        fi
+        if run_capture "cleanup_destroy_$((attempt + 1))" \
+            timeout --signal=TERM --kill-after=30s "$cleanup_destroy_wait" \
+            "$binary" destroy -m "$run_manifest" --yes; then
+            cleanup_succeeded=1
+            printf 'cleanup_destroy_%s\n' "$((attempt + 1))" >"${scratch_dir}/cleanup_result_phase"
+            return 0
+        fi
+        if [ "$cleanup_recovered_empty" -eq 1 ]; then
+            cleanup_succeeded=1
+            printf '%s\n' "$phase" >"${scratch_dir}/cleanup_result_phase"
+            return 0
+        fi
+        sleep 2
+    done
+    return 1
 }
 
 write_report() {
     local end_at
     end_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-    python3 - "$output" "$scratch_dir" "$start_at" "$end_at" "$failure" "$cleanup_attempted" <<'PY'
+    python3 - "$output" "$scratch_dir" "$start_at" "$end_at" "$failure" \
+        "$cleanup_attempted" "$allow_other_labs" "$cleanup_succeeded" \
+        "$cleanup_recovered_empty" <<'PY'
 import json
 import pathlib
 import sys
 
-output, scratch, started_at, ended_at, failure, cleanup_attempted = sys.argv[1:]
+(
+    output,
+    scratch,
+    started_at,
+    ended_at,
+    failure,
+    cleanup_attempted,
+    allow_other_labs,
+    cleanup_succeeded,
+    cleanup_recovered_empty,
+) = sys.argv[1:]
 root = pathlib.Path(scratch)
 
 def text(name):
@@ -304,16 +435,30 @@ def phase(name):
     }
 
 phases = {name: phase(name) for name in (
-    "topology", "status_before", "deploy", "chaos", "cleanup", "status_after_cleanup"
+    "topology", "status_before", "deploy", "chaos", "status_after_cleanup"
 )}
+cleanup_attempts = {
+    path.name.removesuffix(".exit_code"): phase(path.name.removesuffix(".exit_code"))
+    for path in sorted(root.glob("cleanup_*.exit_code"))
+}
+cleanup_result_phase = text("cleanup_result_phase").strip()
 report = {
     "schema_version": 1,
     "started_at": started_at,
     "ended_at": ended_at,
+    "allow_other_labs": allow_other_labs == "1",
     "phases": phases,
     "cleanup_attempted": cleanup_attempted == "1",
+    "cleanup": {
+        "succeeded": cleanup_succeeded == "1",
+        "recovered_empty": cleanup_recovered_empty == "1",
+        "result": cleanup_attempts.get(cleanup_result_phase),
+        "attempts": cleanup_attempts,
+    },
     "result": {
-        "passed": not failure and all(p and p["exit_code"] == 0 for p in phases.values()),
+        "passed": not failure
+        and cleanup_succeeded == "1"
+        and all(p and p["exit_code"] == 0 for p in phases.values()),
         "failure": failure or None,
     },
 }
@@ -325,12 +470,13 @@ finish() {
     local status=$?
     trap - EXIT INT TERM
     if [ "$deployment_started" -eq 1 ]; then
-        cleanup_attempted=1
-        if ! run_capture cleanup "$binary" destroy -m "$run_manifest" --yes; then
+        if ! cleanup_lab; then
             record_failure "cleanup could not remove the chaos lab"
         fi
         if ! run_capture status_after_cleanup "$binary" --json node status -m "$run_manifest"; then
             record_failure "could not collect node status after chaos cleanup"
+        elif ! cleanup_status_is_absent "${scratch_dir}/status_after_cleanup.stdout"; then
+            record_failure "chaos lab remained active after cleanup"
         fi
     fi
     if ! write_report; then

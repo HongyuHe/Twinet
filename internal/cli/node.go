@@ -31,7 +31,7 @@ func tokenFor(flagValue string) (string, error) {
 	if v := os.Getenv("TWINET_TOKEN"); v != "" {
 		return v, nil
 	}
-	return "", fmt.Errorf("no agent token: pass --token or set TWINET_TOKEN")
+	return "", fmt.Errorf("no agent token: set TWINET_TOKEN from a protected credential file")
 }
 
 // clustered reports whether the lab should be driven through node agents.

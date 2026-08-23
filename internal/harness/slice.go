@@ -35,6 +35,12 @@ import (
 	"github.com/HongyuHe/twinet/internal/model"
 )
 
+// CompactCompilerContract changes only when the meaning of Synthetic slicing
+// or its generated reference peers changes. It deliberately is not the CLI
+// source version: an ordinary controller bug-fix release must still verify a
+// previously proven compact/full equivalence artifact.
+const CompactCompilerContract = "compact-harness/v1"
+
 // Options controls how much of the class topology a harness keeps.
 type Options struct {
 	// Depth is how many AS hops of neighbourhood to retain. Zero or less keeps

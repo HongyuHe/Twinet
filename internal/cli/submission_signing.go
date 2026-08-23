@@ -54,8 +54,15 @@ func signBundle(b Bundle, key ed25519.PrivateKey) string {
 // the impersonation this exists to stop.
 func bundleBytes(b Bundle) []byte {
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "lab=%s\nas=%d\ngroup=%s\ntopology=%s\ntaken=%s\n",
-		b.Lab, b.AS, b.Group, b.Topology, b.TakenAt.UTC().Format("2006-01-02T15:04:05Z"))
+	fmt.Fprintf(&sb, "lab=%s\nas=%d\ngroup=%s\n", b.Lab, b.AS, b.Group)
+	// Omit the line for final submissions so archives collected before
+	// attempts existed retain their exact signature bytes and remain
+	// fail-closed/verifiable.
+	if b.Attempt != "" {
+		fmt.Fprintf(&sb, "attempt=%s\n", b.Attempt)
+	}
+	fmt.Fprintf(&sb, "topology=%s\ntaken=%s\n",
+		b.Topology, b.TakenAt.UTC().Format("2006-01-02T15:04:05Z"))
 	names := make([]string, 0, len(b.Files))
 	for n := range b.Files {
 		names = append(names, n)

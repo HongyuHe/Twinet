@@ -59,6 +59,18 @@ func TestASubmissionFRRAcceptsLoads(t *testing.T) {
 	}
 }
 
+func TestPlatformBaselineDoesNotRequireUnconfiguredRoutingDaemons(t *testing.T) {
+	exec := func(_ context.Context, _ string, _ []string) (rt.ExecResult, error) {
+		// The student baseline has no OSPF/BGP configuration yet, so the
+		// platform reset may legitimately leave routing daemons absent.
+		return rt.ExecResult{Stdout: "zebra bgpd ospfd ospf6d ldpd "}, nil
+	}
+	d := &model.Device{ID: "as3/ATL", Name: "ATL", Kind: model.KindRouter}
+	if err := loadPlatformFRRConfig(context.Background(), exec, d, "frr defaults traditional\n"); err != nil {
+		t.Fatalf("empty platform baseline was treated as a malformed submission: %v", err)
+	}
+}
+
 // The daemons checked are the ones the platform actually enables, so enabling a
 // new one does not quietly go unchecked.
 func TestTheDaemonsCheckedAreTheOnesEnabled(t *testing.T) {
