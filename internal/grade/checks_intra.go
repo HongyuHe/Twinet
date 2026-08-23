@@ -1508,8 +1508,8 @@ type installedHop struct{ iface, ip string }
 // aggregate look like no route at all. Equal-prefix/equal-metric routes are
 // retained together so ECMP evidence is not collapsed to one next hop.
 func kernelLPM(routes []netstate.Route, target string) []netstate.Route {
-	dst, err := netip.ParseAddr(addrOnly(target))
-	if err != nil {
+	dst, ok := lpmTargetAddr(target)
+	if !ok {
 		return nil
 	}
 	family := "ipv4"
@@ -1561,8 +1561,22 @@ func routePrefix(raw, family string) (netip.Prefix, bool) {
 		}
 		return netip.PrefixFrom(netip.IPv4Unspecified(), 0), true
 	}
-	prefix, err := netip.ParsePrefix(raw)
-	return prefix, err == nil
+	if prefix, err := netip.ParsePrefix(raw); err == nil {
+		return prefix, true
+	}
+	if address, err := netip.ParseAddr(raw); err == nil {
+		return netip.PrefixFrom(address, address.BitLen()), true
+	}
+	return netip.Prefix{}, false
+}
+
+func lpmTargetAddr(target string) (netip.Addr, bool) {
+	target = strings.TrimSpace(target)
+	if prefix, err := netip.ParsePrefix(target); err == nil {
+		return prefix.Addr(), true
+	}
+	address, err := netip.ParseAddr(target)
+	return address, err == nil
 }
 
 func (h installedHop) label() string {
