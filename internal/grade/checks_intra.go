@@ -1695,11 +1695,22 @@ func checkECMP(ctx context.Context, env *Env) Result {
 				hops = append(hops, installedHop{iface: nh.Device, ip: nh.Address})
 			}
 		}
+		if env.ShadowBatches {
+			legacy, legacyOther, err := legacyECMPHops(ctx, env, router, target)
+			if err != nil {
+				return nil, fmt.Errorf("shadow read of %s's legacy route view: %w", router, err)
+			}
+			if !sameInstalledHopSet(hops, legacy) || !sameStringBoolSet(other, legacyOther) {
+				return nil, fmt.Errorf(
+					"snapshot kernel LPM differs from legacy `show ip route json` on %s for %s "+
+						"(snapshot=%s legacy=%s); refusing to change this ECMP verdict",
+					router, target, describeInstalledHops(hops), describeInstalledHops(legacy))
+			}
+		}
 		nextHops[router] = hops
 		read[router] = true
 		return hops, nil
 	}
-
 	if hops, err := fetch(from); err != nil {
 		return Errored("ospf.ecmp_paths", err)
 	} else if len(hops) == 0 {
