@@ -230,10 +230,14 @@ func ospfCost(i *model.Iface) int {
 }
 
 func usesPointToPointOSPF(i *model.Iface) bool {
-	if i == nil || i.Link == nil || i.Link.Segment == "" || i.Peer == nil || i.Peer.Device == nil {
+	if i == nil || i.Link == nil || i.Peer == nil || i.Peer.Device == nil {
 		return false
 	}
-	return i.Peer.Device.Kind == model.KindP4
+	if i.Peer.Device.Kind == model.KindP4 {
+		return i.Link.Segment != ""
+	}
+	return i.Role == model.RoleIntraAS && i.Link.Kind == model.LinkVeth &&
+		i.Link.Segment == "" && i.Peer.Device.Kind == model.KindRouter
 }
 
 func renderOSPF(d *model.Device) string {
