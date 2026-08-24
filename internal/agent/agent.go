@@ -571,6 +571,46 @@ func (s *Server) acquireOperation(lab, kind string, cancel context.CancelFunc) (
 	return id, done, nil
 }
 
+func (s *Server) acquireDestroyOperation(
+	ctx context.Context,
+	lab string,
+	force bool,
+) (uint64, chan struct{}, error) {
+	if !force {
+		return s.acquireOperation(lab, "destroy", nil)
+	}
+	for {
+		s.mu.Lock()
+		if s.ops == nil {
+			s.ops = map[string]*lease{}
+		}
+		held := s.ops[lab]
+		if held == nil {
+			s.opSequence++
+			id := s.opSequence
+			s.ops[lab] = &lease{id: id, kind: "destroy", at: s.nowTime()}
+			s.mu.Unlock()
+			return id, nil, nil
+		}
+		preemptible := held.cancel != nil && held.done != nil &&
+			(held.kind == "reconcile" || held.kind == "apply")
+		if !preemptible {
+			s.mu.Unlock()
+			return 0, nil, fmt.Errorf("another operation is already running on lab %q: %s, started %s ago",
+				lab, held.kind, s.nowTime().Sub(held.at).Round(time.Second))
+		}
+		held.cancel()
+		done := held.done
+		kind := held.kind
+		s.mu.Unlock()
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return 0, nil, fmt.Errorf("%s did not yield to forced destroy: %w", kind, ctx.Err())
+		}
+	}
+}
+
 // acquireRecoveryOperation gives durable recovery priority over cancellable
 // apply/reconciliation work, and permits a newer fence to cancel only a
 // recovery whose persisted deadline has expired. It does not publish the new
@@ -1974,11 +2014,12 @@ func (s *Server) handleDestroy(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusConflict, errors.New(why))
 		return
 	}
-	if err := s.acquire(req.Lab, "destroy"); err != nil {
+	opID, opDone, err := s.acquireDestroyOperation(r.Context(), req.Lab, req.Force)
+	if err != nil {
 		httpError(w, http.StatusConflict, err)
 		return
 	}
-	defer s.release(req.Lab)
+	defer s.releaseOperation(req.Lab, opID, opDone)
 	fenced, stopFence := s.fencedContext(r.Context(), req.Lab, req.Fence)
 	defer stopFence()
 	r = r.WithContext(fenced)

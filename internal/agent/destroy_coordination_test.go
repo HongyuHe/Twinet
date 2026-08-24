@@ -89,3 +89,21 @@ func TestForcedDestroyCanClearFailedRecovery(t *testing.T) {
 		t.Fatalf("forced destroy was blocked by unrecoverable transaction: %s", why)
 	}
 }
+
+func TestForcedDestroyPreemptsReconciliation(t *testing.T) {
+	server := coordinationTestServer(t, nil)
+	reconcileCtx, cancelReconcile := context.WithCancel(context.Background())
+	id, done, err := server.acquireOperation("lab", "reconcile", cancelReconcile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		<-reconcileCtx.Done()
+		server.releaseOperation("lab", id, done)
+	}()
+	destroyID, destroyDone, err := server.acquireDestroyOperation(context.Background(), "lab", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.releaseOperation("lab", destroyID, destroyDone)
+}
