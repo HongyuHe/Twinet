@@ -282,7 +282,7 @@ func runContainerdRoutedEngine(t *testing.T, ctx context.Context, runtime rt.Run
 kind: Lab
 metadata: {name: %s}
 images: {mode: development}
-defaults: {restart: "no"}
+defaults: {restart: "no", cpus: 2, memory: 512Mi, pids: 256}
 kinds:
   router:
     image: %s

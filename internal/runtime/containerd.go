@@ -1472,6 +1472,60 @@ func (c *Containerd) execTaskRaw(ctx context.Context, name string, cmd ExecCmd) 
 	return ExecResult{ExitCode: int(code), Stdout: stdout.String(), Stderr: stderr.String()}, nil
 }
 
+func (c *Containerd) execTaskSilent(ctx context.Context, name string, cmd ExecCmd) error {
+	container, err := c.load(ctx, name)
+	if err != nil {
+		return fmt.Errorf("containerd silent exec %s: %w", name, err)
+	}
+	task, err := container.Task(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("containerd silent exec task %s: %w", name, err)
+	}
+	spec, err := task.Spec(ctx)
+	if err != nil {
+		return fmt.Errorf("containerd silent exec spec %s: %w", name, err)
+	}
+	process := *spec.Process
+	process.Args = append([]string(nil), cmd.Cmd...)
+	process.Env = mergeEnv(process.Env, cmd.Env)
+	if cmd.WorkDir != "" {
+		process.Cwd = cmd.WorkDir
+	}
+	execID := fmt.Sprintf("silent-%d", c.execSequence.Add(1))
+	proc, err := task.Exec(ctx, execID, &process, cio.NullIO)
+	if err != nil {
+		return fmt.Errorf("containerd silent exec %s: %w", name, err)
+	}
+	wait, err := proc.Wait(ctx)
+	if err != nil {
+		_, _ = proc.Delete(context.WithoutCancel(ctx), cd.WithProcessKill)
+		return fmt.Errorf("containerd silent exec wait %s: %w", name, err)
+	}
+	if err := proc.Start(ctx); err != nil {
+		_, _ = proc.Delete(context.WithoutCancel(ctx), cd.WithProcessKill)
+		return fmt.Errorf("containerd silent exec start %s: %w", name, err)
+	}
+	var status cd.ExitStatus
+	select {
+	case status = <-wait:
+	case <-ctx.Done():
+		_ = proc.Kill(context.WithoutCancel(ctx), syscall.SIGKILL)
+		_, _ = proc.Delete(context.WithoutCancel(ctx), cd.WithProcessKill)
+		return ctx.Err()
+	}
+	code, _, statusErr := status.Result()
+	if _, err := proc.Delete(ctx); err != nil && !containerdNotFound(err) {
+		return fmt.Errorf("containerd delete silent exec %s: %w", name, err)
+	}
+	if statusErr != nil {
+		return statusErr
+	}
+	if code != 0 {
+		return fmt.Errorf("exit status %d", code)
+	}
+	return nil
+}
+
 func (c *Containerd) StreamExec(ctx context.Context, name string, cmd ExecCmd,
 	rows, cols uint32, stdout, stderr io.Writer,
 ) (int, error) {
@@ -1748,11 +1802,52 @@ exit "$status"
 		_ = c.stopFRR(context.WithoutCancel(ctx), name)
 		return fmt.Errorf("start FRR daemons in %s: %w", name, err)
 	}
-	for range 300 {
-		if ready, readyErr := c.frrSocketsReady(ctx, name, daemons); readyErr == nil && ready {
-			return c.bootFRRConfiguration(ctx, name)
+	if err := c.waitFRRSockets(ctx, name, daemons); err != nil {
+		log, _ := os.ReadFile(logPath)
+		return fmt.Errorf("FRR daemons did not become ready in %s: %w: %s",
+			name, err, trim(string(log)))
+	}
+	return c.bootFRRConfiguration(ctx, name)
+}
+
+func (c *Containerd) waitFRRSockets(ctx context.Context, name string, daemons []frrDaemon) error {
+	var tests strings.Builder
+	for _, daemon := range daemons {
+		tests.WriteString("test -S ")
+		tests.WriteString(shellQuote("/run/frr/" + daemon.name + ".vty"))
+		tests.WriteString(" && ")
+	}
+	tests.WriteString("exit 0")
+	script := "for i in $(seq 1 300); do (" + tests.String() +
+		"); rc=$?; [ $rc -eq 0 ] && exit 0; sleep 0.1; done; exit 1"
+	result, err := c.execTaskRaw(ctx, name, ExecCmd{Cmd: []string{"sh", "-c", script}})
+	if err != nil {
+		return err
+	}
+	return result.Err()
+}
+
+func (c *Containerd) bootFRRConfiguration(ctx context.Context, name string) error {
+	timer := time.NewTimer(3 * time.Second)
+	select {
+	case <-ctx.Done():
+		timer.Stop()
+		return ctx.Err()
+	case <-timer.C:
+	}
+	var lastErr error
+	for attempt := range 3 {
+		err := c.execTaskSilent(ctx, name, ExecCmd{Cmd: []string{
+			"sh", "-c", "vtysh --no-fork -b </dev/null >/tmp/twinet-vtysh-boot.log 2>&1",
+		}})
+		if err == nil {
+			return nil
 		}
-		timer := time.NewTimer(100 * time.Millisecond)
+		lastErr = err
+		if attempt == 2 {
+			break
+		}
+		timer = time.NewTimer(time.Second)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
@@ -1760,33 +1855,11 @@ exit "$status"
 		case <-timer.C:
 		}
 	}
-	log, _ := os.ReadFile(logPath)
-	return fmt.Errorf("FRR daemons did not become ready in %s: %s", name,
-		trim(string(log)))
-}
-
-func (c *Containerd) bootFRRConfiguration(ctx context.Context, name string) error {
-	timer := time.NewTimer(500 * time.Millisecond)
-	select {
-	case <-ctx.Done():
-		timer.Stop()
-		return ctx.Err()
-	case <-timer.C:
-	}
-	result, err := c.execTaskRaw(ctx, name, ExecCmd{Cmd: []string{
-		"sh", "-c", `for i in $(seq 1 20); do
-  timeout -s KILL 10 vtysh -b && exit 0
-  sleep 0.5
-done
-exit 1`,
-	}})
-	if err != nil {
-		return fmt.Errorf("boot integrated FRR configuration in %s: %w", name, err)
-	}
-	if err := result.Err(); err != nil {
-		return fmt.Errorf("boot integrated FRR configuration in %s: %w", name, err)
-	}
-	return nil
+	log, _ := c.execTaskRaw(context.WithoutCancel(ctx), name, ExecCmd{
+		Cmd: []string{"cat", "/tmp/twinet-vtysh-boot.log"},
+	})
+	return fmt.Errorf("boot integrated FRR configuration in %s: %w: %s",
+		name, lastErr, trim(log.Stdout+log.Stderr))
 }
 
 func (c *Containerd) frrConfiguration(ctx context.Context, name string) (
