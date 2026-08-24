@@ -12,7 +12,8 @@ import (
 // remains one atomic unit and therefore keeps all of its intra-AS links local.
 func distributePlacementGroups(top *model.Topology, a *Assignment, names []string,
 	caps map[string]demand, hasCap map[string]bool, baseline map[string]demand, opts Options,
-	explicitPinned map[int]bool) ([]string, error) {
+	placementWeights map[string]float64, explicitPinned map[int]bool,
+) ([]string, error) {
 
 	if len(names) < 2 {
 		return nil, nil
@@ -101,7 +102,7 @@ func distributePlacementGroups(top *model.Topology, a *Assignment, names []strin
 		for _, g := range leaves {
 			n, recorded := fixed[g.ID]
 			if !recorded {
-				n = bestGroupNode(names, loads, caps, hasCap, groupDemand(g), nominal)
+				n = bestGroupNode(names, loads, caps, hasCap, placementWeights, groupDemand(g), nominal)
 			}
 			a.ByGroup[g.ID] = n
 			loads[n] = loads[n].add(groupDemand(g))
@@ -173,7 +174,7 @@ func placementDemands(top *model.Topology, a *Assignment, baseline map[string]de
 // silently turning a warning into a deployment refusal would break the
 // established placement contract.
 func bestGroupNode(names []string, loads map[string]demand, caps map[string]demand,
-	hasCap map[string]bool, need demand, nominal int) string {
+	hasCap map[string]bool, weights map[string]float64, need demand, nominal int) string {
 
 	best, bestPressure, found := "", 0.0, false
 	for _, fitOnly := range []bool{true, false} {
@@ -181,7 +182,7 @@ func bestGroupNode(names []string, loads map[string]demand, caps map[string]dema
 			if fitOnly && !fits(loads[n], need, caps[n], hasCap[n]) {
 				continue
 			}
-			p := pressure(loads[n].add(need), caps[n], hasCap[n], nominal)
+			p := placementPressure(loads[n].add(need), caps[n], hasCap[n], nominal, weights[n])
 			if !found || p < bestPressure {
 				best, bestPressure, found = n, p, true
 			}

@@ -179,27 +179,20 @@ placement:
       ephemeral_storage: 20Gi
       file_descriptors: 16384
       netdevs: 256
-      # The front node also runs the controller and its measured initial-apply
-      # throughput is about two thirds of either worker. Reserve object
-      # headroom so all three finish together rather than leaving the peers
-      # idle for the final three minutes.
-      containers: 600
-    node-2:
-      # This secondary reservation avoids a placement-fragmentation cliff and
-      # yields the measured 479/756/785 primary split (roughly
-      # 631/997/1036 including FRR controls).
-      containers: 185
   nodes:
     - name: node-0
       addr: "10.0.1.1:7200"
       underlay_ip: 10.0.1.1
       front: true
-      capacity: {cpus: 50.4, memory: 225Gi, pids: 1000000, ephemeral_storage: 750Gi, file_descriptors: 1000000, netdevs: 5000, containers: 1250}
+      # Initial lifecycle throughput is about four fifths of either worker.
+      # This affects new placement only; capacity remains honest admission.
+      placement_weight: 0.8
+      capacity: {cpus: 50.4, memory: 225Gi, pids: 1000000, ephemeral_storage: 750Gi, file_descriptors: 1000000, netdevs: 5000, containers: 1300}
     - name: node-1
       addr: "10.0.1.2:7200"
       underlay_ip: 10.0.1.2
-      capacity: {cpus: 50.4, memory: 225Gi, pids: 1000000, ephemeral_storage: 750Gi, file_descriptors: 1000000, netdevs: 5000, containers: 1250}
+      capacity: {cpus: 50.4, memory: 225Gi, pids: 1000000, ephemeral_storage: 750Gi, file_descriptors: 1000000, netdevs: 5000, containers: 1300}
     - name: node-2
       addr: "10.0.1.3:7200"
       underlay_ip: 10.0.1.3
-      capacity: {cpus: 50.4, memory: 225Gi, pids: 1000000, ephemeral_storage: 750Gi, file_descriptors: 1000000, netdevs: 5000, containers: 1250}
+      capacity: {cpus: 50.4, memory: 225Gi, pids: 1000000, ephemeral_storage: 750Gi, file_descriptors: 1000000, netdevs: 5000, containers: 1300}

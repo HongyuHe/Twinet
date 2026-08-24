@@ -140,7 +140,7 @@ func stringsFirstReplica(replica string) bool {
 
 func bestServiceNode(names []string, loads map[string]demand, caps map[string]demand,
 	hasCap map[string]bool, need demand, nominal int) string {
-	return bestGroupNode(names, loads, caps, hasCap, need, nominal)
+	return bestGroupNode(names, loads, caps, hasCap, nil, need, nominal)
 }
 
 func serviceReplicaNode(top *model.Topology, assignment *Assignment, device *model.Device) string {

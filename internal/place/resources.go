@@ -441,6 +441,13 @@ func pressure(load, cap demand, has bool, nominal int) float64 {
 	return worst
 }
 
+func placementPressure(load, cap demand, has bool, nominal int, weight float64) float64 {
+	if weight <= 0 {
+		weight = 1
+	}
+	return pressure(load, cap, has, nominal) / weight
+}
+
 func nominalCapacity(names []string, caps map[string]demand, hasCap map[string]bool, total int) int {
 	best := 0
 	for _, n := range names {
@@ -504,7 +511,7 @@ func humanBytes(b int64) string {
 // bestForLocality picks the node that keeps the most links local among
 // capacity-fitting candidates.
 func bestForLocality(names []string, load map[string]demand, caps map[string]demand,
-	hasCap map[string]bool, need demand, tolerance float64, nominal int,
+	hasCap map[string]bool, weights map[string]float64, need demand, tolerance float64, nominal int,
 	localityOf func(node string) int) (string, error) {
 
 	type cand struct {
@@ -518,7 +525,7 @@ func bestForLocality(names []string, load map[string]demand, caps map[string]dem
 		if !fits(load[n], need, caps[n], hasCap[n]) {
 			continue
 		}
-		p := pressure(load[n].add(need), caps[n], hasCap[n], nominal)
+		p := placementPressure(load[n].add(need), caps[n], hasCap[n], nominal, weights[n])
 		if len(cands) == 0 || p < minP {
 			minP = p
 		}

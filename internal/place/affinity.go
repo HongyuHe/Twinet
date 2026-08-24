@@ -195,7 +195,9 @@ func orderForLocality(free []int, g *affinityGraph, weight map[int]demand) []int
 // onto a different machine.
 func refine(names []string, byAS map[int]string, g *affinityGraph, weight map[int]demand,
 	loads map[string]demand, caps map[string]demand, hasCap map[string]bool,
-	pinned map[int]string, front string, tolerance float64, nominal int) int {
+	placementWeights map[string]float64, pinned map[int]string, front string,
+	tolerance float64, nominal int,
+) int {
 
 	movable := make([]int, 0, len(byAS))
 	for asn := range byAS {
@@ -212,19 +214,16 @@ func refine(names []string, byAS map[int]string, g *affinityGraph, weight map[in
 	// tolerance the strategy allows. A placement that already exceeds it --
 	// because a pin does, say -- is not made worse, but neither is it used as
 	// licence to go further.
-	var total demand
+	// The greedy placement is the balance baseline. Deriving an "even share"
+	// by dividing the worst aggregate pressure by node count is invalid for
+	// heterogeneous capacities: the smallest node's capacity is applied to
+	// all cluster demand and permits the refinement to overload larger peers.
+	ceiling := 0.0
 	for _, n := range names {
-		total = total.add(loads[n])
+		ceiling = max(ceiling,
+			placementPressure(loads[n], caps[n], hasCap[n], nominal, placementWeights[n]))
 	}
-	fair := 0.0
-	for _, n := range names {
-		fair = max(fair, pressure(total, caps[n], hasCap[n], nominal))
-	}
-	fair /= float64(len(names))
-	ceiling := fair + tolerance
-	for _, n := range names {
-		ceiling = max(ceiling, pressure(loads[n], caps[n], hasCap[n], nominal))
-	}
+	ceiling += tolerance
 
 	// local counts the links AS asn keeps inside node n.
 	local := func(asn int, n string, at map[int]string) int {
@@ -242,7 +241,7 @@ func refine(names []string, byAS map[int]string, g *affinityGraph, weight map[in
 	}
 	within := func(l demand, n string) bool {
 		return fits(demand{}, l, caps[n], hasCap[n]) &&
-			pressure(l, caps[n], hasCap[n], nominal) <= ceiling+1e-9
+			placementPressure(l, caps[n], hasCap[n], nominal, placementWeights[n]) <= ceiling+1e-9
 	}
 
 	moved := 0

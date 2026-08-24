@@ -70,6 +70,35 @@ func TestAFittingLabIsNotReportedAsOverloaded(t *testing.T) {
 	}
 }
 
+func TestPlacementWeightDoesNotReduceAdmissionCapacity(t *testing.T) {
+	lab := &model.Lab{}
+	lab.Placement.Strategy = "spread-by-as"
+	capacity := &model.Budget{
+		Containers: 100, CPUs: 100, Memory: "100Gi", Pids: 100000,
+		EphemeralStorage: "100Gi", FileDescriptors: 100000, NetDevices: 100000,
+	}
+	lab.Placement.Nodes = []model.NodeSpec{
+		{
+			Name: "a", Front: true, PlacementWeight: 0.5,
+			Capacity: capacity,
+		},
+		{Name: "b", Capacity: capacity},
+	}
+	top := labOf(lab, 12, 1, 1, "64Mi")
+	assignment, err := Place(top, Options{Strict: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if assignment.Load["a"] >= assignment.Load["b"] {
+		t.Fatalf("slower node received %d devices, faster node %d",
+			assignment.Load["a"], assignment.Load["b"])
+	}
+	summary := SummarizeCapacity(top)
+	if summary.Capacity["a"].Containers != summary.Capacity["b"].Containers {
+		t.Fatal("placement weight was incorrectly subtracted from admission capacity")
+	}
+}
+
 func TestDrainExcludesSourceButPreservesRecordedGroupsElsewhere(t *testing.T) {
 	lab := &model.Lab{Placement: model.Placement{
 		Strategy: "pack-by-as",

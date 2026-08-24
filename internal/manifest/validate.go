@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"math"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -1279,6 +1280,10 @@ func (l *Loaded) validatePlacement(d *Diagnostics, file string) {
 		}
 		if n.Capacity != nil {
 			validateBudget(d, file, path+".capacity", *n.Capacity, node)
+		}
+		if n.PlacementWeight < 0 || math.IsNaN(n.PlacementWeight) || math.IsInf(n.PlacementWeight, 0) {
+			d.Add(file, path+".placement_weight",
+				"placement weight must be finite and non-negative (zero uses the default)", node)
 		}
 	}
 	if fronts > 1 {

@@ -1292,6 +1292,10 @@ type NodeSpec struct {
 	RuntimeSocket string `yaml:"runtime_socket,omitempty" json:"runtime_socket,omitempty"`
 	// Capacity optionally caps what may be scheduled here.
 	Capacity *Budget `yaml:"capacity,omitempty" json:"capacity,omitempty"`
+	// PlacementWeight is relative lifecycle throughput used only to balance
+	// new placement. Capacity remains the hard admission boundary. A value of
+	// 0 keeps the default weight of 1.
+	PlacementWeight float64 `yaml:"placement_weight,omitempty" json:"placement_weight,omitempty" jsonschema:"minimum=0"`
 	// Front marks the node that publishes the web UI, gateway and VPN.
 	Front bool `yaml:"front,omitempty" json:"front,omitempty"`
 	// FailureDomain names the independently failing unit containing this

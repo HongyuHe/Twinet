@@ -182,6 +182,7 @@ func Place(top *model.Topology, opts Options) (*Assignment, error) {
 
 	capacity := buildCapacityState(top, opts)
 	names, caps, hasCap := capacity.names, capacity.caps, capacity.hasCap
+	placementWeights := nodePlacementWeights(lab, names)
 	loads := map[string]demand{}
 	for node, load := range capacity.baseline {
 		loads[node] = load
@@ -366,7 +367,8 @@ func Place(top *model.Topology, opts Options) (*Assignment, error) {
 		g := buildAffinity(top)
 		nominal := nominalCapacity(names, caps, hasCap, len(top.Devices))
 		for _, asn := range orderForLocality(free, g, weight) {
-			n, err := bestForLocality(names, loads, caps, hasCap, weight[asn], tolerance, nominal,
+			n, err := bestForLocality(names, loads, caps, hasCap, placementWeights,
+				weight[asn], tolerance, nominal,
 				func(node string) int { return g.pull(asn, node, a.ByAS, front) })
 			if err != nil {
 				return nil, fmt.Errorf("AS %d: %w", asn, err)
@@ -377,7 +379,8 @@ func Place(top *model.Topology, opts Options) (*Assignment, error) {
 		}
 		// The greedy pass places each AS knowing only the ones before it.
 		// Local search repairs the choices that later ASes made bad.
-		refine(names, a.ByAS, g, weight, loads, caps, hasCap, pinned, front, tolerance, nominal)
+		refine(names, a.ByAS, g, weight, loads, caps, hasCap, placementWeights,
+			pinned, front, tolerance, nominal)
 		a.Load = map[string]int{}
 		for _, n := range names {
 			a.Load[n] = loads[n].Containers
@@ -386,7 +389,8 @@ func Place(top *model.Topology, opts Options) (*Assignment, error) {
 		return nil, fmt.Errorf("unknown placement strategy %q; use pack-by-as, spread-by-as or single-node", strategy)
 	}
 
-	if splitMoved, err := distributePlacementGroups(top, a, names, caps, hasCap, capacity.baseline, opts, explicitPinned); err != nil {
+	if splitMoved, err := distributePlacementGroups(top, a, names, caps, hasCap,
+		capacity.baseline, opts, placementWeights, explicitPinned); err != nil {
 		return nil, err
 	} else {
 		moved = append(moved, splitMoved...)
@@ -407,6 +411,17 @@ func Place(top *model.Topology, opts Options) (*Assignment, error) {
 	res.Moved = moved
 	res.Overloaded = overloads(top, a, capacity)
 	return res, nil
+}
+
+func nodePlacementWeights(lab *model.Lab, names []string) map[string]float64 {
+	out := make(map[string]float64, len(names))
+	for _, name := range names {
+		out[name] = 1
+		if node, ok := lab.NodeByName(name); ok && node.PlacementWeight > 0 {
+			out[name] = node.PlacementWeight
+		}
+	}
+	return out
 }
 
 // sortedNodeNames returns names in stable order for capacity diagnostics.
