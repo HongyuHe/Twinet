@@ -1847,7 +1847,7 @@ func (c *Containerd) bootFRRConfiguration(ctx context.Context, name string) erro
 			}, " && "),
 		}})
 		if err == nil {
-			return nil
+			return c.scheduleFRROutboundRefresh(ctx, name)
 		}
 		lastErr = err
 		if attempt == 2 {
@@ -1866,6 +1866,26 @@ func (c *Containerd) bootFRRConfiguration(ctx context.Context, name string) erro
 	})
 	return fmt.Errorf("boot integrated FRR configuration in %s: %w: %s",
 		name, lastErr, trim(log.Stdout+log.Stderr))
+}
+
+func (c *Containerd) scheduleFRROutboundRefresh(ctx context.Context, name string) error {
+	result, err := c.execRaw(ctx, name, ExecCmd{Cmd: []string{
+		"sh", "-c", `setsid sh -c '
+sleep 5
+vtysh -c "clear bgp ipv4 unicast * soft out" >/dev/null 2>&1 || true
+sleep 15
+vtysh -c "clear bgp ipv4 unicast * soft out" >/dev/null 2>&1 || true
+sleep 30
+vtysh -c "clear bgp ipv4 unicast * soft out" >/dev/null 2>&1 || true
+' </dev/null >/tmp/twinet-bgp-refresh.log 2>&1 &`,
+	}})
+	if err != nil {
+		return fmt.Errorf("schedule FRR outbound refresh in %s: %w", name, err)
+	}
+	if err := result.Err(); err != nil {
+		return fmt.Errorf("schedule FRR outbound refresh in %s: %w", name, err)
+	}
+	return nil
 }
 
 func (c *Containerd) frrConfiguration(ctx context.Context, name string) (
