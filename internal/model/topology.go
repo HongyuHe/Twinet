@@ -720,7 +720,8 @@ func ContainerName(lab string, asn int, name string) string {
 	}
 	sum := sha256.Sum256([]byte(value))
 	const suffixLength = 13 // '-' plus 12 hexadecimal characters.
-	return value[:primaryLimit-suffixLength] + fmt.Sprintf("-%x", sum[:6])
+	prefix := strings.TrimRight(value[:primaryLimit-suffixLength], "._-")
+	return prefix + fmt.Sprintf("-%x", sum[:6])
 }
 
 // Stats summarises a topology for status output and capacity planning.

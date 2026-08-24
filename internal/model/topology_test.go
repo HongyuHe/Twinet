@@ -1,6 +1,7 @@
 package model
 
 import (
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -31,7 +32,10 @@ func TestContainerNamesFitContainerdWithControlSuffix(t *testing.T) {
 	prefix := strings.Repeat("scale-grading-long-", 4)
 	first := ContainerName(prefix+"a", 3, "measurement-node-0")
 	second := ContainerName(prefix+"b", 3, "measurement-node-0")
-	for _, name := range []string{first, second} {
+	failingService := ContainerName(
+		"scale-grading-ab4c54b-g3-attest-full-as3-w0c1e6", 0, "measurement-node-0",
+	)
+	for _, name := range []string{first, second, failingService} {
 		if len(name) > 72 {
 			t.Fatalf("primary container name has %d bytes: %q", len(name), name)
 		}
@@ -41,6 +45,9 @@ func TestContainerNamesFitContainerdWithControlSuffix(t *testing.T) {
 	}
 	if first == second {
 		t.Fatalf("long distinct identities collapsed to %q", first)
+	}
+	if !regexp.MustCompile(`^[A-Za-z0-9]+(?:[._-](?:[A-Za-z0-9]+))*$`).MatchString(failingService) {
+		t.Fatalf("bounded service identity is invalid: %q", failingService)
 	}
 }
 
