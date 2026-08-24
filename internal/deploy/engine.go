@@ -2139,6 +2139,10 @@ func (e *Engine) Destroy(ctx context.Context, lab string) error {
 		if err := os.RemoveAll(filepath.Join(e.writableRoot(), lab)); err != nil {
 			problems = append(problems, fmt.Sprintf("remove writable platform state: %v", err))
 		}
+		if err := os.Remove(e.observationPath(lab)); err != nil && !os.IsNotExist(err) &&
+			!(e.ObservationRoot == "" && os.IsPermission(err)) {
+			problems = append(problems, fmt.Sprintf("remove observed deployment state: %v", err))
+		}
 	}
 	return deterministicError(ctxErr, problems)
 }

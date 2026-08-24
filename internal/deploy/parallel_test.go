@@ -111,6 +111,24 @@ func TestDestroyReportsConcurrentFailuresDeterministically(t *testing.T) {
 	}
 }
 
+func TestDestroyRemovesObservedDeploymentState(t *testing.T) {
+	root := t.TempDir()
+	engine := &Engine{
+		Runtime: &destroyRuntime{}, ObservationRoot: root,
+		removeEmptyMultiplex: func(string) ([]string, error) { return nil, nil },
+	}
+	path := engine.observationPath("lab")
+	if err := os.WriteFile(path, []byte(`{"version":1}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.Destroy(context.Background(), "lab"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("destroy left observed deployment state %s: %v", path, err)
+	}
+}
+
 func TestDestroyCancellationDoesNotStartQueuedTeardown(t *testing.T) {
 	runtime := &destroyRuntime{
 		containers: []rt.Container{{Name: "a"}, {Name: "b"}, {Name: "c"}},
