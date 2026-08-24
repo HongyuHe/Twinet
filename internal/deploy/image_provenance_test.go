@@ -30,6 +30,19 @@ func TestPostPullDigestMismatchRefusesBeforeContainerCreate(t *testing.T) {
 	}
 }
 
+func TestPostPullAcceptsContainerdDigestOnlyIdentity(t *testing.T) {
+	ref := "registry.example/router@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	engine := &Engine{
+		Runtime: digestRuntime{
+			digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		},
+		RequireImmutableImages: true,
+	}
+	if err := engine.verifyPulledImage(context.Background(), ref); err != nil {
+		t.Fatalf("matching containerd digest-only identity was rejected: %v", err)
+	}
+}
+
 func TestReleaseModeRefusesMutablePostPullReference(t *testing.T) {
 	engine := &Engine{Runtime: digestRuntime{digest: "sha256:local-config"}, RequireImmutableImages: true}
 	err := engine.verifyPulledImage(context.Background(), "registry.example/router:dev")

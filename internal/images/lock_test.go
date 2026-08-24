@@ -51,6 +51,22 @@ func TestDevelopmentTagsNeedAnExplicitMode(t *testing.T) {
 	}
 }
 
+func TestSameDigestAcceptsContainerdDigestOnlyIdentity(t *testing.T) {
+	const bare = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	if !SameDigest(digestA, bare) || Digest(bare) != bare {
+		t.Fatalf("registry digest %q and runtime identity %q were treated as different",
+			digestA, bare)
+	}
+	for _, invalid := range []string{
+		"sha256:short",
+		"sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+	} {
+		if Digest(invalid) != "" {
+			t.Fatalf("invalid digest %q was accepted", invalid)
+		}
+	}
+}
+
 func TestApplyRejectsMissingDeviceImageBeforeDeployment(t *testing.T) {
 	top := &model.Topology{
 		Lab: &model.Lab{Images: model.ImagePolicy{Mode: model.ImageModeDevelopment}},

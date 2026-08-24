@@ -79,9 +79,24 @@ func IsImmutable(ref string) bool {
 
 // Digest returns the sha256 manifest portion of an immutable reference.
 func Digest(ref string) string {
-	_, digest, ok := strings.Cut(strings.TrimSpace(ref), "@sha256:")
-	if !ok || len(digest) != 64 {
+	ref = strings.TrimSpace(ref)
+	digest := ""
+	if strings.HasPrefix(ref, "sha256:") {
+		digest = strings.TrimPrefix(ref, "sha256:")
+	} else {
+		var ok bool
+		_, digest, ok = strings.Cut(ref, "@sha256:")
+		if !ok {
+			return ""
+		}
+	}
+	if len(digest) != 64 {
 		return ""
+	}
+	for _, character := range digest {
+		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
+			return ""
+		}
 	}
 	return "sha256:" + digest
 }
