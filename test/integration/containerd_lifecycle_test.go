@@ -386,6 +386,43 @@ placement:
 	}
 	control := deploy.FRRControlContainer(device)
 	result, err = runtime.Exec(ctx, control, rt.ExecCmd{
+		Cmd: []string{"sh", "-c", "pidof watchfrr >/dev/null && pidof ospfd && test -S /run/frr/ospfd.vty"},
+	})
+	if err != nil || result.Err() != nil {
+		t.Fatalf("containerd FRR watchdog is not supervising ospfd: %+v, %v", result, err)
+	}
+	oldPID := strings.TrimSpace(result.Stdout)
+	result, err = runtime.Exec(ctx, control, rt.ExecCmd{
+		Cmd: []string{"sh", "-c", `pid="$(pidof ospfd)" && kill -KILL "$pid"`},
+	})
+	if err != nil || result.Err() != nil {
+		t.Fatalf("kill supervised containerd ospfd: %+v, %v", result, err)
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		result, err = runtime.Exec(ctx, control, rt.ExecCmd{
+			Cmd: []string{"sh", "-c", "pidof ospfd && test -S /run/frr/ospfd.vty"},
+		})
+		if err == nil && result.Err() == nil && strings.TrimSpace(result.Stdout) != oldPID {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("watchfrr did not restart ospfd: %+v, %v", result, err)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	for {
+		result, err = runtime.Exec(ctx, device.Container,
+			rt.ExecCmd{Cmd: []string{"vtysh", "-c", "show running-config"}})
+		if err == nil && result.Err() == nil && strings.Contains(result.Stdout, "router ospf") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("watchfrr restart did not restore OSPF configuration: %+v, %v", result, err)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	result, err = runtime.Exec(ctx, control, rt.ExecCmd{
 		Cmd: []string{"sh", "-c", "/usr/lib/frr/frrinit.sh restart"},
 	})
 	if err != nil || result.Err() != nil {

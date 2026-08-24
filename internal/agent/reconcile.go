@@ -626,7 +626,12 @@ func (s *Server) repairLab(ctx context.Context, top *model.Topology, broken []*m
 		if isSemanticOnlyDrift(observation.Reason) {
 			if !s.semanticRepairAttempted(top.Name, d.ID) || forceSemanticRepair(ctx) {
 				semanticCtx, cancel := context.WithTimeout(ctx, semanticRepairTimeout)
-				err := eng.RewireDevice(semanticCtx, top, d)
+				// Local interface loss is classified before semantic drift.
+				// A missing remote route with intact local wiring can only be
+				// repaired here by reapplying this device's configuration.
+				// Rewiring every healthy router for one remote withdrawal
+				// amplifies a single fault into cluster-wide netlink churn.
+				err := eng.ReconfigureDevice(semanticCtx, d)
 				if err == nil {
 					err = s.confirmDaemonRepair(semanticCtx, top, d)
 				}
@@ -643,11 +648,9 @@ func (s *Server) repairLab(ctx context.Context, top *model.Topology, broken []*m
 			s.deferSemanticRepair(top.Name, d.ID, observation.Reason)
 			s.recordEvent(top.Name, "", "reconcile", "", "semantic_repair_deferred", "backoff",
 				d.ID+": "+observation.Reason)
-			// Rewiring a device whose interfaces and daemon set are already
-			// healthy cannot create a missing remote route. Leave the lab
-			// idle, report the precise degraded reason, and wait for a later
-			// routing observation to clear it or an operator deployment to
-			// change desired state.
+			// Reconfiguring a device whose local state is already healthy
+			// cannot create a missing remote route. Leave the lab idle, report
+			// the precise degraded reason, and wait for the remote repair.
 			continue
 		}
 		class := deviceChangeClass(observation)

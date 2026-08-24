@@ -1807,7 +1807,10 @@ exit "$status"
 		return fmt.Errorf("FRR daemons did not become ready in %s: %w: %s",
 			name, err, trim(string(log)))
 	}
-	return c.bootFRRConfiguration(ctx, name)
+	if err := c.bootFRRConfiguration(ctx, name); err != nil {
+		return err
+	}
+	return c.startFRRWatchdog(ctx, name, profile, daemons)
 }
 
 func (c *Containerd) waitFRRSockets(ctx context.Context, name string, daemons []frrDaemon) error {
@@ -1868,6 +1871,50 @@ func (c *Containerd) bootFRRConfiguration(ctx context.Context, name string) erro
 		name, lastErr, trim(log.Stdout+log.Stderr))
 }
 
+func (c *Containerd) startFRRWatchdog(
+	ctx context.Context,
+	name, profile string,
+	daemons []frrDaemon,
+) error {
+	command := watchFRRCommand(profile, daemons)
+	result, err := c.execTaskRaw(ctx, name, ExecCmd{Cmd: command})
+	if err != nil {
+		return fmt.Errorf("start FRR watchdog in %s: %w", name, err)
+	}
+	if err := result.Err(); err != nil {
+		return fmt.Errorf("start FRR watchdog in %s: %w: %s",
+			name, err, trim(result.Stdout+result.Stderr))
+	}
+	return nil
+}
+
+func watchFRRCommand(profile string, daemons []frrDaemon) []string {
+	reload := strings.Join([]string{
+		`daemon=%s`,
+		`/usr/lib/frr/watchfrr.sh restart "$daemon"`,
+		`rc=$?`,
+		`[ "$rc" -eq 0 ] || exit "$rc"`,
+		`for i in $(seq 1 100); do [ -S "/run/frr/$daemon.vty" ] && break; sleep 0.1; done`,
+		`[ -S "/run/frr/$daemon.vty" ] || exit 1`,
+		`vtysh --no-fork -b </dev/null >/tmp/twinet-vtysh-watchfrr.log 2>&1`,
+		`vtysh --no-fork -b </dev/null >>/tmp/twinet-vtysh-watchfrr.log 2>&1`,
+	}, "; ")
+	command := []string{
+		"/usr/lib/frr/watchfrr",
+		"-d",
+		"-F", profile,
+		"-i", "5",
+		"--min-restart-interval", "5",
+		"--max-restart-interval", "60",
+		"-r", reload,
+		"-s", reload,
+	}
+	for _, daemon := range daemons {
+		command = append(command, daemon.name)
+	}
+	return command
+}
+
 func (c *Containerd) frrConfiguration(ctx context.Context, name string) (
 	string, []frrDaemon, error,
 ) {
@@ -1922,6 +1969,7 @@ func (c *Containerd) frrSocketsReady(ctx context.Context, name string,
 		script.WriteString(shellQuote("/run/frr/" + daemon.name + ".vty"))
 		script.WriteString(" || exit 1\n")
 	}
+	script.WriteString("pidof watchfrr >/dev/null 2>&1 || exit 1\n")
 	result, err := c.execTaskRaw(ctx, name, ExecCmd{
 		Cmd: []string{"sh", "-c", script.String()},
 	})
