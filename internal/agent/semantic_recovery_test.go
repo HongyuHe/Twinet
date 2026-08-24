@@ -57,6 +57,17 @@ func TestSolveHostSemanticVerificationRequiresAddressAndDefaultRoute(t *testing.
 	}
 }
 
+func TestMissingAddressRequiresRewireButRemoteDriftDoesNot(t *testing.T) {
+	if !requiresSemanticRewire(&missingExpectedAddressError{
+		device: "as3/ATL", address: "179.2.3.2/24", iface: "ext_2_ALL",
+	}) {
+		t.Fatal("missing local interface address selected configuration-only repair")
+	}
+	if requiresSemanticRewire(context.DeadlineExceeded) {
+		t.Fatal("generic remote/control-plane failure selected destructive rewiring")
+	}
+}
+
 func TestCommitSemanticProofDoesNotRequirePrematureRemoteBGP(t *testing.T) {
 	top, host := semanticHostTopology(model.OwnerStudent)
 	remote := &model.Device{

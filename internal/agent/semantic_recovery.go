@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -223,15 +224,37 @@ func (s *Server) verifyTopologyChecks(ctx context.Context, top *model.Topology,
 				UnderlayIP: s.cfg.UnderlayIP, UnderlayDev: s.cfg.UnderlayDev,
 				PeerUnderlay: s.peerUnderlay(top.Name),
 			}
-			if err := repair.ReconfigureDevice(verifyCtx, device); err != nil {
-				return fmt.Errorf("%w; solved-reference reconfiguration also failed: %v", firstErr, err)
+			repairKind := "reconfiguration"
+			var repairErr error
+			if requiresSemanticRewire(firstErr) {
+				repairKind = "rewiring"
+				repairErr = repair.RewireDevice(verifyCtx, top, device)
+			} else {
+				repairErr = repair.ReconfigureDevice(verifyCtx, device)
+			}
+			if repairErr != nil {
+				return fmt.Errorf("%w; solved-reference %s also failed: %v",
+					firstErr, repairKind, repairErr)
 			}
 			if err := verify(); err != nil {
-				return fmt.Errorf("%w; solved-reference reconfiguration did not repair it: %v",
-					firstErr, err)
+				return fmt.Errorf("%w; solved-reference %s did not repair it: %v",
+					firstErr, repairKind, err)
 			}
 			return nil
 		})
+}
+
+type missingExpectedAddressError struct {
+	device, address, iface string
+}
+
+func (e *missingExpectedAddressError) Error() string {
+	return fmt.Sprintf("%s is missing expected address %s on %s", e.device, e.address, e.iface)
+}
+
+func requiresSemanticRewire(err error) bool {
+	var missing *missingExpectedAddressError
+	return errors.As(err, &missing)
 }
 
 func renderedSemanticArtifacts(r *render.Renderer, device *model.Device) ([]transactionArtifact, error) {
@@ -593,7 +616,9 @@ func (s *Server) verifyExpectedAddresses(ctx context.Context, device *model.Devi
 	for iface, addresses := range expected {
 		for address := range addresses {
 			if !have[iface][address] {
-				return fmt.Errorf("%s is missing expected address %s on %s", device.ID, address, iface)
+				return &missingExpectedAddressError{
+					device: device.ID, address: address, iface: iface,
+				}
 			}
 		}
 	}
