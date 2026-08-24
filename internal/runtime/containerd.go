@@ -1877,13 +1877,30 @@ func (c *Containerd) startFRRWatchdog(
 	daemons []frrDaemon,
 ) error {
 	command := watchFRRCommand(profile, daemons)
-	result, err := c.execTaskRaw(ctx, name, ExecCmd{Cmd: command})
+	words := make([]string, 0, len(command))
+	for _, word := range command {
+		words = append(words, shellQuote(word))
+	}
+	result, err := c.execRaw(ctx, name, ExecCmd{Cmd: []string{
+		"sh", "-c", "setsid " + strings.Join(words, " ") +
+			" </dev/null >/tmp/twinet-watchfrr.log 2>&1 &",
+	}})
 	if err != nil {
 		return fmt.Errorf("start FRR watchdog in %s: %w", name, err)
 	}
 	if err := result.Err(); err != nil {
 		return fmt.Errorf("start FRR watchdog in %s: %w: %s",
 			name, err, trim(result.Stdout+result.Stderr))
+	}
+	ready, err := c.execRaw(ctx, name, ExecCmd{Cmd: []string{
+		"sh", "-c", "for i in $(seq 1 100); do pidof watchfrr >/dev/null 2>&1 && exit 0; sleep 0.05; done; exit 1",
+	}})
+	if err != nil {
+		return fmt.Errorf("verify FRR watchdog in %s: %w", name, err)
+	}
+	if err := ready.Err(); err != nil {
+		return fmt.Errorf("verify FRR watchdog in %s: %w: %s",
+			name, err, trim(ready.Stdout+ready.Stderr))
 	}
 	return nil
 }
