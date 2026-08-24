@@ -161,7 +161,7 @@ if [[ "$args" == *" grade batch "* ]]; then
     exit 0
 fi
 if [[ "$args" == *" grade run "* ]]; then
-    printf '{"duration":"1s","reports":[{"submission":"group3"}]}\n'
+    printf '{"duration":"1s","reports":[{"submission":"group3","total":1,"max_total":1,"questions":[{"id":"convergence","status":"pass","results":[{"check":"fixture.check","status":"pass"}]}]}]}\n'
     exit 0
 fi
 printf 'unexpected fake controller command: %s\n' "$*" >&2
@@ -198,6 +198,8 @@ assert report["budgets"]["deploy"] == "10m"
 assert report["budgets"]["grade"] == "15m"
 assert report["budgets"]["allow_other_labs"] is False
 assert report["convergence"]["exit_code"] == 0
+assert "--rubric " in report["convergence"]["command"]
+assert report["reference_grade"]["exit_code"] == 0
 assert report["cleanup"]["attempted"] and report["cleanup"]["succeeded"]
 assert report["cleanup"]["result"]["exit_code"] == 0
 assert not report["missing_measurements"], report

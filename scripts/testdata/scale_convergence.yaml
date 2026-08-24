@@ -1,0 +1,50 @@
+apiVersion: twinet.dev/v1
+kind: Rubric
+metadata:
+  name: scale-convergence
+  total: 1
+  notes: >
+    A strict, bounded proof that the solved reference has converged. Full
+    course correctness is measured separately by the untimed reference grade.
+questions:
+  - id: convergence.ospf
+    title: Internal control plane
+    points: 0.15
+    checks:
+      - check: ospf.full_adjacency
+        weight: 1.0
+
+  - id: convergence.dataplane
+    title: Internal forwarding
+    points: 0.2
+    checks:
+      - check: dataplane.internal_reachability
+        weight: 1.0
+
+  - id: convergence.ebgp
+    title: External sessions
+    points: 0.15
+    checks:
+      - check: bgp.ebgp_established
+        weight: 1.0
+
+  - id: convergence.policy
+    title: Interdomain route selection
+    points: 0.2
+    checks:
+      - check: policy.gao_rexford
+        weight: 1.0
+
+  - id: convergence.ixp
+    title: Exchange relay
+    points: 0.15
+    checks:
+      - check: policy.ixp_communities
+        weight: 1.0
+
+  - id: convergence.rpki
+    title: Origin validation
+    points: 0.15
+    checks:
+      - check: rpki.invalid_rejected
+        weight: 1.0

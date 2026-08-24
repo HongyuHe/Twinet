@@ -33,6 +33,8 @@ Options:
   --grade-budget D          Maximum batch-grading duration (default: 15m).
   --allow-other-labs        Permit unrelated managed labs to remain on the cluster.
   --convergence-as N        Solved AS used by the convergence-aware grade probe (default: 3).
+  --convergence-rubric F    Focused rubric used for the timed convergence proof
+                            (default: scripts/testdata/scale_convergence.yaml).
   --converge-timeout D      Grade convergence timeout (default: 10m).
   --help                    Show this help.
 
@@ -92,6 +94,7 @@ deploy_budget="10m"
 grade_budget="15m"
 allow_other_labs=0
 convergence_as=3
+convergence_rubric="scripts/testdata/scale_convergence.yaml"
 converge_timeout="10m"
 allow_destructive=0
 
@@ -165,6 +168,11 @@ while [ "$#" -gt 0 ]; do
             convergence_as=$2
             shift 2
             ;;
+        --convergence-rubric)
+            require_value "$@"
+            convergence_rubric=$2
+            shift 2
+            ;;
         --converge-timeout)
             require_value "$@"
             converge_timeout=$2
@@ -217,6 +225,9 @@ fi
 if [ ! -x "$binary" ]; then
     die_usage "controller binary ${binary} is not executable; run make build or pass --binary"
 fi
+if [ ! -r "$convergence_rubric" ]; then
+    die_usage "convergence rubric ${convergence_rubric} does not exist or is not readable"
+fi
 if [ -z "${TWINET_TOKEN:-}" ]; then
     die_usage "TWINET_TOKEN is required to collect cluster evidence"
 fi
@@ -248,6 +259,7 @@ output="$(cd "$(dirname "$output")" && pwd -P)/$(basename "$output")"
 manifest_dir=$(cd "$manifest_dir" && pwd -P) || exit 1
 manifest_file="${manifest_dir}/$(basename "$manifest_file")"
 binary="$(cd "$(dirname "$binary")" && pwd -P)/$(basename "$binary")"
+convergence_rubric="$(cd "$(dirname "$convergence_rubric")" && pwd -P)/$(basename "$convergence_rubric")"
 
 umask 077
 scratch_dir=$(mktemp -d "${output_dir}/.scale_benchmark.XXXXXX") || {
@@ -402,23 +414,52 @@ for row in rows:
 PY
 }
 
-validate_convergence() {
-    python3 - "${scratch_dir}/convergence.stdout" <<'PY'
+validate_grade_probe() {
+    local phase=$1
+    local description=$2
+    python3 - "${scratch_dir}/${phase}.stdout" "$description" <<'PY'
 import json
+import math
 import pathlib
 import sys
 
 try:
     doc = json.loads(pathlib.Path(sys.argv[1]).read_text())
 except Exception as exc:
-    raise SystemExit(f"convergence result is not JSON: {exc}")
+    raise SystemExit(f"{sys.argv[2]} result is not JSON: {exc}")
 if not isinstance(doc, dict):
-    raise SystemExit("convergence result is not an object")
+    raise SystemExit(f"{sys.argv[2]} result is not an object")
 for key in ("reports", "duration"):
     if key not in doc:
-        raise SystemExit(f"convergence result lacks required field {key!r}")
+        raise SystemExit(f"{sys.argv[2]} result lacks required field {key!r}")
 if not isinstance(doc["reports"], list) or not doc["reports"]:
-    raise SystemExit("convergence probe produced no grade report")
+    raise SystemExit(f"{sys.argv[2]} produced no grade report")
+for report in doc["reports"]:
+    if not isinstance(report, dict):
+        raise SystemExit(f"{sys.argv[2]} contains a non-object report")
+    if report.get("needs_review") or report.get("error"):
+        raise SystemExit(f"{sys.argv[2]} requires infrastructure review")
+    total, maximum = report.get("total"), report.get("max_total")
+    if not isinstance(total, (int, float)) or not isinstance(maximum, (int, float)):
+        raise SystemExit(f"{sys.argv[2]} has no numeric total/max_total")
+    if maximum <= 0 or not math.isclose(float(total), float(maximum), rel_tol=0, abs_tol=1e-6):
+        raise SystemExit(f"{sys.argv[2]} scored {total!r}/{maximum!r}, not full marks")
+    questions = report.get("questions")
+    if not isinstance(questions, list) or not questions:
+        raise SystemExit(f"{sys.argv[2]} has no question evidence")
+    for question in questions:
+        if not isinstance(question, dict) or question.get("status") != "pass":
+            raise SystemExit(
+                f"{sys.argv[2]} question {question.get('id', '<unknown>') if isinstance(question, dict) else '<invalid>'} did not pass"
+            )
+        results = question.get("results")
+        if not isinstance(results, list) or not results:
+            raise SystemExit(f"{sys.argv[2]} question {question.get('id', '<unknown>')} has no check evidence")
+        for result in results:
+            if not isinstance(result, dict) or result.get("status") != "pass":
+                raise SystemExit(
+                    f"{sys.argv[2]} check {result.get('check', '<unknown>') if isinstance(result, dict) else '<invalid>'} did not pass"
+                )
 PY
 }
 
@@ -972,6 +1013,7 @@ required = {
     "underlay_preflight": phase_ok("underlay_preflight"),
     "deploy": phase_ok("deploy"),
     "convergence": phase_ok("convergence"),
+    "reference_grade": phase_ok("reference_grade"),
     "node_status_after_deploy": phase_ok("node_status_after_deploy"),
     "cleanup": cleanup_succeeded == "1" if cleanup_attempted == "1" else False,
     "node_status_after_cleanup": phase_ok("node_status_after_cleanup") if cleanup_attempted == "1" else False,
@@ -1045,6 +1087,7 @@ report = {
         "grade_seconds": interval_seconds("grade", "grade") if submission_count != "0" else None,
     },
     "convergence": decoded_phase("convergence"),
+    "reference_grade": decoded_phase("reference_grade"),
     "grade": grade,
     "cleanup": {
         "attempted": cleanup_attempted == "1",
@@ -1143,16 +1186,28 @@ if ! interval_within_budget deploy deploy "$deploy_budget"; then
 fi
 
 if ! run_capture convergence "$binary" --json grade run -m "$run_manifest" --as "$convergence_as" \
-    --out "${scratch_dir}/convergence_reports" --converge-timeout "$converge_timeout"; then
+    --rubric "$convergence_rubric" --out "${scratch_dir}/convergence_reports" \
+    --converge-timeout "$converge_timeout"; then
     record_failure "convergence-aware grade probe did not complete cleanly"
     exit 1
 fi
-if ! validate_convergence; then
-    record_failure "convergence-aware grade probe returned incomplete evidence"
+if ! validate_grade_probe convergence "convergence probe"; then
+    record_failure "convergence-aware grade probe did not earn strict full marks"
     exit 1
 fi
 if ! interval_within_budget deploy convergence "$deploy_budget"; then
     record_failure "scale deployment and convergence exceeded the ${deploy_budget} acceptance budget"
+    exit 1
+fi
+
+if ! run_capture reference_grade "$binary" --json grade run -m "$run_manifest" \
+    --as "$convergence_as" --out "${scratch_dir}/reference_grade_reports" \
+    --converge-timeout "$converge_timeout"; then
+    record_failure "full reference grade did not complete cleanly"
+    exit 1
+fi
+if ! validate_grade_probe reference_grade "full reference grade"; then
+    record_failure "full reference grade did not earn strict full marks"
     exit 1
 fi
 
