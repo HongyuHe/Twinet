@@ -1838,7 +1838,13 @@ func (c *Containerd) bootFRRConfiguration(ctx context.Context, name string) erro
 	var lastErr error
 	for attempt := range 3 {
 		err := c.execTaskSilent(ctx, name, ExecCmd{Cmd: []string{
-			"sh", "-c", "vtysh --no-fork -b </dev/null >/tmp/twinet-vtysh-boot.log 2>&1",
+			"sh", "-c", strings.Join([]string{
+				"vtysh --no-fork -b </dev/null >/tmp/twinet-vtysh-boot.log 2>&1",
+				// Integrated config is sequential: the first pass creates
+				// policy objects referenced earlier by neighbor commands, and
+				// the second binds those references before sessions converge.
+				"vtysh --no-fork -b </dev/null >>/tmp/twinet-vtysh-boot.log 2>&1",
+			}, " && "),
 		}})
 		if err == nil {
 			return nil
