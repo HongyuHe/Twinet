@@ -47,7 +47,7 @@ TWINET_K8S_HELPER_IMAGE ?= docker.io/nicolaka/netshoot:v0.13@sha256:a20c2531bf35
 TWINET_K8S_WORKLOAD_IMAGE ?= docker.io/library/busybox:1.36.1@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662
 TWINET_NIKA_KUBERNETES_BRIDGE ?= python3 $(CURDIR)/contrib/nika/kubernetes_bridge.py --kubectl $(KUBECTL)$(if $(strip $(KUBECONFIG)), --kubeconfig $(abspath $(KUBECONFIG)),) --helper-image $(TWINET_K8S_HELPER_IMAGE) --workload-image $(TWINET_K8S_WORKLOAD_IMAGE)
 
-.PHONY: all build release-build source-identity-stamp source-identity-check test-source-identity test lint fmt vet images push digests image-lock image-verify podman-images podman-integration containerd-integration clean install e2e ci ci-tools tidy-check naming \
+.PHONY: all build release-build source-identity-stamp source-identity-check test-source-identity test lint fmt vet images push digests image-lock image-verify podman-images podman-integration containerd-integration clean install e2e ci ci-tools tidy-check naming fixture-sync \
 	script-tests benchmark chaos soak-short soak-24h nos-images substrate-images substrate-integration \
 	fault-integration k8s-fault-integration fault-stress fault-stress-release o12-integration
 
@@ -115,12 +115,22 @@ lint: fmt vet
 naming:
 	./scripts/check_naming.sh
 
+# The scale fixture is the production-size instance of the same COS461
+# assignment. Letting its copied rubric drift creates a weaker large-class
+# grading contract that ordinary per-file validation cannot detect.
+fixture-sync:
+	@cmp -s examples/scale/rubric/cos461.yaml examples/cos461/rubric/cos461.yaml || { \
+		diff -u examples/scale/rubric/cos461.yaml examples/cos461/rubric/cos461.yaml; \
+		echo "scale COS461 rubric differs from the canonical course rubric" >&2; \
+		exit 1; \
+	}
+
 # Everything CI checks, runnable before pushing.
 # `make ci` is the release gate, so it must fail when it cannot check something
 # rather than report success for the subset of gates that happened to be
 # installed. A tool that is missing is an unrun gate, and an unrun gate that
 # prints "passed" is worse than no gate at all: it is a gate that lies.
-ci: ci-tools naming lint test build tidy-check
+ci: ci-tools naming fixture-sync lint test build tidy-check
 	# Every lab and every rubric that ships, found rather than listed.
 	#
 	# The list was written out, so three labs and two rubrics were added and the
