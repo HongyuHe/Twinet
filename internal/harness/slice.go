@@ -223,6 +223,7 @@ func Slice(top *model.Topology, target int, opts Options) (*model.Topology, erro
 	if _, ok := out.ASes[target]; !ok {
 		return nil, fmt.Errorf("AS %d has no devices after slicing", target)
 	}
+	copyKeptServices(top, out)
 
 	// A link survives only if both endpoints do. Keeping a half-link would
 	// configure an interface towards a router that was never deployed, which
@@ -266,6 +267,52 @@ func Slice(top *model.Topology, target int, opts Options) (*model.Topology, erro
 	rebind(out)
 	out.Hash = hashTopology(out)
 	return out, nil
+}
+
+func copyKeptServices(source, target *model.Topology) {
+	for name, service := range source.Services {
+		if service == nil {
+			continue
+		}
+		copy := *service
+		copy.Device = nil
+		copy.Replicas = nil
+		copy.Config = copyStrMap(service.Config)
+		copy.Attachments = map[int]string{}
+
+		retainedReplicas := map[string]bool{}
+		for _, replica := range service.Replicas {
+			if replica == nil || replica.Device == nil {
+				continue
+			}
+			device := target.Devices[replica.Device.ID]
+			if device == nil {
+				continue
+			}
+			replicaCopy := *replica
+			replicaCopy.Device = device
+			copy.Replicas = append(copy.Replicas, &replicaCopy)
+			retainedReplicas[replica.ID] = true
+		}
+		if service.Device != nil {
+			copy.Device = target.Devices[service.Device.ID]
+		}
+		if copy.Device == nil && len(copy.Replicas) > 0 {
+			copy.Device = copy.Replicas[0].Device
+		}
+		if copy.Device == nil {
+			continue
+		}
+		for asn, replicaID := range service.Attachments {
+			if target.ASes[asn] == nil {
+				continue
+			}
+			if len(service.Replicas) == 0 || retainedReplicas[replicaID] {
+				copy.Attachments[asn] = replicaID
+			}
+		}
+		target.Services[name] = &copy
+	}
 }
 
 // neighbourhood returns the ASes within depth AS hops of the target.

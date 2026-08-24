@@ -332,6 +332,31 @@ func TestFullBreadthKeepsEverythingButStillIsolates(t *testing.T) {
 	if len(a.ASes) != len(full.ASes) {
 		t.Fatalf("full breadth lost ASes: %v vs %v", a.SortedASNs(), full.SortedASNs())
 	}
+	for _, device := range a.SortedDevices() {
+		if device.Kind != model.KindService {
+			continue
+		}
+		service, replica, ok := a.ServiceByDevice(device)
+		if !ok || service == nil {
+			t.Fatalf("service device %s lost its declaration in the harness", device.ID)
+		}
+		if replica != nil && replica.Device != device {
+			t.Fatalf("service replica %s points outside the harness", replica.ID)
+		}
+	}
+	for name, service := range a.Services {
+		original := full.Services[name]
+		if original == nil {
+			continue
+		}
+		if service.Config == nil {
+			service.Config = map[string]string{}
+		}
+		service.Config["__harness_test"] = "harness-only"
+		if original.Config["__harness_test"] == "harness-only" {
+			t.Fatalf("service %s config is shared with the class topology", name)
+		}
+	}
 
 	// Isolation must not depend on the harness being smaller. Two full-breadth
 	// harnesses contain the same ASes and must still share nothing.
