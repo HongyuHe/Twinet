@@ -332,6 +332,23 @@ func TestFullBreadthKeepsEverythingButStillIsolates(t *testing.T) {
 	if len(a.ASes) != len(full.ASes) {
 		t.Fatalf("full breadth lost ASes: %v vs %v", a.SortedASNs(), full.SortedASNs())
 	}
+	for id, original := range full.Devices {
+		copied := a.Devices[id]
+		if copied == nil {
+			t.Fatalf("full breadth lost device %s", id)
+		}
+		for _, expected := range original.Ifaces {
+			actual, ok := copied.IfaceByName(expected.Name)
+			if !ok {
+				t.Fatalf("full breadth lost interface %s:%s", id, expected.Name)
+			}
+			if actual.Addr4 != expected.Addr4 || actual.Addr6 != expected.Addr6 ||
+				actual.Owner != expected.Owner || actual.Role != expected.Role {
+				t.Fatalf("full breadth changed %s:%s: got %+v, want %+v",
+					id, expected.Name, actual, expected)
+			}
+		}
+	}
 	for _, device := range a.SortedDevices() {
 		if device.Kind != model.KindService {
 			continue

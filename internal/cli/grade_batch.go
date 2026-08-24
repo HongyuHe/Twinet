@@ -769,7 +769,7 @@ func deployQuiet(ctx context.Context, c *client.Cluster, h *model.Topology, targ
 		Mode:            "solve",
 		Ungraded:        target,
 		PullPolicy:      string(rt.PullIfMissing),
-		Workers:         8,
+		Workers:         harnessDeployWorkers(len(h.Devices)),
 		Generation:      time.Now().UTC().Format("20060102T150405.000"),
 		StrictAdmission: true,
 	})
@@ -788,6 +788,17 @@ func deployQuiet(ctx context.Context, c *client.Cluster, h *model.Topology, targ
 		}
 	}
 	return nil
+}
+
+func harnessDeployWorkers(devices int) int {
+	workers := (devices + 39) / 40
+	if workers < 8 {
+		return 8
+	}
+	if workers > 56 {
+		return 56
+	}
+	return workers
 }
 
 func destroyLab(ctx context.Context, c *client.Cluster, h *model.Topology) error {

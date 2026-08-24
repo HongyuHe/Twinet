@@ -24,6 +24,23 @@ func TestBatchHarnessOptionsUseAttestedCompactSynthetic(t *testing.T) {
 	}
 }
 
+func TestHarnessDeployWorkersScaleWithTopology(t *testing.T) {
+	for _, test := range []struct {
+		devices int
+		want    int
+	}{
+		{devices: 40, want: 8},
+		{devices: 320, want: 8},
+		{devices: 2020, want: 51},
+		{devices: 4000, want: 56},
+	} {
+		if got := harnessDeployWorkers(test.devices); got != test.want {
+			t.Errorf("harnessDeployWorkers(%d) = %d, want %d",
+				test.devices, got, test.want)
+		}
+	}
+}
+
 func TestBatchHarnessTypeReportsActualMode(t *testing.T) {
 	if got := batchHarnessType(batchOpts{}); got != "full-audit-fallback" {
 		t.Fatalf("unattested harness type=%q", got)
