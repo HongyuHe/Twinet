@@ -824,16 +824,17 @@ type ixpRoute struct {
 	advertisedTo []int
 }
 
+type advertisedIXPPeer struct {
+	Hostname string `json:"hostname"`
+}
+
 // readIXPRoute asks the route server what it has, rather than asking the
 // student's router what it meant to send.
 func readIXPRoute(ctx context.Context, env *Env, rsDevice, prefix string, out *ixpRoute) error {
-	_ = env
 	var raw struct {
-		Prefix       string `json:"prefix"`
-		AdvertisedTo map[string]struct {
-			Hostname string `json:"hostname"`
-		} `json:"advertisedTo"`
-		Paths []struct {
+		Prefix       string                       `json:"prefix"`
+		AdvertisedTo map[string]advertisedIXPPeer `json:"advertisedTo"`
+		Paths        []struct {
 			RxedFromRSClient bool `json:"rxedFromRsClient"`
 			Community        struct {
 				List []string `json:"list"`
@@ -886,16 +887,56 @@ func readIXPRoute(ctx context.Context, env *Env, rsDevice, prefix string, out *i
 	if !out.present {
 		return nil
 	}
-	for _, m := range raw.AdvertisedTo {
-		// The route server names each client by hostname, which carries the AS.
-		if i := strings.LastIndex(m.Hostname, ".as"); i >= 0 {
-			if asn, err := strconv.Atoi(m.Hostname[i+3:]); err == nil {
-				out.advertisedTo = append(out.advertisedTo, asn)
+	rs, ok := env.Topology.Devices[rsDevice]
+	if !ok {
+		return fmt.Errorf("route server %s is not in the topology", rsDevice)
+	}
+	out.advertisedTo = advertisedIXPMembers(env.Topology, rs.ASN, raw.AdvertisedTo)
+	return nil
+}
+
+func advertisedIXPMembers(
+	top *model.Topology,
+	ixp int,
+	advertised map[string]advertisedIXPPeer,
+) []int {
+	members := ixpMembers(top, ixp)
+	byAddress := make(map[string]int)
+	for asn := range members {
+		as, ok := top.ASes[asn]
+		if !ok {
+			continue
+		}
+		for _, d := range as.Devices {
+			for _, iface := range d.Ifaces {
+				if iface.Role == model.RoleIXPLink && iface.Addr4 != "" {
+					byAddress[addrOnly(iface.Addr4)] = asn
+				}
 			}
 		}
 	}
-	sort.Ints(out.advertisedTo)
-	return nil
+
+	found := make(map[int]bool)
+	for address, peer := range advertised {
+		if asn, ok := byAddress[addrOnly(address)]; ok {
+			found[asn] = true
+			continue
+		}
+		// Older FRR versions used the configured neighbour hostname here.
+		// Current FRR can instead report the worker's reverse-DNS hostname, so
+		// the advertised-neighbour address above is the authoritative identity.
+		if i := strings.LastIndex(peer.Hostname, ".as"); i >= 0 {
+			if asn, err := strconv.Atoi(peer.Hostname[i+3:]); err == nil && members[asn] {
+				found[asn] = true
+			}
+		}
+	}
+	out := make([]int, 0, len(found))
+	for asn := range found {
+		out = append(out, asn)
+	}
+	sort.Ints(out)
+	return out
 }
 
 // ixpMembers is the set of AS numbers attached to one exchange.

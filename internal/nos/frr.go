@@ -260,7 +260,10 @@ func readFRRBGP(ctx context.Context, d *model.Device, exec netstate.Executor, qu
 				Best: path.BestPath || path.Best, Valid: path.Valid, LocalPref: path.LocalPref,
 				Origin: path.Origin, Peer: path.Peer, Source: path.PathFrom, RPKI: normalizeRPKI(rpki),
 			}
-			if normalized.Source == "" && normalized.Peer == "(unspec)" {
+			// FRR 10 can label a locally originated `network` path as
+			// pathFrom=external. Its synthetic (unspec) peer is the reliable
+			// discriminator: no external session has that peer identity.
+			if normalized.Peer == "(unspec)" {
 				normalized.Source = "local"
 			}
 			if path.Community != nil {
