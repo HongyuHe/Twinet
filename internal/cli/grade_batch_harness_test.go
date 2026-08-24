@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/HongyuHe/twinet/internal/grade"
 	"github.com/HongyuHe/twinet/internal/model"
@@ -38,6 +39,18 @@ func TestHarnessDeployWorkersScaleWithTopology(t *testing.T) {
 			t.Errorf("harnessDeployWorkers(%d) = %d, want %d",
 				test.devices, got, test.want)
 		}
+	}
+}
+
+func TestWarmHarnessTimeoutsScaleWithTopology(t *testing.T) {
+	if got := warmHarnessBaselineTimeout(40, time.Minute); got != 3*time.Minute {
+		t.Fatalf("compact baseline timeout = %s", got)
+	}
+	if got := warmHarnessBaselineTimeout(2020, 3*time.Minute); got != 10*time.Minute {
+		t.Fatalf("scale baseline timeout = %s", got)
+	}
+	if got := warmHarnessCleanupTimeout(2020); got != 10*time.Minute {
+		t.Fatalf("scale cleanup timeout = %s", got)
 	}
 }
 

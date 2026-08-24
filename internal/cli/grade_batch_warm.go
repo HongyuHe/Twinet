@@ -16,6 +16,31 @@ import (
 
 const warmBaselineExecTimeout = 2 * time.Minute
 
+func warmHarnessBaselineTimeout(devices int, requested time.Duration) time.Duration {
+	minimum := 3 * time.Minute
+	switch {
+	case devices >= 1000:
+		minimum = 10 * time.Minute
+	case devices >= 300:
+		minimum = 5 * time.Minute
+	}
+	if requested > minimum {
+		return requested
+	}
+	return minimum
+}
+
+func warmHarnessCleanupTimeout(devices int) time.Duration {
+	switch {
+	case devices >= 1000:
+		return 10 * time.Minute
+	case devices >= 300:
+		return 5 * time.Minute
+	default:
+		return 3 * time.Minute
+	}
+}
+
 // warmBatchManager owns one compact private pool per target AS. A normal
 // class has one submission per AS and still benefits from the compact harness;
 // release mutations for the same AS reuse its already-deployed substrate.
@@ -165,7 +190,9 @@ func newWarmBatchHarness(ctx context.Context, class *model.Topology, rubric *gra
 		return nil, err
 	}
 	if err := deployQuiet(ctx, cluster, top, asn); err != nil {
-		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Minute)
+		cleanupCtx, cancel := context.WithTimeout(
+			context.WithoutCancel(ctx), warmHarnessCleanupTimeout(len(top.Devices)),
+		)
 		defer cancel()
 		if cleanupErr := destroyLab(cleanupCtx, cluster, top); cleanupErr != nil {
 			return nil, fmt.Errorf("%v; cleaning failed warm deployment: %w", err, cleanupErr)
@@ -187,7 +214,8 @@ func newWarmBatchHarness(ctx context.Context, class *model.Topology, rubric *gra
 		_ = destroyLab(tctx, cluster, top)
 		return nil, err
 	}
-	if err := grade.WaitReferenceBaseline(ctx, top, asn, exec, nil, opts.converge); err != nil {
+	baselineTimeout := warmHarnessBaselineTimeout(len(top.Devices), opts.converge)
+	if err := grade.WaitReferenceBaseline(ctx, top, asn, exec, nil, baselineTimeout); err != nil {
 		held.Release()
 		tctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
 		defer cancel()

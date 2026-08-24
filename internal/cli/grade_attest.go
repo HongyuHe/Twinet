@@ -208,9 +208,10 @@ func runCompactAttestationSuite(ctx context.Context, top *model.Topology, rubric
 		return harness.Attestation{}, "", fmt.Errorf("create reusable audit harnesses: %w", err)
 	}
 	runnerClosed := false
+	cleanupTimeout := warmHarnessCleanupTimeout(len(top.Devices))
 	defer func() {
 		if !runnerClosed {
-			closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Minute)
+			closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
 			defer cancel()
 			_ = runner.Close(closeCtx)
 		}
@@ -265,7 +266,7 @@ func runCompactAttestationSuite(ctx context.Context, top *model.Topology, rubric
 			mutation: mutationArtifact, full: fullArtifact, compact: compactArtifact,
 		}
 	}
-	closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Minute)
+	closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
 	err = runner.Close(closeCtx)
 	cancel()
 	runnerClosed = true
@@ -425,7 +426,9 @@ func newWarmCompactAttestRunner(ctx context.Context, top *model.Topology, rubric
 		return nil, fmt.Errorf("deploy full warm audit harness: %w", err)
 	}
 	if _, err := compactManager.pool(ctx, asn); err != nil {
-		closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Minute)
+		closeCtx, cancel := context.WithTimeout(
+			context.WithoutCancel(ctx), warmHarnessCleanupTimeout(len(top.Devices)),
+		)
 		defer cancel()
 		_ = fullManager.close(closeCtx)
 		return nil, fmt.Errorf("deploy compact warm audit harness: %w", err)
