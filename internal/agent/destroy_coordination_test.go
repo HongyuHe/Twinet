@@ -14,6 +14,7 @@ func TestFinishDestroyedLabClearsCommittedInventoryForRedeploy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	server := coordinationTestServer(t, store)
 	server.recoveryContainers = func(context.Context, string) ([]rt.Container, error) {
 		return nil, nil
@@ -74,5 +75,17 @@ func TestFinishDestroyedLabClearsCommittedInventoryForRedeploy(t *testing.T) {
 	if err := restarted.prepareGeneration(lab, nextLease.Fence, "", "next-generation",
 		raw, "solve", 0, nil, false, nil, nil); err != nil {
 		t.Fatalf("destroyed lab could not be redeployed from an empty generation: %v", err)
+	}
+}
+
+func TestForcedDestroyCanClearFailedRecovery(t *testing.T) {
+	server := &Server{transactions: map[string]applyTransaction{
+		"lab": {Phase: transactionRollbackFailed, Failure: "committed inventory drift"},
+	}}
+	if why := server.destroyRecoveryRefusal(DestroyRequest{Lab: "lab"}); why == "" {
+		t.Fatal("ordinary destroy bypassed failed recovery")
+	}
+	if why := server.destroyRecoveryRefusal(DestroyRequest{Lab: "lab", Force: true}); why != "" {
+		t.Fatalf("forced destroy was blocked by unrecoverable transaction: %s", why)
 	}
 }

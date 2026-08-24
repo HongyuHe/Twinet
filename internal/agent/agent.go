@@ -1966,7 +1966,7 @@ func (s *Server) handleDestroy(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusConflict, err)
 		return
 	}
-	if why := s.recoveryMutationRefusal(req.Lab); why != "" {
+	if why := s.destroyRecoveryRefusal(req); why != "" {
 		httpError(w, http.StatusConflict, errors.New(why))
 		return
 	}
@@ -1994,6 +1994,13 @@ func (s *Server) handleDestroy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	s.destroyLab(w, r, eng, req)
+}
+
+func (s *Server) destroyRecoveryRefusal(req DestroyRequest) string {
+	if req.Force {
+		return ""
+	}
+	return s.recoveryMutationRefusal(req.Lab)
 }
 
 // captureBeforeDestroy saves what the students have on this node, and refuses

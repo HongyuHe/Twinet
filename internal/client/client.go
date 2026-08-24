@@ -407,7 +407,9 @@ func (n *Node) DestroyForce(ctx context.Context, lab string, vnis []uint32) erro
 
 // DestroyEphemeral removes a disposable lab and discards its saved state.
 func (n *Node) DestroyEphemeral(ctx context.Context, lab string, vnis []uint32) error {
-	return n.destroy(ctx, agent.DestroyRequest{Lab: lab, VNIs: vnis, Ephemeral: true})
+	return n.destroy(ctx, agent.DestroyRequest{
+		Lab: lab, VNIs: vnis, Ephemeral: true, Force: true,
+	})
 }
 
 // destroy sends the request and turns a partial cleanup into an error.
@@ -1266,7 +1268,7 @@ func (c *Cluster) DestroyForce(ctx context.Context, lab string, vnis []uint32) [
 // DestroyEphemeral removes a disposable lab from every node and discards its
 // saved state, so a lab of the same name later starts from the manifest.
 func (c *Cluster) DestroyEphemeral(ctx context.Context, lab string, vnis []uint32) []NodeResult[struct{}] {
-	return c.coordinatedDestroy(ctx, lab, vnis, true, false)
+	return c.coordinatedDestroy(ctx, lab, vnis, true, true)
 }
 
 // Hold asks every node to leave a lab alone. Failures are returned per node so

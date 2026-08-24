@@ -165,6 +165,11 @@ func newWarmBatchHarness(ctx context.Context, class *model.Topology, rubric *gra
 		return nil, err
 	}
 	if err := deployQuiet(ctx, cluster, top, asn); err != nil {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Minute)
+		defer cancel()
+		if cleanupErr := destroyLab(cleanupCtx, cluster, top); cleanupErr != nil {
+			return nil, fmt.Errorf("%v; cleaning failed warm deployment: %w", err, cleanupErr)
+		}
 		return nil, err
 	}
 	held, err := holdLab(ctx, top, opts.token, io.Discard)
