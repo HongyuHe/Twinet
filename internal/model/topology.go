@@ -1,6 +1,7 @@
 package model
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"sort"
 	"strings"
@@ -704,10 +705,22 @@ func DeviceID(asn int, name string) string {
 
 // ContainerName builds the runtime container name for a device.
 func ContainerName(lab string, asn int, name string) string {
+	var value string
 	if asn == 0 {
-		return fmt.Sprintf("twinet-%s-svc-%s", lab, strings.ToLower(name))
+		value = fmt.Sprintf("twinet-%s-svc-%s", lab, strings.ToLower(name))
+	} else {
+		value = fmt.Sprintf("twinet-%s-as%d-%s", lab, asn, strings.ToLower(name))
 	}
-	return fmt.Sprintf("twinet-%s-as%d-%s", lab, asn, strings.ToLower(name))
+	// containerd limits IDs to 76 bytes. Router control sidecars append
+	// "-frr", so primary names reserve those four bytes. The digest suffix
+	// keeps names that differ only after the readable prefix distinct.
+	const primaryLimit = 72
+	if len(value) <= primaryLimit {
+		return value
+	}
+	sum := sha256.Sum256([]byte(value))
+	const suffixLength = 13 // '-' plus 12 hexadecimal characters.
+	return value[:primaryLimit-suffixLength] + fmt.Sprintf("-%x", sum[:6])
 }
 
 // Stats summarises a topology for status output and capacity planning.
