@@ -314,7 +314,7 @@ func containerdDigestOnly(ref string) bool {
 		return false
 	}
 	for _, char := range ref[len("sha256:"):] {
-		if !((char >= '0' && char <= '9') || (char >= 'a' && char <= 'f')) {
+		if !strings.ContainsRune("0123456789abcdef", char) {
 			return false
 		}
 	}

@@ -59,9 +59,9 @@ func TestARouterWithNoRoutingDaemonFailsItsDeployment(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			what:    "everything is up except ldpd, which carries the VPN labels",
+			what:    "ldpd is absent from a non-MPLS AS",
 			pidof:   `case "$1" in ldpd) exit 1;; *) exit 0;; esac`,
-			wantErr: true,
+			wantErr: false,
 		},
 	}
 
@@ -117,6 +117,14 @@ func TestEveryEnabledDaemonIsChecked(t *testing.T) {
 				t.Errorf("%s is disabled in the daemons file but was parsed as enabled", off)
 			}
 		}
+	}
+}
+
+func TestMPLSEnablesAndChecksLDP(t *testing.T) {
+	as := &model.AS{ASN: 1, MPLS: model.MPLSSpec{Enabled: true}}
+	script := daemonCheckScriptForAS(t, as)
+	if !strings.Contains(script, "ldpd") {
+		t.Fatal("an MPLS router enables LDP but its deployment does not check ldpd")
 	}
 }
 
@@ -201,16 +209,20 @@ func write(t *testing.T, path, body string) {
 // daemonCheckScript pulls the check out of the plan a real router gets, so the
 // test cannot drift away from what actually runs.
 func daemonCheckScript(t *testing.T) string {
+	return daemonCheckScriptForAS(t, &model.AS{ASN: 1})
+}
+
+func daemonCheckScriptForAS(t *testing.T, as *model.AS) string {
 	t.Helper()
 	top := &model.Topology{
 		Name:  "t",
 		Lab:   &model.Lab{},
-		ASes:  map[int]*model.AS{1: {ASN: 1}},
+		ASes:  map[int]*model.AS{1: as},
 		Links: nil,
 	}
 	d := &model.Device{ID: "as1/R", ASN: 1, Kind: model.KindRouter, Name: "R"}
-	top.ASes[1].Devices = []*model.Device{d}
-	top.ASes[1].Routers = []*model.Device{d}
+	as.Devices = []*model.Device{d}
+	as.Routers = []*model.Device{d}
 
 	r := &Renderer{Top: top}
 	cmds, err := r.Commands(d)
