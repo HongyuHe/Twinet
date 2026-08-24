@@ -142,7 +142,7 @@ func Router(top *model.Topology, d *model.Device) (RouterConfig, error) {
 	var plat, exp strings.Builder
 	header := func(b *strings.Builder) {
 		fmt.Fprintf(b, "frr version 10.0\nfrr defaults traditional\nhostname %s\n", d.Name)
-		b.WriteString("no ipv6 forwarding\nservice integrated-vtysh-config\n!\n")
+		b.WriteString("service integrated-vtysh-config\n!\n")
 	}
 	header(&plat)
 	header(&exp)

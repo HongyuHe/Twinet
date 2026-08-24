@@ -52,6 +52,19 @@ func TestPlatformLoopbackIsAppliedAfterFRRCommands(t *testing.T) {
 	}
 }
 
+func TestFRRDoesNotOverrideRuntimeIPv6Forwarding(t *testing.T) {
+	top := loadCOSRenderTopology(t)
+	router := top.ASes[3].Routers[0]
+	config, err := Router(top, router)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(config.Platform, "no ipv6 forwarding") ||
+		strings.Contains(config.Expected, "no ipv6 forwarding") {
+		t.Fatal("FRR config contradicts the runtime-owned IPv6 forwarding sysctl")
+	}
+}
+
 func TestSolveConfiguresStudentInterfaceAddressesAfterFRR(t *testing.T) {
 	top := loadCOSRenderTopology(t)
 	router := top.Devices["as3/ATL"]
