@@ -899,7 +899,7 @@ func applySubmission(ctx context.Context, exec execFn, h *model.Topology, s subm
 	return nil
 }
 
-// loadFRRConfig installs a submitted configuration and restarts FRR onto it.
+// loadFRRConfig installs a submitted configuration and reloads FRR onto it.
 //
 // The obvious approach, feeding the file to "vtysh -f", does not work for a
 // whole configuration: vtysh accepts commands, and a configuration file also
@@ -908,9 +908,10 @@ func applySubmission(ctx context.Context, exec execFn, h *model.Topology, s subm
 // like a student error when it is the grader's.
 //
 // So the submission is installed exactly where a real deployment puts it and
-// FRR is restarted onto it, which is also the only way to be sure the mark
-// reflects the file the student submitted rather than that file layered on top
-// of whatever the router was already running.
+// FRR's packaged exact-reload tool reconciles the running configuration to it.
+// The router shell and its private FRR control sidecar share /etc/frr and the
+// vty directory; stopping daemons from the unprivileged shell cannot work and
+// removes the sidecar's sockets out from under otherwise healthy daemons.
 func loadFRRConfig(ctx context.Context, exec execFn, d *model.Device, body string) error {
 	return loadFRRConfigWithDaemonCheck(ctx, exec, d, body, true)
 }
@@ -938,12 +939,8 @@ func loadFRRConfigWithDaemonCheck(ctx context.Context, exec execFn, d *model.Dev
 			" | base64 -d > /etc/frr/frr.conf",
 		"chown frr:frr /etc/frr/frr.conf 2>/dev/null || true",
 		"chmod 640 /etc/frr/frr.conf",
-		// watchfrr keeps its own pid file and outlives a plain stop, after
-		// which the daemons can never start again. It has to go first.
-		"for p in $(ps -ef | awk '/watchfrr/ && !/awk/ {print $1}'); do kill $p 2>/dev/null || true; done",
-		"/usr/lib/frr/frrinit.sh stop >/dev/null 2>&1 || true",
-		"rm -f /var/run/frr/*.pid /var/run/frr/*.vty 2>/dev/null || true",
-		"/usr/lib/frr/frrinit.sh start",
+		"PYTHONWARNINGS=ignore /usr/lib/frr/frr-reload.py --reload " +
+			"--bindir /usr/bin --confdir /etc/frr --rundir /run/frr /etc/frr/frr.conf",
 	}, "\n")
 
 	res, err := exec(ctx, d.ID, []string{"sh", "-c", script})
@@ -958,8 +955,9 @@ func loadFRRConfigWithDaemonCheck(ctx context.Context, exec execFn, d *model.Dev
 		return nil
 	}
 
-	// A daemon that rejected the file exits, and FRR's own start script does
-	// not fail when that happens, so the daemons have to be counted.
+	// Every enabled daemon must answer on its own vty socket. PID namespaces
+	// are intentionally private, so pidof in the router shell cannot observe
+	// sidecar processes and would report every healthy daemon as absent.
 	//
 	// This used to ask `vtysh -c "show version"`, which answers as long as any
 	// one daemon is up. A submission whose OSPF configuration was rejected
@@ -976,7 +974,7 @@ func loadFRRConfigWithDaemonCheck(ctx context.Context, exec execFn, d *model.Dev
 	// one; the deadline is what keeps a genuinely rejected configuration from
 	// hanging the run.
 	probe := "for d in " + strings.Join(render.EnabledDaemons(), " ") +
-		"; do pidof \"$d\" >/dev/null 2>&1 || printf '%s ' \"$d\"; done"
+		"; do vtysh -d \"$d\" -c 'show version' >/dev/null 2>&1 || printf '%s ' \"$d\"; done"
 	deadline := time.Now().Add(frrStartWait)
 	var down []string
 	for {
@@ -986,8 +984,8 @@ func loadFRRConfigWithDaemonCheck(ctx context.Context, exec execFn, d *model.Dev
 		}
 		down = strings.Fields(res.Stdout)
 		if len(down) == 0 {
-			// Loading a submission restarts FRR, so its sessions come up while
-			// the validator is still reconnecting -- and a route that arrives
+			// Loading a submission can reset sessions while the validator is
+			// still reconnecting -- and a route that arrives
 			// before the ROAs is filtered as if there were none. FRR records
 			// the validation state afterwards but does not re-run the policy,
 			// so a submission that rejects invalid announcements perfectly

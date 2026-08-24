@@ -13,18 +13,14 @@ import (
 
 // loadFRRConfig has to notice a submission FRR would not accept.
 //
-// FRR's start script succeeds even when a daemon reads the file, rejects a
-// line and exits. The check used to be `vtysh -c "show version"`, which answers
-// as long as any one daemon is up -- so a submission whose OSPF configuration
-// was rejected loaded "successfully" with ospfd dead. Its author was then
-// marked on a network whose routers could not learn a route, with nothing in
-// the report saying why, and their neighbours were marked down with them.
+// A generic `vtysh -c "show version"` answers as long as any one daemon is up.
+// Each daemon therefore has to answer through its own vty socket.
 func TestASubmissionThatKillsADaemonDoesNotLoad(t *testing.T) {
 	dead := "ospfd"
 	exec := func(_ context.Context, _ string, cmd []string) (rt.ExecResult, error) {
 		body := strings.Join(cmd, " ")
 		switch {
-		case strings.Contains(body, "pidof"):
+		case strings.Contains(body, "vtysh -d"):
 			return rt.ExecResult{Stdout: dead + " "}, nil
 		default:
 			return rt.ExecResult{}, nil
@@ -50,12 +46,21 @@ func TestASubmissionThatKillsADaemonDoesNotLoad(t *testing.T) {
 }
 
 func TestASubmissionFRRAcceptsLoads(t *testing.T) {
-	exec := func(_ context.Context, _ string, _ []string) (rt.ExecResult, error) {
+	var commands []string
+	exec := func(_ context.Context, _ string, command []string) (rt.ExecResult, error) {
+		commands = append(commands, strings.Join(command, " "))
 		return rt.ExecResult{}, nil
 	}
 	d := &model.Device{ID: "as3/ATL", Name: "ATL", Kind: model.KindRouter}
 	if err := loadFRRConfig(context.Background(), exec, d, "router ospf\n"); err != nil {
 		t.Fatalf("a submission every daemon accepted was rejected: %v", err)
+	}
+	joined := strings.Join(commands, "\n")
+	if !strings.Contains(joined, "frr-reload.py --reload") {
+		t.Fatal("submission loader did not use exact in-place FRR reload")
+	}
+	if strings.Contains(joined, "frrinit.sh") || strings.Contains(joined, "pidof") {
+		t.Fatalf("submission loader crossed the split-control boundary:\n%s", joined)
 	}
 }
 
