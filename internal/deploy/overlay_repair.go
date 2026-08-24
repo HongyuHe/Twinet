@@ -50,6 +50,14 @@ func (e *Engine) ReconcileOverlayBindings(ctx context.Context, top *model.Topolo
 			links[link.VNI] = link
 		}
 	}
+	hostPortNames := make([]string, 0, len(links))
+	for vni := range links {
+		hostPortNames = append(hostPortNames, hostSideName(vni))
+	}
+	hostPorts, err := netx.HostLinksPresent(hostPortNames)
+	if err != nil {
+		return report, err
+	}
 	for vni := range actualByVNI {
 		if _, wanted := expectedByVNI[vni]; !wanted {
 			report.Extra = append(report.Extra, bindingID(vni))
@@ -57,12 +65,12 @@ func (e *Engine) ReconcileOverlayBindings(ctx context.Context, top *model.Topolo
 	}
 	for _, binding := range expected.Bindings {
 		actualBindings := actualByVNI[binding.VNI]
-		if len(actualBindings) == 1 && sameBinding(binding, actualBindings[0]) {
-			continue
-		}
 		link := links[binding.VNI]
 		if link == nil {
 			report.Failed[bindingID(binding.VNI)] = "topology has no local link for expected binding"
+			continue
+		}
+		if overlayEndpointHealthy(binding, actualBindings, hostPorts[hostSideName(binding.VNI)]) {
 			continue
 		}
 		if err := e.reconcileOverlayLink(ctx, top, link); err != nil {
@@ -147,6 +155,10 @@ func (e *Engine) reconcileOverlayLink(ctx context.Context, top *model.Topology, 
 		return err
 	}
 	return nil
+}
+
+func overlayEndpointHealthy(want netx.LogicalBinding, got []netx.LogicalBinding, hostPortPresent bool) bool {
+	return hostPortPresent && len(got) == 1 && sameBinding(want, got[0])
 }
 
 func sameBinding(want, got netx.LogicalBinding) bool {

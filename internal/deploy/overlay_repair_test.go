@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/HongyuHe/twinet/internal/model"
+	"github.com/HongyuHe/twinet/internal/netx"
 	rt "github.com/HongyuHe/twinet/internal/runtime"
 )
 
@@ -35,5 +36,18 @@ func TestOverlayBindingRepairBlocksAbsentEndpointPrecisely(t *testing.T) {
 	}
 	if len(report.Repaired) != 0 {
 		t.Fatalf("absent endpoint was repaired: %#v", report)
+	}
+}
+
+func TestMatchingOverlayMetadataDoesNotHideMissingEndpoint(t *testing.T) {
+	want := netx.LogicalBinding{
+		VNI: 7001, VLAN: 42, Peer: "10.0.1.2", MTU: 1450, Port: 4789,
+		NodeA: "node-a", NodeB: "node-b",
+	}
+	if overlayEndpointHealthy(want, []netx.LogicalBinding{want}, false) {
+		t.Fatal("matching trunk metadata treated an absent endpoint veth as healthy")
+	}
+	if !overlayEndpointHealthy(want, []netx.LogicalBinding{want}, true) {
+		t.Fatal("complete matching binding was not treated as healthy")
 	}
 }

@@ -477,8 +477,7 @@ func DeleteHostLink(name string) error {
 }
 
 // HostLinkPresent reports whether a host-namespace link exists without
-// modifying it. Overlay binding repair uses this to refuse a missing endpoint
-// before it creates a new trunk mapping for a cable that is not present.
+// modifying it.
 func HostLinkPresent(name string) (bool, error) {
 	h, err := netlink.NewHandle()
 	if err != nil {
@@ -493,6 +492,41 @@ func HostLinkPresent(name string) (bool, error) {
 		return false, nil
 	}
 	return false, fmt.Errorf("look up %s: %w", name, err)
+}
+
+// HostLinksPresent surveys a set of root-namespace links with one netlink
+// dump. Scale reconciliation checks thousands of endpoint veths, so opening a
+// socket and issuing a lookup for each one would put the correctness check on
+// the deployment critical path.
+func HostLinksPresent(names []string) (map[string]bool, error) {
+	want := make(map[string]struct{}, len(names))
+	out := make(map[string]bool, len(names))
+	for _, name := range names {
+		if name == "" {
+			continue
+		}
+		want[name] = struct{}{}
+		out[name] = false
+	}
+	if len(want) == 0 {
+		return out, nil
+	}
+	h, err := netlink.NewHandle()
+	if err != nil {
+		return nil, fmt.Errorf("open host netlink handle: %w", err)
+	}
+	defer h.Close()
+	links, err := h.LinkList()
+	if err != nil {
+		return nil, fmt.Errorf("list host interfaces: %w", err)
+	}
+	for _, link := range links {
+		name := link.Attrs().Name
+		if _, ok := want[name]; ok {
+			out[name] = true
+		}
+	}
+	return out, nil
 }
 
 // endpointHandle opens an independent netlink socket in an endpoint's target

@@ -369,9 +369,10 @@ func captureCommands(ctx context.Context, exec func(context.Context, string, []s
 			`echo "ip tunnel add $n mode sit remote $r local $o ttl 64"; ` +
 			`echo "ip link set $n up"; done`,
 		// Addresses the student added: anything on an interface beyond what a
-		// deployment configures is theirs.
-		`ip -o -4 addr show | awk '$2!="lo"{print "ip addr replace "$4" dev "$2}'`,
-		`ip -o -6 addr show | awk '$2!="lo" && $4 !~ /^fe80/{print "ip -6 addr replace "$4" dev "$2}'`,
+		// deployment configures is theirs. Scope filtering excludes 127.0.0.1,
+		// ::1, and link-local IPv6 while retaining assignment loopbacks.
+		`ip -o -4 addr show scope global | awk '{print "ip addr replace "$4" dev "$2}'`,
+		`ip -o -6 addr show scope global | awk '{print "ip -6 addr replace "$4" dev "$2}'`,
 		// Routes the student added by hand, and only those.
 		//
 		// The filter used to exclude "proto kernel" alone, so every route OSPF
