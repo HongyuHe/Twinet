@@ -108,7 +108,11 @@ func (e *Engine) reconcileOverlayLink(ctx context.Context, top *model.Topology, 
 		return err
 	}
 	if !present {
-		return fmt.Errorf("endpoint %s host port %s is absent", local.Device.ID, hostPort)
+		// A container restart or interrupted high-width apply can lose both
+		// halves of this endpoint while leaving the shared trunk intact.
+		// Recreate this one link idempotently; reporting it as unrepairable
+		// strands an otherwise committed scale deployment.
+		return e.wireCrossNode(ctx, top, link)
 	}
 	peer := e.PeerUnderlay[remote.Device.Node]
 	if peer == "" {
