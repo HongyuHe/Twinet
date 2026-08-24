@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"slices"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/HongyuHe/twinet/internal/deploy"
@@ -411,6 +412,27 @@ func (s *Server) commitAppliedTopology(ctx context.Context, top *model.Topology,
 				return ApplyResponse{}, fmt.Errorf("commit semantic verification failed: %w", err)
 			}
 		}
+	}
+	// A semantic address repair may recreate one cross-node endpoint. Linux
+	// can discard that VLAN/VNI's external FDB binding while the host veth is
+	// replaced, so re-prove and restore the complete logical carrier set
+	// before snapshotting committed inventory.
+	overlayRepair, err := eng.ReconcileOverlayBindings(ctx, top)
+	if err != nil {
+		return ApplyResponse{}, fmt.Errorf("reconcile overlays after semantic repair: %w", err)
+	}
+	if len(overlayRepair.Failed) > 0 {
+		keys := make([]string, 0, len(overlayRepair.Failed))
+		for key := range overlayRepair.Failed {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		var failures []string
+		for _, key := range keys {
+			failures = append(failures, key+": "+overlayRepair.Failed[key])
+		}
+		return ApplyResponse{}, fmt.Errorf("reconcile overlays after semantic repair: %s",
+			strings.Join(failures, "; "))
 	}
 	if err := s.verifyKnownStudentState(ctx, top, previousMode, tx.PreviousUngraded, desiredMode, tx.Ungraded); err != nil {
 		return ApplyResponse{}, err
