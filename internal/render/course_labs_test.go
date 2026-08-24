@@ -46,6 +46,9 @@ func TestMulticastReferenceRenders(t *testing.T) {
 	if got := DaemonsFor(top.ASes[1]); !strings.Contains(got, "pimd=yes") {
 		t.Error("pimd is not enabled, so none of the above can be configured")
 	}
+	if got := DaemonsFor(top.ASes[1]); strings.Contains(got, "ldpd=yes") {
+		t.Error("a non-MPLS lab starts LDP on every router")
+	}
 }
 
 // The advanced VPN lab is an exercise only if the answer is not already in it.
@@ -65,6 +68,9 @@ func TestTheAdvancedLabLeavesTheExerciseToTheStudent(t *testing.T) {
 		t.Fatal(err)
 	}
 	top := res.Topology
+	if got := DaemonsFor(top.ASes[1]); !strings.Contains(got, "ldpd=yes") {
+		t.Fatal("the MPLS exercise cannot start LDP")
+	}
 	for _, name := range []string{"R1", "R5"} {
 		d, ok := top.DeviceInAS(1, name)
 		if !ok {

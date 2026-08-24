@@ -39,10 +39,16 @@ func EnabledDaemons() []string { return daemonsIn(FRRDaemons) }
 // daemon was off, so `ip pim` was rejected on every router and there was
 // nothing to grade.
 func DaemonsFor(as *model.AS) string {
-	if as == nil || !as.Multicast.Enabled {
-		return FRRDaemons
+	out := FRRDaemons
+	if as == nil {
+		return out
 	}
-	out := strings.ReplaceAll(FRRDaemons, "pimd=no", "pimd=yes")
+	if as.Multicast.Enabled {
+		out = strings.ReplaceAll(out, "pimd=no", "pimd=yes")
+	}
+	if as.MPLS.Enabled {
+		out = strings.ReplaceAll(out, "ldpd=no", "ldpd=yes")
+	}
 	return out
 }
 
@@ -76,13 +82,13 @@ func daemonsIn(file string) []string {
 const FRRDaemons = `zebra=yes
 bgpd=yes
 ospfd=yes
-ospf6d=yes
+ospf6d=no
 ripd=no
 ripngd=no
 isisd=no
 pimd=no
 pim6d=no
-ldpd=yes
+ldpd=no
 nhrpd=no
 eigrpd=no
 babeld=no
