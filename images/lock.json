@@ -2,16 +2,16 @@
   "apiVersion": "twinet.dev/v1",
   "kind": "ImageLock",
   "manifest_hash": "77f1118f2b36b78b",
-  "source_version": "v0.1.0-446-g5307ce6",
-  "commit": "5307ce6",
-  "generated_at": "2026-08-24T04:46:40.584647407Z",
+  "source_version": "v0.1.0-448-gecfdc77",
+  "commit": "ecfdc77",
+  "generated_at": "2026-08-24T05:01:52.462491207Z",
   "images": {
-    "hyhe/twinet-bird:0.1": "hyhe/twinet-bird:0.1@sha256:9d4fbe8bd96ba75644b22ada2a8bb1a39004c0ada20cf0ff0a48b68305412490",
-    "hyhe/twinet-controller:0.1": "hyhe/twinet-controller:0.1@sha256:5052e8794e52a651d1893dbdd6b9d50f038f5c42b8c94c3b7483daa80116ad8f",
-    "hyhe/twinet-host:0.1": "hyhe/twinet-host:0.1@sha256:92b71a8670b56353e33de3368e14bbb560016b67b9edbff39ae2a5e79691855d",
-    "hyhe/twinet-p4:0.1": "hyhe/twinet-p4:0.1@sha256:d2c821e2584ad2c80d82b76c72e3e8c9ac8c14a1f7584cc75586f7714e637307",
-    "hyhe/twinet-router:0.1": "hyhe/twinet-router:0.1@sha256:2fe7efeade1ec6377b3994757b4ae2d7abdacaa35aa5594ac77dcfcc50971a35",
-    "hyhe/twinet-svc:0.1": "hyhe/twinet-svc:0.1@sha256:4470f6781963c5f007863dbc8ce4bb5106b3d0af29d33e5b24ab256a6f0453b5",
-    "hyhe/twinet-switch:0.1": "hyhe/twinet-switch:0.1@sha256:b5b5d91881ab113b74e99bdff981241c91c524b06cc9d0551d63119f8666a41c"
+    "hyhe/twinet-bird:0.1": "hyhe/twinet-bird:0.1@sha256:c9c4cf860ed08dbf6f12fc480ddeafd64b31496c52c5101706a3b2e9f5c01382",
+    "hyhe/twinet-controller:0.1": "hyhe/twinet-controller:0.1@sha256:f93a9a0623d6520bb2c6f0b540d1d5df59f66ed76834339b9f421b331e38cf74",
+    "hyhe/twinet-host:0.1": "hyhe/twinet-host:0.1@sha256:d2486bbccd044e360d9005596ae10b2d6d0ea715e6ac0e50de2a9d48e881fd51",
+    "hyhe/twinet-p4:0.1": "hyhe/twinet-p4:0.1@sha256:aa4974fe0056c4db89afe80d6189da32aaa7c28d44d6cf1d64280e6c1c1d4694",
+    "hyhe/twinet-router:0.1": "hyhe/twinet-router:0.1@sha256:ec995bd6b2675c889c0e97ca61db7522f946315188da4481f7e89506ab63cfe5",
+    "hyhe/twinet-svc:0.1": "hyhe/twinet-svc:0.1@sha256:f0f65b1bfae4c04e452be374c74743dcbe6f1bdafa7f250e08707a9798e33319",
+    "hyhe/twinet-switch:0.1": "hyhe/twinet-switch:0.1@sha256:f75456de8f335efaccf30a96fc3f0418ccc9887dc18b9b19f5a3823d34d70bc8"
   }
 }
