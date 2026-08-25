@@ -128,7 +128,11 @@ func newGatewayRunCmd(opts *Options) *cobra.Command {
 					return n.Attach(ctx, container, cmd, tty, rows, cols, stdin, stdout)
 				}}
 			} else {
-				ex = &access.LocalExec{Topology: top}
+				selected, err := localRuntime(top)
+				if err != nil {
+					return err
+				}
+				ex = &access.LocalExec{Topology: top, Runtime: selected}
 			}
 
 			srv, err := access.New(access.Config{

@@ -2,16 +2,23 @@ package access
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
+	"strconv"
 
 	"github.com/HongyuHe/twinet/internal/model"
+	rt "github.com/HongyuHe/twinet/internal/runtime"
 )
 
 // LocalExec runs an interactive session in a container on this machine.
 type LocalExec struct {
 	Topology *model.Topology
+	Runtime  rt.Runtime
+
+	commandContext func(context.Context, string, ...string) *exec.Cmd
 }
 
 // Shell attaches a student's terminal to a device.
@@ -29,6 +36,22 @@ func (l *LocalExec) Shell(ctx context.Context, deviceID string, cmd []string,
 	if !ok {
 		return 1, fmt.Errorf("no device %q", deviceID)
 	}
+	if l.Runtime == nil {
+		return 1, errors.New("no local container runtime is configured")
+	}
+	env := map[string]string(nil)
+	if tty {
+		env = map[string]string{
+			"LINES": strconv.Itoa(rows), "COLUMNS": strconv.Itoa(cols),
+			"TERM": "xterm-256color",
+		}
+	}
+	if stream, ok := l.Runtime.(rt.StreamExecRuntime); ok {
+		return stream.StreamExec(ctx, d.Container, rt.ExecCmd{
+			Cmd: cmd, Env: env, Stdin: stdin, TTY: tty,
+		}, uint32(rows), uint32(cols), stdout, stderr)
+	}
+
 	args := []string{"exec", "--interactive"}
 	if tty {
 		args = append(args, "--tty",
@@ -39,7 +62,18 @@ func (l *LocalExec) Shell(ctx context.Context, deviceID string, cmd []string,
 	args = append(args, d.Container)
 	args = append(args, cmd...)
 
-	c := exec.CommandContext(ctx, "docker", args...)
+	cli, args, processEnv, err := localAttachCLI(l.Runtime.Name(), rt.Endpoint(l.Runtime), args)
+	if err != nil {
+		return 1, err
+	}
+	commandContext := l.commandContext
+	if commandContext == nil {
+		commandContext = exec.CommandContext
+	}
+	c := commandContext(ctx, cli, args...)
+	if len(processEnv) > 0 {
+		c.Env = append(os.Environ(), processEnv...)
+	}
 	c.Stdin, c.Stdout, c.Stderr = stdin, stdout, stderr
 	if err := c.Run(); err != nil {
 		var ee *exec.ExitError
@@ -49,6 +83,26 @@ func (l *LocalExec) Shell(ctx context.Context, deviceID string, cmd []string,
 		return 1, err
 	}
 	return 0, nil
+}
+
+func localAttachCLI(name, endpoint string, args []string) (string, []string, []string, error) {
+	switch name {
+	case "docker":
+		env := []string(nil)
+		if endpoint != "" {
+			env = append(env, "DOCKER_HOST="+endpoint)
+		}
+		return "docker", args, env, nil
+	case "podman":
+		if endpoint == "" {
+			return "podman", args, nil, nil
+		}
+		podmanArgs := append([]string{"--remote", "--url", endpoint}, args...)
+		return "podman", podmanArgs, nil, nil
+	default:
+		return "", nil, nil, fmt.Errorf(
+			"runtime %q does not provide an interactive attach command", name)
+	}
 }
 
 func asExitError(err error, target **exec.ExitError) bool {
