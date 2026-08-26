@@ -266,8 +266,22 @@ func (r *Rubric) MaxTotal() float64 {
 
 // RunOptions tune a grading run.
 type RunOptions struct {
-	// ConvergeTimeout bounds how long the runner waits for the control plane.
+	// ConvergeTimeout bounds how long the runner waits for the control plane
+	// of the AS under test to settle before it observes. Zero or negative
+	// disables the wait, whatever WaitForConvergence says: a caller who has
+	// deliberately turned the budget off must not be made to sleep.
 	ConvergeTimeout time.Duration
+	// WaitForConvergence asks Run to perform that bounded wait itself.
+	//
+	// It is off by default, and both the default and the option matter. A
+	// caller that has just deployed a submission must wait for it, or a
+	// correct answer is marked while its sessions are still coming up. A
+	// caller that has already waited must not wait again: `grade batch` and
+	// `grade class` converge each freshly loaded submission before they call
+	// Run, and a second whole-control-plane wait per submission is the single
+	// largest fixed cost in a class run. `grade run` is the path with nobody
+	// to converge the lab first, so it is the path that sets this.
+	WaitForConvergence bool
 	// CheckTimeout bounds a single check.
 	CheckTimeout time.Duration
 	// Parallel bounds how many checks of one submission run at once. Checks
@@ -310,15 +324,7 @@ func Run(ctx context.Context, r *Rubric, env *Env, opts RunOptions) *Report {
 		// Returning a held/error report rather than running checks prevents
 		// it from being mistaken for a student-earned zero by direct library
 		// callers that did not validate before invoking Run.
-		rep.Err = err.Error()
-		rep.NeedsReview = true
-		rep.Duration = time.Since(start).Round(time.Millisecond).String()
-		phases.append("grade", start, time.Now())
-		rep.PhaseTimings = phases.list()
-		return rep
-	}
-	if opts.ConvergeTimeout == 0 {
-		opts.ConvergeTimeout = 90 * time.Second
+		return notGraded(rep, phases, start, err.Error())
 	}
 	if opts.CheckTimeout == 0 {
 		opts.CheckTimeout = 120 * time.Second
@@ -336,12 +342,8 @@ func Run(ctx context.Context, r *Rubric, env *Env, opts RunOptions) *Report {
 		opts.ObservationParallel = minInt(16, maxGradeWorkers(opts.Parallel*2, 4))
 	}
 
-	// Class and batch grading already converge a freshly loaded submission
-	// before invoking Run. A live `grade run` must instead observe now: an
-	// unconditional whole-control-plane wait here previously spent the entire
-	// four-minute budget on a healthy reference whose RIB counters continued
-	// to change. The immutable snapshot is the observation boundary; checks
-	// report what it saw rather than serially waiting behind one another.
+	// Every raw command a grade issues is counted, including the convergence
+	// polls below, so the report's exec accounting is of the whole run.
 	execs := &execTracker{}
 	runEnv := *env
 	runEnv.ShadowBatches = opts.ShadowBatches
@@ -353,6 +355,51 @@ func Run(ctx context.Context, r *Rubric, env *Env, opts RunOptions) *Report {
 	}
 	opts.phases = phases
 	opts.scheduler = newSchedulerTrace()
+
+	// Class and batch grading already converge a freshly loaded submission
+	// before invoking Run, and say so by leaving WaitForConvergence off. A
+	// live `grade run` has nobody to do that for it, and its
+	// --converge-timeout is the budget for doing it here. An *unconditional*
+	// wait is what was removed: it spent the entire four-minute budget on a
+	// healthy reference whose RIB counters continued to change, so it happens
+	// only when a caller asks and only for the part of the control plane the
+	// rubric's questions are about. The immutable snapshot taken afterwards is
+	// then the observation boundary; checks report what it saw rather than
+	// serially waiting behind one another.
+	if opts.WaitForConvergence && opts.ConvergeTimeout > 0 {
+		convergeStarted := time.Now().UTC()
+		converged := waitBeforeChecks(ctx, &runEnv, rubricConvergeScope(r), opts.ConvergeTimeout)
+		convergeFinished := time.Now().UTC()
+		phases.appendDetail(PhaseTiming{
+			Name: "converge", StartedAt: convergeStarted, FinishedAt: convergeFinished,
+			Duration:   convergeFinished.Sub(convergeStarted).Round(time.Millisecond).String(),
+			WaitReason: string(converged.Outcome),
+		})
+		switch converged.Outcome {
+		case convergenceCancelled:
+			// Nothing was assessed, so nothing may be reported as a mark.
+			return notGraded(rep, phases, start, fmt.Sprintf(
+				"grading was cancelled while waiting for %s of AS %d to settle: %v",
+				converged.Where(), env.AS, converged.Err))
+		case convergenceUnobservable:
+			// The lab could not be reached. This is the failure this package
+			// exists to keep away from a student's total: an unreachable node
+			// is a platform fault, and a platform fault is not a zero.
+			return notGraded(rep, phases, start, fmt.Sprintf(
+				"the grading machinery could not observe %s of AS %d while waiting for it to "+
+					"settle (%v), so nothing here was assessed: %v",
+				converged.Where(), env.AS, converged.Transport, converged.Err))
+		case convergenceUnsettled:
+			// The checks still run: what a lab that is still moving reached is
+			// worth recording, and a report a person reads is more use than an
+			// empty one. It is not a releasable mark, and says so.
+			rep.Warnings = append(rep.Warnings, fmt.Sprintf(
+				"%s of AS %d had not settled after %s, so these marks were taken of a network "+
+					"that was still changing: %v", converged.Where(), env.AS,
+				converged.Waited.Round(time.Second), converged.Err))
+			rep.NeedsReview = true
+		}
+	}
 
 	// Passive collection happens once before active checks. The snapshot is
 	// shared by every copy of Env and later frozen into the report. Dynamic
@@ -436,6 +483,21 @@ func Run(ctx context.Context, r *Rubric, env *Env, opts RunOptions) *Report {
 			WaitReason: strings.Join(rep.SchedulerCriticalPath.Checks, " -> "),
 		})
 	}
+	rep.Duration = time.Since(start).Round(time.Millisecond).String()
+	phases.append("grade", start, time.Now())
+	rep.PhaseTimings = phases.list()
+	return rep
+}
+
+// notGraded closes a report that never assessed anything.
+//
+// A total of zero and an ungraded report look identical in a spreadsheet, so
+// the difference has to be carried explicitly: Err is what makes Summarise
+// quarantine the row and leave the total empty rather than exporting a mark
+// nobody earned or lost.
+func notGraded(rep *Report, phases *phaseRecorder, start time.Time, why string) *Report {
+	rep.Err = why
+	rep.NeedsReview = true
 	rep.Duration = time.Since(start).Round(time.Millisecond).String()
 	phases.append("grade", start, time.Now())
 	rep.PhaseTimings = phases.list()

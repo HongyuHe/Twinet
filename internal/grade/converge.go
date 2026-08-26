@@ -4,13 +4,16 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/HongyuHe/twinet/internal/netstate"
 	"github.com/HongyuHe/twinet/internal/plan"
+	rt "github.com/HongyuHe/twinet/internal/runtime"
 )
 
 // Convergence predicates.
@@ -259,6 +262,203 @@ func WaitLDP(ctx context.Context, env *Env, timeout time.Duration) error {
 				len(down), seen, strings.Join(truncate(down, 3), ", "))
 		},
 	})
+}
+
+// waitForScope waits for whichever part of the control plane a rubric's
+// questions are about.
+//
+// Waiting for more than they need is not conservative, it is wrong: a rubric
+// about the interior that waits for external sessions reports a student whose
+// OSPF is perfect as ungradeable because their BGP is not written yet, and an
+// ungradeable report is a mark nobody receives.
+func waitForScope(ctx context.Context, env *Env, scope string, timeout time.Duration) error {
+	switch scope {
+	case convergeScopeOSPF:
+		return WaitOSPF(ctx, env, timeout)
+	case convergeScopeBGP:
+		deadline := time.Now().Add(timeout)
+		if err := WaitBGPSessions(ctx, env, timeout); err != nil {
+			return err
+		}
+		return WaitRIBStable(ctx, env, time.Until(deadline))
+	default:
+		return WaitConverged(ctx, env, timeout)
+	}
+}
+
+// The scopes a rubric question may name. Anything else means the whole
+// control plane, which is also what an undeclared scope means.
+const (
+	convergeScopeOSPF = "ospf"
+	convergeScopeBGP  = "bgp"
+	convergeScopeAll  = ""
+)
+
+// rubricConvergeScope is the narrowest wait that satisfies every question of a
+// rubric that asks for one.
+//
+// A rubric that asks for nothing still gets the whole control plane, because
+// the caller asking for a wait at all is the one who knows the lab was just
+// deployed. Two questions asking for different parts get both.
+func rubricConvergeScope(r *Rubric) string {
+	if r == nil {
+		return convergeScopeAll
+	}
+	seen := map[string]bool{}
+	for _, q := range r.Questions {
+		if !q.Converge {
+			continue
+		}
+		seen[strings.ToLower(strings.TrimSpace(q.ConvergeScope))] = true
+	}
+	if len(seen) != 1 {
+		return convergeScopeAll
+	}
+	for scope := range seen {
+		switch scope {
+		case convergeScopeOSPF, convergeScopeBGP:
+			return scope
+		}
+	}
+	return convergeScopeAll
+}
+
+// convergenceOutcome says why a bounded convergence wait ended. The four cases
+// are deliberately distinct, because only one of them is about the submission
+// and none of them is a zero.
+type convergenceOutcome string
+
+const (
+	// convergenceSettled: the control plane held still, and what the checks
+	// read afterwards is the network the student configured.
+	convergenceSettled convergenceOutcome = "settled"
+	// convergenceUnsettled: the budget ran out with the network still moving.
+	// A correct submission can simply be slower than the budget, so this is
+	// evidence that the marks below are provisional, not evidence of a
+	// mistake.
+	convergenceUnsettled convergenceOutcome = "unsettled"
+	// convergenceUnobservable: the machinery could not ask. A node that
+	// cannot be reached is never a student's zero.
+	convergenceUnobservable convergenceOutcome = "unobservable"
+	// convergenceCancelled: the caller gave up, or its own deadline expired.
+	convergenceCancelled convergenceOutcome = "cancelled"
+)
+
+// convergenceResult is what one bounded wait established.
+type convergenceResult struct {
+	Outcome convergenceOutcome
+	Scope   string
+	Waited  time.Duration
+	// Err is why the wait ended, for every outcome but settled.
+	Err error
+	// Transport is the first failure to reach a device during the wait. It is
+	// what separates "this lab has not settled" from "this grader cannot see".
+	Transport error
+}
+
+// Where names the part of the control plane that was waited for, in the words
+// a report a person reads uses.
+func (c convergenceResult) Where() string {
+	where := "the control plane"
+	switch c.Scope {
+	case convergeScopeOSPF:
+		where = "the interior"
+	case convergeScopeBGP:
+		where = "BGP"
+	}
+	return where
+}
+
+// waitBeforeChecks performs the bounded convergence wait a caller asked for
+// and classifies why it ended.
+//
+// The wait deliberately reads the lab rather than the grade's frozen
+// observation snapshot: the snapshot is taken afterwards, and a wait that
+// re-read its own first answer would declare every lab settled instantly.
+func waitBeforeChecks(ctx context.Context, env *Env, scope string,
+	timeout time.Duration,
+) convergenceResult {
+	out := convergenceResult{Outcome: convergenceSettled, Scope: scope}
+	if env == nil || timeout <= 0 {
+		return out
+	}
+	if err := ctx.Err(); err != nil {
+		return convergenceResult{Outcome: convergenceCancelled, Scope: scope, Err: err}
+	}
+
+	watch := &transportWatch{}
+	waitEnv := *env
+	waitEnv.snapshot = nil
+	waitEnv.observationBatcher = nil
+	waitEnv.infraSeen = nil
+	waitEnv.trace = nil
+	if waitEnv.Exec != nil {
+		waitEnv.Exec = watch.wrap(waitEnv.Exec)
+	}
+
+	// The budget is a budget. WaitConverged floors each of its phases at
+	// fifteen seconds so a phase given a second cannot cancel its own probe
+	// and blame the router it was asking, which is right for the phase and
+	// wrong for the total: four floors are a minute, and a caller that asked
+	// for thirty seconds must not wait two.
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	start := time.Now()
+	err := waitForScope(waitCtx, &waitEnv, scope, timeout)
+	out.Waited = time.Since(start)
+	out.Transport = watch.failure()
+	switch {
+	// The parent, not the derived context: a wait that spent its own budget
+	// is a lab that did not settle, and only the caller giving up is a
+	// cancellation.
+	case ctx.Err() != nil:
+		out.Outcome, out.Err = convergenceCancelled, ctx.Err()
+	case err == nil:
+	case out.Transport != nil:
+		out.Outcome, out.Err = convergenceUnobservable, err
+	default:
+		out.Outcome, out.Err = convergenceUnsettled, err
+	}
+	return out
+}
+
+// transportWatch remembers whether a device could not be reached at all, as
+// opposed to answering something the wait did not want to hear.
+//
+// A command that exits non-zero is an answer: OSPF is not up yet, BGP has no
+// peers yet. A command that could not be delivered is not, and the difference
+// decides whether a report says the lab was slow or says the grader was blind.
+type transportWatch struct {
+	mu    sync.Mutex
+	first error
+}
+
+func (w *transportWatch) wrap(inner func(context.Context, string, []string) (rt.ExecResult, error),
+) func(context.Context, string, []string) (rt.ExecResult, error) {
+	return func(ctx context.Context, device string, command []string) (rt.ExecResult, error) {
+		res, err := inner(ctx, device, command)
+		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			w.record(fmt.Errorf("%s: %w", device, err))
+		}
+		return res, err
+	}
+}
+
+func (w *transportWatch) record(err error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.first == nil {
+		w.first = err
+	}
+}
+
+func (w *transportWatch) failure() error {
+	if w == nil {
+		return nil
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.first
 }
 
 // WaitConverged waits for the whole control plane of the AS to settle.

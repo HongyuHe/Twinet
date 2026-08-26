@@ -1367,35 +1367,82 @@ func advertisedOwnPath(ctx context.Context, env *Env, router, peer, own string) 
 // The second return says whether any router of that AS could be read. A
 // neighbour nobody can read yields no evidence either way, and the caller
 // gives the submission the benefit of the doubt rather than inventing one.
+//
+// The neighbour is asked through the vendor-neutral state API, not through
+// FRR's command line. It is somebody else's system in more senses than one:
+// the two staff-operated transit references of the shipped COS-461 lab run
+// BIRD, and `vtysh -c "show ip bgp <prefix> json"` is not a command they have.
+// Sending it there did worse than fail to answer the question -- the exec
+// error was recorded as a fault of the grading machinery, and the canonical
+// reference solution came back quarantined rather than marked. Every provider
+// translates its own table into netstate.BGPPath, so the same question is
+// answerable of a BIRD neighbour and an FRR one without either spelling
+// appearing here.
 func neighbourHoldsOurs(ctx context.Context, env *Env, asn int, prefix string) (held, readable bool) {
 	as, ok := env.Topology.ASes[asn]
 	if !ok {
 		return false, false // not in the lab, so nothing can be concluded
 	}
 	for _, r := range as.Routers {
-		res, err := env.Probe(ctx, r.ID, []string{"vtysh", "-c",
-			fmt.Sprintf("show ip bgp %s json", prefix)})
-		if err != nil || res.ExitCode != 0 {
-			continue
-		}
-		var doc struct {
-			Paths []struct {
-				ASPath struct {
-					String string `json:"string"`
-				} `json:"aspath"`
-			} `json:"paths"`
-		}
-		if json.Unmarshal([]byte(res.Stdout), &doc) != nil {
+		paths, err := pathsForPrefix(ctx, env, r, prefix)
+		if err != nil {
 			continue
 		}
 		readable = true
-		for _, p := range doc.Paths {
-			if firstASN(p.ASPath.String) == env.AS {
+		for _, p := range paths {
+			if learntFromAS(p) == env.AS {
 				return true, true
 			}
 		}
 	}
 	return false, readable
+}
+
+// pathsForPrefix returns every path a device holds for one prefix, read
+// through that device's own NOS provider.
+//
+// The prefixes are compared as prefixes rather than as text: a table may spell
+// the same route differently from the plan, and a string comparison would call
+// a route that is there missing.
+func pathsForPrefix(ctx context.Context, env *Env, device *model.Device, prefix string) (
+	[]netstate.BGPPath, error) {
+	if device == nil {
+		return nil, fmt.Errorf("no device to read a routing table from")
+	}
+	want, ok := routePrefix(prefix, "ipv4")
+	if !ok {
+		return nil, fmt.Errorf("%q is not a prefix", prefix)
+	}
+	id := device.ID
+	if id == "" {
+		id = model.DeviceID(device.ASN, device.Name)
+	}
+	state, err := env.DeviceState(ctx, id, netstate.QueryBGPRIB)
+	if err != nil {
+		return nil, err
+	}
+	var out []netstate.BGPPath
+	for _, path := range state.BGP.Paths {
+		got, ok := routePrefix(path.Prefix, "ipv4")
+		if ok && got.Masked() == want.Masked() {
+			out = append(out, path)
+		}
+	}
+	return out, nil
+}
+
+// learntFromAS is the AS a path was received from, which is the one at the
+// front of it. Zero means nobody: an empty path is a route the device
+// originated itself rather than one it learnt.
+//
+// The parsed sequence is preferred over the string because it is the field
+// providers are obliged to normalise; the string is kept as a fallback for a
+// provider that carries confederation spelling it could not parse.
+func learntFromAS(path netstate.BGPPath) int {
+	if len(path.ASNs) > 0 {
+		return int(path.ASNs[0])
+	}
+	return firstASN(path.ASPath)
 }
 
 // firstASN is the AS at the front of a path, which is the one the route was

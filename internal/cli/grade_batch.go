@@ -608,7 +608,7 @@ func gradeOneHarness(ctx context.Context, class *model.Topology, rubric *grade.R
 	}
 
 	rep := grade.Run(ctx, rubric, &grade.Env{Topology: h, AS: s.AS, Exec: exec},
-		grade.RunOptions{ConvergeTimeout: o.converge, Parallel: 4})
+		preConvergedRunOptions(o.converge))
 	rep.Submission = s.Group
 	rep.Attempt = s.Attempt
 	rep.ArchiveSHA256 = s.ArchiveSHA256

@@ -116,6 +116,12 @@ lab right now: it does not put anybody's system back to the reference first, so
 each system is measured across its neighbours in whatever state they happen to
 be in, and one student's broken configuration lowers their neighbours' marks.
 
+Nothing else converges the lab for this command, so it waits for the control
+plane to settle itself, bounded by --converge-timeout and narrowed to the part
+of it the rubric's questions are about. A system that has not settled by then is
+still read and reported, and the report is marked as needing review rather than
+released as a mark. Pass --converge-timeout 0 to read the lab this instant.
+
 Use it to check the reference solution, to investigate one submission, or to see
 where a lab stands. To mark a class, use "twinet grade class", which loads one
 submission at a time onto a blank system with the rest of the internet at the
@@ -218,14 +224,8 @@ reference, and holds the nodes off from repairing anything while it does.`,
 					defer func() { <-sem }()
 
 					env := &grade.Env{Topology: top, AS: asn, Exec: exec, BatchExec: batchExec}
-					rep := grade.Run(cmd.Context(), rubric, env, grade.RunOptions{
-						ConvergeTimeout:     converge,
-						Parallel:            checkParallel,
-						ReadParallel:        checkParallel,
-						ActiveParallel:      activeParallel,
-						ObservationParallel: checkParallel,
-						ShadowBatches:       shadowBatches,
-					})
+					rep := grade.Run(cmd.Context(), rubric, env, liveGradeRunOptions(
+						converge, checkParallel, activeParallel, shadowBatches))
 					rep.Submission = fmt.Sprintf("as%d", asn)
 					if as, ok := top.ASes[asn]; ok && as.OwnerGroup != "" {
 						rep.Submission = as.OwnerGroup
@@ -284,10 +284,43 @@ reference, and holds the nodes off from repairing anything while it does.`,
 	// described as an incomplete one, with the truth of it buried in a warning.
 	// This matches what `grade batch` and `grade class` already use.
 	cmd.Flags().DurationVar(&converge, "converge-timeout", 4*time.Minute,
-		"how long to wait for the control plane to settle")
+		"how long to wait for the control plane to settle before reading it (0 to read it now)")
 	cmd.Flags().StringVar(&token, "token", "", "agent token for cluster labs (or set TWINET_TOKEN)")
 	cmd.Flags().BoolVarP(&quiet, "quiet", "q", false, "suppress per-submission progress")
 	return cmd
+}
+
+// liveGradeRunOptions are the options for grading a lab nobody converged
+// first, which is what `twinet grade run` does.
+//
+// It is the only grading path that has to wait for the control plane itself,
+// so it is the only one that turns the wait on. --converge-timeout is that
+// wait's budget; zero means the operator asked to read the lab as it stands
+// this instant, and no sleep happens at all.
+func liveGradeRunOptions(converge time.Duration, checkParallel, activeParallel int,
+	shadowBatches bool,
+) grade.RunOptions {
+	return grade.RunOptions{
+		ConvergeTimeout:     converge,
+		WaitForConvergence:  converge > 0,
+		Parallel:            checkParallel,
+		ReadParallel:        checkParallel,
+		ActiveParallel:      activeParallel,
+		ObservationParallel: checkParallel,
+		ShadowBatches:       shadowBatches,
+	}
+}
+
+// preConvergedRunOptions are the options for grading a submission that has
+// already been waited for.
+//
+// `grade batch` and `grade class` load a submission, wait for its control
+// plane with the same budget, and only then grade it. Turning the wait on here
+// as well would wait for every submission twice: a second whole-control-plane
+// wait per submission is the largest fixed cost in a class run, and it would
+// observe nothing the first one did not.
+func preConvergedRunOptions(converge time.Duration) grade.RunOptions {
+	return grade.RunOptions{ConvergeTimeout: converge, Parallel: 4}
 }
 
 // execFunc builds the command-execution closure a check uses, routing through

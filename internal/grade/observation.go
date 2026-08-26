@@ -531,6 +531,15 @@ func inferredObservations(name string) []ObservationDependency {
 		"policy.transit_for_customers", "policy.ixp_communities",
 		"rpki.invalid_rejected", "rpki.notfound_preserved", "bgp.next_hop_self":
 		return target(netstate.QueryBGP | netstate.QueryPolicy)
+	case "policy.traffic_engineering":
+		// The inbound half asks the slow neighbour whether the announcement
+		// sent to it survived, which is a fact about somebody else's table.
+		// Declaring it here means the survey collects it once, through that
+		// neighbour's own provider, rather than each check inventing a query.
+		return []ObservationDependency{
+			{Scope: ObservationTargetRouters, Query: netstate.QueryInterfaces},
+			{Scope: ObservationNeighborRouters, Query: netstate.QueryBGPRIB},
+		}
 	case "bgp.ibgp_full_mesh":
 		// This check actively refreshes sessions and compares counters before
 		// and after. It must be live rather than read from a passive snapshot.

@@ -327,7 +327,7 @@ func (w *warmBatchHarness) grade(ctx context.Context, submission submission) *gr
 		_ = grade.WaitConverged(ctx, &grade.Env{Topology: w.top, AS: w.asn, Exec: w.exec}, w.opts.converge)
 	}
 	rep := grade.Run(ctx, w.rubric, &grade.Env{Topology: w.top, AS: w.asn, Exec: w.exec},
-		grade.RunOptions{ConvergeTimeout: w.opts.converge, Parallel: 4})
+		preConvergedRunOptions(w.opts.converge))
 	rep.Submission = submission.Group
 	rep.Attempt = submission.Attempt
 	rep.ArchiveSHA256 = submission.ArchiveSHA256

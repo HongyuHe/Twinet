@@ -678,7 +678,7 @@ func gradeWave(ctx context.Context, top *model.Topology, rubric *grade.Rubric,
 			defer func() { <-sem }()
 
 			rep := grade.Run(ctx, rubric, &grade.Env{Topology: top, AS: s.AS, Exec: exec},
-				grade.RunOptions{ConvergeTimeout: converge, Parallel: 4})
+				preConvergedRunOptions(converge))
 			rep.Submission = s.Group
 			rep.Lab = top.Name
 			rep.Controller = Version
@@ -812,7 +812,7 @@ func attestReference(ctx context.Context, top *model.Topology, rubric *grade.Rub
 			why := settledComplaint(referenceAttempts, func() string {
 				return referenceComplaint(
 					grade.Run(ctx, rubric, &grade.Env{Topology: top, AS: asn, Exec: exec},
-						grade.RunOptions{ConvergeTimeout: converge, Parallel: 4}),
+						preConvergedRunOptions(converge)),
 					rubric.MaxTotal())
 			})
 			if why == "" {
