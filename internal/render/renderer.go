@@ -498,7 +498,10 @@ func (r *Renderer) roaPublishCommands(d *model.Device) []deploy.Command {
 	}
 	publisher := ""
 	for _, router := range as.Routers {
-		if !hasRPKICache(r.Top, router) {
+		// Publication is an exchange with the trust anchor, not a routing
+		// daemon capability, so the publisher is chosen without reference to
+		// which NOS the router runs.
+		if !validatesOrigins(r.Top, router) {
 			continue
 		}
 		if publisher == "" || router.ID < publisher {

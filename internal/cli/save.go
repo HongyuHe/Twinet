@@ -46,6 +46,16 @@ type Bundle struct {
 	Images     map[string]string `json:"images,omitempty"`
 	TakenAt    time.Time         `json:"taken_at"`
 	Files      map[string]string `json:"files"` // path inside the bundle -> sha256
+	// NOS records which network operating system each configuration member was
+	// captured from.
+	//
+	// Without it a loader has to assume, and the only assumption available is
+	// "FRR, like every archive before this field existed". Loading BIRD syntax
+	// through FRR's reload tool, or the reverse, produces a router that
+	// accepted nothing -- which grades exactly like a student who wrote
+	// nothing. Recording the answer is what lets the loader refuse by name
+	// instead.
+	NOS map[string]string `json:"nos,omitempty"`
 }
 
 func newSaveCmd(opts *Options) *cobra.Command {
@@ -168,6 +178,7 @@ func saveAS(ctx context.Context, top *model.Topology, asn int, outDir string,
 		Lab: top.Name, AS: asn, Group: group, Topology: top.Hash,
 		Controller: Version, TakenAt: time.Now().UTC(),
 		ImageLock: imageLock, Files: map[string]string{}, Images: map[string]string{},
+		NOS: map[string]string{},
 	}
 	for _, device := range top.SortedDevices() {
 		if device.Image != "" && device.ImageID != "" {
@@ -179,19 +190,18 @@ func saveAS(ctx context.Context, top *model.Topology, asn int, outDir string,
 	for _, d := range as.Devices {
 		switch d.Kind {
 		case model.KindRouter:
-			res, err := exec(ctx, d.ID, []string{"vtysh", "-c", "show running-config"})
+			// The router's own provider, not vtysh. A BIRD router has no
+			// running-config to show and no vtysh to show it with, and asking
+			// anyway failed the whole save for the group.
+			body, file, err := captureRouterConfig(ctx, exec, d)
 			if err != nil {
-				return "", fmt.Errorf("%s: its routing configuration could not be read: %w; "+
-					"re-run save once the device is reachable", d.ID, err)
+				return "", err
 			}
-			if res.ExitCode != 0 {
-				return "", fmt.Errorf("%s: its routing configuration could not be read: "+
-					"vtysh exited %d: %s; re-run save once the device is reachable",
-					d.ID, res.ExitCode, firstLines(res.Stderr, 3))
-			}
-			contents[d.Name+".conf"] = []byte(cleanConfig(res.Stdout))
+			member := d.Name + file.Extension
+			contents[member] = []byte(body)
+			b.NOS[member] = file.NOS
 
-			// Everything that is not FRR configuration, captured as the
+			// Everything that is not routing configuration, captured as the
 			// commands that recreate it rather than as a human-readable dump.
 			//
 			// This was a dump, and a dump cannot be replayed: the archive
@@ -716,8 +726,12 @@ func restoreBundle(ctx context.Context, top *model.Topology, b Bundle,
 		if !ok {
 			return n, fmt.Errorf("archive names a router %q that AS %d does not have", short, b.AS)
 		}
-		if err := loadFRRConfig(ctx, exec, d, string(m.Configs[short])); err != nil {
-			return n, err
+		// The archive says which NOS it was captured from; a mismatch is
+		// refused by name rather than loaded into a parser that cannot read
+		// it and left to look like a student who configured nothing.
+		if err := loadRouterConfigBody(ctx, exec, d, submissionConfigNOS(b.NOS, short),
+			string(m.Configs[short])); err != nil {
+			return n, fmt.Errorf("%s: %w", d.ID, err)
 		}
 		n++
 	}

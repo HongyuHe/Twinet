@@ -7,10 +7,12 @@ package nos
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/HongyuHe/twinet/internal/model"
 	"github.com/HongyuHe/twinet/internal/netstate"
@@ -123,6 +125,42 @@ type Command struct {
 	Describe    string
 }
 
+// ConfigFile describes a provider's configuration artefact.
+//
+// It is what lets an archive say which NOS its contents were written for.
+// A submission is a file in one vendor's syntax; loading it into a device
+// running another produces either a rejected line or, worse, a device that
+// accepted nothing and grades as an empty control plane. The archive has to
+// carry the answer rather than let the loader assume it.
+type ConfigFile struct {
+	// NOS is the provider name recorded in a submission manifest.
+	NOS string
+	// Path is where the running configuration lives inside the device.
+	Path string
+	// Extension is the archive member suffix for a captured configuration.
+	Extension string
+	// Kind is the snapshot kind the durable state store files it under.
+	Kind state.Kind
+}
+
+// LoadOptions tune how a provider puts a captured configuration back.
+type LoadOptions struct {
+	// RequireDaemons asks the provider to prove its control plane survived
+	// the configuration it has just been given. A platform baseline leaves it
+	// off, because the routing configuration that starts the exercise has not
+	// been supplied yet; every real submission turns it on, so a configuration
+	// the daemon rejected is reported rather than graded as an empty network.
+	RequireDaemons bool
+	// Daemons names the processes RequireDaemons must find alive. It is the
+	// caller's policy -- which daemons this lab enables -- while how they are
+	// proven alive stays with the provider. Empty leaves the choice to the
+	// provider.
+	Daemons []string
+	// Wait bounds how long the daemons are given to bind. Zero uses the
+	// provider's own bound.
+	Wait time.Duration
+}
+
 // Provider owns one NOS implementation.
 type Provider interface {
 	Name() string
@@ -131,9 +169,30 @@ type Provider interface {
 	Apply(RenderRequest) ([]Command, error)
 	Ready(*model.Device, runtime.Runtime) *plan.Waiter
 	ReadState(context.Context, *model.Device, netstate.Executor, netstate.Query) (netstate.State, error)
+	// StateCommands declares the native read-only commands ReadState issues
+	// for a query, so an observer can coalesce a device's whole survey into
+	// one exec without knowing any vendor's CLI.
+	StateCommands(*model.Device, netstate.Query) [][]string
 	StateKind() state.Kind
 	Save(context.Context, *model.Device, netstate.Executor, string, string) ([]state.Snapshot, error)
 	Restore(context.Context, *model.Device, runtime.Runtime, state.Snapshot) error
+	// ConfigFile describes the artefact CaptureConfig and LoadConfig move.
+	ConfigFile() ConfigFile
+	// CaptureConfig reads the device's running routing configuration in this
+	// provider's own syntax.
+	CaptureConfig(context.Context, *model.Device, netstate.Executor) (string, error)
+	// LoadConfig installs a configuration and makes the running daemon adopt
+	// it, rather than rewriting a file and hoping a restart picks it up.
+	LoadConfig(context.Context, *model.Device, netstate.Executor, string, LoadOptions) error
+	// RefreshBGP returns the native commands that ask named neighbours to
+	// re-send their tables.
+	//
+	// It is the one active control-plane action grading performs, and it is
+	// the whole basis of telling a live session from one a hold timer has not
+	// yet given up on. A caller that could only spell it in one vendor's CLI
+	// would move no counter on any other -- and the check reads exactly that
+	// as "established, and carrying nothing".
+	RefreshBGP(*model.Device, []string) [][]string
 }
 
 // UnknownError identifies a manifest or runtime reference to an unregistered
@@ -215,6 +274,57 @@ func Names() []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// ForConfigKind returns the provider that owns a configuration snapshot kind.
+//
+// Restore and submission loading both start from an archived artefact rather
+// than from a device, so they need the reverse of Resolve: which provider is
+// allowed to touch this content at all.
+func ForConfigKind(kind state.Kind) (Provider, bool) {
+	providers.mu.RLock()
+	defer providers.mu.RUnlock()
+	for _, provider := range providers.providers {
+		if provider.ConfigFile().Kind == kind {
+			return provider, true
+		}
+	}
+	return nil, false
+}
+
+// ConfigMismatchError says an archived configuration was written for one NOS
+// and the device it is aimed at runs another.
+//
+// It is deliberately an error and never a skip. Silently ignoring the file
+// produces a device with no configuration at all, graded as a student who
+// wrote none -- a mark that looks exactly like one somebody earned.
+type ConfigMismatchError struct {
+	Device   string
+	Declared string
+	Actual   string
+	Artefact string
+}
+
+func (e *ConfigMismatchError) Error() string {
+	artefact := e.Artefact
+	if artefact == "" {
+		artefact = "the archived configuration"
+	}
+	declared := e.Declared
+	if declared == "" {
+		declared = "an unrecorded NOS"
+	} else {
+		declared = fmt.Sprintf("NOS %q", declared)
+	}
+	return fmt.Sprintf("%s of %s was captured for %s, but that device runs NOS %q; "+
+		"loading it would configure nothing and grade as an empty control plane",
+		artefact, e.Device, declared, e.Actual)
+}
+
+// IsConfigMismatch reports whether err is an archive/provider mismatch.
+func IsConfigMismatch(err error) bool {
+	var mismatch *ConfigMismatchError
+	return errors.As(err, &mismatch)
 }
 
 // FeatureSet validates a provider declaration for a named device.

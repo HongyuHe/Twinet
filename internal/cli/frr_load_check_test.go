@@ -7,11 +7,12 @@ import (
 	"time"
 
 	"github.com/HongyuHe/twinet/internal/model"
+	"github.com/HongyuHe/twinet/internal/nos"
 	"github.com/HongyuHe/twinet/internal/render"
 	rt "github.com/HongyuHe/twinet/internal/runtime"
 )
 
-// loadFRRConfig has to notice a submission FRR would not accept.
+// The submission loader has to notice a submission FRR would not accept.
 //
 // A generic `vtysh -c "show version"` answers as long as any one daemon is up.
 // Each daemon therefore has to answer through its own vty socket.
@@ -30,11 +31,11 @@ func TestASubmissionThatKillsADaemonDoesNotLoad(t *testing.T) {
 
 	// The real budget gives a loaded node time to start FRR; here the daemon
 	// is never coming back, and the test is about the verdict, not the wait.
-	restore := frrStartWait
-	frrStartWait = 100 * time.Millisecond
-	defer func() { frrStartWait = restore }()
+	restore := nos.FRRStartWaitForTest(100 * time.Millisecond)
+	defer restore()
 
-	err := loadFRRConfig(context.Background(), exec, d, "router ospf\n network 3.0.0.0/8 area 0\n")
+	err := loadRouterConfigBody(context.Background(), exec, d, "frr",
+		"router ospf\n network 3.0.0.0/8 area 0\n")
 	if err == nil {
 		t.Fatal("a submission that left ospfd dead loaded successfully. It will be " +
 			"graded on a network that cannot learn a route, and so will its neighbours.")
@@ -52,7 +53,7 @@ func TestASubmissionFRRAcceptsLoads(t *testing.T) {
 		return rt.ExecResult{}, nil
 	}
 	d := &model.Device{ID: "as3/ATL", Name: "ATL", Kind: model.KindRouter}
-	if err := loadFRRConfig(context.Background(), exec, d, "router ospf\n"); err != nil {
+	if err := loadRouterConfigBody(context.Background(), exec, d, "frr", "router ospf\n"); err != nil {
 		t.Fatalf("a submission every daemon accepted was rejected: %v", err)
 	}
 	joined := strings.Join(commands, "\n")
@@ -71,7 +72,7 @@ func TestPlatformBaselineDoesNotRequireUnconfiguredRoutingDaemons(t *testing.T) 
 		return rt.ExecResult{Stdout: "zebra bgpd ospfd ospf6d ldpd "}, nil
 	}
 	d := &model.Device{ID: "as3/ATL", Name: "ATL", Kind: model.KindRouter}
-	if err := loadPlatformFRRConfig(context.Background(), exec, d, "frr defaults traditional\n"); err != nil {
+	if err := loadPlatformConfig(context.Background(), exec, d, "frr defaults traditional\n"); err != nil {
 		t.Fatalf("empty platform baseline was treated as a malformed submission: %v", err)
 	}
 }

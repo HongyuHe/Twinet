@@ -20,10 +20,15 @@ type birdPeer struct {
 	sameRegion    []int
 }
 
-// BirdRouter renders the BIRD 2 configuration used by staff/reference
-// routers. Student-owned routers intentionally remain FRR-only while
-// submissions are FRR command files; manifest validation explains that
-// boundary before deploy.
+// BirdRouter renders the BIRD 2 configuration used by a router that declares
+// `nos: bird`, in a staff-run or a student-owned AS alike.
+//
+// A student-owned BIRD router is now supported end to end: `twinet save`
+// captures BIRD's own configuration file, the archive records which NOS it was
+// captured from, and the loader refuses an archive written for another rather
+// than installing syntax the daemon cannot read. Manifest validation reports
+// the remaining boundary per feature -- BIRD declares no RPKI, MPLS/LDP, VRF,
+// multicast or tunnel support here -- before a deploy is attempted.
 //
 // The configuration is derived from the same topology facts as FRR: kernel
 // addresses are installed by birdRouterCommands, BIRD owns OSPF/BGP and the

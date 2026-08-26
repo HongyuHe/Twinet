@@ -115,11 +115,16 @@ func (l *Loaded) validateNOS(d *Diagnostics) {
 		}
 	}
 
-	// The current submission format is an FRR configuration file. Accepting a
-	// student-owned BIRD router would silently load that syntax nowhere and
-	// grade an empty control plane. BIRD is therefore intentionally limited to
-	// staff/reference routers until submissions carry provider-specific typed
-	// configuration.
+	// A student-owned router may run any registered NOS whose provider can
+	// capture, load and observe a configuration -- which is what makes save,
+	// restore and autograding work for the group that owns it.
+	//
+	// The refusal that used to sit here was blanket: BIRD was rejected in a
+	// student AS because submissions were FRR command files and loading one
+	// into BIRD would have configured nothing while grading an empty control
+	// plane. Archives now record which NOS each configuration was captured
+	// from and the loader refuses a mismatch by name, so the remaining
+	// boundary is a capability one and is reported per feature above.
 	for groupIndex, group := range l.Lab.AutonomousSystems {
 		spec := group.Merge(l.Lab.ASDefaults)
 		if spec.Role != "" && spec.Role != model.RoleStudent {
@@ -140,12 +145,25 @@ func (l *Loaded) validateNOS(d *Diagnostics) {
 					continue
 				}
 				defaults := router.DeviceDefaults.Merge(l.Lab.Kinds[model.KindRouter]).Merge(l.Lab.Defaults)
-				if strings.EqualFold(defaults.NOS, "bird") {
-					d.AddHint(l.Files["lab"], fmt.Sprintf("autonomous_systems[%d]", groupIndex),
-						nodeAt(l.Nodes[l.Files["lab"]], fmt.Sprintf("autonomous_systems[%d]", groupIndex)),
-						fmt.Sprintf("device as%d/%s uses NOS %q in a student-owned AS", asn, routerName, defaults.NOS),
-						"student submissions currently carry FRR commands; use BIRD only for staff/reference routers")
+				name := defaults.NOS
+				if name == "" {
+					name = model.DefaultNOS
 				}
+				provider, ok := nos.Lookup(name)
+				if !ok {
+					// Reported with a better source location above.
+					continue
+				}
+				file := provider.ConfigFile()
+				if file.NOS != "" && file.Path != "" && file.Extension != "" && file.Kind != "" {
+					continue
+				}
+				d.AddHint(l.Files["lab"], fmt.Sprintf("autonomous_systems[%d]", groupIndex),
+					nodeAt(l.Nodes[l.Files["lab"]], fmt.Sprintf("autonomous_systems[%d]", groupIndex)),
+					fmt.Sprintf("device as%d/%s uses NOS %q in a student-owned AS, and that "+
+						"provider cannot capture or load a configuration", asn, routerName, name),
+					"a student AS must be able to be saved, restored and regraded; use a NOS "+
+						"whose provider owns its configuration file")
 			}
 		}
 	}

@@ -20,6 +20,7 @@ import (
 	"strings"
 
 	"github.com/HongyuHe/twinet/internal/model"
+	"github.com/HongyuHe/twinet/internal/nos"
 	"github.com/HongyuHe/twinet/internal/svc"
 )
 
@@ -659,8 +660,29 @@ func rpkiCache(top *model.Topology, as *model.AS) string {
 // two drifting apart is how a router ends up waiting for a session it was
 // never given -- or, worse, being given one nothing ever checks.
 func hasRPKICache(top *model.Topology, d *model.Device) bool {
-	as, ok := top.ASes[d.ASN]
-	if !ok || svc.RPKIAddrFor(top, d.ASN) == "" {
+	if !validatesOrigins(top, d) {
+		return false
+	}
+	// The cache is FRR configuration and the readiness script is FRR's CLI.
+	// A provider that does not declare origin validation has neither, and
+	// running the script there put a vtysh loop inside a container that has no
+	// vtysh -- ignored, so it merely wasted an exec per deployment and left an
+	// FRR command in a BIRD device's history.
+	provider, err := nos.Resolve(d)
+	return err == nil && provider.Capabilities().Supports(nos.FeatureRPKI)
+}
+
+// validatesOrigins reports whether a router is in a position to care about
+// origin validation at all: the lab runs a validator its AS can reach, and the
+// router holds a session with somebody outside the AS.
+//
+// It is deliberately separate from hasRPKICache. Publishing a ROA is an
+// exchange with the trust anchor over HTTP and has nothing to do with which
+// routing daemon the router runs; refusing to publish because the daemon has
+// no RTR client would lose the mark for publishing on a system that published
+// correctly.
+func validatesOrigins(top *model.Topology, d *model.Device) bool {
+	if _, ok := top.ASes[d.ASN]; !ok || svc.RPKIAddrFor(top, d.ASN) == "" {
 		return false
 	}
 	for _, i := range d.Ifaces {
@@ -668,7 +690,6 @@ func hasRPKICache(top *model.Topology, d *model.Device) bool {
 			return true
 		}
 	}
-	_ = as
 	return false
 }
 

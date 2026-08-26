@@ -3,7 +3,6 @@ package cli
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -26,6 +25,7 @@ import (
 	"github.com/HongyuHe/twinet/internal/grade"
 	"github.com/HongyuHe/twinet/internal/harness"
 	"github.com/HongyuHe/twinet/internal/model"
+	"github.com/HongyuHe/twinet/internal/nos"
 	"github.com/HongyuHe/twinet/internal/place"
 	"github.com/HongyuHe/twinet/internal/render"
 	rt "github.com/HongyuHe/twinet/internal/runtime"
@@ -50,11 +50,21 @@ type submission struct {
 	// TakenAt is retained when an attestation mutation is re-signed so a
 	// deterministic fixture differs only in its declared transformation.
 	TakenAt time.Time
-	// Files maps a router's short name to the FRR configuration submitted for
-	// it. A submission that names a router the AS does not have is a mistake
-	// worth reporting rather than ignoring: silently dropping it would mark
-	// the student on an empty router and tell them their routing is wrong.
+	// Files maps a router's short name to the routing configuration submitted
+	// for it. A submission that names a router the AS does not have is a
+	// mistake worth reporting rather than ignoring: silently dropping it would
+	// mark the student on an empty router and tell them their routing is
+	// wrong.
 	Files map[string]string
+	// NOS maps a router's short name to the network operating system its
+	// configuration was captured from, where the archive recorded one.
+	//
+	// An empty entry means an archive written before the field existed, which
+	// is FRR by construction. It is never treated as "whatever this device
+	// happens to run": a configuration is one vendor's syntax, and feeding it
+	// to another's parser produces a router that accepted nothing and a mark
+	// indistinguishable from a student who submitted nothing.
+	NOS map[string]string
 	// ROAs is what this system had authorised at the lab's trust anchor.
 	//
 	// Publishing is a student action rather than a line of configuration, so
@@ -901,9 +911,18 @@ func applySubmission(ctx context.Context, exec execFn, h *model.Topology, s subm
 	sort.Strings(names)
 	for _, name := range names {
 		d := known[strings.ToUpper(name)]
-		if err := loadFRRConfig(ctx, exec, d, s.Files[name]); err != nil {
+		if err := loadRouterConfig(ctx, exec, d, submissionConfigNOS(s.NOS, name), s.Files[name],
+			nos.LoadOptions{RequireDaemons: true}); err != nil {
 			return fmt.Errorf("%s: %w", d.ID, err)
 		}
+		// A submission's routing configuration can reset sessions while the
+		// validator is still reconnecting -- and a route that arrives before
+		// the ROAs is filtered as if there were none. The daemon records the
+		// validation state afterwards but does not re-run the policy, so a
+		// submission that rejects invalid announcements perfectly still ends
+		// up carrying the lab's hijack. The refresh is what makes the answer
+		// visible; it runs in the background because it waits on a service.
+		refreshRPKIInBackground(ctx, exec, d)
 	}
 
 	// What the group authorised at the trust anchor, replayed before anything
@@ -942,122 +961,43 @@ func applySubmission(ctx context.Context, exec execFn, h *model.Topology, s subm
 	return nil
 }
 
-// loadFRRConfig installs a submitted configuration and reloads FRR onto it.
+// loadRouterConfigBody installs a submitted configuration through the device's
+// own provider and proves the control plane survived it.
 //
-// The obvious approach, feeding the file to "vtysh -f", does not work for a
-// whole configuration: vtysh accepts commands, and a configuration file also
-// contains directives such as "frr version" that exist only for the daemons'
-// own startup parser. Feeding one in fails at that line, and the failure looks
-// like a student error when it is the grader's.
-//
-// So the submission is installed exactly where a real deployment puts it and
-// FRR's packaged exact-reload tool reconciles the running configuration to it.
-// The router shell and its private FRR control sidecar share /etc/frr and the
-// vty directory; stopping daemons from the unprivileged shell cannot work and
-// removes the sidecar's sockets out from under otherwise healthy daemons.
-func loadFRRConfig(ctx context.Context, exec execFn, d *model.Device, body string) error {
-	return loadFRRConfigWithDaemonCheck(ctx, exec, d, body, true)
+// The provider owns the mechanism -- FRR's exact-reload tool, BIRD's
+// `configure` -- because both share the same requirement and neither shares an
+// implementation: the configuration must be adopted by the running daemon, so
+// that a line it rejects is reported as a rejected line the student can be
+// shown instead of a router that silently failed to come up and grades as a
+// total loss.
+func loadRouterConfigBody(ctx context.Context, exec execFn, d *model.Device, declared, body string) error {
+	return loadRouterConfig(ctx, exec, d, declared, body, nos.LoadOptions{RequireDaemons: true})
 }
 
-// loadPlatformFRRConfig restores a student's empty platform baseline. It must
-// restart FRR, but deliberately does not require all routing daemons to remain
-// up: the student has not supplied the OSPF/BGP configuration that starts
-// their routing exercise yet. Every actual submission still uses
-// loadFRRConfig, which rejects a daemon that dies on its submitted file.
-func loadPlatformFRRConfig(ctx context.Context, exec execFn, d *model.Device, body string) error {
-	return loadFRRConfigWithDaemonCheck(ctx, exec, d, body, false)
-}
-
-func loadFRRConfigWithDaemonCheck(ctx context.Context, exec execFn, d *model.Device, body string,
-	requireDaemons bool,
-) error {
-	// The configuration is base64-encoded rather than written through a shell
-	// heredoc. A submission is a file a student controls, and a line reading
-	// exactly TWINET_EOF ends the heredoc early -- everything after it becomes
-	// shell, running as root inside the container. Encoding removes the
-	// delimiter entirely, so there is nothing left to escape.
-	script := strings.Join([]string{
-		"set -e",
-		"printf '%s' " + shellQuote(base64.StdEncoding.EncodeToString([]byte(body))) +
-			" | base64 -d > /etc/frr/frr.conf",
-		"chown frr:frr /etc/frr/frr.conf 2>/dev/null || true",
-		"chmod 640 /etc/frr/frr.conf",
-		"PYTHONWARNINGS=ignore /usr/lib/frr/frr-reload.py --reload " +
-			"--bindir /usr/bin --confdir /etc/frr --rundir /run/frr /etc/frr/frr.conf",
-	}, "\n")
-
-	res, err := exec(ctx, d.ID, []string{"sh", "-c", script})
+// loadPlatformConfig restores a student's empty platform baseline. It must
+// restart the routing daemons, but deliberately does not require all of them
+// to remain up: the student has not supplied the OSPF/BGP configuration that
+// starts their routing exercise yet. Every actual submission still goes
+// through loadRouterConfigBody, which rejects a daemon that dies on its
+// submitted file.
+func loadPlatformConfig(ctx context.Context, exec execFn, d *model.Device, body string) error {
+	provider, err := nos.Resolve(d)
 	if err != nil {
-		return fmt.Errorf("installing the configuration: %w", err)
+		return fmt.Errorf("its network operating system could not be resolved: %w", err)
 	}
-	if res.ExitCode != 0 {
-		return fmt.Errorf("installing the configuration: %s",
-			firstLine(res.Stdout+res.Stderr))
-	}
-	if !requireDaemons {
-		return nil
-	}
-
-	// Every enabled daemon must answer on its own vty socket. PID namespaces
-	// are intentionally private, so pidof in the router shell cannot observe
-	// sidecar processes and would report every healthy daemon as absent.
-	//
-	// This used to ask `vtysh -c "show version"`, which answers as long as any
-	// one daemon is up. A submission whose OSPF configuration was rejected
-	// therefore loaded successfully with ospfd dead, and was then marked on a
-	// network in which its routers could not learn a route -- against a lab
-	// that looked healthy. Every process the daemons file enables is now
-	// checked by name.
-	// Polled rather than slept on.
-	//
-	// A fixed two-second wait is a guess about how long FRR takes to bind, and
-	// on a node running two hundred containers it is sometimes wrong -- so a
-	// perfectly good submission was quarantined for being slow. Waiting for the
-	// answer instead is both faster in the common case and correct in the rare
-	// one; the deadline is what keeps a genuinely rejected configuration from
-	// hanging the run.
-	probe := "for d in " + strings.Join(render.EnabledDaemons(), " ") +
-		"; do vtysh -d \"$d\" -c 'show version' >/dev/null 2>&1 || printf '%s ' \"$d\"; done"
-	deadline := time.Now().Add(frrStartWait)
-	var down []string
-	for {
-		res, err = exec(ctx, d.ID, []string{"sh", "-c", probe})
-		if err != nil {
-			return fmt.Errorf("checking that frr came up: %w", err)
-		}
-		down = strings.Fields(res.Stdout)
-		if len(down) == 0 {
-			// Loading a submission can reset sessions while the validator is
-			// still reconnecting -- and a route that arrives
-			// before the ROAs is filtered as if there were none. FRR records
-			// the validation state afterwards but does not re-run the policy,
-			// so a submission that rejects invalid announcements perfectly
-			// still ends up carrying the lab's hijack. The refresh is what
-			// makes the answer visible; it runs in the background because it
-			// waits on a service, and the convergence barrier that follows is
-			// far longer than it needs.
-			refreshRPKIInBackground(ctx, exec, d)
-			return nil
-		}
-		if time.Now().After(deadline) {
-			break
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(500 * time.Millisecond):
-		}
-	}
-	return fmt.Errorf("frr did not come up on the submitted configuration within %s: %s "+
-		"%s not running, which usually means %s rejected a line of it",
-		frrStartWait, strings.Join(down, ", "),
-		map[bool]string{true: "is", false: "are"}[len(down) == 1],
-		map[bool]string{true: "it", false: "they"}[len(down) == 1])
+	return loadRouterConfig(ctx, exec, d, provider.ConfigFile().NOS, body, nos.LoadOptions{})
 }
 
 // refreshRPKIInBackground re-runs inbound policy once the validator answers.
 func refreshRPKIInBackground(ctx context.Context, exec execFn, d *model.Device) {
 	if d.Kind != model.KindRouter {
+		return
+	}
+	// The script is FRR's own CLI and asks about an RPKI cache. A NOS that
+	// declares no origin validation has neither, and running it there would
+	// put an FRR binary inside a container that does not have one.
+	provider, err := nos.Resolve(d)
+	if err != nil || !provider.Capabilities().Supports(nos.FeatureRPKI) {
 		return
 	}
 	// Detached from this exec: the wait is for another container's service, and
@@ -1068,11 +1008,6 @@ func refreshRPKIInBackground(ctx context.Context, exec execFn, d *model.Device) 
 		slog.Debug("could not start the origin-validation refresh", "device", d.ID, "err", err)
 	}
 }
-
-// frrStartWait bounds how long a submission's routing daemons are given to
-// bind. Long enough for a loaded node, short enough that a rejected
-// configuration is reported rather than waited on.
-var frrStartWait = 30 * time.Second
 
 // submissionFromArchive reads a submission out of a `twinet save` archive.
 //
@@ -1112,7 +1047,7 @@ func submissionFromArchive(p string, class *model.Topology) (submission, error) 
 	sub := submission{
 		Group: group, AS: b.AS, Dir: p, Attempt: b.Attempt,
 		ArchiveSHA256: hex.EncodeToString(archiveDigest[:]), Controller: b.Controller, TakenAt: b.TakenAt,
-		Files: map[string]string{}, Scripts: map[string]string{},
+		Files: map[string]string{}, Scripts: map[string]string{}, NOS: map[string]string{},
 	}
 	m, err := classifyBundle(files)
 	if err != nil {
@@ -1121,6 +1056,9 @@ func submissionFromArchive(p string, class *model.Topology) (submission, error) 
 	sub.ROAs = m.ROAs
 	for name, body := range m.Configs {
 		sub.Files[name] = string(body)
+		if declared := submissionConfigNOS(b.NOS, name); declared != "" {
+			sub.NOS[name] = declared
+		}
 	}
 	for name, body := range m.Scripts {
 		sub.Scripts[name] = string(body)
@@ -1226,7 +1164,7 @@ func resetToStudentStart(ctx context.Context, exec execFn, top *model.Topology, 
 		if err != nil {
 			return fmt.Errorf("%s: rendering the starting configuration: %w", d.ID, err)
 		}
-		if err := loadPlatformFRRConfig(ctx, exec, d, cfg.Platform); err != nil {
+		if err := loadPlatformConfig(ctx, exec, d, cfg.Platform); err != nil {
 			return fmt.Errorf("%s: restoring the starting configuration: %w", d.ID, err)
 		}
 	}

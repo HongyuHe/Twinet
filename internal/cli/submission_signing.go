@@ -71,6 +71,22 @@ func bundleBytes(b Bundle) []byte {
 	for _, n := range names {
 		fmt.Fprintf(&sb, "file=%s=%s\n", n, b.Files[n])
 	}
+	// Omitted entirely when the archive records no NOS, so every archive
+	// collected before the field existed keeps its exact signature bytes and
+	// remains verifiable. When it is recorded it is signed, because which
+	// vendor a configuration was written for decides which parser it is fed
+	// to, and that is not something an archive should be able to be edited
+	// into claiming.
+	if len(b.NOS) > 0 {
+		names = names[:0]
+		for n := range b.NOS {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		for _, n := range names {
+			fmt.Fprintf(&sb, "nos=%s=%s\n", n, b.NOS[n])
+		}
+	}
 	return []byte(sb.String())
 }
 

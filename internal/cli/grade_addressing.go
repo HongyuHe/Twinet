@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/HongyuHe/twinet/internal/model"
+	"github.com/HongyuHe/twinet/internal/nos"
 )
 
 // Addresses the assignment lets a group choose.
@@ -127,6 +128,25 @@ func adaptOnePeer(ctx context.Context, exec execFn, peer *model.Iface,
 	plannedTheirs, chosen string) (peerAdaptation, error) {
 
 	var ad peerAdaptation
+	// The adaptation is written in FRR's configuration language, by copying
+	// the reference's own stanza for the planned address. There is no such
+	// stanza on another NOS, and running vtysh inside a container that has
+	// none would report a transport failure rather than the truth. The truth
+	// is that this reference cannot be adapted, which costs the group that
+	// session and is reported as a problem rather than swallowed.
+	if peer.Device != nil {
+		provider, err := nos.Resolve(peer.Device)
+		if err != nil {
+			return ad, fmt.Errorf("its network operating system could not be resolved: %w", err)
+		}
+		if provider.ConfigFile().NOS != model.DefaultNOS {
+			return ad, fmt.Errorf(
+				"the reference on the other side runs NOS %q, and Twinet can only adapt an "+
+					"FRR reference to a peering address the assignment left to the group; "+
+					"agree the planned address %s with this neighbour",
+				provider.Name(), plannedTheirs)
+		}
+	}
 	their, err := netip.ParsePrefix(chosen)
 	if err != nil {
 		return ad, fmt.Errorf("%q is not an address", chosen)
