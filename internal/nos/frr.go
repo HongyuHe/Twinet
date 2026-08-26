@@ -2,6 +2,7 @@ package nos
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"strconv"
@@ -166,6 +167,155 @@ func (frrProvider) Restore(ctx context.Context, d *model.Device, rt runtime.Runt
 	return nil
 }
 
+func (frrProvider) ConfigFile() ConfigFile {
+	return ConfigFile{NOS: model.DefaultNOS, Path: frrConfigPath, Extension: ".conf", Kind: state.KindFRR}
+}
+
+// CaptureConfig reads the running configuration rather than the file on disk.
+// A student configures through vtysh, so the file is whatever the last write
+// left behind and the running configuration is the work.
+func (frrProvider) CaptureConfig(ctx context.Context, d *model.Device, exec netstate.Executor) (string, error) {
+	if d == nil {
+		return "", fmt.Errorf("capture FRR configuration for nil device")
+	}
+	res, err := exec.Exec(ctx, d.ID, []string{"vtysh", "-c", "show running-config"})
+	if err != nil {
+		return "", fmt.Errorf("%s: its routing configuration could not be read: %w; "+
+			"re-run once the device is reachable", d.ID, err)
+	}
+	if res.ExitCode != 0 {
+		return "", fmt.Errorf("%s: its routing configuration could not be read: "+
+			"vtysh exited %d: %s; re-run once the device is reachable",
+			d.ID, res.ExitCode, firstLine(res.Stderr))
+	}
+	return cleanFRRConfig(res.Stdout), nil
+}
+
+// LoadConfig installs a submitted configuration and reloads FRR onto it.
+//
+// The obvious approach, feeding the file to "vtysh -f", does not work for a
+// whole configuration: vtysh accepts commands, and a configuration file also
+// contains directives such as "frr version" that exist only for the daemons'
+// own startup parser. Feeding one in fails at that line, and the failure looks
+// like a student error when it is the grader's.
+//
+// So the submission is installed exactly where a real deployment puts it and
+// FRR's packaged exact-reload tool reconciles the running configuration to it.
+// The router shell and its private FRR control sidecar share /etc/frr and the
+// vty directory; stopping daemons from the unprivileged shell cannot work and
+// removes the sidecar's sockets out from under otherwise healthy daemons.
+func (frrProvider) LoadConfig(ctx context.Context, d *model.Device, exec netstate.Executor,
+	body string, opts LoadOptions,
+) error {
+	if d == nil {
+		return fmt.Errorf("load FRR configuration into nil device")
+	}
+	// The configuration is base64-encoded rather than written through a shell
+	// heredoc. A submission is a file a student controls, and a line reading
+	// exactly TWINET_EOF ends the heredoc early -- everything after it becomes
+	// shell, running as root inside the container. Encoding removes the
+	// delimiter entirely, so there is nothing left to escape.
+	script := strings.Join([]string{
+		"set -e",
+		"printf '%s' " + shellQuote(base64.StdEncoding.EncodeToString([]byte(body))) +
+			" | base64 -d > " + frrConfigPath,
+		"chown frr:frr " + frrConfigPath + " 2>/dev/null || true",
+		"chmod 640 " + frrConfigPath,
+		"PYTHONWARNINGS=ignore /usr/lib/frr/frr-reload.py --reload " +
+			"--bindir /usr/bin --confdir /etc/frr --rundir /run/frr " + frrConfigPath,
+	}, "\n")
+
+	res, err := exec.Exec(ctx, d.ID, []string{"sh", "-c", script})
+	if err != nil {
+		return fmt.Errorf("installing the configuration: %w", err)
+	}
+	if res.ExitCode != 0 {
+		return fmt.Errorf("installing the configuration: %s", firstLine(res.Stdout+res.Stderr))
+	}
+	if !opts.RequireDaemons {
+		return nil
+	}
+	daemons := opts.Daemons
+	if len(daemons) == 0 {
+		daemons = []string{"zebra", "bgpd", "ospfd"}
+	}
+	wait := opts.Wait
+	if wait <= 0 {
+		wait = frrStartWait
+	}
+
+	// Every enabled daemon must answer on its own vty socket. PID namespaces
+	// are intentionally private, so pidof in the router shell cannot observe
+	// sidecar processes and would report every healthy daemon as absent.
+	//
+	// This used to ask `vtysh -c "show version"`, which answers as long as any
+	// one daemon is up. A submission whose OSPF configuration was rejected
+	// therefore loaded successfully with ospfd dead, and was then marked on a
+	// network in which its routers could not learn a route -- against a lab
+	// that looked healthy. Every process the daemons file enables is now
+	// checked by name.
+	// Polled rather than slept on.
+	//
+	// A fixed two-second wait is a guess about how long FRR takes to bind, and
+	// on a node running two hundred containers it is sometimes wrong -- so a
+	// perfectly good submission was quarantined for being slow. Waiting for the
+	// answer instead is both faster in the common case and correct in the rare
+	// one; the deadline is what keeps a genuinely rejected configuration from
+	// hanging the run.
+	probe := "for d in " + strings.Join(daemons, " ") +
+		"; do vtysh -d \"$d\" -c 'show version' >/dev/null 2>&1 || printf '%s ' \"$d\"; done"
+	deadline := time.Now().Add(wait)
+	var down []string
+	for {
+		res, err = exec.Exec(ctx, d.ID, []string{"sh", "-c", probe})
+		if err != nil {
+			return fmt.Errorf("checking that frr came up: %w", err)
+		}
+		down = strings.Fields(res.Stdout)
+		if len(down) == 0 {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+	return fmt.Errorf("frr did not come up on the submitted configuration within %s: %s "+
+		"%s not running, which usually means %s rejected a line of it",
+		wait, strings.Join(down, ", "),
+		map[bool]string{true: "is", false: "are"}[len(down) == 1],
+		map[bool]string{true: "it", false: "they"}[len(down) == 1])
+}
+
+// frrStartWait bounds how long a submission's routing daemons are given to
+// bind. Long enough for a loaded node, short enough that a rejected
+// configuration is reported rather than waited on.
+var frrStartWait = 30 * time.Second
+
+func (frrProvider) StateCommands(d *model.Device, query netstate.Query) [][]string {
+	if d == nil {
+		return nil
+	}
+	var commands [][]string
+	if query.Has(netstate.QueryBGPSessions) {
+		commands = append(commands, []string{"vtysh", "-c", "show ip bgp summary json"})
+	}
+	if query.Has(netstate.QueryBGPRIB) {
+		commands = append(commands, []string{"vtysh", "-c", "show ip bgp json"})
+	}
+	if query.Has(netstate.QueryOSPF) {
+		commands = append(commands, []string{"vtysh", "-c", "show ip ospf neighbor json"})
+	}
+	if query.Has(netstate.QueryPolicy) {
+		commands = append(commands, []string{"vtysh", "-c", "show running-config"})
+	}
+	return commands
+}
+
 type frrSummary struct {
 	IPv4 struct {
 		Peers map[string]struct {
@@ -308,6 +458,10 @@ func readFRROSPF(ctx context.Context, d *model.Device, exec netstate.Executor) (
 		Address   string `json:"address"`
 		Interface string `json:"ifaceName"`
 		State     string `json:"nbrState"`
+		// DeadTimerMsec is how long this neighbour has left before it is
+		// declared gone, which is what tells a live adjacency from one being
+		// held up by a timer nobody has revised yet.
+		DeadTimerMsec int64 `json:"routerDeadIntervalTimerDueMsec"`
 	}
 	var wrapped struct {
 		Neighbors map[string][]neighbor `json:"neighbors"`
@@ -328,9 +482,14 @@ func readFRROSPF(ctx context.Context, d *model.Device, exec netstate.Executor) (
 	var out []netstate.OSPFPeer
 	for routerID, peers := range document {
 		for _, peer := range peers {
-			out = append(out, netstate.OSPFPeer{
-				RouterID: routerID, Address: peer.Address, Interface: peer.Interface, State: peer.State,
-			})
+			observed := netstate.OSPFPeer{
+				RouterID: routerID, Address: peer.Address, Interface: peer.Interface,
+				State: peer.State, DeadTimerMsec: peer.DeadTimerMsec,
+			}
+			if peer.DeadTimerMsec <= 0 {
+				observed.MarkUnknown(netstate.FieldDeadTimer)
+			}
+			out = append(out, observed)
 		}
 	}
 	return out, nil
@@ -420,4 +579,18 @@ func cleanFRRConfig(body string) string {
 		break
 	}
 	return strings.TrimRight(strings.Join(lines[start:], "\n"), "\n")
+}
+
+// RefreshBGP asks each named neighbour to re-send its table. The commands are
+// combined into one vtysh invocation, which is what the grader has always done
+// and keeps one exec per router.
+func (frrProvider) RefreshBGP(d *model.Device, neighbors []string) [][]string {
+	if d == nil || len(neighbors) == 0 {
+		return nil
+	}
+	args := []string{"vtysh"}
+	for _, neighbor := range neighbors {
+		args = append(args, "-c", "clear bgp "+neighbor+" soft in")
+	}
+	return [][]string{args}
 }

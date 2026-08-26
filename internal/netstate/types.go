@@ -178,15 +178,55 @@ type BGP struct {
 	Paths    []BGPPath    `json:"paths,omitempty"`
 }
 
+// Field names a numeric member of BGPSession that a provider may be unable to
+// observe. A grader compares against these constants rather than spelling the
+// field name at each call site.
+type Field string
+
+const (
+	FieldPrefixesIn      Field = "prefixes_in"
+	FieldPrefixesOut     Field = "prefixes_out"
+	FieldUpdatesReceived Field = "updates_received"
+	FieldUpdatesSent     Field = "updates_sent"
+	FieldDeadTimer       Field = "dead_timer_msec"
+)
+
 // BGPSession is one BGP peer session.
+//
+// The counters are deliberately paired with Unknown. A provider that cannot
+// observe one of them leaves it zero and names it there, because zero and
+// "not exposed by this NOS" are different facts and a check that confuses them
+// invents a verdict: "the session carries nothing" is a real accusation, and a
+// counter the vendor never published is not evidence for it.
 type BGPSession struct {
-	Neighbor        string `json:"neighbor"`
-	RemoteAS        uint32 `json:"remote_as,omitempty"`
-	State           string `json:"state"`
-	PrefixesIn      int    `json:"prefixes_in,omitempty"`
-	PrefixesOut     int    `json:"prefixes_out,omitempty"`
-	UpdatesReceived int    `json:"updates_received,omitempty"`
-	UpdatesSent     int    `json:"updates_sent,omitempty"`
+	Neighbor        string  `json:"neighbor"`
+	RemoteAS        uint32  `json:"remote_as,omitempty"`
+	State           string  `json:"state"`
+	PrefixesIn      int     `json:"prefixes_in,omitempty"`
+	PrefixesOut     int     `json:"prefixes_out,omitempty"`
+	UpdatesReceived int     `json:"updates_received,omitempty"`
+	UpdatesSent     int     `json:"updates_sent,omitempty"`
+	Unknown         []Field `json:"unknown,omitempty"`
+}
+
+// Known reports whether the named counter was actually observed.
+func (s BGPSession) Known(field Field) bool {
+	for _, unknown := range s.Unknown {
+		if unknown == field {
+			return false
+		}
+	}
+	return true
+}
+
+// MarkUnknown records that a counter could not be observed on this session.
+func (s *BGPSession) MarkUnknown(fields ...Field) {
+	for _, field := range fields {
+		if s.Known(field) {
+			s.Unknown = append(s.Unknown, field)
+		}
+	}
+	sort.Slice(s.Unknown, func(i, j int) bool { return s.Unknown[i] < s.Unknown[j] })
 }
 
 // RPKIState is an origin-validation result.
@@ -219,11 +259,39 @@ type BGPPath struct {
 }
 
 // OSPFPeer is one OSPF adjacency.
+//
+// DeadTimerMsec is how long this neighbour has left before it is declared
+// gone. Every hello resets it, so watching it is what distinguishes a live
+// adjacency from one that stopped talking and is being held up by a timer that
+// has not expired yet. A provider that cannot publish it names it in Unknown
+// rather than reporting zero, which would read as an adjacency about to die.
 type OSPFPeer struct {
-	RouterID  string `json:"router_id,omitempty"`
-	Address   string `json:"address,omitempty"`
-	Interface string `json:"interface,omitempty"`
-	State     string `json:"state"`
+	RouterID      string  `json:"router_id,omitempty"`
+	Address       string  `json:"address,omitempty"`
+	Interface     string  `json:"interface,omitempty"`
+	State         string  `json:"state"`
+	DeadTimerMsec int64   `json:"dead_timer_msec,omitempty"`
+	Unknown       []Field `json:"unknown,omitempty"`
+}
+
+// Known reports whether the named field was actually observed.
+func (p OSPFPeer) Known(field Field) bool {
+	for _, unknown := range p.Unknown {
+		if unknown == field {
+			return false
+		}
+	}
+	return true
+}
+
+// MarkUnknown records that a field could not be observed on this adjacency.
+func (p *OSPFPeer) MarkUnknown(fields ...Field) {
+	for _, field := range fields {
+		if p.Known(field) {
+			p.Unknown = append(p.Unknown, field)
+		}
+	}
+	sort.Slice(p.Unknown, func(i, j int) bool { return p.Unknown[i] < p.Unknown[j] })
 }
 
 // PolicyFact is a provider-confirmed policy fact. It intentionally captures
