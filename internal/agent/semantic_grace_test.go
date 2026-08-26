@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
@@ -71,7 +72,7 @@ func TestRemoteOnlySemanticRepairDoesNotTouchLocalState(t *testing.T) {
 		Health: healthBroken,
 		Reason: "network semantics drifted: as3/SFO has no route to reference host address(es) 29.101.0.1",
 	}
-	err := s.repairSemanticDrift(nil, nil, nil, nil, observation)
+	err := s.repairSemanticDrift(context.Background(), nil, nil, nil, observation)
 	if err == nil || !strings.Contains(err.Error(), "no route to reference host") {
 		t.Fatalf("remote drift result = %v, want alert-only failure", err)
 	}
