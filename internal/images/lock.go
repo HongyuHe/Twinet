@@ -77,6 +77,18 @@ func IsImmutable(ref string) bool {
 	return true
 }
 
+// ClaimsDigest reports whether a reference advertises a sha256 manifest
+// digest, well formed or not.
+//
+// It exists so a reference that looks pinned but cannot be one -- a truncated
+// digest, a typo, a non-hexadecimal character -- is refused rather than
+// quietly treated as an ordinary mutable tag. Such a reference is nobody's
+// intent: whoever wrote it believed the deployment was pinned.
+func ClaimsDigest(ref string) bool {
+	_, remainder, ok := strings.Cut(strings.TrimSpace(ref), "@")
+	return ok && strings.HasPrefix(remainder, "sha256:")
+}
+
 // Digest returns the sha256 manifest portion of an immutable reference.
 func Digest(ref string) string {
 	ref = strings.TrimSpace(ref)

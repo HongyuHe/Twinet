@@ -67,6 +67,37 @@ func TestSameDigestAcceptsContainerdDigestOnlyIdentity(t *testing.T) {
 	}
 }
 
+// A reference that advertises a digest and then does not carry one is nobody's
+// intent: whoever wrote it believed the deployment was pinned. Telling it
+// apart from an honest tag is what lets the deployment refuse it instead of
+// quietly treating it as a moving name.
+func TestClaimsDigestSeparatesBrokenPinsFromHonestTags(t *testing.T) {
+	for _, pretender := range []string{
+		"registry.example/twinet-router:v1@sha256:deadbeef",
+		"registry.example/twinet-router@sha256:" + strings.Repeat("z", 64),
+		"registry.example/twinet-router@sha256:",
+	} {
+		if !ClaimsDigest(pretender) {
+			t.Errorf("%q does not read as a claimed digest", pretender)
+		}
+		if IsImmutable(pretender) || Digest(pretender) != "" {
+			t.Errorf("%q was accepted as an immutable reference", pretender)
+		}
+	}
+	for _, tag := range []string{
+		"registry.example/twinet-router:v1",
+		"twinet-router",
+		"registry.local:5000/twinet-router:0.1",
+	} {
+		if ClaimsDigest(tag) {
+			t.Errorf("mutable tag %q was read as a claimed digest", tag)
+		}
+	}
+	if !ClaimsDigest(digestA) || !IsImmutable(digestA) {
+		t.Fatalf("%q is a well-formed pin and was not recognised as one", digestA)
+	}
+}
+
 func TestApplyRejectsMissingDeviceImageBeforeDeployment(t *testing.T) {
 	top := &model.Topology{
 		Lab: &model.Lab{Images: model.ImagePolicy{Mode: model.ImageModeDevelopment}},

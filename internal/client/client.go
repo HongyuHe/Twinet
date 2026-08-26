@@ -1050,26 +1050,56 @@ func (c *Cluster) Apply(ctx context.Context, top *model.Topology, req agent.Appl
 	return c.coordinatedApply(ctx, top, req)
 }
 
+// verifyAppliedImageDigests proves, after the pull and before the transaction
+// commits, that a node is running the manifest its references name.
+//
+// It runs for every node the lab is placed on, whether or not that node held
+// the image when the deployment began. This is what makes unequal caches safe
+// for a digest-pinned lab: the controller no longer has to insist that every
+// assigned node already agreed before the pull, because each of them is made
+// to state afterwards which manifest it actually has, and a node that answers
+// with anything else fails the transaction into a rollback.
+//
+// A pinned reference is verified in any image mode -- a development manifest
+// may pin a digest too, and a pin nobody checks is decoration.
 func verifyAppliedImageDigests(top *model.Topology, node string, response agent.ApplyResponse) error {
-	if top == nil || top.Lab == nil || !top.Lab.Images.RequiresImmutableImages() {
+	if top == nil {
 		return nil
 	}
+	strict := top.Lab != nil && top.Lab.Images.RequiresImmutableImages()
 	refs := map[string]bool{}
 	for _, device := range top.DevicesOnNode(node) {
 		if device.Image != "" {
 			refs[device.Image] = true
 		}
 	}
-	for ref := range refs {
+	for _, ref := range sortedRefs(refs) {
+		locked := images.Digest(ref)
+		if locked == "" {
+			if strict {
+				return fmt.Errorf("%s ran %s, which is not an immutable registry digest; "+
+					"release and grading modes deploy only locked manifests", node, ref)
+			}
+			continue
+		}
 		actual := response.ImageDigests[ref]
 		if actual == "" {
 			return fmt.Errorf("%s did not report a post-pull digest for %s", node, ref)
 		}
 		if !images.SameDigest(ref, actual) {
-			return fmt.Errorf("%s pulled %s as %s, not locked digest %s", node, ref, actual, images.Digest(ref))
+			return fmt.Errorf("%s pulled %s as %s, not locked digest %s", node, ref, actual, locked)
 		}
 	}
 	return nil
+}
+
+func sortedRefs(refs map[string]bool) []string {
+	out := make([]string, 0, len(refs))
+	for ref := range refs {
+		out = append(out, ref)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // unfencedApply is only for a dry run or an empty local cluster. All
@@ -1108,12 +1138,26 @@ func (c *Cluster) unfencedApply(ctx context.Context, top *model.Topology,
 // Best effort by design: an image nobody has pulled yet has no digest, and a
 // first deployment must still be possible. What matters is that every caller
 // arrives at the same answer, not that the answer is always known.
+//
+// A digest-pinned reference is never asked about: it already states its
+// identity, and that answer is the same for every caller and every node.
 func (c *Cluster) stampImageIDs(ctx context.Context, top *model.Topology) {
 	refs := map[string]bool{}
 	for _, d := range top.Devices {
-		if d.Image != "" && d.ImageID == "" {
-			refs[d.Image] = true
+		if d.Image == "" || d.ImageID != "" {
+			continue
 		}
+		// An immutable reference is its own identity, and no cache can
+		// improve on it. A runtime answers a digest query with whatever local
+		// alias it holds -- a repository-qualified spelling, a config ID, an
+		// entry left by an earlier pull -- and adopting that would replace an
+		// authored, verified digest with one nothing has proven, and would
+		// give two callers holding the same lock two different spec hashes.
+		if pinned := images.Digest(d.Image); pinned != "" {
+			d.ImageID = pinned
+			continue
+		}
+		refs[d.Image] = true
 	}
 	if len(refs) == 0 {
 		return

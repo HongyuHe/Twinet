@@ -19,6 +19,7 @@ import (
 	"github.com/HongyuHe/twinet/internal/agent"
 	"github.com/HongyuHe/twinet/internal/client"
 	"github.com/HongyuHe/twinet/internal/deploy"
+	"github.com/HongyuHe/twinet/internal/images"
 	"github.com/HongyuHe/twinet/internal/model"
 	"github.com/HongyuHe/twinet/internal/netx"
 	"github.com/HongyuHe/twinet/internal/place"
@@ -1035,6 +1036,12 @@ func resolveImageIDs(ctx context.Context, top *model.Topology, token string) err
 		list = append(list, r)
 	}
 	sort.Strings(list)
+	// A reference that advertises a digest it cannot honour is refused before
+	// any node is contacted: it is neither a pin nor an honest tag, and every
+	// check below would reason about it as though it were one or the other.
+	if err := refuseMalformedPins(list); err != nil {
+		return err
+	}
 
 	// The agents are asked, not the local machine. The controller need not run
 	// containers at all, and here it could not even talk to the daemon -- so
@@ -1084,10 +1091,10 @@ func resolveImageIDs(ctx context.Context, top *model.Topology, token string) err
 					seen[ref] = id
 				}
 			}
-			if err := sameEverywhere(byRef); err != nil {
-				return err
-			}
-			if err := allOrNoneHaveIt(byRef, required); err != nil {
+			// Pinned references are held to the stronger rule first, so a
+			// cache that disagrees with the locked manifest is named as
+			// exactly that rather than as a tag that might have moved.
+			if err := imageCachesAllowDeployment(byRef, required); err != nil {
 				return err
 			}
 		}
@@ -1107,14 +1114,107 @@ func resolveImageIDs(ctx context.Context, top *model.Topology, token string) err
 	}
 
 	for _, d := range top.SortedDevices() {
-		// A release/grading lock has already stamped the required manifest
-		// digest. Do not erase it merely because this is the first pull and
-		// no node had an image to report during the preflight survey.
-		if resolved := seen[d.Image]; resolved != "" {
-			d.ImageID = resolved
-		}
+		d.ImageID = stampedImageIdentity(d.Image, seen, d.ImageID)
 	}
 	return nil
+}
+
+// stampedImageIdentity decides what a device's image identity is, given what
+// the survey found.
+//
+// An immutable reference is its own identity and outranks anything a cache
+// says. A runtime answers a digest query with whatever local alias it holds --
+// a repository-qualified spelling, a config ID, an entry left by an earlier
+// pull of the same tag -- and adopting that would replace an authored,
+// verified digest with an identity nothing has proven, and would move the
+// container spec hash between two callers that were given the same lock.
+//
+// An identity the caller already established survives an empty survey: a
+// release or grading lock has stamped the required manifest, and this is the
+// first pull, so no node had anything to report.
+func stampedImageIdentity(ref string, surveyed map[string]string, current string) string {
+	if pinned := images.Digest(ref); pinned != "" {
+		return pinned
+	}
+	if resolved := surveyed[ref]; resolved != "" {
+		return resolved
+	}
+	return current
+}
+
+// imageCachesAllowDeployment is every refusal the preflight survey can make,
+// in the order that produces the most specific message.
+//
+// A pinned reference is judged against the manifest it names; a tag is judged
+// against the other nodes, because nothing else can speak for it.
+func imageCachesAllowDeployment(byRef map[string]map[string]string,
+	required map[string]map[string]bool,
+) error {
+	if err := pinnedCachesMatchTheirDigest(byRef); err != nil {
+		return err
+	}
+	if err := sameEverywhere(byRef); err != nil {
+		return err
+	}
+	return allOrNoneHaveIt(byRef, required)
+}
+
+// refuseMalformedPins rejects a reference that claims a sha256 digest but does
+// not carry a well-formed one.
+//
+// Such a reference cannot be verified after the pull and cannot be trusted
+// before it, and treating it as a mutable tag would let it deploy on the
+// strength of a coincidence: nothing about `@sha256:deadbeef` says the author
+// meant a moving tag.
+func refuseMalformedPins(refs []string) error {
+	var problems []string
+	for _, ref := range refs {
+		if images.ClaimsDigest(ref) && !images.IsImmutable(ref) {
+			problems = append(problems, "  "+ref)
+		}
+	}
+	if len(problems) == 0 {
+		return nil
+	}
+	return fmt.Errorf("these image references claim a digest that is not one:\n%s\n"+
+		"A sha256 manifest digest is exactly 64 lower-case hexadecimal characters. "+
+		"Correct the reference, or regenerate the image lock with `twinet images lock` "+
+		"so the deployment pulls a manifest it can prove",
+		strings.Join(problems, "\n"))
+}
+
+// pinnedCachesMatchTheirDigest refuses a node whose cache answers a
+// digest-pinned reference with a different manifest.
+//
+// Every node was asked about the same immutable reference, so there is one
+// correct answer and it is written in the reference itself. A node that
+// reports another manifest under it is not a tag that moved -- it is a cache
+// that cannot be believed, and the same query after the pull would fail the
+// transaction anyway, so it is refused here where nothing has been touched.
+func pinnedCachesMatchTheirDigest(byRef map[string]map[string]string) error {
+	var problems []string
+	for _, ref := range sortedKeysOf(byRef) {
+		want := images.Digest(ref)
+		if want == "" {
+			continue
+		}
+		for _, node := range sortedKeysOf(byRef[ref]) {
+			got := byRef[ref][node]
+			if images.SameDigest(ref, got) {
+				continue
+			}
+			problems = append(problems, fmt.Sprintf(
+				"  %s is %s on %s, not the pinned %s", ref, got, node, want))
+		}
+	}
+	if len(problems) == 0 {
+		return nil
+	}
+	return fmt.Errorf("these nodes hold something other than the pinned manifest:\n%s\n"+
+		"The reference names one manifest and cannot mean another, so this cache "+
+		"cannot serve it. Remove the image on the listed node and let the "+
+		"deployment pull the pinned digest again",
+		strings.Join(problems, "\n"))
 }
 
 func requiredImageNodes(top *model.Topology) map[string]map[string]bool {
@@ -1134,14 +1234,8 @@ func requiredImageNodes(top *model.Topology) map[string]map[string]bool {
 	return required
 }
 
-// sameEverywhere refuses a deployment whose nodes do not agree on what an image
-// is.
-//
-// The alternative is to deploy anyway and let each student run whatever build
-// happens to be on the node their AS landed on. Nothing downstream can detect
-// that, and no report would mention it.
 // allOrNoneHaveIt refuses a deployment in which only some of the nodes that
-// will run an image hold it.
+// will run a *mutable* image reference hold it.
 //
 // A required node without the image is about to pull it, and the tag may have
 // been rebuilt since the other required nodes pulled theirs -- so the
@@ -1152,13 +1246,28 @@ func requiredImageNodes(top *model.Topology) map[string]map[string]bool {
 // No required node having it is the ordinary first deployment and is allowed:
 // they will all pull the same tag within seconds of each other, and the next
 // deployment resolves and agrees.
+//
+// A digest-pinned reference has no such hazard and is not refused. A
+// registry reference of the form repository@sha256:... names one manifest, so
+// a node that is missing it can only pull that manifest or fail; unequal
+// caches are then an ordinary consequence of a partial run, not a source of
+// divergence. Refusing them blocked the release scale benchmark on any cluster
+// whose nodes had not pulled identically, and the refusal's own remedy -- pin
+// it by digest -- was already in force, which left the operator with nothing
+// to do but preload the images by hand. What makes this safe is not the survey
+// but the proof afterwards: every assigned node reports its post-pull digest
+// and the transaction refuses to commit unless each one is the locked
+// manifest.
 func allOrNoneHaveIt(byRef map[string]map[string]string,
 	required map[string]map[string]bool,
 ) error {
 	var problems []string
 	for _, ref := range sortedKeysOf(required) {
 		want := required[ref]
-		if len(want) <= 1 {
+		// A bare sha256 identity is not exempt: it names no registry, so a
+		// node that lacks it has nothing to pull, and the deployment should
+		// say so here rather than fail halfway through.
+		if len(want) <= 1 || images.IsImmutable(ref) {
 			continue
 		}
 		var have, missing []string
@@ -1179,7 +1288,7 @@ func allOrNoneHaveIt(byRef map[string]map[string]string,
 	if len(problems) == 0 {
 		return nil
 	}
-	return fmt.Errorf("the nodes assigned these images do not share one cache state:\n%s\n"+
+	return fmt.Errorf("the nodes assigned these mutable image tags do not share one cache state:\n%s\n"+
 		"The missing nodes are about to pull, and if the tag has been rebuilt since "+
 		"the other assigned nodes pulled theirs, the lab can run different software "+
 		"under one name. Preload the image through the selected runtime on every "+
@@ -1187,13 +1296,34 @@ func allOrNoneHaveIt(byRef map[string]map[string]string,
 		strings.Join(problems, "\n"))
 }
 
+// sameEverywhere refuses a deployment whose nodes do not agree on what a
+// mutable tag is.
+//
+// The alternative is to deploy anyway and let each student run whatever build
+// happens to be on the node their AS landed on. Nothing downstream can detect
+// that, and no report would mention it.
+//
+// Digest-pinned references are answered by pinnedCachesMatchTheirDigest, which
+// compares each node against the manifest the reference names rather than
+// against the other nodes -- a stricter question with an answer an operator can
+// act on, and one whose remedy is not the pinning that is already in force.
 func sameEverywhere(byRef map[string]map[string]string) error {
 	var problems []string
 	for _, ref := range sortedKeysOf(byRef) {
+		if images.Digest(ref) != "" {
+			continue
+		}
 		perNode := byRef[ref]
 		ids := map[string][]string{}
 		for node, id := range perNode {
-			ids[id] = append(ids[id], node)
+			// Runtimes spell the same manifest differently: containerd
+			// answers with the bare digest, Docker with a repository-qualified
+			// one. Comparing the spelling would refuse a cluster that agrees.
+			key := id
+			if digest := images.Digest(id); digest != "" {
+				key = digest
+			}
+			ids[key] = append(ids[key], node)
 		}
 		if len(ids) <= 1 {
 			continue

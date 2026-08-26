@@ -263,11 +263,22 @@ created, and `--overcommit` is the audited exception rather than a silent
 fallback.
 
 On a first deployment, each assigned node pulls the images it needs. If only
-some of the nodes assigned the same mutable tag already cache it, Twinet
+some of the nodes assigned the same **mutable tag** already cache it, Twinet
 refuses: the missing nodes could otherwise pull a newer build under the same
 name. Preload that image through the selected runtime on the nodes named by the
 error, or use a digest-pinned image lock. A cache on a node that will not run
 that image is intentionally outside the coherence boundary.
+
+A **digest-pinned** reference — what `images.mode: release` produces, and what
+every bundled example deploys — is not subject to that refusal. The reference
+names one manifest, so a node that is missing it can only pull that manifest or
+fail, and unequal caches after a partial run are safe. The proof is taken after
+the pull rather than before it: every assigned node reports the digest it
+actually has, and the deployment refuses to commit — and rolls back — unless
+each one is the locked manifest. A reference that claims a digest but does not
+carry a well-formed one (64 lower-case hexadecimal characters), and a node whose
+cache answers a pinned reference with a different manifest, are both refused
+before anything is created; clear that image on the node named and re-run.
 
 Useful variations:
 
