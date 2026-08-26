@@ -444,22 +444,8 @@ func (s *Server) commitAppliedTopology(ctx context.Context, top *model.Topology,
 	// can discard that VLAN/VNI's external FDB binding while the host veth is
 	// replaced, so re-prove and restore the complete logical carrier set
 	// before snapshotting committed inventory.
-	overlayRepair, err := eng.ReconcileOverlayBindings(ctx, top)
-	if err != nil {
-		return ApplyResponse{}, fmt.Errorf("reconcile overlays after semantic repair: %w", err)
-	}
-	if len(overlayRepair.Failed) > 0 {
-		keys := make([]string, 0, len(overlayRepair.Failed))
-		for key := range overlayRepair.Failed {
-			keys = append(keys, key)
-		}
-		sort.Strings(keys)
-		var failures []string
-		for _, key := range keys {
-			failures = append(failures, key+": "+overlayRepair.Failed[key])
-		}
-		return ApplyResponse{}, fmt.Errorf("reconcile overlays after semantic repair: %s",
-			strings.Join(failures, "; "))
+	if err := reconcileCommitOverlays(ctx, eng, top); err != nil {
+		return ApplyResponse{}, err
 	}
 	if err := s.verifyKnownStudentState(ctx, top, previousMode, tx.PreviousUngraded, desiredMode, tx.Ungraded); err != nil {
 		return ApplyResponse{}, err
@@ -489,23 +475,33 @@ func (s *Server) commitAppliedTopology(ctx context.Context, top *model.Topology,
 	if len(resp.Failures) > 0 {
 		return resp, nil
 	}
-	actual, err := s.snapshotTransactionInventory(ctx, top.Name)
-	if err != nil {
-		return ApplyResponse{}, fmt.Errorf("verify committed inventory: %w", err)
-	}
-	inventory, err := expectedTransactionInventoryFinal(eng, top, s.cfg.Node, tx, actual)
-	if err != nil {
-		return ApplyResponse{}, fmt.Errorf("derive committed runtime inventory: %w", err)
-	}
-	if !tx.Prune {
-		// An explicitly non-pruning deployment preserves deliberate extra
-		// objects, but desired objects still use their expected lineage.
-		// Recording actual labels for desired objects would let an unrecorded
-		// recreate appear committed merely because pruning was disabled.
-		inventory, err = mergePreservedInventory(inventory, actual)
-		if err != nil {
-			return ApplyResponse{}, fmt.Errorf("verify non-pruning committed inventory: %w", err)
+	var actual, inventory transactionInventory
+	err = retryMissingDesiredVNI(ctx, 3, func() error {
+		var snapshotErr error
+		actual, snapshotErr = s.snapshotTransactionInventory(ctx, top.Name)
+		if snapshotErr != nil {
+			return fmt.Errorf("verify committed inventory: %w", snapshotErr)
 		}
+		inventory, snapshotErr = expectedTransactionInventoryFinal(eng, top, s.cfg.Node, tx, actual)
+		if snapshotErr != nil {
+			return fmt.Errorf("derive committed runtime inventory: %w", snapshotErr)
+		}
+		if !tx.Prune {
+			// An explicitly non-pruning deployment preserves deliberate extra
+			// objects, but desired objects still use their expected lineage.
+			// Recording actual labels for desired objects would let an unrecorded
+			// recreate appear committed merely because pruning was disabled.
+			inventory, snapshotErr = mergePreservedInventory(inventory, actual)
+			if snapshotErr != nil {
+				return fmt.Errorf("verify non-pruning committed inventory: %w", snapshotErr)
+			}
+		}
+		return nil
+	}, func() error {
+		return reconcileCommitOverlays(ctx, eng, top)
+	})
+	if err != nil {
+		return ApplyResponse{}, err
 	}
 	if err := s.validateInventoryLineage(top.Name, inventory, tx.Generation); err != nil {
 		return ApplyResponse{}, fmt.Errorf("commit inventory lineage: %w", err)
@@ -562,10 +558,62 @@ func mergePreservedInventory(expected, actual transactionInventory) (transaction
 	}
 	for vni := range wantVNIs {
 		if !haveVNIs[vni] {
-			return transactionInventory{}, fmt.Errorf("desired VNI %d is absent", vni)
+			return transactionInventory{}, &desiredVNIAbsentError{VNI: vni}
 		}
 	}
 	return out, nil
+}
+
+type desiredVNIAbsentError struct {
+	VNI uint32
+}
+
+func (e *desiredVNIAbsentError) Error() string {
+	return fmt.Sprintf("desired VNI %d is absent", e.VNI)
+}
+
+func retryMissingDesiredVNI(ctx context.Context, attempts int, verify, repair func() error) error {
+	if attempts < 1 {
+		attempts = 1
+	}
+	var last error
+	for attempt := 0; attempt < attempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		last = verify()
+		if last == nil {
+			return nil
+		}
+		var missing *desiredVNIAbsentError
+		if !errors.As(last, &missing) || attempt+1 == attempts {
+			return last
+		}
+		if err := repair(); err != nil {
+			return fmt.Errorf("%w; targeted overlay reconciliation failed: %v", last, err)
+		}
+	}
+	return last
+}
+
+func reconcileCommitOverlays(ctx context.Context, eng *deploy.Engine, top *model.Topology) error {
+	report, err := eng.ReconcileOverlayBindings(ctx, top)
+	if err != nil {
+		return fmt.Errorf("reconcile overlays after semantic repair: %w", err)
+	}
+	if len(report.Failed) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(report.Failed))
+	for key := range report.Failed {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	failures := make([]string, 0, len(keys))
+	for _, key := range keys {
+		failures = append(failures, key+": "+report.Failed[key])
+	}
+	return fmt.Errorf("reconcile overlays after semantic repair: %s", strings.Join(failures, "; "))
 }
 
 func addApplyFailure(resp *ApplyResponse, scope string, err error) {
