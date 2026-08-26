@@ -976,7 +976,7 @@ func ensureMultiplexBinding(h *netlink.Handle, vx *netlink.Vxlan, vlan uint16, v
 	if err := h.BridgeVlanAddTunnelInfo(vx, vlan, 0, vni, 0, false, false); err != nil && !isExist(err) {
 		return fmt.Errorf("map VLAN %d to VNI %d on %s: %w", vlan, vni, vx.Attrs().Name, err)
 	}
-	tunnels, err := h.BridgeVlanTunnelShow()
+	tunnels, err := retryNetlinkDump(h.BridgeVlanTunnelShow)
 	if err != nil {
 		return fmt.Errorf("multiplex VXLAN %s: verify VLAN tunnel mapping: %w", vx.Attrs().Name, err)
 	}
@@ -1007,7 +1007,7 @@ func reconcileTunnelMapping(h *netlink.Handle, vx *netlink.Vxlan, vlan uint16, v
 	for _, current := range vnis {
 		own[current] = true
 	}
-	tunnels, err := h.BridgeVlanTunnelShow()
+	tunnels, err := retryNetlinkDump(h.BridgeVlanTunnelShow)
 	if err != nil {
 		return fmt.Errorf("multiplex VXLAN %s: list VLAN tunnel mappings: %w", vx.Attrs().Name, err)
 	}
@@ -1087,7 +1087,7 @@ func attachToBridgeHandle(h *netlink.Handle, link netlink.Link, bridge *netlink.
 func ensureVLANMembership(h *netlink.Handle, link netlink.Link, vlan uint16,
 	pvid, untagged, exclusive bool) error {
 
-	memberships, err := h.BridgeVlanList()
+	memberships, err := retryNetlinkDump(h.BridgeVlanList)
 	if err != nil {
 		return fmt.Errorf("list VLANs on %s: %w", link.Attrs().Name, err)
 	}
@@ -1193,7 +1193,7 @@ func carriedBindings(h *netlink.Handle, vx *netlink.Vxlan) ([]carriedBinding, er
 		return nil, fmt.Errorf("multiplex VXLAN %s: list forwarding entries before replacement: %w",
 			vx.Attrs().Name, err)
 	}
-	tunnels, err := h.BridgeVlanTunnelShow()
+	tunnels, err := retryNetlinkDump(h.BridgeVlanTunnelShow)
 	if err != nil {
 		return nil, fmt.Errorf("multiplex VXLAN %s: list VLAN tunnel mappings before replacement: %w",
 			vx.Attrs().Name, err)
@@ -1277,9 +1277,11 @@ func carriedBindingsToRestore(carried []carriedBinding, skip uint32) []carriedBi
 
 func listExternalFDB(vx *netlink.Vxlan) ([]externalFDBEntry, error) {
 	msg := netlink.Ndmsg{Family: syscall.AF_BRIDGE, Index: uint32(vx.Attrs().Index)}
-	req := nl.NewNetlinkRequest(unix.RTM_GETNEIGH, unix.NLM_F_DUMP)
-	req.AddData(&msg)
-	msgs, err := req.Execute(unix.NETLINK_ROUTE, unix.RTM_NEWNEIGH)
+	msgs, err := retryNetlinkDump(func() ([][]byte, error) {
+		req := nl.NewNetlinkRequest(unix.RTM_GETNEIGH, unix.NLM_F_DUMP)
+		req.AddData(&msg)
+		return req.Execute(unix.NETLINK_ROUTE, unix.RTM_NEWNEIGH)
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -1570,7 +1572,7 @@ func removeVNIFromDevice(h *netlink.Handle, device multiplexDevice, vni uint32) 
 	if !found {
 		return nil
 	}
-	tunnels, err := h.BridgeVlanTunnelShow()
+	tunnels, err := retryNetlinkDump(h.BridgeVlanTunnelShow)
 	if err != nil {
 		return fmt.Errorf("multiplex VXLAN %s: list VLAN tunnel mappings: %w", device.vx.Attrs().Name, err)
 	}

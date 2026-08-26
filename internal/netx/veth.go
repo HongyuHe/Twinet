@@ -516,7 +516,7 @@ func HostLinksPresent(names []string) (map[string]bool, error) {
 		return nil, fmt.Errorf("open host netlink handle: %w", err)
 	}
 	defer h.Close()
-	links, err := h.LinkList()
+	links, err := listHandleLinks(h)
 	if err != nil {
 		return nil, fmt.Errorf("list host interfaces: %w", err)
 	}

@@ -90,7 +90,7 @@ func InspectOverlayInventory(lab string) (OverlayInventory, error) {
 	if err != nil {
 		return OverlayInventory{}, err
 	}
-	tunnels, err := h.BridgeVlanTunnelShow()
+	tunnels, err := retryNetlinkDump(h.BridgeVlanTunnelShow)
 	if err != nil {
 		return OverlayInventory{}, fmt.Errorf("list VLAN tunnel mappings: %w", err)
 	}

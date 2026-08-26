@@ -9,8 +9,12 @@ import (
 )
 
 const (
-	netlinkDumpAttempts   = 5
-	netlinkDumpRetryDelay = 10 * time.Millisecond
+	// Class-scale apply and teardown mutate hundreds of links while commit
+	// inventory and GC read them. Five attempts over 100ms still surfaced
+	// interrupted dumps in live scale transactions; this bounded 700ms window
+	// lets the dump generation settle without retrying persistent errors.
+	netlinkDumpAttempts   = 8
+	netlinkDumpRetryDelay = 25 * time.Millisecond
 )
 
 func retryNetlinkDump[T any](fn func() (T, error)) (T, error) {
