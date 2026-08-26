@@ -32,7 +32,7 @@ func (e *Engine) ExpectedOverlayInventory(top *model.Topology) (netx.OverlayInve
 		if peer == "" {
 			return netx.OverlayInventory{}, fmt.Errorf("link %s has no underlay peer for %s", link.ID, remoteNode)
 		}
-		vlan, mtu, port, err := multiplexParameters(top, e.Node, remoteNode, link.VNI)
+		vlan, mtu, port, err := e.multiplexParameters(top, e.Node, remoteNode, link.VNI)
 		if err != nil {
 			return netx.OverlayInventory{}, fmt.Errorf("link %s: %w", link.ID, err)
 		}

@@ -198,15 +198,22 @@ type Engine struct {
 
 	// pendingRestore records devices whose captured configuration must be
 	// replayed once their interfaces exist.
-	pendingRestore          sync.Map
+	pendingRestore sync.Map
+	// createdContainers records devices whose primary container this apply
+	// pass created from its image.
+	createdContainers       sync.Map
 	observationMu           sync.Mutex
 	observation             *observationTracker
+	desiredLinkHashes       map[string]string
 	lastDiff                BuildDiff
 	mutationMu              sync.Mutex
 	mutations               map[string]int
 	convergenceMu           sync.Mutex
 	convergenceGate         chan struct{}
 	convergenceGateLimit    int
+	overlayMu               sync.Mutex
+	overlayPlanTop          *model.Topology
+	overlayPlan             *overlayPlan
 	removeEmptyMultiplex    func(string) ([]string, error)
 	inspectOverlayInventory func(string) (netx.OverlayInventory, error)
 	hostLinkPresence        func([]string) (map[string]bool, error)
@@ -336,6 +343,7 @@ func (e *Engine) Build(top *model.Topology) (*plan.Plan, error) {
 func (e *Engine) BuildContext(ctx context.Context, top *model.Topology) (*plan.Plan, error) {
 	p := plan.New()
 	e.resetMutationCounts()
+	e.resetCreatedContainers()
 	devices := top.DevicesOnNode(e.Node)
 	if len(devices) == 0 {
 		e.setBuildObservation(nil, BuildDiff{})
@@ -445,7 +453,7 @@ func (e *Engine) BuildContext(ctx context.Context, top *model.Topology) (*plan.P
 					if !link.Props.Empty() {
 						e.recordMutation("qdisc", qdiscEndpointsOnNode(link, e.Node))
 					}
-					hash, err := e.desiredWireHash(top, link)
+					hash, err := e.observedWireHash(top, link)
 					if err != nil {
 						return err
 					}
@@ -674,10 +682,34 @@ func (e *Engine) ensureContainer(ctx context.Context, top *model.Topology, d *mo
 	if err := e.Runtime.Start(ctx, d.Container); err != nil {
 		return err
 	}
+	// The filesystem this container starts from is its image's. Configuration
+	// can therefore write the platform's rendered files without first reading
+	// each one back to compare it against content that cannot be there yet.
+	e.markContainerCreated(d.ID)
 	if err := e.restoreIfNeeded(ctx, top, d); err != nil {
 		return err
 	}
 	return e.ensureFRRControl(ctx, top, final)
+}
+
+// markContainerCreated records that this apply pass created the device's
+// primary container from its image.
+func (e *Engine) markContainerCreated(id string) { e.createdContainers.Store(id, true) }
+
+// containerCreatedThisPass reports whether this apply pass created the
+// device's primary container. The plan makes a device's configure step depend
+// on its create step, so a true answer means nothing has written to the
+// container's filesystem since the image was unpacked.
+func (e *Engine) containerCreatedThisPass(id string) bool {
+	_, ok := e.createdContainers.Load(id)
+	return ok
+}
+
+func (e *Engine) resetCreatedContainers() {
+	e.createdContainers.Range(func(key, _ any) bool {
+		e.createdContainers.Delete(key)
+		return true
+	})
 }
 
 // FRRControlContainer returns the private control-plane container associated
@@ -1517,7 +1549,7 @@ func (e *Engine) wireCrossNode(ctx context.Context, top *model.Topology, l *mode
 	if remoteIP == "" {
 		return fmt.Errorf("link %s: no underlay address known for node %s", l.ID, remote.Device.Node)
 	}
-	vlan, mtu, port, err := multiplexParameters(top, e.Node, remote.Device.Node, l.VNI)
+	vlan, mtu, port, err := e.multiplexParameters(top, e.Node, remote.Device.Node, l.VNI)
 	if err != nil {
 		return fmt.Errorf("link %s: %w", l.ID, err)
 	}
@@ -1577,77 +1609,6 @@ func (e *Engine) wireCrossNode(ctx context.Context, top *model.Topology, l *mode
 // hostSideName derives the root-namespace veth name for a cross-node link.
 // It must fit IFNAMSIZ-1 and be unique per VNI, which it is because the VNI is.
 func hostSideName(vni uint32) string { return fmt.Sprintf("twp%d", vni) }
-
-// multiplexParameters computes the one bridge VLAN, outer MTU, and UDP port
-// for a link's node pair. Both endpoint agents run this against the same full
-// topology, so VLAN and port collision resolution stays symmetric.
-func multiplexParameters(top *model.Topology, first, second string, target uint32) (uint16, int, int, error) {
-	var vnis []uint32
-	mtu := 0
-	found := false
-	pairs := map[string][2]string{}
-	for _, link := range top.Links {
-		if link == nil || !link.CrossNode() || link.A == nil || link.B == nil ||
-			link.A.Device == nil || link.B.Device == nil {
-			continue
-		}
-		a, b := link.A.Device.Node, link.B.Device.Node
-		pairID, err := netx.MultiplexPairID(a, b)
-		if err != nil {
-			return 0, 0, 0, fmt.Errorf("cross-node link %s: %w", link.ID, err)
-		}
-		pairs[pairID] = [2]string{a, b}
-		if !sameNodePair(a, b, first, second) {
-			continue
-		}
-		if link.VNI == 0 {
-			return 0, 0, 0, fmt.Errorf("cross-node link %s has no VNI", link.ID)
-		}
-		vnis = append(vnis, link.VNI)
-		if linkMTU(link) > mtu {
-			mtu = linkMTU(link)
-		}
-		if link.VNI == target {
-			found = true
-		}
-	}
-	if !found {
-		return 0, 0, 0, fmt.Errorf("VNI %d is not a cross-node link between %s and %s",
-			target, first, second)
-	}
-	if mtu == 0 {
-		mtu = 1500
-	}
-	vlans, err := netx.AssignOverlayVLANs(vnis)
-	if err != nil {
-		return 0, 0, 0, err
-	}
-	vlan := vlans[target]
-	if vlan == 0 {
-		return 0, 0, 0, fmt.Errorf("no VLAN assigned to VNI %d", target)
-	}
-	allPairs := make([][2]string, 0, len(pairs))
-	for _, pair := range pairs {
-		allPairs = append(allPairs, pair)
-	}
-	ports, err := netx.AssignMultiplexPorts(top.Name, allPairs)
-	if err != nil {
-		return 0, 0, 0, err
-	}
-	pairID, err := netx.MultiplexPairID(first, second)
-	if err != nil {
-		return 0, 0, 0, err
-	}
-	port := ports[pairID]
-	if port == 0 {
-		return 0, 0, 0, fmt.Errorf("no UDP port assigned to node pair %s/%s", first, second)
-	}
-	return vlan, mtu, port, nil
-}
-
-func sameNodePair(a, b, first, second string) bool {
-	return (a == first && b == second) || (a == second && b == first)
-}
 
 // endpoint builds the netx specification for one side of a link.
 func (e *Engine) endpoint(top *model.Topology, i *model.Iface, nsPath string, l *model.Link) netx.EndpointSpec {
@@ -1763,6 +1724,12 @@ func (e *Engine) configureDesired(ctx context.Context, d *model.Device, state de
 			return err
 		}
 	}
+	// A container this pass created from its image holds none of the
+	// platform's rendered configuration, so reading every file back before
+	// writing it is a guaranteed miss. At scale that is thousands of runtime
+	// round-trips per node -- and for a service device with hundreds of
+	// generated zone files they are serialized inside one step.
+	fresh := e.containerCreatedThisPass(d.ID)
 	for _, path := range sortedKeys(state.files) {
 		f := state.files[path]
 		keep, err := e.holdsStudentWork(ctx, d, path)
@@ -1779,7 +1746,7 @@ func (e *Engine) configureDesired(ctx context.Context, d *model.Device, state de
 			// business rewriting the part it deliberately left to someone else.
 			continue
 		}
-		if e.fileContentMatches(ctx, d, path, f.Content) {
+		if !fresh && e.fileContentMatches(ctx, d, path, f.Content) {
 			continue
 		}
 		if err := e.Runtime.CopyTo(ctx, d.Container, path, f.Mode, f.Content); err != nil {
@@ -2141,7 +2108,7 @@ func (e *Engine) Destroy(ctx context.Context, lab string) error {
 			problems = append(problems, fmt.Sprintf("remove writable platform state: %v", err))
 		}
 		if err := os.Remove(e.observationPath(lab)); err != nil && !os.IsNotExist(err) &&
-			!(e.ObservationRoot == "" && os.IsPermission(err)) {
+			(e.ObservationRoot != "" || !os.IsPermission(err)) {
 			problems = append(problems, fmt.Sprintf("remove observed deployment state: %v", err))
 		}
 	}

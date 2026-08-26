@@ -485,14 +485,24 @@ func (c *Cluster) coordinatedApplyWithLeaseTimed(ctx context.Context, top *model
 	}
 
 	if err := measure("prepare", func() error {
-		for _, node := range nodes {
-			prepare := applyRequestForNode(req, wire, peers, lease, node.Name,
-				"prepare", expected, generation)
-			if proofs != nil {
-				prepare.StateProofs = append([]agent.StateProof(nil), proofs[node.Name]...)
-			}
-			if _, err := node.Apply(lease.Context(), prepare); err != nil {
-				return fmt.Errorf("prepare %s: %w", node.Name, err)
+		// Each node's prepare is independent and the transaction already
+		// tolerates a partially prepared cluster: a failure below runs the
+		// same recovery a sequential loop ran when its last node failed.
+		// Sending them together removes two whole-topology round-trips from
+		// the critical path without weakening the barrier -- every node must
+		// still have prepared before apply begins.
+		results := fanOut(lease.Context(), nodes,
+			func(prepareCtx context.Context, node *Node) (agent.ApplyResponse, error) {
+				prepare := applyRequestForNode(req, wire, peers, lease, node.Name,
+					"prepare", expected, generation)
+				if proofs != nil {
+					prepare.StateProofs = append([]agent.StateProof(nil), proofs[node.Name]...)
+				}
+				return node.Apply(prepareCtx, prepare)
+			})
+		for _, result := range results {
+			if result.Err != nil {
+				return fmt.Errorf("prepare %s: %w", result.Node, result.Err)
 			}
 		}
 		return nil
@@ -608,12 +618,16 @@ func (c *Cluster) coordinatedApplyWithLeaseTimed(ctx context.Context, top *model
 	}
 
 	if err := measure("finalize", func() error {
-		for _, node := range nodes {
-			finalize := applyRequestForNode(req, wire, peers, lease, node.Name,
-				"finalize", expected, generation)
-			finalize.Topology = nil
-			if _, err := node.Apply(lease.Context(), finalize); err != nil {
-				return fmt.Errorf("finalize %s: %w", node.Name, err)
+		results := fanOut(lease.Context(), nodes,
+			func(finalizeCtx context.Context, node *Node) (agent.ApplyResponse, error) {
+				finalize := applyRequestForNode(req, wire, peers, lease, node.Name,
+					"finalize", expected, generation)
+				finalize.Topology = nil
+				return node.Apply(finalizeCtx, finalize)
+			})
+		for _, result := range results {
+			if result.Err != nil {
+				return fmt.Errorf("finalize %s: %w", result.Node, result.Err)
 			}
 		}
 		return nil

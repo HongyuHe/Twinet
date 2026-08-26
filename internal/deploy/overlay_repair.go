@@ -176,7 +176,7 @@ func (e *Engine) reconcileOverlayLink(ctx context.Context, top *model.Topology, 
 	if peer == "" {
 		return fmt.Errorf("no underlay peer for node %s", remote.Device.Node)
 	}
-	vlan, mtu, port, err := multiplexParameters(top, e.Node, remote.Device.Node, link.VNI)
+	vlan, mtu, port, err := e.multiplexParameters(top, e.Node, remote.Device.Node, link.VNI)
 	if err != nil {
 		return err
 	}

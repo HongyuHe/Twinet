@@ -163,6 +163,25 @@ native containerd, and Podman backends have since replaced the CLI default.
 The trace must prove useful concurrency, no global namespace lock, no Docker CLI
 processes on the default path, and zero unintended mutations on redeploy.
 
+**Shipped planning contract.** Node-local planning derives every deployment-wide
+value once. Multiplex overlay parameters -- the bridge VLAN per cross-node VNI,
+the outer MTU and the deconflicted UDP port per node pair -- are a pure function
+of the placed topology, so they are computed in one pass over the link set per
+topology instead of once per cross-node link; on the 84-AS lab that is one scan
+of 2,927 links rather than 186 of them, and
+`TestScaleBuildDerivesOverlayParametersOnce` asserts the bound directly. Per
+device rendering, final runtime-spec derivation, and desired wire hashing carry
+no shared state and are fanned out across the host's CPUs, and the wire hash
+observation computed is reused by the wire step rather than recomputed.
+`BenchmarkScaleBuildPlan` measures the whole pass on the release-gate topology.
+
+Configuration writes the platform's rendered files without first reading each
+one back when this apply pass created the container from its image, because
+nothing can be there to compare against yet; a container that already existed
+keeps the comparison, which is what keeps an unchanged file from being
+rewritten and keeps a no-change redeploy free of mutations.
+`TestFreshContainersSkipRedundantConfigurationReads` pins both halves.
+
 ### O3 - Add real admission control and backpressure
 
 **Problem.** `cpus` and `memory` were container limits that acted as placement
@@ -623,6 +642,25 @@ workflow now exist; a completed 24-hour soak is not recorded in
 
 **Acceptance.** The full gate demonstrates O1-O14 and O16 from a clean cluster and
 produces an auditable report tied to source and image digests.
+
+**Shipped evidence contract.** `scripts/scale_benchmark.sh` writes
+`schema_version: 2` evidence whose verdict is never rendered before the required
+measurements have been attempted. A recorded failure -- including an acceptance
+budget overrun -- no longer short-circuits the remaining collection: the
+convergence probe, the full reference grade, and the post-deployment node status
+are still measured, and a measurement that is deliberately not attempted is
+named with its reason under `skipped_measurements` rather than silently absent.
+`required_measurements.grade` is keyed to the operator's `--submissions`
+request, not to a submission count a failing run never reached.
+
+Cleanup is separated from a passing result. Recovery joins are recorded as
+`cleanup.best_effort_attempts` with their real exit codes and are never on their
+own accepted as proof that the lab is gone; a cleanup that cannot prove removal
+fails the run and appears in `result.failures`, which lists every recorded
+failure rather than only the first. When the evidence document itself cannot be
+rendered, the raw per-phase captures are preserved next to the intended output
+instead of being deleted, minus the copied manifest that carries controller
+credentials. The `--allow-destructive` acknowledgement remains mandatory.
 
 ### O16 - Complete the NIKA substrate coverage
 

@@ -115,6 +115,7 @@ if [[ "$args" == *" node check "* ]]; then
     exit 0
 fi
 if [[ "$args" == *" deploy "* ]]; then
+    sleep "${FAKE_DEPLOY_SECONDS:-0}"
     printf 'ok\n'
     exit 0
 fi
@@ -133,6 +134,10 @@ if [[ "$args" == *" destroy "* ]]; then
     exit 0
 fi
 if [[ "$args" == *" recover "* ]]; then
+    if [ "${FAKE_RECOVER_ALWAYS_FAILS:-0}" = "1" ]; then
+        printf 'lease is not recoverable\n' >&2
+        exit 1
+    fi
     cat <<'JSON'
 {"lab":"scale","nodes":{"node-a":{"phase":"committed","consistent":true,"expected_containers":0,"observed_containers":0,"expected_vnis":0,"observed_vnis":0,"expected_logical_bindings":0,"observed_logical_bindings":0,"expected_physical_trunks":0,"observed_physical_trunks":0},"node-b":{"phase":"committed","consistent":true,"expected_containers":0,"observed_containers":0,"expected_vnis":0,"observed_vnis":0,"expected_logical_bindings":0,"observed_logical_bindings":0,"expected_physical_trunks":0,"observed_physical_trunks":0}}}
 JSON
@@ -254,6 +259,114 @@ assert cleanup["attempts"]["cleanup_destroy_2"]["exit_code"] != 0
 PY
 then
     fail "benchmark recovered-empty evidence was incomplete"
+fi
+
+# A run that blows the acceptance budget must still collect every other
+# required measurement before it renders the failing verdict. Reporting a
+# budget overrun while silently skipping the reference grade and the
+# post-deployment node status leaves the next run unable to tell an overrun
+# from a lab that never came up.
+budget_evidence="${work_dir}/benchmark_budget.json"
+expect_status 1 "benchmark budget overrun" env FAKE_DEPLOY_SECONDS=2 TWINET_TOKEN=test-token \
+    bash scripts/scale_benchmark.sh --allow-destructive --binary "$fake_controller" \
+    --manifest examples/scale --deploy-budget 1s --output "$budget_evidence"
+if ! python3 - "$budget_evidence" <<'PY'
+import json
+import pathlib
+import sys
+
+report = json.loads(pathlib.Path(sys.argv[1]).read_text())
+assert report["result"]["passed"] is False, report
+assert "acceptance budget" in (report["result"]["failure"] or ""), report["result"]
+assert report["deploy"]["exit_code"] == 0, report["deploy"]
+for name in ("convergence", "reference_grade", "node_status_after_deploy"):
+    assert report["required_measurements"][name] is True, (name, report["required_measurements"])
+    assert name not in report["missing_measurements"], report["missing_measurements"]
+assert report["acceptance"]["deploy_and_convergence_seconds"] > 0, report["acceptance"]
+assert report["cleanup"]["attempted"] and report["cleanup"]["succeeded"], report["cleanup"]
+assert not report["missing_measurements"], report["missing_measurements"]
+PY
+then
+    fail "a budget overrun skipped required measurements instead of collecting them"
+fi
+
+# A cleanup that never proves the lab is gone must fail the run and stay
+# visible in the evidence even though an earlier failure already set the
+# headline verdict. Best-effort recovery joins are recorded as attempts, never
+# as a result.
+unrecoverable_evidence="${work_dir}/benchmark_unrecoverable.json"
+expect_status 1 "benchmark unrecoverable cleanup" env FAKE_DESTROY_ALWAYS_409=1 \
+    FAKE_RECOVER_ALWAYS_FAILS=1 FAKE_DEPLOY_SECONDS=2 TWINET_TOKEN=test-token \
+    bash scripts/scale_benchmark.sh --allow-destructive --binary "$fake_controller" \
+    --manifest examples/scale --deploy-budget 1s --output "$unrecoverable_evidence"
+if ! python3 - "$unrecoverable_evidence" <<'PY'
+import json
+import pathlib
+import sys
+
+report = json.loads(pathlib.Path(sys.argv[1]).read_text())
+cleanup = report["cleanup"]
+assert report["result"]["passed"] is False, report["result"]
+assert cleanup["attempted"] and not cleanup["succeeded"], cleanup
+assert "cleanup" in report["missing_measurements"], report["missing_measurements"]
+failures = report["result"]["failures"]
+assert any("acceptance budget" in f for f in failures), failures
+assert any("cleanup" in f for f in failures), failures
+assert cleanup["best_effort_attempts"], cleanup
+for name in cleanup["best_effort_attempts"]:
+    assert cleanup["attempts"][name]["exit_code"] != 0, cleanup["attempts"][name]
+PY
+then
+    fail "an unrecoverable cleanup was not reported as a distinct, visible failure"
+fi
+
+# Grading that was requested but never attempted has to stay visible. It used
+# to disappear from the schema entirely, because the required set was keyed off
+# a submission count the failing run never got as far as computing.
+requested_grade_evidence="${work_dir}/benchmark_requested_grade.json"
+mkdir -p "${work_dir}/empty_submissions/group3"
+expect_status 1 "benchmark records unattempted grading" env FAKE_DEPLOY_SECONDS=2 \
+    TWINET_TOKEN=test-token bash scripts/scale_benchmark.sh --allow-destructive \
+    --binary "$fake_controller" --manifest examples/scale --deploy-budget 1s \
+    --submissions "${work_dir}/empty_submissions" --expected-submissions 1 \
+    --compact-attestation "$fake_controller" --compact-attestation-key "$fake_controller" \
+    --expected-score-plan "$fake_controller" --output "$requested_grade_evidence"
+if ! python3 - "$requested_grade_evidence" <<'PY'
+import json
+import pathlib
+import sys
+
+report = json.loads(pathlib.Path(sys.argv[1]).read_text())
+assert report["required_measurements"]["grade"] is False, report["required_measurements"]
+assert "grade" in report["missing_measurements"], report["missing_measurements"]
+assert "grade" in report["skipped_measurements"], report["skipped_measurements"]
+assert report["skipped_measurements"]["grade"], report["skipped_measurements"]
+PY
+then
+    fail "a requested but unattempted grade phase vanished from the evidence"
+fi
+
+# If the evidence document cannot be rendered, the raw per-phase captures are
+# the only remaining record of what was measured. Deleting them would turn a
+# rendering failure into an unexplained one -- but the copied manifest carries
+# controller credentials and must not be left behind with them.
+blocked_output="${work_dir}/benchmark_blocked.json"
+mkdir -p "$blocked_output"
+expect_status 1 "benchmark preserves evidence when the report cannot be written" \
+    env TWINET_TOKEN=test-token bash scripts/scale_benchmark.sh --allow-destructive \
+    --binary "$fake_controller" --manifest examples/scale --output "$blocked_output"
+preserved="${work_dir}/benchmark_blocked.evidence"
+if [ ! -s "${preserved}/deploy.exit_code" ]; then
+    fail "a failed evidence render deleted the raw phase captures"
+fi
+if [ ! -s "${preserved}/node_status_after_cleanup.exit_code" ]; then
+    fail "a failed evidence render deleted the post-cleanup cluster observation"
+fi
+if [ -e "${preserved}/manifest" ]; then
+    fail "preserved evidence retained the copied manifest and its controller credentials"
+fi
+if find "$work_dir" -maxdepth 1 -name '.scale_benchmark.*' | grep -q .; then
+    fail "benchmark runner left its scratch directory behind after preserving evidence"
 fi
 
 submissions_dir="${work_dir}/submissions"

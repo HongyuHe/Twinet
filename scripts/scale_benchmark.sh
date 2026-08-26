@@ -254,12 +254,28 @@ if ! mkdir -p "$output_dir"; then
     printf '%s: cannot create evidence directory %s\n' "$program_name" "$output_dir" >&2
     exit 1
 fi
+absolute_path() {
+    local dir base
+    dir=$(cd -- "$(dirname -- "$1")" && pwd -P) || return 1
+    base=$(basename -- "$1")
+    printf '%s/%s\n' "$dir" "$base"
+}
+
 output_dir=$(cd "$output_dir" && pwd -P) || exit 1
-output="$(cd "$(dirname "$output")" && pwd -P)/$(basename "$output")"
+output=$(absolute_path "$output") || {
+    printf '%s: cannot resolve evidence path %s\n' "$program_name" "$output" >&2
+    exit 1
+}
 manifest_dir=$(cd "$manifest_dir" && pwd -P) || exit 1
 manifest_file="${manifest_dir}/$(basename "$manifest_file")"
-binary="$(cd "$(dirname "$binary")" && pwd -P)/$(basename "$binary")"
-convergence_rubric="$(cd "$(dirname "$convergence_rubric")" && pwd -P)/$(basename "$convergence_rubric")"
+binary=$(absolute_path "$binary") || {
+    printf '%s: cannot resolve controller binary %s\n' "$program_name" "$binary" >&2
+    exit 1
+}
+convergence_rubric=$(absolute_path "$convergence_rubric") || {
+    printf '%s: cannot resolve convergence rubric %s\n' "$program_name" "$convergence_rubric" >&2
+    exit 1
+}
 
 umask 077
 scratch_dir=$(mktemp -d "${output_dir}/.scale_benchmark.XXXXXX") || {
@@ -268,25 +284,7 @@ scratch_dir=$(mktemp -d "${output_dir}/.scale_benchmark.XXXXXX") || {
 }
 scratch_dir=$(cd "$scratch_dir" && pwd -P) || exit 1
 run_manifest_dir="${scratch_dir}/manifest"
-if ! cp -a "$manifest_dir" "$run_manifest_dir"; then
-    rm -rf "$scratch_dir"
-    printf '%s: cannot copy manifest into isolated benchmark workspace\n' "$program_name" >&2
-    exit 1
-fi
-rm -rf "${run_manifest_dir}/.twinet"
-if [ -d "${manifest_dir}/.twinet/pki" ]; then
-    if ! mkdir -p "${run_manifest_dir}/.twinet" ||
-        ! cp -a "${manifest_dir}/.twinet/pki" "${run_manifest_dir}/.twinet/pki"; then
-        rm -rf "$scratch_dir"
-        printf '%s: cannot copy controller credentials into benchmark workspace\n' "$program_name" >&2
-        exit 1
-    fi
-fi
-if [ "$(basename "$manifest_file")" = "twinet.yaml" ]; then
-    run_manifest="$run_manifest_dir"
-else
-    run_manifest="${run_manifest_dir}/$(basename "$manifest_file")"
-fi
+run_manifest="$run_manifest_dir"
 
 start_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 start_epoch_ns=$(date +%s%N)
@@ -297,6 +295,15 @@ cleanup_succeeded=0
 cleanup_recovered_empty=0
 submission_count=0
 grade_reports=""
+# Evidence identity is collected after the exit trap is installed, so every
+# field the report needs must already exist if setup fails first.
+manifest_hash=""
+source_revision=""
+git_status=""
+grade_requested=0
+if [ -n "$submissions" ]; then
+    grade_requested=1
+fi
 
 cleanup_recovery_attempts=6
 cleanup_recovery_wait=3m
@@ -309,11 +316,35 @@ for argument in "${argv[@]}"; do
 done
 command_string=${command_string% }
 
+# record_failure keeps every recorded failure, in order. A cleanup failure
+# discovered during the exit trap must stay visible even though an earlier
+# failure already set the single-line verdict.
 record_failure() {
+    printf '%s: %s\n' "$program_name" "$1" >&2
     if [ -z "$failure" ]; then
         failure=$1
-        printf '%s: %s\n' "$program_name" "$failure" >&2
     fi
+    printf '%s\n' "$1" >>"${scratch_dir}/failures"
+}
+
+# record_skipped records a required measurement that was deliberately not
+# attempted, with the reason. A verdict must never look complete merely
+# because an unattempted phase left no evidence behind.
+record_skipped() {
+    printf '%s\t%s\n' "$1" "$2" >>"${scratch_dir}/measurement_skips"
+    printf '%s: not collecting %s: %s\n' "$program_name" "$1" "$2" >&2
+}
+
+# run_best_effort runs a command whose failure is expected and is never on its
+# own evidence that anything succeeded. The exit status is recorded rather than
+# discarded, and the caller still has to prove the outcome independently.
+run_best_effort() {
+    local phase=$1
+    shift
+    local status=0
+    run_capture "$phase" "$@" || status=$?
+    printf '%s\n' "$status" >"${scratch_dir}/${phase}.best_effort"
+    return 0
 }
 
 run_capture() {
@@ -557,8 +588,13 @@ PY
 cleanup_lab() {
     local attempt phase lab_name
     local -a recover_args
-    lab_name=$(<"${scratch_dir}/lab_name")
     cleanup_attempted=1
+    if [ ! -s "${scratch_dir}/lab_name" ]; then
+        printf '%s: no lab name was recorded, so cleanup cannot target the benchmark lab\n' \
+            "$program_name" >&2
+        return 1
+    fi
+    lab_name=$(<"${scratch_dir}/lab_name")
     if run_capture cleanup_destroy_1 timeout --signal=TERM --kill-after=30s \
         "$cleanup_destroy_wait" "$binary" destroy -m "$run_manifest" --lab "$lab_name" --yes; then
         cleanup_succeeded=1
@@ -577,7 +613,12 @@ cleanup_lab() {
             phase="cleanup_recover_takeover_${attempt}"
             recover_args+=(--takeover)
         fi
-        run_capture "$phase" "${recover_args[@]}" || true
+        # Recovery is best effort: a lease that is not yet recoverable is an
+        # expected transient. Its status is recorded in the evidence, and it is
+        # never on its own accepted as proof that the lab is gone -- either a
+        # later destroy has to succeed, or the recovery report itself has to
+        # show a verified-empty inventory.
+        run_best_effort "$phase" "${recover_args[@]}"
         if recovery_inventory_is_empty "${scratch_dir}/${phase}.stdout" 2>/dev/null; then
             cleanup_recovered_empty=1
         fi
@@ -820,8 +861,12 @@ if observed_hashes != {expected_hash}:
 PY
 }
 
-manifest_hash=$(
-    python3 - "$manifest_dir" "$manifest_file" <<'PY'
+# collect_source_identity records the exact manifest and source revision the
+# run measured. It runs under the exit trap so a failure here still produces
+# an evidence record naming the measurements that were never taken.
+collect_source_identity() {
+    manifest_hash=$(
+        python3 - "$manifest_dir" "$manifest_file" <<'PY'
 import hashlib
 import pathlib
 import sys
@@ -842,21 +887,19 @@ for path in files:
     digest.update(b"\0")
 print(digest.hexdigest())
 PY
-) || {
-    rm -rf "$scratch_dir"
-    printf '%s: cannot calculate manifest fingerprint\n' "$program_name" >&2
-    exit 1
-}
-
-source_revision=$(git rev-parse HEAD 2>/dev/null) || {
-    rm -rf "$scratch_dir"
-    printf '%s: cannot determine source revision\n' "$program_name" >&2
-    exit 1
-}
-git_status=$(git status --porcelain 2>/dev/null) || {
-    rm -rf "$scratch_dir"
-    printf '%s: cannot determine source worktree state\n' "$program_name" >&2
-    exit 1
+    ) || {
+        record_failure "could not calculate the manifest fingerprint"
+        return 1
+    }
+    source_revision=$(git rev-parse HEAD 2>/dev/null) || {
+        record_failure "could not determine the source revision under test"
+        return 1
+    }
+    git_status=$(git status --porcelain 2>/dev/null) || {
+        record_failure "could not determine the source worktree state"
+        return 1
+    }
+    return 0
 }
 
 write_report() {
@@ -868,7 +911,7 @@ write_report() {
         "$start_epoch_ns" "$end_epoch_ns" "$failure" "$deployment_started" \
         "$cleanup_attempted" "$submission_count" "$grade_reports" "$convergence_as" \
         "$deploy_budget" "$grade_budget" "$allow_other_labs" "$expected_submissions" \
-        "$cleanup_succeeded" "$cleanup_recovered_empty" <<'PY'
+        "$cleanup_succeeded" "$cleanup_recovered_empty" "$grade_requested" <<'PY'
 import json
 import pathlib
 import sys
@@ -897,6 +940,7 @@ import sys
     expected_submissions,
     cleanup_succeeded,
     cleanup_recovered_empty,
+    grade_requested,
 ) = sys.argv[1:]
 
 root = pathlib.Path(scratch)
@@ -1018,9 +1062,15 @@ required = {
     "cleanup": cleanup_succeeded == "1" if cleanup_attempted == "1" else False,
     "node_status_after_cleanup": phase_ok("node_status_after_cleanup") if cleanup_attempted == "1" else False,
 }
-if submission_count != "0":
+if grade_requested == "1":
     required["grade"] = phase_ok("grade")
 missing = sorted(name for name, ok in required.items() if not ok)
+skips = {}
+for line in text("measurement_skips").splitlines():
+    name, _, reason = line.partition("\t")
+    if name:
+        skips.setdefault(name, reason)
+recorded_failures = [line for line in text("failures").splitlines() if line]
 
 grade_phase = decoded_phase("grade")
 grade = None
@@ -1041,6 +1091,7 @@ cleanup_attempts = {
     path.name.removesuffix(".exit_code"): decoded_phase(path.name.removesuffix(".exit_code"))
     for path in sorted(root.glob("cleanup_*.exit_code"))
 }
+best_effort = sorted(path.name.removesuffix(".best_effort") for path in root.glob("*.best_effort"))
 cleanup_result_phase = text("cleanup_result_phase").strip()
 
 try:
@@ -1049,7 +1100,7 @@ except ValueError:
     total_duration = None
 
 report = {
-    "schema_version": 1,
+    "schema_version": 2,
     "command": command,
     "started_at": started_at,
     "ended_at": ended_at,
@@ -1095,12 +1146,17 @@ report = {
         "recovered_empty": cleanup_recovered_empty == "1",
         "result": cleanup_attempts.get(cleanup_result_phase),
         "attempts": cleanup_attempts,
+        # Recovery joins are retries, not results. They are listed separately
+        # so a non-zero exit here is never read as a cleanup that passed.
+        "best_effort_attempts": best_effort,
     },
     "required_measurements": required,
     "missing_measurements": missing,
+    "skipped_measurements": skips,
     "result": {
         "passed": not failure and not missing,
         "failure": failure or None,
+        "failures": recorded_failures,
     },
 }
 pathlib.Path(output).write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
@@ -1109,6 +1165,7 @@ PY
 
 finish() {
     local original_status=$?
+    local preserved
     trap - EXIT INT TERM
 
     if [ "$deployment_started" -eq 1 ]; then
@@ -1124,11 +1181,24 @@ finish() {
         fi
     fi
 
-    if ! write_report; then
+    if write_report; then
+        rm -rf "$scratch_dir"
+        printf '%s: evidence written to %s\n' "$program_name" "$output" >&2
+    else
         record_failure "could not write machine-readable benchmark evidence"
+        # The raw per-phase captures are the only remaining record of what the
+        # run measured. Deleting them here would turn a rendering failure into
+        # an unexplained one, so they are kept -- minus the copied manifest,
+        # which carries controller credentials.
+        rm -rf "$run_manifest_dir"
+        preserved="${output%.json}.evidence"
+        rm -rf "$preserved"
+        if mv "$scratch_dir" "$preserved"; then
+            printf '%s: raw phase evidence preserved in %s\n' "$program_name" "$preserved" >&2
+        else
+            printf '%s: raw phase evidence remains in %s\n' "$program_name" "$scratch_dir" >&2
+        fi
     fi
-    rm -rf "$scratch_dir"
-    printf '%s: evidence written to %s\n' "$program_name" "$output" >&2
 
     if [ -n "$failure" ]; then
         exit 1
@@ -1138,6 +1208,32 @@ finish() {
 
 trap finish EXIT
 trap 'exit 130' INT TERM
+
+# Everything below can fail after evidence collection has begun, so it runs
+# with the exit trap installed: a setup failure still renders a report saying
+# which measurements were never taken.
+if ! cp -a "$manifest_dir" "$run_manifest_dir"; then
+    record_failure "could not copy the manifest into an isolated benchmark workspace"
+    exit 1
+fi
+if ! rm -rf "${run_manifest_dir}/.twinet"; then
+    record_failure "could not clear inherited controller state from the benchmark workspace"
+    exit 1
+fi
+if [ -d "${manifest_dir}/.twinet/pki" ]; then
+    if ! mkdir -p "${run_manifest_dir}/.twinet" ||
+        ! cp -a "${manifest_dir}/.twinet/pki" "${run_manifest_dir}/.twinet/pki"; then
+        record_failure "could not copy controller credentials into the benchmark workspace"
+        exit 1
+    fi
+fi
+if [ "$(basename "$manifest_file")" != "twinet.yaml" ]; then
+    run_manifest="${run_manifest_dir}/$(basename "$manifest_file")"
+fi
+
+if ! collect_source_identity; then
+    exit 1
+fi
 
 if ! run_capture binary_version "$binary" version; then
     record_failure "could not collect binary version"
@@ -1176,78 +1272,85 @@ if ! run_capture underlay_preflight "$binary" node check -m "$run_manifest"; the
 fi
 
 deployment_started=1
-if ! run_capture deploy "$binary" deploy -m "$run_manifest" --solve --quiet; then
+deploy_completed=0
+if run_capture deploy "$binary" deploy -m "$run_manifest" --solve --quiet; then
+    deploy_completed=1
+else
     record_failure "scale deployment did not converge"
-    exit 1
-fi
-if ! interval_within_budget deploy deploy "$deploy_budget"; then
-    record_failure "scale deployment exceeded the ${deploy_budget} acceptance budget"
-    exit 1
 fi
 
-if ! run_capture convergence "$binary" --json grade run -m "$run_manifest" --as "$convergence_as" \
-    --rubric "$convergence_rubric" --out "${scratch_dir}/convergence_reports" \
-    --converge-timeout "$converge_timeout"; then
-    record_failure "convergence-aware grade probe did not complete cleanly"
-    exit 1
-fi
-if ! validate_grade_probe convergence "convergence probe"; then
-    record_failure "convergence-aware grade probe did not earn strict full marks"
-    exit 1
-fi
-if ! interval_within_budget deploy convergence "$deploy_budget"; then
-    record_failure "scale deployment and convergence exceeded the ${deploy_budget} acceptance budget"
-    exit 1
+# A recorded failure below never short-circuits the remaining evidence. The
+# release verdict has to name which measurement failed *and* carry the rest of
+# the required measurements, or the next run cannot tell a budget overrun from
+# a lab that never came up.
+if [ "$deploy_completed" -eq 1 ]; then
+    if ! interval_within_budget deploy deploy "$deploy_budget"; then
+        record_failure "scale deployment exceeded the ${deploy_budget} acceptance budget"
+    fi
+
+    if ! run_capture convergence "$binary" --json grade run -m "$run_manifest" --as "$convergence_as" \
+        --rubric "$convergence_rubric" --out "${scratch_dir}/convergence_reports" \
+        --converge-timeout "$converge_timeout"; then
+        record_failure "convergence-aware grade probe did not complete cleanly"
+    elif ! validate_grade_probe convergence "convergence probe"; then
+        record_failure "convergence-aware grade probe did not earn strict full marks"
+    fi
+    if [ -r "${scratch_dir}/convergence.ended_epoch_ns" ] &&
+        ! interval_within_budget deploy convergence "$deploy_budget"; then
+        record_failure "scale deployment and convergence exceeded the ${deploy_budget} acceptance budget"
+    fi
+
+    if ! run_capture reference_grade "$binary" --json grade run -m "$run_manifest" \
+        --as "$convergence_as" --out "${scratch_dir}/reference_grade_reports" \
+        --converge-timeout "$converge_timeout"; then
+        record_failure "full reference grade did not complete cleanly"
+    elif ! validate_grade_probe reference_grade "full reference grade"; then
+        record_failure "full reference grade did not earn strict full marks"
+    fi
+else
+    # Both grade probes measure a converged lab. Running them against a
+    # deployment that never completed would burn two convergence timeouts to
+    # restate the failure already recorded, so they are recorded as skipped
+    # with the reason instead of silently missing.
+    record_skipped convergence "the scale deployment did not converge"
+    record_skipped reference_grade "the scale deployment did not converge"
 fi
 
-if ! run_capture reference_grade "$binary" --json grade run -m "$run_manifest" \
-    --as "$convergence_as" --out "${scratch_dir}/reference_grade_reports" \
-    --converge-timeout "$converge_timeout"; then
-    record_failure "full reference grade did not complete cleanly"
-    exit 1
-fi
-if ! validate_grade_probe reference_grade "full reference grade"; then
-    record_failure "full reference grade did not earn strict full marks"
-    exit 1
-fi
-
+# Post-deployment node status is collected whatever happened above: it is the
+# only record of what the cluster actually held when the run failed.
 if ! run_capture node_status_after_deploy "$binary" --json node status -m "$run_manifest"; then
     record_failure "could not collect per-node status/resources after deployment"
-    exit 1
-fi
-if ! validate_node_status "${scratch_dir}/node_status_after_deploy.stdout"; then
+elif ! validate_node_status "${scratch_dir}/node_status_after_deploy.stdout"; then
     record_failure "per-node status/resources after deployment were incomplete"
-    exit 1
 fi
 
-if [ -n "$submissions" ]; then
+if [ -n "$submissions" ] && [ -n "$failure" ]; then
+    record_skipped grade "an earlier required measurement failed: ${failure}"
+elif [ -n "$submissions" ]; then
     if ! count_submissions; then
         record_failure "could not count supplied submissions"
-        exit 1
-    fi
-    submission_count=$(cat "${scratch_dir}/submission_count")
-    grade_reports="${output%.json}.grade_reports"
-    if ! mkdir -p "$grade_reports"; then
-        record_failure "could not create grading evidence directory"
-        exit 1
-    fi
-    if ! run_capture grade "$binary" grade batch -m "$run_manifest" --submissions "$submissions" \
-        --out "$grade_reports" --parallel "$grade_parallel" --all-attempts \
-        --compact-attestation "$compact_attestation" \
-        --compact-attestation-key "$compact_attestation_key"; then
-        record_failure "batch grading did not complete without infrastructure review"
-        exit 1
-    fi
-    if ! interval_within_budget grade grade "$grade_budget"; then
-        record_failure "batch grading exceeded the ${grade_budget} acceptance budget"
-        exit 1
-    fi
-    if ! validate_grade_summary; then
-        record_failure "batch grading did not write a complete machine-readable summary"
-        exit 1
-    fi
-    if ! validate_expected_score_plan; then
-        record_failure "batch grading reports did not match compact attestation provenance and expected scores"
-        exit 1
+    else
+        submission_count=$(cat "${scratch_dir}/submission_count")
+        grade_reports="${output%.json}.grade_reports"
+        if ! mkdir -p "$grade_reports"; then
+            record_failure "could not create grading evidence directory"
+        elif ! run_capture grade "$binary" grade batch -m "$run_manifest" --submissions "$submissions" \
+            --out "$grade_reports" --parallel "$grade_parallel" --all-attempts \
+            --compact-attestation "$compact_attestation" \
+            --compact-attestation-key "$compact_attestation_key"; then
+            record_failure "batch grading did not complete without infrastructure review"
+        else
+            # The batch completed, so every grading measurement it produced is
+            # checked before the verdict, including after a budget overrun.
+            if ! interval_within_budget grade grade "$grade_budget"; then
+                record_failure "batch grading exceeded the ${grade_budget} acceptance budget"
+            fi
+            if ! validate_grade_summary; then
+                record_failure "batch grading did not write a complete machine-readable summary"
+            fi
+            if ! validate_expected_score_plan; then
+                record_failure "batch grading reports did not match compact attestation provenance and expected scores"
+            fi
+        fi
     fi
 fi

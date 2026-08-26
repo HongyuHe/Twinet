@@ -276,6 +276,86 @@ func (t *observationTracker) prune(devices map[string]bool, links map[string]boo
 	t.mu.Unlock()
 }
 
+// deviceObservation is one device's contribution to the build diff. It is
+// computed independently per device so the work can be fanned out, then merged
+// in device order.
+type deviceObservation struct {
+	state     desiredDeviceState
+	create    bool
+	recreate  bool
+	configure bool
+	ready     bool
+	capture   bool
+	semantic  bool
+}
+
+// observeDevice derives one device's desired state and dirty flags. It touches
+// no shared state beyond the tracker, whose accessors are already serialised,
+// and performs no runtime, netlink, or filesystem I/O.
+func (e *Engine) observeDevice(top *model.Topology, d *model.Device,
+	byName map[string]runtime.Container, tracker *observationTracker, modeDirty bool,
+) (deviceObservation, error) {
+	var out deviceObservation
+	state, err := e.renderDesired(d)
+	if err != nil {
+		return deviceObservation{}, err
+	}
+	state.runtime, err = e.finalRuntimeSpecs(top, d)
+	if err != nil {
+		return deviceObservation{}, err
+	}
+	out.state = state
+	container, ok := byName[d.Container]
+	primaryRecreate := !ok || container.State == runtime.StateAbsent ||
+		container.Labels[LabelSpec] != state.runtime.spec.Labels[LabelSpec] ||
+		container.Labels[LabelRuntimeContract] != runtimeSpecContractVersion
+	if e.RecoveryCompatibility && d.Kind == model.KindService {
+		primaryRecreate = true
+	}
+	specDirty := primaryRecreate || !container.State.Joinable()
+	if !specDirty && state.runtime.controlSpec != nil {
+		control, controlOK := byName[FRRControlContainer(d)]
+		specDirty = !controlOK || !control.State.Joinable() ||
+			control.Labels[LabelSpec] != state.runtime.controlSpec.Labels[LabelSpec] ||
+			control.Labels[LabelRuntimeContract] != runtimeSpecContractVersion
+	}
+	if specDirty {
+		out.create = true
+		if primaryRecreate {
+			out.recreate = true
+		}
+		if studentOwned(top, d) {
+			out.capture = true
+		}
+	}
+
+	previous, known := tracker.device(d.ID)
+	bootstrap := !specDirty && container.Labels[LabelHash] == top.Hash && d.ASN > 0
+	if !known && bootstrap && !modeDirty {
+		previous = observedDeviceState{
+			SpecHash: state.runtime.spec.Labels[LabelSpec], ConfigHash: state.configHash,
+			FileHash: state.fileHash, CommandHash: state.commandHash, ReadyHash: state.readyHash,
+		}
+		tracker.bootstrapDevice(d.ID, previous)
+		known = true
+	}
+	if e.Renderer != nil && (modeDirty || specDirty || !known || previous.ConfigHash != state.configHash ||
+		previous.FileHash != state.fileHash || previous.CommandHash != state.commandHash) {
+		out.configure = true
+		if studentOwned(top, d) {
+			out.capture = true
+		}
+	}
+	if e.Renderer != nil && e.Renderer.Ready(d, e.Runtime) != nil &&
+		(modeDirty || specDirty || out.configure || !known || previous.ReadyHash != state.readyHash) {
+		out.ready = true
+	}
+	if e.SemanticProbe != nil && !specDirty {
+		out.semantic = true
+	}
+	return out, nil
+}
+
 func (e *Engine) observeNode(ctx context.Context, top *model.Topology, devices []*model.Device) (
 	*observationTracker, map[string]desiredDeviceState, BuildDiff, error,
 ) {
@@ -332,64 +412,52 @@ func (e *Engine) observeNode(ctx context.Context, top *model.Topology, devices [
 		Capture:     map[string]bool{},
 	}
 	wantDevices := make(map[string]bool, len(devices))
-	semanticDevices := make([]*model.Device, 0, len(devices))
 	for _, d := range devices {
 		wantDevices[d.ID] = true
-		state, err := e.renderDesired(d)
+	}
+	// Rendering every device's configuration and deriving its final runtime
+	// spec is the single largest pure-CPU stage of a scale deployment, and
+	// each device is independent of every other. Fan it out and merge the
+	// results in device order, so the diff, its error, and the observation
+	// snapshot stay byte-for-byte what a sequential pass produced.
+	observations := make([]deviceObservation, len(devices))
+	_, observeErrs, ctxErr := e.runBoundedWidth(ctx, e.observationWorkers(len(devices)), len(devices),
+		func(i int) error {
+			observation, err := e.observeDevice(top, devices[i], byName, tracker, modeDirty)
+			if err != nil {
+				return err
+			}
+			observations[i] = observation
+			return nil
+		})
+	if ctxErr != nil {
+		return nil, nil, BuildDiff{}, ctxErr
+	}
+	for _, err := range observeErrs {
 		if err != nil {
 			return nil, nil, BuildDiff{}, err
 		}
-		state.runtime, err = e.finalRuntimeSpecs(top, d)
-		if err != nil {
-			return nil, nil, BuildDiff{}, err
-		}
-		desired[d.ID] = state
-		container, ok := byName[d.Container]
-		primaryRecreate := !ok || container.State == runtime.StateAbsent ||
-			container.Labels[LabelSpec] != state.runtime.spec.Labels[LabelSpec] ||
-			container.Labels[LabelRuntimeContract] != runtimeSpecContractVersion
-		if e.RecoveryCompatibility && d.Kind == model.KindService {
-			primaryRecreate = true
-		}
-		specDirty := primaryRecreate || !container.State.Joinable()
-		if !specDirty && state.runtime.controlSpec != nil {
-			control, controlOK := byName[FRRControlContainer(d)]
-			specDirty = !controlOK || !control.State.Joinable() ||
-				control.Labels[LabelSpec] != state.runtime.controlSpec.Labels[LabelSpec] ||
-				control.Labels[LabelRuntimeContract] != runtimeSpecContractVersion
-		}
-		if specDirty {
+	}
+	semanticDevices := make([]*model.Device, 0, len(devices))
+	for i, d := range devices {
+		observation := observations[i]
+		desired[d.ID] = observation.state
+		if observation.create {
 			diff.Create[d.ID] = true
-			if primaryRecreate {
-				diff.Recreate[d.ID] = true
-			}
-			if studentOwned(top, d) {
-				diff.Capture[d.ID] = true
-			}
 		}
-
-		previous, known := tracker.device(d.ID)
-		bootstrap := !specDirty && container.Labels[LabelHash] == top.Hash && d.ASN > 0
-		if !known && bootstrap && !modeDirty {
-			previous = observedDeviceState{
-				SpecHash: state.runtime.spec.Labels[LabelSpec], ConfigHash: state.configHash,
-				FileHash: state.fileHash, CommandHash: state.commandHash, ReadyHash: state.readyHash,
-			}
-			tracker.bootstrapDevice(d.ID, previous)
-			known = true
+		if observation.recreate {
+			diff.Recreate[d.ID] = true
 		}
-		if e.Renderer != nil && (modeDirty || specDirty || !known || previous.ConfigHash != state.configHash ||
-			previous.FileHash != state.fileHash || previous.CommandHash != state.commandHash) {
+		if observation.configure {
 			diff.Configure[d.ID] = true
-			if studentOwned(top, d) {
-				diff.Capture[d.ID] = true
-			}
 		}
-		if e.Renderer != nil && e.Renderer.Ready(d, e.Runtime) != nil &&
-			(modeDirty || specDirty || diff.Configure[d.ID] || !known || previous.ReadyHash != state.readyHash) {
+		if observation.ready {
 			diff.Ready[d.ID] = true
 		}
-		if e.SemanticProbe != nil && !specDirty {
+		if observation.capture {
+			diff.Capture[d.ID] = true
+		}
+		if observation.semantic {
 			semanticDevices = append(semanticDevices, d)
 		}
 	}
@@ -421,15 +489,40 @@ func (e *Engine) observeNode(ctx context.Context, top *model.Topology, devices [
 	}
 
 	wantLinks := map[string]bool{}
+	nodeLinks := make([]*model.Link, 0, len(top.Links))
 	for _, link := range top.Links {
 		if link == nil || (link.A.Device.Node != e.Node && link.B.Device.Node != e.Node) {
 			continue
 		}
 		wantLinks[link.ID] = true
-		hash, err := e.desiredWireHash(top, link)
+		nodeLinks = append(nodeLinks, link)
+	}
+	// The desired wire hash is a pure function of the topology and this
+	// engine's immutable underlay identity, so hashing every link this node
+	// touches is independent CPU work. Compute it once here; the wire steps
+	// reuse the result rather than hashing the same link a second time.
+	linkHashes := make(map[string]string, len(nodeLinks))
+	hashes := make([]string, len(nodeLinks))
+	_, hashErrs, ctxErr := e.runBoundedWidth(ctx, e.observationWorkers(len(nodeLinks)), len(nodeLinks),
+		func(i int) error {
+			hash, err := e.desiredWireHash(top, nodeLinks[i])
+			if err != nil {
+				return err
+			}
+			hashes[i] = hash
+			return nil
+		})
+	if ctxErr != nil {
+		return nil, nil, BuildDiff{}, ctxErr
+	}
+	for _, err := range hashErrs {
 		if err != nil {
 			return nil, nil, BuildDiff{}, err
 		}
+	}
+	for i, link := range nodeLinks {
+		hash := hashes[i]
+		linkHashes[link.ID] = hash
 		previous, known := tracker.link(link.ID)
 		endpointCreate := (link.A.Device.Node == e.Node && diff.Create[link.A.Device.ID]) ||
 			(link.B.Device.Node == e.Node && diff.Create[link.B.Device.ID])
@@ -451,7 +544,28 @@ func (e *Engine) observeNode(ctx context.Context, top *model.Topology, devices [
 		}
 	}
 	diff.DiffedFor = time.Since(diffStart)
+	e.setDesiredLinkHashes(linkHashes)
 	return tracker, desired, diff, nil
+}
+
+// setDesiredLinkHashes publishes the wire hashes observation already computed
+// so a wire step records the link without hashing it again.
+func (e *Engine) setDesiredLinkHashes(hashes map[string]string) {
+	e.observationMu.Lock()
+	e.desiredLinkHashes = hashes
+	e.observationMu.Unlock()
+}
+
+// observedWireHash returns the hash observation computed for a link, falling
+// back to recomputing it if observation did not record one.
+func (e *Engine) observedWireHash(top *model.Topology, link *model.Link) (string, error) {
+	e.observationMu.Lock()
+	hash, ok := e.desiredLinkHashes[link.ID]
+	e.observationMu.Unlock()
+	if ok {
+		return hash, nil
+	}
+	return e.desiredWireHash(top, link)
 }
 
 func (e *Engine) observedOverlayInventory(lab string) (netx.OverlayInventory, error) {
@@ -629,7 +743,7 @@ func (e *Engine) desiredWireHash(top *model.Topology, link *model.Link) (string,
 		}
 	}
 	if link.CrossNode() {
-		vlan, mtu, port, err := multiplexParameters(top, link.A.Device.Node, link.B.Device.Node, link.VNI)
+		vlan, mtu, port, err := e.multiplexParameters(top, link.A.Device.Node, link.B.Device.Node, link.VNI)
 		if err != nil {
 			return "", err
 		}
