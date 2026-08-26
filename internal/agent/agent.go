@@ -158,6 +158,8 @@ func Main(ctx context.Context, args []string) error {
 			"node-wide routing convergence concurrency (0 selects the measured runtime default)")
 		recoveryMaxTimeout = fs.Duration("recovery-max-timeout", MaximumRecoveryTotalTimeout,
 			"maximum workload-derived recovery duration (hard cap 2h)")
+		hostLock = fs.String("host-lock", os.Getenv("TWINET_HOST_LOCK"),
+			"process lock for exclusive ownership of this host network namespace (default /run/twinet/agent.lock)")
 		verbose = fs.Bool("verbose", false, "debug logging")
 		version = fs.Bool("version", false, "print the version and exit")
 	)
@@ -188,6 +190,14 @@ func Main(ctx context.Context, args []string) error {
 			"The agent can create privileged containers and rewire the host's networking, " +
 			"so it must never be reachable unauthenticated")
 	}
+	if strings.TrimSpace(*hostLock) == "" {
+		*hostLock = "/run/twinet/agent.lock"
+	}
+	hostLease, err := acquireHostAgentLock(*hostLock, *node, *listen, *runtimeNamespace)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = hostLease.Close() }()
 
 	s, err := New(Config{
 		Node: *node, Listen: *listen, Token: *token,

@@ -215,6 +215,15 @@ the binary that was just built:
 `--bind-underlay` narrows the agent from every interface to the fabric address
 it already announces as its own.
 
+Exactly one `twinetd` may own a host network namespace. A second process on
+another API port or in another containerd metadata namespace is **not**
+isolated: both still create and remove root-namespace veths, bridges and
+VXLANs. The agent holds `/run/twinet/agent.lock` for its process lifetime, and
+the rollout script refuses any alternate `twinetd*` process before changing a
+node. A deliberately network-namespace-isolated test agent may use a distinct
+`-host-lock` path inside that isolated environment; never use that override to
+run two agents in the same root network namespace.
+
 ## 6. Check the cluster before you deploy
 
 ```sh

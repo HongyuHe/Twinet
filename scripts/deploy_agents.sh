@@ -66,6 +66,29 @@ case "$RUNTIME_SOCKET" in
     *[[:space:]]*) echo "runtime socket must not contain whitespace" >&2; exit 2 ;;
 esac
 
+# One root network namespace has one owner. A second agent may use another API
+# port and another containerd metadata namespace, but its veths, bridges and
+# VXLANs still live in the same kernel namespace. A stale acceptance agent did
+# exactly that and repeatedly removed the active cluster's links by matching
+# deterministic VNIs. Refuse before stopping or replacing any healthy agent.
+for n in "${NODES[@]}"; do
+    if [ "$n" = "$(hostname -s)" ]; then
+        agents=$(ps -eo pid=,args=)
+    else
+        agents=$(sudo ssh -o BatchMode=yes "$n" 'ps -eo pid=,args=')
+    fi
+    agents=$(printf '%s\n' "$agents" | awk '$2 ~ /\/twinetd[^/ ]*$/ {print}')
+    bad=$(printf '%s\n' "$agents" | awk 'NF && $2 != "/usr/local/bin/twinetd" {print}')
+    primary_count=$(printf '%s\n' "$agents" |
+        awk '$2 == "/usr/local/bin/twinetd" {n++} END {print n+0}')
+    if [ -n "$bad" ] || [ "$primary_count" -gt 1 ]; then
+        echo "$n: refusing rollout because another Twinet agent shares the host network namespace:" >&2
+        printf '%s\n' "$agents" >&2
+        echo "Stop and disable every stale/alternate twinetd service first; runtime namespaces do not isolate host links." >&2
+        exit 1
+    fi
+done
+
 make build
 WANT=$(md5sum bin/twinetd | cut -d' ' -f1)
 echo "built twinetd ${WANT}"
