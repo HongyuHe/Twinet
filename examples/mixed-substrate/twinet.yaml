@@ -5,7 +5,8 @@ metadata:
   description: Typed BMv2, OpenFlow, traffic, MPLS, and delegated-Kubernetes incident substrate.
 
 images:
-  mode: development
+  mode: release
+  lock: images.lock.json
 
 defaults:
   restart: unless-stopped

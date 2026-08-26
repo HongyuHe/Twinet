@@ -1,10 +1,10 @@
 {
   "apiVersion": "twinet.dev/v1",
   "kind": "ImageLock",
-  "manifest_hash": "77f1118f2b36b78b",
-  "source_version": "v0.1.0-479-gdebfab5",
+  "manifest_hash": "26322a0da9ae995f",
+  "source_version": "v0.1.0-479-gdebfab5-dirty",
   "commit": "debfab5",
-  "generated_at": "2026-08-26T09:13:31.37666341Z",
+  "generated_at": "2026-08-26T09:15:31.215369649Z",
   "images": {
     "hyhe/twinet-bird:0.1": "hyhe/twinet-bird:0.1@sha256:7e7a80eb59add3b63395e664c377f04d2e1cbef91de873c6b3a0eb32d8f41bc0",
     "hyhe/twinet-controller:0.1": "hyhe/twinet-controller:0.1@sha256:112e73d669be47191117ad5dfd65797e18a6df9b5729d4126accaac159a67fd1",

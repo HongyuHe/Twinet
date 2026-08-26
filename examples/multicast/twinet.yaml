@@ -14,7 +14,8 @@ metadata:
     multicast forwarding tables of the routers in between.
 
 images:
-  mode: development
+  mode: release
+  lock: images.lock.json
 
 kinds:
   router:

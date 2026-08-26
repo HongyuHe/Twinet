@@ -5,7 +5,8 @@ metadata:
   description: Small distributable Clos fixture for topology, placement, and rubric validation.
 
 images:
-  mode: development
+  mode: release
+  lock: images.lock.json
 
 defaults:
   cpus: 2

@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	imagepkg "github.com/HongyuHe/twinet/internal/images"
 	"github.com/HongyuHe/twinet/internal/manifest"
 	"github.com/HongyuHe/twinet/internal/model"
 	twinetruntime "github.com/HongyuHe/twinet/internal/runtime"
@@ -123,6 +124,40 @@ func TestEveryBundledExampleUsesDocumentedClusterNodes(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestEveryBundledExamplePinsOneImmutableRelease(t *testing.T) {
+	commits := map[string]bool{}
+	for name, dir := range bundledExamples(t) {
+		t.Run(name, func(t *testing.T) {
+			loaded, err := manifest.Load(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if mode := loaded.Lab.Images.EffectiveMode(); mode != model.ImageModeRelease {
+				t.Fatalf("examples/%s image mode is %q, want release", name, mode)
+			}
+			if loaded.Lab.Images.Lock == "" {
+				t.Fatalf("examples/%s has no image lock", name)
+			}
+			lock, err := imagepkg.Load(filepath.Join(dir, loaded.Lab.Images.Lock))
+			if err != nil {
+				t.Fatalf("examples/%s image lock: %v", name, err)
+			}
+			if lock.ManifestHash == "" || lock.Commit == "" || len(lock.Images) == 0 {
+				t.Fatalf("examples/%s has incomplete release provenance: %#v", name, lock)
+			}
+			commits[lock.Commit] = true
+			for authored, resolved := range lock.Images {
+				if !strings.Contains(resolved, "@sha256:") {
+					t.Errorf("examples/%s %s is not digest-pinned: %s", name, authored, resolved)
+				}
+			}
+		})
+	}
+	if len(commits) != 1 {
+		t.Fatalf("bundled examples do not pin one release source: %v", commits)
 	}
 }
 

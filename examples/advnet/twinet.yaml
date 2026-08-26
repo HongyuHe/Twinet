@@ -10,7 +10,8 @@ metadata:
   term: fall25
 
 images:
-  mode: development
+  mode: release
+  lock: images.lock.json
 
 defaults:
   cpus: 1
