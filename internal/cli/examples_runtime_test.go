@@ -90,6 +90,42 @@ func TestEveryBundledExampleDeclaresTheClusterRuntime(t *testing.T) {
 	}
 }
 
+func TestEveryBundledExampleUsesDocumentedClusterNodes(t *testing.T) {
+	examples := bundledExamples(t)
+	canonical, err := manifest.Load(examples["cos461"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodes := map[string]model.NodeSpec{}
+	for _, node := range canonical.Lab.Placement.Nodes {
+		nodes[node.Name] = node
+	}
+	for name, dir := range examples {
+		t.Run(name, func(t *testing.T) {
+			loaded, err := manifest.Load(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, node := range loaded.Lab.Placement.Nodes {
+				want, ok := nodes[node.Name]
+				if !ok {
+					t.Errorf("examples/%s selects node %q, which the operator guide's cluster "+
+						"does not contain", name, node.Name)
+					continue
+				}
+				if node.UnderlayIP != want.UnderlayIP {
+					t.Errorf("examples/%s node %s underlay is %q, want documented %q",
+						name, node.Name, node.UnderlayIP, want.UnderlayIP)
+				}
+				if node.Addr != "" && node.Addr != want.Addr {
+					t.Errorf("examples/%s node %s agent address is %q, want documented %q",
+						name, node.Name, node.Addr, want.Addr)
+				}
+			}
+		})
+	}
+}
+
 // Docker and Podman remain usable, and remain something an operator states.
 //
 // The override is what keeps one manifest deployable on the cluster and on a
