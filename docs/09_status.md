@@ -289,6 +289,22 @@ reached students, and each motivated a permanent test.
    now walks decorator chains, and a runtime that runs split sidecars without
    being able to place them stops the deployment instead of certifying it.
 
+   Repairing the namespace turned out not to repair the router. A new namespace
+   is empty, and an address a student configured lives only in their FRR
+   configuration, so the repair depends on FRR re-applying that file. Applying
+   `interface X` / `ip address A/B` belongs to `mgmtd`, which FRR's own init
+   script starts whatever `/etc/frr/daemons` says; the containerd backend starts
+   the daemons itself and started only what the file enabled, so `mgmtd` and
+   `staticd` never ran on that backend. Every address line was refused with
+   `mgmtd is not running` while the OSPF and BGP around them were accepted, and
+   the cost was invisible for as long as the addresses an earlier deployment had
+   put in the kernel survived. Once the namespace was replaced they did not: the
+   router came back wired, supervised, holding a correct running configuration,
+   with no address on any interface and no adjacency with anyone. FRR's
+   mandatory daemons are now started on every backend and checked like any
+   other, and the containerd lifecycle gate asserts the addresses and a Full
+   OSPF neighbour after a restart repaired by an ordinary deploy.
+
 10. **A release gate that answered yes without looking.** `make ci` printed
     "all CI gates passed" while skipping the lint and the shell check whenever
     their tools were absent, which on the development machine was always.

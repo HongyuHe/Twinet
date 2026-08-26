@@ -498,6 +498,18 @@ container, and everything in it, is never touched. Event-driven and periodic
 reconcile do the same thing without being asked, and an ordinary `deploy`
 refuses to report a no-op while a sidecar is split or unprovable.
 
+Rebuilding the sidecar restores the addresses too, and that is worth stating
+because it depends on a daemon that is easy to overlook. A new namespace is
+empty: the platform re-creates the cables, but an address a student configured
+lives only in `/etc/frr/frr.conf`, and it comes back when FRR reloads that file.
+Applying `interface X` / `ip address A/B` is `mgmtd`'s work, so a router without
+`mgmtd` accepts the OSPF and BGP around those lines and refuses the addresses
+with `mgmtd is not running` — leaving a router with every cable, every routing
+daemon, a correct running configuration and no adjacency to anyone. `mgmtd` and
+`staticd` are therefore started and checked like any other daemon, on every
+backend; `twinet node controls` reports a router missing either of them as
+degraded.
+
 If a cluster mutation was interrupted — a controller killed halfway, a node
 rebooted mid-apply — the transaction is persisted and resumable:
 

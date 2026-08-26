@@ -80,7 +80,16 @@ func daemonsIn(file string) []string {
 // FRRDaemons is the /etc/frr/daemons file. Only the daemons the courses need
 // are enabled: every extra daemon is a process in every one of a thousand
 // containers.
+//
+// zebra, mgmtd and staticd are not in that trade-off. FRR starts them whatever
+// this file says, because they are not routing protocols: mgmtd owns interface
+// configuration, so without it `ip address` is refused on every router, and
+// staticd owns static routes. They are named here so that what the deployment
+// and the agent check for is what FRR actually runs -- a daemon that is started
+// but never checked is one nobody notices the absence of.
 const FRRDaemons = `zebra=yes
+mgmtd=yes
+staticd=yes
 bgpd=yes
 ospfd=yes
 ospf6d=no
@@ -101,6 +110,7 @@ vrrpd=no
 pathd=no
 
 zebra_options="  -A 127.0.0.1 -s 90000000"
+mgmtd_options="  -A 127.0.0.1"
 # The RPKI module is loaded here rather than left to the exercise: it is a
 # build-time capability of the daemon, not something a student can configure.
 # Without it the rpki commands do not exist, and a student following the

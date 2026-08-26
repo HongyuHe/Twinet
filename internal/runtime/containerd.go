@@ -1783,30 +1783,9 @@ func (c *Containerd) startFRRAttempt(ctx context.Context, name string) error {
 	if len(daemons) == 0 {
 		return nil
 	}
-	var starter strings.Builder
-	starter.WriteString("set -e\n")
-	for _, daemon := range daemons {
-		args := []string{"/usr/lib/frr/" + daemon.name, "-F", profile}
-		args = append(args, daemon.options...)
-		args = append(args, "-d")
-		for _, arg := range args {
-			starter.WriteString(shellQuote(arg))
-			starter.WriteByte(' ')
-		}
-		if daemon.name == "zebra" {
-			starter.WriteByte('\n')
-		} else {
-			starter.WriteString("&\npids=\"$pids $!\"\n")
-		}
-	}
-	starter.WriteString(`set +e
-status=0
-for pid in $pids; do wait "$pid" || status=1; done
-exit "$status"
-`)
 	logPath := filepath.Join(c.containerRoot(name), "frr-supervisor.log")
 	result, err := c.execTaskRaw(ctx, name, ExecCmd{
-		Cmd: []string{"/bin/bash", "-c", starter.String()},
+		Cmd: []string{"/bin/bash", "-c", frrStarterScript(profile, daemons)},
 	})
 	if err != nil {
 		_ = c.stopFRR(context.WithoutCancel(ctx), name)
@@ -1826,6 +1805,38 @@ exit "$status"
 		return err
 	}
 	return c.startFRRWatchdog(ctx, name, profile, daemons)
+}
+
+// frrStarterScript launches a daemon set the way FRR's init script does.
+//
+// The daemons that carry configuration are started in sequence and the routing
+// protocols in parallel. That is not a performance choice: a protocol daemon
+// registers with mgmtd and zebra as it starts, and starting them all at once
+// applies the first pass of the integrated configuration against a datastore
+// whose owner may not be listening yet.
+func frrStarterScript(profile string, daemons []frrDaemon) string {
+	var starter strings.Builder
+	starter.WriteString("set -e\n")
+	for _, daemon := range daemons {
+		args := []string{"/usr/lib/frr/" + daemon.name, "-F", profile}
+		args = append(args, daemon.options...)
+		args = append(args, "-d")
+		for _, arg := range args {
+			starter.WriteString(shellQuote(arg))
+			starter.WriteByte(' ')
+		}
+		if frrMandatoryDaemons[daemon.name] {
+			starter.WriteByte('\n')
+		} else {
+			starter.WriteString("&\npids=\"$pids $!\"\n")
+		}
+	}
+	starter.WriteString(`set +e
+status=0
+for pid in $pids; do wait "$pid" || status=1; done
+exit "$status"
+`)
+	return starter.String()
 }
 
 func (c *Containerd) waitFRRSockets(ctx context.Context, name string, daemons []frrDaemon) error {
@@ -1959,8 +1970,15 @@ func (c *Containerd) frrConfiguration(ctx context.Context, name string) (
 	if err := result.Err(); err != nil {
 		return "", nil, fmt.Errorf("read FRR daemon config for %s: %w", name, err)
 	}
+	profile, daemons := parseFRRDaemonsFile(result.Stdout)
+	return profile, daemons, nil
+}
+
+// parseFRRDaemonsFile reads /etc/frr/daemons the way FRR's own init script
+// does, and returns the daemons to start in FRR's start order.
+func parseFRRDaemonsFile(text string) (string, []frrDaemon) {
 	values := map[string]string{}
-	for _, line := range strings.Split(result.Stdout, "\n") {
+	for _, line := range strings.Split(text, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
@@ -1982,15 +2000,37 @@ func (c *Containerd) frrConfiguration(ctx context.Context, name string) (
 	}
 	var daemons []frrDaemon
 	for _, daemon := range order {
-		if values[daemon] != "yes" {
+		if values[daemon] != "yes" && !frrMandatoryDaemons[daemon] {
 			continue
 		}
 		daemons = append(daemons, frrDaemon{
 			name: daemon, options: strings.Fields(values[daemon+"_options"]),
 		})
 	}
-	return profile, daemons, nil
+	return profile, daemons
 }
+
+// frrMandatoryDaemons are the processes FRR starts whatever the daemons file
+// says. Its own init script forces them on -- tools/frrcommon.sh reads
+// `[ "$daemon" = zebra -o "$daemon" = staticd -o "$daemon" = mgmtd ] && cfg=yes`
+// -- because they are not routing protocols but the parts of FRR that make
+// configuration work at all.
+//
+// This backend starts the daemons itself rather than running that script, and
+// starting only what the file enables silently dropped two of them. mgmtd owns
+// interface configuration from FRR 9.1 on, so without it every `interface X` /
+// `ip address A/B` in a configuration is refused with "mgmtd is not running",
+// and vtysh reports the refusal on its own standard error while the daemons it
+// does reach accept the rest of the file. A router then loads its exact
+// configuration, runs a full daemon set, answers on every vty, holds the right
+// running configuration for OSPF and BGP -- and has no addresses on any
+// interface, so it forms no adjacency with anyone.
+//
+// That is invisible until a namespace is replaced. Addresses put in the kernel
+// by an earlier deployment survive every reload, so the missing daemon costs
+// nothing until the kernel state is gone and the configuration is the only copy
+// left; then the router comes back wired, supervised, configured and mute.
+var frrMandatoryDaemons = map[string]bool{"zebra": true, "mgmtd": true, "staticd": true}
 
 func (c *Containerd) frrSocketsReady(ctx context.Context, name string,
 	daemons []frrDaemon,

@@ -241,3 +241,34 @@ func daemonCheckScriptForAS(t *testing.T, as *model.AS) string {
 		"with no bgpd deploys cleanly and breaks its neighbours instead of itself")
 	return ""
 }
+
+// TestTheDaemonsFileNamesFRRsConfigurationPlane keeps the daemons file honest
+// about the processes FRR starts whatever it says.
+//
+// mgmtd owns interface configuration from FRR 9.1 on. A router without it
+// refuses every `interface X` / `ip address A/B` with "mgmtd is not running"
+// while accepting the OSPF and BGP around them, so it holds a complete and
+// correct running configuration and has no address on any interface. Nothing
+// notices until the kernel state is replaced -- a restarted container gets a
+// new network namespace -- and then the router comes back wired, supervised,
+// configured and unable to form a single adjacency.
+func TestTheDaemonsFileNamesFRRsConfigurationPlane(t *testing.T) {
+	enabled := EnabledDaemons()
+	for _, want := range []string{"zebra", "mgmtd", "staticd", "bgpd", "ospfd"} {
+		found := false
+		for _, daemon := range enabled {
+			if daemon == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("%s is not enabled in the daemons file: %v", want, enabled)
+		}
+	}
+	// And what is enabled is what a deployment refuses to finish without.
+	script := daemonCheckScript(t)
+	if !strings.Contains(script, "mgmtd") {
+		t.Fatalf("a router is deployed without checking that mgmtd runs:\n%s", script)
+	}
+}

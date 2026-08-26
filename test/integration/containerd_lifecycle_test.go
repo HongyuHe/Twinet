@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -303,7 +304,7 @@ templates:
     routers: {R1: {id: 1}, R2: {id: 2}}
     internal_links: [[R1, R2]]
 autonomous_systems:
-  - {list: [1], role: staff, template: pair}
+  - {list: [1], role: student, template: pair}
 placement:
   strategy: single-node
   runtime: containerd
@@ -385,6 +386,8 @@ placement:
 	if err != nil || result.Err() != nil || !strings.Contains(result.Stdout, "router ospf") {
 		t.Fatalf("containerd routed FRR configuration was not loaded: %+v, %v", result, err)
 	}
+	requireRoutedAddresses(t, ctx, runtime, device, "after the first apply")
+	requireFullOSPFNeighbour(t, ctx, runtime, device, "after the first apply", 90*time.Second)
 	control := deploy.FRRControlContainer(device)
 	result, err = runtime.Exec(ctx, control, rt.ExecCmd{
 		Cmd: []string{"sh", "-c", "pidof watchfrr >/dev/null && pidof ospfd && test -S /run/frr/ospfd.vty"},
@@ -429,7 +432,18 @@ placement:
 	if err != nil || result.Err() != nil {
 		t.Fatalf("containerd ready FRR restart fallback: %+v, %v", result, err)
 	}
-	assertContainerdSidecarRebindsAfterRestart(t, ctx, runtime, engine, top, device)
+	// The repair a live node performs is an ordinary deploy, not a solving
+	// one. That distinction is the whole of this fixture: solve mode re-applies
+	// every reference address on every pass and would paper over a repair that
+	// restores none of them, which is what a real teaching deployment does.
+	teaching := &deploy.Engine{
+		Runtime: timed, Node: integrationHostname(t),
+		Renderer:        render.New(top, render.ModePlatform),
+		ObservationRoot: filepath.Join(work, "observed"),
+		FRRControlRoot:  filepath.Join(work, "control"),
+		WritableRoot:    filepath.Join(work, "writable"),
+	}
+	assertContainerdSidecarRebindsAfterRestart(t, ctx, runtime, teaching, top, device)
 	if err := engine.Destroy(ctx, lab); err != nil {
 		t.Fatal(err)
 	}
@@ -673,5 +687,126 @@ func assertContainerdSidecarRebindsAfterRestart(t *testing.T, ctx context.Contex
 			t.Fatalf("the rebuilt control plane never ran OSPF on %s: %+v, %v", wired, result, err)
 		}
 		time.Sleep(500 * time.Millisecond)
+	}
+
+	// Daemons, a vty and an interface list are what the sidecar can report
+	// about itself. None of them is the control plane working. A restarted
+	// router is rewired with bare interfaces, and a student-owned address is
+	// applied by the configuration rather than by the wiring, so a repair that
+	// stops at the namespace leaves a router with every cable, every daemon and
+	// no address -- and no adjacency, which is the thing the lab is for.
+	requireRoutedAddresses(t, ctx, runtime, device, "after the sidecar repair")
+	requireFullOSPFNeighbour(t, ctx, runtime, device, "after the sidecar repair", 120*time.Second)
+}
+
+// routedAddressesPresent reports the modelled addresses a device is missing
+// from its own network namespace.
+//
+// A student-owned address is not applied by the wiring: the platform creates
+// the interface bare and the address arrives with the configuration. That makes
+// it the half of a repair that no interface listing and no daemon count can
+// stand in for -- a router with every cable, every daemon and no address is
+// indistinguishable from a healthy one until its adjacencies fail to form.
+func routedAddressesPresent(ctx context.Context, runtime rt.Runtime,
+	device *model.Device,
+) ([]string, error) {
+	result, err := runtime.Exec(ctx, device.Container,
+		rt.ExecCmd{Cmd: []string{"ip", "-o", "-4", "addr", "show"}})
+	if err != nil {
+		return nil, err
+	}
+	if err := result.Err(); err != nil {
+		return nil, err
+	}
+	var missing []string
+	for _, iface := range device.Ifaces {
+		if iface.Addr4 == "" {
+			continue
+		}
+		if !strings.Contains(result.Stdout, iface.Addr4) {
+			missing = append(missing, iface.Name+"="+iface.Addr4)
+		}
+	}
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		return missing, fmt.Errorf("%s is missing %s; it has:\n%s",
+			device.ID, strings.Join(missing, ", "), result.Stdout)
+	}
+	return nil, nil
+}
+
+func requireRoutedAddresses(t *testing.T, ctx context.Context, runtime rt.Runtime,
+	device *model.Device, stage string,
+) {
+	t.Helper()
+	deadline := time.Now().Add(90 * time.Second)
+	for {
+		missing, err := routedAddressesPresent(ctx, runtime, device)
+		if err == nil && len(missing) == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			dumpControlDiagnostics(t, ctx, runtime, device)
+			t.Fatalf("%s: %v", stage, err)
+		}
+		time.Sleep(time.Second)
+	}
+}
+
+// requireFullOSPFNeighbour waits for a routed adjacency, which is the only
+// evidence that the control plane is working rather than merely running.
+func requireFullOSPFNeighbour(t *testing.T, ctx context.Context, runtime rt.Runtime,
+	device *model.Device, stage string, wait time.Duration,
+) {
+	t.Helper()
+	control := deploy.FRRControlContainer(device)
+	deadline := time.Now().Add(wait)
+	var last string
+	for {
+		result, err := runtime.Exec(ctx, control,
+			rt.ExecCmd{Cmd: []string{"vtysh", "-c", "show ip ospf neighbor"}})
+		if err == nil && result.Err() == nil {
+			last = result.Stdout
+			if strings.Contains(result.Stdout, "Full") {
+				return
+			}
+		} else if err != nil {
+			last = err.Error()
+		}
+		if time.Now().After(deadline) {
+			dumpControlDiagnostics(t, ctx, runtime, device)
+			t.Fatalf("%s: %s has no Full OSPF neighbour after %s:\n%s",
+				stage, device.ID, wait, last)
+		}
+		time.Sleep(time.Second)
+	}
+}
+
+// dumpControlDiagnostics prints what an operator would have to collect by hand
+// from a router whose control plane is running and not working. It is read-only
+// on purpose: a probe that repairs what it is measuring destroys the evidence.
+func dumpControlDiagnostics(t *testing.T, ctx context.Context, runtime rt.Runtime,
+	device *model.Device,
+) {
+	t.Helper()
+	control := deploy.FRRControlContainer(device)
+	for _, probe := range []struct{ container, label, command string }{
+		{device.Container, "primary addresses", "ip -o addr show"},
+		{device.Container, "primary links", "ip -o link show"},
+		{device.Container, "primary frr.conf", "cat /etc/frr/frr.conf"},
+		{control, "sidecar addresses", "ip -o addr show"},
+		{control, "sidecar frr.conf", "cat /etc/frr/frr.conf"},
+		{control, "sidecar running-config", "vtysh -c 'show running-config'"},
+		{control, "sidecar processes", "ps -o pid,args 2>/dev/null || ps"},
+		{control, "sidecar reload errors", "grep -iE 'error|fail' /var/log/frr/frr-reload.log | tail -n 30"},
+		{control, "sidecar watchfrr vtysh log", "cat /tmp/twinet-vtysh-watchfrr.log 2>/dev/null || true"},
+		{control, "sidecar capabilities", "grep Cap /proc/self/status"},
+		{control, "sidecar enabled daemons", "cat /etc/frr/daemons"},
+		{control, "sidecar boot log", "cat /tmp/twinet-vtysh-boot.log 2>/dev/null || true"},
+	} {
+		result, err := runtime.Exec(ctx, probe.container,
+			rt.ExecCmd{Cmd: []string{"sh", "-c", probe.command}})
+		t.Logf("--- %s (%s): err=%v exit=%d\n%s%s", probe.label, probe.container,
+			err, result.ExitCode, result.Stdout, result.Stderr)
 	}
 }
