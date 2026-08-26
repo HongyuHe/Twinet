@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -65,7 +66,7 @@ func birdStudentLab() *model.Topology {
 // marker-delimited shell, so the helper answers that form too: the point of
 // this fixture is that the real batching path serves a BIRD device, not that
 // batching is switched off for it.
-func birdLabExec(t *testing.T, seen *[]string) func(context.Context, string, []string) (rt.ExecResult, error) {
+func birdLabExec(t *testing.T, log *commandLog) func(context.Context, string, []string) (rt.ExecResult, error) {
 	t.Helper()
 	const neighbors = `BIRD 2.0.12 ready.
 ospf4:
@@ -91,7 +92,7 @@ ebgp_ext_1_ALL BGP    ---        up     2026-08-26 06:00:12  Established
       Export updates:             11          3          2        ---          6
 `
 	return func(_ context.Context, device string, command []string) (rt.ExecResult, error) {
-		*seen = append(*seen, device+": "+strings.Join(command, " "))
+		log.record(device, command)
 		joined := strings.Join(command, " ")
 		answer := func(joined string) rt.ExecResult {
 			switch {
@@ -152,23 +153,28 @@ func emulateObservationBatch(script string, answer func(string) rt.ExecResult) r
 
 var observationMarkerRE = regexp.MustCompile(`__TWINET_OBS_[0-9a-f]+`)
 
-func birdLabEnv(t *testing.T, seen *[]string) *Env {
+func birdLabEnv(t *testing.T, log *commandLog) *Env {
 	t.Helper()
-	return &Env{Topology: birdStudentLab(), AS: 3, Exec: birdLabExec(t, seen)}
+	return &Env{Topology: birdStudentLab(), AS: 3, Exec: birdLabExec(t, log)}
 }
 
-func assertNoFRRCommandReachedBIRD(t *testing.T, commands []string) {
+// assertNoFRRCommandReachedBIRD audits every device in the student AS against
+// the shared list of FRR's own words, without having to name its routers. It
+// insists the trail is non-empty: an audit over commands that were never
+// recorded proves nothing, which is what an unsynchronised recorder silently
+// degraded into when the grader surveyed devices concurrently.
+func assertNoFRRCommandReachedBIRD(t *testing.T, log *commandLog) {
 	t.Helper()
-	for _, command := range commands {
-		device, body, _ := strings.Cut(command, ": ")
+	audited := 0
+	for _, device := range log.devices() {
 		if !strings.HasPrefix(device, "as3/") {
 			continue
 		}
-		for _, forbidden := range []string{"vtysh", "frr-reload.py", "/etc/frr"} {
-			if strings.Contains(body, forbidden) {
-				t.Fatalf("an FRR command reached the BIRD student AS: %q", command)
-			}
-		}
+		assertNoFRRCommands(t, log, device)
+		audited++
+	}
+	if audited == 0 {
+		t.Fatal("no command to the BIRD student AS was recorded, so the audit checked nothing")
 	}
 }
 
@@ -176,8 +182,8 @@ func assertNoFRRCommandReachedBIRD(t *testing.T, commands []string) {
 // -- the remaining dead time -- is published by both NOSes. It has to read the
 // same on BIRD as on FRR.
 func TestBIRDStudentASOSPFAdjacencyReadsThroughTheProvider(t *testing.T) {
-	var seen []string
-	env := birdLabEnv(t, &seen)
+	log := newCommandLog()
+	env := birdLabEnv(t, log)
 
 	timers := deadTimers(context.Background(), env)
 	if got := timers["ATL"]["int_CHI"]; got != 36000 {
@@ -192,15 +198,15 @@ func TestBIRDStudentASOSPFAdjacencyReadsThroughTheProvider(t *testing.T) {
 	if intervals := helloIntervals(context.Background(), env); len(intervals) != 0 {
 		t.Fatalf("hello intervals were read from a NOS that does not publish them: %#v", intervals)
 	}
-	assertNoFRRCommandReachedBIRD(t, seen)
+	assertNoFRRCommandReachedBIRD(t, log)
 }
 
 // A BIRD session's counters have to reach the eBGP check, or a route refresh
 // that moved them reads as one that moved nothing -- which the check reports
 // as a session "held open by a timer and carrying nothing".
 func TestBIRDStudentASBGPSessionCountersReachTheChecks(t *testing.T) {
-	var seen []string
-	env := birdLabEnv(t, &seen)
+	log := newCommandLog()
+	env := birdLabEnv(t, log)
 
 	summary, err := bgpSummary(context.Background(), env, "ATL")
 	if err != nil {
@@ -219,7 +225,52 @@ func TestBIRDStudentASBGPSessionCountersReachTheChecks(t *testing.T) {
 	if peer.MsgRcvd != 9 || peer.MsgSent != 6 {
 		t.Errorf("updates = %d received / %d sent, want 9/6", peer.MsgRcvd, peer.MsgSent)
 	}
-	assertNoFRRCommandReachedBIRD(t, seen)
+	assertNoFRRCommandReachedBIRD(t, log)
+}
+
+// The audit is only worth as much as the trail it reads. Grading fans out over
+// devices, so concurrent appends to an unguarded recorder would drop entries --
+// and a dropped entry is a forbidden command the audit silently misses, which
+// is a worse failure than a noisy one.
+func TestTheCommandAuditLosesNothingUnderConcurrency(t *testing.T) {
+	const writers, each = 16, 64
+	log := newCommandLog()
+
+	var wg sync.WaitGroup
+	for w := range writers {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := range each {
+				log.record(fmt.Sprintf("as3/R%d", w), []string{"birdc", "show", fmt.Sprint(i)})
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	if devices := log.devices(); len(devices) != writers {
+		t.Fatalf("the trail names %d devices, want %d: whole devices were lost",
+			len(devices), writers)
+	}
+	for w := range writers {
+		device := fmt.Sprintf("as3/R%d", w)
+		commands := log.forDevice(device)
+		if len(commands) != each {
+			t.Fatalf("%s recorded %d commands, want %d: entries were lost",
+				device, len(commands), each)
+		}
+		for i, command := range commands {
+			if want := fmt.Sprint(i); command[2] != want {
+				t.Fatalf("%s command %d = %q, want %q: the trail is not what ran",
+					device, i, command[2], want)
+			}
+		}
+	}
+	// What a reader gets back is its own copy, so an assertion can range over
+	// the trail while the run that produced it is still writing to it.
+	stolen := log.forDevice("as3/R0")
+	stolen[0] = []string{"vtysh", "-c", "show running-config"}
+	assertNoFRRCommandReachedBIRD(t, log)
 }
 
 // The whole rubric, run against the BIRD student AS. The vendor-neutral
@@ -227,8 +278,8 @@ func TestBIRDStudentASBGPSessionCountersReachTheChecks(t *testing.T) {
 // unsupported, with the question marked for review rather than scored as if
 // the check had never existed.
 func TestBIRDStudentASGradesTheUnchangedRubricSubset(t *testing.T) {
-	var seen []string
-	env := birdLabEnv(t, &seen)
+	log := newCommandLog()
+	env := birdLabEnv(t, log)
 
 	rubric := &Rubric{
 		Metadata: RubricMeta{Name: "mixed-student"},
@@ -281,7 +332,7 @@ func TestBIRDStudentASGradesTheUnchangedRubricSubset(t *testing.T) {
 			}
 		}
 	}
-	assertNoFRRCommandReachedBIRD(t, seen)
+	assertNoFRRCommandReachedBIRD(t, log)
 }
 
 // A check with a declared feature requirement must refuse before it runs, so

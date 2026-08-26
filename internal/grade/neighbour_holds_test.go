@@ -3,6 +3,8 @@ package grade
 import (
 	"context"
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -32,10 +34,20 @@ func (l *commandLog) forDevice(device string) [][]string {
 	return append([][]string(nil), l.cmd[device]...)
 }
 
+// devices names everything that was sent anything, so an audit can cover a
+// whole AS without being told which routers it contains.
+func (l *commandLog) devices() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return slices.Sorted(maps.Keys(l.cmd))
+}
+
 // frrOnly words are FRR's, and a device that does not run FRR does not have
-// them. They are searched for inside the whole command line because a passive
-// survey legitimately coalesces several native commands into one shell.
-var frrOnly = []string{"vtysh", "show ip bgp", "show running-config"}
+// them: the first three are how FRR is asked a question, the last two how it
+// is given a configuration. They are searched for inside the whole command
+// line because a passive survey legitimately coalesces several native
+// commands into one shell.
+var frrOnly = []string{"vtysh", "show ip bgp", "show running-config", "frr-reload.py", "/etc/frr"}
 
 func assertNoFRRCommands(t *testing.T, log *commandLog, device string) {
 	t.Helper()
