@@ -34,7 +34,11 @@ func newImagesLockCmd(opts *Options) *cobra.Command {
 		Use:   "lock",
 		Short: "Write a machine-readable lock from pushed image digests",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			top, err := loadAndPlace(opts)
+			// A lock is generated from the authored image references. Applying
+			// the old lock first turns its digest values into new source keys,
+			// so every refresh accumulates another generation of stale
+			// `tag@sha256` entries.
+			top, err := loadAndPlaceUnpinned(opts)
 			if err != nil {
 				return err
 			}

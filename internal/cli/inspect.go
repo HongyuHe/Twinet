@@ -23,6 +23,10 @@ import (
 // reported in full rather than one at a time, because a course author editing a
 // hundred-AS lab should see every problem in a single pass.
 func load(opts *Options) (*model.Topology, error) { //nolint:revive
+	return loadExpanded(opts, true)
+}
+
+func loadExpanded(opts *Options, applyImageLock bool) (*model.Topology, error) {
 	l, err := manifest.Load(opts.Manifest)
 	if err != nil {
 		return nil, err
@@ -46,8 +50,10 @@ func load(opts *Options) (*model.Topology, error) { //nolint:revive
 	for _, w := range res.Warnings {
 		fmt.Fprintln(os.Stderr, "warning: "+w)
 	}
-	if _, err := images.Apply(res.Topology); err != nil {
-		return nil, err
+	if applyImageLock {
+		if _, err := images.Apply(res.Topology); err != nil {
+			return nil, err
+		}
 	}
 	return res.Topology, nil
 }

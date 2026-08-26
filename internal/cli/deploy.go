@@ -1256,6 +1256,17 @@ func loadAndPlace(opts *Options) (*model.Topology, error) {
 	return top, nil
 }
 
+func loadAndPlaceUnpinned(opts *Options) (*model.Topology, error) {
+	top, err := loadExpanded(opts, false)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := placeWithRecord(top, false); err != nil {
+		return nil, err
+	}
+	return top, nil
+}
+
 // labPrivateDir is where the controller keeps what it knows about a lab.
 func labPrivateDir(top *model.Topology) string {
 	return filepath.Join(top.Lab.Dir, ".twinet")
