@@ -444,7 +444,7 @@ func (s *Server) commitAppliedTopology(ctx context.Context, top *model.Topology,
 	// can discard that VLAN/VNI's external FDB binding while the host veth is
 	// replaced, so re-prove and restore the complete logical carrier set
 	// before snapshotting committed inventory.
-	if err := reconcileCommitOverlays(ctx, eng, top); err != nil {
+	if err := s.reconcileCommitOverlays(ctx, eng, top, desiredMode, tx.Ungraded); err != nil {
 		return ApplyResponse{}, err
 	}
 	if err := s.verifyKnownStudentState(ctx, top, previousMode, tx.PreviousUngraded, desiredMode, tx.Ungraded); err != nil {
@@ -498,7 +498,7 @@ func (s *Server) commitAppliedTopology(ctx context.Context, top *model.Topology,
 		}
 		return nil
 	}, func() error {
-		return reconcileCommitOverlays(ctx, eng, top)
+		return s.reconcileCommitOverlays(ctx, eng, top, desiredMode, tx.Ungraded)
 	})
 	if err != nil {
 		return ApplyResponse{}, err
@@ -515,6 +515,7 @@ func (s *Server) commitAppliedTopology(ctx context.Context, top *model.Topology,
 	if err := s.finishCommittedGeneration(top.Name, fence, tx.Generation, inventory); err != nil {
 		return ApplyResponse{}, err
 	}
+	s.beginSemanticConvergenceGrace(top)
 	return resp, nil
 }
 
@@ -596,12 +597,27 @@ func retryMissingDesiredVNI(ctx context.Context, attempts int, verify, repair fu
 	return last
 }
 
-func reconcileCommitOverlays(ctx context.Context, eng *deploy.Engine, top *model.Topology) error {
+func (s *Server) reconcileCommitOverlays(ctx context.Context, eng *deploy.Engine, top *model.Topology,
+	mode render.Mode, ungraded int,
+) error {
 	report, err := eng.ReconcileOverlayBindings(ctx, top)
 	if err != nil {
 		return fmt.Errorf("reconcile overlays after semantic repair: %w", err)
 	}
 	if len(report.Failed) == 0 {
+		for _, device := range repairedLocalDevices(top, eng.Node, report.Repaired) {
+			// Recreating a missing host veth also recreates its container-side
+			// interface. The wire is healthy but its solved/student address is
+			// gone until the device contract is replayed.
+			if err := eng.ReconfigureDevice(ctx, device); err != nil {
+				return fmt.Errorf("reconfigure %s after overlay endpoint repair: %w", device.ID, err)
+			}
+			if renderModeForDevice(mode, ungraded, device) != render.ModeSolve && s.store != nil {
+				if _, err := deploy.Restore(ctx, s.rt, device, top.Name, s.store); err != nil {
+					return fmt.Errorf("restore %s after overlay endpoint repair: %w", device.ID, err)
+				}
+			}
+		}
 		return nil
 	}
 	keys := make([]string, 0, len(report.Failed))
@@ -614,6 +630,38 @@ func reconcileCommitOverlays(ctx context.Context, eng *deploy.Engine, top *model
 		failures = append(failures, key+": "+report.Failed[key])
 	}
 	return fmt.Errorf("reconcile overlays after semantic repair: %s", strings.Join(failures, "; "))
+}
+
+func repairedLocalDevices(top *model.Topology, node string, repaired []string) []*model.Device {
+	if top == nil || len(repaired) == 0 {
+		return nil
+	}
+	repairedSet := make(map[string]bool, len(repaired))
+	for _, id := range repaired {
+		repairedSet[id] = true
+	}
+	byID := map[string]*model.Device{}
+	for _, link := range top.Links {
+		if link == nil || !link.CrossNode() || !repairedSet[fmt.Sprintf("vni:%d", link.VNI)] {
+			continue
+		}
+		switch node {
+		case link.A.Device.Node:
+			byID[link.A.Device.ID] = link.A.Device
+		case link.B.Device.Node:
+			byID[link.B.Device.ID] = link.B.Device
+		}
+	}
+	ids := make([]string, 0, len(byID))
+	for id := range byID {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	out := make([]*model.Device, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, byID[id])
+	}
+	return out
 }
 
 func addApplyFailure(resp *ApplyResponse, scope string, err error) {
@@ -770,6 +818,7 @@ func (s *Server) rollbackPreparedApply(ctx context.Context, lab string, fence Fe
 		}
 		s.mu.Lock()
 		delete(s.current, lab)
+		delete(s.semanticGraceUntil, lab)
 		delete(s.modes, lab)
 		delete(s.ungraded, lab)
 		delete(s.peers, lab)
@@ -849,7 +898,11 @@ func (s *Server) rollbackPreparedApply(ctx context.Context, lab string, fence Fe
 	}
 	s.peers[lab] = oldWire.PeerUnderlay
 	s.mu.Unlock()
-	return s.restoreOverlayClaims(lab, fence, overlayVNIsOnNode(oldTop, s.cfg.Node))
+	if err := s.restoreOverlayClaims(lab, fence, overlayVNIsOnNode(oldTop, s.cfg.Node)); err != nil {
+		return err
+	}
+	s.beginSemanticConvergenceGrace(oldTop)
+	return nil
 }
 
 func (s *Server) restoreOverlayClaims(lab string, fence Fence, oldVNIs []uint32) error {

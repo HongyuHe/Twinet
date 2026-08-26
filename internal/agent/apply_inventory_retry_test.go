@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/HongyuHe/twinet/internal/model"
 )
 
 func TestCommitInventoryRepairsAndResnapshotsAMissingVNI(t *testing.T) {
@@ -69,5 +71,21 @@ func TestCommitInventorySurfacesOverlayRepairFailure(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "desired VNI 9 is absent") ||
 		!strings.Contains(err.Error(), "netlink unavailable") {
 		t.Fatalf("error = %v, want inventory and repair failures", err)
+	}
+}
+
+func TestRepairedOverlayDevicesAreDeduplicatedAndLocal(t *testing.T) {
+	a := &model.Device{ID: "as3/CHI", Node: "node-2"}
+	b := &model.Device{ID: "as140/FABRIC", Node: "node-0"}
+	c := &model.Device{ID: "as3/SFO", Node: "node-2"}
+	d := &model.Device{ID: "as29/MSP", Node: "node-1"}
+	top := &model.Topology{Links: []*model.Link{
+		{VNI: 100, A: &model.Iface{Device: a}, B: &model.Iface{Device: b}},
+		{VNI: 101, A: &model.Iface{Device: c}, B: &model.Iface{Device: d}},
+		{VNI: 102, A: &model.Iface{Device: a}, B: &model.Iface{Device: d}},
+	}}
+	got := repairedLocalDevices(top, "node-2", []string{"vni:102", "vni:100"})
+	if len(got) != 1 || got[0].ID != a.ID {
+		t.Fatalf("repaired local devices = %#v, want only %s", got, a.ID)
 	}
 }

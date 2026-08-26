@@ -343,6 +343,11 @@ type Server struct {
 	// converge or stop and say so, rather than retry for ever.
 	semanticCycles map[string]int
 	repairTerminal map[string]string
+	// semanticGraceUntil prevents ordinary distributed routing convergence
+	// from being mistaken for locally repairable drift immediately after a
+	// commit or agent restart. Local interface/address defects remain
+	// actionable during this window.
+	semanticGraceUntil map[string]time.Time
 	// overlayBindingRepair is a test-only seam for the cross-node binding
 	// half of a semantic repair, which otherwise needs host netlink.
 	overlayBindingRepair func(context.Context, *model.Topology, *model.Device) (deploy.OverlayRepairReport, error)
@@ -427,16 +432,17 @@ func New(cfg Config) (*Server, error) {
 		tools:     integrity.NewChecker(engine).Verify,
 		toolsSeen: map[string]toolsVerdict{},
 
-		repairFails:      map[string]int{},
-		repairNext:       map[string]time.Time{},
-		semanticCycles:   map[string]int{},
-		repairTerminal:   map[string]string{},
-		exempt:           map[string]*exemptions{},
-		partial:          map[string]int{},
-		lastCapture:      map[string]time.Time{},
-		durabilityBusy:   map[string]bool{},
-		durabilityCancel: map[string]context.CancelFunc{},
-		peerHealth:       map[string]PeerReplicationStatus{},
+		repairFails:        map[string]int{},
+		repairNext:         map[string]time.Time{},
+		semanticCycles:     map[string]int{},
+		repairTerminal:     map[string]string{},
+		semanticGraceUntil: map[string]time.Time{},
+		exempt:             map[string]*exemptions{},
+		partial:            map[string]int{},
+		lastCapture:        map[string]time.Time{},
+		durabilityBusy:     map[string]bool{},
+		durabilityCancel:   map[string]context.CancelFunc{},
+		peerHealth:         map[string]PeerReplicationStatus{},
 	}
 	if source, ok := interface{}(engine).(rt.EventSource); ok {
 		srv.eventSource = source
@@ -514,6 +520,7 @@ func (s *Server) rehydrate() {
 			continue
 		}
 		s.current[top.Name] = top
+		s.beginSemanticConvergenceGrace(top)
 		state := s.generations[top.Name]
 		if wt.Generation != "" {
 			// topology.json is atomically written with its generation, so it

@@ -1437,8 +1437,16 @@ func (s *Server) observeDevice(ctx context.Context, lab string, d *model.Device,
 		}
 	}
 	if reason := s.semanticReason(ctx, lab, d); reason != "" {
+		fullReason := "network semantics drifted: " + reason
+		if !s.semanticDriftActionable(lab, fullReason) {
+			// The runtime, interfaces, addresses, and daemons above are all
+			// locally sound. Remote routes and sessions are allowed to form
+			// after a commit without an agent repeatedly reloading healthy
+			// routers and resetting the very convergence it is observing.
+			return deviceObservation{Health: healthHealthy, State: c.State, SpecMatches: specMatches}
+		}
 		return deviceObservation{Health: healthBroken, State: c.State, SpecMatches: specMatches,
-			Reason: "network semantics drifted: " + reason}
+			Reason: fullReason}
 	}
 	return deviceObservation{Health: healthHealthy, State: c.State, SpecMatches: specMatches}
 }
