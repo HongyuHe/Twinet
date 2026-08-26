@@ -31,6 +31,12 @@ type coordinationStub struct {
 	didBlock      bool
 	commitStarted chan<- string
 	releaseCommit <-chan struct{}
+	// failFinalize and staleRecovery break the two stages that run only after
+	// every node has acknowledged commit.
+	failFinalize  bool
+	staleRecovery bool
+	// failApply breaks a stage that runs before any node commits.
+	failApply bool
 }
 
 func newCoordinationStub(name string, order *[]string) *coordinationStub {
@@ -142,10 +148,16 @@ func (s *coordinationStub) handler(w http.ResponseWriter, r *http.Request) {
 		lab := r.URL.Query().Get("lab")
 		s.mu.Lock()
 		generation := s.generations[lab]
+		stale := s.staleRecovery
 		s.mu.Unlock()
 		phase := "idle"
 		if generation != "" {
 			phase = "committed"
+		}
+		if stale {
+			write(agent.RecoveryStatus{Lab: lab, Phase: phase, Generation: generation,
+				Consistent: false, Error: "inventory does not match the committed generation"})
+			return
 		}
 		write(agent.RecoveryStatus{Lab: lab, Phase: phase, Generation: generation, Consistent: true})
 	case "/v1/destroy":
@@ -179,6 +191,11 @@ func (s *coordinationStub) handler(w http.ResponseWriter, r *http.Request) {
 			}
 			s.prepared[req.Lab] = req.Generation
 		case "apply":
+			if s.failApply {
+				s.mu.Unlock()
+				fail(http.StatusInternalServerError, fmt.Errorf("%s could not create a container", s.name))
+				return
+			}
 			if s.prepared[req.Lab] != req.Generation {
 				s.mu.Unlock()
 				fail(http.StatusConflict, fmt.Errorf("not prepared"))
@@ -219,6 +236,11 @@ func (s *coordinationStub) handler(w http.ResponseWriter, r *http.Request) {
 			write(agent.ApplyResponse{Node: s.name, Generation: req.Generation, Phase: req.Phase})
 			return
 		case "finalize":
+			if s.failFinalize {
+				s.mu.Unlock()
+				fail(http.StatusInternalServerError, fmt.Errorf("%s could not prune the previous generation", s.name))
+				return
+			}
 			delete(s.prepared, req.Lab)
 		case "abort":
 			delete(s.prepared, req.Lab)

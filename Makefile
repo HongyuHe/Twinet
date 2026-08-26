@@ -11,7 +11,20 @@ COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo none)
 SOURCE_DIGEST_REQUESTED := $(strip $(SOURCE_DIGEST))
 SOURCE_DIGEST_COMPUTED := $(shell python3 "$(CURDIR)/scripts/source_digest.py" --root "$(CURDIR)" 2>/dev/null)
 override SOURCE_DIGEST := $(SOURCE_DIGEST_COMPUTED)
-DATE    ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+# Build metadata must not depend on when the build ran. Stamping the wall clock
+# meant two builds of one tree produced different bytes, so a release could
+# only assert its provenance and never let anyone check it: the obvious test --
+# rebuild and compare -- failed by construction. SOURCE_DATE_EPOCH is the
+# cross-ecosystem convention for this; the commit's own timestamp is the next
+# deterministic answer, and a tree with no Git metadata at all falls back to
+# the epoch rather than to "now".
+#
+# The date is provenance, not identity. What a binary was built from is
+# SourceDigest, which is content-addressed over the build inputs and remains
+# exact for a dirty worktree and for a source tarball.
+SOURCE_DATE_EPOCH ?= $(shell git log -1 --pretty=%ct 2>/dev/null || echo 0)
+DATE ?= $(shell date -u -d "@$(SOURCE_DATE_EPOCH)" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || \
+	date -u -r "$(SOURCE_DATE_EPOCH)" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)
 LDFLAGS := -s -w \
 	-X github.com/HongyuHe/twinet/internal/cli.Version=$(VERSION) \
 	-X github.com/HongyuHe/twinet/internal/cli.Commit=$(COMMIT) \
@@ -314,6 +327,7 @@ script-tests:
 	bash scripts/test_remote_image_digest.sh
 	bash scripts/test_push_images.sh
 	bash scripts/test_source_digest.sh
+	bash scripts/test_reproducible_build.sh
 	python3 contrib/nika/test_kubernetes_bridge.py
 
 # Cluster evidence is never part of ordinary CI: it mutates a real cluster and

@@ -394,6 +394,54 @@ func transactionFailure(nodes []*Node, values map[string]agent.ApplyResponse, ca
 	return out
 }
 
+// ErrCommitted marks a failure that happened after every node acknowledged
+// commit. Callers test for it rather than reading the message, because what an
+// operator must do about it is the opposite of a pre-commit failure: the new
+// generation is live and durable, so redeploying from scratch or discarding the
+// placement record would be wrong.
+var ErrCommitted = errors.New("the cluster mutation is committed and durable")
+
+// postCommitFailure reports a mutation whose commit succeeded everywhere but
+// whose finalization or post-commit verification did not.
+//
+// Reporting "did not commit" here was false in the way that matters. Commit is
+// fanned out to every node and returns only when all of them acknowledge it;
+// nothing after that point rolls the generation back. An operator told the
+// mutation had not committed would redeploy work that is already running, and
+// would throw away the placement record that says where it is. What actually
+// remains unproven is the cleanup pass or the inventory verification, and the
+// answer to that is to look at the node, not to deploy again.
+func postCommitFailure(nodes []*Node, values map[string]agent.ApplyResponse, stage string,
+	cause error,
+) []NodeResult[agent.ApplyResponse] {
+	out := make([]NodeResult[agent.ApplyResponse], 0, len(nodes))
+	for _, node := range nodes {
+		out = append(out, NodeResult[agent.ApplyResponse]{
+			Node: node.Name, Value: values[node.Name],
+			Err: fmt.Errorf("%w on every node, but %s did not complete, so nothing was rolled "+
+				"back and the new generation is live: %w", ErrCommitted, stage, cause),
+		})
+	}
+	return out
+}
+
+// CommittedResults reports whether every failure in a set of node results is a
+// post-commit one. A single pre-commit failure makes the whole transaction a
+// non-commit, so this is deliberately an "all", not an "any".
+func CommittedResults(results []NodeResult[agent.ApplyResponse]) bool {
+	failed := false
+	for _, r := range results {
+		if r.Err == nil {
+			continue
+		}
+		failed = true
+		if !errors.Is(r.Err, ErrCommitted) {
+			return false
+		}
+	}
+	return failed
+}
+
 func responseFailure(resp agent.ApplyResponse) error {
 	if len(resp.Failures) == 0 {
 		return nil
@@ -644,17 +692,18 @@ func (c *Cluster) coordinatedApplyWithLeaseTimed(ctx context.Context, top *model
 		return nil
 	}); err != nil {
 		// Every node acknowledged commit before finalization begins. Do not
-		// roll that complete generation back merely because cleanup failed.
-		return transactionFailure(nodes, values, err)
+		// roll that complete generation back merely because cleanup failed,
+		// and do not describe it as a mutation that did not commit.
+		return postCommitFailure(nodes, values, "finalization", err)
 	}
 
 	if err := measure("recovery_verify", func() error {
 		return c.verifyCommittedRecovery(lease.Context(), top.Name, generation)
 	}); err != nil {
-		return transactionFailure(nodes, values, err)
+		return postCommitFailure(nodes, values, "post-commit inventory verification", err)
 	}
 	if err := lease.Err(); err != nil {
-		return transactionFailure(nodes, values,
+		return postCommitFailure(nodes, values, "the fenced mutation lease",
 			c.recoverFailedApply(ctx, lease, top.Name, err))
 	}
 

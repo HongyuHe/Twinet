@@ -3,6 +3,8 @@
 /dist/
 *.test
 *.out
+# Scratch trees for the repeat-build reproducibility check, removed on exit.
+/.reproducible-build.*
 
 # Lab runtime state
 /labs/*/state/

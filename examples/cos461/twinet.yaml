@@ -190,7 +190,20 @@ access:
   legacy_ports: {enabled: true, base: 2000}
 
 placement:
-  strategy: pack-by-as
+  # The guide's canonical walkthrough says this lab is deployed across the
+  # three nodes, and it has to be true of the lab as shipped rather than of a
+  # cluster somebody edited. Under `pack-by-as` it was not: on the measured
+  # three-worker cluster every one of the 212 containers and all twelve ASes
+  # landed on node-0, no link crossed the fabric, and the documented run
+  # therefore exercised no overlay path at all while every graded exec queued
+  # behind one agent.
+  #
+  # `spread-by-as` trades no imbalance for locality, so the answer does not
+  # depend on how much headroom a particular cluster happens to report. AS
+  # locality is preserved either way: both strategies walk the peering graph
+  # and keep an autonomous system whole on one node, so no intra-AS link
+  # becomes a tunnel and the course semantics are unchanged.
+  strategy: spread-by-as
   # The engine every node of this lab runs on, stated rather than inherited.
   # An omitted selection means Docker for compatibility with manifests older
   # than the runtime registry, which does not deploy on the containerd cluster

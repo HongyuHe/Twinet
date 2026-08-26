@@ -19,7 +19,12 @@ var (
 	// inputs. Unlike Version/git-describe and Commit it is independent of Git
 	// tags and remains available in source release tarballs.
 	SourceDigest = "none"
-	Date         = "unknown"
+	// Date is the source's own timestamp, not the moment of the build. It is
+	// derived from SOURCE_DATE_EPOCH or the commit, because a wall clock in
+	// the binary makes two builds of one tree differ and turns provenance into
+	// something that can only be asserted. What the binary was built from is
+	// SourceDigest.
+	Date = "unknown"
 )
 
 // Options are the flags shared by every subcommand.
@@ -102,7 +107,8 @@ func newVersionCmd() *cobra.Command {
 		Use:   "version",
 		Short: "Print the twinet version",
 		Run: func(cmd *cobra.Command, _ []string) {
-			fmt.Fprintf(cmd.OutOrStdout(), "twinet %s (commit %s, built %s)\n", Version, Commit, Date)
+			fmt.Fprintf(cmd.OutOrStdout(), "twinet %s (commit %s, source %s, source date %s)\n",
+				Version, Commit, SourceDigest, Date)
 		},
 	}
 }

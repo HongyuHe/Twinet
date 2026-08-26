@@ -292,10 +292,8 @@ after a partial failure, a reboot, or a topology edit.`,
 					return deployErr
 				})
 				if deployErr != nil {
-					if !dryRun {
-						if discardErr := place.DiscardStagedRecord(labPrivateDir(top)); discardErr != nil {
-							return fmt.Errorf("%w; also could not discard uncommitted placement: %v", deployErr, discardErr)
-						}
+					if err := settleStagedRecord(labPrivateDir(top), deployErr, dryRun); err != nil {
+						return err
 					}
 					return deployErr
 				}
@@ -1400,6 +1398,34 @@ func loadAndPlaceUnpinned(opts *Options) (*model.Topology, error) {
 // labPrivateDir is where the controller keeps what it knows about a lab.
 func labPrivateDir(top *model.Topology) string {
 	return filepath.Join(top.Lab.Dir, ".twinet")
+}
+
+// settleStagedRecord decides what becomes of a staged placement when a
+// deployment fails.
+//
+// The two failures are opposites. Before commit nothing was applied, so the
+// staged assignment describes a lab that does not exist and must be discarded
+// or the next command would route to it. After commit the new generation is
+// live on every node and nothing rolled it back, so discarding the staged
+// assignment would throw away the only record of where that running lab is,
+// and every later exec, grade, save, or destroy would look for its containers
+// on the machines the previous deployment used. Both were treated as "did not
+// commit".
+func settleStagedRecord(dir string, deployErr error, dryRun bool) error {
+	if dryRun || deployErr == nil {
+		return nil
+	}
+	if errors.Is(deployErr, client.ErrCommitted) {
+		if err := place.CommitStagedRecord(dir); err != nil {
+			return fmt.Errorf("%w; the committed placement could not be recorded either: %v",
+				deployErr, err)
+		}
+		return nil
+	}
+	if err := place.DiscardStagedRecord(dir); err != nil {
+		return fmt.Errorf("%w; also could not discard uncommitted placement: %v", deployErr, err)
+	}
+	return nil
 }
 
 // placeWithRecord places the topology, honouring the record of where the lab

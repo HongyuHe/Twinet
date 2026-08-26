@@ -97,6 +97,12 @@ type NodeInventory struct {
 	Reserved      Resources            `json:"reserved"`
 	ReservedByLab map[string]Resources `json:"reserved_by_lab,omitempty"`
 	Unknown       []string             `json:"unknown,omitempty"`
+	// Unlimited names the dimensions the node's kernel imposes no ceiling on,
+	// in the same vocabulary strict admission uses to report a missing one.
+	// It is not the same as unknown: an unknown dimension is refused because
+	// it is neither zero nor unlimited, whereas this one is known, and known
+	// to constrain nothing.
+	Unlimited []string `json:"unlimited,omitempty"`
 }
 
 // TopologyDemandByNode returns the requests of the topology as currently
@@ -207,7 +213,9 @@ func budgetDemand(b model.Budget) demand {
 // effectiveCapacityOf takes the minimum of the optional manifest upper bound
 // and observed allocatable capacity. A missing value stays missing so strict
 // admission can name uncertainty instead of silently treating it as zero or
-// infinity.
+// infinity. A dimension the node reports as unlimited is neither: it is known,
+// and known to bound nothing, so it is left unconstrained rather than added to
+// the missing set that strict admission refuses on.
 func effectiveCapacityOf(n model.NodeSpec, reserve map[string]model.Budget,
 	inv *NodeInventory,
 ) (demand, bool, []string) {
@@ -216,8 +224,12 @@ func effectiveCapacityOf(n model.NodeSpec, reserve map[string]model.Budget,
 		declared = n.Capacity
 	}
 	var live Capacity
+	unlimited := map[string]bool{}
 	if inv != nil {
 		live = inv.Allocatable
+		for _, name := range inv.Unlimited {
+			unlimited[name] = true
+		}
 	}
 
 	var (
@@ -229,7 +241,9 @@ func effectiveCapacityOf(n model.NodeSpec, reserve map[string]model.Budget,
 		okDeclared := declared > 0
 		okLive := live != nil
 		if !okDeclared && !okLive {
-			missing = append(missing, name)
+			if !unlimited[name] {
+				missing = append(missing, name)
+			}
 			return 0
 		}
 		have = true
@@ -246,7 +260,9 @@ func effectiveCapacityOf(n model.NodeSpec, reserve map[string]model.Budget,
 		okDeclared := declared > 0
 		okLive := live != nil
 		if !okDeclared && !okLive {
-			missing = append(missing, name)
+			if !unlimited[name] {
+				missing = append(missing, name)
+			}
 			return 0
 		}
 		have = true
@@ -266,7 +282,9 @@ func effectiveCapacityOf(n model.NodeSpec, reserve map[string]model.Budget,
 		okDeclared := declared > 0
 		okLive := live != nil
 		if !okDeclared && !okLive {
-			missing = append(missing, name)
+			if !unlimited[name] {
+				missing = append(missing, name)
+			}
 			return 0
 		}
 		have = true
@@ -299,26 +317,32 @@ func effectiveCapacityOf(n model.NodeSpec, reserve map[string]model.Budget,
 	// A nil source is unknown and appears in missing. A known zero is
 	// exhausted, not unspecified: encode it as a negative sentinel so fits
 	// can reject a positive request instead of silently skipping the
-	// dimension's zero-value convention.
-	if !containsString(missing, "containers") && out.Containers == 0 {
+	// dimension's zero-value convention. A dimension the node reports as
+	// unlimited is a third thing again: it must keep the zero that fits and
+	// pressure read as "does not constrain", or an unbounded kernel limit
+	// would be encoded as an exhausted one and refuse every request.
+	exhausted := func(name string) bool {
+		return !containsString(missing, name) && !unlimited[name]
+	}
+	if exhausted("containers") && out.Containers == 0 {
 		out.Containers = -1
 	}
-	if !containsString(missing, "cpu") && out.CPUs == 0 {
+	if exhausted("cpu") && out.CPUs == 0 {
 		out.CPUs = -1
 	}
-	if !containsString(missing, "memory") && out.MemoryBytes == 0 {
+	if exhausted("memory") && out.MemoryBytes == 0 {
 		out.MemoryBytes, out.MemBytes = -1, -1
 	}
-	if !containsString(missing, "ephemeral storage") && out.DiskBytes == 0 {
+	if exhausted("ephemeral storage") && out.DiskBytes == 0 {
 		out.DiskBytes = -1
 	}
-	if !containsString(missing, "pids") && out.Pids == 0 {
+	if exhausted("pids") && out.Pids == 0 {
 		out.Pids = -1
 	}
-	if !containsString(missing, "file descriptors") && out.FileDescriptors == 0 {
+	if exhausted("file descriptors") && out.FileDescriptors == 0 {
 		out.FileDescriptors = -1
 	}
-	if !containsString(missing, "netdevs") && out.NetDevices == 0 {
+	if exhausted("netdevs") && out.NetDevices == 0 {
 		out.NetDevices = -1
 	}
 	sort.Strings(missing)

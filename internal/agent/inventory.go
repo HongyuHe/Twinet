@@ -77,6 +77,17 @@ type HostInventory struct {
 	NetworkDevice NetworkDeviceInventory       `json:"network_devices"`
 	ImageCache    ImageCacheInventory          `json:"image_cache"`
 	Unknown       []string                     `json:"unknown,omitempty"`
+	// Unlimited names the dimensions the kernel imposes no ceiling on. It is a
+	// third state, and it must not be collapsed into either of the other two.
+	//
+	// A host with fs.file-max at LONG_MAX was reported as 8301034833169298227
+	// allocatable file descriptors: a request budget nine tenths of the way to
+	// the end of a signed 64-bit integer, printed as though a lab could ask for
+	// it. Calling that unknown instead would be just as wrong in the other
+	// direction, because strict admission refuses an unknown dimension and the
+	// documented deployment would stop on a host that in fact constrains
+	// nothing.
+	Unlimited []string `json:"unlimited,omitempty"`
 }
 
 type cpuSample struct {
@@ -148,6 +159,12 @@ func (o *hostInventoryObserver) observe(stateDir string, containers []rt.Contain
 	markUnknown := func(names ...string) {
 		for _, name := range names {
 			unknown[name] = true
+		}
+	}
+	unlimited := map[string]bool{}
+	markUnlimited := func(names ...string) {
+		for _, name := range names {
+			unlimited[name] = true
 		}
 	}
 
@@ -228,10 +245,17 @@ func (o *hostInventoryObserver) observe(stateDir string, containers []rt.Contain
 		markUnknown("used.pids")
 	}
 
-	fdLimit := readInt64(o.readFile, "/proc/sys/fs/file-max")
-	if fdLimit == nil {
+	fdLimit, fdUnlimited := hostFileLimit(o.readFile)
+	switch {
+	case fdUnlimited:
+		// The kernel is saying "no system-wide ceiling", not a number. Turning
+		// RLIM_INFINITY into a reservation budget produced ~8.3e18 allocatable
+		// descriptors on this cluster; the honest report is that this
+		// dimension does not constrain admission at all.
+		markUnlimited("physical.file_descriptors", "allocatable.file_descriptors")
+	case fdLimit == nil:
 		markUnknown("physical.file_descriptors", "allocatable.file_descriptors")
-	} else {
+	default:
 		inv.Physical.FileDescriptors = int64Ptr(*fdLimit)
 		inv.Allocatable.FileDescriptors = int64Ptr(reserveCount(*fdLimit, 1024))
 	}
@@ -248,13 +272,15 @@ func (o *hostInventoryObserver) observe(stateDir string, containers []rt.Contain
 		count := int64(len(ifaces))
 		inv.Used.NetDevices = int64Ptr(count)
 		inv.NetworkDevice.Count = int64Ptr(count)
-		if fdLimit != nil {
+		if fdLimit != nil || fdUnlimited {
 			// A netdev carries queues, namespace bookkeeping, and file-backed
 			// handles. The kernel has no portable netdev-count ceiling, so use
-			// the conservative lower of 5000 and one eighth of handle capacity.
-			limit := *fdLimit / 8
-			if limit > 5000 {
-				limit = 5000
+			// the conservative lower of 5000 and one eighth of handle
+			// capacity. An unbounded handle capacity bounds nothing, so the
+			// conservative constant is the whole answer.
+			limit := int64(5000)
+			if fdLimit != nil && *fdLimit/8 < limit {
+				limit = *fdLimit / 8
 			}
 			if limit < count+64 {
 				limit = count + 64
@@ -328,6 +354,10 @@ func (o *hostInventoryObserver) observe(stateDir string, containers []rt.Contain
 		inv.Unknown = append(inv.Unknown, name)
 	}
 	sortStrings(inv.Unknown)
+	for name := range unlimited {
+		inv.Unlimited = append(inv.Unlimited, name)
+	}
+	sortStrings(inv.Unlimited)
 	return inv
 }
 
@@ -638,6 +668,34 @@ func readInt64(readFile func(string) ([]byte, error), path string) *int64 {
 		return nil
 	}
 	return int64Ptr(n)
+}
+
+// hostFileLimit reads the system-wide file-handle ceiling, and says separately
+// whether the kernel declared one at all.
+//
+// fs.file-max is a long, and a host that imposes no ceiling reports LONG_MAX.
+// Treating that as a quantity is what produced an allocatable budget of
+// 8301034833169298227 descriptors: an arithmetic artefact of reserving a tenth
+// of the largest representable number, offered to operators as though a lab
+// could request it. The threshold matches readLimit's, so a cgroup "no limit"
+// and a sysctl "no limit" are recognised the same way.
+func hostFileLimit(readFile func(string) ([]byte, error)) (*int64, bool) {
+	raw, err := readFile("/proc/sys/fs/file-max")
+	if err != nil {
+		return nil, false
+	}
+	text := strings.TrimSpace(string(raw))
+	if text == "" || text == "max" {
+		return nil, text == "max"
+	}
+	n, err := strconv.ParseInt(text, 10, 64)
+	if err != nil || n <= 0 {
+		return nil, false
+	}
+	if n > math.MaxInt64/2 {
+		return nil, true
+	}
+	return int64Ptr(n), false
 }
 
 func processCount(readDir func(string) ([]os.DirEntry, error)) (int64, error) {

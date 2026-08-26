@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -121,7 +122,8 @@ func newNodeCmd(opts *Options) *cobra.Command {
 				fmt.Fprintf(w, "%s\t%s\t%s\t%s %s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 					r.Node, state, v.Version, v.Runtime, v.RuntimeVer, contractSummary(v.Compatibility),
 					dash(v.RuntimeSocket),
-					inventorySummary(v.Inventory.Allocatable), inventorySummary(v.Inventory.Reserved),
+					inventorySummary(v.Inventory.Allocatable, v.Inventory.Unlimited),
+					inventorySummary(v.Inventory.Reserved, nil),
 					loadSummary(v.Inventory.Load), limiterPressureSummary(v.Backpressure),
 					imageCacheSummary(v.Inventory.ImageCache),
 					dash(v.UnderlayIP), peerReplicationSummary(v.PeerReplication), containerSummary(v), lab,
@@ -930,6 +932,16 @@ func deployCluster(ctx context.Context, top *model.Topology, tok string, req age
 	}
 
 	if failed > 0 {
+		// A failure after commit is not a failure to deploy. Saying "re-run
+		// deploy to converge" for one would send an operator to redeploy a
+		// generation that is already live on every node.
+		if client.CommittedResults(results) {
+			return fmt.Errorf("%w on every node and was not rolled back, but %d node(s) did not "+
+				"finish finalization or post-commit verification, so the lab is live. Check "+
+				"`twinet -m <manifest> node status` and, if a node still reports an incomplete "+
+				"generation for %s, resume it with `twinet -m <manifest> recover --strategy "+
+				"forward`; do not redeploy", client.ErrCommitted, failed, top.Name)
+		}
 		return fmt.Errorf("%d node(s) reported problems; re-run deploy to converge", failed)
 	}
 	// A deployment that changed nothing is only a success if the nodes agree
@@ -1174,14 +1186,33 @@ func statusUnknown(values []string, want string) bool {
 	return false
 }
 
-func inventorySummary(v agent.ResourceInventory) string {
+// inventorySummary renders one resource vector. An unbounded dimension is
+// named as such rather than printed as a number: a host whose kernel imposes
+// no file-handle ceiling used to be reported as having 8301034833169298227
+// allocatable descriptors, which is not a budget anything could be deployed
+// against.
+func inventorySummary(v agent.ResourceInventory, unlimited []string) string {
+	fd := inventoryTerm(v.FileDescriptors, "fd",
+		statusUnknown(unlimited, "allocatable.file_descriptors"))
 	if v.CPUs == nil || v.MemoryBytes == nil || v.DiskBytes == nil || v.Pids == nil ||
-		v.FileDescriptors == nil || v.NetDevices == nil {
+		fd == "" || v.NetDevices == nil {
 		return "unknown"
 	}
-	return fmt.Sprintf("%.1fc/%s/%s/%dp/%dfd/%dnd",
+	return fmt.Sprintf("%.1fc/%s/%s/%dp/%s/%dnd",
 		*v.CPUs, inventoryBytes(*v.MemoryBytes), inventoryBytes(*v.DiskBytes),
-		*v.Pids, *v.FileDescriptors, *v.NetDevices)
+		*v.Pids, fd, *v.NetDevices)
+}
+
+// inventoryTerm renders one dimension with its unit, or an empty string when
+// the dimension is genuinely unknown rather than unbounded.
+func inventoryTerm(v *int64, unit string, unlimited bool) string {
+	if v != nil {
+		return strconv.FormatInt(*v, 10) + unit
+	}
+	if unlimited {
+		return "unlimited-" + unit
+	}
+	return ""
 }
 
 func inventoryBytes(v int64) string {
@@ -1255,12 +1286,12 @@ func newNodeSweepCmd(opts *Options) *cobra.Command {
 			results := c.Sweep(cmd.Context(), remove)
 
 			w := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
-			fmt.Fprintln(w, "NODE\tLOGICAL\tTRUNKS\tORPHANS\tREMOVED\tIN USE\tNOTE")
+			fmt.Fprintln(w, "NODE\tLOGICAL\tTRUNKS\tORPHANS\tREMOVED\tIN USE\tFENCED\tNOTE")
 			bad, total := 0, 0
 			for _, r := range results {
 				if r.Err != nil {
 					bad++
-					fmt.Fprintf(w, "%s\t-\t-\t-\t-\t-\t%s\n", r.Node, firstLine(r.Err.Error()))
+					fmt.Fprintf(w, "%s\t-\t-\t-\t-\t-\t-\t%s\n", r.Node, firstLine(r.Err.Error()))
 					continue
 				}
 				v := r.Value
@@ -1269,9 +1300,9 @@ func newNodeSweepCmd(opts *Options) *cobra.Command {
 				if len(v.Errs) > 0 {
 					note = strings.Join(v.Errs, "; ")
 				}
-				fmt.Fprintf(w, "%s\t%d\t%d\t%d\t%d\t%d\t%s\n",
+				fmt.Fprintf(w, "%s\t%d\t%d\t%d\t%d\t%d\t%d\t%s\n",
 					r.Node, v.LogicalBindings, v.PhysicalTrunks,
-					len(v.Orphans), len(v.Removed), len(v.InUse), note)
+					len(v.Orphans), len(v.Removed), len(v.InUse), len(v.Fenced), note)
 			}
 			if err := w.Flush(); err != nil {
 				return err

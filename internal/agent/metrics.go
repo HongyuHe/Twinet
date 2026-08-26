@@ -584,6 +584,13 @@ func appendInventoryMetrics(b *strings.Builder, inventory HostInventory) {
 		writeMetricLine(b, "twinet_inventory_unknown",
 			[]string{metricLabel("dimension", boundedInventoryDimension(unknown))}, "1")
 	}
+	writeMetricHeader(b, "twinet_inventory_unlimited",
+		"Inventory dimensions the kernel imposes no ceiling on, which are neither a "+
+			"quantity nor unknown.", "gauge")
+	for _, unlimited := range inventory.Unlimited {
+		writeMetricLine(b, "twinet_inventory_unlimited",
+			[]string{metricLabel("dimension", boundedInventoryDimension(unlimited))}, "1")
+	}
 	writeMetricHeader(b, "twinet_image_cache",
 		"Local image-cache metadata when the runtime exposes it.", "gauge")
 	writeMetricLine(b, "twinet_image_cache", []string{metricLabel("state", "referenced")},

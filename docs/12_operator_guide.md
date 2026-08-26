@@ -73,6 +73,14 @@ node agent), and `bin/twinet-init` (the PID 1 used by the containerd backend).
 The bootstrap in [§5](#5-install-the-agents) copies `bin/twinetd` and
 `bin/twinet-init` to the nodes, so build before you bootstrap.
 
+The build is byte-reproducible: the same source and toolchain produce the same
+binaries, whatever the clock says. The embedded date is the source's, taken
+from `SOURCE_DATE_EPOCH` or the commit, not the moment of the build, so
+provenance can be checked rather than only asserted — `twinet version` prints
+the version, the commit, and the content-addressed source digest that
+identifies exactly what was compiled. `bash scripts/test_reproducible_build.sh`
+builds twice and compares.
+
 Container images are pulled from a registry by each node when a lab is
 deployed. Build them yourself only if you are changing them:
 
@@ -96,7 +104,7 @@ so the node names, agent addresses, and underlay addresses are yours:
 
 ```yaml
 placement:
-  strategy: pack-by-as
+  strategy: spread-by-as
   runtime: containerd
   nodes:
     - {name: node-0, addr: "10.0.1.1:7200", underlay_ip: 10.0.1.1, front: true}
@@ -111,6 +119,19 @@ placement:
   the shared services.
 - `runtime` states the engine. It is declared rather than inherited; see
   [§9](#9-the-runtime-contract).
+- `strategy` decides how autonomous systems are distributed. Both `pack-by-as`
+  and `spread-by-as` keep each autonomous system whole on one node, so no
+  internal link becomes a tunnel; they differ in how much imbalance they will
+  accept to keep peering neighbours together. The canonical lab ships
+  `spread-by-as` because this walkthrough promises a lab deployed across the
+  three nodes: under `pack-by-as` a cluster with plenty of headroom put all
+  twelve autonomous systems on `node-0`, which exercises no overlay path and
+  queues every graded `exec` behind one agent. Confirm with
+  `twinet -m examples/cos461 inspect --placement`. Changing the strategy of a
+  lab that is already running does not move anything by itself: the placement
+  record is honoured so a redeploy never rebuilds the containers a student is
+  working in. `twinet -m examples/cos461 deploy --rebalance` is the explicit
+  way to recompute, and it does rebuild them.
 
 Check the file before it is used for anything:
 
@@ -222,11 +243,16 @@ it already announces as its own.
 Exactly one `twinetd` may own a host network namespace. A second process on
 another API port or in another containerd metadata namespace is **not**
 isolated: both still create and remove root-namespace veths, bridges and
-VXLANs. The agent holds `/run/twinet/agent.lock` for its process lifetime, and
-the rollout script refuses any alternate `twinetd*` process before changing a
-node. A deliberately network-namespace-isolated test agent may use a distinct
-`-host-lock` path inside that isolated environment; never use that override to
-run two agents in the same root network namespace.
+VXLANs. Ownership is claimed from the kernel's own identity for the namespace —
+the inode behind `/proc/self/ns/net` — so two agents in one namespace always
+contend and two agents in genuinely separate namespaces never do. There is no
+path to override: an agent that is refused is told which namespace it lost and
+which process holds it. An agent in the host's root namespace also holds
+`/run/twinet/agent.lock`, the fixed path older builds used, so a stale one of
+those is refused too, and the rollout script refuses any alternate `twinetd*`
+process before changing a node. `-host-lock-dir` moves only the directory
+holding that record, for a host whose `/run` is unusual; it cannot change who
+contends with whom.
 
 ## 6. Check the cluster before you deploy
 
@@ -242,6 +268,15 @@ counts, the lab it is holding, and any recovery in progress. It exits non-zero
 when a node is unreachable *or* merely degraded — a version-skewed agent, a
 grading hold, or a busy node are each something the next command will refuse,
 and being told afterwards is not the same as being told.
+
+The inventory columns distinguish three states, because collapsing them
+misleads in opposite directions. A number is a measured budget. `unknown` means
+the agent could not read that dimension, and strict admission refuses it rather
+than guess. A term such as `unlimited-fd` means the kernel imposes no ceiling
+at all — a host with `fs.file-max` at `LONG_MAX` was once reported as having
+8301034833169298227 allocatable file descriptors — and that dimension simply
+does not constrain admission. Declare a `placement.nodes[].capacity` if you
+want an unbounded dimension bounded by policy.
 
 `node check` compares the underlay MTU against the lab's link MTU plus VXLAN
 overhead and names the MTU to use if it does not fit. Run it whenever the
@@ -546,6 +581,17 @@ An overlay whose bridge still has something attached is never removed by a
 sweep, whatever its ownership record says: it is carrying a cable for
 something.
 
+A removing sweep is refused outright while anything on the node owns its
+objects — an operation in flight, a fenced cluster mutation, a transaction
+being rolled forward or back by recovery, a grading hold, or a prepared
+generation — and the refusal names which. That fence is re-proved before every
+single deletion rather than once for the batch, and each object is claimed
+through the same lock a deployment reserves it with, so an overlay a deploy
+claims part-way through a long sweep is left in place and counted under
+`FENCED` instead of being deleted out from under it. Reporting is never
+refused: run the sweep without `--remove` to see what is there while the node
+is busy.
+
 ### When there is no manifest
 
 `twinet destroy --lab NAME` with no loadable manifest refuses and changes
@@ -605,8 +651,13 @@ than clearing the store.
 | an underlay problem naming an MTU | the underlay cannot carry the lab MTU plus VXLAN overhead | raise the underlay MTU, or lower `link_defaults.mtu` |
 | a node reports a backend different from its requested runtime | manifest and agent disagree about the engine | fix `placement.runtime`, or re-roll the agent with `deploy_agents.sh --runtime` |
 | an admission refusal naming a resource | requests exceed live allocatable inventory | reduce the lab, add capacity, or use the audited `--overcommit` |
+| an admission refusal saying a resource is *unknown* | the agent could not read that dimension at all; it is neither zero nor unlimited | fix the node, declare a safe `placement.nodes[].capacity`, or use the audited `--overcommit`. A dimension the kernel simply does not bound is reported as `unlimited-` and never refused |
 | `refusing to remove lab ... from a name alone` | destroy has no manifest and cannot prove the scope | [§12](#when-there-is-no-manifest) |
 | `its saved configuration could not be replayed` | a captured command was rejected by the device | [§12](#when-a-devices-saved-configuration-will-not-replay) — re-run `deploy`; never delete `/var/lib/twinet/state` |
+| `this node is not idle, so sweeping now could remove an overlay that is being built or recovered` | a removing sweep met an operation, mutation lease, transaction, hold, or prepared generation | wait for the named owner, or sweep without `--remove` to report only |
+| a sweep that reports objects under `FENCED` | a deployment claimed those overlays between the scan and the deletion | nothing: they belong to a live lab. Re-run the sweep later if they are still orphaned |
+| `another Twinet agent already owns network namespace ...` | two agents are in one network namespace; a separate lock directory, API port, or runtime namespace is not isolation | stop the process the refusal names; there is no override ([§5.3](#53-bootstrap)) |
+| `the cluster mutation is committed and durable ... but finalization ... did not complete` | every node committed and nothing was rolled back; only cleanup or the post-commit inventory proof failed | the lab is live: check `node status`, then resume with `twinet recover --strategy forward` if a node still reports an incomplete generation ([§10](#10-reconcile-repair-and-recover)). Do not redeploy |
 | a quarantine instead of a mark | the infrastructure failed, not the submission | re-grade after `twinet node status` is clean |
 | a deploy that will not report a no-op, naming a control sidecar | a router's FRR sidecar is in a different network namespace from the router, or its namespace cannot be read | let the deployment run; it rebuilds the sidecar. `twinet node controls` names the device, and `--repair` does it on its own |
 

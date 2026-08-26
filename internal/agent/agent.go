@@ -158,8 +158,10 @@ func Main(ctx context.Context, args []string) error {
 			"node-wide routing convergence concurrency (0 selects the measured runtime default)")
 		recoveryMaxTimeout = fs.Duration("recovery-max-timeout", MaximumRecoveryTotalTimeout,
 			"maximum workload-derived recovery duration (hard cap 2h)")
-		hostLock = fs.String("host-lock", os.Getenv("TWINET_HOST_LOCK"),
-			"process lock for exclusive ownership of this host network namespace (default /run/twinet/agent.lock)")
+		hostLockDir = fs.String("host-lock-dir", os.Getenv("TWINET_HOST_LOCK_DIR"),
+			"directory holding the per-network-namespace agent lock (default /run/twinet)")
+		legacyHostLock = fs.String("host-lock", "",
+			"removed: the lock is named after this host's network namespace and cannot be chosen")
 		verbose = fs.Bool("verbose", false, "debug logging")
 		version = fs.Bool("version", false, "print the version and exit")
 	)
@@ -190,10 +192,20 @@ func Main(ctx context.Context, args []string) error {
 			"The agent can create privileged containers and rewire the host's networking, " +
 			"so it must never be reachable unauthenticated")
 	}
-	if strings.TrimSpace(*hostLock) == "" {
-		*hostLock = "/run/twinet/agent.lock"
+	// An arbitrary lock path never isolated anything: two agents pointed at
+	// different files still shared one root network namespace, and both
+	// rewired its veths, bridges and VXLANs. Refuse the old override loudly
+	// rather than accept a value that no longer means what it used to, and
+	// refuse its environment form too, which would otherwise be ignored in
+	// silence by an operator who believed it was in force.
+	if strings.TrimSpace(*legacyHostLock) != "" || os.Getenv("TWINET_HOST_LOCK") != "" {
+		return errors.New("-host-lock and TWINET_HOST_LOCK have been removed: the agent's lock is " +
+			"named after the inode of the network namespace it is in, so two agents in one namespace " +
+			"always contend and two agents in genuinely separate namespaces never do. " +
+			"A network-namespace-isolated test agent needs no override. Use -host-lock-dir only to " +
+			"move the lock directory off /run/twinet")
 	}
-	hostLease, err := acquireHostAgentLock(*hostLock, *node, *listen, *runtimeNamespace)
+	hostLease, err := acquireHostAgentLock(*hostLockDir, *node, *listen, *runtimeNamespace)
 	if err != nil {
 		return err
 	}
@@ -3067,13 +3079,73 @@ type SweepRequest struct {
 
 // SweepResponse is what the node found.
 type SweepResponse struct {
-	Node            string        `json:"node"`
-	Orphans         []netx.Orphan `json:"orphans,omitempty"`
-	Removed         []uint32      `json:"removed,omitempty"`
-	InUse           []netx.Orphan `json:"in_use,omitempty"`
+	Node    string        `json:"node"`
+	Orphans []netx.Orphan `json:"orphans,omitempty"`
+	Removed []uint32      `json:"removed,omitempty"`
+	InUse   []netx.Orphan `json:"in_use,omitempty"`
+	// Fenced are the orphans a removing sweep declined to delete because the
+	// object, or its owner, became claimed between the scan and the deletion.
+	// They are reported rather than dropped: an operator who asked for a
+	// removal is entitled to know which ones did not happen and why.
+	Fenced          []netx.Orphan `json:"fenced,omitempty"`
 	LogicalBindings int           `json:"logical_bindings"`
 	PhysicalTrunks  int           `json:"physical_trunks"`
 	Errs            []string      `json:"errors,omitempty"`
+}
+
+// sweepFencesLocked names every reason this node must not delete an overlay
+// right now. The caller holds s.mu.
+//
+// An operation lease is only one of them. A fenced cluster mutation, a
+// half-applied transaction being rolled forward or back by recovery, a grading
+// hold, and a prepared generation each mean something is entitled to the
+// objects on this host even though no local lease is open at this instant --
+// recovery in particular reconstructs overlays from a transaction record
+// without ever taking s.ops.
+func (s *Server) sweepFencesLocked(now time.Time) []string {
+	var out []string
+	for lab, l := range s.ops {
+		out = append(out, fmt.Sprintf("operation %s on lab %q", l.kind, lab))
+	}
+	for lab, lease := range s.mutations {
+		if now.Before(lease.until) {
+			out = append(out, fmt.Sprintf("mutation lease on lab %q held by %s", lab, lease.holder))
+		}
+	}
+	for lab, tx := range s.transactions {
+		out = append(out, fmt.Sprintf("transaction on lab %q in phase %s", lab, tx.Phase))
+	}
+	for lab, h := range s.holds {
+		if h != nil && now.Before(h.until) {
+			out = append(out, fmt.Sprintf("hold on lab %q held by %s", lab, h.holder))
+		}
+	}
+	for lab, gen := range s.generations {
+		if gen.Prepared != "" {
+			out = append(out, fmt.Sprintf("prepared generation %q on lab %q", gen.Prepared, lab))
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (s *Server) sweepFences() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initCoordination()
+	now := s.nowTime()
+	if s.expireCoordinationLocked(now) {
+		if err := s.saveCoordinationLocked(); err != nil {
+			slog.Warn("persist expired coordination before sweep", "err", err)
+		}
+	}
+	return s.sweepFencesLocked(now)
+}
+
+func sweepConflict(fences []string) error {
+	return fmt.Errorf("this node is not idle, so sweeping now could remove an overlay that is "+
+		"being built or recovered: %s. Wait for it to finish, or run the sweep without --remove "+
+		"to report only", strings.Join(fences, "; "))
 }
 
 // handleSweep finds overlays belonging to no lab this node hosts.
@@ -3084,6 +3156,14 @@ type SweepResponse struct {
 // record they are missing. A hundred were found on one node of this cluster
 // against forty-four in use, left by labs destroyed weeks earlier, and nothing
 // had ever reported them.
+//
+// Sweeping is the one destructive path an operator drives by hand, against a
+// list that was true when it was read. Between the scan and the deletion a
+// deploy can claim the identifier, recovery can start rebuilding the very
+// overlay the scan called abandoned, and a grading hold can be taken. So the
+// node-wide fence is re-proved immediately before each removal, and each
+// object is additionally claimed through the same lock the reservation path
+// takes -- the fence that already protects garbage collection.
 func (s *Server) handleSweep(w http.ResponseWriter, r *http.Request) {
 	var req SweepRequest
 	if r.Body != nil {
@@ -3094,21 +3174,31 @@ func (s *Server) handleSweep(w http.ResponseWriter, r *http.Request) {
 	for name := range s.current {
 		live[name] = true
 	}
-	busy := len(s.ops) > 0
 	s.mu.Unlock()
-	// A node in the middle of an operation is creating overlays right now, and
-	// one created a moment ago has no container on it yet.
-	if req.Remove && busy {
-		httpError(w, http.StatusConflict,
-			errors.New("this node has an operation in flight; sweeping now could remove an "+
-				"overlay that is being built"))
-		return
+	if req.Remove {
+		if fences := s.sweepFences(); len(fences) > 0 {
+			httpError(w, http.StatusConflict, sweepConflict(fences))
+			return
+		}
+	}
+
+	// The same discovery and removal seams garbage collection uses, so both
+	// destructive paths agree about what an orphan is and a test can exercise
+	// the fence without host netlink.
+	s.gcMu.Lock()
+	findOrphans, removeOverlay := s.gcFindOrphans, s.gcRemoveOverlay
+	s.gcMu.Unlock()
+	if findOrphans == nil {
+		findOrphans = netx.FindOrphans
+	}
+	if removeOverlay == nil {
+		removeOverlay = netx.RemoveOverlay
 	}
 
 	var found []netx.Orphan
 	err := s.workLimiter().Run(r.Context(), []limiter.Kind{limiter.Netlink}, func() error {
 		var findErr error
-		found, findErr = netx.FindOrphans(live)
+		found, findErr = findOrphans(live)
 		return findErr
 	})
 	if err != nil {
@@ -3131,10 +3221,27 @@ func (s *Server) handleSweep(w http.ResponseWriter, r *http.Request) {
 		if !req.Remove {
 			continue
 		}
-		if err := s.workLimiter().Run(r.Context(), []limiter.Kind{limiter.Netlink}, func() error {
-			return netx.RemoveOverlay(o.VNI)
-		}); err != nil {
-			resp.Errs = append(resp.Errs, fmt.Sprintf("vni %d: %v", o.VNI, err))
+		// Re-prove the node-wide fence for every object, not once for the
+		// batch. A sweep of a hundred overlays is not instantaneous, and the
+		// deploy or recovery that starts halfway through it is exactly the one
+		// this refusal exists for.
+		if fences := s.sweepFences(); len(fences) > 0 {
+			resp.Fenced = append(resp.Fenced, o)
+			resp.Errs = append(resp.Errs, fmt.Sprintf("vni %d: %v", o.VNI, sweepConflict(fences)))
+			continue
+		}
+		if !s.beginOverlayCollection(o.VNI, o.Owner) {
+			resp.Fenced = append(resp.Fenced, o)
+			resp.Errs = append(resp.Errs, fmt.Sprintf(
+				"vni %d: claimed by a deployment or another collection since the scan; left in place", o.VNI))
+			continue
+		}
+		removeErr := s.workLimiter().Run(r.Context(), []limiter.Kind{limiter.Netlink}, func() error {
+			return removeOverlay(o.VNI)
+		})
+		s.endOverlayCollection(o.VNI, o.Owner)
+		if removeErr != nil {
+			resp.Errs = append(resp.Errs, fmt.Sprintf("vni %d: %v", o.VNI, removeErr))
 			continue
 		}
 		resp.Removed = append(resp.Removed, o.VNI)

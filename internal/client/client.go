@@ -913,10 +913,37 @@ func placementInventory(name string, in agent.HostInventory) place.NodeInventory
 		Reserved:      placementResources(in.Reserved),
 		ReservedByLab: map[string]place.Resources{},
 		Unknown:       append([]string(nil), in.Unknown...),
+		Unlimited:     placementUnlimited(in.Unlimited),
 	}
 	for lab, reservation := range in.Reservations {
 		out.ReservedByLab[lab] = placementResources(reservation)
 	}
+	return out
+}
+
+// placementDimension translates an agent's allocatable inventory name into the
+// vocabulary strict admission reports refusals in. Anything else an agent may
+// report -- a physical or used dimension, a future name -- is deliberately
+// dropped rather than guessed at, because a wrong translation here would
+// silently exempt a dimension from admission.
+var placementDimension = map[string]string{
+	"allocatable.containers":       "containers",
+	"allocatable.cpus":             "cpu",
+	"allocatable.memory":           "memory",
+	"allocatable.disk":             "ephemeral storage",
+	"allocatable.pids":             "pids",
+	"allocatable.file_descriptors": "file descriptors",
+	"allocatable.netdevs":          "netdevs",
+}
+
+func placementUnlimited(names []string) []string {
+	var out []string
+	for _, name := range names {
+		if dimension, ok := placementDimension[name]; ok {
+			out = append(out, dimension)
+		}
+	}
+	sort.Strings(out)
 	return out
 }
 
