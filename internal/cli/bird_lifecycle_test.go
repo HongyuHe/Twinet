@@ -204,3 +204,40 @@ func TestPlatformBaselineUsesTheDeviceProvider(t *testing.T) {
 	}
 	assertNoFRRBinary(t, seen)
 }
+
+// A captured configuration is written into the archive as a file, and a file
+// ends in a newline. The preamble-stripping helper that used to guarantee that
+// for FRR became unreachable once capture moved behind the provider, and both
+// providers report their text trimmed; dropping the guarantee with the helper
+// would have changed the bytes of every saved FRR archive.
+func TestACapturedConfigurationIsNewlineTerminated(t *testing.T) {
+	for _, tc := range []struct {
+		name, nos, stdout string
+	}{
+		{"frr preamble and no trailing newline", "frr",
+			"Building configuration...\n\nCurrent configuration:\n!\nrouter bgp 3\n exit"},
+		{"frr already terminated", "frr", "!\nrouter bgp 3\n exit\n"},
+		{"frr terminated more than once", "frr", "!\nrouter bgp 3\n exit\n\n\n"},
+		{"bird", "bird", "router id 3.0.0.1;\nprotocol device {}"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, router := birdStudentTopology()
+			router.NOS = tc.nos
+			exec := func(_ context.Context, _ string, _ []string) (execResult, error) {
+				return execResult{Stdout: tc.stdout}, nil
+			}
+
+			body, _, err := captureRouterConfig(context.Background(), exec, router)
+			if err != nil {
+				t.Fatalf("capture: %v", err)
+			}
+			if !strings.HasSuffix(body, "\n") || strings.HasSuffix(body, "\n\n") {
+				t.Fatalf("captured body must end in exactly one newline, got %q", body)
+			}
+			if strings.Contains(body, "Building configuration") ||
+				strings.Contains(body, "Current configuration") {
+				t.Fatalf("vtysh preamble survived into the archive: %q", body)
+			}
+		})
+	}
+}

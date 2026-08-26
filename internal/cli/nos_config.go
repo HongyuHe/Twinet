@@ -51,7 +51,12 @@ func captureRouterConfig(ctx context.Context, exec execFn, d *model.Device) (str
 	if err != nil {
 		return "", nos.ConfigFile{}, err
 	}
-	return body, provider.ConfigFile(), nil
+	// Providers report the configuration text without deciding how it is
+	// stored. An archive member is a configuration file and ends in a newline,
+	// as it did when this was vtysh-specific: a file whose last line has no
+	// terminator is a poor thing to hand back to a parser, and changing the
+	// saved bytes would change every archive digest for no reason.
+	return strings.TrimRight(body, "\n") + "\n", provider.ConfigFile(), nil
 }
 
 // loadRouterConfig installs a configuration through the device's own provider.

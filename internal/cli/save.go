@@ -468,23 +468,6 @@ done`
 	return "# captured from " + d.ID + "\n" + strings.TrimSpace(res.Stdout) + "\n", nil
 }
 
-// cleanConfig strips the preamble vtysh prints before a configuration, which it
-// then refuses to read back.
-func cleanConfig(out string) string {
-	lines := strings.Split(out, "\n")
-	start := 0
-	for i, l := range lines {
-		t := strings.TrimSpace(l)
-		if t == "" || strings.HasPrefix(t, "Building configuration") ||
-			strings.HasPrefix(t, "Current configuration") {
-			start = i + 1
-			continue
-		}
-		break
-	}
-	return strings.TrimRight(strings.Join(lines[start:], "\n"), "\n") + "\n"
-}
-
 func newRestoreCmd(opts *Options) *cobra.Command {
 	var (
 		token string
