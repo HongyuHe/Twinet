@@ -454,6 +454,11 @@ type timedContainerdRuntime struct {
 	calls map[string][]time.Duration
 }
 
+// Unwrap exposes the containerd backend behind this timing decorator. Embedding
+// rt.Runtime satisfies the core interface and hides every capability beyond it,
+// exactly as the explicit batch field above compensates for ExecBatch.
+func (r *timedContainerdRuntime) Unwrap() rt.Runtime { return r.Runtime }
+
 func (r *timedContainerdRuntime) record(name string, started time.Time) {
 	r.mu.Lock()
 	if r.calls == nil {

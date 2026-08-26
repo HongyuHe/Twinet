@@ -200,3 +200,89 @@ func TestObservedNetnsIdentityMatchesTheProvenOne(t *testing.T) {
 		t.Fatalf("proven %v, observed %v, self %v disagree", proven, observed, self)
 	}
 }
+
+// opaqueDecorator is how every runtime decorator is written: it satisfies
+// Runtime by embedding one, which hides every capability of the backend behind
+// it. It is here because that shape, wrapped around containerd, is what let a
+// live deployment find no namespace proof and report a no-op over an orphaned
+// control sidecar.
+type opaqueDecorator struct{ Runtime }
+
+type forwardingDecorator struct{ Runtime }
+
+func (d *forwardingDecorator) Unwrap() Runtime { return d.Runtime }
+
+// selfWrappingDecorator is malformed on purpose: capability resolution must
+// terminate on it rather than follow the chain for ever.
+type selfWrappingDecorator struct{ Runtime }
+
+func (d *selfWrappingDecorator) Unwrap() Runtime { return d }
+
+func TestADecoratorDoesNotSilentlyEraseTheIdentityCapability(t *testing.T) {
+	pid := os.Getpid()
+	self, err := SelfNetnsIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := &identityBackend{path: fmt.Sprintf("/proc/%d/ns/net", pid)}
+	observation := Container{Name: "tw-r1", State: StateRunning, PID: pid}
+
+	if !SupportsNetnsIdentity(backend) {
+		t.Fatal("the backend cannot prove namespace identity")
+	}
+
+	opaque := &opaqueDecorator{Runtime: backend}
+	if SupportsNetnsIdentity(opaque) {
+		t.Fatal("a decorator that hides the backend claimed the capability")
+	}
+	if _, err := NetnsIdentityOf(context.Background(), opaque, "tw-r1"); !errors.Is(
+		err, ErrNamespaceIdentityUnsupported) {
+		t.Fatalf("hidden capability error = %v", err)
+	}
+
+	forwarding := &forwardingDecorator{Runtime: backend}
+	if !SupportsNetnsIdentity(forwarding) {
+		t.Fatal("a decorator that exposes its backend lost the capability")
+	}
+	proven, err := NetnsIdentityOf(context.Background(), forwarding, "tw-r1")
+	if err != nil || !proven.SameAs(self) {
+		t.Fatalf("proof through a decorator = %s, %v", proven, err)
+	}
+	observed, err := ObservedNetnsIdentityOf(context.Background(), forwarding, observation)
+	if err != nil || !observed.SameAs(self) {
+		t.Fatalf("observation through a decorator = %s, %v", observed, err)
+	}
+
+	// Two layers, and the outermost is the one an agent adds for metrics.
+	nested := &forwardingDecorator{Runtime: &forwardingDecorator{Runtime: backend}}
+	if !SupportsNetnsIdentity(nested) {
+		t.Fatal("a two-layer decorator chain lost the capability")
+	}
+
+	if SupportsNetnsIdentity(&selfWrappingDecorator{}) {
+		t.Fatal("a self-wrapping decorator claimed the capability")
+	}
+}
+
+// identityBackend is a capable backend: it answers namespace identity the way
+// containerd, Docker, and Podman do.
+type identityBackend struct {
+	Runtime
+	path string
+}
+
+func (b *identityBackend) Name() string { return "containerd" }
+
+func (b *identityBackend) Inspect(_ context.Context, name string) (Container, error) {
+	return Container{Name: name, State: StateRunning, PID: os.Getpid()}, nil
+}
+
+func (b *identityBackend) NSPath(context.Context, string) (string, error) { return b.path, nil }
+
+func (b *identityBackend) NetnsIdentity(ctx context.Context, name string) (NetnsIdentity, error) {
+	return netnsIdentityViaTask(ctx, b, name)
+}
+
+func (b *identityBackend) ObservedNetnsIdentity(_ context.Context, c Container) (NetnsIdentity, error) {
+	return observedNetnsIdentityViaTask(c)
+}

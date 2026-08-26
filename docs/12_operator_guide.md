@@ -660,6 +660,7 @@ than clearing the store.
 | `the cluster mutation is committed and durable ... but finalization ... did not complete` | every node committed and nothing was rolled back; only cleanup or the post-commit inventory proof failed | the lab is live: check `node status`, then resume with `twinet recover --strategy forward` if a node still reports an incomplete generation ([§10](#10-reconcile-repair-and-recover)). Do not redeploy |
 | a quarantine instead of a mark | the infrastructure failed, not the submission | re-grade after `twinet node status` is clean |
 | a deploy that will not report a no-op, naming a control sidecar | a router's FRR sidecar is in a different network namespace from the router, or its namespace cannot be read | let the deployment run; it rebuilds the sidecar. `twinet node controls` names the device, and `--repair` does it on its own |
+| `manages split FRR control sidecars but cannot prove network namespace identity` | the runtime backend in use runs FRR routers as a router plus a private sidecar but cannot say which namespace either is in | this is a defect in the build, not a cluster fault: report it. Deploy refuses rather than certify a control plane it never located |
 
 ## 14. What this guide does not claim
 

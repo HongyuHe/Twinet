@@ -148,7 +148,7 @@ func TestUnprovableSidecarNamespaceMakesADeployDirty(t *testing.T) {
 	}
 }
 
-func TestControlSharesPrimaryNamespaceIsCapabilityGated(t *testing.T) {
+func TestControlNamespaceProofNeverAssumesCoResidency(t *testing.T) {
 	engine, _, device, runtime := namespaceAwareLab(t)
 	control := FRRControlContainer(device)
 
@@ -168,14 +168,48 @@ func TestControlSharesPrimaryNamespaceIsCapabilityGated(t *testing.T) {
 		t.Fatal("an unreadable namespace was not refused")
 	}
 
-	// A backend with no identity capability keeps the behaviour it had before
-	// the proof existed, rather than failing every deployment it cannot prove.
-	plain := &Engine{Runtime: &observedDockerRuntime{observedRuntime: observedRuntime{
-		files: map[string][]byte{},
-	}}}
-	if bound, err := plain.controlSharesPrimaryNamespace(
-		context.Background(), device, control); err != nil || !bound {
-		t.Fatalf("a capability-less backend was refused: %t, %v", bound, err)
+	// The case that let a live deployment report success over a dead control
+	// plane: a decorator in front of containerd satisfies Runtime and offers no
+	// identity proof. That is a defect in the decorator, not a backend without
+	// the capability, and it must be refused rather than read as co-residency.
+	hidden := &Engine{Runtime: &opaqueRuntime{Runtime: runtime}}
+	if bound, err := hidden.controlSharesPrimaryNamespace(
+		context.Background(), device, control); err == nil || bound {
+		t.Fatalf("a hidden capability was read as proof: %t, %v", bound, err)
+	}
+}
+
+// opaqueRuntime is the shape of every runtime decorator: it satisfies Runtime
+// by embedding one and therefore exposes none of the backend's capabilities.
+type opaqueRuntime struct{ rt.Runtime }
+
+// forwardingRuntime is the same decorator written correctly.
+type forwardingRuntime struct{ rt.Runtime }
+
+func (r *forwardingRuntime) Unwrap() rt.Runtime { return r.Runtime }
+
+func TestADecoratorMustNotEraseTheNamespaceProof(t *testing.T) {
+	engine, top, device, runtime := namespaceAwareLab(t)
+	control := FRRControlContainer(device)
+	runtime.identity[control] = rt.NetnsIdentity{Dev: 4, Inode: 4026535379}
+
+	// A decorator that hides the proof must stop the deployment, not let it
+	// report a no-op over a sidecar nobody located.
+	engine.Runtime = &opaqueRuntime{Runtime: runtime}
+	if _, err := engine.Build(top); err == nil {
+		t.Fatal("a deployment that cannot prove any namespace reported a diff")
+	} else if !strings.Contains(err.Error(), "cannot prove") {
+		t.Fatalf("unexpected refusal: %v", err)
+	}
+
+	// A decorator that exposes what it wraps keeps the backend's proof, so the
+	// orphaned sidecar is found through it exactly as it is found without it.
+	engine.Runtime = &forwardingRuntime{Runtime: runtime}
+	if _, err := engine.Build(top); err != nil {
+		t.Fatal(err)
+	}
+	if !engine.LastBuildDiff().Create[device.ID] {
+		t.Fatal("an orphaned sidecar behind a forwarding decorator was reported as no work")
 	}
 }
 
@@ -226,19 +260,18 @@ func TestEnsureFRRControlRefusesAnUnprovableSidecar(t *testing.T) {
 // An agent wraps its engine in a metrics decorator that offers the capability
 // unconditionally; the backend behind it may not have it. Reading that as an
 // unprovable namespace would mark every router dirty on every pass for ever.
-func TestACapabilityLessBackendBehindTheWrapperIsNotADirtySignal(t *testing.T) {
+func TestABackendThatCannotProveNamespacesStopsTheDeployment(t *testing.T) {
 	engine, top, device, runtime := namespaceAwareLab(t)
 	runtime.failFor[device.Container] = fmt.Errorf("%w: unit",
 		rt.ErrNamespaceIdentityUnsupported)
-	runtime.failFor[FRRControlContainer(device)] = fmt.Errorf("%w: unit",
-		rt.ErrNamespaceIdentityUnsupported)
 
-	for pass := 0; pass < 2; pass++ {
-		if _, err := engine.Build(top); err != nil {
-			t.Fatal(err)
-		}
-		if engine.LastBuildDiff().Create[device.ID] {
-			t.Fatalf("pass %d scheduled repair on a backend that cannot prove namespaces", pass)
-		}
+	// Reporting a no-op here is the defect. Every backend that runs split
+	// control sidecars can prove where they are, so one that cannot is a
+	// runtime wired wrongly, and the deployment must say so rather than
+	// quietly certify a control plane it never found.
+	if _, err := engine.Build(top); err == nil {
+		t.Fatalf("device %s was diffed against an unprovable control plane", device.ID)
+	} else if !strings.Contains(err.Error(), "cannot prove") {
+		t.Fatalf("unexpected refusal: %v", err)
 	}
 }

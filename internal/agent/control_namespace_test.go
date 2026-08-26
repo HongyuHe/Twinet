@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/HongyuHe/twinet/internal/deploy"
+	"github.com/HongyuHe/twinet/internal/limiter"
 	"github.com/HongyuHe/twinet/internal/model"
 	"github.com/HongyuHe/twinet/internal/render"
 	rt "github.com/HongyuHe/twinet/internal/runtime"
@@ -504,5 +505,46 @@ func TestReconcileRoutesANamespaceSplitToASidecarRebuild(t *testing.T) {
 	}
 	if planned != device.ID+"="+string(ChangeControl) {
 		t.Fatalf("the repair was planned as %q, not a control-sidecar rebuild", planned)
+	}
+}
+
+// provingBackend answers namespace identity the way a host backend does.
+type provingBackend struct {
+	rt.Runtime
+	identity rt.NetnsIdentity
+}
+
+func (b *provingBackend) Name() string { return "containerd" }
+
+func (b *provingBackend) NetnsIdentity(context.Context, string) (rt.NetnsIdentity, error) {
+	return b.identity, nil
+}
+
+func (b *provingBackend) ObservedNetnsIdentity(context.Context, rt.Container) (rt.NetnsIdentity, error) {
+	return b.identity, nil
+}
+
+// TestTheMetricsWrapperKeepsTheBackendNamespaceProof pins the property whose
+// absence let a decorated containerd report a clean deploy over an orphaned
+// sidecar: a wrapper in front of a backend must not take away the ability to
+// prove where a container is attached.
+func TestTheMetricsWrapperKeepsTheBackendNamespaceProof(t *testing.T) {
+	backend := &provingBackend{identity: rt.NetnsIdentity{Dev: 4, Inode: 4026552127}}
+	wrapper := &observedRuntime{
+		runtime: backend, metrics: newAgentMetrics(), limiter: limiter.New(limiter.WithDefaults(limiter.Config{})),
+	}
+	if !rt.SupportsNetnsIdentity(wrapper) {
+		t.Fatal("the metrics wrapper hid the backend's namespace proof")
+	}
+	if wrapper.Unwrap() != rt.Runtime(backend) {
+		t.Fatal("the metrics wrapper does not expose the backend it wraps")
+	}
+	identity, err := rt.NetnsIdentityOf(context.Background(), wrapper, "twinet-lab-r1")
+	if err != nil || !identity.SameAs(backend.identity) {
+		t.Fatalf("proof through the metrics wrapper = %s, %v", identity, err)
+	}
+	observed, err := rt.ObservedNetnsIdentityOf(context.Background(), wrapper, rt.Container{Name: "twinet-lab-r1"})
+	if err != nil || !observed.SameAs(backend.identity) {
+		t.Fatalf("observation through the metrics wrapper = %s, %v", observed, err)
 	}
 }

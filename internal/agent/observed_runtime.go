@@ -33,6 +33,10 @@ func observeRuntimeError(m *agentMetrics, method string, fn func() error) error 
 
 func (r *observedRuntime) Name() string { return r.runtime.Name() }
 
+// Unwrap exposes the backend behind the metrics wrapper so a capability the
+// backend offers is not lost merely because its calls are being observed.
+func (r *observedRuntime) Unwrap() rt.Runtime { return r.runtime }
+
 // RuntimeEndpoint preserves the selected backend socket through the metrics
 // wrapper. Status must report the actual socket, not lose it merely because
 // runtime calls are being observed.

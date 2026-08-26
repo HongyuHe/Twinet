@@ -70,16 +70,59 @@ type NetnsIdentityRuntime interface {
 	ObservedNetnsIdentity(ctx context.Context, container Container) (NetnsIdentity, error)
 }
 
-// SupportsNetnsIdentity reports whether a backend can prove namespace identity.
+// UnwrappingRuntime is implemented by a decorator that wraps another Runtime.
+//
+// Capability resolution walks the chain. A decorator added for metrics, timing,
+// or rate limiting satisfies Runtime by embedding or forwarding it, which
+// silently drops every capability the backend offers beyond that interface. For
+// namespace identity that is worse than a backend which never had the
+// capability: callers gate on it, find it missing, and fall back to the path
+// that assumes a control sidecar is where it was put -- which is the assumption
+// this whole proof exists to stop them making. Any decorator in front of a real
+// backend must therefore either implement the capability itself, as the agent's
+// metrics wrapper does, or expose the runtime it wraps here.
+type UnwrappingRuntime interface {
+	Runtime
+	Unwrap() Runtime
+}
+
+// maxRuntimeUnwrapDepth bounds capability resolution. A decorator chain is
+// short by construction; the bound exists so a runtime that wraps itself
+// cannot hang the caller.
+const maxRuntimeUnwrapDepth = 8
+
+// netnsIdentityProver resolves the namespace identity capability through any
+// decorator chain, so a wrapper cannot erase the backend's ability to prove
+// where a container is attached.
+func netnsIdentityProver(r Runtime) (NetnsIdentityRuntime, bool) {
+	for depth := 0; r != nil && depth < maxRuntimeUnwrapDepth; depth++ {
+		if prover, ok := r.(NetnsIdentityRuntime); ok {
+			return prover, true
+		}
+		decorator, ok := r.(UnwrappingRuntime)
+		if !ok {
+			return nil, false
+		}
+		inner := decorator.Unwrap()
+		if inner == nil || inner == r {
+			return nil, false
+		}
+		r = inner
+	}
+	return nil, false
+}
+
+// SupportsNetnsIdentity reports whether a backend can prove namespace identity,
+// including through any decorator wrapped around it.
 func SupportsNetnsIdentity(r Runtime) bool {
-	_, ok := r.(NetnsIdentityRuntime)
+	_, ok := netnsIdentityProver(r)
 	return ok
 }
 
 // NetnsIdentityOf proves one container's network namespace identity through
 // whichever backend is in use, or reports the missing capability.
 func NetnsIdentityOf(ctx context.Context, r Runtime, nameOrID string) (NetnsIdentity, error) {
-	prover, ok := r.(NetnsIdentityRuntime)
+	prover, ok := netnsIdentityProver(r)
 	if !ok {
 		return NetnsIdentity{}, fmt.Errorf("%w: %s", ErrNamespaceIdentityUnsupported, runtimeBackendName(r))
 	}
@@ -89,7 +132,7 @@ func NetnsIdentityOf(ctx context.Context, r Runtime, nameOrID string) (NetnsIden
 // ObservedNetnsIdentityOf resolves the namespace identity of an observation the
 // caller already holds.
 func ObservedNetnsIdentityOf(ctx context.Context, r Runtime, container Container) (NetnsIdentity, error) {
-	prover, ok := r.(NetnsIdentityRuntime)
+	prover, ok := netnsIdentityProver(r)
 	if !ok {
 		return NetnsIdentity{}, fmt.Errorf("%w: %s", ErrNamespaceIdentityUnsupported, runtimeBackendName(r))
 	}

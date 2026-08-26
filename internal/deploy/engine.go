@@ -1036,26 +1036,21 @@ func (e *Engine) requireControlSharesPrimaryNamespace(ctx context.Context,
 // controlSharesPrimaryNamespace proves that a control sidecar is attached to
 // the network namespace its router is in now.
 //
-// A backend with no identity capability answers "unsupported", and the caller
-// keeps the behaviour it had before this check existed -- that is the gate that
-// keeps unit runtimes and any future backend out of a host-specific proof.
-// Every other failure is returned: a deployment that cannot tell where its
-// control plane is must refuse rather than report success.
+// There is no "cannot tell" answer here. Split control sidecars exist only on
+// the three host backends, and all three can prove namespace identity, so a
+// runtime that reaches this point without the capability is a decorator that
+// dropped it rather than a backend that never had it. Answering "assume it is
+// fine" in that case rebuilds the exact defect this proof exists to stop: a
+// deployment that reports success over a control plane it never located.
 func (e *Engine) controlSharesPrimaryNamespace(ctx context.Context, d *model.Device, control string) (bool, error) {
 	if d == nil {
 		return true, nil
 	}
 	primary, err := runtime.NetnsIdentityOf(ctx, e.Runtime, d.Container)
-	if errors.Is(err, runtime.ErrNamespaceIdentityUnsupported) {
-		return true, nil
-	}
 	if err != nil {
 		return false, fmt.Errorf("prove the network namespace of %s: %w", d.Container, err)
 	}
 	sidecar, err := runtime.NetnsIdentityOf(ctx, e.Runtime, control)
-	if errors.Is(err, runtime.ErrNamespaceIdentityUnsupported) {
-		return true, nil
-	}
 	if err != nil {
 		return false, fmt.Errorf("prove the network namespace of %s: %w", control, err)
 	}

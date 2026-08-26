@@ -282,7 +282,12 @@ reached students, and each motivated a permanent test.
    the backend can give it, the router's own interfaces either way), a split is
    reported as degraded rather than inferred from daemon counts, and reconcile
    rebuilds the sidecar in the router's current namespace without touching the
-   student's container.
+   student's container. The first version of that proof was itself defeated the
+   same way: it resolved the backend capability by type assertion, so a runtime
+   decorator satisfying only the core interface hid it, and every caller fell
+   back to assuming the sidecar was where it had been put. Capability resolution
+   now walks decorator chains, and a runtime that runs split sidecars without
+   being able to place them stops the deployment instead of certifying it.
 
 10. **A release gate that answered yes without looking.** `make ci` printed
     "all CI gates passed" while skipping the lint and the shell check whenever

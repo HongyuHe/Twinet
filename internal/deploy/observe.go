@@ -365,13 +365,15 @@ func (e *Engine) observeDevice(top *model.Topology, d *model.Device,
 // hundred routers, and the create step it schedules proves the relationship
 // again before it removes anything. Failing to resolve an identity marks the
 // device dirty rather than clean -- a deployment that cannot see where a
-// control plane is must do the work, not report a no-op.
+// control plane is must do the work, not report a no-op. A backend that offers
+// no proof at all stops the deployment outright, because every backend that
+// runs split sidecars can prove where they are.
 func (e *Engine) observedControlNamespaceSplits(ctx context.Context, devices []*model.Device,
 	observations []deviceObservation, byName map[string]runtime.Container,
-) map[string]bool {
+) (map[string]bool, error) {
 	out := map[string]bool{}
-	if e.Runtime == nil || !runtime.SupportsNetnsIdentity(e.Runtime) {
-		return out
+	if e.Runtime == nil {
+		return out, nil
 	}
 	for i, d := range devices {
 		observation := observations[i]
@@ -385,24 +387,19 @@ func (e *Engine) observedControlNamespaceSplits(ctx context.Context, devices []*
 		}
 		primaryNS, err := runtime.ObservedNetnsIdentityOf(ctx, e.Runtime, primary)
 		if errors.Is(err, runtime.ErrNamespaceIdentityUnsupported) {
-			// The wrapper an agent puts around its engine always offers the
-			// capability; the engine behind it may not. Treating that as a
-			// fault would mark every device dirty on every pass for ever.
-			return out
+			return nil, fmt.Errorf("%s manages split FRR control sidecars but cannot prove "+
+				"network namespace identity: %w", runtimeName(e.Runtime), err)
 		}
 		if err != nil {
 			out[d.ID] = true
 			continue
 		}
 		controlNS, err := runtime.ObservedNetnsIdentityOf(ctx, e.Runtime, control)
-		if errors.Is(err, runtime.ErrNamespaceIdentityUnsupported) {
-			return out
-		}
 		if err != nil || !primaryNS.SameAs(controlNS) {
 			out[d.ID] = true
 		}
 	}
-	return out
+	return out, nil
 }
 
 func (e *Engine) observeNode(ctx context.Context, top *model.Topology, devices []*model.Device) (
@@ -492,7 +489,10 @@ func (e *Engine) observeNode(ctx context.Context, top *model.Topology, devices [
 	// to a namespace its router has left behind. That is invisible to every
 	// label comparison above, so it is screened here from the observation
 	// already in hand; the create step re-proves it before acting.
-	splitControls := e.observedControlNamespaceSplits(ctx, devices, observations, byName)
+	splitControls, err := e.observedControlNamespaceSplits(ctx, devices, observations, byName)
+	if err != nil {
+		return nil, nil, BuildDiff{}, err
+	}
 	for i, d := range devices {
 		observation := observations[i]
 		if splitControls[d.ID] {
