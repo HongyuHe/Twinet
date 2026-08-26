@@ -99,7 +99,7 @@ three-node evidence; neither is a claim about another environment.
 | Same source and cluster, run 2 | 452.019 s + 84.123 s = **536.191 s**; 1/1 and 10/10 |
 | Same source and cluster, run 3 | 461.108 s + 84.439 s = **545.595 s**; 1/1 and 10/10 |
 | Abandoned grading harness | Killed controller; all nodes self-reaped at lease expiry while COS461 deployed |
-| Immutable images | Seven `0.1-7f6ed89` manifests remotely verified; all bundled examples release-locked |
+| Immutable images | Seven `0.1-e8d207d` manifests remotely verified; all bundled examples release-locked |
 
 **The scale topology changed shape after the historical deployment.** The
 22m38s run measured 2,012 devices. [`examples/scale`](../examples/scale) now
