@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/HongyuHe/twinet/internal/model"
@@ -20,16 +21,78 @@ type namespaceAwareRuntime struct {
 	failFor   map[string]error
 	removed   []string
 	nsPathErr error
+	// contents is what the continuity probe reads out of each container's
+	// network namespace. A container with no entry answers with an empty one,
+	// which is what a task that has just restarted has.
+	contents map[string]string
+	// onProbe runs when a container's namespace is read, so a test can restart
+	// a device in the middle of the proof that brackets that reading.
+	onProbe func(container string)
+	// nsMu guards the three maps above. A pass settles every unbaselined
+	// device concurrently, and a test that moves one of them mid-proof is
+	// writing from one goroutine what another is reading.
+	nsMu sync.Mutex
+}
+
+func (r *namespaceAwareRuntime) setIdentity(name string, identity rt.NetnsIdentity) {
+	r.nsMu.Lock()
+	defer r.nsMu.Unlock()
+	r.identity[name] = identity
+}
+
+func (r *namespaceAwareRuntime) setContents(name, body string) {
+	r.nsMu.Lock()
+	defer r.nsMu.Unlock()
+	r.contents[name] = body
 }
 
 func (*namespaceAwareRuntime) PullImage(context.Context, string, rt.PullPolicy) error { return nil }
 
-// Exec answers the restore marker honestly. The shared fake returns success
-// for almost every command, which would have every device in every fixture
-// claiming it still owes its student a replay.
+// namespaceProbeOutput renders the reading the continuity probe makes of a
+// namespace holding exactly these netdevs and addresses.
+func namespaceProbeOutput(links []string, addrs map[string][]string) string {
+	var body strings.Builder
+	body.WriteString("1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN\n")
+	for i, name := range links {
+		fmt.Fprintf(&body, "%d: %s@if%d: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue state UP\n",
+			i+2, name, i+40)
+	}
+	body.WriteString("---\n")
+	body.WriteString("1: lo    inet 127.0.0.1/8 scope host lo\n")
+	for i, name := range links {
+		fmt.Fprintf(&body, "%d: %s    inet6 fe80::1/64 scope link \n", i+2, name)
+	}
+	for _, name := range append(append([]string{}, links...), "lo") {
+		for _, address := range addrs[name] {
+			family := "inet"
+			if strings.Contains(address, ":") {
+				family = "inet6"
+			}
+			fmt.Fprintf(&body, "9: %s    %s %s scope global %s\n", name, family, address, name)
+		}
+	}
+	// The four remaining addrCapture sections: routes, then the VLAN and VRF
+	// netdevs the addresses above are allowed to name.
+	body.WriteString("---\n---\n---\n---\n")
+	return body.String()
+}
+
+// Exec answers the restore marker and the namespace continuity probe honestly.
+// The shared fake returns success for almost every command, which would have
+// every device in every fixture claiming it still owes its student a replay and
+// every namespace answering that it holds whatever it was asked about.
 func (r *namespaceAwareRuntime) Exec(ctx context.Context, c string, cmd rt.ExecCmd) (rt.ExecResult, error) {
 	if strings.HasPrefix(strings.Join(cmd.Cmd, " "), "test -f "+restoreMarker) {
 		return rt.ExecResult{ExitCode: 1}, nil
+	}
+	if len(cmd.Cmd) == 3 && cmd.Cmd[2] == namespaceContinuityProbe {
+		r.nsMu.Lock()
+		body, moved := r.contents[c], r.onProbe
+		r.nsMu.Unlock()
+		if moved != nil {
+			moved(c)
+		}
+		return rt.ExecResult{Stdout: body}, nil
 	}
 	return r.observedRuntime.Exec(ctx, c, cmd)
 }
@@ -65,6 +128,8 @@ func (r *namespaceAwareRuntime) Remove(_ context.Context, name string, _ bool) e
 }
 
 func (r *namespaceAwareRuntime) NetnsIdentity(_ context.Context, name string) (rt.NetnsIdentity, error) {
+	r.nsMu.Lock()
+	defer r.nsMu.Unlock()
 	if err := r.failFor[name]; err != nil {
 		return rt.NetnsIdentity{}, err
 	}
@@ -97,7 +162,8 @@ func namespaceAwareLab(t *testing.T) (*Engine, *model.Topology, *model.Device, *
 			device.Container:            {Dev: 4, Inode: 4026552127},
 			FRRControlContainer(device): {Dev: 4, Inode: 4026552127},
 		},
-		failFor: map[string]error{},
+		failFor:  map[string]error{},
+		contents: map[string]string{},
 	}
 	root := observeTestRoot(t)
 	engine := &Engine{

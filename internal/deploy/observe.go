@@ -691,8 +691,13 @@ func (e *Engine) observeNode(ctx context.Context, top *model.Topology, devices [
 				diff.Ready[d.ID] = true
 			}
 		}
-		e.settleNamespaceBaselines(ctx, semanticDevices, diff, byName, tracker)
 	}
+	// Every device with no recorded namespace is settled here, whether or not
+	// a semantic probe was run on it. The probe is skipped for exactly the
+	// devices that also need a new image or a changed file -- and those are the
+	// devices about to be captured and replaced, where being wrong about what
+	// is in the namespace costs a student their work rather than a pass.
+	e.settleNamespaceBaselines(ctx, top, devices, diff, lost, byName, tracker)
 
 	wantLinks := map[string]bool{}
 	nodeLinks := make([]*model.Link, 0, len(top.Links))

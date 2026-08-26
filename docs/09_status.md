@@ -343,6 +343,21 @@ reached students, and each motivated a permanent test.
    a restart and had not been replayed into filed its empty namespace over the
    snapshot on the way to being deleted.
 
+   What a baseline is allowed to be taken on. The paragraph above says "whose
+   semantic probe passes", and that was the hole: in platform mode the probe
+   skips every interface a student owns, a router is never asked for a default
+   route, and a device the audit already believes healthy is not re-read at all,
+   so a student's router that restarted into an empty namespace last term passes
+   all three. Blessing it records the one place their work is *not* as the place
+   it lives. A baseline is now taken only on a positive reading of the namespace
+   -- every interface the wiring put there, every platform address on them, and
+   every address the state store last saved for the device -- bracketed by the
+   namespace identity before and after, so a device that restarts mid-proof is
+   refused rather than credited. The reading covers the devices that are about
+   to be *replaced* as well: a changed image turns the semantic probe off, and
+   that is exactly the device whose empty namespace was being captured over the
+   addressing its replacement would have restored.
+
 10. **A release gate that answered yes without looking.** `make ci` printed
     "all CI gates passed" while skipping the lint and the shell check whenever
     their tools were absent, which on the development machine was always.

@@ -5,6 +5,7 @@ package integration
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -452,6 +453,8 @@ placement:
 		WritableRoot:    filepath.Join(work, "writable"),
 	}
 	assertContainerdSidecarRebindsAfterRestart(t, ctx, runtime, teaching, top, device)
+	assertContainerdBaselineDemandsProof(t, ctx, runtime, teaching, top, device,
+		filepath.Join(work, "observed"))
 	if err := engine.Destroy(ctx, lab); err != nil {
 		t.Fatal(err)
 	}
@@ -1028,4 +1031,145 @@ func requireNoConfiguredAddresses(t *testing.T, ctx context.Context, runtime rt.
 			}
 		}
 	}
+}
+
+// assertContainerdBaselineDemandsProof erases every recorded namespace, which
+// is the state an upgrade to this code leaves a node in, and proves the
+// baselines come back only on a positive reading of what is in the namespace.
+//
+// The reading is the part a fake cannot stand in for. It parses real iproute2
+// output out of a real container and compares it against a real state store, so
+// a change to either -- the output shape, the canonical fact spelling, the
+// sections addrCapture prints -- shows up here rather than as a node that
+// quietly stops protecting itself.
+func assertContainerdBaselineDemandsProof(t *testing.T, ctx context.Context, runtime rt.Runtime,
+	engine *deploy.Engine, top *model.Topology, device *model.Device, observedRoot string,
+) {
+	t.Helper()
+	forgetContainerdNamespaces(t, observedRoot)
+
+	live, err := rt.NetnsIdentityOf(ctx, runtime, device.Container)
+	if err != nil {
+		t.Fatalf("proving the healthy router's namespace: %v", err)
+	}
+	if !containerdNoOpDeploy(t, ctx, engine, top, device, "baselining an upgraded node") {
+		return
+	}
+	recorded, ok := recordedContainerdNamespace(t, observedRoot, device.ID)
+	if !ok {
+		t.Fatal("an upgraded node ran an ordinary deploy over a healthy lab and recorded " +
+			"no namespace for its router, so the router's next restart is invisible")
+	}
+	if !recorded.SameAs(live) {
+		t.Fatalf("the recorded namespace %s is not the one the router is in (%s)", recorded, live)
+	}
+
+	// The other half. A namespace that has lost what the store says was in it
+	// is exactly the namespace a restart leaves behind, and it must not become
+	// the baseline every later pass compares against.
+	forgetContainerdNamespaces(t, observedRoot)
+	loopback := modelledLoopback(t, device)
+	control := deploy.FRRControlContainer(device)
+	result, err := runtime.Exec(ctx, control, rt.ExecCmd{
+		Cmd: []string{"ip", "addr", "del", loopback, "dev", "lo"}})
+	if err != nil || result.Err() != nil {
+		t.Fatalf("removing %s from %s: %+v, %v", loopback, device.ID, result, err)
+	}
+	defer func() {
+		result, err := runtime.Exec(ctx, control, rt.ExecCmd{
+			Cmd: []string{"ip", "addr", "replace", loopback, "dev", "lo"}})
+		if err != nil || result.Err() != nil {
+			t.Fatalf("putting %s back on %s: %+v, %v", loopback, device.ID, result, err)
+		}
+	}()
+	if !containerdNoOpDeploy(t, ctx, engine, top, device, "refusing an unprovable baseline") {
+		return
+	}
+	if recorded, ok := recordedContainerdNamespace(t, observedRoot, device.ID); ok {
+		t.Fatalf("a router missing the addressing its own saved state says it had was "+
+			"baselined at %s; the emptiness is now what every later pass compares against",
+			recorded)
+	}
+	if reason := engine.UnprovenNamespaceDevices()[device.ID]; !strings.Contains(reason, loopback) {
+		t.Fatalf("the refusal did not name the missing address %s: %q", loopback, reason)
+	}
+}
+
+// containerdNoOpDeploy runs the deploy an operator runs and insists it stayed a
+// no-op, so a baseline recorded either side of it came from reading the
+// namespace rather than from configuring the device.
+func containerdNoOpDeploy(t *testing.T, ctx context.Context, engine *deploy.Engine,
+	top *model.Topology, device *model.Device, what string,
+) bool {
+	t.Helper()
+	p, err := engine.BuildContext(ctx, top)
+	if err != nil {
+		t.Fatalf("%s: %v", what, err)
+	}
+	if diff := engine.LastBuildDiff(); diff.Create[device.ID] || diff.Configure[device.ID] {
+		t.Fatalf("%s: the deploy was not a no-op, so nothing here is about baselining: %#v",
+			what, diff.Counts())
+	}
+	report, err := p.Execute(ctx, plan.Options{Workers: 1, ContinueOnError: true})
+	if err != nil {
+		t.Fatalf("%s: %v", what, err)
+	}
+	if report.Failed() {
+		t.Fatalf("%s: %v", what, report.Err())
+	}
+	return true
+}
+
+// forgetContainerdNamespaces strips the recorded namespaces from the node's
+// observation while leaving every hash in it alone, which is exactly what an
+// upgrade from a build without them looks like: a converged node whose next
+// deploy is a no-op and which can prove nothing about where anything is.
+func forgetContainerdNamespaces(t *testing.T, observedRoot string) {
+	t.Helper()
+	entries, err := filepath.Glob(filepath.Join(observedRoot, "*.json"))
+	if err != nil || len(entries) == 0 {
+		t.Fatalf("no node observation was persisted under %s: %v", observedRoot, err)
+	}
+	for _, path := range entries {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var observed map[string]any
+		if err := json.Unmarshal(raw, &observed); err != nil {
+			t.Fatal(err)
+		}
+		delete(observed, "namespaces")
+		body, err := json.Marshal(observed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, body, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func recordedContainerdNamespace(t *testing.T, observedRoot, id string) (rt.NetnsIdentity, bool) {
+	t.Helper()
+	entries, err := filepath.Glob(filepath.Join(observedRoot, "*.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range entries {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var observed struct {
+			Namespaces map[string]rt.NetnsIdentity `json:"namespaces"`
+		}
+		if err := json.Unmarshal(raw, &observed); err != nil {
+			t.Fatal(err)
+		}
+		if identity, ok := observed.Namespaces[id]; ok && identity.Known() {
+			return identity, true
+		}
+	}
+	return rt.NetnsIdentity{}, false
 }

@@ -541,14 +541,33 @@ The comparison needs something to compare against, and the first deployment
 after an upgrade has nothing recorded for any device. A device that is healthy
 and stays healthy never configures, so it would never acquire a baseline and its
 first restart would be invisible for ever. An apply therefore records the
-namespace of every device whose semantic probe passes: a device holding the
-network state the model says it should, in the namespace it is in now, is making
-exactly the claim a baseline makes. A plan records nothing — it decided nothing.
-A device with no baseline whose network state is *missing* is the dangerous one,
-since it may have restarted weeks ago and its student's addressing may exist only
-in the state store; it is repaired like any other drift, but it is not given a
-baseline and its namespace-backed state is withheld from the store until a probe
-passes, so the emptiness is never filed over the work.
+namespace of every device whose namespace it can read and show to be *continuous*
+with what the device is supposed to hold: every interface the platform's own
+wiring put there is present, every address the platform renders onto them is on
+them, and every address the state store last saved for the device is still there.
+Passing a semantic probe is deliberately **not** enough on its own. In platform
+mode that probe skips every interface a student owns — the model carries their
+addresses so grading and `--solve` agree about the answer, not because the
+running lab is supposed to have them yet — a router is never asked for a default
+route, and a device the audit already believes healthy is not re-read at all. A
+student's router that restarted into an empty namespace last term passes all
+three, and blessing that namespace would record the one place their work is *not*
+as the place it lives. The proof is bracketed by the namespace identity read from
+the backend before and after it, so a device that restarts while it is being read
+is refused rather than credited with a reading of a namespace it had already
+left. A plan records nothing — it decided nothing.
+
+A device with no baseline whose namespace cannot be shown continuous is the
+dangerous one, since it may have restarted weeks ago and its student's addressing
+may exist only in the state store. It is repaired like any other drift, but it is
+not given a baseline and its namespace-backed state is withheld from the store
+until continuity can be shown again, so the emptiness is never filed over the
+work. That withholding covers the device being *replaced* as well as the device
+being left alone: a changed image or rendered file turns the semantic probe off,
+and that is exactly the device about to be captured and destroyed. The one
+exemption is a container this pass rebuilt from its image and replayed the store
+into, where the namespace is new and its contents are known because the
+deployment just put them there.
 
 If a cluster mutation was interrupted — a controller killed halfway, a node
 rebooted mid-apply — the transaction is persisted and resumable:

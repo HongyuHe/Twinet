@@ -7,8 +7,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/HongyuHe/twinet/internal/model"
 	"github.com/HongyuHe/twinet/internal/plan"
@@ -369,6 +372,7 @@ func namespaceAwareLinkedLab(t *testing.T) (*Engine, *model.Topology,
 		observedRuntime: observedRuntime{files: map[string][]byte{}},
 		identity:        map[string]rt.NetnsIdentity{},
 		failFor:         map[string]error{},
+		contents:        map[string]string{},
 	}
 	root := observeTestRoot(t)
 	renderer := observedRenderer{revision: map[string]string{}}
@@ -389,6 +393,11 @@ func namespaceAwareLinkedLab(t *testing.T) (*Engine, *model.Topology,
 			},
 		})
 		runtime.identity[d.Container] = rt.NetnsIdentity{Dev: 4, Inode: uint64(4026550000 + i)}
+		// A wired namespace, which is what a device that has not restarted
+		// has. Nothing here can be inferred from a container label, which is
+		// the whole reason it has to be read.
+		runtime.setContents(d.Container, namespaceProbeOutput(
+			modelledNamespaceInterfaces(d), nil))
 	}
 	return engine, top, devices, runtime
 }
@@ -665,7 +674,7 @@ func TestAnAlreadyBrokenDeviceIsNeitherBlessedNorCaptured(t *testing.T) {
 func TestAnUnprovenDeviceIsNotBaselinedByConfiguringIt(t *testing.T) {
 	engine, top, devices, _ := namespaceAwareLinkedLab(t)
 	unproven := devices[1]
-	engine.markNamespaceUnproven(unproven.ID)
+	engine.markNamespaceUnproven(unproven.ID, "its namespace could not be read")
 	tracker, err := engine.loadObservation(top.Name)
 	if err != nil {
 		t.Fatal(err)
@@ -781,5 +790,278 @@ func TestPruneStillSavesTheStateOfAnOrphanThatOwesNothing(t *testing.T) {
 	}
 	if _, err := store.Current("cos461", "as3/ATL", state.KindAddrs); err != nil {
 		t.Fatalf("prune did not save the namespace state of the container it deleted: %v", err)
+	}
+}
+
+// reseedContainerSpec rewrites a container's recorded specification after a
+// test has changed the device it belongs to, so the device is clean again and
+// the pass reaches the decisions this file is about rather than stopping at a
+// replacement.
+func reseedContainerSpec(t *testing.T, engine *Engine, top *model.Topology,
+	runtime *namespaceAwareRuntime, d *model.Device,
+) {
+	t.Helper()
+	hash, err := engine.FinalSpecHash(top, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range runtime.containers {
+		if runtime.containers[i].Name == d.Container {
+			runtime.containers[i].Labels[LabelSpec] = hash
+			return
+		}
+	}
+	t.Fatalf("no container for %s", d.ID)
+}
+
+// studentAddressSnapshot files the addressing a signed submission carries: the
+// student's work, captured out of a kernel that is now gone, kept where the
+// model does not carry it.
+func studentAddressSnapshot(t *testing.T, store *state.Store, lab string,
+	d *model.Device, addrs map[string][]string,
+) {
+	t.Helper()
+	body := "twinet-state/v2 addrs\n"
+	var facts []string
+	for iface, list := range addrs {
+		for _, address := range list {
+			family := "inet"
+			if strings.Contains(address, ":") {
+				family = "inet6"
+			}
+			facts = append(facts, "addr "+family+" "+iface+" "+address)
+		}
+	}
+	sort.Strings(facts)
+	body += strings.Join(facts, "\n") + "\n"
+	if _, err := store.Put(state.Snapshot{
+		Lab: lab, AS: d.ASN, Device: d.ID, Kind: state.KindAddrs,
+		TakenAt: time.Now().UTC(), Content: []byte(body),
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A semantic probe is not a proof about a namespace, and treating it as one put
+// the whole scheme back where it started.
+//
+// In platform mode the probe deliberately skips every interface a student owns
+// -- the model carries their addresses so grading and `--solve` agree about the
+// answer, not because the running lab is supposed to have them -- a router is
+// never asked for a default route, and a device the audit already believes
+// healthy is not re-read at all. A student's router that restarted into an
+// empty namespace last term therefore passes every check the probe makes, and
+// blessing that namespace as its baseline is the one thing that must never
+// happen: it is where their work is supposed to be.
+func TestAStudentRoutersEmptyNamespaceIsNotBlessedByAPassingProbe(t *testing.T) {
+	engine, top, devices, runtime := namespaceAwareLinkedLab(t)
+	store, err := testStateStore(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine.State = store
+	emptied := devices[0]
+	emptied.Kind, emptied.NOS = model.KindRouter, "bird"
+	for _, i := range emptied.Ifaces {
+		i.Owner = model.OwnerStudent
+	}
+	// A router that has not been asked for anything new: same image, same
+	// specification, same files. Nothing about it is dirty except what is not
+	// in its namespace.
+	reseedContainerSpec(t, engine, top, runtime, emptied)
+	studentAddressSnapshot(t, store, top.Name, emptied, map[string][]string{
+		"port_H1": {"10.0.1.1/24"}, "lo": {"3.156.0.1/24"},
+	})
+	// It restarted before any of this existed: a new namespace, nothing in it,
+	// and a container whose every label and file hash is still correct.
+	runtime.setContents(emptied.Container, namespaceProbeOutput(nil, nil))
+	// Exactly what the platform-mode probe says about it.
+	engine.SemanticProbe = func(context.Context, *model.Device) error { return nil }
+
+	if _, err := engine.Build(top); err != nil {
+		t.Fatal(err)
+	}
+	if diff := engine.LastBuildDiff(); diff.Create[emptied.ID] || diff.Configure[emptied.ID] {
+		t.Fatalf("the fixture's router was dirty for some other reason, so it never "+
+			"reached the baselining this is about: %#v", diff)
+	}
+	if _, ok := persistedNamespaces(t, engine, top.Name)[emptied.ID]; ok {
+		t.Fatal("a student router with an empty namespace was baselined because a probe " +
+			"that never looks at a student's interfaces did not complain; its restart " +
+			"can never be detected now")
+	}
+	kept := engine.storableSnapshots(context.Background(), emptied, []state.Snapshot{
+		{Device: emptied.ID, Kind: state.KindAddrs, Content: []byte("twinet-state/v2 addrs\n")},
+	})
+	if len(kept) != 0 {
+		t.Fatal("the empty namespace was cleared to be captured over the addressing " +
+			"that is the only copy of the student's work")
+	}
+	if _, ok := persistedNamespaces(t, engine, top.Name)[devices[1].ID]; !ok {
+		t.Fatal("one unprovable device stopped its provable neighbours being baselined")
+	}
+}
+
+// The half a rewire leaves behind. A reconcile that noticed a restarted device
+// rebuilds its cables, so the netdevs are all back and every modelled interface
+// is present -- and the addressing the student put on them is still only in the
+// store. Interface presence alone would call that continuous and record the
+// namespace, which is the same mistake one step later.
+func TestARewiredDeviceWithoutItsSavedAddressesIsNotBaselined(t *testing.T) {
+	engine, top, devices, runtime := namespaceAwareLinkedLab(t)
+	store, err := testStateStore(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine.State = store
+	bare := devices[1]
+	studentAddressSnapshot(t, store, top.Name, bare, map[string][]string{
+		"port_H0": {"10.0.1.2/24"},
+	})
+	// Every cable back, nothing on any of them.
+	runtime.setContents(bare.Container, namespaceProbeOutput(modelledNamespaceInterfaces(bare), nil))
+
+	if _, err := engine.Build(top); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := persistedNamespaces(t, engine, top.Name)[bare.ID]; ok {
+		t.Fatal("a rewired device with none of its saved addressing on the rebuilt " +
+			"interfaces was recorded as continuous")
+	}
+	if reason := engine.UnprovenNamespaceDevices()[bare.ID]; !strings.Contains(reason, "10.0.1.2/24") {
+		t.Fatalf("the refusal did not say which saved address was missing: %q", reason)
+	}
+
+	// And the other way: put the addressing back where the store says it was,
+	// and the device is baselined.
+	runtime.setContents(bare.Container, namespaceProbeOutput(modelledNamespaceInterfaces(bare),
+		map[string][]string{"port_H0": {"10.0.1.2/24"}}))
+	if _, err := engine.Build(top); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := persistedNamespaces(t, engine, top.Name)[bare.ID]; !ok {
+		t.Fatal("a device carrying exactly the addressing the store saved was still refused " +
+			"a baseline, so it stays unprotected for ever")
+	}
+}
+
+// The blind spot inside the blind spot. A device whose image or rendered files
+// also changed has its semantic probe skipped entirely, so it never reached the
+// settling above at all -- and it is the one device in the pass that is about
+// to be captured and replaced. An unbaselined, already-emptied device therefore
+// filed its emptiness over the student's addressing on the way past, and the
+// replacement it was captured for then restored that.
+func TestASpecDirtyDeviceWithNoBaselineCannotCaptureOverItsSavedAddresses(t *testing.T) {
+	engine, top, devices, runtime := namespaceAwareLinkedLab(t)
+	store, err := testStateStore(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine.State = store
+	moving := devices[2]
+	studentAddressSnapshot(t, store, top.Name, moving, map[string][]string{
+		"port_H1": {"10.0.2.2/24"},
+	})
+	runtime.setContents(moving.Container, namespaceProbeOutput(nil, nil))
+	// A new image is a new specification, which is what turns the probe off.
+	moving.Image = "host:next"
+	engine.SemanticProbe = func(context.Context, *model.Device) error { return nil }
+
+	if _, err := engine.Build(top); err != nil {
+		t.Fatal(err)
+	}
+	diff := engine.LastBuildDiff()
+	if !diff.Create[moving.ID] || !diff.Capture[moving.ID] {
+		t.Fatalf("the fixture did not schedule the replacement this is about: %#v", diff)
+	}
+	if diff.Semantic[moving.ID] {
+		t.Fatal("the fixture's device was still probed, so it does not exercise the " +
+			"devices that are excluded from the probe")
+	}
+	kept := engine.storableSnapshots(context.Background(), moving, []state.Snapshot{
+		{Device: moving.ID, Kind: state.KindFRR, Content: []byte("router ospf\n")},
+		{Device: moving.ID, Kind: state.KindAddrs, Content: []byte("twinet-state/v2 addrs\n")},
+	})
+	if len(kept) != 1 || kept[0].Kind != state.KindFRR {
+		t.Fatalf("a device being replaced captured its empty namespace over the addressing "+
+			"the replacement was going to restore: %+v", kinds(kept))
+	}
+
+	// A replacement that goes through is not left unbaselined for ever: the
+	// container is new, the store has been replayed into it, and the namespace
+	// it ends up in is the one the next deployment must compare against.
+	engine.markContainerCreated(moving.ID)
+	if engine.namespaceUnproven(moving.ID) {
+		t.Fatal("a container this pass rebuilt and replayed the store into was still " +
+			"treated as unaccounted for, so no baseline would ever be recorded for it")
+	}
+}
+
+// A device is perfectly capable of restarting while its namespace is being
+// read. The container record the observation holds names a pid that has already
+// gone, so the contents of one namespace would be recorded under the identity
+// of another -- and the baseline written would be the one namespace nothing has
+// ever proven anything about.
+func TestARestartDuringTheProofIsNotBaselined(t *testing.T) {
+	engine, top, devices, runtime := namespaceAwareLinkedLab(t)
+	moving := devices[0]
+	var reads atomic.Int32
+	runtime.onProbe = func(container string) {
+		if container != moving.Container {
+			return
+		}
+		reads.Add(1)
+		// Killed between the identity that opened the proof and the one that
+		// closes it.
+		runtime.setIdentity(container, rt.NetnsIdentity{Dev: 4, Inode: 4026559999})
+	}
+
+	if _, err := engine.Build(top); err != nil {
+		t.Fatal(err)
+	}
+	if reads.Load() == 0 {
+		t.Fatal("the namespace was never read, so the race was never run")
+	}
+	if _, ok := persistedNamespaces(t, engine, top.Name)[moving.ID]; ok {
+		t.Fatal("a device that restarted while its namespace was being read had the " +
+			"reading recorded against the namespace it had already left")
+	}
+	if _, ok := persistedNamespaces(t, engine, top.Name)[devices[1].ID]; !ok {
+		t.Fatal("one racing device stopped its settled neighbours being baselined")
+	}
+
+	// Once it holds still, the proof closes and the baseline is taken.
+	runtime.onProbe = nil
+	if _, err := engine.Build(top); err != nil {
+		t.Fatal(err)
+	}
+	if got := persistedNamespaces(t, engine, top.Name)[moving.ID]; got.Inode != 4026559999 {
+		t.Fatalf("a device that stopped moving was never baselined: %+v", got)
+	}
+}
+
+// The part of a namespace's contents that does not depend on whether a student
+// has done any work yet. The platform put these netdevs there, and a namespace
+// without them is not the one the device was wired into -- whatever the state
+// store does or does not have to say about it.
+func TestADeviceThatLostItsCablesIsNotBaselined(t *testing.T) {
+	engine, top, devices, runtime := namespaceAwareLinkedLab(t)
+	stripped := devices[1]
+	runtime.setContents(stripped.Container, namespaceProbeOutput(nil, nil))
+
+	if _, err := engine.Build(top); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := persistedNamespaces(t, engine, top.Name)[stripped.ID]; ok {
+		t.Fatal("a device with none of the interfaces the platform wired into it was " +
+			"recorded as the namespace to compare every later pass against")
+	}
+	if reason := engine.UnprovenNamespaceDevices()[stripped.ID]; !strings.Contains(reason, "port_H0") {
+		t.Fatalf("the refusal did not name the interface that is missing: %q", reason)
+	}
+	for _, d := range []*model.Device{devices[0], devices[2]} {
+		if _, ok := persistedNamespaces(t, engine, top.Name)[d.ID]; !ok {
+			t.Fatalf("%s was wired exactly as modelled and was still refused a baseline", d.ID)
+		}
 	}
 }

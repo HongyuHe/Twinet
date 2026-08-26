@@ -187,3 +187,31 @@ func TestSolveNoChangeNeverRestoresPlatformStudentSnapshots(t *testing.T) {
 		t.Fatalf("solve no-change entered solve->platform restore path: %v", err)
 	}
 }
+
+// The reason a namespace baseline cannot be taken on the strength of a passing
+// semantic probe, written down where the probe is.
+//
+// A student's router in teaching mode owns every interface it has, and the
+// probe skips those deliberately: the model carries their addresses so that
+// grading and `--solve` agree about the answer, not because the running lab is
+// supposed to have them yet. A router is not asked for a default route either.
+// So a router whose network namespace was replaced -- no interfaces, no
+// addresses, nothing at all -- is indistinguishable here from one whose student
+// has not started, and the probe is right to pass it. What it must not do is
+// let anything else conclude that the namespace is the one the work was in.
+func TestPlatformSemanticsPassAStudentRouterWithAnEmptyNamespace(t *testing.T) {
+	top, _ := semanticHostTopology(model.OwnerStudent)
+	router := top.Devices["as5/R"]
+	router.Node, router.Container = "node-0", "twinet-lab-as5-r"
+	router.NOS = "bird"
+	router.Ifaces[0].Owner = model.OwnerStudent
+	server := &Server{rt: &semanticRuntime{output: map[string]rt.ExecResult{
+		"ip\x00-o\x00addr\x00show":        {Stdout: "1: lo    inet 127.0.0.1/8 scope host lo\n"},
+		"ip\x00-o\x00route\x00show":       {},
+		"ip\x00-o\x00-6\x00route\x00show": {},
+	}}}
+	if err := server.verifyNetworkSemantics(context.Background(), top, router, render.ModePlatform); err != nil {
+		t.Fatalf("the probe reported a verdict about a student's own interfaces, so the "+
+			"deploy engine's namespace proof can stop doing its own reading: %v", err)
+	}
+}
