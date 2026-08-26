@@ -525,14 +525,30 @@ namespace a device was last configured in is recorded beside the hashes that
 decide whether it is current, and a device found in a different one is not
 current: it is rewired, reconfigured, and then has its saved state replayed on
 top, in that order, because an address cannot be put on an interface that does
-not exist yet. Its neighbours on the same node are replayed with it — a veth is
-a pair and is rebuilt as one, so a restarted router takes its neighbours'
-interfaces with it and they come back bare. Nothing captures over that state
-until the replay has happened, so the pass that finds a restarted router cannot
-overwrite the snapshot it is about to restore. A backend that cannot prove
-namespace identity is not asked to: its containers are replaced rather than
-restarted when a task dies, which the ordinary create path already restores
-through.
+not exist yet. Its links are rebuilt with it, because an address cannot be
+replayed onto an interface that went with the namespace. Its neighbours on the
+same node are replayed too — a veth is a pair and is rebuilt as one, so a
+restarted router takes its neighbours' interfaces with it and they come back
+bare — but only replayed: nothing restarted them, so their containers and their
+other cables are left alone. Nothing captures over that state until the replay
+has happened, so the pass that finds a restarted router cannot overwrite the
+snapshot it is about to restore, and neither can a prune that is about to delete
+an unreplayed container. A backend that cannot prove namespace identity is not
+asked to: its containers are replaced rather than restarted when a task dies,
+which the ordinary create path already restores through.
+
+The comparison needs something to compare against, and the first deployment
+after an upgrade has nothing recorded for any device. A device that is healthy
+and stays healthy never configures, so it would never acquire a baseline and its
+first restart would be invisible for ever. An apply therefore records the
+namespace of every device whose semantic probe passes: a device holding the
+network state the model says it should, in the namespace it is in now, is making
+exactly the claim a baseline makes. A plan records nothing — it decided nothing.
+A device with no baseline whose network state is *missing* is the dangerous one,
+since it may have restarted weeks ago and its student's addressing may exist only
+in the state store; it is repaired like any other drift, but it is not given a
+baseline and its namespace-backed state is withheld from the store until a probe
+passes, so the emptiness is never filed over the work.
 
 If a cluster mutation was interrupted — a controller killed halfway, a node
 rebooted mid-apply — the transaction is persisted and resumable:

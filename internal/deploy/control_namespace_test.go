@@ -16,9 +16,36 @@ import (
 // network namespaces the test controls.
 type namespaceAwareRuntime struct {
 	observedRuntime
-	identity map[string]rt.NetnsIdentity
-	failFor  map[string]error
-	removed  []string
+	identity  map[string]rt.NetnsIdentity
+	failFor   map[string]error
+	removed   []string
+	nsPathErr error
+}
+
+func (*namespaceAwareRuntime) PullImage(context.Context, string, rt.PullPolicy) error { return nil }
+
+// Exec answers the restore marker honestly. The shared fake returns success
+// for almost every command, which would have every device in every fixture
+// claiming it still owes its student a replay.
+func (r *namespaceAwareRuntime) Exec(ctx context.Context, c string, cmd rt.ExecCmd) (rt.ExecResult, error) {
+	if strings.HasPrefix(strings.Join(cmd.Cmd, " "), "test -f "+restoreMarker) {
+		return rt.ExecResult{ExitCode: 1}, nil
+	}
+	return r.observedRuntime.Exec(ctx, c, cmd)
+}
+
+func (*namespaceAwareRuntime) ImageDigest(_ context.Context, ref string) (string, error) {
+	return "sha256:" + ref, nil
+}
+
+// NSPath is what wiring asks for before it touches netlink, so a test that
+// cannot wire anything fails there rather than panicking through an embedded
+// interface that is nil.
+func (r *namespaceAwareRuntime) NSPath(_ context.Context, name string) (string, error) {
+	if r.nsPathErr != nil {
+		return "", r.nsPathErr
+	}
+	return "/proc/self/ns/net", nil
 }
 
 func (*namespaceAwareRuntime) Name() string { return "containerd" }

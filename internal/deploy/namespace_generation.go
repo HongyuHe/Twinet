@@ -89,6 +89,84 @@ func (e *Engine) resetLostNamespaceState() {
 		e.lostNamespaceState.Delete(key)
 		return true
 	})
+	e.unprovenNamespace.Range(func(key, _ any) bool {
+		e.unprovenNamespace.Delete(key)
+		return true
+	})
+}
+
+// markNamespaceUnproven records that a device has no recorded namespace and is
+// not healthy enough to be given one.
+//
+// This is the upgrade window. Everything above compares a device's namespace
+// against the one it was last configured in, and before this code existed
+// nothing recorded that -- so on the first pass after an upgrade every device
+// is unbaselined. A healthy device is baselined below and the window closes.
+// A device that is already broken is the dangerous one: it may have restarted
+// weeks ago, in which case its namespace is empty and its student's addressing
+// exists only in the state store. Recording that namespace would bless the
+// emptiness as the device's own, and capturing from it would then overwrite
+// the only copy of the work.
+//
+// So it is left unbaselined, and its namespace-backed state is withheld from
+// the store until the device is proven healthy again. The device is still
+// repaired -- a failing semantic probe already schedules its configuration --
+// and the snapshot is still there for an operator who wants it replayed.
+func (e *Engine) markNamespaceUnproven(id string) { e.unprovenNamespace.Store(id, true) }
+
+func (e *Engine) namespaceUnproven(id string) bool {
+	_, ok := e.unprovenNamespace.Load(id)
+	return ok
+}
+
+// settleNamespaceBaselines gives a recorded namespace to every device this pass
+// has proven healthy, and refuses one to every device it has not.
+//
+// A device is only baselined by the configure step, so a node full of healthy
+// devices that never need configuring would never be protected: the first
+// restart of any of them would be invisible for ever, because there would be
+// nothing to compare against. Health is the proof that makes a baseline safe.
+// A device whose semantic probe passes has the network state the model says it
+// should, in the namespace it is in now, which is the whole claim a baseline
+// makes.
+func (e *Engine) settleNamespaceBaselines(ctx context.Context, probed []*model.Device,
+	diff BuildDiff, byName map[string]runtime.Container, tracker *observationTracker,
+) {
+	if e.Runtime == nil || tracker == nil || !runtime.SupportsNetnsIdentity(e.Runtime) {
+		return
+	}
+	for _, d := range probed {
+		if recorded, known := tracker.namespace(d.ID); known && recorded.Known() {
+			continue
+		}
+		if diff.Semantic[d.ID] {
+			e.markNamespaceUnproven(d.ID)
+			continue
+		}
+		if diff.Create[d.ID] || diff.Recreate[d.ID] || diff.Configure[d.ID] || diff.Ready[d.ID] {
+			// Dirty in some other way. The configure step records the
+			// namespace it leaves the device in, which is a better baseline
+			// than one taken before the work.
+			continue
+		}
+		if e.ObservationReadOnly {
+			// A plan reports; it does not decide what the next deployment will
+			// trust. Reading the identity here would cost a round trip per
+			// device and persist nothing.
+			continue
+		}
+		container, ok := byName[d.Container]
+		if !ok || !container.State.Joinable() {
+			continue
+		}
+		identity, err := runtime.ObservedNetnsIdentityOf(ctx, e.Runtime, container)
+		if err != nil || !identity.Known() {
+			// No proof, no baseline. The device is healthy, so nothing is at
+			// risk until it restarts, and the next pass will try again.
+			continue
+		}
+		tracker.bootstrapNamespace(d.ID, identity)
+	}
 }
 
 // observedNamespaceReplacements names devices whose network namespace is not
@@ -143,6 +221,15 @@ func (e *Engine) recordDeviceNamespace(ctx context.Context, tracker *observation
 	if e.Runtime == nil || tracker == nil || d == nil || !runtime.SupportsNetnsIdentity(e.Runtime) {
 		return nil
 	}
+	if e.namespaceUnproven(d.ID) {
+		// This device has never had a namespace recorded and arrived at this
+		// pass with its modelled network state missing. Configuring it does
+		// not prove which of the two things happened -- an ordinary drift, or
+		// a restart that emptied the namespace weeks ago -- and recording the
+		// namespace now would settle the question the wrong way for ever. It
+		// stays unbaselined until a semantic probe passes.
+		return nil
+	}
 	var last error
 	for attempt := 0; attempt < namespaceProofAttempts; attempt++ {
 		identity, err := runtime.NetnsIdentityOf(ctx, e.Runtime, d.Container)
@@ -192,6 +279,12 @@ func namespaceBackedKind(kind state.Kind) bool {
 // boundary: capture is also run by an engine that did no observing, and by a
 // later agent entirely, and neither of those knows what the pass that found
 // the restart knew.
+//
+// A device with no baseline that failed its semantic probe is withheld too.
+// There the doubt is the point: nothing can say whether its namespace is the
+// one its student worked in or an empty one it restarted into before any of
+// this was recorded, and the emptiness is exactly what a capture would file
+// over the work.
 func (e *Engine) storableSnapshots(ctx context.Context, d *model.Device,
 	snaps []state.Snapshot,
 ) []state.Snapshot {
@@ -208,7 +301,7 @@ func (e *Engine) storableSnapshots(ctx context.Context, d *model.Device,
 	if !namespaceBacked {
 		return snaps
 	}
-	if !e.namespaceStateLost(d.ID) && !e.restoreIsPending(ctx, d) {
+	if !e.namespaceStateLost(d.ID) && !e.namespaceUnproven(d.ID) && !e.restoreIsPending(ctx, d) {
 		return snaps
 	}
 	out := snaps[:0:0]

@@ -204,7 +204,11 @@ type Engine struct {
 	createdContainers sync.Map
 	// lostNamespaceState records devices whose namespace-backed state this pass
 	// found gone, until it has been replayed back into them.
-	lostNamespaceState      sync.Map
+	lostNamespaceState sync.Map
+	// unprovenNamespace records devices with no recorded namespace that this
+	// pass could not prove healthy. Nothing may take a baseline from them or
+	// file their namespace-backed state as their student's work.
+	unprovenNamespace       sync.Map
 	observationMu           sync.Mutex
 	observation             *observationTracker
 	desiredLinkHashes       map[string]string
@@ -1415,6 +1419,14 @@ func (e *Engine) orphanSnapshots(ctx context.Context, top *model.Topology, c run
 		d.Kind = model.KindRouter
 	}
 	snaps, err := Capture(ctx, e.Runtime, d, top.Name, top.Hash)
+	// A container that still carries the restore marker came back without its
+	// student's configuration and has not had it replayed. Its namespace holds
+	// none of the addressing, tunnels or bridge ports the snapshot in the store
+	// does, and a prune that filed what is in it now would destroy that
+	// snapshot on the way to deleting the container -- the one path here that
+	// nobody gets to undo. The routing configuration is a file, survived the
+	// restart, and is still worth keeping.
+	snaps = e.storableSnapshots(ctx, d, snaps)
 	if err != nil {
 		return snaps, err
 	}

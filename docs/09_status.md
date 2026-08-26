@@ -327,6 +327,22 @@ reached students, and each motivated a permanent test.
    snapshot it was about to restore. The gate now runs a restored submission
    rather than a solved lab, and fails without the replay.
 
+   Three things that repair left behind. Noticing a restart is not the same as
+   repairing it: a link is only rebuilt when one of its endpoints is being
+   created, and a device with no control sidecar -- a host, a switch, a BIRD
+   router -- had no sidecar to prove anything, so it was marked for a replay
+   with none of its cables scheduled and its addresses were applied to
+   interfaces that were not there. The comparison also needs something to
+   compare against, and the first deployment after an upgrade has nothing
+   recorded: a device that is healthy and never configures would never acquire a
+   baseline, so an apply now records the namespace of every device whose
+   semantic probe passes, a plan records nothing, and a device whose network
+   state is already missing is neither blessed with a baseline nor captured from
+   until it is healthy again. And prune, the one path nobody gets to undo,
+   stored what it read straight into the store: a container that came back from
+   a restart and had not been replayed into filed its empty namespace over the
+   snapshot on the way to being deleted.
+
 10. **A release gate that answered yes without looking.** `make ci` printed
     "all CI gates passed" while skipping the lint and the shell check whenever
     their tools were absent, which on the development machine was always.

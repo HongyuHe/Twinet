@@ -284,6 +284,26 @@ func (t *observationTracker) bootstrapDevice(id string, value observedDeviceStat
 	t.mu.Unlock()
 }
 
+// bootstrapNamespace records the namespace of a device that is being seen for
+// the first time by a deployment that can prove one, without overwriting a
+// namespace a configure step already recorded.
+//
+// It does not persist on its own. The observation is written once, at the end
+// of the pass, and only when the pass is allowed to write -- which is what
+// keeps a read-only plan from establishing a baseline it never verified by
+// deploying anything.
+func (t *observationTracker) bootstrapNamespace(id string, value runtime.NetnsIdentity) {
+	t.mu.Lock()
+	if t.state.Namespaces == nil {
+		t.state.Namespaces = map[string]runtime.NetnsIdentity{}
+	}
+	if _, exists := t.state.Namespaces[id]; !exists {
+		t.state.Namespaces[id] = value
+		t.changed = true
+	}
+	t.mu.Unlock()
+}
+
 func (t *observationTracker) bootstrapLink(id, hash string) {
 	t.mu.Lock()
 	if _, exists := t.state.Links[id]; !exists {
@@ -580,16 +600,30 @@ func (e *Engine) observeNode(ctx context.Context, top *model.Topology, devices [
 	// An orphaned sidecar is proof that its router's namespace was replaced:
 	// the sidecar joined that namespace when it was built and has not moved
 	// since. Both findings mean the same repair.
+	//
+	// The two sets are kept apart. A device that was itself found in a new
+	// namespace lost its interfaces with it and needs them rebuilt; a device
+	// dragged in by the expansion below did not move, and rebuilding its
+	// container would be a repair nothing asked for.
+	replaced := map[string]bool{}
 	lost := map[string]bool{}
 	for _, d := range devices {
 		if splitControls[d.ID] || replacedNamespaces[d.ID] {
+			replaced[d.ID] = true
 			lost[d.ID] = true
 		}
 	}
 	expandLostStateToPeers(devices, lost, e.Node)
 	for i, d := range devices {
 		observation := observations[i]
-		if splitControls[d.ID] {
+		if replaced[d.ID] {
+			// A new namespace has none of the device's cables in it, and a
+			// link is only rebuilt when one of its endpoints is being created.
+			// Without this a restarted host, switch or BIRD router had its
+			// saved addresses replayed onto interfaces that were not there:
+			// the replay reported success and put nothing anywhere. Only the
+			// device that actually moved is marked, so its links -- and only
+			// its links -- are wired again.
 			observation.create = true
 		}
 		if lost[d.ID] {
@@ -657,6 +691,7 @@ func (e *Engine) observeNode(ctx context.Context, top *model.Topology, devices [
 				diff.Ready[d.ID] = true
 			}
 		}
+		e.settleNamespaceBaselines(ctx, semanticDevices, diff, byName, tracker)
 	}
 
 	wantLinks := map[string]bool{}
