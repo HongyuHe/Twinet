@@ -470,6 +470,17 @@ func (c *Cluster) coordinatedApplyWithLeaseTimed(ctx context.Context, top *model
 	}
 	wire := agent.Serialise(top)
 	wire.Mode, wire.Ungraded = req.Mode, req.Ungraded
+	// The disposable marker is part of the persisted topology, not just of
+	// this request: an agent restart reads topology.json, and a harness that
+	// comes back without it is durable forever.
+	wire.Ephemeral = req.Ephemeral || top.Ephemeral
+	wire.EphemeralTTLSeconds = req.EphemeralTTLSeconds
+	if wire.EphemeralTTLSeconds == 0 {
+		wire.EphemeralTTLSeconds = top.EphemeralTTLSeconds
+	}
+	wire.EphemeralOwner = req.EphemeralOwner
+	req.Ephemeral = wire.Ephemeral
+	req.EphemeralTTLSeconds = wire.EphemeralTTLSeconds
 	peers := map[string]string{}
 	if top.Lab != nil {
 		for _, node := range top.Lab.Placement.Nodes {

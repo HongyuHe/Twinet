@@ -65,6 +65,16 @@ func (s *Server) handleApplyPrepare(w http.ResponseWriter, r *http.Request, req 
 			wireMode, req.Topology.Ungraded, mode, req.Ungraded))
 		return
 	}
+	// A disposable lab must say so in both the request and the topology that
+	// is persisted from it. Accepting a request that claims one and a wire
+	// that claims the other would let a restart rehydrate a harness as durable
+	// -- or, far worse, a teaching lab as collectable.
+	if req.Topology.Ephemeral != req.Ephemeral {
+		httpError(w, http.StatusBadRequest, fmt.Errorf(
+			"topology ephemeral=%t does not match request ephemeral=%t",
+			req.Topology.Ephemeral, req.Ephemeral))
+		return
+	}
 	top, err := req.Topology.Rehydrate()
 	if err != nil {
 		httpError(w, http.StatusBadRequest, fmt.Errorf("rehydrate topology: %w", err))
@@ -362,6 +372,20 @@ func (s *Server) commitAppliedTopology(ctx context.Context, top *model.Topology,
 	}
 	s.peers[top.Name] = tx.PeerUnderlay
 	s.mu.Unlock()
+
+	// The lifetime is recorded after the topology, so a crash between the two
+	// leaves an ephemeral topology whose deadline rehydration re-derives under
+	// a bounded restart grace rather than a durable lab with a deadline.
+	if authoritative {
+		if wire.Ephemeral {
+			if err := s.noteEphemeralLease(top.Name, wire.EphemeralOwner,
+				wire.EphemeralTTLSeconds, tx.Generation); err != nil {
+				return ApplyResponse{}, err
+			}
+		} else if err := s.forgetEphemeralLease(top.Name); err != nil {
+			return ApplyResponse{}, err
+		}
+	}
 
 	resp := ApplyResponse{
 		Node: s.cfg.Node, AgentVersion: Version,

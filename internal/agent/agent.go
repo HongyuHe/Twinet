@@ -241,6 +241,8 @@ type Server struct {
 	gcDeleteHostLink       func(string) error
 	gcListMultiplex        func(string) ([]netx.MultiplexOverlay, error)
 	gcRemoveEmptyMultiplex func(string) ([]string, error)
+	gcFindOrphanBridges    func(map[string]bool) ([]netx.OrphanBridge, error)
+	gcRemoveOrphanBridge   func(string) error
 
 	// tools compares a container's programs against its image's, so that a
 	// mark never rests on a program the student under examination wrote. It is
@@ -287,13 +289,22 @@ type Server struct {
 	// mutations are fenced, cluster-scoped operation leases. Unlike ops,
 	// which only serialise work inside this process, these leases are issued
 	// to the controller and survive every handler boundary.
-	mutations       map[string]*clusterLease
-	fenceHighWater  map[string]uint64
-	overlayClaims   map[uint32]overlayClaim
-	generations     map[string]generationState
-	transactions    map[string]applyTransaction
-	inventories     map[string]transactionInventory
-	overlayLineage  map[string]map[uint32]string
+	mutations      map[string]*clusterLease
+	fenceHighWater map[string]uint64
+	overlayClaims  map[uint32]overlayClaim
+	generations    map[string]generationState
+	transactions   map[string]applyTransaction
+	inventories    map[string]transactionInventory
+	overlayLineage map[string]map[uint32]string
+	// ephemeral holds the bounded lifetime of every disposable lab this node
+	// is carrying. A lab absent from this map is durable and is never
+	// reclaimed automatically.
+	ephemeral map[string]ephemeralLease
+	// gcCollecting fences objects a collection pass has decided to remove.
+	// Reservation refuses a VNI listed here, so a deploy arriving mid-pass is
+	// told to retry instead of racing the deletion of the object it just
+	// claimed.
+	gcCollecting    map[uint32]bool
 	now             func() time.Time
 	overlayOwners   func() (map[uint32]string, error)
 	overlayAdopter  func(uint32, string) error
@@ -309,6 +320,7 @@ type Server struct {
 	recoveryRestore          func(context.Context, string, applyTransaction) error
 	recoveryVerify           func(context.Context, applyTransaction) error
 	recoveryReplicate        func(context.Context, applyTransaction) error
+	ephemeralDestroy         func(context.Context, string) error
 	recoveryPhaseTimeout     time.Duration
 	recoveryTotalTimeout     time.Duration
 	recoveryLeaseTTL         time.Duration
@@ -458,6 +470,7 @@ func renderer(top *model.Topology, mode render.Mode, ungraded int) *render.Rende
 // destroy arrives and skips the capture of student work it no longer knows
 // exists.
 func (s *Server) rehydrate() {
+	restoredLifetimes := false
 	labs, err := s.store.Labs()
 	if err != nil {
 		slog.Warn("reloading known labs", "err", err)
@@ -511,6 +524,15 @@ func (s *Server) rehydrate() {
 			state.Committed = top.Hash
 		}
 		s.generations[top.Name] = state
+		if wt.Ephemeral {
+			// The persisted topology is the authority on whether a lab is
+			// disposable. Its deadline lives in the coordination journal; if
+			// only one of the two survived a crash, a bounded restart grace is
+			// substituted rather than an unbounded lifetime.
+			if s.restoreEphemeralLeaseLocked(top.Name, wt.EphemeralTTLSeconds, wt.Generation) {
+				restoredLifetimes = true
+			}
+		}
 		s.rememberHow(top.Name, string(mode), wt.Ungraded)
 		s.loadExemptions(top.Name)
 		s.loadHolds(top.Name)
@@ -521,6 +543,13 @@ func (s *Server) rehydrate() {
 			s.peers[top.Name] = wt.PeerUnderlay
 		}
 		s.loadPersistedPeerReplicationHealth(top)
+	}
+	if restoredLifetimes {
+		// Persisted immediately so a crash-looping agent cannot keep granting
+		// itself a fresh restart grace for the same abandoned harness.
+		if err := s.saveCoordinationLocked(); err != nil {
+			slog.Error("AUDIT: persisting restored ephemeral lab deadlines", "err", err)
+		}
 	}
 	if len(s.current) > 0 {
 		slog.Info("reloaded labs from the state store", "count", len(s.current))
@@ -590,6 +619,26 @@ func (s *Server) acquireDestroyOperation(
 	if !force {
 		return s.acquireOperation(lab, "destroy", nil)
 	}
+	return s.acquireForcedOperation(ctx, lab, "destroy", false)
+}
+
+// acquireForcedOperation takes a lab's operation lease, cancelling whatever
+// cancellable work already holds it.
+//
+// preemptStaleRecovery additionally displaces a recovery that has already
+// passed its own persisted deadline. Only automatic reclamation asks for that:
+// an operator's forced destroy still waits for recovery, because recovery is
+// the thing protecting student state, whereas a lab that a node has decided to
+// reclaim has no state to protect and must not be blocked indefinitely by a
+// recovery that is itself stuck.
+func (s *Server) acquireForcedOperation(
+	ctx context.Context,
+	lab, kind string,
+	preemptStaleRecovery bool,
+) (uint64, chan struct{}, error) {
+	if lab == "" {
+		return 0, nil, errors.New("an operation must name the lab it acts on")
+	}
 	for {
 		s.mu.Lock()
 		if s.ops == nil {
@@ -599,12 +648,14 @@ func (s *Server) acquireDestroyOperation(
 		if held == nil {
 			s.opSequence++
 			id := s.opSequence
-			s.ops[lab] = &lease{id: id, kind: "destroy", at: s.nowTime()}
+			s.ops[lab] = &lease{id: id, kind: kind, at: s.nowTime()}
 			s.mu.Unlock()
 			return id, nil, nil
 		}
+		staleRecovery := preemptStaleRecovery && held.kind == "recovery" &&
+			!held.deadline.IsZero() && !s.nowTime().Before(held.deadline)
 		preemptible := held.cancel != nil && held.done != nil &&
-			(held.kind == "reconcile" || held.kind == "apply")
+			(held.kind == "reconcile" || held.kind == "apply" || staleRecovery)
 		if !preemptible {
 			s.mu.Unlock()
 			return 0, nil, fmt.Errorf("another operation is already running on lab %q: %s, started %s ago",
@@ -612,12 +663,12 @@ func (s *Server) acquireDestroyOperation(
 		}
 		held.cancel()
 		done := held.done
-		kind := held.kind
+		heldKind := held.kind
 		s.mu.Unlock()
 		select {
 		case <-done:
 		case <-ctx.Done():
-			return 0, nil, fmt.Errorf("%s did not yield to forced destroy: %w", kind, ctx.Err())
+			return 0, nil, fmt.Errorf("%s did not yield to %s: %w", heldKind, kind, ctx.Err())
 		}
 	}
 }
@@ -825,6 +876,12 @@ func (s *Server) Serve(ctx context.Context) error {
 	mux.HandleFunc("POST /v1/overlay/reserve", s.authorize(endpointPolicy{
 		Action: authz.ActionDeploy, Mutation: true, ResolveRequest: scopeFromJSONLab(authz.ActionDeploy),
 	}, s.handleOverlayReserve))
+	// A heartbeat is deploy authority over one lab: it can only extend the
+	// lifetime of a lab that a deployment already declared disposable, and it
+	// can never create one.
+	mux.HandleFunc("POST /v1/ephemeral", s.authorize(endpointPolicy{
+		Action: authz.ActionDeploy, Mutation: true, ResolveRequest: scopeFromJSONLab(authz.ActionDeploy),
+	}, s.observedHandler("ephemeral", s.handleEphemeral)))
 	mux.HandleFunc("GET /v1/recovery", s.authorize(endpointPolicy{
 		Action: authz.ActionObserve, AllowCluster: true, ResolveRequest: scopeFromQuery(authz.ActionObserve, false),
 	}, s.observedHandler("recovery", s.handleRecoveryStatus)))
@@ -999,6 +1056,10 @@ func (s *Server) Serve(ctx context.Context) error {
 	// partial applies. The loop obtains a new internal fence only after a
 	// controller lease lapses and keeps retrying rollback after node recovery.
 	go s.recoveryLoop(ctx)
+	// A disposable lab belongs to a controller that is still running. This is
+	// the only thing on the node that can tell the difference between a
+	// grading harness whose controller was killed and a lab a course needs.
+	go s.ephemeralLoop(ctx)
 
 	errc := make(chan error, 1)
 	go func() {
@@ -1099,6 +1160,10 @@ type StatusResponse struct {
 	// A controller must not read an HTTP 200 status as proof that a failed
 	// apply preserved services; Consistent is the proof boundary.
 	Recoveries map[string]RecoveryStatus `json:"recoveries,omitempty"`
+	// Ephemeral names every disposable lab this node holds and when its
+	// lifetime ends. It is how an operator sees that a harness is still
+	// consuming the cluster and exactly how long that can continue.
+	Ephemeral []EphemeralStatus `json:"ephemeral,omitempty"`
 	// Inventory distinguishes observed physical and allocatable capacity from
 	// Twinet's own reservations. Unknown values are nil and named explicitly
 	// in Inventory.Unknown; they are never reported as zero capacity.
@@ -1273,6 +1338,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	resp.Generations = s.committedGenerations()
 	resp.Modes = s.committedModes()
 	resp.Recoveries = s.recoveryStatuses(r.Context())
+	resp.Ephemeral = s.ephemeralStatuses()
 	resp.PeerReplication = s.peerReplicationStatuses()
 
 	if owners, err := netx.OverlayOwners(); err == nil {
@@ -1301,6 +1367,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		resp.Generations = nil
 		resp.Modes = nil
 		resp.Recoveries = nil
+		resp.Ephemeral = nil
 		resp.PeerReplication = nil
 		resp.SemanticHealth = nil
 		// Aggregates carry no tenant identifiers and remain useful to a
@@ -1453,9 +1520,20 @@ type ApplyRequest struct {
 	// lab is rendered with the reference solution. It is how a grading harness
 	// surrounds a submission with a correct internet without also configuring
 	// the work being marked.
-	Ungraded int  `json:"ungraded_as,omitempty"`
-	Workers  int  `json:"workers"`
-	DryRun   bool `json:"dry_run"`
+	Ungraded int `json:"ungraded_as,omitempty"`
+	// Ephemeral asks the node to hold this lab under a bounded, renewable
+	// lifetime instead of indefinitely. It is how a controller says "this lab
+	// exists only while I do", and it is the only thing that lets a node
+	// reclaim a grading harness whose controller was killed.
+	//
+	// EphemeralTTLSeconds is the requested lifetime between heartbeats; the
+	// node clamps it to its own safe bounds and never grants more than its
+	// absolute lifetime ceiling from first deployment.
+	Ephemeral           bool   `json:"ephemeral,omitempty"`
+	EphemeralTTLSeconds int    `json:"ephemeral_ttl_seconds,omitempty"`
+	EphemeralOwner      string `json:"ephemeral_owner,omitempty"`
+	Workers             int    `json:"workers"`
+	DryRun              bool   `json:"dry_run"`
 	// StrictAdmission makes the controller verify live inventory before any
 	// cluster mutation. It is set by deploy and grading; low-level callers
 	// retain their explicit compatibility behavior.

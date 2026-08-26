@@ -405,6 +405,13 @@ func (s *Server) reconcileOnce(ctx context.Context) {
 				"lab", name, "reason", why)
 			continue
 		}
+		if s.ephemeralExpired(name) {
+			// Reclamation is owed on this lab. Repairing it would spend the
+			// very capacity the reclamation exists to return, and would fight
+			// the reaper for the operation lease.
+			slog.Debug("leaving an expired ephemeral lab alone until it is reclaimed", "lab", name)
+			continue
+		}
 		// The survey runs without the lab lock. Holding it for the whole scan
 		// made a background maintenance task block the operator: a deploy
 		// arriving mid-sweep was refused with "another operation is already
@@ -442,7 +449,7 @@ func (s *Server) reconcileSample(ctx context.Context) {
 	s.mu.Unlock()
 	for name, top := range labs {
 		if top == nil || s.heldBy(name) != "" || s.mutationLeaseHolder(name) != "" ||
-			s.ordinaryMaintenanceSuppression(name) != "" {
+			s.ordinaryMaintenanceSuppression(name) != "" || s.ephemeralExpired(name) {
 			continue
 		}
 		var devices []*model.Device

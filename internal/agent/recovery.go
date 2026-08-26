@@ -38,6 +38,22 @@ type RecoveryRequest struct {
 	// recovery: it records that unavailable historical replicas cannot be
 	// reconstructed and the desired solve/reference transaction will win.
 	ForwardAcknowledged bool `json:"forward_acknowledged,omitempty"`
+	// RollbackCommitted permits rolling back a generation this node has
+	// already committed but not yet finalized.
+	//
+	// It exists for the split commit: a cluster where one node acknowledged
+	// commit and another did not. The nodes that failed roll back to the
+	// previous generation and, on completing, delete the transaction that was
+	// the evidence anything happened. The node that committed refuses to roll
+	// back, because ordinarily a committed generation is the answer. What is
+	// left is a cluster permanently at two generations, which every subsequent
+	// apply refuses as a failed compare-and-swap -- with no way out but
+	// force-destroying the lab and every student's work in it.
+	//
+	// The decision to abandon a committed generation is a cluster decision, so
+	// it is never taken by a node on its own: only a coordinator that has read
+	// every node's state may ask for it, and it asks explicitly.
+	RollbackCommitted bool `json:"rollback_committed,omitempty"`
 }
 
 // RecoveryResponse reports the verified state after a recovery attempt.
@@ -120,6 +136,7 @@ type recoveryRunOptions struct {
 	takeover            bool
 	automatic           bool
 	forwardAcknowledged bool
+	rollbackCommitted   bool
 }
 
 func (s *Server) recoveryPhaseLimit() time.Duration {
@@ -509,6 +526,66 @@ func (s *Server) keepRecoveryFence(ctx context.Context, lab string, fence Fence)
 		close(stop)
 		<-done
 	}
+}
+
+// reopenCommittedTransaction turns a committed-but-unfinalized transaction
+// back into rollback work.
+//
+// It is deliberately narrow. Finalization is the point after which rollback
+// material is discarded, so a transaction that is absent or already finalized
+// cannot be reopened and this refuses rather than inventing a pre-state. The
+// pre-state must also still be state-safe: rolling back over a node that never
+// durably captured what it was holding would trade one inconsistency for lost
+// student work, which is the one outcome this whole path exists to avoid.
+func (s *Server) reopenCommittedTransaction(lab string, fence Fence, generation string) (
+	applyTransaction, error,
+) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initCoordination()
+	if err := s.fenceErrorLocked(lab, fence, s.nowTime()); err != nil {
+		return applyTransaction{}, err
+	}
+	tx, ok := s.transactions[lab]
+	if !ok || tx.Generation != generation {
+		return applyTransaction{}, fmt.Errorf(
+			"generation %q of lab %q was finalized and cannot be rolled back; "+
+				"its rollback material no longer exists", generation, lab)
+	}
+	if !tx.Committed {
+		return tx, nil
+	}
+	if len(tx.Prestate.Containers) > 0 && !tx.Prestate.StateSafe {
+		return applyTransaction{}, fmt.Errorf(
+			"refusing to abandon committed generation %q of lab %q: its pre-state was not durably captured",
+			generation, lab)
+	}
+	if tx.PreviousGen == "" && len(tx.Previous) > 0 {
+		return applyTransaction{}, fmt.Errorf(
+			"refusing to abandon committed generation %q of lab %q: it records no previous generation",
+			generation, lab)
+	}
+	before := tx
+	state := s.generations[lab]
+	beforeState := state
+	tx.Committed = false
+	tx.Phase = transactionRollbackNeeded
+	tx.Failure = "cluster split commit: another node did not commit this generation"
+	// The lab's committed generation returns to the prepared/uncommitted shape
+	// so status, garbage collection and any later apply all agree that this
+	// generation is not the cluster's answer.
+	state.Committed, state.Prepared = tx.PreviousGen, generation
+	s.generations[lab] = state
+	s.transactions[lab] = tx
+	if err := s.saveCoordinationLocked(); err != nil {
+		s.transactions[lab] = before
+		s.generations[lab] = beforeState
+		return applyTransaction{}, fmt.Errorf("persisting split-commit rollback decision: %w", err)
+	}
+	slog.Warn("AUDIT: abandoning a committed generation because the cluster did not commit it everywhere",
+		"lab", lab, "generation", generation, "previous_generation", tx.PreviousGen,
+		"node", s.cfg.Node)
+	return tx, nil
 }
 
 func (s *Server) beginRecovery(lab string, fence Fence, generation, strategy string,
@@ -1624,6 +1701,12 @@ func (s *Server) transactionInventoryStatus(ctx context.Context, lab string) Rec
 			(!tx.RecoveryDeadline.IsZero() && !now.Before(tx.RecoveryDeadline))
 		if !tx.Committed {
 			status.AllowedStrategies = []string{"rollback", "forward"}
+		} else {
+			// Committed but not finalized: the rollback material is still
+			// here, so a coordinator that finds the cluster split can still
+			// choose the previous generation.
+			status.CommittedPending = true
+			status.AllowedStrategies = []string{"rollback"}
 		}
 		if tx.Phase == transactionRollbackNeeded || tx.Phase == transactionRecovering ||
 			tx.Phase == transactionRollbackFailed {
@@ -1951,7 +2034,10 @@ func (s *Server) handleRecovery(w http.ResponseWriter, r *http.Request) {
 		strategy = "rollback"
 	}
 	status, err := s.recoverTransactionStrategyOptions(r.Context(), req.Lab, req.Fence, strategy,
-		recoveryRunOptions{takeover: req.Takeover, forwardAcknowledged: req.ForwardAcknowledged})
+		recoveryRunOptions{
+			takeover: req.Takeover, forwardAcknowledged: req.ForwardAcknowledged,
+			rollbackCommitted: req.RollbackCommitted,
+		})
 	if err != nil {
 		httpError(w, http.StatusConflict, err)
 		return
@@ -2180,13 +2266,27 @@ func (s *Server) recoverTransactionStrategyOptions(ctx context.Context, lab stri
 		s.mu.Unlock()
 	}
 	if tx.Committed {
-		status := s.transactionInventoryStatus(ctx, lab)
-		if !status.Consistent {
-			_ = s.markTransactionPhase(lab, fence, tx.Generation, transactionRollbackFailed,
-				"committed inventory drift: "+status.Error)
-			return status, fmt.Errorf("committed generation %q inventory drift: %s", tx.Generation, status.Error)
+		if !options.rollbackCommitted || strategy != "rollback" {
+			status := s.transactionInventoryStatus(ctx, lab)
+			if !status.Consistent {
+				_ = s.markTransactionPhase(lab, fence, tx.Generation, transactionRollbackFailed,
+					"committed inventory drift: "+status.Error)
+				return status, fmt.Errorf("committed generation %q inventory drift: %s", tx.Generation, status.Error)
+			}
+			return status, nil
 		}
-		return status, nil
+		// A coordinator that has read the whole cluster has decided this
+		// generation did not complete everywhere. Rollback material is still
+		// here because finalization never ran, so the node can return to the
+		// previous generation exactly, with the student state its pre-state
+		// captured. Reopening is persisted before any work starts, so an
+		// interruption here resumes as ordinary rollback rather than as a
+		// committed generation again.
+		reopened, err := s.reopenCommittedTransaction(lab, fence, tx.Generation)
+		if err != nil {
+			return s.transactionInventoryStatus(ctx, lab), err
+		}
+		tx = reopened
 	}
 	recoveryLimit := s.recoveryTotalLimit(tx)
 	if strategy == "forward" {

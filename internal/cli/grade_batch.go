@@ -498,8 +498,32 @@ func gradeOneHarness(ctx context.Context, class *model.Topology, rubric *grade.R
 	}
 
 	c := client.NewCluster(h.Lab, o.token)
+	// A harness exists only while this process is marking against it. The
+	// heartbeat is what says so; the nodes reclaim the lab if it stops, which
+	// is the entire difference between a controller that is killed here and a
+	// cluster that has to be cleaned up by hand afterwards.
+	//
+	// It starts before the deployment, so a run interrupted between deploy and
+	// the first renewal is still covered by the lease the deployment created.
+	owner := client.EphemeralOwnerName("grade-batch")
+	heartbeat := c.KeepEphemeralAlive(ctx, h.Name, owner, ephemeralHarnessTTL)
+	defer heartbeat.Stop()
 	defer func() {
 		if o.keepLab {
+			// A kept harness is still disposable: --keep-labs is for
+			// investigating one mark, not for creating a permanent lab. It is
+			// granted the longest single lifetime a node will give so an
+			// investigation has room, and it is still bounded, so an
+			// investigation that is abandoned does not cost the cluster
+			// indefinitely.
+			kctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
+			defer cancel()
+			if err := c.RenewEphemeral(kctx, h.Name, owner, keptHarnessTTL); err != nil {
+				slog.Warn("could not extend a kept harness's lifetime", "lab", h.Name, "err", err)
+			}
+			slog.Info("keeping a grading harness for investigation; it is still ephemeral "+
+				"and the cluster will reclaim it once its lifetime ends",
+				"lab", h.Name, "lifetime", keptHarnessTTL)
 			return
 		}
 		// Teardown runs even when grading panicked or the context was
@@ -538,7 +562,7 @@ func gradeOneHarness(ctx context.Context, class *model.Topology, rubric *grade.R
 		return fail("clearing the previous attempt's harness", err)
 	}
 
-	if err := deployQuiet(ctx, c, h, s.AS); err != nil {
+	if err := deployQuiet(ctx, c, h, s.AS, owner); err != nil {
 		return fail("deploying the harness", err)
 	}
 
@@ -759,7 +783,18 @@ func joinInts(xs []int) string {
 	return strings.Join(parts, ", ")
 }
 
-func deployQuiet(ctx context.Context, c *client.Cluster, h *model.Topology, target int) error {
+// ephemeralHarnessTTL is how long a node holds a grading harness between
+// heartbeats. It is long enough to survive a slow or briefly unreachable
+// cluster and short enough that an abandoned class-scale run is reclaimed
+// before the next one needs the capacity.
+const ephemeralHarnessTTL = 15 * time.Minute
+
+// keptHarnessTTL is the one-off lifetime a harness kept with --keep-labs is
+// given when the run that created it ends. Nothing renews it afterwards, so it
+// is how long an investigation has before the cluster takes the harness back.
+const keptHarnessTTL = time.Hour
+
+func deployQuiet(ctx context.Context, c *client.Cluster, h *model.Topology, target int, owner string) error {
 	deconflictOverlays(ctx, c, h)
 	if problems := c.CheckUnderlay(ctx, h); len(problems) > 0 {
 		return fmt.Errorf("underlay cannot carry the harness: %s", problems[0])
@@ -768,12 +803,18 @@ func deployQuiet(ctx context.Context, c *client.Cluster, h *model.Topology, targ
 		// The surrounding internet is solved so the submission is marked
 		// against neighbours that actually work; the graded AS keeps platform
 		// mode so what is marked is the student's own configuration.
-		Mode:            "solve",
-		Ungraded:        target,
-		PullPolicy:      string(rt.PullIfMissing),
-		Workers:         harnessDeployWorkers(len(h.Devices)),
-		Generation:      time.Now().UTC().Format("20060102T150405.000"),
-		StrictAdmission: true,
+		Mode:       "solve",
+		Ungraded:   target,
+		PullPolicy: string(rt.PullIfMissing),
+		// Nobody's work lives in a harness, and nothing outside this process
+		// wants it. Saying so at deployment is what lets a node reclaim it
+		// when this process is killed before its teardown runs.
+		Ephemeral:           true,
+		EphemeralTTLSeconds: int(ephemeralHarnessTTL.Seconds()),
+		EphemeralOwner:      owner,
+		Workers:             harnessDeployWorkers(len(h.Devices)),
+		Generation:          time.Now().UTC().Format("20060102T150405.000"),
+		StrictAdmission:     true,
 	})
 	for _, r := range results {
 		if r.Err != nil {

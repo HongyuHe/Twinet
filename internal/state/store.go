@@ -15,11 +15,13 @@
 package state
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -62,9 +64,14 @@ type Snapshot struct {
 }
 
 // Store is a directory of snapshots.
-type Store struct{ root string }
+type Store struct {
+	root             string
+	sweptTemporaries int
+	sweepErr         error
+}
 
-// Open prepares a store rooted at dir.
+// Open prepares a store rooted at dir and clears anything a previous process
+// was killed in the middle of writing.
 func Open(dir string) (*Store, error) {
 	if dir == "" {
 		return nil, errors.New("state: no directory given")
@@ -72,8 +79,22 @@ func Open(dir string) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return nil, fmt.Errorf("state: create %s: %w", dir, err)
 	}
-	return &Store{root: dir}, nil
+	s := &Store{root: dir}
+	// Startup is the one moment where an abandoned temporary can be
+	// distinguished from one in flight with certainty about our own process,
+	// and it is still bounded by age so another agent sharing the directory is
+	// safe. A failure here is reported to the caller's log, never fatal: a
+	// node must still come up holding a class's work.
+	if removed, err := s.SweepStaleTemporaries(time.Now().Add(-staleTempAge)); err != nil {
+		s.sweepErr = err
+	} else {
+		s.sweptTemporaries = removed
+	}
+	return s, nil
 }
+
+// SweptTemporaries reports what Open cleared, and why it could not.
+func (s *Store) SweptTemporaries() (int, error) { return s.sweptTemporaries, s.sweepErr }
 
 // Root returns the store's directory.
 func (s *Store) Root() string { return s.root }
@@ -282,36 +303,131 @@ func (s *Store) Prune(lab string, keep int) (int, error) {
 	return removed, nil
 }
 
+// tempPrefix and tempMarker bracket the temporary name every atomic write
+// uses. They are the only thing that identifies a leftover as ours, so the
+// startup sweep below can be certain it is not removing somebody else's file.
+func tempPrefix(base string) string { return "." + base + tempMarker }
+
+const tempMarker = ".tmp-"
+
+// writeAtomic writes a file by rename, and never leaves its temporary behind.
+//
+// The cleanup used to be repeated at each error return, which meant the two
+// paths that did not repeat it -- a failed rename, and a Close that reported an
+// error after a successful write -- leaked. Over a term of periodic captures
+// that is a directory of hidden files nobody ever looks at, on the one disk
+// that must not fill up: it holds the only copy of a class's work. A deferred
+// cleanup keyed on whether the rename happened cannot be forgotten by a future
+// error path.
 func writeAtomic(path string, data []byte, mode os.FileMode) error {
 	dir, base := filepath.Dir(path), filepath.Base(path)
 	// A fixed ".tmp" name turns two periodic captures into one writer
 	// truncating the other's body before either rename. Keep temporary files
 	// beside their target for atomic rename, but make each writer unique.
-	f, err := os.CreateTemp(dir, "."+base+".tmp-*")
+	f, err := os.CreateTemp(dir, tempPrefix(base)+"*")
 	if err != nil {
 		return fmt.Errorf("state: open %s: %w", path, err)
 	}
 	tmp := f.Name()
+	renamed := false
+	defer func() {
+		if !renamed {
+			_ = os.Remove(tmp)
+		}
+	}()
 	if err := f.Chmod(mode); err != nil {
 		_ = f.Close()
-		_ = os.Remove(tmp)
 		return fmt.Errorf("state: chmod %s: %w", tmp, err)
 	}
 	if _, err := f.Write(data); err != nil {
 		_ = f.Close()
-		_ = os.Remove(tmp)
 		return fmt.Errorf("state: write %s: %w", tmp, err)
 	}
 	if err := f.Sync(); err != nil {
 		_ = f.Close()
-		_ = os.Remove(tmp)
 		return fmt.Errorf("state: sync %s: %w", tmp, err)
 	}
 	if err := f.Close(); err != nil {
-		_ = os.Remove(tmp)
 		return err
 	}
-	return os.Rename(tmp, path)
+	if err := os.Rename(tmp, path); err != nil {
+		return fmt.Errorf("state: rename %s: %w", path, err)
+	}
+	renamed = true
+	return nil
+}
+
+// staleTempAge is how long a temporary file must have gone untouched before a
+// sweep treats it as abandoned rather than as a write in flight.
+//
+// It is deliberately far longer than any single write. The cost of waiting is
+// one stale file for an hour; the cost of being wrong is deleting the
+// half-written snapshot of a student's configuration out from under the
+// process that is writing it.
+const staleTempAge = time.Hour
+
+// SweepStaleTemporaries removes abandoned temporary files left by a process
+// that was killed mid-write.
+//
+// A crash between CreateTemp and rename leaves a file no future run will ever
+// look at again, and nothing was removing them. Only names this package
+// produces are considered, and only those older than staleTempAge, so a
+// concurrent writer -- including one in another agent process sharing the
+// directory -- is never touched. The count of removed files is returned for
+// the caller to log; a failure to remove one is not fatal.
+func (s *Store) SweepStaleTemporaries(before time.Time) (int, error) {
+	removed := 0
+	// An unreadable subtree is skipped rather than failing the sweep: a
+	// startup path must not refuse to run because one lab directory cannot be
+	// listed. Nothing is removed on that path, so skipping is fail-closed.
+	walk := func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			if entry != nil && entry.IsDir() {
+				return fs.SkipDir
+			}
+			return nil //nolint:nilerr // an unreadable entry is skipped, never removed
+		}
+		if !abandonedTemporary(entry, before) {
+			return nil
+		}
+		if removeErr := os.Remove(path); removeErr == nil {
+			removed++
+		}
+		return nil
+	}
+	if err := filepath.WalkDir(s.root, walk); err != nil {
+		return removed, fmt.Errorf("state: sweep temporary files under %s: %w", s.root, err)
+	}
+	return removed, nil
+}
+
+// abandonedTemporary reports whether an entry is one of this package's
+// temporary files and has gone untouched long enough to be certain no writer
+// still owns it. An entry whose metadata cannot be read is never abandoned.
+func abandonedTemporary(entry fs.DirEntry, before time.Time) bool {
+	if entry.IsDir() || !isStateTemporary(entry.Name()) {
+		return false
+	}
+	info, err := entry.Info()
+	if err != nil {
+		return false
+	}
+	return info.ModTime().Before(before)
+}
+
+// isStateTemporary recognises only the shape os.CreateTemp produces for this
+// package: a dot, the target's own name, ".tmp-", and a random suffix.
+func isStateTemporary(name string) bool {
+	if !strings.HasPrefix(name, ".") {
+		return false
+	}
+	marker := strings.LastIndex(name, tempMarker)
+	if marker <= 0 {
+		return false
+	}
+	// The target base name must be non-empty and the random suffix must be
+	// present, or this is not a name this package wrote.
+	return marker > 1 && len(name) > marker+len(tempMarker)
 }
 
 // safe turns an identifier into a path component.
@@ -454,11 +570,112 @@ func (s *Store) Coordination() ([]byte, error) {
 	return os.ReadFile(filepath.Join(s.root, "coordination.json"))
 }
 
-// PutEventJournal persists the bounded agent event journal. The journal is
-// node-local operational history, not a replicated lab artefact: it must
-// survive an agent restart so an operator can trace a failure across that
-// restart, but copying another node's events into this node would make a
-// merged stream report the same event twice.
+// The event journal is node-local operational history, not a replicated lab
+// artefact: it must survive an agent restart so an operator can trace a
+// failure across that restart, but copying another node's events into this
+// node would make a merged stream report the same event twice.
+//
+// It used to be one JSON array rewritten in full for every event. With the
+// default four-thousand-event retention, every event marshalled, wrote and
+// fsynced the entire retained history -- and an agent under load emits events
+// faster than it does anything else: every repair, every reservation, every
+// destroy. The durability is unchanged (one fsync per event either way), but
+// the work per event is now the size of that event rather than the size of
+// everything the node has ever recorded. Compaction rewrites the whole history
+// only when the file passes a size bound, which is once per many thousand
+// events.
+const (
+	eventJournalFile = "events.log"
+	// eventJournalMaxBytes bounds the log between compactions. It is chosen so
+	// compaction is rare relative to appends while the file stays small enough
+	// to read back quickly at startup.
+	eventJournalMaxBytes = 8 << 20
+)
+
+// AppendEventJournal durably records one encoded event and reports whether the
+// log has grown past the point where it should be compacted.
+func (s *Store) AppendEventJournal(raw []byte) (bool, error) {
+	if len(raw) == 0 {
+		return false, nil
+	}
+	path := filepath.Join(s.root, eventJournalFile)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return false, fmt.Errorf("state: open %s: %w", path, err)
+	}
+	defer func() { _ = f.Close() }()
+	line := make([]byte, 0, len(raw)+1)
+	line = append(line, raw...)
+	line = append(line, '\n')
+	if _, err := f.Write(line); err != nil {
+		return false, fmt.Errorf("state: append %s: %w", path, err)
+	}
+	if err := f.Sync(); err != nil {
+		return false, fmt.Errorf("state: sync %s: %w", path, err)
+	}
+	info, err := f.Stat()
+	if err != nil {
+		return false, nil
+	}
+	return info.Size() > eventJournalMaxBytes, nil
+}
+
+// RotateEventJournal replaces the log with exactly the retained history. It is
+// an atomic rename, so an interrupted compaction leaves the previous log
+// intact rather than a truncated one.
+func (s *Store) RotateEventJournal(lines [][]byte) error {
+	total := 0
+	for _, line := range lines {
+		total += len(line) + 1
+	}
+	buf := make([]byte, 0, total)
+	for _, line := range lines {
+		if len(line) == 0 {
+			continue
+		}
+		buf = append(buf, line...)
+		buf = append(buf, '\n')
+	}
+	if err := writeAtomic(filepath.Join(s.root, eventJournalFile), buf, 0o600); err != nil {
+		return err
+	}
+	// The pre-rotation array form is superseded once a log exists. Removing it
+	// keeps startup from replaying a stale history behind a current one.
+	if err := os.Remove(filepath.Join(s.root, "events.json")); err != nil &&
+		!errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("state: remove superseded event journal: %w", err)
+	}
+	return nil
+}
+
+// EventJournalLines returns the retained encoded events, oldest first. A
+// trailing partial line -- the signature of a crash mid-append -- is dropped
+// rather than reported as corruption: the events before it are still exact.
+func (s *Store) EventJournalLines() ([][]byte, error) {
+	raw, err := os.ReadFile(filepath.Join(s.root, eventJournalFile))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var out [][]byte
+	for len(raw) > 0 {
+		end := bytes.IndexByte(raw, '\n')
+		if end < 0 {
+			break
+		}
+		line := bytes.TrimSpace(raw[:end])
+		if len(line) > 0 {
+			out = append(out, append([]byte(nil), line...))
+		}
+		raw = raw[end+1:]
+	}
+	return out, nil
+}
+
+// PutEventJournal persists the whole retained journal in the pre-rotation
+// array form. It remains for callers and tests written against that contract.
 func (s *Store) PutEventJournal(raw []byte) error {
 	if len(raw) == 0 {
 		raw = []byte("[]")
@@ -466,7 +683,8 @@ func (s *Store) PutEventJournal(raw []byte) error {
 	return writeAtomic(filepath.Join(s.root, "events.json"), raw, 0o600)
 }
 
-// EventJournal returns the last persisted bounded agent event journal.
+// EventJournal returns the last persisted array-form journal, which is what an
+// agent upgraded from a build that predates the log reads once at startup.
 func (s *Store) EventJournal() ([]byte, error) {
 	return os.ReadFile(filepath.Join(s.root, "events.json"))
 }

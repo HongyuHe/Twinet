@@ -51,6 +51,19 @@ type Wire struct {
 	// the student's. The device would come back holding the reference answer
 	// for the very system being marked, and nothing would say so.
 	Ungraded int `json:"ungraded_as,omitempty"`
+	// Ephemeral marks a lab that belongs to a running controller rather than
+	// to a course, and EphemeralTTLSeconds is the lifetime the node grants it
+	// between heartbeats.
+	//
+	// Both travel with the persisted topology on purpose. An agent that
+	// restarts rehydrates whatever topology.json says it is hosting; without
+	// this marker a grading harness comes back indistinguishable from a
+	// teaching lab, is protected by garbage collection because its containers
+	// exist, is repaired forever by reconciliation, and outlives by an
+	// unbounded margin the process that was the only thing that wanted it.
+	Ephemeral           bool   `json:"ephemeral,omitempty"`
+	EphemeralTTLSeconds int    `json:"ephemeral_ttl_seconds,omitempty"`
+	EphemeralOwner      string `json:"ephemeral_owner,omitempty"`
 	// LabSpec is the manifest itself, carried whole.
 	//
 	// Reconstructing a minimal Lab on the far side and copying across the few
@@ -227,7 +240,10 @@ type WireDefault struct {
 
 // Serialise projects a topology onto the wire form.
 func Serialise(top *model.Topology) *Wire {
-	w := &Wire{Lab: top.Name, Hash: top.Hash}
+	w := &Wire{
+		Lab: top.Name, Hash: top.Hash,
+		Ephemeral: top.Ephemeral, EphemeralTTLSeconds: top.EphemeralTTLSeconds,
+	}
 	if top.Lab != nil {
 		if top.Lab.LinkDefaults.MTU != nil {
 			w.Defaults.MTU = *top.Lab.LinkDefaults.MTU
@@ -378,6 +394,7 @@ func (w *Wire) Rehydrate() (*model.Topology, error) {
 
 	top := &model.Topology{
 		Lab: lab, Name: w.Lab, Hash: w.Hash,
+		Ephemeral: w.Ephemeral, EphemeralTTLSeconds: w.EphemeralTTLSeconds,
 		Devices: map[string]*model.Device{}, ASes: map[int]*model.AS{},
 		Services: map[string]*model.Service{},
 	}

@@ -24,6 +24,7 @@ const (
 type GCSummary struct {
 	RemovedOverlays []uint32 `json:"removed_overlays,omitempty"`
 	RemovedPairs    []string `json:"removed_pairs,omitempty"`
+	RemovedBridges  []string `json:"removed_bridges,omitempty"`
 	RemovedRecords  int      `json:"removed_records,omitempty"`
 	ExpiredClaims   int      `json:"expired_claims,omitempty"`
 	Protected       int      `json:"protected_labs,omitempty"`
@@ -59,11 +60,13 @@ func (s *Server) gcLoop(ctx context.Context) {
 				continue
 			}
 			if len(summary.RemovedOverlays) > 0 || len(summary.RemovedPairs) > 0 ||
-				summary.RemovedRecords > 0 || summary.ExpiredClaims > 0 {
+				len(summary.RemovedBridges) > 0 || summary.RemovedRecords > 0 ||
+				summary.ExpiredClaims > 0 {
 				s.recordEvent("", "", "gc", "", "garbage_collect", "success",
-					fmt.Sprintf("overlays=%d pairs=%d records=%d reservations=%d",
+					fmt.Sprintf("overlays=%d pairs=%d bridges=%d records=%d reservations=%d",
 						len(summary.RemovedOverlays), len(summary.RemovedPairs),
-						summary.RemovedRecords, summary.ExpiredClaims))
+						len(summary.RemovedBridges), summary.RemovedRecords,
+						summary.ExpiredClaims))
 			}
 		}
 	}
@@ -95,22 +98,19 @@ func (s *Server) gcOnce(ctx context.Context) (GCSummary, error) {
 		if !s.gcEligible(key, now) {
 			continue
 		}
-		if orphan.Ports > 0 {
-			// A stale cross-node host port has a deterministic twp<VNI> name.
-			// Remove only that Twinet-owned name, then re-observe before
-			// deleting a bridge. An arbitrary port keeps the bridge protected.
-			if err := deleteHost(gcHostSideName(orphan.VNI)); err != nil {
-				continue
-			}
-			fresh, freshErr := findOrphans(protected)
-			if freshErr != nil || orphanHasPorts(fresh, orphan.VNI) {
-				continue
-			}
-		}
-		if err := removeOverlay(orphan.VNI); err != nil {
+		// Ownership is re-proved under the reservation lock immediately
+		// before anything is deleted, and the identifier is held for the
+		// duration. A deploy that claims this VNI in the window between the
+		// scan above and the deletion below is refused a stale reservation
+		// rather than silently losing the overlay it was given.
+		if !s.beginOverlayCollection(orphan.VNI, orphan.Owner) {
 			continue
 		}
-		s.releaseGCOverlayClaim(orphan.VNI)
+		removed := s.collectLegacyOrphan(orphan, protected, findOrphans, removeOverlay, deleteHost)
+		s.endOverlayCollection(orphan.VNI, orphan.Owner)
+		if !removed {
+			continue
+		}
 		summary.RemovedOverlays = append(summary.RemovedOverlays, orphan.VNI)
 		s.recordEvent(orphan.Owner, "", "gc", "", "overlay_removed", "success",
 			fmt.Sprintf("legacy VNI %d", orphan.VNI))
@@ -132,11 +132,15 @@ func (s *Server) gcOnce(ctx context.Context) (GCSummary, error) {
 			if !s.gcEligible(key, now) {
 				continue
 			}
-			_ = deleteHost(gcHostSideName(vni))
-			if err := removeOverlay(vni); err != nil {
+			if !s.beginOverlayCollection(vni, overlay.Lab) {
 				continue
 			}
-			s.releaseGCOverlayClaim(vni)
+			_ = deleteHost(gcHostSideName(vni))
+			removeErr := removeOverlay(vni)
+			s.endOverlayCollection(vni, overlay.Lab)
+			if removeErr != nil {
+				continue
+			}
 			summary.RemovedOverlays = append(summary.RemovedOverlays, vni)
 			s.recordEvent(overlay.Lab, "", "gc", "", "overlay_removed", "success",
 				fmt.Sprintf("multiplex VNI %d", vni))
@@ -161,7 +165,15 @@ func (s *Server) gcOnce(ctx context.Context) (GCSummary, error) {
 			if !s.gcEligible("records:"+lab, now) {
 				continue
 			}
+			// The lab's own operation lease is taken so a deploy arriving now
+			// either happens entirely before this removal or is refused; and
+			// protection is re-proved once it is held.
+			opID, claimed := s.beginLabRecordCollection(lab)
+			if !claimed {
+				continue
+			}
 			removed, removeErr := s.store.GarbageCollectLabRecords(lab, now.Add(-s.gcGrace()), true)
+			s.endLabRecordCollection(lab, opID)
 			if removeErr != nil {
 				continue
 			}
@@ -172,11 +184,39 @@ func (s *Server) gcOnce(ctx context.Context) (GCSummary, error) {
 			}
 		}
 	}
+	// Bridges are collected last: the paths above delete VXLANs, and a bridge
+	// only becomes demonstrably empty once its tunnel is gone.
+	if err := s.collectOrphanBridges(protected, now, &summary); err != nil {
+		return summary, err
+	}
 	sort.Slice(summary.RemovedOverlays, func(i, j int) bool {
 		return summary.RemovedOverlays[i] < summary.RemovedOverlays[j]
 	})
 	sort.Strings(summary.RemovedPairs)
+	sort.Strings(summary.RemovedBridges)
 	return summary, nil
+}
+
+// collectLegacyOrphan performs the removal itself while the identifier is
+// fenced. It returns whether the overlay is gone.
+func (s *Server) collectLegacyOrphan(orphan netx.Orphan, protected map[string]bool,
+	findOrphans func(map[string]bool) ([]netx.Orphan, error),
+	removeOverlay func(uint32) error,
+	deleteHost func(string) error,
+) bool {
+	if orphan.Ports > 0 {
+		// A stale cross-node host port has a deterministic twp<VNI> name.
+		// Remove only that Twinet-owned name, then re-observe before
+		// deleting a bridge. An arbitrary port keeps the bridge protected.
+		if err := deleteHost(gcHostSideName(orphan.VNI)); err != nil {
+			return false
+		}
+		fresh, freshErr := findOrphans(protected)
+		if freshErr != nil || orphanHasPorts(fresh, orphan.VNI) {
+			return false
+		}
+	}
+	return removeOverlay(orphan.VNI) == nil
 }
 
 func (s *Server) gcHooks() (
@@ -318,18 +358,6 @@ func (s *Server) gcReleaseStaleLiveClaims(protected map[string]bool, now time.Ti
 	return removed
 }
 
-func (s *Server) releaseGCOverlayClaim(vni uint32) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, exists := s.overlayClaims[vni]; !exists {
-		return
-	}
-	delete(s.overlayClaims, vni)
-	if err := s.saveCoordinationLocked(); err != nil {
-		slog.Warn("persist collected overlay claim", "vni", vni, "err", err)
-	}
-}
-
 // gcGenerationProven requires there to be no active or prepared generation
 // for the lab. It is intentionally separate from a name/age check: a stale
 // record may be old but still be the only evidence an interrupted controller
@@ -340,7 +368,10 @@ func (s *Server) gcGenerationProven(lab string) bool {
 	if _, active := s.current[lab]; active {
 		return false
 	}
-	if _, active := s.ops[lab]; active {
+	// A collection's own lease is not evidence of activity. Every other kind
+	// is: a deploy, a destroy or a recovery holding the lab means the records
+	// are still needed.
+	if held := s.ops[lab]; held != nil && held.kind != "gc" {
 		return false
 	}
 	if _, active := s.transactions[lab]; active {

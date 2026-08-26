@@ -68,10 +68,19 @@ remain useful observed state for reconciliation.
 
 That does **not** mean Twinet has no state store. The node-local store persists
 student-owned snapshots, the applied topology, holds and exemptions,
-coordination high-water marks, overlay claims, event journals, and replica
-acknowledgements. Content-addressed records and atomic current pointers make a
-restart/recovery path possible without treating student work as disposable
-derived state.
+coordination high-water marks, overlay claims, ephemeral lab deadlines, event
+journals, and replica acknowledgements. Content-addressed records and atomic
+current pointers make a restart/recovery path possible without treating student
+work as disposable derived state.
+
+Every durable write is a temporary file, an fsync and a rename, and the
+temporary is removed on every path including a failed rename. A process killed
+between the two leaves one behind; opening the store sweeps temporaries older
+than an hour, which is far longer than any write and short enough that the disk
+holding the only copy of a class's work does not accumulate them. The node
+event journal is append-only with size-bounded compaction rather than a full
+rewrite per event, so the work of recording an event is the size of that event
+rather than the size of everything the node has recorded.
 
 The deployment engine captures student-owned state before destructive
 boundaries and restores it after a replacement. Clustered policies can require
@@ -89,6 +98,33 @@ cross-node overlay identifiers under the same fence.
 
 The in-process per-lab operation lock prevents overlapping local work. It is
 not a replacement for the cluster fence, and it is not described as one.
+
+## Lab lifetime: durable and ephemeral labs
+
+A teaching lab is durable. It exists because a course says so, it outlives
+every controller process, and nothing removes it automatically.
+
+A lab may instead be deployed **ephemeral**, which says the opposite: it exists
+only while a controller is running, and nobody's work is in it. Grading
+harnesses are the only ephemeral labs today, and `internal/harness` marks every
+harness it builds. The marker travels on the apply request and on the persisted
+topology, so an agent restart still knows which kind of lab it is holding.
+
+An ephemeral lab has a durable deadline on each node. The controller extends it
+by heartbeat (`POST /v1/ephemeral`); no heartbeat can extend it past an
+absolute ceiling measured from first deployment, and a heartbeat can never
+create a lifetime for a lab no deployment declared disposable. When the
+deadline passes, the node reclaims the lab on its own authority: it takes a
+fresh internal fence, preempts its own repair loop, removes the containers, the
+overlays it owns, its reservations and its records, and forgets it. A lab that
+is currently leased by a live controller or held for grading defers rather than
+being taken away, and every reason to defer is itself time-bounded.
+
+This is what makes a killed grading controller survivable. Without it an
+abandoned harness is indistinguishable from a course's lab: its containers are
+running so collection protects it, its topology record is on disk so every
+restart rehydrates it, reconciliation repairs it forever, and its own repair
+lease answers a later destroy with a conflict.
 
 ## Network realization
 

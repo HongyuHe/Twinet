@@ -1080,6 +1080,14 @@ func (c *Cluster) unfencedApply(ctx context.Context, top *model.Topology,
 ) []NodeResult[agent.ApplyResponse] {
 	wire := agent.Serialise(top)
 	wire.Mode, wire.Ungraded = req.Mode, req.Ungraded
+	wire.Ephemeral = req.Ephemeral || top.Ephemeral
+	wire.EphemeralTTLSeconds = req.EphemeralTTLSeconds
+	if wire.EphemeralTTLSeconds == 0 {
+		wire.EphemeralTTLSeconds = top.EphemeralTTLSeconds
+	}
+	wire.EphemeralOwner = req.EphemeralOwner
+	req.Ephemeral = wire.Ephemeral
+	req.EphemeralTTLSeconds = wire.EphemeralTTLSeconds
 	peers := map[string]string{}
 	if top.Lab != nil {
 		for _, n := range top.Lab.Placement.Nodes {

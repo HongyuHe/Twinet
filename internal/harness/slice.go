@@ -126,6 +126,12 @@ func Slice(top *model.Topology, target int, opts Options) (*model.Topology, erro
 		Devices:  make(map[string]*model.Device, len(keepDev)),
 		ASes:     make(map[int]*model.AS, len(keepAS)),
 		Services: map[string]*model.Service{},
+		// A harness is disposable by construction: it is a private copy of a
+		// class network built to mark one submission, nobody's work lives in
+		// it, and it must not outlive the run that asked for it. Marking it
+		// here rather than at each call site means a future caller cannot
+		// create one that a node would hold forever.
+		Ephemeral: true,
 	}
 
 	for id := range keepDev {

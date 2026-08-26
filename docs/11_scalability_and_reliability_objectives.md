@@ -291,6 +291,19 @@ the evidence.
 - Garbage-collect abandoned veths, bridges, tunnels, reservations, and lab
   records after a safe grace period, while refusing to remove anything an
   active operation can still use.
+- Include host objects whose ownership record is missing rather than only those
+  that still carry one. A bridge with a deterministic Twinet name, no alias and
+  nothing enslaved to it is demonstrably abandoned; a bridge with a port, with
+  an alias this build cannot read, or with an alias naming a live lab is not,
+  and is preserved.
+- Re-prove ownership under the reservation lock immediately before deleting an
+  object, and hold a visible claim on it while deleting, so a deployment that
+  claims the object mid-pass is refused a retryable conflict instead of being
+  handed an overlay that is about to disappear. A grace window makes that race
+  rarer; only mutual exclusion removes it.
+- Give a lab that exists only for a running controller an explicit bounded
+  lifetime, so an abandoned grading harness is reclaimed by the node rather
+  than protected forever by the containers it is still running.
 
 **Acceptance.** Overlay tunnel/bridge count grows with active lab/node pairs,
 not cross-node links. Killing a controller halfway through deployment leaves no

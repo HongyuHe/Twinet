@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"sort"
 	"strconv"
@@ -12,6 +13,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/HongyuHe/twinet/internal/state"
 )
 
 const (
@@ -66,6 +69,14 @@ type eventWatcher struct {
 	ch  chan Event
 }
 
+// eventJournal is the durable side of the ring. Append records one event;
+// Compact rewrites the retained history and is called only when Append says
+// the log has outgrown its bound.
+type eventJournal interface {
+	Append(Event) (bool, error)
+	Compact([]Event) error
+}
+
 type eventRing struct {
 	mu        sync.Mutex
 	persistMu sync.Mutex
@@ -75,10 +86,10 @@ type eventRing struct {
 	items     []Event
 	watchers  map[uint64]eventWatcher
 	nextWatch uint64
-	persist   func([]Event)
+	journal   eventJournal
 }
 
-func newEventRing(capacity int, node string, persist func([]Event)) *eventRing {
+func newEventRing(capacity int, node string, journal eventJournal) *eventRing {
 	if capacity <= 0 {
 		capacity = defaultEventCapacity
 	}
@@ -86,7 +97,7 @@ func newEventRing(capacity int, node string, persist func([]Event)) *eventRing {
 		capacity: capacity,
 		node:     node,
 		watchers: map[uint64]eventWatcher{},
-		persist:  persist,
+		journal:  journal,
 	}
 }
 
@@ -141,20 +152,33 @@ func (r *eventRing) append(event Event) Event {
 		}
 	}
 	r.mu.Unlock()
-	r.save()
+	r.record(event)
 	return event
 }
 
-func (r *eventRing) save() {
-	if r.persist == nil {
+// record durably appends one event, and compacts only when the journal says
+// its bound has been passed. The cost of an ordinary event no longer depends
+// on how much history the node has accumulated.
+func (r *eventRing) record(event Event) {
+	if r.journal == nil {
 		return
 	}
 	r.persistMu.Lock()
 	defer r.persistMu.Unlock()
+	rotate, err := r.journal.Append(event)
+	if err != nil {
+		slog.Warn("persisting a node event", "err", err)
+		return
+	}
+	if !rotate {
+		return
+	}
 	r.mu.Lock()
 	snapshot := append([]Event(nil), r.items...)
 	r.mu.Unlock()
-	r.persist(snapshot)
+	if err := r.journal.Compact(snapshot); err != nil {
+		slog.Warn("compacting the node event journal", "err", err)
+	}
 }
 
 func (r *eventRing) after(after uint64, lab string, limit int) ([]Event, uint64) {
@@ -214,7 +238,7 @@ func (r *eventRing) subscribe(after uint64, lab string) ([]Event, uint64, <-chan
 func boundedEventScope(value string) string {
 	switch value {
 	case "api", "runtime", "reconcile", "gc", "matrix", "grading", "underlay",
-		"deploy", "durability", "coordination", "inventory":
+		"deploy", "durability", "coordination", "inventory", "ephemeral":
 		return value
 	default:
 		return "other"
@@ -290,25 +314,111 @@ func (s *Server) eventLog() *eventRing {
 		capacity = defaultEventCapacity
 	}
 	store := s.store
-	ring := newEventRing(capacity, s.cfg.Node, func(events []Event) {
-		if store == nil {
-			return
-		}
-		raw, err := json.Marshal(events)
-		if err == nil {
-			_ = store.PutEventJournal(raw)
-		}
-	})
+	var journal eventJournal
 	if store != nil {
-		if raw, err := store.EventJournal(); err == nil && len(raw) > 0 {
-			var saved []Event
-			if json.Unmarshal(raw, &saved) == nil {
-				ring.restore(saved)
+		journal = &storeEventJournal{store: store}
+	}
+	ring := newEventRing(capacity, s.cfg.Node, journal)
+	if store != nil {
+		restored, migrated := restoredEvents(store, capacity)
+		ring.restore(restored)
+		if migrated {
+			// The pre-upgrade array is folded into the log immediately. Left
+			// alone it would be shadowed by the log from the next restart on,
+			// and the history an operator most wants after an upgrade is
+			// exactly the history from before it.
+			if err := journal.Compact(restored); err != nil {
+				slog.Warn("folding the pre-upgrade event journal into the log", "err", err)
 			}
 		}
 	}
 	s.events = ring
 	return ring
+}
+
+// storeEventJournal is the state store's implementation of the ring's durable
+// side.
+type storeEventJournal struct{ store *state.Store }
+
+func (j *storeEventJournal) Append(event Event) (bool, error) {
+	raw, err := json.Marshal(event)
+	if err != nil {
+		return false, err
+	}
+	return j.store.AppendEventJournal(raw)
+}
+
+func (j *storeEventJournal) Compact(events []Event) error {
+	lines := make([][]byte, 0, len(events))
+	for _, event := range events {
+		raw, err := json.Marshal(event)
+		if err != nil {
+			return err
+		}
+		lines = append(lines, raw)
+	}
+	return j.store.RotateEventJournal(lines)
+}
+
+// restoredEvents reads the retained history from both forms and reports
+// whether the pre-upgrade array contributed anything.
+//
+// Both are read, not one or the other. Reading only the log would lose every
+// event an upgraded agent recorded before the upgrade as soon as one new event
+// made the log non-empty, and compaction is thousands of events away, so a
+// restart always came first. Ordering is by the events' own sequence rather
+// than by which file they came from.
+func restoredEvents(store *state.Store, capacity int) ([]Event, bool) {
+	lines, err := store.EventJournalLines()
+	if err != nil {
+		slog.Warn("reading the node event journal", "err", err)
+	}
+	out := make([]Event, 0, len(lines))
+	for _, line := range lines {
+		var event Event
+		if json.Unmarshal(line, &event) != nil {
+			continue
+		}
+		out = append(out, event)
+	}
+	migrated := false
+	if raw, legacyErr := store.EventJournal(); legacyErr == nil && len(raw) > 0 {
+		var saved []Event
+		if json.Unmarshal(raw, &saved) == nil && len(saved) > 0 {
+			out = append(out, saved...)
+			migrated = true
+		}
+	}
+	if migrated {
+		out = mergeEventHistory(out)
+	}
+	if len(out) > capacity {
+		out = out[len(out)-capacity:]
+	}
+	return out, migrated
+}
+
+// mergeEventHistory orders two sources of retained history and drops the
+// duplicates an overlapping upgrade window produces.
+func mergeEventHistory(events []Event) []Event {
+	sort.SliceStable(events, func(i, j int) bool {
+		if events[i].Sequence != events[j].Sequence {
+			return events[i].Sequence < events[j].Sequence
+		}
+		return events[i].Timestamp.Before(events[j].Timestamp)
+	})
+	out := events[:0]
+	seen := map[uint64]bool{}
+	for _, event := range events {
+		if event.Sequence != 0 {
+			if seen[event.Sequence] {
+				continue
+			}
+			seen[event.Sequence] = true
+		}
+		out = append(out, event)
+	}
+	return out
 }
 
 func (s *Server) recordEvent(lab, generation, scope, correlation, action, result, detail string) Event {

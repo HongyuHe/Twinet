@@ -34,6 +34,17 @@ type Topology struct {
 	// Hash is a content hash of the expanded topology, stamped onto every
 	// container so drift between manifest and deployment is detectable.
 	Hash string
+
+	// Ephemeral marks a lab whose existence is owned by a running controller
+	// rather than by a course. A grading harness is the only such lab today:
+	// nobody's work lives in it, and it must not outlive the process that
+	// asked for it. A teaching lab is never ephemeral, and the field is
+	// deliberately not derivable from the manifest -- the caller that creates
+	// a disposable lab says so explicitly.
+	Ephemeral bool
+	// EphemeralTTLSeconds is the lifetime a node grants this lab between
+	// controller heartbeats. Zero asks the node for its own safe default.
+	EphemeralTTLSeconds int
 }
 
 // AS is one expanded autonomous system.

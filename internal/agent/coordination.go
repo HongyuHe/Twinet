@@ -165,40 +165,44 @@ type transactionInventory struct {
 // RecoveryStatus is safe to expose in node status and recovery responses. It
 // names a phase and inventory counts, never student configuration content.
 type RecoveryStatus struct {
-	Lab                     string    `json:"lab"`
-	Phase                   string    `json:"phase"`
-	Generation              string    `json:"generation,omitempty"`
-	PreviousGeneration      string    `json:"previous_generation,omitempty"`
-	Mode                    string    `json:"mode,omitempty"`
-	Ungraded                int       `json:"ungraded_as,omitempty"`
-	PreviousMode            string    `json:"previous_mode,omitempty"`
-	PreviousUngraded        int       `json:"previous_ungraded_as,omitempty"`
-	Owner                   string    `json:"owner,omitempty"`
-	Strategy                string    `json:"strategy,omitempty"`
-	StartedAt               time.Time `json:"started_at,omitempty"`
-	LastProgressAt          time.Time `json:"last_progress_at,omitempty"`
-	Deadline                time.Time `json:"deadline,omitempty"`
-	TotalDeadline           time.Time `json:"total_deadline,omitempty"`
-	LeaseExpiresAt          time.Time `json:"lease_expires_at,omitempty"`
-	CurrentTarget           string    `json:"current_target,omitempty"`
-	LastError               string    `json:"last_error,omitempty"`
-	RetryCount              int       `json:"retry_count,omitempty"`
-	TakeoverAllowed         bool      `json:"takeover_allowed,omitempty"`
-	ForwardAcknowledged     bool      `json:"forward_acknowledged,omitempty"`
-	ForwardPhase            string    `json:"forward_phase,omitempty"`
-	DataLossScope           []string  `json:"data_loss_scope,omitempty"`
-	ExpectedContainers      int       `json:"expected_containers"`
-	ObservedContainers      int       `json:"observed_containers"`
-	ExpectedVNIs            int       `json:"expected_vnis"`
-	ObservedVNIs            int       `json:"observed_vnis"`
-	ExpectedLogicalBindings int       `json:"expected_logical_bindings"`
-	ObservedLogicalBindings int       `json:"observed_logical_bindings"`
-	ExpectedPhysicalTrunks  int       `json:"expected_physical_trunks"`
-	ObservedPhysicalTrunks  int       `json:"observed_physical_trunks"`
-	Consistent              bool      `json:"consistent"`
-	Attempts                int       `json:"attempts,omitempty"`
-	Error                   string    `json:"error,omitempty"`
-	AllowedStrategies       []string  `json:"allowed_strategies,omitempty"`
+	Lab                string    `json:"lab"`
+	Phase              string    `json:"phase"`
+	Generation         string    `json:"generation,omitempty"`
+	PreviousGeneration string    `json:"previous_generation,omitempty"`
+	Mode               string    `json:"mode,omitempty"`
+	Ungraded           int       `json:"ungraded_as,omitempty"`
+	PreviousMode       string    `json:"previous_mode,omitempty"`
+	PreviousUngraded   int       `json:"previous_ungraded_as,omitempty"`
+	Owner              string    `json:"owner,omitempty"`
+	Strategy           string    `json:"strategy,omitempty"`
+	StartedAt          time.Time `json:"started_at,omitempty"`
+	LastProgressAt     time.Time `json:"last_progress_at,omitempty"`
+	Deadline           time.Time `json:"deadline,omitempty"`
+	TotalDeadline      time.Time `json:"total_deadline,omitempty"`
+	LeaseExpiresAt     time.Time `json:"lease_expires_at,omitempty"`
+	CurrentTarget      string    `json:"current_target,omitempty"`
+	LastError          string    `json:"last_error,omitempty"`
+	RetryCount         int       `json:"retry_count,omitempty"`
+	TakeoverAllowed    bool      `json:"takeover_allowed,omitempty"`
+	// CommittedPending marks a generation this node committed but has not
+	// finalized. Its rollback material still exists, which is what makes a
+	// split cluster commit recoverable instead of permanent.
+	CommittedPending        bool     `json:"committed_pending,omitempty"`
+	ForwardAcknowledged     bool     `json:"forward_acknowledged,omitempty"`
+	ForwardPhase            string   `json:"forward_phase,omitempty"`
+	DataLossScope           []string `json:"data_loss_scope,omitempty"`
+	ExpectedContainers      int      `json:"expected_containers"`
+	ObservedContainers      int      `json:"observed_containers"`
+	ExpectedVNIs            int      `json:"expected_vnis"`
+	ObservedVNIs            int      `json:"observed_vnis"`
+	ExpectedLogicalBindings int      `json:"expected_logical_bindings"`
+	ObservedLogicalBindings int      `json:"observed_logical_bindings"`
+	ExpectedPhysicalTrunks  int      `json:"expected_physical_trunks"`
+	ObservedPhysicalTrunks  int      `json:"observed_physical_trunks"`
+	Consistent              bool     `json:"consistent"`
+	Attempts                int      `json:"attempts,omitempty"`
+	Error                   string   `json:"error,omitempty"`
+	AllowedStrategies       []string `json:"allowed_strategies,omitempty"`
 }
 
 // applyTransaction persists enough information to fail closed after a crashed
@@ -258,6 +262,11 @@ type coordinationState struct {
 	Transactions   map[string]applyTransaction     `json:"transactions,omitempty"`
 	Inventories    map[string]transactionInventory `json:"inventories,omitempty"`
 	OverlayLineage map[string]map[uint32]string    `json:"overlay_lineage,omitempty"`
+	// Ephemeral is absent from every record written before disposable labs
+	// had a bounded lifetime. An absent map means every lab on this node is
+	// durable, which is exactly the old behaviour, so no migration step is
+	// required to read an older journal.
+	Ephemeral map[string]ephemeralLease `json:"ephemeral,omitempty"`
 }
 
 func (s *Server) initCoordination() {
@@ -281,6 +290,12 @@ func (s *Server) initCoordination() {
 	}
 	if s.overlayLineage == nil {
 		s.overlayLineage = map[string]map[uint32]string{}
+	}
+	if s.ephemeral == nil {
+		s.ephemeral = map[string]ephemeralLease{}
+	}
+	if s.gcCollecting == nil {
+		s.gcCollecting = map[uint32]bool{}
 	}
 }
 
@@ -368,6 +383,23 @@ func (s *Server) loadCoordination() {
 	for lab, lineage := range disk.OverlayLineage {
 		s.overlayLineage[lab] = lineage
 	}
+	for lab, lease := range disk.Ephemeral {
+		if lease.Lab == "" {
+			lease.Lab = lab
+		}
+		if lease.HardExpiresAt.IsZero() {
+			// A record written before the absolute ceiling existed would
+			// otherwise be renewable forever. Anchor it to its creation, or to
+			// now if that is missing too, so the ceiling always applies.
+			anchor := lease.CreatedAt
+			if anchor.IsZero() {
+				anchor = s.nowTime()
+			}
+			lease.HardExpiresAt = anchor.Add(maxEphemeralLifetime)
+			migrated = true
+		}
+		s.ephemeral[lab] = lease
+	}
 	_ = s.expireCoordinationLocked(s.nowTime())
 	if migrated {
 		if err := s.saveCoordinationLocked(); err != nil {
@@ -438,6 +470,7 @@ func (s *Server) saveCoordinationLocked() error {
 		Transactions:   s.transactions,
 		Inventories:    s.inventories,
 		OverlayLineage: s.overlayLineage,
+		Ephemeral:      s.ephemeral,
 	}
 	raw, err := json.Marshal(disk)
 	if err != nil {
@@ -803,6 +836,14 @@ func (s *Server) reserveOverlays(req OverlayReservationRequest) (OverlayReservat
 	lease := s.mutations[req.Lab]
 	legacy := make([]uint32, 0, len(vnis))
 	for _, vni := range vnis {
+		// A collection pass that has already proved this identifier abandoned
+		// is mid-deletion. Granting the reservation would hand the lab an
+		// overlay that is about to be removed underneath it; refusing is
+		// retryable and takes at most one collection pass.
+		if s.collectingOverlayLocked(vni) {
+			return OverlayReservationResponse{}, fmt.Errorf(
+				"VNI %d is being collected on this node; retry the deployment", vni)
+		}
 		if owner, exists := owners[vni]; exists && owner != req.Lab {
 			if owner == "" {
 				if err := s.legacyOwnerlessOverlayProofLocked(req.Lab, vni); err != nil {
@@ -1003,6 +1044,7 @@ func (s *Server) finishDestroyedLab(lab string, fence Fence) error {
 	tx, hadTransaction := s.transactions[lab]
 	inventory, hadInventory := s.inventories[lab]
 	lineage, hadLineage := s.overlayLineage[lab]
+	lifetime, hadLifetime := s.clearEphemeralLeaseLocked(lab)
 	claims := map[uint32]overlayClaim{}
 	for vni, claim := range s.overlayClaims {
 		if claim.Lab == lab {
@@ -1026,6 +1068,9 @@ func (s *Server) finishDestroyedLab(lab string, fence Fence) error {
 		}
 		if hadLineage {
 			s.overlayLineage[lab] = lineage
+		}
+		if hadLifetime {
+			s.ephemeral[lab] = lifetime
 		}
 		for vni, claim := range claims {
 			s.overlayClaims[vni] = claim

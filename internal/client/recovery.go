@@ -272,6 +272,14 @@ func recoveryWaitError(lab string, report RecoveryReport) error {
 	return fmt.Errorf("recovery for lab %q is still in progress: %s", lab, strings.Join(progress, "; "))
 }
 
+// readRecoveryStatuses separates a cluster that cannot be read from a cluster
+// that can be read and disagrees.
+//
+// They used to be the same error, and that is what made a split commit
+// terminal: the divergence itself aborted recovery before recovery could look
+// at it, so the one thing that could have converged the cluster never ran. A
+// node that does not answer is still fatal -- deciding a generation from a
+// subset of the cluster is how the split happens in the first place.
 func (c *Cluster) readRecoveryStatuses(ctx context.Context, lab string) (RecoveryReport, bool, error) {
 	report := RecoveryReport{Lab: lab, Nodes: map[string]agent.RecoveryStatus{}}
 	pending := false
@@ -288,8 +296,6 @@ func (c *Cluster) readRecoveryStatuses(ctx context.Context, lab string) (Recover
 				report.Generation = status.Generation
 			} else if report.Generation != status.Generation {
 				pending = true
-				problems = append(problems, fmt.Sprintf("%s generation %q, not %q",
-					node.Name, status.Generation, report.Generation))
 			}
 		}
 		if status.Phase != "idle" && (!status.Consistent || status.Phase != "committed") {
@@ -343,6 +349,20 @@ func (c *Cluster) recoverWithLeaseStrategyOptions(ctx context.Context, lab strin
 		}
 		report.Nodes[result.node] = result.status
 	}
+	// A first pass can leave the cluster split: nodes that failed have rolled
+	// back and forgotten, while nodes that committed kept the generation the
+	// rest of the cluster no longer has. That is not an error to report and
+	// walk away from -- it is a state with exactly one safe resolution, and
+	// leaving it is what previously required force-destroying the lab.
+	if strategy == "rollback" {
+		observed := c.observeNodes(ctx, lab, report)
+		if split, found := detectSplitCommit(observed); found {
+			if err := c.resolveSplitCommit(ctx, lab, lease, split, options); err != nil {
+				problems = append(problems, err.Error())
+			}
+		}
+	}
+
 	for _, node := range nodes {
 		status, err := node.RecoveryStatus(ctx, lab)
 		if err != nil {
@@ -371,4 +391,26 @@ func (c *Cluster) recoverWithLeaseStrategyOptions(ctx context.Context, lab strin
 		return report, fmt.Errorf("recovery for lab %q is incomplete: %s", lab, strings.Join(problems, "; "))
 	}
 	return report, nil
+}
+
+// observeNodes re-reads every node's state, keeping whatever the caller
+// already has for a node that cannot be reached. A split-commit decision is
+// only made when every node answered; observing a subset and acting on it
+// would be the same partial-information mistake in a new place.
+func (c *Cluster) observeNodes(ctx context.Context, lab string, fallback RecoveryReport) RecoveryReport {
+	out := RecoveryReport{Lab: lab, Nodes: map[string]agent.RecoveryStatus{}}
+	for _, node := range c.sortedNodes() {
+		status, err := node.RecoveryStatus(ctx, lab)
+		if err != nil {
+			if known, ok := fallback.Nodes[node.Name]; ok {
+				out.Nodes[node.Name] = known
+				continue
+			}
+			// An unreachable node with no prior observation makes the cluster
+			// unknowable; return an empty report so no decision is taken.
+			return RecoveryReport{Lab: lab, Nodes: map[string]agent.RecoveryStatus{}}
+		}
+		out.Nodes[node.Name] = status
+	}
+	return out
 }

@@ -172,6 +172,8 @@ type warmBatchHarness struct {
 	c           *client.Cluster
 	exec        execFn
 	hold        *labHold
+	owner       string
+	heartbeat   *client.EphemeralHeartbeat
 	mu          sync.Mutex
 	grades      int
 	taint       error
@@ -189,7 +191,12 @@ func newWarmBatchHarness(ctx context.Context, class *model.Topology, rubric *gra
 	if err := clearStaleHarness(ctx, cluster, top); err != nil {
 		return nil, err
 	}
-	if err := deployQuiet(ctx, cluster, top, asn); err != nil {
+	// A warm harness outlives any single submission but not this process. Its
+	// heartbeat runs for the pool's whole lifetime and stops with it.
+	owner := client.EphemeralOwnerName("grade-batch-warm")
+	heartbeat := cluster.KeepEphemeralAlive(ctx, top.Name, owner, ephemeralHarnessTTL)
+	if err := deployQuiet(ctx, cluster, top, asn, owner); err != nil {
+		heartbeat.Stop()
 		cleanupCtx, cancel := context.WithTimeout(
 			context.WithoutCancel(ctx), warmHarnessCleanupTimeout(len(top.Devices)),
 		)
@@ -201,6 +208,7 @@ func newWarmBatchHarness(ctx context.Context, class *model.Topology, rubric *gra
 	}
 	held, err := holdLab(ctx, top, opts.token, io.Discard)
 	if err != nil {
+		heartbeat.Stop()
 		tctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
 		defer cancel()
 		_ = destroyLab(tctx, cluster, top)
@@ -208,6 +216,7 @@ func newWarmBatchHarness(ctx context.Context, class *model.Topology, rubric *gra
 	}
 	exec, err := execFuncWithHoldTimeout(ctx, top, opts.token, held.token, warmBaselineExecTimeout)
 	if err != nil {
+		heartbeat.Stop()
 		held.Release()
 		tctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
 		defer cancel()
@@ -216,6 +225,7 @@ func newWarmBatchHarness(ctx context.Context, class *model.Topology, rubric *gra
 	}
 	baselineTimeout := warmHarnessBaselineTimeout(len(top.Devices), opts.converge)
 	if err := grade.WaitReferenceBaseline(ctx, top, asn, exec, nil, baselineTimeout); err != nil {
+		heartbeat.Stop()
 		held.Release()
 		tctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
 		defer cancel()
@@ -223,7 +233,8 @@ func newWarmBatchHarness(ctx context.Context, class *model.Topology, rubric *gra
 		return nil, fmt.Errorf("verifying solved reference baseline: %w", err)
 	}
 	return &warmBatchHarness{class: class, rubric: rubric, top: top, asn: asn,
-		opts: opts, c: cluster, exec: exec, hold: held}, nil
+		opts: opts, c: cluster, exec: exec, hold: held,
+		owner: owner, heartbeat: heartbeat}, nil
 }
 
 func (w *warmBatchHarness) WarmIdentity() harness.WarmIdentity {
@@ -258,6 +269,12 @@ func (w *warmBatchHarness) Reset(ctx context.Context) error {
 
 func (w *warmBatchHarness) Destroy(ctx context.Context) error {
 	w.destroyOnce.Do(func() {
+		// The heartbeat stops first so a teardown that fails still ends in
+		// automatic reclamation rather than in a lab nobody is renewing and
+		// nobody is removing.
+		if w.heartbeat != nil {
+			w.heartbeat.Stop()
+		}
 		w.destroyErr = destroyLab(ctx, w.c, w.top)
 		if w.hold != nil {
 			w.hold.Release()
