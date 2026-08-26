@@ -507,6 +507,32 @@ node is contacted or changed, and the output says so. `--runtime` is required
 because without a manifest nothing says which engine created the lab, and an
 empty answer from the wrong daemon is indistinguishable from an empty machine.
 
+### When a device's saved configuration will not replay
+
+`twinet destroy` captures every student-owned device before removing anything,
+and the next `deploy` replays it. If a replay is refused you see it during
+configure, and the deployment stops there:
+
+```
+node-0/as7: configure as7/BOS: as7/BOS was recreated but its saved
+configuration could not be replayed (the snapshot is safe in the state store,
+and the device is still marked as needing one): restore as7/BOS addrs
+command "ip route replace ..." exited 2: ...
+```
+
+Nothing was lost. The snapshot is on the node that owns the device, under
+`/var/lib/twinet/state/<lab>/<as>_<device>/`, and the device carries
+`/etc/twinet/restore-pending` so any later deploy looks for it again. Re-run
+`twinet -m <manifest> deploy`: routes are canonicalised on the way out of the
+store as well as on the way in, so a snapshot written by an older build is
+repaired as it is read and does not need to be deleted.
+
+Deleting `/var/lib/twinet/state/<lab>` is the one action to avoid. It is not a
+cache: it is the only copy of the work captured from devices that no longer
+exist, and removing it is silent and permanent. If a replay is still refused
+after a re-run, quote the rejected command — it is printed in full — rather
+than clearing the store.
+
 ## 13. When something is refused
 
 | What you see | What it means | What to do |
@@ -516,6 +542,7 @@ empty answer from the wrong daemon is indistinguishable from an empty machine.
 | a node reports a backend different from its requested runtime | manifest and agent disagree about the engine | fix `placement.runtime`, or re-roll the agent with `deploy_agents.sh --runtime` |
 | an admission refusal naming a resource | requests exceed live allocatable inventory | reduce the lab, add capacity, or use the audited `--overcommit` |
 | `refusing to remove lab ... from a name alone` | destroy has no manifest and cannot prove the scope | [§12](#when-there-is-no-manifest) |
+| `its saved configuration could not be replayed` | a captured command was rejected by the device | [§12](#when-a-devices-saved-configuration-will-not-replay) — re-run `deploy`; never delete `/var/lib/twinet/state` |
 | a quarantine instead of a mark | the infrastructure failed, not the submission | re-grade after `twinet node status` is clean |
 
 ## 14. What this guide does not claim

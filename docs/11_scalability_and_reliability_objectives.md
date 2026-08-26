@@ -368,9 +368,24 @@ disk disappears.
   peer suffixes, link-local addresses, lifetimes, and route cache decorations
   do not change a snapshot digest; missing or extra student-significant facts
   do.
+- A captured route is stored as portable, user-constructible semantics, not as
+  the kernel printed it. The nexthop-object id a routing daemon's routes carry
+  (`nhid <N>`), the protocol that installed them, IPv6 route preference, link
+  state, and `ip -o`'s backslash line separator are dropped; destination, type,
+  via/dev, metric, table, source, scope, `onlink`, locked metrics, weights, and
+  encapsulation are kept. Multipath is stored and replayed as one
+  `ip route replace P ... nexthop via A dev X weight 1 nexthop via B dev Y
+  weight 1`. A route the kernel resolved only through a nexthop object it did
+  not describe cannot be asked for by any command and is not stored; the kernel's
+  own per-interface `fe80::/64` routes are not student state. Snapshots written
+  in the kernel's spelling are re-canonicalised when they are read, so a lab
+  with saved state never has to delete it to become deployable again.
 - Restore clears stale dynamic facts before replay and fails on the first
-  rejected command. FRR/BIRD configuration is replayed only after its daemon
-  is ready, after interfaces and tunnels have been restored.
+  rejected command. Replay is in dependency order rather than stored order:
+  tunnel, VLAN, and VRF devices are created and brought up first, then
+  addresses, then the routes that name them, with the routes over a tunnel
+  last. FRR/BIRD configuration is replayed only after its daemon is ready,
+  after interfaces and tunnels have been restored.
 - A persisted unfinished transaction gates event repair, sampled/full semantic
   audit, periodic capture/replication, and GC before their loops can mutate a
   rehydrated lab. Recovery cancels already scheduled periodic work and is the
