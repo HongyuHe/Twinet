@@ -387,6 +387,24 @@ type Summary struct {
 	// is fewer than Count whenever something could not be graded.
 	Graded int    `json:"graded"`
 	Note   string `json:"note,omitempty"`
+	// Scheduling records how many systems were read at once and why. A report
+	// produced under an operator-chosen width that the cluster could not
+	// support has to be distinguishable, afterwards and from the artefact
+	// alone, from one produced under the width the cluster advertised.
+	Scheduling *SchedulingRecord `json:"scheduling,omitempty"`
+}
+
+// SchedulingRecord is the outer grading width that produced a summary.
+type SchedulingRecord struct {
+	// Width is how many systems were read at once.
+	Width int `json:"width"`
+	// Reason is the binding constraint, in the words the run printed.
+	Reason string `json:"reason,omitempty"`
+	// Requested is the width an operator asked for, zero when it was derived.
+	Requested int `json:"requested,omitempty"`
+	// Safe is the capacity-safe width that was derived regardless, so a run
+	// made wider than the cluster advertises says so in its own artefact.
+	Safe int `json:"capacity_safe_width,omitempty"`
 }
 
 // Summarise builds a class summary.

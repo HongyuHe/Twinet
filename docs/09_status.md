@@ -1412,6 +1412,33 @@ reached students, and each motivated a permanent test.
      nested inside `if ... && !hops[want]`, with a comment describing a leniency
      for the final hop that the code did not implement.
 
+108. **A grading width chosen without asking the machine underneath it.**
+     `twinet grade run` with no `--as` grades every student system, and shipped
+     a fixed default of eight concurrent submissions, each with its own
+     eight-wide check pool. The canonical lab packs onto one node -- 212
+     containers, one agent -- so all of it arrived at one exec budget of 56 as
+     roughly 64 concurrent commands, plus a batched survey fan-out per grade
+     and the tool-integrity read every grading exec carries. Every check
+     exhausted its two-minute budget, and all eight reference reports came back
+     quarantined at a provisional 7.00/10 -- against a lab deployed `--solve`,
+     in which nothing was wrong, and which scored 10.00/10.00 when read one
+     system at a time. Fail-closed marking held: no total was released. But the
+     documented smoke test could not run at its own defaults, which is a
+     capability defect in the diagnostic rather than in the marks.
+     `--parallel` is now an override, and an omitted one is derived from the
+     deployment: each target's device footprint and where the placer put it,
+     the `exec_probe` budget each agent advertises minus what it is already
+     serving (grading takes at most half), and how many targets converge on the
+     same routers (at most two grades read one router's control plane at once,
+     because that evidence is a full table dump served by one daemon in one
+     container). Targets on independent nodes that share no router still run
+     together; a node that cannot be asked is assumed to have room for one.
+     The chosen width and the binding reason are printed and recorded in
+     `summary.json`; an explicit width above the derived one is printed as an
+     `AUDIT:` line and recorded with it. Canonical placement is unchanged:
+     `pack-by-as` is a deliberate locality choice, and a grading command that
+     only works on a spread lab would still be broken.
+
 
 
 

@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"sync"
 	"text/tabwriter"
 	"time"
 
@@ -122,6 +121,16 @@ of it the rubric's questions are about. A system that has not settled by then is
 still read and reported, and the report is marked as needing review rather than
 released as a mark. Pass --converge-timeout 0 to read the lab this instant.
 
+How many systems are read at once is derived, not fixed. Each grade reads its
+own devices and its neighbours' through the node agents that hold them, so the
+safe width depends on where the lab is placed, on the exec budget each node
+advertises, and on how many of the targets converge on the same staff routers
+and exchange route servers. Systems on independent nodes are read together;
+systems packed onto one agent are not. The chosen width and the reason for it
+are printed before grading starts. --parallel overrides the derived width; a
+value above it is announced as such, and checks that then run out of time are
+still quarantined rather than marked.
+
 Use it to check the reference solution, to investigate one submission, or to see
 where a lab stands. To mark a class, use "twinet grade class", which loads one
 submission at a time onto a blank system with the rest of the internet at the
@@ -206,44 +215,37 @@ reference, and holds the nodes off from repairing anything while it does.`,
 				return err
 			}
 
-			if parallel <= 0 {
-				parallel = 8
-			}
+			// The outer width is derived from where the lab is placed and what
+			// its agents advertise, unless an operator named one. Grading all
+			// eight systems of the canonical lab at a fixed eight put every
+			// exec through the single agent that holds all 212 containers and
+			// quarantined every report; --parallel is the override, not the
+			// default.
+			gate, scheduling := planGradeRun(cmd.Context(), top, token, targets,
+				parallel, checkParallel, activeParallel, cmd.ErrOrStderr())
+
 			start := time.Now()
-			reports := make([]*grade.Report, len(targets))
-			var wg sync.WaitGroup
-			sem := make(chan struct{}, parallel)
-			var mu sync.Mutex
-			done := 0
-
-			for i, asn := range targets {
-				wg.Add(1)
-				go func(i, asn int) {
-					defer wg.Done()
-					sem <- struct{}{}
-					defer func() { <-sem }()
-
+			reports := grade.RunEach(cmd.Context(), targets, gate,
+				func(ctx context.Context, asn int) *grade.Report {
 					env := &grade.Env{Topology: top, AS: asn, Exec: exec, BatchExec: batchExec}
-					rep := grade.Run(cmd.Context(), rubric, env, liveGradeRunOptions(
+					rep := grade.Run(ctx, rubric, env, liveGradeRunOptions(
 						converge, checkParallel, activeParallel, shadowBatches))
 					rep.Submission = fmt.Sprintf("as%d", asn)
 					if as, ok := top.ASes[asn]; ok && as.OwnerGroup != "" {
 						rep.Submission = as.OwnerGroup
 					}
-					reports[i] = rep
-
-					mu.Lock()
-					done++
-					if !quiet {
-						fmt.Fprintf(cmd.ErrOrStderr(), "  [%d/%d] %-12s %.2f / %.2f\n",
-							done, len(targets), rep.Submission, rep.Total, rep.MaxTotal)
+					return rep
+				},
+				func(done, total int, rep *grade.Report) {
+					if quiet {
+						return
 					}
-					mu.Unlock()
-				}(i, asn)
-			}
-			wg.Wait()
+					fmt.Fprintf(cmd.ErrOrStderr(), "  [%d/%d] %-12s %.2f / %.2f\n",
+						done, total, rep.Submission, rep.Total, rep.MaxTotal)
+				})
 
 			summary := grade.Summarise(rubric.Metadata.Name, reports, time.Since(start))
+			summary.Scheduling = scheduling
 			if err := writeReports(outDir, summary); err != nil {
 				return err
 			}
@@ -268,7 +270,8 @@ reference, and holds the nodes off from repairing anything while it does.`,
 	cmd.Flags().StringVarP(&rubricPath, "rubric", "r", "", "rubric file (default: the one under <lab>/rubric/)")
 	cmd.Flags().IntSliceVar(&asList, "as", nil, "AS numbers to grade (default: every student AS)")
 	cmd.Flags().StringVarP(&outDir, "out", "o", "", "directory for reports")
-	cmd.Flags().IntVarP(&parallel, "parallel", "p", 8, "submissions graded concurrently")
+	cmd.Flags().IntVarP(&parallel, "parallel", "p", 0,
+		"submissions graded concurrently (default: derived from placement and node exec budgets)")
 	cmd.Flags().IntVar(&checkParallel, "check-parallel", 8,
 		"maximum checks/passive observations per submission")
 	cmd.Flags().IntVar(&activeParallel, "active-check-parallel", 4,

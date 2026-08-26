@@ -323,8 +323,39 @@ twinet grade validate examples/cos461/rubric/cos461.yaml
 twinet -m examples/cos461 grade run --as 3 --out reports
 ```
 
-`grade run` is a diagnostic: it reads the lab exactly as it is. To mark a
-class, use one of the two fair modes:
+`grade run` is a diagnostic: it reads the lab exactly as it is. Given no `--as`
+it reads every student system, and it chooses for itself how many to read at
+once:
+
+```
+$ twinet -m examples/cos461 grade run --out reports
+grading 8 system(s), at most 3 at a time: node node-0 admits 28 concurrent
+grading exec(s) and each grade needs up to 8 there
+```
+
+Every grade reads its own devices and its neighbours' through the node agent
+that holds them, so the safe width depends on where the lab is placed, on the
+exec budget each node advertises, and on how many systems converge on the same
+staff routers and exchange route servers. The canonical lab packs onto one node
+(`inspect --placement` shows it), so its eight systems are read a few at a time;
+systems on independent nodes that share no router are read together. A node
+that cannot be asked what it admits is assumed to have room for one system, and
+the run says so.
+
+`--parallel` overrides the derived width. It is an operator's decision to make,
+and a value above what the cluster advertises is recorded next to the marks it
+produced:
+
+```
+$ twinet -m examples/cos461 grade run --parallel 8 --out reports
+AUDIT: grading 8 system(s) at --parallel 8, above the capacity-safe width of 3 …
+```
+
+Checks that then run out of time are still quarantined rather than marked:
+overriding the width can waste a run, but it cannot turn an overloaded cluster
+into a student's zero.
+
+To mark a class, use one of the two fair modes:
 
 ```sh
 twinet -m examples/cos461 grade class --out reports          # one submission at a time, in the class lab

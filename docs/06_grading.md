@@ -37,6 +37,41 @@ records, per-check cache/exec accounting, lock waits, and a scheduler critical
 path. `grade run --check-parallel` bounds total/passive checks; the smaller
 `--active-check-parallel` pool protects node runtime pressure.
 
+### How many systems are read at once
+
+`grade run --parallel` is an override, not the default. With it omitted the
+outer width is derived from the deployment: the devices each target reads
+(its own AS, its neighbour routers, the exchange route servers it peers with,
+and the services it is cabled to), where the placer put them, and what each
+node agent advertises as its `exec_probe` budget minus what it is already
+serving. Grading takes at most half of that budget; the rest belongs to the
+node's own reconciler, semantic audit, control sidecars, and any other lab.
+
+Two constraints bind, and both are properties of the deployment rather than of
+the request:
+
+- **Per node.** One grade occupies up to one batched-survey fan-out plus its
+  in-flight checks on each node it reads, so the width is what the advertised
+  budget divides by, not the number of submissions.
+- **Per router.** A router's evidence is a full control-plane dump served by
+  one daemon in one container, so simultaneous readers of the same router each
+  wait for all the others. At most two grades read one router at a time. Hosts
+  and services answer cheap commands and are not capped this way.
+
+Targets on independent nodes that share no router are still read together. A
+node that cannot be asked is treated as having room for a single system, never
+as an idle one. The chosen width and the binding reason are printed before the
+run starts; an explicit `--parallel` above the derived width is printed as an
+`AUDIT:` line, and checks that run out of time under it are still quarantined
+rather than marked.
+
+This replaces a fixed default of eight, which read all eight student systems of
+the canonical lab against the single agent that holds all 212 of its
+containers: every check exhausted its two-minute budget and all eight reports
+were quarantined, while the same lab graded 10.00/10.00 one system at a time.
+Canonical placement remains `pack-by-as`: locality is worth having, and a
+grading command that only works on a spread lab would still be broken.
+
 The compact `harness.Options.Synthetic` substrate keeps the target AS and IXPs
 intact while collapsing each other retained AS to one deterministic
 policy/origin router. It is enabled only by a signed release attestation keyed
