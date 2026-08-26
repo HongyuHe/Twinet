@@ -455,6 +455,8 @@ placement:
 	assertContainerdSidecarRebindsAfterRestart(t, ctx, runtime, teaching, top, device)
 	assertContainerdBaselineDemandsProof(t, ctx, runtime, teaching, top, device,
 		filepath.Join(work, "observed"))
+	assertContainerdBaselineSeesEveryNamespaceObject(t, ctx, runtime, teaching, top, device,
+		store, lab, filepath.Join(work, "observed"))
 	if err := engine.Destroy(ctx, lab); err != nil {
 		t.Fatal(err)
 	}
@@ -1092,6 +1094,96 @@ func assertContainerdBaselineDemandsProof(t *testing.T, ctx context.Context, run
 	}
 	if reason := engine.UnprovenNamespaceDevices()[device.ID]; !strings.Contains(reason, loopback) {
 		t.Fatalf("the refusal did not name the missing address %s: %q", loopback, reason)
+	}
+}
+
+// assertContainerdBaselineSeesEveryNamespaceObject proves the reading covers
+// more than addresses, against a real kernel.
+//
+// A VLAN sub-interface is a namespace object in its own right: it is captured
+// alongside the addressing because the addressing depends on it, and it goes
+// with the namespace when a task is replaced. A proof that compared only
+// addresses would find every address in place -- they are on the interfaces the
+// platform rewired -- and record a namespace that has lost the student's VLANs
+// as the one their work was done in. `ip -d -o link show type vlan` is also
+// exactly the kind of output a fake gets subtly wrong, so it is worth reading
+// from a container that really has one.
+func assertContainerdBaselineSeesEveryNamespaceObject(t *testing.T, ctx context.Context,
+	runtime rt.Runtime, engine *deploy.Engine, top *model.Topology, device *model.Device,
+	store *state.Store, lab, observedRoot string,
+) {
+	t.Helper()
+	port := ""
+	for _, iface := range device.Ifaces {
+		if iface != nil && iface.Link != nil && iface.Name != "" && iface.Name != "lo" {
+			port = iface.Name
+			break
+		}
+	}
+	if port == "" {
+		t.Fatalf("%s has no wired interface to stack a VLAN on", device.ID)
+	}
+	vlan := port + ".42"
+	control := deploy.FRRControlContainer(device)
+	run := func(what string, args ...string) {
+		t.Helper()
+		result, err := runtime.Exec(ctx, control, rt.ExecCmd{Cmd: args})
+		if err != nil || result.Err() != nil {
+			t.Fatalf("%s: %+v, %v", what, result, err)
+		}
+	}
+	run("creating "+vlan, "ip", "link", "add", "link", port, "name", vlan, "type", "vlan", "id", "42")
+	defer func() {
+		_, _ = runtime.Exec(ctx, control, rt.ExecCmd{Cmd: []string{"ip", "link", "del", vlan}})
+	}()
+
+	// Saved the way a submission is saved: read out of the kernel by the same
+	// capture, canonicalised by the same code, into the same store.
+	snaps, err := deploy.Capture(ctx, runtime, device, lab, top.Hash)
+	if err != nil {
+		t.Fatalf("saving %s: %v", device.ID, err)
+	}
+	saved := false
+	for _, snap := range snaps {
+		if snap.Kind != state.KindAddrs {
+			continue
+		}
+		if !bytes.Contains(snap.Content, []byte("link vlan "+vlan+" "+port+" 42")) {
+			t.Fatalf("a capture of %s did not record the VLAN it is carrying:\n%s",
+				device.ID, snap.Content)
+		}
+		if _, err := store.Put(snap); err != nil {
+			t.Fatalf("saving the addressing of %s: %v", device.ID, err)
+		}
+		saved = true
+	}
+	if !saved {
+		t.Fatalf("capturing %s produced no addressing snapshot", device.ID)
+	}
+
+	forgetContainerdNamespaces(t, observedRoot)
+	if !containerdNoOpDeploy(t, ctx, engine, top, device, "baselining a router with its VLAN") {
+		return
+	}
+	if _, ok := recordedContainerdNamespace(t, observedRoot, device.ID); !ok {
+		t.Fatalf("a router carrying exactly the VLAN its saved state records was refused "+
+			"a baseline: %q", engine.UnprovenNamespaceDevices()[device.ID])
+	}
+
+	// And with the VLAN gone, which is what a replaced task leaves behind: the
+	// netdev went with the namespace, every address is back on the interfaces
+	// the reconcile rewired, and the student's VLAN is only in the store.
+	run("removing "+vlan, "ip", "link", "del", vlan)
+	forgetContainerdNamespaces(t, observedRoot)
+	if !containerdNoOpDeploy(t, ctx, engine, top, device, "refusing a router that lost its VLAN") {
+		return
+	}
+	if recorded, ok := recordedContainerdNamespace(t, observedRoot, device.ID); ok {
+		t.Fatalf("a router that lost the VLAN its saved state records was baselined at %s; "+
+			"the next capture would file that loss over the student's work", recorded)
+	}
+	if reason := engine.UnprovenNamespaceDevices()[device.ID]; !strings.Contains(reason, vlan) {
+		t.Fatalf("the refusal did not name the missing VLAN %s: %q", vlan, reason)
 	}
 }
 

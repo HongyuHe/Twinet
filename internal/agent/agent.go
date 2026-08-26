@@ -1632,6 +1632,18 @@ type ApplyResponse struct {
 	// after the response was produced. A controller uses it to refuse a
 	// zero-change success that contradicts the node it just deployed to.
 	SemanticHealth SemanticHealth `json:"semantic_health"`
+	// UnprovenNamespaces names the devices whose network namespace this pass
+	// could neither prove continuous with the state they are supposed to hold
+	// nor repair, with the reason for each.
+	//
+	// These devices are running, and their audited health may well say they
+	// are fine -- the audit does not look at what a student owns. What is
+	// wrong with them is invisible from outside: their saved addressing,
+	// tunnels and bridge ports are being withheld from the state store,
+	// because writing what is in their namespace now could overwrite the only
+	// copy of the work. A lab that has quietly stopped being backed up is not
+	// something an operator can be expected to infer.
+	UnprovenNamespaces map[string]string `json:"unproven_namespaces,omitempty"`
 }
 
 func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
@@ -1884,6 +1896,7 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 			SemanticHealth:         s.labSemanticHealth(top.Name),
 		}
 		attachDeploymentStats(&resp, deploymentStats, rep)
+		attachUnprovenNamespaces(&resp, eng.UnprovenNamespaceDevices())
 		recordStart := time.Now()
 		if err := s.recordGenerationDirtyCapture(top.Name, req.Fence, req.Generation, eng.DirtyCaptureDevices()); err != nil {
 			httpError(w, http.StatusConflict, err)
@@ -2005,6 +2018,7 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		SemanticHealth:         s.labSemanticHealth(top.Name),
 	}
 	attachDeploymentStats(&resp, deploymentStats, rep)
+	attachUnprovenNamespaces(&resp, eng.UnprovenNamespaceDevices())
 	addPhaseTiming(&resp, "record", time.Since(recordStart))
 	if recordFailure != "" {
 		resp.Failures = map[string][]string{"state": {recordFailure}}

@@ -50,6 +50,17 @@ ip -d -o link show type vlan || exit $?
 echo ---
 ip -d -o link show type vrf || exit $?`
 
+// tunnelCapture reads the tunnel netdevs FRR does not manage, and the IPv6
+// routes that ride over them.
+//
+// Named rather than written at its one call site because it is read twice: a
+// capture writes what it returns into the store, and a continuity proof reads
+// it back to ask whether the tunnels in the snapshot are still there. Two
+// spellings of the same reading would compare canonical forms of different
+// commands.
+const tunnelCapture = `ip -d tunnel show || exit $?
+ip -6 route show`
+
 // switchCapture records each port's VLAN assignment in a directly replayable
 // form. ovs-vsctl prints lists as "[10, 20]"; the space is stripped along with
 // the brackets, because a trunk written as "trunks=10, 20" is split by the
@@ -209,8 +220,7 @@ func Capture(ctx context.Context, r rt.Runtime, d *model.Device, lab, topoHash s
 		}
 		// Tunnels are configured with ip(8) rather than through FRR, so they
 		// are captured separately or the 6in4 exercise would be lost.
-		if body, ok := read("the tunnels", []string{"sh", "-c",
-			"ip -d tunnel show || exit $?; ip -6 route show"}); ok {
+		if body, ok := read("the tunnels", []string{"sh", "-c", tunnelCapture}); ok {
 			add(state.KindTunnels, body)
 		}
 		if body, ok := read("the addresses and routes", []string{"sh", "-c", addrCapture}); ok {

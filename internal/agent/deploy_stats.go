@@ -8,6 +8,21 @@ import (
 	"github.com/HongyuHe/twinet/internal/plan"
 )
 
+// attachUnprovenNamespaces publishes the devices whose network namespace a
+// deployment could not vouch for.
+//
+// Refusing to record a namespace, and withholding what a capture read out of
+// it, is invisible from every other field in this response: the steps ran, the
+// inventory matches, and the audited health of a device whose student-owned
+// addressing has gone is "healthy", because the audit does not look at what a
+// student owns. Somebody has to be told.
+func attachUnprovenNamespaces(resp *ApplyResponse, unproven map[string]string) {
+	if resp == nil || len(unproven) == 0 {
+		return
+	}
+	resp.UnprovenNamespaces = unproven
+}
+
 func attachDeploymentStats(resp *ApplyResponse, stats deploy.DeploymentStats, report *plan.Report) {
 	resp.Dirty = stats.Dirty
 	resp.Mutations = stats.Mutations

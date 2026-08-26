@@ -25,6 +25,13 @@ type namespaceAwareRuntime struct {
 	// network namespace. A container with no entry answers with an empty one,
 	// which is what a task that has just restarted has.
 	contents map[string]string
+	// tunnels and ports are the further readings the proof makes when the
+	// store says there is tunnel or bridge-port state to account for. They are
+	// separate because they are separate execs, and because a container that
+	// is asked for one it has never had should answer with nothing rather than
+	// with somebody else's state.
+	tunnels map[string]string
+	ports   map[string]string
 	// onProbe runs when a container's namespace is read, so a test can restart
 	// a device in the middle of the proof that brackets that reading.
 	onProbe func(container string)
@@ -46,11 +53,38 @@ func (r *namespaceAwareRuntime) setContents(name, body string) {
 	r.contents[name] = body
 }
 
+func (r *namespaceAwareRuntime) setTunnels(name, body string) {
+	r.nsMu.Lock()
+	defer r.nsMu.Unlock()
+	if r.tunnels == nil {
+		r.tunnels = map[string]string{}
+	}
+	r.tunnels[name] = body
+}
+
+func (r *namespaceAwareRuntime) setPorts(name, body string) {
+	r.nsMu.Lock()
+	defer r.nsMu.Unlock()
+	if r.ports == nil {
+		r.ports = map[string]string{}
+	}
+	r.ports[name] = body
+}
+
 func (*namespaceAwareRuntime) PullImage(context.Context, string, rt.PullPolicy) error { return nil }
 
 // namespaceProbeOutput renders the reading the continuity probe makes of a
 // namespace holding exactly these netdevs and addresses.
 func namespaceProbeOutput(links []string, addrs map[string][]string) string {
+	return namespaceProbeOutputWith(links, addrs, nil, nil)
+}
+
+// namespaceProbeOutputWith adds the last two addrCapture sections: the VLAN
+// sub-interfaces and VRF masters the addresses above them are allowed to name,
+// which are namespace-backed objects in their own right.
+func namespaceProbeOutputWith(links []string, addrs map[string][]string,
+	vlans, vrfs []string,
+) string {
 	var body strings.Builder
 	body.WriteString("1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN\n")
 	for i, name := range links {
@@ -71,10 +105,33 @@ func namespaceProbeOutput(links []string, addrs map[string][]string) string {
 			fmt.Fprintf(&body, "9: %s    %s %s scope global %s\n", name, family, address, name)
 		}
 	}
-	// The four remaining addrCapture sections: routes, then the VLAN and VRF
-	// netdevs the addresses above are allowed to name.
-	body.WriteString("---\n---\n---\n---\n")
+	// The routes, which are deliberately not compared, then the VLAN and VRF
+	// netdevs, which are.
+	body.WriteString("---\n---\n---\n")
+	for _, line := range vlans {
+		body.WriteString(line + "\n")
+	}
+	body.WriteString("---\n")
+	for _, line := range vrfs {
+		body.WriteString(line + "\n")
+	}
 	return body.String()
+}
+
+// vlanLinkLine is one `ip -d -o link show type vlan` line, in the shape
+// iproute2 prints it: the detail continues after a backslash.
+func vlanLinkLine(name, parent, id string) string {
+	return fmt.Sprintf("9: %s@%s: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue "+
+		"state UP mode DEFAULT group default \\    link/ether 02:42:ac:11:00:02 brd "+
+		"ff:ff:ff:ff:ff:ff promiscuity 0 \\    vlan protocol 802.1Q id %s <REORDER_HDR> ",
+		name, parent, id)
+}
+
+// vrfLinkLine is one `ip -d -o link show type vrf` line.
+func vrfLinkLine(name, table string) string {
+	return fmt.Sprintf("11: %s: <NOARP,MASTER,UP,LOWER_UP> mtu 65575 qdisc noqueue state UP "+
+		"mode DEFAULT group default \\    link/ether 12:34:56:78:9a:bc brd ff:ff:ff:ff:ff:ff "+
+		"promiscuity 0 \\    vrf table %s ", name, table)
 }
 
 // Exec answers the restore marker and the namespace continuity probe honestly.
@@ -85,14 +142,25 @@ func (r *namespaceAwareRuntime) Exec(ctx context.Context, c string, cmd rt.ExecC
 	if strings.HasPrefix(strings.Join(cmd.Cmd, " "), "test -f "+restoreMarker) {
 		return rt.ExecResult{ExitCode: 1}, nil
 	}
-	if len(cmd.Cmd) == 3 && cmd.Cmd[2] == namespaceContinuityProbe {
-		r.nsMu.Lock()
-		body, moved := r.contents[c], r.onProbe
-		r.nsMu.Unlock()
-		if moved != nil {
-			moved(c)
+	if len(cmd.Cmd) == 3 && cmd.Cmd[0] == "sh" {
+		switch cmd.Cmd[2] {
+		case namespaceContinuityProbe:
+			r.nsMu.Lock()
+			body, moved := r.contents[c], r.onProbe
+			r.nsMu.Unlock()
+			if moved != nil {
+				moved(c)
+			}
+			return rt.ExecResult{Stdout: body}, nil
+		case tunnelCapture:
+			r.nsMu.Lock()
+			defer r.nsMu.Unlock()
+			return rt.ExecResult{Stdout: r.tunnels[c]}, nil
+		case switchCapture:
+			r.nsMu.Lock()
+			defer r.nsMu.Unlock()
+			return rt.ExecResult{Stdout: r.ports[c]}, nil
 		}
-		return rt.ExecResult{Stdout: body}, nil
 	}
 	return r.observedRuntime.Exec(ctx, c, cmd)
 }

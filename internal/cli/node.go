@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -897,6 +898,15 @@ func deployCluster(ctx context.Context, top *model.Topology, tok string, req age
 			}
 		}
 	}
+	// Printed whatever else the deployment did, including a dry run, because
+	// it describes the node rather than the run: these devices are having
+	// their saved state withheld, and the operator is the only one who can
+	// decide whether what is in the namespace or what is in the store is the
+	// student's work.
+	unproven := clusterUnprovenNamespaces(results)
+	for _, line := range unproven {
+		fmt.Fprintln(errOut, "  UNPROVEN NAMESPACE: "+line)
+	}
 
 	// Summed from actual per-node wire results, not the manifest. A cross-node
 	// link reports two completed endpoints, so only the reported cross-endpoint
@@ -949,6 +959,24 @@ func deployCluster(ctx context.Context, top *model.Topology, tok string, req age
 	// `node status` shows, so a zero-change run against a node reporting
 	// drifted devices is a contradiction, and it used to be reported as
 	// success with an exit status of zero.
+	return deploymentAudit(errOut, results, unproven, steps)
+}
+
+// deploymentAudit is everything a completed deployment has to say about the
+// cluster it just converged, and whether any of it is a failure of the
+// command.
+//
+// The two answers are deliberately not the same. Remaining semantic drift on a
+// run that did work is audited on stderr and forgiven -- the deployment
+// reported that work, and the cluster is converging. A device whose network
+// namespace could not be vouched for is not converging towards anything: its
+// saved state is being withheld from the store until somebody looks at it, the
+// next deployment will refuse in exactly the same way, and the audited health
+// that would otherwise raise the alarm does not look at student-owned state at
+// all.
+func deploymentAudit(errOut io.Writer, results []client.NodeResult[agent.ApplyResponse],
+	unproven []string, steps int,
+) error {
 	if drift := clusterSemanticDrift(results); drift != "" {
 		if err := zeroChangeDriftError(steps, drift); err != nil {
 			return err
@@ -957,7 +985,7 @@ func deployCluster(ctx context.Context, top *model.Topology, tok string, req age
 			"AUDIT: the deployment made %d change(s) and the cluster is still degraded: %s\n",
 			steps, drift)
 	}
-	return nil
+	return unprovenNamespaceError(unproven)
 }
 
 // zeroChangeDriftError enforces the one invariant a deployment summary must
@@ -970,6 +998,46 @@ func zeroChangeDriftError(steps int, drift string) error {
 	}
 	return fmt.Errorf("deployment made no changes while %s; "+
 		"the cluster is not converged, so this is not a successful no-op", drift)
+}
+
+// clusterUnprovenNamespaces names the devices no node could vouch for, in the
+// order an operator would read them.
+//
+// A node that failed outright is included: the failure is reported separately,
+// and the devices whose work has stopped being preserved are a different thing
+// to act on.
+func clusterUnprovenNamespaces(results []client.NodeResult[agent.ApplyResponse]) []string {
+	var out []string
+	for _, r := range results {
+		for device, reason := range r.Value.UnprovenNamespaces {
+			out = append(out, fmt.Sprintf("%s/%s: %s", r.Node, device, firstLine(reason)))
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// unprovenNamespaceError is what a deployment says about devices whose network
+// namespace it could not prove holds the state it is supposed to hold.
+//
+// It is a failure of the command, not a note in the output. These devices are
+// running and their audited health says they are fine -- the audit does not
+// look at addressing a student owns -- while their saved state is being
+// withheld from the store because capturing what is in their namespace now
+// could overwrite the only copy of the work. Nothing about that is visible in
+// a summary of steps and links, and an exit status is the only part of it an
+// operator cannot miss.
+func unprovenNamespaceError(unproven []string) error {
+	if len(unproven) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%d device(s) have unproven network-namespace continuity, so their saved "+
+		"addressing, VLANs, tunnels and switch ports are not being preserved: %s. Their audited "+
+		"health does not cover student-owned state, so nothing else here shows it. Look at each "+
+		"device with `twinet -m <manifest> exec`: if its namespace is empty because it "+
+		"restarted, replay the stored snapshot with `twinet -m <manifest> restore`; if this "+
+		"deployment was repairing it, re-run deploy once it has converged",
+		len(unproven), strings.Join(unproven, "; "))
 }
 
 // clusterSemanticDrift names the degraded nodes and one device that proves it.

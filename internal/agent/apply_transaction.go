@@ -135,6 +135,7 @@ func (s *Server) handleApplyPrepare(w http.ResponseWriter, r *http.Request, req 
 	s.mu.Unlock()
 	dirtyCapture := []string(nil)
 	semanticDirty := []string(nil)
+	unproven := map[string]string(nil)
 	if previous != nil {
 		observed := &deploy.Engine{
 			Runtime:                s.rt,
@@ -164,6 +165,9 @@ func (s *Server) handleApplyPrepare(w http.ResponseWriter, r *http.Request, req 
 		}
 		dirtyCapture = observed.DirtyCaptureDevices()
 		semanticDirty = observed.DirtySemanticDevices()
+		// Prepare is the pass that captures before a destructive boundary, so
+		// it is the pass whose refusals decide whose work survives it.
+		unproven = observed.UnprovenNamespaceDevices()
 	}
 	if previous != nil {
 		prestate.TopologyHash = previous.Hash
@@ -242,7 +246,7 @@ func (s *Server) handleApplyPrepare(w http.ResponseWriter, r *http.Request, req 
 	}
 	writeJSON(w, ApplyResponse{
 		Node: s.cfg.Node, AgentVersion: Version, ControllerVersion: req.ControllerVersion,
-		Generation: req.Generation, Phase: "prepare",
+		Generation: req.Generation, Phase: "prepare", UnprovenNamespaces: unproven,
 	})
 }
 
@@ -515,6 +519,10 @@ func (s *Server) commitAppliedTopology(ctx context.Context, top *model.Topology,
 	if err := s.finishCommittedGeneration(top.Name, fence, tx.Generation, inventory); err != nil {
 		return ApplyResponse{}, err
 	}
+	// Whatever this commit's own engine could not vouch for. The apply phase
+	// found most of it, and the controller merges the two rather than letting
+	// the later response overwrite the earlier one with silence.
+	attachUnprovenNamespaces(&resp, eng.UnprovenNamespaceDevices())
 	s.beginSemanticConvergenceGrace(top)
 	return resp, nil
 }

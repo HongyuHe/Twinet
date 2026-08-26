@@ -358,6 +358,25 @@ reached students, and each motivated a permanent test.
    that is exactly the device whose empty namespace was being captured over the
    addressing its replacement would have restored.
 
+   What a namespace holds, and who is told when it cannot be shown. The reading
+   above compared addresses, and a namespace holds more than those: a VLAN
+   sub-interface and a VRF master are objects in their own right, and a tunnel
+   and a bridge port are the whole of what the other two snapshots are, so a
+   switch whose ports had lost every VLAN and a router that came back without
+   its 6in4 tunnel were still blessed. All of them are compared now, in the
+   canonical form a capture writes, with routes excluded because a daemon churns
+   them; each extra reading is made only where there is saved state to compare
+   against, so no router is asked for bridge ports and no host for tunnels. A
+   snapshot that could not be *read* -- a body that does not match its digest, a
+   half-written pair of files -- also answered "nothing saved", which is the
+   condition under which an empty namespace proves continuous; only a snapshot
+   that was never taken counts as none now. And the refusal is finally visible:
+   the node publishes `unproven_namespaces` in its apply response and `twinet
+   deploy` prints a line per device and exits non-zero, because the devices are
+   running, the audit does not look at student-owned state, and a lab that has
+   quietly stopped being backed up is not something anybody can be expected to
+   infer.
+
 10. **A release gate that answered yes without looking.** `make ci` printed
     "all CI gates passed" while skipping the lint and the shell check whenever
     their tools were absent, which on the development machine was always.

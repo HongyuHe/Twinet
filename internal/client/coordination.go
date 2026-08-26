@@ -442,6 +442,23 @@ func CommittedResults(results []NodeResult[agent.ApplyResponse]) bool {
 	return failed
 }
 
+// mergeUnprovenNamespaces unions what two phases of one deployment could not
+// vouch for. A phase that did not observe a device says nothing about it, and
+// saying nothing is not the same as saying it is fine.
+func mergeUnprovenNamespaces(first, second map[string]string) map[string]string {
+	if len(first) == 0 && len(second) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(first)+len(second))
+	for id, reason := range first {
+		out[id] = reason
+	}
+	for id, reason := range second {
+		out[id] = reason
+	}
+	return out
+}
+
 func responseFailure(resp agent.ApplyResponse) error {
 	if len(resp.Failures) == 0 {
 		return nil
@@ -570,6 +587,11 @@ func (c *Cluster) coordinatedApplyWithLeaseTimed(ctx context.Context, top *model
 		return transactionFailure(nodes, nil, cause)
 	}
 
+	// A prepare's own UnprovenNamespaces is deliberately not carried forward.
+	// It observed the topology this deployment is replacing; the apply below
+	// observes the desired one, on the same node, moments later, and knows
+	// which of those devices it went on to rebuild and restore. Its answer
+	// supersedes rather than being merged with a staler, broader one.
 	values := map[string]agent.ApplyResponse{}
 	var (
 		wg       sync.WaitGroup
@@ -668,6 +690,13 @@ func (c *Cluster) coordinatedApplyWithLeaseTimed(ctx context.Context, top *model
 					applied.CrossLinkEndpoints, applied.WantCrossLinkEndpoints
 				resp.WantDevice, resp.WantLinks = applied.WantDevice, applied.WantLinks
 				resp.DurationMS = applied.DurationMS
+				// Merged, not replaced. The forward apply is the pass that
+				// observes every device; commit runs a narrower engine, so
+				// taking its answer alone would report a node with nothing
+				// unresolved on it purely because the later phase never
+				// looked.
+				resp.UnprovenNamespaces = mergeUnprovenNamespaces(
+					applied.UnprovenNamespaces, resp.UnprovenNamespaces)
 			}
 			values[nodeName] = resp
 		}

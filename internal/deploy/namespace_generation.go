@@ -2,7 +2,9 @@ package deploy
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -140,12 +142,17 @@ func (e *Engine) namespaceUnproven(id string) bool {
 // state is being withheld from the store and whose namespace is not being
 // recorded, which is a state an operator has to be able to see rather than
 // infer from a lab that quietly stops being backed up.
+//
+// A device this pass rebuilt from its image is not here even if something
+// earlier in the pass was in doubt about it, for the same reason it is not
+// withheld: the create path replays the store into the new namespace, so the
+// doubt was settled by the deployment rather than left for somebody to chase.
 func (e *Engine) UnprovenNamespaceDevices() map[string]string {
 	out := map[string]string{}
 	e.unprovenNamespace.Range(func(key, value any) bool {
 		id, idOK := key.(string)
 		reason, reasonOK := value.(string)
-		if idOK && reasonOK {
+		if idOK && reasonOK && !e.containerCreatedThisPass(id) {
 			out[id] = reason
 		}
 		return true
@@ -163,16 +170,35 @@ func (e *Engine) UnprovenNamespaceDevices() map[string]string {
 const namespaceContinuityProbe = "ip -o link show || exit $?\necho ---\n" + addrCapture
 
 // namespaceContents is one reading of a namespace: which netdevs are in it and
-// which typed address facts are on them.
+// which typed facts -- addresses, VLAN and VRF interfaces, tunnels, bridge
+// ports -- are on them.
 type namespaceContents struct {
 	links map[string]bool
-	addrs map[string]bool
+	facts map[string]bool
 }
 
-func parseNamespaceContents(raw string) namespaceContents {
-	out := namespaceContents{links: map[string]bool{}, addrs: map[string]bool{}}
-	linkLines, addrBody := splitNamespaceProbe(raw)
-	for _, line := range strings.Split(linkLines, "\n") {
+// namespaceReading names one exec a continuity proof makes: the kind of saved
+// state it is evidence about, and the shell that reads it.
+type namespaceReading struct {
+	kind state.Kind
+	cmd  string
+}
+
+// namespaceReadingName describes a reading in the words an operator would use
+// for the thing it failed to read.
+func namespaceReadingName(kind state.Kind) string {
+	switch kind {
+	case state.KindTunnels:
+		return "tunnels"
+	case state.KindOVS:
+		return "switch ports"
+	default:
+		return "network namespace"
+	}
+}
+
+func addNamespaceLinks(links map[string]bool, raw string) {
+	for _, line := range strings.Split(raw, "\n") {
 		fields := strings.Fields(strings.TrimSpace(line))
 		if len(fields) < 2 {
 			continue
@@ -180,13 +206,9 @@ func parseNamespaceContents(raw string) namespaceContents {
 		name := strings.TrimSuffix(fields[1], ":")
 		name, _, _ = strings.Cut(name, "@")
 		if name != "" {
-			out.links[name] = true
+			links[name] = true
 		}
 	}
-	for _, fact := range canonicalAddressFacts(addrBody) {
-		out.addrs[fact] = true
-	}
-	return out
 }
 
 func splitNamespaceProbe(raw string) (links, addrs string) {
@@ -199,18 +221,65 @@ func splitNamespaceProbe(raw string) (links, addrs string) {
 	return raw, ""
 }
 
-// canonicalAddressFacts reduces one addrCapture reading to its typed address
-// lines. Routes are deliberately left out: a routing daemon installs and
-// withdraws them constantly, and comparing them would make every busy router
-// look discontinuous.
-func canonicalAddressFacts(raw string) []string {
+// stableNamespaceFacts reduces one reading of a namespace-backed artefact to
+// the objects in it that are supposed to stay where they were put.
+//
+// Both sides of the comparison go through here, and through the same
+// canonicalisation a capture writes into the store, so a saved snapshot and a
+// live reading are compared as the same strings rather than as two spellings
+// of the same fact.
+//
+// What a namespace holds is more than addresses. A VLAN sub-interface and a
+// VRF master are objects in their own right -- they are captured in the
+// addresses snapshot precisely because the addressing depends on them -- and a
+// tunnel and a bridge port are the whole of what the other two snapshots are.
+// Comparing only the addresses meant a switch whose ports had lost every VLAN,
+// or a router that came back without its 6in4 tunnel, read as continuous and
+// had that emptiness recorded as the namespace its student had worked in.
+//
+// Routes are left out of every kind. A routing daemon installs and withdraws
+// them constantly, and requiring them would make every busy router look
+// discontinuous; the objects they are configured on are what this proves, and
+// a route cannot be present without the interface, address, or tunnel it runs
+// over.
+func stableNamespaceFacts(kind state.Kind, raw string) []string {
 	var out []string
-	for _, line := range strings.Split(CanonicalDynamicSnapshot(state.KindAddrs, raw), "\n") {
-		if strings.HasPrefix(line, "addr ") {
-			out = append(out, line)
+	for _, line := range strings.Split(CanonicalDynamicSnapshot(kind, raw), "\n") {
+		switch kind {
+		case state.KindAddrs:
+			if strings.HasPrefix(line, "addr ") || strings.HasPrefix(line, "link ") {
+				out = append(out, line)
+			}
+		case state.KindTunnels:
+			if strings.HasPrefix(line, "tunnel ") {
+				out = append(out, line)
+			}
+		case state.KindOVS:
+			if strings.HasPrefix(line, "port ") {
+				out = append(out, line)
+			}
 		}
 	}
 	return out
+}
+
+// namespaceObjectName describes a saved fact as the kind of object it is, so a
+// refusal names what is missing rather than printing a typed line at somebody.
+func namespaceObjectName(kind state.Kind, fact string) string {
+	switch {
+	case strings.HasPrefix(fact, "addr "):
+		return "address"
+	case strings.HasPrefix(fact, "link vlan "):
+		return "VLAN interface"
+	case strings.HasPrefix(fact, "link vrf "):
+		return "VRF interface"
+	case strings.HasPrefix(fact, "tunnel "):
+		return "tunnel"
+	case strings.HasPrefix(fact, "port "):
+		return "switch port"
+	default:
+		return string(kind) + " object"
+	}
 }
 
 // modelledNamespaceInterfaces names the netdevs the platform's own wiring puts
@@ -256,21 +325,57 @@ func modelledPlatformAddresses(d *model.Device) []string {
 	return out
 }
 
-// savedNamespaceAddresses names the addresses the state store says this device
-// had the last time anything read it.
+// savedNamespaceObjects names every stable object the state store says this
+// device's namespace held the last time anything read it.
 //
 // This is the evidence the model cannot supply. On a teaching deployment the
-// student's addressing is captured out of the kernel and kept here, and it is
-// the only description of what their namespace is supposed to contain.
-func (e *Engine) savedNamespaceAddresses(top *model.Topology, d *model.Device) []string {
-	if e.State == nil || top == nil || !studentOwned(top, d) {
-		return nil
+// student's addressing, VLANs, VRFs, tunnels and bridge ports are captured out
+// of the kernel and kept here, and this is the only description of what their
+// namespace is supposed to contain.
+//
+// Every namespace-backed kind is read, not the ones this device's kind is
+// captured for. What is in the store is what a restore would replay and what a
+// capture would overwrite, whatever the device is called now.
+func (e *Engine) savedNamespaceObjects(top *model.Topology, d *model.Device,
+) (map[state.Kind][]string, error) {
+	out := map[state.Kind][]string{}
+	if e.State == nil || top == nil || d == nil || !studentOwned(top, d) {
+		return out, nil
 	}
-	snapshot, err := e.State.Current(top.Name, d.ID, state.KindAddrs)
+	for _, kind := range namespaceBackedKinds {
+		facts, err := e.savedNamespaceFacts(top.Name, d.ID, kind)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", kind, err)
+		}
+		if len(facts) > 0 {
+			out[kind] = facts
+		}
+	}
+	return out, nil
+}
+
+// savedNamespaceFacts reads one saved snapshot, and distinguishes a device
+// that has never had one from a snapshot that could not be read.
+//
+// The two used to be the same answer. Every failure -- a body whose digest
+// does not match what was written beside it, a half-written file, a disk that
+// is refusing reads -- returned "nothing is saved", and nothing saved is
+// exactly the condition under which a namespace with nothing in it proves
+// continuous. So the one circumstance where the stored copy of a student's
+// work is already in question was the circumstance that let an empty namespace
+// be recorded as theirs and then captured over the top of it.
+//
+// A missing snapshot is a legitimate none: the device is new, or nobody has
+// configured anything on it yet. Anything else fails closed.
+func (e *Engine) savedNamespaceFacts(lab, device string, kind state.Kind) ([]string, error) {
+	snapshot, err := e.State.Current(lab, device, kind)
 	if err != nil {
-		return nil
+		if errors.Is(err, os.ErrNotExist) && !e.State.Has(lab, device, kind) {
+			return nil, nil
+		}
+		return nil, err
 	}
-	return canonicalAddressFacts(string(snapshot.Content))
+	return stableNamespaceFacts(kind, string(snapshot.Content)), nil
 }
 
 // provenNamespaceContinuity reports whether a device's current namespace can
@@ -285,35 +390,90 @@ func (e *Engine) savedNamespaceAddresses(top *model.Topology, d *model.Device) [
 func (e *Engine) provenNamespaceContinuity(ctx context.Context, top *model.Topology,
 	d *model.Device,
 ) (bool, string) {
-	result, err := e.Runtime.Exec(ctx, d.Container, runtime.ExecCmd{
-		Cmd: []string{"sh", "-c", namespaceContinuityProbe}})
+	saved, err := e.savedNamespaceObjects(top, d)
 	if err != nil {
-		return false, fmt.Sprintf("its network namespace could not be read: %v", err)
+		return false, fmt.Sprintf("its saved network state could not be read, so there is "+
+			"nothing trustworthy to compare its namespace against: %v", err)
 	}
-	if result.ExitCode != 0 {
-		return false, fmt.Sprintf("reading its network namespace exited %d", result.ExitCode)
+	have, reason := e.readNamespaceContents(ctx, d, saved)
+	if reason != "" {
+		return false, reason
 	}
-	have := parseNamespaceContents(result.Stdout)
 	for _, name := range modelledNamespaceInterfaces(d) {
 		if !have.links[name] {
 			return false, "the modelled interface " + name + " is not in it"
 		}
 	}
 	for _, want := range modelledPlatformAddresses(d) {
-		if !have.addrs[want] {
+		if !have.facts[want] {
 			return false, "the platform address it should carry is not in it (" + want + ")"
 		}
 	}
-	// The interfaces can be back without the work on them: a reconcile that
-	// rewired a restarted device rebuilds bare veths, and a namespace with
-	// every cable in it and none of the student's addresses is exactly what
-	// this must not bless.
-	for _, want := range e.savedNamespaceAddresses(top, d) {
-		if !have.addrs[want] {
-			return false, "the saved address it was last seen with is not in it (" + want + ")"
+	// The student's own state, from the store rather than from the model. A
+	// namespace that has the platform's wiring in it but not this has been
+	// rewired since the work was done, which is exactly what a restart
+	// followed by a reconcile looks like: bare veths back, and nothing on
+	// them.
+	for _, kind := range namespaceBackedKinds {
+		for _, want := range saved[kind] {
+			if !have.facts[want] {
+				return false, "the saved " + namespaceObjectName(kind, want) +
+					" it was last seen with is not in it (" + want + ")"
+			}
 		}
 	}
 	return true, ""
+}
+
+// readNamespaceContents reads a device's namespace once for its netdevs and
+// addressing, and again for each further kind of state there is something
+// saved to compare against.
+//
+// Reading only what there is evidence about keeps the common device at one
+// round trip, and keeps the proof from depending on commands an image need not
+// have: a router with no tunnels is never asked for them, and nothing but a
+// switch is ever asked for bridge ports. A device holding saved state its own
+// kind is never read for is not quietly excused it -- the command is still not
+// run, and the mismatch is reported as what it is.
+func (e *Engine) readNamespaceContents(ctx context.Context, d *model.Device,
+	saved map[state.Kind][]string,
+) (namespaceContents, string) {
+	have := namespaceContents{links: map[string]bool{}, facts: map[string]bool{}}
+	readings := []namespaceReading{{kind: state.KindAddrs, cmd: namespaceContinuityProbe}}
+	if len(saved[state.KindTunnels]) > 0 {
+		if d.Kind != model.KindRouter {
+			return have, "it has saved tunnels, which only a router's namespace is read for"
+		}
+		readings = append(readings, namespaceReading{kind: state.KindTunnels, cmd: tunnelCapture})
+	}
+	if len(saved[state.KindOVS]) > 0 {
+		if d.Kind != model.KindSwitch {
+			return have, "it has saved switch ports, which only a switch's namespace is read for"
+		}
+		readings = append(readings, namespaceReading{kind: state.KindOVS, cmd: switchCapture})
+	}
+	for _, reading := range readings {
+		result, err := e.Runtime.Exec(ctx, d.Container, runtime.ExecCmd{
+			Cmd: []string{"sh", "-c", reading.cmd}})
+		if err != nil {
+			return have, fmt.Sprintf("its %s could not be read: %v",
+				namespaceReadingName(reading.kind), err)
+		}
+		if result.ExitCode != 0 {
+			return have, fmt.Sprintf("reading its %s exited %d",
+				namespaceReadingName(reading.kind), result.ExitCode)
+		}
+		body := result.Stdout
+		if reading.kind == state.KindAddrs {
+			var links string
+			links, body = splitNamespaceProbe(body)
+			addNamespaceLinks(have.links, links)
+		}
+		for _, fact := range stableNamespaceFacts(reading.kind, body) {
+			have.facts[fact] = true
+		}
+	}
+	return have, ""
 }
 
 // settleNamespaceBaselines gives a recorded namespace to every device whose
@@ -516,6 +676,14 @@ func (e *Engine) recordDeviceNamespace(ctx context.Context, tracker *observation
 	return fmt.Errorf("record the network namespace %s was configured in: %w", d.ID, last)
 }
 
+// namespaceBackedKinds are the snapshots that record what is in a network
+// namespace rather than what is on a filesystem.
+//
+// One list, used by both halves of the rule: these are the snapshots withheld
+// from the store when a device's namespace is in doubt, and these are the
+// snapshots a namespace has to be shown to still hold before it is trusted.
+var namespaceBackedKinds = []state.Kind{state.KindAddrs, state.KindTunnels, state.KindOVS}
+
 // namespaceBackedKind reports whether a snapshot records what is in a network
 // namespace rather than what is on a filesystem.
 //
@@ -525,12 +693,12 @@ func (e *Engine) recordDeviceNamespace(ctx context.Context, tracker *observation
 // that emptiness to the store as the current snapshot destroys the only copy
 // of the work that is meant to be replayed back on top.
 func namespaceBackedKind(kind state.Kind) bool {
-	switch kind {
-	case state.KindAddrs, state.KindTunnels, state.KindOVS:
-		return true
-	default:
-		return false
+	for _, backed := range namespaceBackedKinds {
+		if kind == backed {
+			return true
+		}
 	}
+	return false
 }
 
 // storableSnapshots drops the namespace-backed snapshots of a device whose

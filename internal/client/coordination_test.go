@@ -37,6 +37,10 @@ type coordinationStub struct {
 	staleRecovery bool
 	// failApply breaks a stage that runs before any node commits.
 	failApply bool
+	// unproven is what this node's forward apply reports it could not vouch
+	// for. Its commit deliberately says nothing, which is what a real one
+	// does: commit runs a narrower engine that never observed those devices.
+	unproven map[string]string
 }
 
 func newCoordinationStub(name string, order *[]string) *coordinationStub {
@@ -223,6 +227,13 @@ func (s *coordinationStub) handler(w http.ResponseWriter, r *http.Request) {
 			}
 			s.applied = append([]string(nil), req.AssignedDevices...)
 			s.applyCalls++
+			unproven := s.unproven
+			s.mu.Unlock()
+			write(agent.ApplyResponse{
+				Node: s.name, Generation: req.Generation, Phase: req.Phase,
+				UnprovenNamespaces: unproven,
+			})
+			return
 		case "commit":
 			s.generations[req.Lab] = req.Generation
 			started, release := s.commitStarted, s.releaseCommit

@@ -544,7 +544,28 @@ first restart would be invisible for ever. An apply therefore records the
 namespace of every device whose namespace it can read and show to be *continuous*
 with what the device is supposed to hold: every interface the platform's own
 wiring put there is present, every address the platform renders onto them is on
-them, and every address the state store last saved for the device is still there.
+them, and every stable object the state store last saved for the device is still
+there. That last part is more than addresses. A VLAN sub-interface and a VRF
+master are namespace objects in their own right — they are captured alongside the
+addressing precisely because the addressing depends on them — and a tunnel and a
+bridge port are the whole of what the other two snapshots are, so a switch whose
+ports had lost every VLAN and a router that came back without its 6in4 tunnel are
+refused as well. Routes are deliberately excluded: a routing daemon installs and
+withdraws them constantly, and a route cannot exist without the interface,
+address, or tunnel it runs over. Each further reading is made only when there is
+something saved to compare it against and only on the kind of device it belongs
+to, so no router is asked for its bridge ports and no host is asked for its
+tunnels.
+
+A snapshot that cannot be *read* is not a device with nothing saved. A body
+whose digest does not match what was recorded beside it, a half-written pair of
+files, a disk that is refusing reads — every one of those used to answer "no
+saved state", which is the condition under which an empty namespace proves
+continuous, so the one circumstance where the stored copy of a student's work is
+already in question was the circumstance that let an empty namespace be recorded
+as theirs. Only a snapshot that has genuinely never been taken counts as none;
+anything else refuses.
+
 Passing a semantic probe is deliberately **not** enough on its own. In platform
 mode that probe skips every interface a student owns — the model carries their
 addresses so grading and `--solve` agree about the answer, not because the
@@ -568,6 +589,27 @@ and that is exactly the device about to be captured and destroyed. The one
 exemption is a container this pass rebuilt from its image and replayed the store
 into, where the namespace is new and its contents are known because the
 deployment just put them there.
+
+Every device left in that state is reported. The node publishes them in its
+apply response as `unproven_namespaces`, keyed by device with the reason for
+each, and `twinet deploy` prints one `UNPROVEN NAMESPACE:` line per device and
+exits non-zero:
+
+```
+  UNPROVEN NAMESPACE: node-1/as3/ATL: the saved address it was last seen with is not in it (addr inet lo 3.156.0.1/24)
+```
+
+This is a failure of the command rather than a note in the output, because
+nothing else in a deployment's summary shows it. The devices are running, the
+inventory matches, and the audited health that would otherwise raise the alarm
+does not look at student-owned state at all — so a lab can quietly stop being
+backed up while every other number says it is fine. Look at each device: if its
+namespace is empty because it restarted, replay the stored snapshot with
+`twinet restore`; if what is in the namespace is the work and the snapshot is
+stale, capture it deliberately; if the deployment was repairing that device,
+re-run it once the device has converged and it will be baselined on the next
+pass. A dry run prints the same lines without failing, since it changed
+nothing.
 
 If a cluster mutation was interrupted — a controller killed halfway, a node
 rebooted mid-apply — the transaction is persisted and resumable:
