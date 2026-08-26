@@ -17,9 +17,10 @@ type ReconcileRequest struct {
 	// Overlay repairs missing VNI/VLAN bindings without recreating endpoint
 	// containers. It is implicit when all local devices are reconciled.
 	Overlay bool `json:"overlay,omitempty"`
-	// Force clears only automatic-repair backoff before queuing the selected
-	// check. It never bypasses a hold, fault exemption, recovery fence, or
-	// authorization policy.
+	// Force clears automatic-repair backoff, including a terminal state a
+	// bounded distributed repair has already given up on, before queuing the
+	// selected check. It never bypasses a hold, fault exemption, recovery
+	// fence, or authorization policy.
 	Force bool `json:"force,omitempty"`
 }
 

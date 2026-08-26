@@ -122,7 +122,8 @@ func boundedEventAction(value string) string {
 
 func boundedRepairResult(value string) string {
 	switch value {
-	case "scheduled", "success", "failed", "backoff", "unknown", "held", "exempt":
+	case "scheduled", "success", "failed", "backoff", "unknown", "held", "exempt",
+		"terminal", "binding":
 		return value
 	default:
 		return "other"
@@ -508,10 +509,9 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 			reservations++
 		}
 	}
-	convergence := map[string]int{}
-	for _, observation := range s.health {
-		convergence[string(observation.Health)]++
-	}
+	convergence := convergenceCounts(
+		semanticHealthLocked(s.health, s.repairTerminal, s.current, s.cfg.Node, ""))
+	terminal := len(s.repairTerminal)
 	s.mu.Unlock()
 	writeMetricHeader(&b, "twinet_labs", "Current agent lab state.", "gauge")
 	writeMetricLine(&b, "twinet_labs", []string{metricLabel("state", "active")}, strconv.Itoa(activeLabs))
@@ -524,6 +524,9 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		writeMetricLine(&b, "twinet_convergence_devices", []string{metricLabel("state", state)},
 			strconv.Itoa(convergence[state]))
 	}
+	writeMetricHeader(&b, "twinet_semantic_repair_terminal",
+		"Devices whose bounded distributed semantic repair was abandoned and alerted.", "gauge")
+	writeMetricLine(&b, "twinet_semantic_repair_terminal", nil, strconv.Itoa(terminal))
 
 	writeMetricHeader(&b, "twinet_metrics_scrape_duration_seconds",
 		"Time spent collecting the bounded agent metrics snapshot.", "gauge")

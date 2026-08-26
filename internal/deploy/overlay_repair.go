@@ -23,6 +23,33 @@ type OverlayRepairReport struct {
 // bindings for live cross-node endpoints. It never creates/replaces a
 // container or deletes an extra binding.
 func (e *Engine) ReconcileOverlayBindings(ctx context.Context, top *model.Topology) (OverlayRepairReport, error) {
+	return e.reconcileOverlayBindings(ctx, top, nil)
+}
+
+// ReconcileDeviceOverlayBindings restores the cross-node bindings of the links
+// that terminate on one device.
+//
+// It exists so that automatic repair of a single device does not have to ask
+// for a node-wide overlay pass, and so that the answer to "this router lost
+// its IXP interface" is the one veth and the one VNI binding it is missing.
+// Extras are not reported: a device-scoped caller has not looked at the rest
+// of the node and must not be able to make a claim about it.
+func (e *Engine) ReconcileDeviceOverlayBindings(ctx context.Context, top *model.Topology,
+	device *model.Device,
+) (OverlayRepairReport, error) {
+	if top == nil || device == nil {
+		return OverlayRepairReport{}, fmt.Errorf("device overlay repair needs a topology device")
+	}
+	report, err := e.reconcileOverlayBindings(ctx, top, func(link *model.Link) bool {
+		return link.A.Device.ID == device.ID || link.B.Device.ID == device.ID
+	})
+	report.Extra = nil
+	return report, err
+}
+
+func (e *Engine) reconcileOverlayBindings(ctx context.Context, top *model.Topology,
+	want func(*model.Link) bool,
+) (OverlayRepairReport, error) {
 	report := OverlayRepairReport{Failed: map[string]string{}}
 	if e.Runtime == nil {
 		return report, fmt.Errorf("overlay binding repair needs a container runtime")
@@ -31,7 +58,7 @@ func (e *Engine) ReconcileOverlayBindings(ctx context.Context, top *model.Topolo
 	if err != nil {
 		return report, err
 	}
-	actual, err := netx.InspectOverlayInventory(top.Name)
+	actual, err := e.observedOverlayInventory(top.Name)
 	if err != nil {
 		return report, err
 	}
@@ -47,6 +74,9 @@ func (e *Engine) ReconcileOverlayBindings(ctx context.Context, top *model.Topolo
 	for _, link := range top.Links {
 		if link != nil && link.CrossNode() && link.VNI != 0 &&
 			(link.A.Device.Node == e.Node || link.B.Device.Node == e.Node) {
+			if want != nil && !want(link) {
+				continue
+			}
 			links[link.VNI] = link
 		}
 	}
@@ -54,22 +84,27 @@ func (e *Engine) ReconcileOverlayBindings(ctx context.Context, top *model.Topolo
 	for vni := range links {
 		hostPortNames = append(hostPortNames, hostSideName(vni))
 	}
-	hostPorts, err := netx.HostLinksPresent(hostPortNames)
+	hostPorts, err := e.hostLinksPresent(hostPortNames)
 	if err != nil {
 		return report, err
 	}
-	for vni := range actualByVNI {
-		if _, wanted := expectedByVNI[vni]; !wanted {
-			report.Extra = append(report.Extra, bindingID(vni))
+	if want == nil {
+		for vni := range actualByVNI {
+			if _, wanted := expectedByVNI[vni]; !wanted {
+				report.Extra = append(report.Extra, bindingID(vni))
+			}
 		}
 	}
 	for _, binding := range expected.Bindings {
-		actualBindings := actualByVNI[binding.VNI]
 		link := links[binding.VNI]
 		if link == nil {
+			if want != nil {
+				continue
+			}
 			report.Failed[bindingID(binding.VNI)] = "topology has no local link for expected binding"
 			continue
 		}
+		actualBindings := actualByVNI[binding.VNI]
 		if overlayEndpointHealthy(binding, actualBindings, hostPorts[hostSideName(binding.VNI)]) {
 			continue
 		}
@@ -85,6 +120,21 @@ func (e *Engine) ReconcileOverlayBindings(ctx context.Context, top *model.Topolo
 		report.Failed = nil
 	}
 	return report, nil
+}
+
+func (e *Engine) hostLinksPresent(names []string) (map[string]bool, error) {
+	if e.hostLinkPresence != nil {
+		return e.hostLinkPresence(names)
+	}
+	return netx.HostLinksPresent(names)
+}
+
+func (e *Engine) hostLinkPresent(name string) (bool, error) {
+	if e.hostLinkPresence != nil {
+		present, err := e.hostLinkPresence([]string{name})
+		return present[name], err
+	}
+	return netx.HostLinkPresent(name)
 }
 
 func (e *Engine) reconcileOverlayLink(ctx context.Context, top *model.Topology, link *model.Link) error {
@@ -111,7 +161,7 @@ func (e *Engine) reconcileOverlayLink(ctx context.Context, top *model.Topology, 
 		return fmt.Errorf("endpoint %s namespace: %w", local.Device.ID, err)
 	}
 	hostPort := hostSideName(link.VNI)
-	present, err := netx.HostLinkPresent(hostPort)
+	present, err := e.hostLinkPresent(hostPort)
 	if err != nil {
 		return err
 	}

@@ -386,6 +386,10 @@ func ensureMultiplexPair(h *netlink.Handle, k pairKey, spec MultiplexOverlaySpec
 	// still mandatory: controller retries and a local CLI can be separate
 	// processes sharing the same kernel namespace.
 	last := ""
+	// One node pair carries every cross-node link between those two nodes, so
+	// a trunk this loop has to replace is holding other links' bindings. They
+	// are recorded before the delete and reinstalled on the replacement.
+	var carried []carriedBinding
 	for retry := 0; retry < 16; retry++ {
 		bridgeName, vxlanName, _, _, err := multiplexPairCandidate(h, k, alias)
 		if err != nil {
@@ -451,6 +455,17 @@ func ensureMultiplexPair(h *netlink.Handle, k pairKey, spec MultiplexOverlaySpec
 					// The legacy standard-port trunk is otherwise identical and
 					// may continue through the ordinary binding reconciliation.
 				} else {
+					// Everything this trunk is carrying belongs to links the
+					// caller is not repairing. Deleting the device drops every
+					// FDB entry and VLAN-to-VNI mapping on it at once, which
+					// turned one link's repair into the loss of every
+					// cross-node binding this node pair had. Record them
+					// first; they are reinstalled on the replacement below.
+					existing, err := carriedBindings(h, vx)
+					if err != nil {
+						return nil, nil, err
+					}
+					carried = mergeCarriedBindings(carried, existing)
 					if err := h.LinkDel(vx); err != nil && !IsNotFound(err) {
 						return nil, nil, fmt.Errorf("replace inactive multiplex VXLAN %s: %w", vxlanName, err)
 					}
@@ -485,6 +500,13 @@ func ensureMultiplexPair(h *netlink.Handle, k pairKey, spec MultiplexOverlaySpec
 			}
 		}
 		if err := multiplexCreatedStep("trunk-ready"); err != nil {
+			return nil, nil, err
+		}
+		// The replacement carries the pair again before the caller installs
+		// its own binding, so a repair that had to move the receive socket
+		// converges the whole pair instead of stranding the links it never
+		// looked at.
+		if err := restoreCarriedBindings(h, vx, carried, spec.VNI); err != nil {
 			return nil, nil, err
 		}
 		return br, vx, nil
@@ -1148,6 +1170,109 @@ func ensureVNIForwarding(vx *netlink.Vxlan, vni uint32, remote net.IP) error {
 type externalFDBEntry struct {
 	netlink.Neigh
 	SourceVNI uint32
+}
+
+// carriedBinding is one VLAN/VNI/peer mapping a shared trunk was carrying.
+//
+// A node pair has exactly one trunk, so its bindings belong to every
+// cross-node link between those two nodes. Replacing the device -- which is
+// the only way to move a receive socket a peer has already moved -- destroys
+// all of them, and the caller only knows about the one link it is repairing.
+type carriedBinding struct {
+	VNI  uint32
+	VLAN uint16
+	Peer net.IP
+}
+
+// carriedBindings records what a trunk is carrying, immediately before it is
+// replaced. An unreadable FDB or VLAN mapping is an error rather than an
+// empty result: proceeding would delete bindings nobody could put back.
+func carriedBindings(h *netlink.Handle, vx *netlink.Vxlan) ([]carriedBinding, error) {
+	entries, err := listExternalFDB(vx)
+	if err != nil {
+		return nil, fmt.Errorf("multiplex VXLAN %s: list forwarding entries before replacement: %w",
+			vx.Attrs().Name, err)
+	}
+	tunnels, err := h.BridgeVlanTunnelShow()
+	if err != nil {
+		return nil, fmt.Errorf("multiplex VXLAN %s: list VLAN tunnel mappings before replacement: %w",
+			vx.Attrs().Name, err)
+	}
+	vlanFor := make(map[uint32]uint16, len(tunnels))
+	for _, tunnel := range tunnels {
+		vlanFor[tunnel.TunId] = tunnel.Vid
+	}
+	return carriedBindingsFrom(entries, vlanFor), nil
+}
+
+// carriedBindingsFrom is the pure half of the snapshot: it keeps the
+// zero-MAC, source-VNI forwarding entries that represent a logical link and
+// pairs each with the bridge VLAN currently mapped to it.
+func carriedBindingsFrom(entries []externalFDBEntry, vlanFor map[uint32]uint16) []carriedBinding {
+	seen := map[uint32]bool{}
+	var out []carriedBinding
+	for _, entry := range entries {
+		if entry.SourceVNI == 0 || entry.IP == nil || !isZeroMAC(entry.HardwareAddr) {
+			continue
+		}
+		vlan, mapped := vlanFor[entry.SourceVNI]
+		if !mapped || vlan == 0 || seen[entry.SourceVNI] {
+			continue
+		}
+		seen[entry.SourceVNI] = true
+		peer := make(net.IP, len(entry.IP))
+		copy(peer, entry.IP)
+		out = append(out, carriedBinding{VNI: entry.SourceVNI, VLAN: vlan, Peer: peer})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].VNI < out[j].VNI })
+	return out
+}
+
+// mergeCarriedBindings keeps the earliest observation of each VNI. A retry
+// that has already replaced the device would otherwise overwrite the true
+// pre-replacement state with the empty FDB of the object it just created.
+func mergeCarriedBindings(existing, observed []carriedBinding) []carriedBinding {
+	known := make(map[uint32]bool, len(existing))
+	for _, binding := range existing {
+		known[binding.VNI] = true
+	}
+	out := append([]carriedBinding(nil), existing...)
+	for _, binding := range observed {
+		if known[binding.VNI] {
+			continue
+		}
+		known[binding.VNI] = true
+		out = append(out, binding)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].VNI < out[j].VNI })
+	return out
+}
+
+// restoreCarriedBindings reinstalls the recorded bindings on a replacement
+// trunk. The VNI the caller is about to install is skipped: its VLAN comes
+// from the current topology, which may deliberately differ from the mapping
+// the replaced device held.
+func restoreCarriedBindings(h *netlink.Handle, vx *netlink.Vxlan, carried []carriedBinding,
+	skip uint32,
+) error {
+	for _, binding := range carriedBindingsToRestore(carried, skip) {
+		if err := ensureMultiplexBinding(h, vx, binding.VLAN, binding.VNI, binding.Peer); err != nil {
+			return fmt.Errorf("restore VNI %d on replacement multiplex VXLAN %s: %w",
+				binding.VNI, vx.Attrs().Name, err)
+		}
+	}
+	return nil
+}
+
+func carriedBindingsToRestore(carried []carriedBinding, skip uint32) []carriedBinding {
+	out := make([]carriedBinding, 0, len(carried))
+	for _, binding := range carried {
+		if binding.VNI == skip {
+			continue
+		}
+		out = append(out, binding)
+	}
+	return out
 }
 
 func listExternalFDB(vx *netlink.Vxlan) ([]externalFDBEntry, error) {

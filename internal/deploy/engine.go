@@ -209,6 +209,7 @@ type Engine struct {
 	convergenceGateLimit    int
 	removeEmptyMultiplex    func(string) ([]string, error)
 	inspectOverlayInventory func(string) (netx.OverlayInventory, error)
+	hostLinkPresence        func([]string) (map[string]bool, error)
 }
 
 func (e *Engine) limited(ctx context.Context, kinds []limiter.Kind, fn func() error) error {

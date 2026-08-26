@@ -37,6 +37,11 @@ type PlanResponse struct {
 	Noop            bool                   `json:"noop"`
 	Stats           deploy.DeploymentStats `json:"stats"`
 	Reason          string                 `json:"reason,omitempty"`
+	// SemanticHealth is this node's audited convergence state for the lab.
+	// It is the same evidence `node status` publishes, carried here so that a
+	// controller cannot accept a zero-change deployment against a node that
+	// is simultaneously reporting drifted devices.
+	SemanticHealth SemanticHealth `json:"semantic_health"`
 }
 
 type PlanVerifyRequest struct {
@@ -82,7 +87,7 @@ func (s *Server) handlePlan(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 	resp := PlanResponse{
 		Node: s.cfg.Node, Generation: committed, FenceGeneration: fenceGeneration,
-		Hash: top.Hash, Mode: mode,
+		Hash: top.Hash, Mode: mode, SemanticHealth: s.labSemanticHealth(req.Lab),
 	}
 	if current == nil || current.Hash != top.Hash {
 		resp.Reason = "committed topology hash differs"
@@ -114,7 +119,15 @@ func (s *Server) handlePlan(w http.ResponseWriter, r *http.Request) {
 		RequireImmutableImages: top.Lab.Images.RequiresImmutableImages(),
 		ObservationReadOnly:    true,
 		SemanticProbe: func(ctx context.Context, device *model.Device) error {
-			return s.semanticProbe(ctx, top, render.Mode(mode), req.Ungraded, device)
+			if err := s.semanticProbe(ctx, top, render.Mode(mode), req.Ungraded, device); err != nil {
+				return err
+			}
+			// The audit sees what a rendered-hash diff cannot: a container
+			// with no interfaces, a router with no routing daemons, a dead
+			// FRR sidecar. A preflight that ignored it answered "no changes"
+			// for a lab whose own node was publishing a hundred drifted
+			// devices at the same moment.
+			return auditedDriftError(s.auditedDriftReason(ctx, req.Lab, device))
 		},
 	}
 	plan, err := eng.BuildContext(r.Context(), top)
@@ -123,8 +136,18 @@ func (s *Server) handlePlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp.Stats = eng.DeploymentStats(nil)
+	// The plan is re-read after the probes above, which refresh the audited
+	// observations they consult.
+	resp.SemanticHealth = s.labSemanticHealth(req.Lab)
 	resp.Noop = plan.Len() == 0 && eng.LastBuildDiff().Empty()
-	if resp.Noop {
+	// Zero work and degraded health are mutually exclusive answers, and the
+	// health is the more useful of the two: it names the device an operator
+	// has to look at. The deployment falls through to the ordinary fenced
+	// path, which can repair what the preflight refused to ignore.
+	if reason := noopRefusalReason(resp.SemanticHealth); reason != "" {
+		resp.Noop = false
+		resp.Reason = reason
+	} else if resp.Noop {
 		resp.Token = planToken(committed, fenceGeneration, top.Hash, mode, req.Ungraded)
 	} else {
 		resp.Reason = "desired/observed dirty set is non-empty"

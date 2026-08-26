@@ -49,12 +49,6 @@ type deviceObservation struct {
 	SpecMatches bool
 }
 
-func (s *Server) semanticRepairAttempted(lab, id string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.repairFails[repairKey(lab, id)] >= repairAttemptsBeforeGivingUp
-}
-
 // reconcileLoop repairs devices that have lost their wiring.
 //
 // A container that restarts -- because someone typed `docker restart`, because
@@ -593,17 +587,7 @@ func (s *Server) repairLab(ctx context.Context, top *model.Topology, broken []*m
 	mode := s.modes[top.Name]
 	ungraded := s.ungraded[top.Name]
 	s.mu.Unlock()
-	eng := &deploy.Engine{
-		Runtime: s.rt, Node: s.cfg.Node, State: s.store,
-		Limiter:               s.workLimiter(),
-		Renderer:              renderer(top, render.Mode(mode), ungraded),
-		WritesReference:       render.Mode(mode) == render.ModeSolve,
-		UnderlayIP:            s.cfg.UnderlayIP,
-		UnderlayDev:           s.cfg.UnderlayDev,
-		PeerUnderlay:          s.peerUnderlay(top.Name),
-		ModeKey:               rendererModeKey(render.Mode(mode), ungraded),
-		ForceOverlayReconcile: true,
-	}
+	eng := s.autoRepairEngine(top)
 	for _, d := range broken {
 		if reason := s.ordinaryMaintenanceSuppression(top.Name); reason != "" {
 			s.metricRegistry().observeRepair("recovery")
@@ -624,33 +608,29 @@ func (s *Server) repairLab(ctx context.Context, top *model.Topology, broken []*m
 			continue
 		}
 		if isSemanticOnlyDrift(observation.Reason) {
-			if !s.semanticRepairAttempted(top.Name, d.ID) || forceSemanticRepair(ctx) {
-				semanticCtx, cancel := context.WithTimeout(ctx, semanticRepairTimeout)
-				// Local interface loss is classified before semantic drift.
-				// A missing remote route with intact local wiring can only be
-				// repaired here by reapplying this device's configuration.
-				// Rewiring every healthy router for one remote withdrawal
-				// amplifies a single fault into cluster-wide netlink churn.
-				err := eng.ReconfigureDevice(semanticCtx, d)
-				if err == nil {
-					err = s.confirmDaemonRepair(semanticCtx, top, d)
-				}
-				cancel()
-				if err == nil {
-					s.repairSucceeded(top.Name, d.ID)
-					s.metricRegistry().observeRepair("success")
-					s.recordEvent(top.Name, "", "reconcile", "", "semantic_repair", "success", d.ID)
-					continue
-				}
-				s.recordEvent(top.Name, "", "reconcile", "", "semantic_repair", "error",
-					d.ID+": "+err.Error())
+			if reason := s.semanticRepairTerminalReason(top.Name, d.ID); reason != "" && !forceSemanticRepair(ctx) {
+				// Terminal is terminal. The device has had its bounded cycle
+				// of local repairs, the drift outlived every one of them, and
+				// the node has already said so loudly. Retrying for ever
+				// would keep a fault that needs a human looking like work in
+				// progress.
+				s.metricRegistry().observeRepair("terminal")
+				s.recordEvent(top.Name, "", "reconcile", "", "semantic_repair_terminal", "error",
+					d.ID+": "+reason)
+				continue
 			}
-			s.deferSemanticRepair(top.Name, d.ID, observation.Reason)
-			s.recordEvent(top.Name, "", "reconcile", "", "semantic_repair_deferred", "backoff",
-				d.ID+": "+observation.Reason)
-			// Reconfiguring a device whose local state is already healthy
-			// cannot create a missing remote route. Leave the lab idle, report
-			// the precise degraded reason, and wait for the remote repair.
+			semanticCtx, cancel := context.WithTimeout(ctx, semanticRepairTimeout)
+			repairErr := s.repairSemanticDrift(semanticCtx, eng, top, d, observation)
+			cancel()
+			if repairErr == nil {
+				s.repairSucceeded(top.Name, d.ID)
+				s.metricRegistry().observeRepair("success")
+				s.recordEvent(top.Name, "", "reconcile", "", "semantic_repair", "success", d.ID)
+				continue
+			}
+			s.recordEvent(top.Name, "", "reconcile", "", "semantic_repair", "error",
+				d.ID+": "+repairErr.Error())
+			s.deferSemanticRepair(top.Name, d.ID, repairErr.Error())
 			continue
 		}
 		class := deviceChangeClass(observation)
@@ -791,6 +771,156 @@ func (s *Server) repairLab(ctx context.Context, top *model.Topology, broken []*m
 	}
 }
 
+// repairSemanticDrift performs one bounded local repair cycle for a device
+// whose containers and cables are present but whose network semantics are not
+// what the topology says they should be.
+//
+// The steps escalate and every one of them is scoped to this device: restore
+// the cross-node bindings its own links need, reapply its rendered
+// configuration, and -- only for drift this node provably owns -- rewire the
+// device itself. Nothing here may replace a shared trunk or touch a device
+// that was not reported broken, because the fault this exists to repair was
+// caused by exactly that: a single endpoint's repair deleting the bindings of
+// every other link on the same node pair.
+//
+// It returns nil only after re-observing the device as healthy, so a repair
+// can never report success against evidence it did not check.
+func (s *Server) repairSemanticDrift(ctx context.Context, eng *deploy.Engine,
+	top *model.Topology, d *model.Device, observation deviceObservation,
+) error {
+	if err := s.restoreDeviceOverlayBindings(ctx, eng, top, d); err != nil {
+		return err
+	}
+	if err := eng.ReconfigureDevice(ctx, d); err != nil {
+		return err
+	}
+	if err := s.confirmDaemonRepair(ctx, top, d); err != nil {
+		return err
+	}
+	after := s.observeDevice(ctx, top.Name, d, false)
+	s.rememberHealth(top.Name, d.ID, after)
+	if after.Health == healthHealthy {
+		return nil
+	}
+	if !isSemanticOnlyDrift(after.Reason) || !locallyRepairableDrift(after.Reason) {
+		// A missing remote prefix cannot be created from here. Report the
+		// precise reason and let the bounded cycle decide whether the lab is
+		// still converging or has to be escalated to an operator.
+		return errors.New(semanticDriftReason(after, observation))
+	}
+	// A missing address or interface is a local fact this node owns, so it is
+	// worth one bounded rewire of this device -- and only this device.
+	if err := eng.RewireDevice(ctx, top, d); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	mode, ungraded := s.modes[top.Name], s.ungraded[top.Name]
+	s.mu.Unlock()
+	// Rewiring re-renders the platform's own files. Anything a student wrote
+	// comes back from the snapshot store, exactly as the lifecycle repair
+	// path does it, and never over a lab deployed at the reference.
+	if renderModeForDevice(render.Mode(mode), ungraded, d) != render.ModeSolve {
+		if _, err := deploy.Restore(ctx, s.rt, d, top.Name, s.store); err != nil {
+			return fmt.Errorf("configuration could not be put back after rewiring %s: %w", d.ID, err)
+		}
+	}
+	final := s.observeDevice(ctx, top.Name, d, false)
+	s.rememberHealth(top.Name, d.ID, final)
+	if final.Health == healthHealthy {
+		return nil
+	}
+	return errors.New(semanticDriftReason(final, observation))
+}
+
+func semanticDriftReason(after, observation deviceObservation) string {
+	if after.Reason != "" {
+		return after.Reason
+	}
+	if observation.Reason != "" {
+		return observation.Reason
+	}
+	return string(after.Health)
+}
+
+// restoreDeviceOverlayBindings puts back the VNI bindings and host-side ports
+// of this device's cross-node links. It is idempotent, reports nothing for a
+// device whose links are all local, and never removes a binding it did not
+// expect: an extra one belongs to somebody else until ownership proves
+// otherwise.
+func (s *Server) restoreDeviceOverlayBindings(ctx context.Context, eng *deploy.Engine,
+	top *model.Topology, d *model.Device,
+) error {
+	if !deviceHasCrossNodeLink(top, d, s.cfg.Node) {
+		return nil
+	}
+	repair := s.overlayBindingRepair
+	if repair == nil {
+		repair = eng.ReconcileDeviceOverlayBindings
+	}
+	report, err := repair(ctx, top, d)
+	if err != nil {
+		return fmt.Errorf("restore cross-node bindings of %s: %w", d.ID, err)
+	}
+	if len(report.Failed) > 0 {
+		return fmt.Errorf("restore cross-node bindings of %s: %s", d.ID,
+			joinBindingFailures(report.Failed))
+	}
+	if len(report.Repaired) > 0 {
+		s.metricRegistry().observeRepair("binding")
+		s.recordEvent(top.Name, "", "reconcile", "", "overlay_binding_repair", "success",
+			d.ID+": "+strings.Join(report.Repaired, ","))
+		slog.Info("cross-node bindings restored", "lab", top.Name, "device", d.ID,
+			"bindings", strings.Join(report.Repaired, ","))
+	}
+	return nil
+}
+
+func joinBindingFailures(failed map[string]string) string {
+	out := make([]string, 0, len(failed))
+	for binding, reason := range failed {
+		out = append(out, binding+": "+reason)
+	}
+	sort.Strings(out)
+	return strings.Join(out, "; ")
+}
+
+func deviceHasCrossNodeLink(top *model.Topology, d *model.Device, node string) bool {
+	if top == nil || d == nil {
+		return false
+	}
+	for _, link := range top.Links {
+		if link == nil || !link.CrossNode() || link.VNI == 0 {
+			continue
+		}
+		if link.A.Device.ID != d.ID && link.B.Device.ID != d.ID {
+			continue
+		}
+		if link.A.Device.Node == node || link.B.Device.Node == node {
+			return true
+		}
+	}
+	return false
+}
+
+// locallyRepairableDrift names the semantic failures whose evidence and whose
+// repair are both on this node. Everything else -- a withdrawn remote prefix,
+// a session the far end has not brought up -- is deliberately excluded: a
+// rewire cannot create it, and doing one anyway costs a live device its
+// interfaces for nothing.
+func locallyRepairableDrift(reason string) bool {
+	for _, local := range []string{
+		"is missing expected", // address or default route
+		"has no usable OVS bridge",
+		"is not tagged",
+		"is missing VLAN",
+	} {
+		if strings.Contains(reason, local) {
+			return true
+		}
+	}
+	return false
+}
+
 // forceRewireDevice is the explicit operator path for a known broken link.
 // It performs one bounded rewire with the same ownership/hold protections as
 // automatic repair, and forces a stale active multiplex receive port to the
@@ -838,7 +968,26 @@ func (s *Server) forceRewireDevice(ctx context.Context, top *model.Topology, d *
 	return nil
 }
 
+// repairEngine is the explicit operator path: `node reconcile --force` may
+// move a live receive socket, because converging two endpoints that disagree
+// about it is impossible without doing so. The trunk's other bindings are
+// preserved across that replacement by netx, so it is bounded to the port
+// change the operator asked for.
 func (s *Server) repairEngine(top *model.Topology) *deploy.Engine {
+	eng := s.autoRepairEngine(top)
+	eng.ForceOverlayReconcile = true
+	return eng
+}
+
+// autoRepairEngine is what unattended repair is allowed to do.
+//
+// It deliberately does not force an overlay reconcile. One node pair shares
+// one trunk, so forcing its receive socket deletes every VNI binding the pair
+// carries and reinstalls only the link being repaired. An unattended audit did
+// exactly that to a converged 84-AS lab: repairing one endpoint dropped a
+// hundred and ten cross-node bindings, and the marks of every autonomous
+// system behind them went with it five minutes after a clean deployment.
+func (s *Server) autoRepairEngine(top *model.Topology) *deploy.Engine {
 	s.mu.Lock()
 	mode := s.modes[top.Name]
 	ungraded := s.ungraded[top.Name]
@@ -852,7 +1001,7 @@ func (s *Server) repairEngine(top *model.Topology) *deploy.Engine {
 		UnderlayDev:           s.cfg.UnderlayDev,
 		PeerUnderlay:          s.peerUnderlay(top.Name),
 		ModeKey:               rendererModeKey(render.Mode(mode), ungraded),
-		ForceOverlayReconcile: true,
+		ForceOverlayReconcile: false,
 	}
 }
 
@@ -1504,6 +1653,16 @@ func (s *Server) duplicateDaemonsResult(ctx context.Context, d *model.Device, as
 // window opens, and any healthy observation clears the history immediately.
 const repairAttemptsBeforeGivingUp = 3
 
+// semanticRepairCycles bounds distributed convergence.
+//
+// A drift whose other half lives on another node cannot be repaired from
+// here, and repeating a local repair that has already been proven not to fix
+// it is not convergence -- it is a device that stays broken while the node
+// keeps reporting work in progress. After this many complete local repair
+// cycles the device enters an explicit terminal state, is alerted, and is
+// left alone until it is observed healthy or an operator intervenes.
+const semanticRepairCycles = 3
+
 const (
 	repairBackoffBase = time.Second
 	repairBackoffMax  = 5 * time.Minute
@@ -1552,10 +1711,13 @@ func (s *Server) repairFailed(lab, id, what string, err error) {
 	}
 }
 
-// deferSemanticRepair records a non-local semantic failure without sending the
-// reconciler through two immediate rewire attempts that cannot change a remote
-// prefix. A later healthy observation still clears it, while an operator sees
-// the device and exact reason in node status.
+// deferSemanticRepair records one completed local repair cycle that did not
+// converge, and decides whether the device gets another.
+//
+// Two outcomes are possible and no third one is: another bounded retry, or an
+// explicit terminal state that stops retrying and says so. A device that
+// retries for ever is indistinguishable from one that is being repaired, and
+// the whole failure this bounds looked exactly like progress in the log.
 func (s *Server) deferSemanticRepair(lab, id, reason string) {
 	k := repairKey(lab, id)
 	s.mu.Lock()
@@ -1565,6 +1727,12 @@ func (s *Server) deferSemanticRepair(lab, id, reason string) {
 	if s.repairNext == nil {
 		s.repairNext = map[string]time.Time{}
 	}
+	if s.semanticCycles == nil {
+		s.semanticCycles = map[string]int{}
+	}
+	if s.repairTerminal == nil {
+		s.repairTerminal = map[string]string{}
+	}
 	n := s.repairFails[k] + 1
 	if n < repairAttemptsBeforeGivingUp {
 		n = repairAttemptsBeforeGivingUp
@@ -1572,11 +1740,37 @@ func (s *Server) deferSemanticRepair(lab, id, reason string) {
 	s.repairFails[k] = n
 	delay := repairDelay(n)
 	s.repairNext[k] = s.nowTime().Add(delay)
+	cycle := s.semanticCycles[k] + 1
+	s.semanticCycles[k] = cycle
+	terminal := cycle >= semanticRepairCycles
+	if terminal {
+		s.repairTerminal[k] = reason
+	}
 	s.mu.Unlock()
+
+	if terminal {
+		s.metricRegistry().observeRepair("terminal")
+		slog.Error("distributed semantic repair did not converge within its bounded cycle; "+
+			"the device is now in a terminal state and will not be retried automatically",
+			"lab", lab, "device", id, "reason", reason, "cycles", cycle)
+		s.recordEvent(lab, "", "reconcile", "", "semantic_repair_terminal", "error",
+			id+": "+reason)
+		return
+	}
 	s.metricRegistry().observeRepair("backoff")
-	slog.Warn("semantic drift is not locally repairable; deferring with backoff",
-		"lab", lab, "device", id, "reason", reason, "attempt", n, "backoff", delay)
+	slog.Warn("semantic drift survived a local repair cycle; retrying within a bounded budget",
+		"lab", lab, "device", id, "reason", reason,
+		"cycle", cycle, "cycles", semanticRepairCycles, "backoff", delay)
+	s.recordEvent(lab, "", "reconcile", "", "semantic_repair_deferred", "backoff", id+": "+reason)
 	s.queueReconcileAfter(lab, id, delay)
+}
+
+// semanticRepairTerminalReason reports why a device's bounded distributed
+// repair was abandoned, or "" while it is still converging.
+func (s *Server) semanticRepairTerminalReason(lab, id string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.repairTerminal[repairKey(lab, id)]
 }
 
 func isSemanticOnlyDrift(reason string) bool {
@@ -1590,20 +1784,31 @@ func forceSemanticRepair(ctx context.Context) bool {
 
 func (s *Server) repairSucceeded(lab, id string) {
 	s.mu.Lock()
-	delete(s.repairFails, repairKey(lab, id))
-	delete(s.repairNext, repairKey(lab, id))
+	key := repairKey(lab, id)
+	delete(s.repairFails, key)
+	delete(s.repairNext, key)
+	delete(s.semanticCycles, key)
+	delete(s.repairTerminal, key)
 	s.mu.Unlock()
 }
 
+// repairDelay is bounded exponential backoff that actually reaches its
+// declared maximum. The shift used to be capped at eight, so the longest
+// delay a device could ever wait was 256 seconds and repairBackoffMax was a
+// constant nothing could read: the documented five-minute ceiling and the
+// implemented one disagreed, which is precisely the kind of difference that
+// is only discovered while reading a log that says the wrong thing.
 func repairDelay(attempt int) time.Duration {
 	if attempt < 1 {
 		attempt = 1
 	}
-	shift := attempt - 1
-	if shift > 8 {
-		shift = 8
+	delay := repairBackoffBase
+	for i := 1; i < attempt; i++ {
+		if delay >= repairBackoffMax {
+			return repairBackoffMax
+		}
+		delay *= 2
 	}
-	delay := repairBackoffBase << shift
 	if delay > repairBackoffMax {
 		return repairBackoffMax
 	}
@@ -1645,24 +1850,31 @@ func (s *Server) forgetLab(name string) {
 	delete(s.peers, name)
 	delete(s.exempt, name)
 	delete(s.holds, name)
-	for k := range s.repairFails {
-		if strings.HasPrefix(k, name+"|") {
-			delete(s.repairFails, k)
-		}
-		for k := range s.repairNext {
+	// Each map is swept independently. They used to be nested inside the
+	// repair-failure loop, so a lab with no recorded failures kept its health
+	// and backoff entries for ever after it was removed.
+	for _, records := range []map[string]string{s.repairTerminal} {
+		for k := range records {
 			if strings.HasPrefix(k, name+"|") {
-				delete(s.repairNext, k)
-			}
-		}
-		for k := range s.health {
-			if strings.HasPrefix(k, name+"|") {
-				delete(s.health, k)
+				delete(records, k)
 			}
 		}
 	}
-	for k := range s.partial {
+	for _, counts := range []map[string]int{s.repairFails, s.semanticCycles, s.partial} {
+		for k := range counts {
+			if strings.HasPrefix(k, name+"|") {
+				delete(counts, k)
+			}
+		}
+	}
+	for k := range s.repairNext {
 		if strings.HasPrefix(k, name+"|") {
-			delete(s.partial, k)
+			delete(s.repairNext, k)
+		}
+	}
+	for k := range s.health {
+		if strings.HasPrefix(k, name+"|") {
+			delete(s.health, k)
 		}
 	}
 	store := s.store

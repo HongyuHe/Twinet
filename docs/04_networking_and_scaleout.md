@@ -110,6 +110,25 @@ No-change deploy observation also probes compact live semantic fingerprints.
 An address/route/BGP-session drift becomes a targeted configure/ready plan;
 an actually healthy no-change deployment still has zero mutation steps.
 
+A zero-change deployment and degraded semantic health are mutually exclusive
+answers. Agents publish their audited convergence state — the same evidence
+`twinet node status` shows — in the read-only plan preflight and in every apply
+response. The controller refuses a no-op witness from a node reporting drifted
+devices, and a deployment that reports no changes against a degraded cluster
+fails with a non-zero status naming the drift instead of printing
+`0 devices, 0 links`.
+
+Repair of a shared trunk is bounded and non-destructive. One node pair carries
+one trunk, so replacing its receive socket destroys every VNI binding on it;
+the bindings are therefore recorded and reinstalled across any such
+replacement, and unattended repair never forces one at all — it restores the
+missing binding, host port, address, or interface for the one device it is
+repairing. Distributed drift that no local repair can fix is retried for a
+bounded number of cycles and then enters an explicit terminal state that is
+alerted, counted in `twinet_semantic_repair_terminal`, and named in node
+status. It is never retried for ever, and a later healthy observation clears
+it.
+
 FRR routers use a private control sidecar: legacy daemons in the student shell
 are stopped before the sidecar owns the daemon set, and recovery refuses
 duplicate sidecar daemons. `twinet node status` reports primary topology

@@ -107,6 +107,17 @@ func planFallbackReason(result NodeResult[agent.PlanResponse], hash, mode string
 	if value.Node != result.Node {
 		return fmt.Sprintf("plan answered as %q", value.Node)
 	}
+	// Checked before Noop, and independently of it. A node that publishes
+	// drifted devices has already contradicted a zero-change deployment; the
+	// controller must not accept the no-op merely because the node's own diff
+	// was willing to.
+	if degraded := value.SemanticHealth.Degraded(); degraded > 0 {
+		reason := fmt.Sprintf("%d device(s) have semantic/runtime drift", degraded)
+		if drift := value.SemanticHealth.Drift(); drift != "" {
+			reason += ": " + drift
+		}
+		return reason
+	}
 	if !value.Noop {
 		if value.Reason != "" {
 			return value.Reason

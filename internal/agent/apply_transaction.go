@@ -142,7 +142,10 @@ func (s *Server) handleApplyPrepare(w http.ResponseWriter, r *http.Request, req 
 			RequireImmutableImages: top.Lab.Images.RequiresImmutableImages(),
 			RetainLegacyOverlays:   true,
 			SemanticProbe: func(ctx context.Context, device *model.Device) error {
-				return s.semanticProbe(ctx, top, mode, req.Ungraded, device)
+				if err := s.semanticProbe(ctx, top, mode, req.Ungraded, device); err != nil {
+					return err
+				}
+				return auditedDriftError(s.auditedDriftReason(ctx, top.Name, device))
 			},
 		}
 		if _, err := observed.BuildContext(r.Context(), top); err != nil {
@@ -582,7 +585,10 @@ func (s *Server) transactionEngine(top *model.Topology, tx applyTransaction) (*d
 			if s.isExempt(top.Name, device.ID) {
 				return nil
 			}
-			return s.semanticProbe(ctx, top, mode, tx.Ungraded, device)
+			if err := s.semanticProbe(ctx, top, mode, tx.Ungraded, device); err != nil {
+				return err
+			}
+			return auditedDriftError(s.auditedDriftReason(ctx, top.Name, device))
 		},
 	}, nil
 }

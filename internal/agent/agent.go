@@ -325,6 +325,15 @@ type Server struct {
 	// an abandoned device from consuming a permanent share of the node while
 	// still allowing a later healthy observation or bounded retry to recover.
 	repairNext map[string]time.Time
+	// semanticCycles counts the complete local repair cycles a semantically
+	// drifted device has already been given, and repairTerminal records why
+	// one was abandoned. Together they make distributed repair either
+	// converge or stop and say so, rather than retry for ever.
+	semanticCycles map[string]int
+	repairTerminal map[string]string
+	// overlayBindingRepair is a test-only seam for the cross-node binding
+	// half of a semantic repair, which otherwise needs host netlink.
+	overlayBindingRepair func(context.Context, *model.Topology, *model.Device) (deploy.OverlayRepairReport, error)
 
 	// exempt records, per lab, the devices that are broken on purpose.
 	exempt map[string]*exemptions
@@ -408,6 +417,8 @@ func New(cfg Config) (*Server, error) {
 
 		repairFails:      map[string]int{},
 		repairNext:       map[string]time.Time{},
+		semanticCycles:   map[string]int{},
+		repairTerminal:   map[string]string{},
 		exempt:           map[string]*exemptions{},
 		partial:          map[string]int{},
 		lastCapture:      map[string]time.Time{},
@@ -1127,11 +1138,45 @@ type SemanticHealth struct {
 	Broken  int `json:"broken"`
 	Unknown int `json:"unknown"`
 	Partial int `json:"partial"`
+	// Terminal counts devices whose bounded distributed repair was abandoned.
+	// They are a subset of Broken: the node has proven it cannot repair them
+	// locally and has stopped retrying, so an operator has to look.
+	Terminal int `json:"terminal,omitempty"`
 	// Reasons names each currently non-healthy device and its bounded last
 	// observation, so an idle node status cannot hide a sidecar/reachability
 	// failure behind aggregate counts.
 	Reasons map[string]string `json:"reasons,omitempty"`
 }
+
+// Degraded counts devices this node has observed and proven are not what the
+// topology says they should be. Unknown is deliberately excluded: it is an
+// absence of evidence, not evidence of drift.
+func (h SemanticHealth) Degraded() int { return h.Broken + h.Partial }
+
+// Drift names one device and its reason, for a caller that has to explain a
+// refusal in one line. It is deterministic and prefers a terminal device,
+// because that is the one nothing else is going to repair.
+func (h SemanticHealth) Drift() string {
+	devices := make([]string, 0, len(h.Reasons))
+	for device := range h.Reasons {
+		devices = append(devices, device)
+	}
+	sort.Strings(devices)
+	for _, device := range devices {
+		if strings.HasPrefix(h.Reasons[device], terminalReasonPrefix) {
+			return device + ": " + h.Reasons[device]
+		}
+	}
+	if len(devices) > 0 {
+		return devices[0] + ": " + h.Reasons[devices[0]]
+	}
+	return ""
+}
+
+// terminalReasonPrefix marks a reason an operator must act on. It is part of
+// the wire format so that a controller can distinguish "still converging"
+// from "this node has given up" without a second request.
+const terminalReasonPrefix = "terminal: "
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	ver, err := s.rt.Ping(r.Context())
@@ -1218,30 +1263,12 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	sort.Strings(busy)
 	resp.Busy = busy
-	resp.Convergence = map[string]int{}
-	resp.SemanticHealth = map[string]SemanticHealth{}
-	for key, observation := range s.health {
-		resp.Convergence[string(observation.Health)]++
-		lab, device, _ := strings.Cut(key, "|")
-		health := resp.SemanticHealth[lab]
-		switch observation.Health {
-		case healthHealthy:
-			health.Healthy++
-		case healthBroken:
-			health.Broken++
-		case healthUnknown:
-			health.Unknown++
-		case healthPartial:
-			health.Partial++
-		}
-		if observation.Health != healthHealthy && observation.Reason != "" {
-			if health.Reasons == nil {
-				health.Reasons = map[string]string{}
-			}
-			health.Reasons[device] = observation.Reason
-		}
-		resp.SemanticHealth[lab] = health
-	}
+	// Both views are derived from the same filtered observations. A count
+	// that disagreed with the per-device reasons -- or with what the plan
+	// endpoint publishes -- would put the contradiction this removes straight
+	// back into node status.
+	resp.SemanticHealth = semanticHealthLocked(s.health, s.repairTerminal, s.current, s.cfg.Node, "")
+	resp.Convergence = convergenceCounts(resp.SemanticHealth)
 	s.mu.Unlock()
 	resp.Generations = s.committedGenerations()
 	resp.Modes = s.committedModes()
@@ -1486,6 +1513,10 @@ type ApplyResponse struct {
 	Failures  map[string][]string `json:"failures,omitempty"`
 	Pruned    []string            `json:"pruned,omitempty"`
 	Snapshots int                 `json:"snapshots,omitempty"`
+	// SemanticHealth is this node's audited convergence state for the lab
+	// after the response was produced. A controller uses it to refuse a
+	// zero-change success that contradicts the node it just deployed to.
+	SemanticHealth SemanticHealth `json:"semantic_health"`
 }
 
 func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
@@ -1641,7 +1672,10 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 			if s.isExempt(top.Name, device.ID) {
 				return nil
 			}
-			return s.semanticProbe(ctx, top, mode, ungraded, device)
+			if err := s.semanticProbe(ctx, top, mode, ungraded, device); err != nil {
+				return err
+			}
+			return auditedDriftError(s.auditedDriftReason(ctx, top.Name, device))
 		},
 	}
 	if !req.DryRun && req.Phase == "apply" {
@@ -1729,6 +1763,7 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 			WantDevice:             rep.Planned(plan.StageCreate),
 			WantLinks:              rep.Planned(plan.StageWire),
 			DurationMS:             rep.Duration.Milliseconds(),
+			SemanticHealth:         s.labSemanticHealth(top.Name),
 		}
 		attachDeploymentStats(&resp, deploymentStats, rep)
 		recordStart := time.Now()
@@ -1849,6 +1884,7 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		WantLinks:              rep.Planned(plan.StageWire),
 		DryRun:                 req.DryRun,
 		DurationMS:             rep.Duration.Milliseconds(),
+		SemanticHealth:         s.labSemanticHealth(top.Name),
 	}
 	attachDeploymentStats(&resp, deploymentStats, rep)
 	addPhaseTiming(&resp, "record", time.Since(recordStart))

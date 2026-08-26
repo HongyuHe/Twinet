@@ -69,11 +69,17 @@ func TestStatusSeparatesPrimaryAndFRRControlContainers(t *testing.T) {
 func TestStatusIncludesDegradedDeviceReason(t *testing.T) {
 	runtime := &statusRuntime{}
 	server := &Server{
-		cfg:     Config{Node: "node-0"},
-		rt:      runtime,
-		current: map[string]*model.Topology{"lab": {Name: "lab"}},
+		cfg: Config{Node: "node-0"},
+		rt:  runtime,
+		// Published health is scoped to the devices this node currently
+		// hosts: an observation left behind by a device the lab no longer
+		// declares is stale, and deployment refusals now depend on it.
+		current: map[string]*model.Topology{"lab": {Name: "lab", Devices: map[string]*model.Device{
+			"as5/CHI": {ID: "as5/CHI", Node: "node-0"},
+		}}},
 		health: map[string]deviceObservation{
-			"lab|as5/CHI": {Health: healthBroken, Reason: "FRR control daemon bgpd has 2 process(es), want exactly one"},
+			"lab|as5/CHI":  {Health: healthBroken, Reason: "FRR control daemon bgpd has 2 process(es), want exactly one"},
+			"lab|as9/GONE": {Health: healthBroken, Reason: "container is absent"},
 		},
 	}
 	response := httptest.NewRecorder()
@@ -84,5 +90,11 @@ func TestStatusIncludesDegradedDeviceReason(t *testing.T) {
 	}
 	if got := status.SemanticHealth["lab"].Reasons["as5/CHI"]; !strings.Contains(got, "want exactly one") {
 		t.Fatalf("degraded reason = %q", got)
+	}
+	if got := status.SemanticHealth["lab"].Reasons["as9/GONE"]; got != "" {
+		t.Fatalf("status published a device the lab no longer declares: %q", got)
+	}
+	if got := status.SemanticHealth["lab"].Degraded(); got != 1 {
+		t.Fatalf("degraded device count = %d, want 1", got)
 	}
 }

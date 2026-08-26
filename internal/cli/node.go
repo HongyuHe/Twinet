@@ -836,7 +836,7 @@ func deployCluster(ctx context.Context, top *model.Topology, tok string, req age
 	fmt.Fprintln(w, "NODE\tSTEPS\tDURATION\tSTATUS")
 	failed := 0
 	devices, links, crossEndpoints, wantDev, wantLink, wantCrossEndpoints := 0, 0, 0, 0, 0, 0
-	reached := 0
+	reached, steps := 0, 0
 	for _, r := range results {
 		if r.Err != nil {
 			failed++
@@ -844,6 +844,7 @@ func deployCluster(ctx context.Context, top *model.Topology, tok string, req age
 			continue
 		}
 		reached++
+		steps += r.Value.Steps
 		devices += r.Value.Devices
 		links += r.Value.Links
 		crossEndpoints += r.Value.CrossLinkEndpoints
@@ -908,7 +909,63 @@ func deployCluster(ctx context.Context, top *model.Topology, tok string, req age
 	if failed > 0 {
 		return fmt.Errorf("%d node(s) reported problems; re-run deploy to converge", failed)
 	}
+	// A deployment that changed nothing is only a success if the nodes agree
+	// that there was nothing to change. They publish the same audited health
+	// `node status` shows, so a zero-change run against a node reporting
+	// drifted devices is a contradiction, and it used to be reported as
+	// success with an exit status of zero.
+	if drift := clusterSemanticDrift(results); drift != "" {
+		if err := zeroChangeDriftError(steps, drift); err != nil {
+			return err
+		}
+		fmt.Fprintf(errOut,
+			"AUDIT: the deployment made %d change(s) and the cluster is still degraded: %s\n",
+			steps, drift)
+	}
 	return nil
+}
+
+// zeroChangeDriftError enforces the one invariant a deployment summary must
+// never break: zero changes and degraded semantic health cannot both be true
+// and still be a success. A run that did change something has reported that
+// work, and its remaining drift is audited rather than fatal.
+func zeroChangeDriftError(steps int, drift string) error {
+	if drift == "" || steps > 0 {
+		return nil
+	}
+	return fmt.Errorf("deployment made no changes while %s; "+
+		"the cluster is not converged, so this is not a successful no-op", drift)
+}
+
+// clusterSemanticDrift names the degraded nodes and one device that proves it.
+func clusterSemanticDrift(results []client.NodeResult[agent.ApplyResponse]) string {
+	var degraded []string
+	detail := ""
+	for _, r := range results {
+		if r.Err != nil {
+			continue
+		}
+		count := r.Value.SemanticHealth.Degraded()
+		if count == 0 {
+			continue
+		}
+		degraded = append(degraded, fmt.Sprintf("%s reports %d device(s) with semantic/runtime drift",
+			r.Node, count))
+		if detail == "" {
+			if drift := r.Value.SemanticHealth.Drift(); drift != "" {
+				detail = drift
+			}
+		}
+	}
+	if len(degraded) == 0 {
+		return ""
+	}
+	sort.Strings(degraded)
+	out := strings.Join(degraded, "; ")
+	if detail != "" {
+		out += " (" + firstLine(detail) + ")"
+	}
+	return out
 }
 
 func logicalLinks(endpoints, crossEndpoints int) int {
@@ -1015,14 +1072,9 @@ func semanticStatusReason(values map[string]agent.SemanticHealth) string {
 	}
 	sort.Strings(labs)
 	for _, lab := range labs {
-		health := values[lab]
-		devices := make([]string, 0, len(health.Reasons))
-		for device := range health.Reasons {
-			devices = append(devices, device)
-		}
-		sort.Strings(devices)
-		if len(devices) > 0 {
-			return devices[0] + ": " + firstLine(health.Reasons[devices[0]])
+		if drift := values[lab].Drift(); drift != "" {
+			device, reason, _ := strings.Cut(drift, ": ")
+			return device + ": " + firstLine(reason)
 		}
 	}
 	return ""
