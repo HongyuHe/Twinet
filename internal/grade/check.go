@@ -26,6 +26,10 @@ type Env struct {
 	AS int
 	// infraSeen collects failures of the grading machinery during one check.
 	infraSeen *infraTracker
+	// capabilitySeen collects NOS capability refusals during one check, so a
+	// check written against one vendor's CLI cannot silently absorb the
+	// refusal and report a verdict about a device that was never asked.
+	capabilitySeen *capabilityTracker
 
 	// Exec runs a command inside a device of the grading lab.
 	Exec func(ctx context.Context, deviceID string, cmd []string) (rt.ExecResult, error)
@@ -136,7 +140,12 @@ func (e *Env) readDeviceState(ctx context.Context, deviceID string, query netsta
 			return netstate.State{}, e.infra(deviceID, "resolve NOS state provider", err)
 		}
 		if err := nos.ValidateStateQuery(provider, d.ID, query); err != nil {
-			return netstate.State{}, e.infra(deviceID, "validate NOS state provider", err)
+			// A provider that never declared the family is a capability
+			// boundary, not the machinery breaking. Recording it as such is
+			// what lets the report say "this NOS has no RPKI" instead of
+			// summoning somebody to fix a grader that is working.
+			return netstate.State{}, e.capabilityRefusal(deviceID, provider.Name(),
+				"read network state "+query.String(), err)
 		}
 		reader = provider
 	}
@@ -214,13 +223,20 @@ func (e *Env) Routers() []*model.Device {
 }
 
 // Vtysh runs a vtysh command on a router and returns its output.
+//
+// It is FRR's own CLI, so it is refused on any other NOS rather than executed.
+// The refusal is recorded centrally: a check that absorbs the error and
+// concludes something anyway is overridden with an explicit capability result
+// by the runner, because "we could not ask" must never render as "we asked and
+// the answer was no".
 func (e *Env) Vtysh(ctx context.Context, device, command string) (string, error) {
 	if e.Topology != nil {
 		if d, ok := e.Device(device); ok && d.EffectiveNOS() != model.DefaultNOS {
-			return "", e.infra(d.ID, command, &netstate.UnsupportedError{
-				Device: d.ID, NOS: d.EffectiveNOS(), Query: netstate.QueryBGP,
-				Reason: "FRR vtysh is not a vendor-neutral state API",
-			})
+			return "", e.capabilityRefusal(d.ID, d.EffectiveNOS(), command,
+				&netstate.UnsupportedError{
+					Device: d.ID, NOS: d.EffectiveNOS(), Query: netstate.QueryBGP,
+					Reason: "FRR vtysh is not a vendor-neutral state API",
+				})
 		}
 	}
 	deviceID := model.DeviceID(e.AS, device)
@@ -297,6 +313,215 @@ func (e *Env) Observe(ctx context.Context, deviceID string, cmd []string) (rt.Ex
 		return e.snapshot.command(withCheckTrace(ctx, e.trace), "exec", deviceID, cmd)
 	}
 	return e.Exec(ctx, deviceID, cmd)
+}
+
+// CapabilityError says a device's NOS cannot answer what a check asked.
+//
+// It is deliberately separate from InfraError. An unreachable node is the
+// platform failing and a human has to look at the platform; a BIRD router
+// without an RPKI cache is the platform working exactly as declared, and what
+// a human has to look at is the rubric. Both keep the question out of the
+// weighting; only one of them is a fault.
+type CapabilityError struct {
+	Device string
+	NOS    string
+	Op     string
+	Err    error
+}
+
+func (e *CapabilityError) Error() string {
+	return fmt.Sprintf("%s runs NOS %q, which cannot answer %q: %v", e.Device, e.NOS, e.Op, e.Err)
+}
+
+func (e *CapabilityError) Unwrap() error { return e.Err }
+
+// IsCapability reports whether an error is a declared NOS capability boundary.
+func IsCapability(err error) bool {
+	var ce *CapabilityError
+	return errors.As(err, &ce)
+}
+
+// capabilityTracker collects NOS capability refusals seen during one check.
+type capabilityTracker struct {
+	mu      sync.Mutex
+	first   *CapabilityError
+	count   int
+	reduced []string
+}
+
+func (t *capabilityTracker) record(e *CapabilityError) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.count++
+	if t.first == nil {
+		t.first = e
+	}
+}
+
+func (t *capabilityTracker) reduce(why string) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for _, seen := range t.reduced {
+		if seen == why {
+			return
+		}
+	}
+	t.reduced = append(t.reduced, why)
+}
+
+func (t *capabilityTracker) reductions() []string {
+	if t == nil {
+		return nil
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := append([]string(nil), t.reduced...)
+	sort.Strings(out)
+	return out
+}
+
+func (t *capabilityTracker) refusal() *CapabilityError {
+	if t == nil {
+		return nil
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.first
+}
+
+// capabilityRefusal records that a device's NOS declined a request and returns
+// the error to the caller.
+func (e *Env) capabilityRefusal(device, name, op string, err error) error {
+	ce := &CapabilityError{Device: device, NOS: name, Op: op, Err: err}
+	e.capabilitySeen.record(ce)
+	return ce
+}
+
+// NoteUnobservable records that one strand of a check's evidence is not
+// expressible on this device's NOS, while the check goes on to decide from the
+// evidence that is.
+//
+// It is the middle case between a check that works everywhere and one that
+// cannot run at all. BIRD exports every route it installs to the kernel under
+// one protocol identity, so "a static route is overriding the BGP decision" has
+// no kernel-visible form there -- but "the packet leaves over the slow link"
+// still does, and that is the question. The strand that was not gathered is
+// carried into the result so a pass reached from less says so.
+func (e *Env) NoteUnobservable(device, what string) {
+	name := ""
+	if e.Topology != nil {
+		if d, ok := e.Topology.Device(device); ok {
+			name = d.EffectiveNOS()
+		} else if d, ok := e.Device(device); ok {
+			name = d.EffectiveNOS()
+		}
+	}
+	if name == "" {
+		name = "this NOS"
+	}
+	e.capabilitySeen.reduce(fmt.Sprintf("%s runs %s, which does not express %s", device, name, what))
+}
+
+// Provider resolves the registered NOS provider of a router in the AS under
+// test, named as the rubric names it.
+func (e *Env) Provider(device string) (nos.Provider, error) {
+	if e.Topology == nil {
+		return nil, fmt.Errorf("no topology is available")
+	}
+	d, ok := e.Device(device)
+	if !ok {
+		return nil, fmt.Errorf("%s is not a device of AS %d", device, e.AS)
+	}
+	return nos.Resolve(d)
+}
+
+// SupportsFeature reports whether a router's NOS declares a feature. A device
+// that cannot be resolved is reported as not supporting it, so a check gates
+// itself rather than proceeding on an assumption.
+func (e *Env) SupportsFeature(device string, feature nos.Feature) bool {
+	provider, err := e.Provider(device)
+	if err != nil {
+		return false
+	}
+	return provider.Capabilities().Supports(feature)
+}
+
+// UsesDefaultNOS reports whether a router runs the FRR provider, for the
+// narrow refinements that are only expressible in FRR's own CLI.
+//
+// A check uses this to *skip* an optional refinement without tainting itself.
+// A check whose whole subject is FRR-specific must use RequireFeature instead,
+// so the question records that it was not assessed.
+func (e *Env) UsesDefaultNOS(device string) bool {
+	if e.Topology == nil {
+		return true
+	}
+	d, ok := e.Device(device)
+	if !ok {
+		return true
+	}
+	return d.EffectiveNOS() == model.DefaultNOS
+}
+
+// RequireFeature gates a check on every router of the AS under test declaring
+// a feature, and returns the explicit capability result when one does not.
+//
+// Returning a Result rather than a bool is deliberate: the caller cannot
+// forget to say why it stopped, and the report cannot end up with a question
+// whose denominator quietly shrank.
+func (e *Env) RequireFeature(check string, feature nos.Feature) *Result {
+	routers := e.Routers()
+	if len(routers) == 0 {
+		return nil
+	}
+	var without []string
+	name := ""
+	for _, r := range routers {
+		provider, err := nos.Resolve(r)
+		if err != nil {
+			result := Errored(check, fmt.Errorf("resolve the NOS of %s: %w", r.ID, err))
+			return &result
+		}
+		if !provider.Capabilities().Supports(feature) {
+			without = append(without, r.Name)
+			name = provider.Name()
+		}
+	}
+	if len(without) == 0 {
+		return nil
+	}
+	sort.Strings(without)
+	err := e.capabilityRefusal(model.DeviceID(e.AS, without[0]), name, check,
+		fmt.Errorf("%s of AS %d run NOS %q, which does not declare %q",
+			strings.Join(without, ", "), e.AS, name, feature))
+	result := Unsupported(check, err)
+	return &result
+}
+
+// RequireDefaultNOS gates a check that can only be expressed in FRR's own CLI.
+func (e *Env) RequireDefaultNOS(check, why string) *Result {
+	var others []string
+	name := ""
+	for _, r := range e.Routers() {
+		if r.EffectiveNOS() != model.DefaultNOS {
+			others = append(others, r.Name)
+			name = r.EffectiveNOS()
+		}
+	}
+	if len(others) == 0 {
+		return nil
+	}
+	sort.Strings(others)
+	err := e.capabilityRefusal(model.DeviceID(e.AS, others[0]), name, check,
+		fmt.Errorf("%s of AS %d run NOS %q, and %s", strings.Join(others, ", "), e.AS, name, why))
+	result := Unsupported(check, err)
+	return &result
 }
 
 // InfraError marks a failure of the grading machinery rather than of the
@@ -482,6 +707,15 @@ type Check struct {
 	// Class selects the bounded scheduler pool. Empty receives the reviewed
 	// classification for shipped checks at registration.
 	Class CheckClass
+	// Requires names NOS features every router of the AS under test must
+	// declare before this check can mean anything.
+	//
+	// It is declared here rather than tested inside each check so that a
+	// capability boundary is one fact in one place: a check about LDP labels
+	// or an RPKI cache table simply does not apply to a NOS that has neither,
+	// and the runner records that explicitly instead of letting the check
+	// discover it as an unreadable command and call it a student failure.
+	Requires []nos.Feature
 }
 
 // registry holds every known check. It is populated by init functions in the
@@ -549,6 +783,11 @@ func runCheck(ctx context.Context, c *Check, env *Env) (res Result) {
 	}()
 	if err := ctxErr(ctx); err != nil {
 		return Errored(c.Name, err)
+	}
+	for _, feature := range c.Requires {
+		if refusal := env.RequireFeature(c.Name, feature); refusal != nil {
+			return *refusal
+		}
 	}
 	return c.Run(ctx, env)
 }

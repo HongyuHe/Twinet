@@ -12,6 +12,7 @@ import (
 	"sync"
 
 	"github.com/HongyuHe/twinet/internal/model"
+	"github.com/HongyuHe/twinet/internal/nos"
 )
 
 // Checks for the advanced-networks course: a BGP-free core and BGP/MPLS L3VPN.
@@ -28,26 +29,31 @@ func init() {
 		Name:     "mpls.bgp_free_core",
 		Describe: "the core routers hold no BGP state, and the edges do not peer with them",
 		Run:      checkBGPFreeCore,
+		Requires: []nos.Feature{nos.FeatureMPLS},
 	})
 	Register(&Check{
 		Name:     "mpls.ldp_adjacencies",
 		Describe: "every interior link has an operational LDP session, and labels are installed",
 		Run:      checkLDPAdjacencies,
+		Requires: []nos.Feature{nos.FeatureMPLS, nos.FeatureLDP},
 	})
 	Register(&Check{
 		Name:     "vpn.site_reachability",
 		Describe: "the sites of one customer can reach each other across the provider",
 		Run:      checkVPNReachability,
+		Requires: []nos.Feature{nos.FeatureMPLS, nos.FeatureVRF},
 	})
 	Register(&Check{
 		Name:     "vpn.label_switched",
 		Describe: "the customer's remote sites are reached over a two-label path, not by plain routing",
 		Run:      checkVPNLabelSwitched,
+		Requires: []nos.Feature{nos.FeatureMPLS, nos.FeatureVRF},
 	})
 	Register(&Check{
 		Name:     "vpn.isolation",
 		Describe: "one customer cannot reach another, whatever addresses they use",
 		Run:      checkVPNIsolation,
+		Requires: []nos.Feature{nos.FeatureMPLS, nos.FeatureVRF},
 	})
 }
 

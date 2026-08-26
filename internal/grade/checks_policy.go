@@ -15,6 +15,7 @@ import (
 
 	"github.com/HongyuHe/twinet/internal/model"
 	"github.com/HongyuHe/twinet/internal/netstate"
+	"github.com/HongyuHe/twinet/internal/nos"
 	"github.com/HongyuHe/twinet/internal/svc"
 )
 
@@ -41,11 +42,13 @@ func init() {
 		Name:     "rpki.invalid_rejected",
 		Describe: "a route whose origin is RPKI-invalid is not selected",
 		Run:      checkRPKIInvalidRejected,
+		Requires: []nos.Feature{nos.FeatureRPKI},
 	})
 	Register(&Check{
 		Name:     "rpki.notfound_preserved",
 		Describe: "routes with no ROA are still usable, so filtering has not gone too far",
 		Run:      checkRPKINotFoundPreserved,
+		Requires: []nos.Feature{nos.FeatureRPKI},
 	})
 }
 
@@ -3327,46 +3330,57 @@ func installedVia(ctx context.Context, env *Env, slow []string, slowIf map[strin
 	sort.Strings(probeList)
 
 	for _, r := range env.Routers() {
-		var routes map[string][]struct {
-			Protocol string `json:"protocol"`
-			Selected bool   `json:"selected"`
-			Nexthops []struct {
-				IP    string `json:"ip"`
-				FIB   bool   `json:"fib"`
-				Iface string `json:"interfaceName"`
-			} `json:"nexthops"`
-		}
-		if err := env.VtyshJSON(ctx, r.Name, "show ip route json", &routes); err != nil {
-			return nil, fmt.Sprintf("%s: its routing table could not be read (%v), so where "+
-				"its traffic actually goes could not be established", r.Name, err)
-		}
 		flagged := map[string]bool{}
-		for prefix, entries := range routes {
-			if !alt[prefix] || !routableTEDestination(env, prefix) {
-				continue
+		// The daemon's own table is a second opinion beside the kernel probe
+		// below, and it is FRR's own JSON. On another NOS the kernel probe is
+		// the whole answer -- it is also the more direct one, since it asks
+		// where a packet actually goes -- so the check goes on rather than
+		// refusing, and records that it saw one witness instead of two.
+		if !env.UsesDefaultNOS(r.Name) {
+			env.NoteUnobservable(r.ID,
+				"a routing table the grader can read alongside the kernel, so the traffic-"+
+					"engineering verdict for this router rests on the kernel probe alone")
+		} else {
+			var routes map[string][]struct {
+				Protocol string `json:"protocol"`
+				Selected bool   `json:"selected"`
+				Nexthops []struct {
+					IP    string `json:"ip"`
+					FIB   bool   `json:"fib"`
+					Iface string `json:"interfaceName"`
+				} `json:"nexthops"`
 			}
-			for _, e := range entries {
-				if !e.Selected {
+			if err := env.VtyshJSON(ctx, r.Name, "show ip route json", &routes); err != nil {
+				return nil, fmt.Sprintf("%s: its routing table could not be read (%v), so where "+
+					"its traffic actually goes could not be established", r.Name, err)
+			}
+			for prefix, entries := range routes {
+				if !alt[prefix] || !routableTEDestination(env, prefix) {
 					continue
 				}
-				for _, nh := range e.Nexthops {
-					// Either way of naming the slow link counts. `ip route
-					// 2.0.0.0/8 <slow neighbour>` puts the neighbour's address
-					// in "ip"; `ip route 2.0.0.0/8 <slow interface>` puts
-					// nothing there at all and only names the interface, and
-					// reading the address alone let that second form send the
-					// traffic over exactly the link the question asks it to
-					// avoid while the check reported the forwarding correct.
-					//
-					// The interface is read from the resolved next hop, so a
-					// static route pointed at some far address that recurses
-					// over the slow link is caught by the same test.
-					if !isSlow[nh.IP] && !slowIf[r.Name][nh.Iface] {
+				for _, e := range entries {
+					if !e.Selected {
 						continue
 					}
-					via = append(via, fmt.Sprintf("%s on %s (%s)", prefix, r.Name, e.Protocol))
-					flagged[prefix] = true
-					break
+					for _, nh := range e.Nexthops {
+						// Either way of naming the slow link counts. `ip route
+						// 2.0.0.0/8 <slow neighbour>` puts the neighbour's address
+						// in "ip"; `ip route 2.0.0.0/8 <slow interface>` puts
+						// nothing there at all and only names the interface, and
+						// reading the address alone let that second form send the
+						// traffic over exactly the link the question asks it to
+						// avoid while the check reported the forwarding correct.
+						//
+						// The interface is read from the resolved next hop, so a
+						// static route pointed at some far address that recurses
+						// over the slow link is caught by the same test.
+						if !isSlow[nh.IP] && !slowIf[r.Name][nh.Iface] {
+							continue
+						}
+						via = append(via, fmt.Sprintf("%s on %s (%s)", prefix, r.Name, e.Protocol))
+						flagged[prefix] = true
+						break
+					}
 				}
 			}
 		}

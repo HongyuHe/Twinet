@@ -95,7 +95,8 @@ func (p BenchmarkPlan) Validate() error {
 				return fmt.Errorf("%s has an incomplete expected check", digest)
 			}
 			switch check.Status {
-			case grade.StatusPass, grade.StatusFail, grade.StatusPartial, grade.StatusSkipped, grade.StatusNotApplicable:
+			case grade.StatusPass, grade.StatusFail, grade.StatusPartial, grade.StatusSkipped,
+				grade.StatusNotApplicable, grade.StatusUnsupported:
 			default:
 				return fmt.Errorf("%s has invalid expected check status %q", digest, check.Status)
 			}

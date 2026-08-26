@@ -606,10 +606,24 @@ func executeScheduledCheck(ctx context.Context, job scheduledCheck, opts RunOpti
 	}
 	env.Args = job.spec.Args
 	env.infraSeen = &infraTracker{}
+	env.capabilitySeen = &capabilityTracker{}
 	env.liveState = job.check.LiveObservations
 	env.trace = job.trace
 	res := runCheck(cctx, job.check, &env)
 
+	// A capability refusal seen anywhere inside the check overrides a verdict
+	// the check reached anyway. A check written against FRR's CLI that quietly
+	// treats "this NOS has no such command" as "the student did not configure
+	// it" is the mixed-vendor version of scoring an outage as a zero, and the
+	// same rule applies: what could not be asked is not evidence.
+	if refusal := env.capabilitySeen.refusal(); refusal != nil &&
+		res.Status != StatusError && res.Status != StatusUnsupported {
+		res = Unsupported(job.spec.Check, refusal)
+	}
+	if reduced := env.capabilitySeen.reductions(); len(reduced) > 0 &&
+		res.Status != StatusUnsupported {
+		res.Reduced = reduced
+	}
 	if fail := env.infraSeen.failure(); fail != nil && res.Status != StatusError {
 		res = Errored(job.spec.Check, fail)
 	}

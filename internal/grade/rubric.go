@@ -518,12 +518,14 @@ func unmetDependency(q QuestionSpec, earned map[string]float64) string {
 // score independent of completion order.
 func questionResult(q QuestionSpec, results []Result) QuestionResult {
 	qr := QuestionResult{ID: q.ID, Title: q.Title, Points: q.Points, Results: results}
-	var broken []string
+	var broken, unsupported []string
 	inapplicable := 0
 	for _, result := range results {
 		switch result.Status {
 		case StatusError:
 			broken = append(broken, result.Check)
+		case StatusUnsupported:
+			unsupported = append(unsupported, result.Check)
 		case StatusNotApplicable:
 			inapplicable++
 		}
@@ -534,21 +536,60 @@ func questionResult(q QuestionSpec, results []Result) QuestionResult {
 		awarded = qr.Awarded / q.Points
 	}
 	qr.Status = statusFor(awarded)
+	var notes []string
+	// A verdict reached from less evidence than the check was designed around
+	// is worth a mark only if somebody knows it was. A failure needs no such
+	// caveat -- the missing strand could only have made it worse.
+	var reduced []string
+	for _, result := range results {
+		if len(result.Reduced) == 0 || result.Score <= 0 {
+			continue
+		}
+		for _, why := range result.Reduced {
+			reduced = append(reduced, result.Check+": "+why)
+		}
+	}
+	if len(reduced) > 0 {
+		sort.Strings(reduced)
+		qr.NeedsReview = true
+		notes = append(notes, fmt.Sprintf(
+			"%d check(s) scored from reduced evidence (%s)", len(reduced), strings.Join(reduced, "; ")))
+	}
 	if len(broken) > 0 {
 		sort.Strings(broken)
 		qr.NeedsReview = true
-		qr.Note = fmt.Sprintf("%d check(s) could not run (%s); this question needs a human before the mark stands",
-			len(broken), strings.Join(broken, ", "))
+		notes = append(notes, fmt.Sprintf(
+			"%d check(s) could not run (%s); this question needs a human before the mark stands",
+			len(broken), strings.Join(broken, ", ")))
 		if len(broken) == len(q.Checks) {
 			// Nothing about this question was assessed; it is not a zero.
 			qr.Status = StatusError
 		}
 	}
-	if len(broken)+inapplicable == len(q.Checks) && inapplicable > 0 {
+	// A capability the device's NOS never had is not a student mistake and not
+	// a grader malfunction, but it does shrink what this mark rests on. Saying
+	// so is what keeps the smaller denominator from being invisible.
+	if len(unsupported) > 0 {
+		sort.Strings(unsupported)
+		qr.NeedsReview = true
+		notes = append(notes, fmt.Sprintf(
+			"%d check(s) are not supported by the network operating system of this AS (%s), so "+
+				"this mark rests on the remaining check(s)",
+			len(unsupported), strings.Join(unsupported, ", ")))
+		if len(unsupported)+len(broken) == len(q.Checks) {
+			qr.Status = StatusUnsupported
+		}
+	}
+	if len(broken)+len(unsupported)+inapplicable == len(q.Checks) && inapplicable > 0 &&
+		len(unsupported) == 0 {
 		qr.NeedsReview = true
 		qr.Status = StatusError
-		qr.Note = fmt.Sprintf("none of the %d check(s) apply to this AS, so the question was "+
-			"not assessed; the rubric does not fit this topology", len(q.Checks))
+		notes = append(notes, fmt.Sprintf(
+			"none of the %d check(s) apply to this AS, so the question was "+
+				"not assessed; the rubric does not fit this topology", len(q.Checks)))
+	}
+	if len(notes) > 0 {
+		qr.Note = strings.Join(notes, "; ")
 	}
 	return qr
 }
@@ -584,7 +625,8 @@ func awardFor(q QuestionSpec, results []Result) float64 {
 		if w == 0 {
 			w = 1
 		}
-		if results[i].Status == StatusError || results[i].Status == StatusNotApplicable {
+		if results[i].Status == StatusError || results[i].Status == StatusNotApplicable ||
+			results[i].Status == StatusUnsupported {
 			continue
 		}
 		weightSum += w

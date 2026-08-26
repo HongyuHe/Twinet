@@ -15,6 +15,7 @@ import (
 
 	"github.com/HongyuHe/twinet/internal/mcast"
 	"github.com/HongyuHe/twinet/internal/model"
+	"github.com/HongyuHe/twinet/internal/nos"
 )
 
 // Checks for the advanced-networks course's multicast exercise.
@@ -36,21 +37,25 @@ func init() {
 		Name:     "multicast.pim_enabled",
 		Describe: "PIM runs on every router interface, and IGMP on the host-facing ones",
 		Run:      checkPIMEnabled,
+		Requires: []nos.Feature{nos.FeatureMulticast},
 	})
 	Register(&Check{
 		Name:     "multicast.rendezvous_point",
 		Describe: "every router agrees on the rendezvous point for the group range",
 		Run:      checkRendezvousPoint,
+		Requires: []nos.Feature{nos.FeatureMulticast},
 	})
 	Register(&Check{
 		Name:     "multicast.delivery",
 		Describe: "a packet sent to a joined group reaches the host that joined it, over a tree",
 		Run:      checkMulticastDelivery,
+		Requires: []nos.Feature{nos.FeatureMulticast},
 	})
 	Register(&Check{
 		Name:     "multicast.no_flooding",
 		Describe: "a host that did not join the group does not receive it",
 		Run:      checkMulticastNoFlooding,
+		Requires: []nos.Feature{nos.FeatureMulticast},
 	})
 }
 

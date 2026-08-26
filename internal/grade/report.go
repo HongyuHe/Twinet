@@ -54,6 +54,16 @@ const (
 	// property nobody established. The check is left out of the weighting, so
 	// the question's marks rest on the checks that could be asked.
 	StatusNotApplicable Status = "not_applicable"
+	// StatusUnsupported means the network operating system the device runs
+	// cannot answer this check at all.
+	//
+	// It is neither the grader breaking nor the student being wrong: a BIRD
+	// router has no RPKI cache table and no `show running-config`, so a check
+	// phrased in those terms has nothing to observe. Like StatusError it is
+	// excluded from the weighting -- a student is not marked down for a
+	// capability their NOS never had -- and it always marks the question for
+	// review, so the smaller denominator is visible rather than silent.
+	StatusUnsupported Status = "unsupported"
 )
 
 // Evidence is machine-readable proof of what was observed.
@@ -79,6 +89,15 @@ type Result struct {
 	Evidence Evidence `json:"evidence,omitempty"`
 	Err      string   `json:"error,omitempty"`
 	Duration string   `json:"duration,omitempty"`
+	// Reduced names strands of evidence this check could not gather because
+	// the device's NOS does not express them.
+	//
+	// The check still reached a verdict from what it could see, which is the
+	// right thing to do -- a BIRD router really does forward packets and the
+	// kernel really does say where. But a pass reached from less evidence than
+	// the check was designed around is not the same pass, and saying so is
+	// what stops a mixed-vendor lab quietly lowering the bar.
+	Reduced []string `json:"reduced_evidence,omitempty"`
 }
 
 // Passed reports whether the result earned full marks.
@@ -126,6 +145,21 @@ func Errored(check string, err error) Result {
 func NotApplicable(check, why string) Result {
 	return Result{Check: check, Status: StatusNotApplicable, Score: 0,
 		Evidence: Evidence{Observed: why}}
+}
+
+// Unsupported builds a result recording that the device's NOS cannot answer
+// this check.
+//
+// The reason is carried in both places on purpose: as evidence, so the student
+// can see which capability was missing, and as an error string, so a report
+// consumer that only looks at Err still learns the question was not fully
+// assessed. It is never a zero and never silently absent.
+func Unsupported(check string, err error) Result {
+	if err == nil {
+		err = fmt.Errorf("the network operating system of this device does not support it")
+	}
+	return Result{Check: check, Status: StatusUnsupported, Score: 0, Err: err.Error(),
+		Evidence: Evidence{Observed: err.Error()}}
 }
 
 // QuestionResult aggregates the checks belonging to one assignment question.
@@ -329,6 +363,8 @@ func (r *Report) Text() string {
 			mark = "-"
 		case StatusError:
 			mark = "!"
+		case StatusUnsupported:
+			mark = "ns"
 		}
 		fmt.Fprintf(&b, "[%-2s] %-8s %-42s %.2f / %.2f\n", mark, q.ID, q.Title, q.Awarded, q.Points)
 		if q.Skipped != "" {
@@ -359,6 +395,9 @@ func (r *Report) Text() string {
 }
 
 func describe(r Result) string {
+	if r.Status == StatusUnsupported {
+		return "not supported by this NOS: " + r.Err
+	}
 	if r.Err != "" {
 		return "could not run: " + r.Err
 	}

@@ -11,6 +11,7 @@ import (
 
 	"github.com/HongyuHe/twinet/internal/model"
 	"github.com/HongyuHe/twinet/internal/netstate"
+	"github.com/HongyuHe/twinet/internal/nos"
 	rt "github.com/HongyuHe/twinet/internal/runtime"
 )
 
@@ -79,6 +80,14 @@ func (e *stateBatchExecutor) ensure(ctx context.Context) error {
 	return nil
 }
 
+// stateCommands asks the device's own provider which native commands its
+// survey will issue.
+//
+// It used to be a switch over NOS names in this package, which meant a new
+// provider silently fell through to "no commands" and quietly lost the
+// coalescing -- or worse, that grading and the provider disagreed about which
+// commands a query implies. The provider owns its CLI; the observer only needs
+// the list.
 func stateCommands(device *model.Device, query netstate.Query) [][]string {
 	if device == nil {
 		return nil
@@ -94,34 +103,8 @@ func stateCommands(device *model.Device, query netstate.Query) [][]string {
 			[]string{"sysctl", "-n", "net.ipv6.conf.all.forwarding"},
 		)
 	}
-	switch device.EffectiveNOS() {
-	case model.DefaultNOS:
-		if query.Has(netstate.QueryBGPSessions) {
-			commands = append(commands, []string{"vtysh", "-c", "show ip bgp summary json"})
-		}
-		if query.Has(netstate.QueryBGPRIB) {
-			commands = append(commands, []string{"vtysh", "-c", "show ip bgp json"})
-		}
-		if query.Has(netstate.QueryOSPF) {
-			commands = append(commands, []string{"vtysh", "-c", "show ip ospf neighbor json"})
-		}
-		if query.Has(netstate.QueryPolicy) {
-			commands = append(commands, []string{"vtysh", "-c", "show running-config"})
-		}
-	case "bird":
-		const socket = "/run/bird.ctl"
-		if query.Has(netstate.QueryBGPSessions) {
-			commands = append(commands, []string{"birdc", "-r", "-s", socket, "show", "protocols", "all"})
-		}
-		if query.Has(netstate.QueryBGPRIB) {
-			commands = append(commands, []string{"birdc", "-r", "-s", socket, "show", "route", "all"})
-		}
-		if query.Has(netstate.QueryOSPF) {
-			commands = append(commands, []string{"birdc", "-r", "-s", socket, "show", "ospf", "neighbors"})
-		}
-		if query.Has(netstate.QueryPolicy) {
-			commands = append(commands, []string{"cat", "/etc/bird/bird.conf"})
-		}
+	if provider, err := nos.Resolve(device); err == nil {
+		commands = append(commands, provider.StateCommands(device, query)...)
 	}
 	return uniqueCommands(commands)
 }

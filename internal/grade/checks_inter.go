@@ -14,6 +14,7 @@ import (
 
 	"github.com/HongyuHe/twinet/internal/model"
 	"github.com/HongyuHe/twinet/internal/netstate"
+	"github.com/HongyuHe/twinet/internal/nos"
 )
 
 // This file registers the checks that grade the inter-domain half of the
@@ -347,21 +348,40 @@ func checkIBGPFullMesh(ctx context.Context, env *Env) Result {
 // neighbour it has, so each session has to carry a message while the check is
 // watching. It disturbs nothing: the peer re-sends routes the receiver already
 // has.
+//
+// How to ask belongs to the device's provider. Spelling it as vtysh here sent
+// no message at all on any other NOS, and a session whose counters had
+// therefore not moved reads to the check below as one held open by a timer and
+// carrying nothing -- a specific, damning verdict about a session that was
+// perfectly alive and simply never asked.
 func refreshExternal(ctx context.Context, env *Env, byRouter map[string][]string) {
 	var wg sync.WaitGroup
 	for router, peers := range byRouter {
 		if len(peers) == 0 {
 			continue
 		}
+		device, ok := env.Device(router)
+		if !ok {
+			continue
+		}
+		provider, err := nos.Resolve(device)
+		if err != nil {
+			continue
+		}
+		commands := provider.RefreshBGP(device, peers)
+		if len(commands) == 0 {
+			env.NoteUnobservable(device.ID,
+				"a way to ask a neighbour to re-send its table, so this session's liveness "+
+					"rests on its reported state alone")
+			continue
+		}
 		wg.Add(1)
-		go func(router string, peers []string) {
+		go func(router string, commands [][]string) {
 			defer wg.Done()
-			args := []string{"vtysh"}
-			for _, p := range peers {
-				args = append(args, "-c", "clear bgp "+p+" soft in")
+			for _, command := range commands {
+				_, _ = env.Probe(ctx, model.DeviceID(env.AS, router), command)
 			}
-			_, _ = env.Probe(ctx, model.DeviceID(env.AS, router), args)
-		}(router, peers)
+		}(router, commands)
 	}
 	wg.Wait()
 	select {
@@ -815,6 +835,19 @@ func overriddenByStatic(ctx context.Context, env *Env, routers []*model.Device) 
 				}
 			}
 
+			// FRR labels a kernel route with the daemon that installed it, so
+			// its own table and the kernel agree about which protocol chose a
+			// path. BIRD installs everything under one identity, so "a static
+			// route is overriding the BGP decision" has no form there; the
+			// kernel evidence above and below still answers where the packet
+			// goes, and the strand that could not be gathered is recorded
+			// rather than passed over.
+			if !env.UsesDefaultNOS(r.Name) {
+				env.NoteUnobservable(r.ID,
+					"which protocol installed each kernel route, so a static or connected "+
+						"route shadowing the BGP decision could not be looked for")
+				return
+			}
 			var routes ospfRouteJSON
 			if err := env.VtyshJSON(ctx, r.Name, "show ip route json", &routes); err != nil {
 				return
@@ -1904,6 +1937,14 @@ func sourceRelationship(e bgpRoute, selfAS int, relOf map[string]model.Relations
 }
 
 func checkNoForbiddenOSPF(ctx context.Context, env *Env) Result {
+	// The assignment forbids a class of FRR configuration statement, and this
+	// check reads the running configuration to find it. There is no such text
+	// on another NOS, and an absence-based conclusion drawn from a file that
+	// was never going to contain the words is not evidence of anything.
+	if refusal := env.RequireDefaultNOS("config.no_forbidden_ospf",
+		"this check concludes from the absence of an FRR configuration statement"); refusal != nil {
+		return *refusal
+	}
 	// Every router, or none: this check concludes from what it does not find,
 	// so a router it could not read is a router whose forbidden statements it
 	// would also not have found.

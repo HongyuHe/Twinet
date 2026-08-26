@@ -462,20 +462,12 @@ func anyInSubnet(addrs []string, subnet string) bool {
 	return false
 }
 
-// ospfNeighborJSON is the shape of `show ip ospf neighbor json`.
-type ospfNeighborJSON struct {
-	Neighbors map[string][]struct {
-		NbrState  string `json:"nbrState"`
-		IfaceName string `json:"ifaceName"`
-		Converged string `json:"converged"`
-		// DeadTimerMsec is how long this neighbour has left before it is
-		// declared gone. Every hello resets it, so watching it is how a
-		// stopped conversation is told from a state nobody has revised yet.
-		DeadTimerMsec int64 `json:"routerDeadIntervalTimerDueMsec"`
-	} `json:"neighbors"`
-}
-
 // deadTimers reads every router's remaining dead time per interface.
+//
+// It reads the normalized adjacency table rather than FRR's own JSON: BIRD
+// publishes the same remaining dead time in its neighbour listing, and a
+// liveness test that only worked on one vendor would have refused every
+// interior question of an AS running the other.
 func deadTimers(ctx context.Context, env *Env) map[string]map[string]int64 {
 	out := map[string]map[string]int64{}
 	var mu sync.Mutex
@@ -484,20 +476,21 @@ func deadTimers(ctx context.Context, env *Env) map[string]map[string]int64 {
 		wg.Add(1)
 		go func(r *model.Device) {
 			defer wg.Done()
-			var doc ospfNeighborJSON
-			if err := env.VtyshJSON(ctx, r.Name, "show ip ospf neighbor json", &doc); err != nil {
+			observed, err := env.RouterState(ctx, r.Name, netstate.QueryOSPF)
+			if err != nil {
 				return
 			}
 			byIface := map[string]int64{}
-			for _, ns := range doc.Neighbors {
-				for _, n := range ns {
-					iface := n.IfaceName
-					if i := strings.IndexByte(iface, ':'); i >= 0 {
-						iface = iface[:i]
-					}
-					if v, ok := byIface[iface]; !ok || n.DeadTimerMsec > v {
-						byIface[iface] = n.DeadTimerMsec
-					}
+			for _, peer := range observed.OSPF {
+				if !peer.Known(netstate.FieldDeadTimer) {
+					continue
+				}
+				iface := peer.Interface
+				if i := strings.IndexByte(iface, ':'); i >= 0 {
+					iface = iface[:i]
+				}
+				if v, ok := byIface[iface]; !ok || peer.DeadTimerMsec > v {
+					byIface[iface] = peer.DeadTimerMsec
 				}
 			}
 			mu.Lock()
@@ -565,12 +558,18 @@ type ospfIfaceJSON struct {
 // what keeps the test from calling a slow-hello adjacency dead.
 //
 // An interval that cannot be read is taken to be the default, which makes the
-// window shorter and the test stricter -- never the other way round.
+// window shorter and the test stricter -- never the other way round. The same
+// applies to a NOS that does not publish it: a router whose interval cannot be
+// asked for is watched for the default rather than tainted, because assuming
+// the shortest interval can only tighten the test.
 func helloIntervals(ctx context.Context, env *Env) map[string]map[string]int64 {
 	out := map[string]map[string]int64{}
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	for _, r := range env.Routers() {
+		if !env.UsesDefaultNOS(r.Name) {
+			continue
+		}
 		wg.Add(1)
 		go func(r *model.Device) {
 			defer wg.Done()
@@ -868,6 +867,15 @@ type ospfRouteJSON map[string][]struct {
 }
 
 func checkOSPFSubnets(ctx context.Context, env *Env) Result {
+	// Intra-area against redistributed-external is the distinction this check
+	// turns on, and it is read out of FRR's own OSPF route classes. BIRD
+	// publishes the same distinction in a form Twinet does not normalize yet,
+	// so the question is declared unassessable there rather than answered from
+	// a table that cannot tell the two apart.
+	if refusal := env.RequireDefaultNOS("ospf.subnets_advertised",
+		"Twinet does not yet normalize their intra-area versus external OSPF route classes"); refusal != nil {
+		return *refusal
+	}
 	routers := env.Routers()
 	if len(routers) == 0 {
 		return Errored("ospf.subnets_advertised", fmt.Errorf("AS %d has no routers", env.AS))
@@ -1709,7 +1717,7 @@ func checkECMP(ctx context.Context, env *Env) Result {
 				hops = append(hops, installedHop{iface: nh.Device, ip: nh.Address})
 			}
 		}
-		if env.ShadowBatches {
+		if env.ShadowBatches && env.UsesDefaultNOS(router) {
 			legacy, legacyOther, err := legacyECMPHops(ctx, env, router, target)
 			if err != nil {
 				return nil, fmt.Errorf("shadow read of %s's legacy route view: %w", router, err)
