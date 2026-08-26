@@ -590,6 +590,28 @@ exemption is a container this pass rebuilt from its image and replayed the store
 into, where the namespace is new and its contents are known because the
 deployment just put them there.
 
+**This is established by the capture itself, not only by a deployment.** A
+deployment is one of several things that write to the state store. The
+durability timer captures every student-owned device every capture interval; a
+destructive apply captures before it replaces anything; a destroy captures
+before it removes the containers; a fresh state export captures before handing a
+device to another node; recovery captures after a rollback. Each of those builds
+an engine for the purpose, so none of them has observed anything and none of
+them holds a deployment's findings — and on a live node it is usually the timer,
+not a deployment, that reaches a restarted router first. Every capture therefore
+establishes the same two facts before it writes: the namespace the device was
+last configured in, read from the node's own record, and the identity of the one
+it is in now. A namespace that is demonstrably not the recorded one, an identity
+that cannot be read, and a container that is not running are all treated the
+same way, because none of them is evidence that the namespace survived. A device
+with no baseline has to prove continuity against what is saved before it may
+overwrite it, which is also what happens if the record itself cannot be read —
+losing the record is not a way through. The identity is resolved *after* the
+namespace has been read, so a task replaced during the reading invalidates it
+rather than being credited with it. Configuration files are captured either
+way: they are on a filesystem, they survived, and withholding them would be a
+different way of losing the same work.
+
 Every device left in that state is reported. The node publishes them in its
 apply response as `unproven_namespaces`, keyed by device with the reason for
 each, and `twinet deploy` prints one `UNPROVEN NAMESPACE:` line per device and

@@ -32,6 +32,10 @@ type namespaceAwareRuntime struct {
 	// with somebody else's state.
 	tunnels map[string]string
 	ports   map[string]string
+	// frr is the routing configuration vtysh hands back. It is on a
+	// filesystem, it survives a namespace being replaced, and a capture must
+	// go on storing it when the namespace-backed snapshots are withheld.
+	frr map[string]string
 	// onProbe runs when a container's namespace is read, so a test can restart
 	// a device in the middle of the proof that brackets that reading.
 	onProbe func(container string)
@@ -69,6 +73,15 @@ func (r *namespaceAwareRuntime) setPorts(name, body string) {
 		r.ports = map[string]string{}
 	}
 	r.ports[name] = body
+}
+
+func (r *namespaceAwareRuntime) setFRR(name, body string) {
+	r.nsMu.Lock()
+	defer r.nsMu.Unlock()
+	if r.frr == nil {
+		r.frr = map[string]string{}
+	}
+	r.frr[name] = body
 }
 
 func (*namespaceAwareRuntime) PullImage(context.Context, string, rt.PullPolicy) error { return nil }
@@ -152,6 +165,15 @@ func (r *namespaceAwareRuntime) Exec(ctx context.Context, c string, cmd rt.ExecC
 				moved(c)
 			}
 			return rt.ExecResult{Stdout: body}, nil
+		case addrCapture:
+			// What a capture reads is the second half of what the proof
+			// reads, out of the same namespace. A fake that let the two
+			// disagree could pass a test the kernel would fail.
+			r.nsMu.Lock()
+			body := r.contents[c]
+			r.nsMu.Unlock()
+			_, addrs := splitNamespaceProbe(body)
+			return rt.ExecResult{Stdout: addrs}, nil
 		case tunnelCapture:
 			r.nsMu.Lock()
 			defer r.nsMu.Unlock()
@@ -160,6 +182,13 @@ func (r *namespaceAwareRuntime) Exec(ctx context.Context, c string, cmd rt.ExecC
 			r.nsMu.Lock()
 			defer r.nsMu.Unlock()
 			return rt.ExecResult{Stdout: r.ports[c]}, nil
+		}
+	}
+	if len(cmd.Cmd) == 3 && cmd.Cmd[0] == "vtysh" {
+		r.nsMu.Lock()
+		defer r.nsMu.Unlock()
+		if body, ok := r.frr[c]; ok {
+			return rt.ExecResult{Stdout: body}, nil
 		}
 	}
 	return r.observedRuntime.Exec(ctx, c, cmd)

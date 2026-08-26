@@ -377,6 +377,24 @@ reached students, and each motivated a permanent test.
    quietly stopped being backed up is not something anybody can be expected to
    infer.
 
+   Where the guard actually lives. All of the above was armed by a build: a
+   deployment observed the node, found what had moved, and the capture at the
+   end of that pass consulted what it found. Nothing else that captures does any
+   of that, and there are five other things that capture. The durability timer
+   runs every capture interval; a destructive apply captures before it replaces
+   anything; a destroy captures before it removes the containers; a fresh state
+   export captures before handing a device to another node; recovery captures
+   after a rollback. Each builds an engine for the purpose and calls the capture
+   API directly, so each arrived at a restarted router's empty namespace with
+   nothing to consult and filed it over the student's addressing -- and on a
+   live node the timer is the one that gets there first, because it runs whether
+   or not anything has gone wrong. The check now belongs to the capture: before
+   it writes a namespace-backed snapshot it reads the recorded namespace and the
+   live identity itself, withholds what it cannot vouch for, and proves
+   continuity for anything that has no baseline. The fresh export, which read
+   the containers itself and never went through the capture API at all, goes
+   through it now.
+
 10. **A release gate that answered yes without looking.** `make ci` printed
     "all CI gates passed" while skipping the lint and the shell check whenever
     their tools were absent, which on the development machine was always.

@@ -593,6 +593,12 @@ func (e *Engine) captureSelected(ctx context.Context, top *model.Topology, store
 
 	saved := 0
 	var problems []string
+	// After the readings and before anything is written. A device that
+	// restarted between the two is caught, because the identity is resolved
+	// once the namespace has already been read; a device that restarts after
+	// this does not matter, because what was read came out of the namespace
+	// this proved.
+	problems = append(problems, e.ensureCaptureSafety(ctx, top, store, devices)...)
 	for i, d := range devices {
 		err := captureErrs[i]
 		if err != nil && !errors.Is(err, ErrNotRunning) {

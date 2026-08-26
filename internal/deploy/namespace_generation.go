@@ -336,14 +336,19 @@ func modelledPlatformAddresses(d *model.Device) []string {
 // Every namespace-backed kind is read, not the ones this device's kind is
 // captured for. What is in the store is what a restore would replay and what a
 // capture would overwrite, whatever the device is called now.
-func (e *Engine) savedNamespaceObjects(top *model.Topology, d *model.Device,
+//
+// The store is a parameter rather than the engine's own, because the caller
+// that needs this most is a capture, and the store a capture must be judged
+// against is the one it is about to write. An engine assembled only to capture
+// need not have been given the same one.
+func savedNamespaceObjects(store *state.Store, top *model.Topology, d *model.Device,
 ) (map[state.Kind][]string, error) {
 	out := map[state.Kind][]string{}
-	if e.State == nil || top == nil || d == nil || !studentOwned(top, d) {
+	if store == nil || top == nil || d == nil || !studentOwned(top, d) {
 		return out, nil
 	}
 	for _, kind := range namespaceBackedKinds {
-		facts, err := e.savedNamespaceFacts(top.Name, d.ID, kind)
+		facts, err := savedNamespaceFacts(store, top.Name, d.ID, kind)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", kind, err)
 		}
@@ -367,10 +372,10 @@ func (e *Engine) savedNamespaceObjects(top *model.Topology, d *model.Device,
 //
 // A missing snapshot is a legitimate none: the device is new, or nobody has
 // configured anything on it yet. Anything else fails closed.
-func (e *Engine) savedNamespaceFacts(lab, device string, kind state.Kind) ([]string, error) {
-	snapshot, err := e.State.Current(lab, device, kind)
+func savedNamespaceFacts(store *state.Store, lab, device string, kind state.Kind) ([]string, error) {
+	snapshot, err := store.Current(lab, device, kind)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) && !e.State.Has(lab, device, kind) {
+		if errors.Is(err, os.ErrNotExist) && !store.Has(lab, device, kind) {
 			return nil, nil
 		}
 		return nil, err
@@ -387,10 +392,10 @@ func (e *Engine) savedNamespaceFacts(lab, device string, kind state.Kind) ([]str
 // already believes healthy is not re-read at all -- so a student's router that
 // restarted into an empty namespace last week passes every one of those checks
 // and would have its emptiness recorded as the namespace its work was done in.
-func (e *Engine) provenNamespaceContinuity(ctx context.Context, top *model.Topology,
-	d *model.Device,
+func (e *Engine) provenNamespaceContinuity(ctx context.Context, store *state.Store,
+	top *model.Topology, d *model.Device,
 ) (bool, string) {
-	saved, err := e.savedNamespaceObjects(top, d)
+	saved, err := savedNamespaceObjects(store, top, d)
 	if err != nil {
 		return false, fmt.Sprintf("its saved network state could not be read, so there is "+
 			"nothing trustworthy to compare its namespace against: %v", err)
@@ -551,7 +556,7 @@ func (e *Engine) settleNamespaceBaselines(ctx context.Context, top *model.Topolo
 	proven := make([]runtime.NetnsIdentity, len(candidates))
 	reasons := make([]string, len(candidates))
 	_, _, ctxErr := e.runBounded(ctx, len(candidates), func(i int) error {
-		proven[i], reasons[i] = e.proveNamespaceBaseline(ctx, top, candidates[i].device)
+		proven[i], reasons[i] = e.proveNamespaceBaseline(ctx, e.State, top, candidates[i].device)
 		return nil
 	})
 	if ctxErr != nil {
@@ -577,14 +582,14 @@ func (e *Engine) settleNamespaceBaselines(ctx context.Context, top *model.Topolo
 // would attribute one namespace's contents to another's identity. So the
 // identity is resolved from the backend before and after, and both readings
 // have to agree before anything is recorded.
-func (e *Engine) proveNamespaceBaseline(ctx context.Context, top *model.Topology,
-	d *model.Device,
+func (e *Engine) proveNamespaceBaseline(ctx context.Context, store *state.Store,
+	top *model.Topology, d *model.Device,
 ) (runtime.NetnsIdentity, string) {
 	before, err := runtime.NetnsIdentityOf(ctx, e.Runtime, d.Container)
 	if err != nil || !before.Known() {
 		return runtime.NetnsIdentity{}, "its network namespace identity could not be read"
 	}
-	proven, reason := e.provenNamespaceContinuity(ctx, top, d)
+	proven, reason := e.provenNamespaceContinuity(ctx, store, top, d)
 	if !proven {
 		return runtime.NetnsIdentity{}, reason
 	}
@@ -683,6 +688,133 @@ func (e *Engine) recordDeviceNamespace(ctx context.Context, tracker *observation
 // from the store when a device's namespace is in doubt, and these are the
 // snapshots a namespace has to be shown to still hold before it is trusted.
 var namespaceBackedKinds = []state.Kind{state.KindAddrs, state.KindTunnels, state.KindOVS}
+
+// ensureCaptureSafety decides, for devices that are about to be captured,
+// whether the namespace each of them is using is the one its saved state came
+// out of.
+//
+// Everything above establishes this during a deployment, and a deployment is
+// not the only thing that captures. Periodic durability captures on a timer;
+// a destructive boundary captures before it replaces anything; a destroy
+// captures before it removes the containers; recovery captures after a
+// rollback. Every one of those builds an Engine for the purpose and calls
+// straight into the capture API, so none of them has observed anything, none
+// of them holds a build's findings, and the guard those findings feed was
+// simply not armed. The check that decides whether a student's work is about
+// to be overwritten was running only on the path that had already done the
+// work of finding out.
+//
+// So it is established here instead, from the two things a capture always has:
+// the namespace recorded on disk by whichever pass last configured the device,
+// and the identity of the one it is in now. A device whose namespace has been
+// replaced has its namespace-backed snapshots withheld; a device that never
+// had a baseline has to prove continuity against what is saved before it may
+// take one. Its configuration files are captured either way -- they are on a
+// filesystem, they survived, and they are still the student's work.
+//
+// A pass that already knows is not asked again: a device this engine found
+// with its state lost, or could not vouch for, keeps that finding. A device
+// this engine repaired and replayed keeps the baseline the configure step
+// recorded, and is re-proved against it here, which is what makes it
+// capturable again in the same pass.
+//
+// It is arranged so that losing the record is not a way through. A device with
+// no baseline -- because none was ever taken, or because the file holding them
+// could not be read -- has to prove continuity against what is saved before it
+// may overwrite it, which is the same answer by a longer route.
+func (e *Engine) ensureCaptureSafety(ctx context.Context, top *model.Topology,
+	store *state.Store, devices []*model.Device,
+) []string {
+	if e.Runtime == nil || top == nil || store == nil || len(devices) == 0 {
+		return nil
+	}
+	if !runtime.SupportsNetnsIdentity(e.Runtime) {
+		// A backend that cannot prove namespace identity does not hand a
+		// device a new namespace behind the deployment's back: it replaces the
+		// whole container, which the create path already restores through.
+		return nil
+	}
+	tracker, err := e.loadObservation(top.Name)
+	var problems []string
+	if err != nil {
+		// An observation that cannot be read is not the dangerous case it
+		// looks like. Every device becomes one with no baseline, so every one
+		// of them has to prove continuity against what is saved before it may
+		// overwrite it -- which is more work, and the same answer, for a
+		// device that really did restart.
+		//
+		// Reported unless it is the default root refusing an unprivileged
+		// process, which is the same exemption a destroy makes when it cannot
+		// remove that file: the record belongs to the agent, and a lab run
+		// without one has never had it.
+		tracker = e.newObservationTracker(top.Name)
+		if e.ObservationRoot != "" || !errors.Is(err, os.ErrPermission) {
+			problems = append(problems,
+				fmt.Sprintf("read the recorded network namespaces: %v", err))
+		}
+	}
+	baselines := make([]runtime.NetnsIdentity, len(devices))
+	settled := make([]bool, len(devices))
+	_, _, ctxErr := e.runBounded(ctx, len(devices), func(i int) error {
+		baselines[i] = e.settleCaptureSafety(ctx, top, store, devices[i], tracker)
+		settled[i] = true
+		return nil
+	})
+	for i, d := range devices {
+		if !settled[i] {
+			e.markNamespaceUnproven(d.ID, fmt.Sprintf("this capture was interrupted before it "+
+				"could establish what is in its network namespace: %v", ctxErr))
+			continue
+		}
+		if baselines[i].Known() {
+			tracker.bootstrapNamespace(d.ID, baselines[i])
+		}
+	}
+	if e.ObservationReadOnly {
+		return problems
+	}
+	if err := tracker.save(); err != nil &&
+		(e.ObservationRoot != "" || !errors.Is(err, os.ErrPermission)) {
+		// The capture itself is still safe -- every decision above was taken
+		// before this -- but a baseline that was proved and then not written is
+		// work the next capture has to do again, and a disk that will not take
+		// it is worth saying out loud.
+		problems = append(problems, fmt.Sprintf("record proven network namespaces: %v", err))
+	}
+	return problems
+}
+
+// settleCaptureSafety establishes one device's capture safety, and returns the
+// namespace identity to baseline it at if it earned one.
+func (e *Engine) settleCaptureSafety(ctx context.Context, top *model.Topology,
+	store *state.Store, d *model.Device, tracker *observationTracker,
+) runtime.NetnsIdentity {
+	if e.namespaceStateLost(d.ID) || e.namespaceUnproven(d.ID) {
+		// Already decided, by a build this engine ran or by a loss it is on
+		// its way to repair. Asking again could only weaken it.
+		return runtime.NetnsIdentity{}
+	}
+	recorded, known := tracker.namespace(d.ID)
+	if !known || !recorded.Known() {
+		identity, reason := e.proveNamespaceBaseline(ctx, store, top, d)
+		if !identity.Known() {
+			e.markNamespaceUnproven(d.ID, reason)
+			return runtime.NetnsIdentity{}
+		}
+		return identity
+	}
+	now, err := runtime.NetnsIdentityOf(ctx, e.Runtime, d.Container)
+	if err != nil || !now.Known() || !now.SameAs(recorded) {
+		// Fail closed on all three. A namespace that is demonstrably not the
+		// recorded one has lost what was in it; an identity that could not be
+		// read is not evidence that it survived; and a container that is not
+		// running lost its namespace when its task did. Being wrong here costs
+		// one deferred snapshot of state the store already holds. Being wrong
+		// the other way costs the only copy of it.
+		e.markNamespaceStateLost(d.ID)
+	}
+	return runtime.NetnsIdentity{}
+}
 
 // namespaceBackedKind reports whether a snapshot records what is in a network
 // namespace rather than what is on a filesystem.

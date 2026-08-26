@@ -258,6 +258,15 @@ func (s *Server) installImportedRecord(record state.Record) error {
 // while the source is reachable is precisely the stale-state migration failure
 // this boundary prevents; an explicit recovery path may request fresh=false
 // only after a source-loss decision is audited.
+//
+// It goes through the engine's capture API rather than reading the containers
+// itself, because that API is where a capture is checked against the namespace
+// the device's saved state came out of. Reading them here meant a device that
+// had restarted was exported as the empty namespace it came back into -- a
+// fresh capture is exactly the operation that overwrites the old one -- and the
+// destination then received that as the student's work. Selecting through the
+// same predicate periodic durability uses is part of it: what a fresh export
+// hands over must be what a capture is allowed to store.
 func (s *Server) captureBeforeExport(ctx context.Context, lab string, devices []string) error {
 	if s.rt == nil || s.store == nil {
 		return errors.New("this node cannot capture durable state")
@@ -274,6 +283,7 @@ func (s *Server) captureBeforeExport(ctx context.Context, lab string, devices []
 	for _, d := range devices {
 		want[d] = true
 	}
+	selected := make([]string, 0, len(want))
 	for id := range want {
 		d, ok := top.Device(id)
 		if !ok {
@@ -282,7 +292,7 @@ func (s *Server) captureBeforeExport(ctx context.Context, lab string, devices []
 		if d.Node != s.cfg.Node {
 			return fmt.Errorf("device %s is placed on %s, not source %s", id, d.Node, s.cfg.Node)
 		}
-		if renderModeForDevice(mode, ungraded, d) == render.ModeSolve {
+		if !capturesStudentState(top, mode, ungraded, d) {
 			continue
 		}
 		current, err := s.rt.Inspect(ctx, d.Container)
@@ -292,14 +302,16 @@ func (s *Server) captureBeforeExport(ctx context.Context, lab string, devices []
 		if current.State == rt.StateAbsent {
 			return fmt.Errorf("device %s is absent, so its state cannot be freshly captured", d.ID)
 		}
-		snaps, err := deploy.Capture(ctx, s.rt, d, lab, top.Hash)
-		if err != nil {
-			return fmt.Errorf("capture %s: %w", d.ID, err)
+		selected = append(selected, id)
+	}
+	sort.Strings(selected)
+	if len(selected) > 0 {
+		eng := &deploy.Engine{
+			Runtime: s.rt, Node: s.cfg.Node, Limiter: s.workLimiter(), State: s.store,
+			Renderer: renderer(top, render.ModePlatform, 0),
 		}
-		for _, sn := range snaps {
-			if _, err := s.store.Put(sn); err != nil {
-				return fmt.Errorf("store %s/%s: %w", d.ID, sn.Kind, err)
-			}
+		if _, err := eng.CaptureDevices(ctx, top, s.store, selected); err != nil {
+			return fmt.Errorf("capture %s: %w", lab, err)
 		}
 	}
 	if err := s.replicateDurableState(ctx, top); err != nil {

@@ -457,6 +457,8 @@ placement:
 		filepath.Join(work, "observed"))
 	assertContainerdBaselineSeesEveryNamespaceObject(t, ctx, runtime, teaching, top, device,
 		store, lab, filepath.Join(work, "observed"))
+	assertContainerdCaptureOutsideADeployRefusesAReplacedNamespace(t, ctx, runtime, teaching,
+		top, device, store, lab, filepath.Join(work, "observed"))
 	if err := engine.Destroy(ctx, lab); err != nil {
 		t.Fatal(err)
 	}
@@ -1184,6 +1186,121 @@ func assertContainerdBaselineSeesEveryNamespaceObject(t *testing.T, ctx context.
 	}
 	if reason := engine.UnprovenNamespaceDevices()[device.ID]; !strings.Contains(reason, vlan) {
 		t.Fatalf("the refusal did not name the missing VLAN %s: %q", vlan, reason)
+	}
+}
+
+// assertContainerdCaptureOutsideADeployRefusesAReplacedNamespace proves the
+// guard is on the capture rather than on the deployment that used to arm it.
+//
+// Every assertion above reaches the namespace check through a build: the
+// deployment observes the node, finds what moved, and the capture at the end of
+// the pass consults what it found. Nothing else that captures does any of that.
+// The durability timer, the boundary before a destructive apply, a destroy and
+// a fresh export each construct an engine for the purpose and call the capture
+// API directly, and on a real node the timer is the one that gets to a
+// restarted router first -- it runs every capture interval, and nothing has to
+// have gone wrong for it to run.
+//
+// So this restarts the task for real and then captures from an engine that has
+// never observed anything, which is what those callers hold.
+func assertContainerdCaptureOutsideADeployRefusesAReplacedNamespace(t *testing.T,
+	ctx context.Context, runtime rt.Runtime, engine *deploy.Engine, top *model.Topology,
+	device *model.Device, store *state.Store, lab, observedRoot string,
+) {
+	t.Helper()
+	loopback := modelledLoopback(t, device)
+	// Bring the store back into step with the namespace, so a baseline can be
+	// taken and the only thing that changes afterwards is the restart.
+	snaps, err := deploy.Capture(ctx, runtime, device, lab, top.Hash)
+	if err != nil {
+		t.Fatalf("saving %s: %v", device.ID, err)
+	}
+	for _, snap := range snaps {
+		if _, err := store.Put(snap); err != nil {
+			t.Fatalf("saving the %s of %s: %v", snap.Kind, device.ID, err)
+		}
+	}
+	requireSavedAddress(t, store, lab, device, loopback)
+	forgetContainerdNamespaces(t, observedRoot)
+	if !containerdNoOpDeploy(t, ctx, engine, top, device, "baselining before a restart") {
+		return
+	}
+	baseline, ok := recordedContainerdNamespace(t, observedRoot, device.ID)
+	if !ok {
+		t.Fatal("a router holding exactly its saved state was refused a baseline")
+	}
+
+	// The fault: pid 1 dies, containerd brings the task back, and the
+	// namespace it comes back into holds nothing at all.
+	if err := runtime.Stop(ctx, device.Container, 10*time.Second); err != nil {
+		t.Fatalf("stopping the router task: %v", err)
+	}
+	if err := runtime.Start(ctx, device.Container); err != nil {
+		t.Fatalf("restarting the router task: %v", err)
+	}
+	replaced, err := rt.NetnsIdentityOf(ctx, runtime, device.Container)
+	if err != nil {
+		t.Fatalf("proving the restarted router's namespace: %v", err)
+	}
+	if replaced.SameAs(baseline) {
+		t.Fatalf("the task came back in the namespace it left (%s); the fixture no longer "+
+			"reproduces the replacement", baseline)
+	}
+	t.Logf("router restarted out of %s into %s with a capture due", baseline, replaced)
+
+	// What the durability timer holds: a runtime, a node, a store, and nothing
+	// else. No build, no observation of this pass, no findings.
+	timer := &deploy.Engine{
+		Runtime: runtime, Node: engine.Node, State: store,
+		Renderer: engine.Renderer, ObservationRoot: observedRoot,
+	}
+	if _, err := timer.CaptureDevices(ctx, top, store, []string{device.ID}); err != nil {
+		t.Fatalf("capturing after the restart: %v", err)
+	}
+	requireSavedAddress(t, store, lab, device, loopback)
+	if _, err := store.Current(lab, device.ID, state.KindFRR); err != nil {
+		t.Fatalf("the same capture withheld the routing configuration, which is a file and "+
+			"survived the restart: %v", err)
+	}
+
+	// And the same capture with no baseline to compare against, which is what
+	// an upgraded node has for every device it has never configured. There the
+	// refusal has to be reported, because nothing else will say it.
+	forgetContainerdNamespaces(t, observedRoot)
+	unbaselined := &deploy.Engine{
+		Runtime: runtime, Node: engine.Node, State: store,
+		Renderer: engine.Renderer, ObservationRoot: observedRoot,
+	}
+	if _, err := unbaselined.CaptureDevices(ctx, top, store, []string{device.ID}); err != nil {
+		t.Fatalf("capturing after the restart with no baseline: %v", err)
+	}
+	requireSavedAddress(t, store, lab, device, loopback)
+	reason, reported := unbaselined.UnprovenNamespaceDevices()[device.ID]
+	if !reported || strings.TrimSpace(reason) == "" {
+		t.Fatalf("a capture that withheld a router's state did not report why: %q", reason)
+	}
+	// The reason is whichever part of the namespace it looked for first and did
+	// not find, which for a task that came back into an empty one is the
+	// wiring rather than the addressing on it.
+	t.Logf("the capture refused the restarted router: %s", reason)
+	if recorded, ok := recordedContainerdNamespace(t, observedRoot, device.ID); ok {
+		t.Fatalf("the empty namespace was recorded as the baseline anyway (%s)", recorded)
+	}
+}
+
+// requireSavedAddress insists the store still holds an address, in the
+// canonical form a restore replays.
+func requireSavedAddress(t *testing.T, store *state.Store, lab string, device *model.Device,
+	address string,
+) {
+	t.Helper()
+	snapshot, err := store.Current(lab, device.ID, state.KindAddrs)
+	if err != nil {
+		t.Fatalf("reading the saved addressing of %s: %v", device.ID, err)
+	}
+	if !strings.Contains(string(snapshot.Content), " lo "+address) {
+		t.Fatalf("the saved addressing of %s no longer holds %s:\n%s",
+			device.ID, address, snapshot.Content)
 	}
 }
 

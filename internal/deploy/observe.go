@@ -132,8 +132,8 @@ func (e *Engine) observationPath(lab string) string {
 	return filepath.Join(root, hex.EncodeToString(sum[:])+".json")
 }
 
-func (e *Engine) loadObservation(lab string) (*observationTracker, error) {
-	tracker := &observationTracker{
+func (e *Engine) newObservationTracker(lab string) *observationTracker {
+	return &observationTracker{
 		e:    e,
 		path: e.observationPath(lab),
 		state: nodeObservedState{
@@ -145,6 +145,10 @@ func (e *Engine) loadObservation(lab string) (*observationTracker, error) {
 			Namespaces: map[string]runtime.NetnsIdentity{},
 		},
 	}
+}
+
+func (e *Engine) loadObservation(lab string) (*observationTracker, error) {
+	tracker := e.newObservationTracker(lab)
 	raw, err := os.ReadFile(tracker.path)
 	if os.IsNotExist(err) {
 		return tracker, nil
