@@ -9,10 +9,12 @@ metadata:
     mini-Internet's l3_routers_tier1_and_stub.txt simplification.
 
 routers:
-  # COS-461 submissions are FRR command files, so BIRD is intentionally used
-  # only on the two staff-operated transit references (AS 1 and AS 2). This
-  # exercises mixed-NOS peering without asking a student submission to use
-  # syntax the archive format cannot represent.
+  # BIRD is used on the two staff-operated transit references (AS 1 and AS 2),
+  # which exercises mixed-NOS peering against unchanged FRR student work. The
+  # COS-461 rubric asks about origin validation and FRR configuration text, so
+  # this course keeps its students on FRR; a student AS may declare BIRD, and
+  # the questions its NOS cannot answer are reported as unsupported rather than
+  # scored. See docs/03_topology_model.md.
   ALL:
     id: 1
     nos: bird

@@ -157,6 +157,17 @@ manifest validation rejects a router/NOS request the provider cannot support.
 BIRD support is intentionally narrower than FRR's: it does not claim Twinet
 support for MPLS/LDP, VRF, multicast, DHCP, RPKI, or tunnels through BIRD.
 
+A provider owns rendering, apply/readiness, the native commands its
+operational-state survey issues, save/restore, configuration capture and load,
+and the route refresh grading uses as a session-liveness witness. Nothing
+outside `internal/nos` names a vendor binary for a router: `twinet save`,
+`grade batch` submission loading, the platform reset and the observation
+snapshot all resolve the device's provider first. A submission archive records
+which NOS each configuration was captured from, and the loader refuses a
+mismatch by name rather than installing one vendor's syntax into another's
+parser -- an archive that is ignored produces a device with no configuration,
+which grades exactly like a student who wrote none.
+
 The shared generator registry includes `explicit`, `ring`, `two-tier`, and
 `clos` interiors. Expansion produces ordinary devices and links; a declared
 distributable Clos may be split only along its defined placement groups.

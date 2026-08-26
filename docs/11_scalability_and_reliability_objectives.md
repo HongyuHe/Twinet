@@ -59,7 +59,7 @@ comparison follows its local manager, Docker, and Kubernetes implementations.
 |---|---|---|---|---|
 | Multi-node deployment | None; one Docker host | Core is single-host; manual VXLAN or separate Clabernetes for Kubernetes | Kubernetes backend distributes pods and collision domains | Native three-node placement and shared VXLAN; no HA scheduler. Node loss is an operator-driven fenced `twinet node drain` or an audited `on_node_loss: reschedule` deployment, never an automatic failover |
 | Topology model | Eight positional files and shell-derived state | Mature generic YAML and node-kind model | Simple Netkit-compatible `lab.conf` model | Strong typed course model, templates, IPAM, and inter-AS generation |
-| Vendor breadth | FRR-centric | More than 40 NOS kinds, plus vrnetlab VMs | Generic image/backend abstraction | Two registered NOS providers, FRR and BIRD, behind one capability-validated interface; canonical and 84-AS mixed-NOS reference grades both passed live at 10/10 |
+| Vendor breadth | FRR-centric | More than 40 NOS kinds, plus vrnetlab VMs | Generic image/backend abstraction | Two registered NOS providers, FRR and BIRD, behind one capability-validated interface that also owns configuration capture/load and the grading route refresh; canonical and 84-AS mixed-NOS reference grades both passed live at 10/10 with BIRD on staff transit. A student-owned BIRD AS is source-supported and not yet measured live |
 | Runtime breadth | Docker-specific scripts | Docker and Podman abstractions | Docker and Kubernetes managers | Three registered backends: Docker, Podman, and native containerd. Every bundled example declares one of them, and `--runtime` overrides it per run |
 | Reconciliation | Teardown and rebuild | Real topology/link diff classes for supported changes | Kubernetes supplies declarative reconciliation in that backend | Idempotent apply, event-driven repair, and bounded desired/observed device classes (live, config, rewire, restart, recreate, delete, unknown) through `twinet node reconcile`; deploy still computes no minimal cluster-wide change plan |
 | Distributed scheduling | None | None in core; Kubernetes in Clabernetes | Kubernetes scheduler | Static AS placement from manifest-declared nodes |
@@ -480,17 +480,46 @@ Kathara cleanly separates Docker and Kubernetes managers.
 
 **Acceptance.** Replace two routers in `examples/cos461` with the second NOS.
 The unchanged rubric must award the unchanged reference score, while an
-unsupported MPLS request is refused before deployment.
+unsupported MPLS request is refused before deployment. A student AS running the
+second NOS must additionally survive save, restore and batch regrade, and its
+report must name every question its NOS cannot answer. The save/restore,
+submission-load and no-FRR-binary-reaches-BIRD parts of that are source-verified
+by `TestSaveAndRestoreOfABIRDStudentAS`, `TestSubmissionLoadingSelectsTheProvider`,
+`TestNoFRRBinaryReachesABIRDDevice` and
+`TestBIRDStudentASGradesTheUnchangedRubricSubset`; a live student-AS BIRD grade
+has not been measured.
 
 #### O10 implementation boundary
 
 `examples/cos461/templates/transit_as.yaml` explicitly selects BIRD 2 for the
-two staff-operated transit routers (AS 1 and AS 2). Student-owned routers
-remain FRR: the COS-461 submission archive currently carries FRR command files,
-so accepting BIRD for a student device would silently leave its submitted
-configuration unapplied. Manifest validation rejects that combination before
-deployment. The unchanged `examples/cos461/rubric/cos461.yaml` therefore
-continues to assess FRR student work against BIRD reference peers.
+two staff-operated transit routers (AS 1 and AS 2), and the unchanged
+`examples/cos461/rubric/cos461.yaml` assesses FRR student work against those
+BIRD reference peers.
+
+Student-owned BIRD is no longer refused by manifest validation. The refusal was
+correct while it stood — a submission was an FRR command file, and loading one
+into BIRD would have configured nothing while grading the empty control plane
+that resulted — and it has been replaced by the mechanism it was standing in
+for. A submission archive now records which NOS each configuration was captured
+from, the manifest signature covers that record, and every capture/apply/reload
+path resolves the device's provider: `twinet save`, `restore`, `grade batch`
+submission loading, the platform reset, and the observation snapshot's native
+command list. An archive aimed at the wrong provider is refused by name; it is
+never skipped. Validation still refuses a student AS whose provider owns no
+configuration file, because such an AS could not be saved, restored or
+regraded.
+
+What remains narrower for a BIRD student AS is capability, not plumbing, and it
+is reported per question. Checks that conclude from FRR configuration text
+(`config.no_forbidden_ospf`, `policy.ixp_communities`), from FRR's OSPF route
+classes (`ospf.subnets_advertised`), or from a feature BIRD does not declare
+(`rpki.*`, `multicast.*`, `mpls.*`, `vpn.*`) return an explicit `unsupported`
+status: excluded from the question's weighting, never scored zero, and always
+marking the question `needs_review` with a note naming the NOS. A check that
+reaches a verdict from fewer witnesses than it was designed around — the
+traffic-engineering question, whose daemon-table second opinion has no BIRD
+form — carries that as reduced evidence and marks the question for review when
+it awarded marks. See [03](03_topology_model.md) for the per-question table.
 
 The `bird` image pins Alpine by digest and BIRD to `2.15.1-r0`. It declares
 IPv4/IPv6, OSPF, BGP, policy/community, and VLAN support; it does not declare

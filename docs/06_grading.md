@@ -25,8 +25,19 @@ than treating host pressure as a student result.
 
 One grade builds a shared passive observation snapshot: normalized kernel/NOS
 state, OSPF/BGP/RPKI facts, OVS inventory, and directly relevant service state.
-Identical passive reads are deduplicated; unavailable state remains an
-infrastructure error. Active delivery probes are never cached.
+The native commands that survey a device come from its own NOS provider, so a
+BIRD router is read with `birdc` and never with `vtysh`. Identical passive reads
+are deduplicated; unavailable state remains an infrastructure error. Active
+delivery probes are never cached.
+
+A check whose subject the device's NOS cannot express returns `unsupported`
+rather than an error or a failure. It is excluded from the question's
+weighting, exactly like a check that could not run, and the question is marked
+`needs_review` with a note naming the NOS and the missing capability -- so a
+smaller denominator is always visible. A check that reaches a verdict from
+fewer witnesses than it was designed around records `reduced_evidence`, which
+marks the question for review when it awarded marks. Neither is ever a zero,
+and neither disappears from the report.
 
 The runner speculatively schedules all questions and checks concurrently;
 dependencies still control scoring and skipped feedback. It serializes only

@@ -57,7 +57,8 @@ three-node deployment acceptance claim.
 
 Routers default to FRR when no `nos:` is selected. FRR and BIRD are registered
 providers, and a provider owns rendering, apply/readiness, state collection,
-save, and restore for its syntax.
+configuration capture and load, save, restore, and the BGP route refresh used
+as a session-liveness witness.
 
 Validation derives requested capabilities from the topology and refuses a
 provider that does not declare them. The BIRD provider deliberately supports a
@@ -65,6 +66,33 @@ smaller feature set than FRR: it does not claim Twinet support for BIRD
 MPLS/LDP, VRF, multicast, DHCP, RPKI, or tunnels. Treat a manifest using BIRD
 as source-supported only unless a specific measured result is recorded in
 [09](09_status.md).
+
+### BIRD in a student-owned AS
+
+A student AS may declare `nos: bird`. `twinet save` captures BIRD's own
+configuration file, the archive manifest records `bird` for that member and the
+signature covers it, and `grade batch`/`restore` install it with
+`birdc configure` rather than FRR's reload tool. An archive whose recorded NOS
+does not match the device is refused by name; an archive that records no NOS at
+all is accepted only for FRR, which is what every archive written before the
+field existed contains.
+
+What a BIRD student AS is graded on is narrower, and the report says so per
+question rather than quietly shrinking a denominator:
+
+| Rubric area | BIRD student AS |
+| --- | --- |
+| `l3.addressing_matches_plan`, `l2.vlan_isolation`, `dataplane.*`, `tunnel.sixin4` | assessed; kernel and probe evidence is vendor-neutral |
+| `ospf.full_adjacency` | assessed, including the dead-timer liveness witness, which BIRD publishes in `show ospf neighbors` |
+| `ospf.ecmp_paths` | assessed; the provider attributes each kernel route to the BIRD protocol that produced it, because Linux records only `proto bird` |
+| `bgp.*`, `policy.gao_rexford`, `policy.no_transit_for_peers`, `policy.transit_for_customers` | assessed; BIRD's per-channel `Routes:` and route-change statistics supply the prefix and update counters, and `birdc reload in all` is the route refresh |
+| `policy.traffic_engineering` | assessed from the kernel probe; the daemon-table second opinion is recorded as reduced evidence and marks the question for review |
+| `ospf.subnets_advertised`, `config.no_forbidden_ospf`, `policy.ixp_communities` | reported `unsupported`: each concludes from FRR configuration text or FRR's OSPF route classes |
+| `rpki.*`, `multicast.*`, `mpls.*`, `vpn.*` | reported `unsupported`: the BIRD provider declares none of those features |
+
+An `unsupported` check is excluded from the question's weighting, exactly like a
+check that could not run, and always marks the question `needs_review` with a
+note naming the NOS. It is never a zero and never silently absent.
 
 ## Services, endpoints, and state policy
 

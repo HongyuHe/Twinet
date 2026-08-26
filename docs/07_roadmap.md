@@ -19,7 +19,7 @@
 | M6 — scale validation | Measured target not met | The recorded class-scale deployment is evidence, not completion of the original target |
 | M7 — course parity | Partly shipped | Advanced MPLS/VRF and multicast examples exist; no blanket course-parity acceptance is claimed |
 | M8 — fault/RCA | Separately maintained | See [10](10_fault_injection.md); do not infer its live acceptance from this roadmap |
-| M9 — heterogeneous NOS | Source-verified in part | FRR/BIRD providers and capability validation exist; broad mixed-vendor live acceptance is not claimed |
+| M9 — heterogeneous NOS | Source-verified in part | FRR/BIRD providers, capability validation, and provider-owned configuration capture/load, state commands and route refresh exist, so a student AS may run either; broad mixed-vendor live acceptance, and any live student-AS BIRD grade, are not claimed |
 | M10 — generated interiors | Source-verified in part | The registered interior generators exist; full live-cluster acceptance remains unmeasured |
 
 ## Open acceptance work
