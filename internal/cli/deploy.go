@@ -1046,6 +1046,7 @@ func resolveImageIDs(ctx context.Context, top *model.Topology, token string) err
 	if clustered(top) {
 		if tok, err := tokenFor(token); err == nil {
 			cl := client.NewCluster(top.Lab, tok)
+			required := requiredImageNodes(top)
 			// Every node is asked, and their answers are compared.
 			//
 			// This used to accept the first node's answer and stop. Nodes drift
@@ -1058,7 +1059,16 @@ func resolveImageIDs(ctx context.Context, top *model.Topology, token string) err
 			// and nothing anywhere would have said so.
 			byRef := map[string]map[string]string{}
 			for _, n := range cl.Nodes {
-				got, err := n.ImageDigests(ctx, list)
+				var needed []string
+				for _, ref := range list {
+					if required[ref][n.Name] {
+						needed = append(needed, ref)
+					}
+				}
+				if len(needed) == 0 {
+					continue
+				}
+				got, err := n.ImageDigests(ctx, needed)
 				if err != nil {
 					continue
 				}
@@ -1077,7 +1087,7 @@ func resolveImageIDs(ctx context.Context, top *model.Topology, token string) err
 			if err := sameEverywhere(byRef); err != nil {
 				return err
 			}
-			if err := allOrNoneHaveIt(byRef, list, len(cl.Nodes)); err != nil {
+			if err := allOrNoneHaveIt(byRef, required); err != nil {
 				return err
 			}
 		}
@@ -1107,46 +1117,73 @@ func resolveImageIDs(ctx context.Context, top *model.Topology, token string) err
 	return nil
 }
 
+func requiredImageNodes(top *model.Topology) map[string]map[string]bool {
+	required := map[string]map[string]bool{}
+	if top == nil {
+		return required
+	}
+	for _, device := range top.Devices {
+		if device.Image == "" || device.Node == "" {
+			continue
+		}
+		if required[device.Image] == nil {
+			required[device.Image] = map[string]bool{}
+		}
+		required[device.Image][device.Node] = true
+	}
+	return required
+}
+
 // sameEverywhere refuses a deployment whose nodes do not agree on what an image
 // is.
 //
 // The alternative is to deploy anyway and let each student run whatever build
 // happens to be on the node their AS landed on. Nothing downstream can detect
 // that, and no report would mention it.
-// allOrNoneHaveIt refuses a deployment in which some nodes hold an image and
-// others do not.
+// allOrNoneHaveIt refuses a deployment in which only some of the nodes that
+// will run an image hold it.
 //
-// A node without the image is about to pull it, and the tag may have been
-// rebuilt since the others pulled theirs -- so the deployment stamps the old
-// digest into every container's specification while one node quietly runs new
-// software. Nothing downstream can tell, and a student's mark then depends on
-// which machine their autonomous system was placed on.
+// A required node without the image is about to pull it, and the tag may have
+// been rebuilt since the other required nodes pulled theirs -- so the
+// deployment stamps the old digest into every container's specification while
+// one node quietly runs new software. Nodes that will not run this image do not
+// participate in its coherence boundary.
 //
-// Nobody having it is the ordinary first deployment and is allowed: they will
-// all pull the same tag within seconds of each other, and the next deployment
-// resolves and agrees.
-func allOrNoneHaveIt(byRef map[string]map[string]string, refs []string, nodes int) error {
-	if nodes <= 1 {
-		return nil
-	}
+// No required node having it is the ordinary first deployment and is allowed:
+// they will all pull the same tag within seconds of each other, and the next
+// deployment resolves and agrees.
+func allOrNoneHaveIt(byRef map[string]map[string]string,
+	required map[string]map[string]bool,
+) error {
 	var problems []string
-	for _, ref := range refs {
-		have := len(byRef[ref])
-		if have == 0 || have == nodes {
+	for _, ref := range sortedKeysOf(required) {
+		want := required[ref]
+		if len(want) <= 1 {
+			continue
+		}
+		var have, missing []string
+		for _, node := range sortedKeysOf(want) {
+			if byRef[ref][node] != "" {
+				have = append(have, node)
+			} else {
+				missing = append(missing, node)
+			}
+		}
+		if len(have) == 0 || len(missing) == 0 {
 			continue
 		}
 		problems = append(problems, fmt.Sprintf(
-			"  %s is on %d of %d nodes (%s)", ref, have, nodes,
-			strings.Join(sortedKeysOf(byRef[ref]), ", ")))
+			"  %s is cached on %s but missing from %s", ref,
+			strings.Join(have, ", "), strings.Join(missing, ", ")))
 	}
 	if len(problems) == 0 {
 		return nil
 	}
-	return fmt.Errorf("some nodes hold these images and some do not:\n%s\n"+
-		"The nodes without them are about to pull, and if the tag has been rebuilt "+
-		"since the others pulled theirs, half the lab runs different software while "+
-		"every report says one thing. Pull on every node first (`docker pull <image>` "+
-		"on each), or refer to the image by digest so the tag cannot move",
+	return fmt.Errorf("the nodes assigned these images do not share one cache state:\n%s\n"+
+		"The missing nodes are about to pull, and if the tag has been rebuilt since "+
+		"the other assigned nodes pulled theirs, the lab can run different software "+
+		"under one name. Preload the image through the selected runtime on every "+
+		"listed node, or pin it by digest so the tag cannot move",
 		strings.Join(problems, "\n"))
 }
 

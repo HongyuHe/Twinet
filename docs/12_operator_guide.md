@@ -249,6 +249,13 @@ does not fit the live allocatable inventory is refused before anything is
 created, and `--overcommit` is the audited exception rather than a silent
 fallback.
 
+On a first deployment, each assigned node pulls the images it needs. If only
+some of the nodes assigned the same mutable tag already cache it, Twinet
+refuses: the missing nodes could otherwise pull a newer build under the same
+name. Preload that image through the selected runtime on the nodes named by the
+error, or use a digest-pinned image lock. A cache on a node that will not run
+that image is intentionally outside the coherence boundary.
+
 Useful variations:
 
 ```sh
