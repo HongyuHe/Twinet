@@ -666,6 +666,30 @@ func (s *Server) repairLab(ctx context.Context, top *model.Topology, broken []*m
 		// re-render its configuration in platform mode, which in a lab
 		// deployed at the reference throws the reference solution away -- a
 		// far worse outcome than the fault being repaired.
+		//
+		// A sidecar left behind in the namespace of a router that has since
+		// restarted is a different fault with a different repair. Its daemons
+		// are running and its vty answers; what is wrong is where it is. Only
+		// the sidecar is rebuilt, so the student's router and everything in it
+		// survive the repair untouched.
+		if strings.HasPrefix(observation.Reason, controlNamespaceSplit) {
+			if err := s.rebindControlSidecar(ctx, eng, top, d); err != nil {
+				s.repairFailed(top.Name, d.ID, "FRR control sidecar could not be rebound", err)
+				s.recordEvent(top.Name, "", "reconcile", "", "repair", "error",
+					d.ID+": "+err.Error())
+				// Never rewire or re-render the router because its sidecar
+				// landed in the wrong namespace. The next attempt follows the
+				// ordinary bounded backoff.
+				continue
+			}
+			s.repairSucceeded(top.Name, d.ID)
+			s.metricRegistry().observeRepair("success")
+			s.recordEvent(top.Name, "", "reconcile", "", "repair", "success",
+				d.ID+" FRR control sidecar rebound to the router's network namespace")
+			slog.Info("FRR control sidecar rebound to its router's network namespace",
+				"device", d.ID)
+			continue
+		}
 		if why := observation.Reason; strings.HasPrefix(why, daemonsDown) {
 			if s.requiresFRRControl(d) {
 				controlCtx, cancel := context.WithTimeout(ctx, controlDaemonRepairTimeout)
@@ -754,6 +778,17 @@ func (s *Server) repairLab(ctx context.Context, top *model.Topology, broken []*m
 					d.ID+": "+err.Error())
 				continue
 			}
+		}
+		// A rewire gives the router its cables back; it does nothing for a
+		// control sidecar that is still attached to the namespace the router
+		// had before it restarted. Rebinding it here rather than on a later
+		// retry is what lets a SIGKILLed router recover its control plane
+		// inside a single repair.
+		if err := s.repairControlNamespaceAfterRewire(ctx, eng, top, d); err != nil {
+			s.repairFailed(top.Name, d.ID, "FRR control sidecar could not be rebound after rewiring", err)
+			s.recordEvent(top.Name, "", "reconcile", "", "repair", "error",
+				d.ID+": "+err.Error())
+			continue
 		}
 		// Confirmed, not assumed. A repair that reports success without being
 		// checked is how the previous version of this loop claimed to have
@@ -1408,6 +1443,14 @@ func (s *Server) observeDevice(ctx context.Context, lab string, d *model.Device,
 			if !sidecar.State.Joinable() {
 				return deviceObservation{Health: healthBroken, State: c.State, SpecMatches: specMatches,
 					Reason: "FRR control sidecar is absent or not running"}
+			}
+			// Before anything is asked of the sidecar. A restarted router gets
+			// a new network namespace and its sidecar does not follow: the
+			// daemons below then answer for a namespace holding a loopback and
+			// no cables, and every one of those answers is "healthy".
+			if observation, split := controlNamespaceObservation(
+				s.proveControlNamespace(ctx, d), c, specMatches); split {
+				return observation
 			}
 			if primary, err := s.primaryFRRDaemonCount(ctx, d); err != nil {
 				return deviceObservation{Health: healthUnknown, State: c.State, SpecMatches: specMatches,

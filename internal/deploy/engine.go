@@ -971,7 +971,18 @@ func (e *Engine) ensureFRRControl(ctx context.Context, top *model.Topology, fina
 	want := spec.Labels[LabelSpec]
 	if current.State != runtime.StateAbsent {
 		if current.Labels[LabelSpec] == want && current.State.Joinable() {
-			return e.stopPrimaryFRRDaemons(ctx, final.device)
+			// The specification says which container's namespace to join, not
+			// which namespace: a router that has been restarted is in a new one
+			// and its sidecar is still in the old one, with an identical spec
+			// hash and a perfectly healthy daemon set. Reusing it here is what
+			// let an ordinary deploy report success over a dead control plane.
+			bound, err := e.controlSharesPrimaryNamespace(ctx, final.device, name)
+			if err != nil {
+				return err
+			}
+			if bound {
+				return e.stopPrimaryFRRDaemons(ctx, final.device)
+			}
 		}
 		if err := e.Runtime.Remove(ctx, name, true); err != nil {
 			return fmt.Errorf("replace FRR control %s: %w", name, err)
@@ -986,7 +997,69 @@ func (e *Engine) ensureFRRControl(ctx context.Context, top *model.Topology, fina
 	if err := e.Runtime.Start(ctx, name); err != nil {
 		return fmt.Errorf("start FRR control %s: %w", name, err)
 	}
+	if err := e.requireControlSharesPrimaryNamespace(ctx, final.device, name); err != nil {
+		return err
+	}
 	return e.stopPrimaryFRRDaemons(ctx, final.device)
+}
+
+// requireControlSharesPrimaryNamespace proves a freshly started sidecar landed
+// in its router's namespace. The proof is retried briefly because a backend may
+// publish a task's state a moment after Start returns; it is not retried long,
+// because an identity that stays unreadable is a deployment failure and must be
+// reported as one rather than absorbed device by device.
+func (e *Engine) requireControlSharesPrimaryNamespace(ctx context.Context,
+	d *model.Device, control string,
+) error {
+	var last error
+	for attempt := 0; attempt < 5; attempt++ {
+		bound, err := e.controlSharesPrimaryNamespace(ctx, d, control)
+		if err == nil {
+			if bound {
+				return nil
+			}
+			return fmt.Errorf("FRR control %s did not start in the network namespace of %s",
+				control, d.Container)
+		}
+		last = err
+		timer := time.NewTimer(100 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return last
+}
+
+// controlSharesPrimaryNamespace proves that a control sidecar is attached to
+// the network namespace its router is in now.
+//
+// A backend with no identity capability answers "unsupported", and the caller
+// keeps the behaviour it had before this check existed -- that is the gate that
+// keeps unit runtimes and any future backend out of a host-specific proof.
+// Every other failure is returned: a deployment that cannot tell where its
+// control plane is must refuse rather than report success.
+func (e *Engine) controlSharesPrimaryNamespace(ctx context.Context, d *model.Device, control string) (bool, error) {
+	if d == nil {
+		return true, nil
+	}
+	primary, err := runtime.NetnsIdentityOf(ctx, e.Runtime, d.Container)
+	if errors.Is(err, runtime.ErrNamespaceIdentityUnsupported) {
+		return true, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("prove the network namespace of %s: %w", d.Container, err)
+	}
+	sidecar, err := runtime.NetnsIdentityOf(ctx, e.Runtime, control)
+	if errors.Is(err, runtime.ErrNamespaceIdentityUnsupported) {
+		return true, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("prove the network namespace of %s: %w", control, err)
+	}
+	return primary.SameAs(sidecar), nil
 }
 
 // stopPrimaryFRRDaemons migrates legacy routers to the split control-plane

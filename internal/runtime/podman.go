@@ -27,6 +27,7 @@ type Podman struct {
 }
 
 var _ EventRuntime = (*Podman)(nil)
+var _ NetnsIdentityRuntime = (*Podman)(nil)
 
 // NewPodman constructs a Podman runtime. Its API client is initialized on the
 // first operation so callers get a clear configuration error from that call.
@@ -212,6 +213,17 @@ func (p *Podman) NSPath(ctx context.Context, nameOrID string) (string, error) {
 		return "", err
 	}
 	return backend.NSPath(ctx, nameOrID)
+}
+
+// NetnsIdentity proves which network namespace a container is attached to.
+func (p *Podman) NetnsIdentity(ctx context.Context, nameOrID string) (NetnsIdentity, error) {
+	return netnsIdentityViaTask(ctx, p, nameOrID)
+}
+
+// ObservedNetnsIdentity resolves the namespace implied by an observation
+// already in hand.
+func (p *Podman) ObservedNetnsIdentity(_ context.Context, container Container) (NetnsIdentity, error) {
+	return observedNetnsIdentityViaTask(container)
 }
 
 // Exec runs a command inside a container.

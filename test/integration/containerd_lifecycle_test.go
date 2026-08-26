@@ -17,6 +17,7 @@ import (
 	"github.com/HongyuHe/twinet/internal/expand"
 	"github.com/HongyuHe/twinet/internal/images"
 	"github.com/HongyuHe/twinet/internal/manifest"
+	"github.com/HongyuHe/twinet/internal/model"
 	"github.com/HongyuHe/twinet/internal/place"
 	"github.com/HongyuHe/twinet/internal/plan"
 	"github.com/HongyuHe/twinet/internal/render"
@@ -428,6 +429,7 @@ placement:
 	if err != nil || result.Err() != nil {
 		t.Fatalf("containerd ready FRR restart fallback: %+v, %v", result, err)
 	}
+	assertContainerdSidecarRebindsAfterRestart(t, ctx, runtime, engine, top, device)
 	if err := engine.Destroy(ctx, lab); err != nil {
 		t.Fatal(err)
 	}
@@ -544,4 +546,127 @@ func containerdHostLinks(t *testing.T) map[string]bool {
 		out[entry.Name()] = true
 	}
 	return out
+}
+
+// assertContainerdSidecarRebindsAfterRestart reproduces the fault a SIGKILLed
+// router produces on a live containerd node and proves it is both visible and
+// repaired.
+//
+// A restarted task gets a new network namespace. The private FRR control
+// sidecar was created against the previous task and keeps running in the old
+// one: its daemons are all up, its vty answers, its running configuration is
+// correct, and it is attached to a namespace holding a loopback and no cables.
+// Nothing that reads the sidecar alone can tell the difference, so the proof
+// here is the namespace identity on either side of the repair.
+func assertContainerdSidecarRebindsAfterRestart(t *testing.T, ctx context.Context,
+	runtime rt.Runtime, engine *deploy.Engine, top *model.Topology, device *model.Device,
+) {
+	t.Helper()
+	control := deploy.FRRControlContainer(device)
+	primaryBefore, err := rt.NetnsIdentityOf(ctx, runtime, device.Container)
+	if err != nil {
+		t.Fatalf("containerd cannot prove the router's network namespace: %v", err)
+	}
+	controlBefore, err := rt.NetnsIdentityOf(ctx, runtime, control)
+	if err != nil {
+		t.Fatalf("containerd cannot prove the sidecar's network namespace: %v", err)
+	}
+	if !primaryBefore.SameAs(controlBefore) {
+		t.Fatalf("a freshly deployed sidecar is already split: router %s, sidecar %s",
+			primaryBefore, controlBefore)
+	}
+
+	// The reported reproduction: the router's PID 1 dies and containerd brings
+	// the task back. Stop+Start is the same transition through the runtime API.
+	if err := runtime.Stop(ctx, device.Container, 10*time.Second); err != nil {
+		t.Fatalf("stopping the router task: %v", err)
+	}
+	if err := runtime.Start(ctx, device.Container); err != nil {
+		t.Fatalf("restarting the router task: %v", err)
+	}
+	sidecar, err := runtime.Inspect(ctx, control)
+	if err != nil || !sidecar.State.Joinable() {
+		t.Fatalf("the sidecar did not survive the router restart: %+v, %v", sidecar, err)
+	}
+	primaryOrphaned, err := rt.NetnsIdentityOf(ctx, runtime, device.Container)
+	if err != nil {
+		t.Fatalf("proving the restarted router's namespace: %v", err)
+	}
+	controlOrphaned, err := rt.NetnsIdentityOf(ctx, runtime, control)
+	if err != nil {
+		t.Fatalf("proving the surviving sidecar's namespace: %v", err)
+	}
+	if primaryOrphaned.SameAs(controlOrphaned) {
+		t.Fatalf("containerd kept the sidecar with its router across a restart (%s); "+
+			"the fixture no longer reproduces the split", primaryOrphaned)
+	}
+	t.Logf("router restarted into %s, sidecar orphaned in %s", primaryOrphaned, controlOrphaned)
+
+	repair, err := engine.BuildContext(ctx, top)
+	if err != nil {
+		t.Fatal(err)
+	}
+	diff := engine.LastBuildDiff()
+	if !diff.Create[device.ID] {
+		t.Fatal("an ordinary deploy reported no work while the router's control sidecar was orphaned")
+	}
+	report, err := repair.Execute(ctx, plan.Options{Workers: 1, ContinueOnError: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Failed() {
+		t.Fatal(report.Err())
+	}
+
+	primaryAfter, err := rt.NetnsIdentityOf(ctx, runtime, device.Container)
+	if err != nil {
+		t.Fatalf("proving the repaired router's namespace: %v", err)
+	}
+	controlAfter, err := rt.NetnsIdentityOf(ctx, runtime, control)
+	if err != nil {
+		t.Fatalf("proving the rebuilt sidecar's namespace: %v", err)
+	}
+	if !primaryAfter.SameAs(controlAfter) {
+		t.Fatalf("the repair left the sidecar in %s while the router is in %s",
+			controlAfter, primaryAfter)
+	}
+	if controlAfter.SameAs(controlOrphaned) {
+		t.Fatalf("the sidecar was not rebuilt: it is still in %s", controlOrphaned)
+	}
+
+	result, err := runtime.Exec(ctx, control, rt.ExecCmd{Cmd: []string{
+		"sh", "-c", "pidof zebra >/dev/null && pidof ospfd >/dev/null && test -S /run/frr/ospfd.vty",
+	}})
+	if err != nil || result.Err() != nil {
+		t.Fatalf("the rebuilt sidecar has no daemon set or vty socket: %+v, %v", result, err)
+	}
+	wired := ""
+	for _, iface := range device.Ifaces {
+		if iface.Link != nil {
+			wired = iface.Name
+			break
+		}
+	}
+	if wired == "" {
+		t.Fatal("the routed fixture has no wired interface to prove against")
+	}
+	result, err = runtime.Exec(ctx, control, rt.ExecCmd{
+		Cmd: []string{"sh", "-c", "ip -o link show " + wired},
+	})
+	if err != nil || result.Err() != nil {
+		t.Fatalf("the rebuilt sidecar cannot see %s: %+v, %v", wired, result, err)
+	}
+	deadline := time.Now().Add(60 * time.Second)
+	for {
+		result, err = runtime.Exec(ctx, control, rt.ExecCmd{
+			Cmd: []string{"vtysh", "-c", "show ip ospf interface " + wired},
+		})
+		if err == nil && result.Err() == nil && strings.Contains(result.Stdout, wired) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the rebuilt control plane never ran OSPF on %s: %+v, %v", wired, result, err)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
 }

@@ -109,6 +109,22 @@ func (r *observedRuntime) NSPath(ctx context.Context, name string) (string, erro
 	return observeRuntimeCall(r.metrics, "nspath", func() (string, error) { return r.runtime.NSPath(ctx, name) })
 }
 
+// NetnsIdentity forwards the namespace-identity capability when the selected
+// backend has it. Losing it through the metrics wrapper would silently turn
+// every proof into "unsupported", which is exactly the answer that let an
+// orphaned control sidecar be reported healthy.
+func (r *observedRuntime) NetnsIdentity(ctx context.Context, name string) (rt.NetnsIdentity, error) {
+	return observeRuntimeCall(r.metrics, "netns_identity", func() (rt.NetnsIdentity, error) {
+		return rt.NetnsIdentityOf(ctx, r.runtime, name)
+	})
+}
+
+func (r *observedRuntime) ObservedNetnsIdentity(ctx context.Context, container rt.Container) (rt.NetnsIdentity, error) {
+	return observeRuntimeCall(r.metrics, "netns_identity", func() (rt.NetnsIdentity, error) {
+		return rt.ObservedNetnsIdentityOf(ctx, r.runtime, container)
+	})
+}
+
 func (r *observedRuntime) Exec(ctx context.Context, name string, cmd rt.ExecCmd) (rt.ExecResult, error) {
 	return observeRuntimeCall(r.metrics, "exec", func() (rt.ExecResult, error) { return r.runtime.Exec(ctx, name, cmd) })
 }
@@ -132,3 +148,4 @@ func (r *observedRuntime) Close() error {
 var _ rt.Runtime = (*observedRuntime)(nil)
 var _ rt.EndpointRuntime = (*observedRuntime)(nil)
 var _ rt.NamespaceRuntime = (*observedRuntime)(nil)
+var _ rt.NetnsIdentityRuntime = (*observedRuntime)(nil)

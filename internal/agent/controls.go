@@ -15,15 +15,16 @@ import (
 // ControlStatus is one private FRR control-sidecar audit result. It never
 // exposes a student router shell as a control target.
 type ControlStatus struct {
-	Node      string         `json:"node"`
-	Lab       string         `json:"lab"`
-	Device    string         `json:"device"`
-	Container string         `json:"container"`
-	State     rt.State       `json:"state"`
-	Daemons   map[string]int `json:"daemons,omitempty"`
-	VTY       bool           `json:"vty"`
-	Healthy   bool           `json:"healthy"`
-	Reason    string         `json:"reason,omitempty"`
+	Node      string            `json:"node"`
+	Lab       string            `json:"lab"`
+	Device    string            `json:"device"`
+	Container string            `json:"container"`
+	State     rt.State          `json:"state"`
+	Daemons   map[string]int    `json:"daemons,omitempty"`
+	VTY       bool              `json:"vty"`
+	Namespace *ControlNamespace `json:"namespace,omitempty"`
+	Healthy   bool              `json:"healthy"`
+	Reason    string            `json:"reason,omitempty"`
 }
 
 // ControlAuditResponse is a stable node-local sidecar inventory.
@@ -113,6 +114,17 @@ func (s *Server) auditControl(ctx context.Context, top *model.Topology, device *
 	status.State = sidecar.State
 	if !sidecar.State.Joinable() {
 		status.Reason = "control sidecar is absent or not running"
+		return status
+	}
+	// Where the sidecar is, before what is running inside it. A sidecar left
+	// in the namespace of a router that has since restarted runs the complete
+	// daemon set, answers on its vty, and is attached to a namespace with a
+	// loopback and no cables. Counting its daemons is how this audit used to
+	// certify exactly that device as healthy.
+	proof := s.proveControlNamespace(ctx, device)
+	status.Namespace = proof.wire()
+	if !proof.OK() {
+		status.Reason = proof.Reason
 		return status
 	}
 	as := top.ASes[device.ASN]

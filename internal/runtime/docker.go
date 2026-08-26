@@ -45,6 +45,7 @@ type Docker struct {
 }
 
 var _ EventRuntime = (*Docker)(nil)
+var _ NetnsIdentityRuntime = (*Docker)(nil)
 
 // NewDocker constructs a Docker runtime. The Engine API client is initialized
 // on the first operation so construction remains compatible with all callers.
@@ -249,6 +250,17 @@ func (d *Docker) NSPath(ctx context.Context, nameOrID string) (string, error) {
 		return "", err
 	}
 	return backend.NSPath(ctx, nameOrID)
+}
+
+// NetnsIdentity proves which network namespace a container is attached to.
+func (d *Docker) NetnsIdentity(ctx context.Context, nameOrID string) (NetnsIdentity, error) {
+	return netnsIdentityViaTask(ctx, d, nameOrID)
+}
+
+// ObservedNetnsIdentity resolves the namespace implied by an observation
+// already in hand.
+func (d *Docker) ObservedNetnsIdentity(_ context.Context, container Container) (NetnsIdentity, error) {
+	return observedNetnsIdentityViaTask(container)
 }
 
 // Exec runs a command inside a container.

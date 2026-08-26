@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -356,6 +357,54 @@ func (e *Engine) observeDevice(top *model.Topology, d *model.Device,
 	return out, nil
 }
 
+// observedControlNamespaceSplits names devices whose private FRR control
+// sidecar is no longer in the network namespace of its router.
+//
+// It is a screen, not a verdict: it reads only the observation the caller
+// already holds, so it costs no further engine round trip on a node with two
+// hundred routers, and the create step it schedules proves the relationship
+// again before it removes anything. Failing to resolve an identity marks the
+// device dirty rather than clean -- a deployment that cannot see where a
+// control plane is must do the work, not report a no-op.
+func (e *Engine) observedControlNamespaceSplits(ctx context.Context, devices []*model.Device,
+	observations []deviceObservation, byName map[string]runtime.Container,
+) map[string]bool {
+	out := map[string]bool{}
+	if e.Runtime == nil || !runtime.SupportsNetnsIdentity(e.Runtime) {
+		return out
+	}
+	for i, d := range devices {
+		observation := observations[i]
+		if observation.create || observation.state.runtime.controlSpec == nil {
+			continue
+		}
+		primary, primaryOK := byName[d.Container]
+		control, controlOK := byName[FRRControlContainer(d)]
+		if !primaryOK || !controlOK {
+			continue
+		}
+		primaryNS, err := runtime.ObservedNetnsIdentityOf(ctx, e.Runtime, primary)
+		if errors.Is(err, runtime.ErrNamespaceIdentityUnsupported) {
+			// The wrapper an agent puts around its engine always offers the
+			// capability; the engine behind it may not. Treating that as a
+			// fault would mark every device dirty on every pass for ever.
+			return out
+		}
+		if err != nil {
+			out[d.ID] = true
+			continue
+		}
+		controlNS, err := runtime.ObservedNetnsIdentityOf(ctx, e.Runtime, control)
+		if errors.Is(err, runtime.ErrNamespaceIdentityUnsupported) {
+			return out
+		}
+		if err != nil || !primaryNS.SameAs(controlNS) {
+			out[d.ID] = true
+		}
+	}
+	return out
+}
+
 func (e *Engine) observeNode(ctx context.Context, top *model.Topology, devices []*model.Device) (
 	*observationTracker, map[string]desiredDeviceState, BuildDiff, error,
 ) {
@@ -439,8 +488,30 @@ func (e *Engine) observeNode(ctx context.Context, top *model.Topology, devices [
 		}
 	}
 	semanticDevices := make([]*model.Device, 0, len(devices))
+	// A sidecar whose spec hash and state are both right may still be attached
+	// to a namespace its router has left behind. That is invisible to every
+	// label comparison above, so it is screened here from the observation
+	// already in hand; the create step re-proves it before acting.
+	splitControls := e.observedControlNamespaceSplits(ctx, devices, observations, byName)
 	for i, d := range devices {
 		observation := observations[i]
+		if splitControls[d.ID] {
+			observation.create = true
+			if e.Renderer != nil {
+				observation.configure = true
+				if e.Renderer.Ready(d, e.Runtime) != nil {
+					// A rebuilt sidecar starts with no daemons. The readiness
+					// gate is the check that the control plane came back, so a
+					// deployment must not skip it here of all places.
+					observation.ready = true
+				}
+			}
+			if studentOwned(top, d) {
+				observation.capture = true
+			}
+			observation.semantic = false
+			observations[i] = observation
+		}
 		desired[d.ID] = observation.state
 		if observation.create {
 			diff.Create[d.ID] = true

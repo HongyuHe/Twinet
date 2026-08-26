@@ -273,12 +273,12 @@ func newNodeControlsCmd(opts *Options, token *string) *cobra.Command {
 				return json.NewEncoder(cmd.OutOrStdout()).Encode(results)
 			}
 			w := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
-			fmt.Fprintln(w, "NODE\tDEVICE\tCONTROL\tSTATE\tDAEMONS\tVTY\tSTATUS\tREASON")
+			fmt.Fprintln(w, "NODE\tDEVICE\tCONTROL\tSTATE\tDAEMONS\tVTY\tNETNS\tSTATUS\tREASON")
 			problems := 0
 			for _, result := range results {
 				if result.Err != nil {
 					problems++
-					fmt.Fprintf(w, "%s\t-\t-\t-\t-\t-\tERROR\t%s\n", result.Node, firstLine(result.Err.Error()))
+					fmt.Fprintf(w, "%s\t-\t-\t-\t-\t-\t-\tERROR\t%s\n", result.Node, firstLine(result.Err.Error()))
 					continue
 				}
 				for _, control := range result.Value.Controls {
@@ -287,9 +287,10 @@ func newNodeControlsCmd(opts *Options, token *string) *cobra.Command {
 						problems++
 						status = "DEGRADED"
 					}
-					fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%t\t%s\t%s\n",
+					fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%t\t%s\t%s\t%s\n",
 						result.Node, control.Device, control.Container, control.State,
-						controlDaemonSummary(control.Daemons), control.VTY, status, firstLine(control.Reason))
+						controlDaemonSummary(control.Daemons), control.VTY,
+						controlNamespaceSummary(control.Namespace), status, firstLine(control.Reason))
 				}
 			}
 			if err := w.Flush(); err != nil {
@@ -333,6 +334,28 @@ func controlDaemonSummary(counts map[string]int) string {
 		parts = append(parts, fmt.Sprintf("%s=%d", name, counts[name]))
 	}
 	return strings.Join(parts, ",")
+}
+
+// controlNamespaceSummary renders where a control sidecar is attached
+// relative to its router. "SPLIT" is the case an operator must act on: the
+// sidecar is running, its daemons answer, and it is not in the router's
+// network namespace, so the router has no control plane at all.
+func controlNamespaceSummary(ns *agent.ControlNamespace) string {
+	if ns == nil {
+		return "-"
+	}
+	switch {
+	case ns.Proven && ns.Match && ns.Interfaces:
+		return "same"
+	case ns.Proven && !ns.Match:
+		return "SPLIT"
+	case !ns.Supported && ns.Interfaces:
+		return "wired"
+	case !ns.Supported:
+		return "unproven"
+	default:
+		return "UNKNOWN"
+	}
 }
 
 func newNodeReconcileCmd(opts *Options, token *string) *cobra.Command {

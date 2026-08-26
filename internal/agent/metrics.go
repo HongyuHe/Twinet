@@ -104,7 +104,7 @@ func boundedOperation(value string) string {
 func boundedRuntimeMethod(value string) string {
 	switch value {
 	case "ping", "pull", "create", "start", "stop", "pause", "unpause", "remove",
-		"inspect", "list", "nspath", "exec", "copy_to", "copy_from", "subscribe":
+		"inspect", "list", "nspath", "netns_identity", "exec", "copy_to", "copy_from", "subscribe":
 		return value
 	default:
 		return "other"

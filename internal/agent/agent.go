@@ -234,6 +234,13 @@ type Server struct {
 	eventMu sync.Mutex
 	events  *eventRing
 
+	// hostNetns is the agent's own network namespace, resolved once. A device
+	// container never shares it, so it is the reference a namespace proof uses
+	// to reject an identity that came from a recycled pid.
+	hostNetnsOnce sync.Once
+	hostNetns     rt.NetnsIdentity
+	hostNetnsErr  error
+
 	reconcileMu          sync.Mutex
 	reconcileQueue       chan reconcileRequest
 	reconcilePending     map[string]bool

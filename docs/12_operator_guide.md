@@ -410,6 +410,28 @@ twinet -m examples/cos461 node controls --repair              # private FRR cont
 twinet -m examples/cos461 events --follow                     # what the cluster is doing, as it happens
 ```
 
+`node controls` audits the private FRR control sidecar of every FRR router.
+Its `NETNS` column is the one to read first:
+
+| `NETNS` | What it means |
+|---|---|
+| `same` | the sidecar is provably in its router's network namespace |
+| `SPLIT` | the sidecar is running in a **different** namespace from its router — the router has no control plane at all, whatever its daemon counts say |
+| `UNKNOWN` | the namespace identity could not be read; the sidecar is reported degraded rather than assumed well |
+| `wired`/`unproven` | the backend cannot prove inode identity, so only the interface evidence applies |
+
+`SPLIT` is what a router looks like after its PID 1 has been killed and the
+runtime has brought the task back: the container gets a **new** network
+namespace, the sidecar that was created against the old task keeps running in
+the old one, and every question asked inside that sidecar — how many daemons,
+is the vty socket alive, what is the running configuration — is answered
+correctly about a namespace holding a loopback and no cables. `--repair`
+rebuilds the sidecar in the router's current namespace, restarts its daemons
+from the shared `/etc/frr`, and re-proves both identities. The student's router
+container, and everything in it, is never touched. Event-driven and periodic
+reconcile do the same thing without being asked, and an ordinary `deploy`
+refuses to report a no-op while a sidecar is split or unprovable.
+
 If a cluster mutation was interrupted — a controller killed halfway, a node
 rebooted mid-apply — the transaction is persisted and resumable:
 
@@ -555,6 +577,7 @@ than clearing the store.
 | `refusing to remove lab ... from a name alone` | destroy has no manifest and cannot prove the scope | [§12](#when-there-is-no-manifest) |
 | `its saved configuration could not be replayed` | a captured command was rejected by the device | [§12](#when-a-devices-saved-configuration-will-not-replay) — re-run `deploy`; never delete `/var/lib/twinet/state` |
 | a quarantine instead of a mark | the infrastructure failed, not the submission | re-grade after `twinet node status` is clean |
+| a deploy that will not report a no-op, naming a control sidecar | a router's FRR sidecar is in a different network namespace from the router, or its namespace cannot be read | let the deployment run; it rebuilds the sidecar. `twinet node controls` names the device, and `--repair` does it on its own |
 
 ## 14. What this guide does not claim
 

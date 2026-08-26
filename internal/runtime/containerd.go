@@ -78,6 +78,7 @@ type Containerd struct {
 var _ EventRuntime = (*Containerd)(nil)
 var _ EndpointRuntime = (*Containerd)(nil)
 var _ StreamExecRuntime = (*Containerd)(nil)
+var _ NetnsIdentityRuntime = (*Containerd)(nil)
 
 func NewContainerd() *Containerd {
 	return &Containerd{
@@ -1185,6 +1186,20 @@ func (c *Containerd) NSPath(ctx context.Context, name string) (string, error) {
 			name, container.State)
 	}
 	return fmt.Sprintf("/proc/%d/ns/net", container.PID), nil
+}
+
+// NetnsIdentity proves which network namespace a containerd task is attached
+// to. A restarted task is a new namespace, so anything sharing the old one --
+// a control sidecar created against the previous task's PID -- keeps running
+// somewhere the router no longer is.
+func (c *Containerd) NetnsIdentity(ctx context.Context, name string) (NetnsIdentity, error) {
+	return netnsIdentityViaTask(ctx, c, name)
+}
+
+// ObservedNetnsIdentity resolves the namespace implied by an observation
+// already in hand.
+func (c *Containerd) ObservedNetnsIdentity(_ context.Context, container Container) (NetnsIdentity, error) {
+	return observedNetnsIdentityViaTask(container)
 }
 
 func (c *Containerd) Exec(ctx context.Context, name string, cmd ExecCmd) (ExecResult, error) {

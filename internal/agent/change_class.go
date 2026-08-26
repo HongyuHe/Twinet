@@ -15,6 +15,7 @@ type ChangeClass string
 const (
 	ChangeLive     ChangeClass = "live"
 	ChangeConfig   ChangeClass = "config"
+	ChangeControl  ChangeClass = "control"
 	ChangeRewire   ChangeClass = "rewire"
 	ChangeRestart  ChangeClass = "restart"
 	ChangeRecreate ChangeClass = "recreate"
@@ -60,6 +61,11 @@ func ClassifyChange(observed DesiredObserved) ChangeClass {
 	case healthBroken:
 		reason := strings.ToLower(observed.Reason)
 		switch {
+		case strings.HasPrefix(observed.Reason, controlNamespaceSplit):
+			// The router is intact and its sidecar is in the wrong namespace.
+			// Rewiring the router repairs nothing and re-renders a device that
+			// may be holding a student's work.
+			return ChangeControl
 		case strings.Contains(reason, "daemon"), strings.Contains(reason, "healthcheck"):
 			return ChangeConfig
 		default:
