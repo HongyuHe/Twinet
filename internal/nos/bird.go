@@ -188,6 +188,7 @@ var (
 	birdNeighborRE = regexp.MustCompile(`(?i)^\s*neighbor address:\s*([0-9a-f:.]+)`)
 	birdASRE       = regexp.MustCompile(`(?i)^\s*neighbor AS:\s*([0-9]+)`)
 	birdRouteRE    = regexp.MustCompile(`^\s*([0-9a-fA-F:.]+/[0-9]+|default)\s+.*?\s\[(.+?)\].*$`)
+	birdAltRouteRE = regexp.MustCompile(`^\s+(?:unicast|blackhole|unreachable|prohibit)\s+\[(.+?)\].*$`)
 	birdViaRE      = regexp.MustCompile(`\bvia\s+([0-9a-fA-F:.]+)`)
 	birdPathRE     = regexp.MustCompile(`\]?\s+\[([0-9 ]+)\]`)
 )
@@ -230,14 +231,24 @@ func readBirdBGP(ctx context.Context, d *model.Device, exec netstate.Executor, q
 		return netstate.BGP{}, err
 	}
 	var current *netstate.BGPPath
+	var currentPrefix string
 	for _, raw := range strings.Split(routes, "\n") {
 		matches := birdRouteRE.FindStringSubmatch(raw)
+		if len(matches) == 3 {
+			currentPrefix = matches[1]
+		} else if alternate := birdAltRouteRE.FindStringSubmatch(raw); len(alternate) == 2 &&
+			currentPrefix != "" {
+			matches = []string{alternate[0], currentPrefix, alternate[1]}
+		}
 		if len(matches) != 3 {
 			if current == nil {
 				continue
 			}
 			line := strings.TrimSpace(raw)
 			switch {
+			case birdViaRE.MatchString(line):
+				via := birdViaRE.FindStringSubmatch(line)
+				current.NextHops = []netstate.NextHop{{Address: via[1]}}
 			case strings.HasPrefix(line, "BGP.community:"):
 				current.Communities = birdCommunities(strings.TrimSpace(strings.TrimPrefix(line, "BGP.community:")))
 			case strings.HasPrefix(line, "BGP.local_pref:"):
