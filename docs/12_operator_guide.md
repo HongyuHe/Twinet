@@ -510,6 +510,30 @@ daemon, a correct running configuration and no adjacency to anyone. `mgmtd` and
 backend; `twinet node controls` reports a router missing either of them as
 degraded.
 
+That covers the addresses a router's own configuration carries. On a teaching
+deployment most of them are not in it. Where a course leaves `router_interfaces`
+and `loopbacks` to the students — COS-461 does — the platform renders no
+`ip address` line for those interfaces at all: the model carries the addresses
+so the grader and `--solve` agree on what they should be, and the running lab
+has them only because somebody configured them. Saving such a router splits it
+in two, a `.conf` of protocol configuration and a `.sh` of the `ip` commands
+that recreate the addressing, and that is exactly how it comes back from a
+restore.
+
+A namespace replacement is therefore not only a control-plane repair. The
+namespace a device was last configured in is recorded beside the hashes that
+decide whether it is current, and a device found in a different one is not
+current: it is rewired, reconfigured, and then has its saved state replayed on
+top, in that order, because an address cannot be put on an interface that does
+not exist yet. Its neighbours on the same node are replayed with it — a veth is
+a pair and is rebuilt as one, so a restarted router takes its neighbours'
+interfaces with it and they come back bare. Nothing captures over that state
+until the replay has happened, so the pass that finds a restarted router cannot
+overwrite the snapshot it is about to restore. A backend that cannot prove
+namespace identity is not asked to: its containers are replaced rather than
+restarted when a task dies, which the ordinary create path already restores
+through.
+
 If a cluster mutation was interrupted — a controller killed halfway, a node
 rebooted mid-apply — the transaction is persisted and resumable:
 

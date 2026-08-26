@@ -1866,6 +1866,9 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if !req.DryRun && !rep.Failed() {
+		s.refreshRepairedHealth(operationCtx, top, eng.DirtyNamespaceStateDevices())
+	}
 	if req.Phase == "apply" {
 		resp := ApplyResponse{
 			Node: s.cfg.Node, AgentVersion: Version, ControllerVersion: req.ControllerVersion,

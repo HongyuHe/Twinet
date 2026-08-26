@@ -159,3 +159,29 @@ func (s *Server) auditedDriftReason(ctx context.Context, lab string, device *mod
 		return ""
 	}
 }
+
+// refreshRepairedHealth re-observes the devices a deployment put back together
+// after finding their network namespace, or the interfaces in it, replaced.
+//
+// Those devices have their semantic probe turned off for the pass that repairs
+// them: there is no point auditing addressing that the same pass is about to
+// replay, and the probe is what would otherwise refresh the cached verdict.
+// Without this the deployment that fixed a router answers, and publishes, the
+// verdict from before it ran -- so an operator who has just repaired a lab is
+// told it is still degraded, with nothing to distinguish that from a repair
+// that did not work.
+//
+// The set is bounded by what actually moved, so a node with two hundred healthy
+// routers pays nothing for it.
+func (s *Server) refreshRepairedHealth(ctx context.Context, top *model.Topology, ids []string) {
+	if top == nil || len(ids) == 0 {
+		return
+	}
+	for _, id := range ids {
+		device, ok := top.Device(id)
+		if !ok || device.Node != s.cfg.Node {
+			continue
+		}
+		s.rememberHealth(top.Name, device.ID, s.observeDevice(ctx, top.Name, device, false))
+	}
+}

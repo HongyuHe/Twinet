@@ -201,7 +201,10 @@ type Engine struct {
 	pendingRestore sync.Map
 	// createdContainers records devices whose primary container this apply
 	// pass created from its image.
-	createdContainers       sync.Map
+	createdContainers sync.Map
+	// lostNamespaceState records devices whose namespace-backed state this pass
+	// found gone, until it has been replayed back into them.
+	lostNamespaceState      sync.Map
 	observationMu           sync.Mutex
 	observation             *observationTracker
 	desiredLinkHashes       map[string]string
@@ -344,6 +347,7 @@ func (e *Engine) BuildContext(ctx context.Context, top *model.Topology) (*plan.P
 	p := plan.New()
 	e.resetMutationCounts()
 	e.resetCreatedContainers()
+	e.resetLostNamespaceState()
 	devices := top.DevicesOnNode(e.Node)
 	if len(devices) == 0 {
 		e.setBuildObservation(nil, BuildDiff{})
@@ -491,6 +495,16 @@ func (e *Engine) BuildContext(ctx context.Context, top *model.Topology) (*plan.P
 					if err := e.configureDesired(ctx, dev, state); err != nil {
 						return err
 					}
+					// A device whose namespace was replaced has just been
+					// rewired into an empty one. Its files came back with it
+					// and its links have been rebuilt above; the addresses,
+					// routes and tunnels its student put there did not, and
+					// the store is the only place they still exist.
+					if e.namespaceStateLost(dev.ID) {
+						if err := e.restoreIfNeeded(ctx, top, dev); err != nil {
+							return err
+						}
+					}
 					// Whatever the student had is replayed *after* the platform's
 					// own configuration and after the interfaces exist, so it wins
 					// over the defaults and lands on devices that are present.
@@ -501,6 +515,14 @@ func (e *Engine) BuildContext(ctx context.Context, top *model.Topology) (*plan.P
 						e.pendingRestore.Delete(dev.ID)
 						e.clearRestorePending(ctx, dev)
 					} else if err := e.replayPending(ctx, top, dev); err != nil {
+						return err
+					}
+					// The replacement has been made good, so this device's
+					// namespace-backed state is its student's work again and
+					// may be captured. Recording the namespace it is now in is
+					// what lets the next deployment tell if it moves again.
+					e.clearNamespaceStateLost(dev.ID)
+					if err := e.recordDeviceNamespace(ctx, tracker, dev); err != nil {
 						return err
 					}
 					return tracker.markDevice(dev.ID, observedDeviceState{
@@ -1141,7 +1163,7 @@ func (e *Engine) captureBeforeReplace(ctx context.Context, top *model.Topology, 
 	if err != nil {
 		return fmt.Errorf("refusing to replace %s: its configuration could not be captured: %w", d.ID, err)
 	}
-	for _, s := range snaps {
+	for _, s := range e.storableSnapshots(ctx, d, snaps) {
 		if _, err := e.State.Put(s); err != nil {
 			return fmt.Errorf("refusing to replace %s: its configuration could not be saved: %w", d.ID, err)
 		}

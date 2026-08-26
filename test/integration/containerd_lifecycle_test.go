@@ -23,6 +23,7 @@ import (
 	"github.com/HongyuHe/twinet/internal/plan"
 	"github.com/HongyuHe/twinet/internal/render"
 	rt "github.com/HongyuHe/twinet/internal/runtime"
+	"github.com/HongyuHe/twinet/internal/state"
 )
 
 func TestContainerdRuntimeLifecycle(t *testing.T) {
@@ -433,11 +434,18 @@ placement:
 		t.Fatalf("containerd ready FRR restart fallback: %+v, %v", result, err)
 	}
 	// The repair a live node performs is an ordinary deploy, not a solving
-	// one. That distinction is the whole of this fixture: solve mode re-applies
-	// every reference address on every pass and would paper over a repair that
-	// restores none of them, which is what a real teaching deployment does.
+	// one, and the lab it performs it on is a restored teaching submission
+	// rather than the reference. Both halves of that matter: solve mode
+	// re-applies every reference address on every pass, and a lab it has just
+	// deployed carries those addresses in its routing configuration, so either
+	// one on its own papers over a repair that restores none of them.
+	store, err := state.Open(filepath.Join(work, "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	installSignedSubmissionState(t, ctx, runtime, top, store, lab)
 	teaching := &deploy.Engine{
-		Runtime: timed, Node: integrationHostname(t),
+		Runtime: timed, Node: integrationHostname(t), State: store,
 		Renderer:        render.New(top, render.ModePlatform),
 		ObservationRoot: filepath.Join(work, "observed"),
 		FRRControlRoot:  filepath.Join(work, "control"),
@@ -808,5 +816,216 @@ func dumpControlDiagnostics(t *testing.T, ctx context.Context, runtime rt.Runtim
 			rt.ExecCmd{Cmd: []string{"sh", "-c", probe.command}})
 		t.Logf("--- %s (%s): err=%v exit=%d\n%s%s", probe.label, probe.container,
 			err, result.ExitCode, result.Stdout, result.Stderr)
+	}
+}
+
+// installSignedSubmissionState puts the lab into the state a restored teaching
+// submission is in, which is where the reported failure happened and is not
+// where a freshly solved lab is.
+//
+// A COS-461 group's router interfaces and loopbacks belong to them, so the
+// platform renders no `ip address` for any of them: the model carries the
+// addresses so the grader and `--solve` agree on what they should be, and the
+// running lab has them only because somebody configured them. That is what an
+// archive's two halves are -- protocol configuration in the .conf, and the
+// addressing as the ip(8) commands that recreate it in the .sh -- and after a
+// restore it is what the router holds: a routing configuration with no address
+// in it, and addresses that exist in the kernel and in the state store and
+// nowhere else.
+//
+// Solving the lab is what produces those addresses in the first place, so the
+// fixture solves, saves what solving built, strips the addressing out of the
+// saved routing configuration exactly as a saved submission has it, and puts
+// the router onto that pair. The distinction is the whole point of the test:
+// with the addresses still in the routing configuration, a rebuilt control
+// plane reads them off the disk and the repair looks complete whether or not
+// anything replayed the student's state.
+func installSignedSubmissionState(t *testing.T, ctx context.Context, runtime rt.Runtime,
+	top *model.Topology, store *state.Store, lab string,
+) {
+	t.Helper()
+	for _, device := range routedFixtureRouters(top) {
+		snaps, err := deploy.Capture(ctx, runtime, device, lab, top.Hash)
+		if err != nil {
+			t.Fatalf("saving %s: %v", device.ID, err)
+		}
+		var protocols string
+		for _, snap := range snaps {
+			if snap.Kind == state.KindFRR {
+				protocols = withoutAddressLines(string(snap.Content))
+				snap.Content = []byte(protocols)
+				snap.Digest, snap.Bytes = "", 0
+			}
+			if _, err := store.Put(snap); err != nil {
+				t.Fatalf("saving %s %s: %v", device.ID, snap.Kind, err)
+			}
+		}
+		if protocols == "" || !strings.Contains(protocols, "router ospf") {
+			t.Fatalf("the saved configuration of %s carries no protocol configuration", device.ID)
+		}
+		if addresses, err := store.Current(lab, device.ID, state.KindAddrs); err != nil {
+			t.Fatalf("the saved addressing of %s: %v", device.ID, err)
+		} else if !bytes.Contains(addresses.Content, []byte(modelledLoopback(t, device))) {
+			t.Fatalf("the saved addressing of %s does not carry its loopback:\n%s",
+				device.ID, addresses.Content)
+		}
+	}
+	// Put each router onto its submission: the protocol configuration on disk,
+	// FRR restarted onto it so nothing is left holding the addresses it used
+	// to be told about, and then the addressing replayed by the same restore
+	// path that loads an archive.
+	for _, device := range routedFixtureRouters(top) {
+		snap, err := store.Current(lab, device.ID, state.KindFRR)
+		if err != nil {
+			t.Fatalf("reading back the saved configuration of %s: %v", device.ID, err)
+		}
+		writeSubmissionConfig(t, ctx, runtime, device, snap.Content)
+	}
+	for _, device := range routedFixtureRouters(top) {
+		if _, err := deploy.Restore(ctx, runtime, device, lab, store); err != nil {
+			t.Fatalf("restoring the submission of %s: %v", device.ID, err)
+		}
+	}
+	for _, device := range routedFixtureRouters(top) {
+		requireNoConfiguredAddresses(t, ctx, runtime, device)
+		requireRoutedAddresses(t, ctx, runtime, device, "after restoring the submission")
+	}
+	requireFullOSPFNeighbour(t, ctx, runtime, routedFixtureRouters(top)[0],
+		"after restoring the submission", 120*time.Second)
+}
+
+func routedFixtureRouters(top *model.Topology) []*model.Device {
+	var out []*model.Device
+	for _, d := range top.Devices {
+		if d.Kind == model.KindRouter {
+			out = append(out, d)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+func modelledLoopback(t *testing.T, device *model.Device) string {
+	t.Helper()
+	loopback, ok := device.IfaceByName("lo")
+	if !ok || loopback.Addr4 == "" {
+		t.Fatalf("%s has no modelled loopback", device.ID)
+	}
+	return loopback.Addr4
+}
+
+// withoutAddressLines is what a saved submission's routing configuration looks
+// like beside its addressing script: the addresses are captured as the ip(8)
+// commands that recreate them, not as configuration lines, so an interface
+// stanza that held nothing else goes with them entirely -- header, body and
+// terminator. Leaving a stanza's `exit` behind produces a file vtysh stops
+// reading at, which is a different fault from the one under test.
+func withoutAddressLines(config string) string {
+	lines := strings.Split(config, "\n")
+	kept := make([]string, 0, len(lines))
+	for i := 0; i < len(lines); i++ {
+		if !strings.HasPrefix(lines[i], "interface ") {
+			kept = append(kept, lines[i])
+			continue
+		}
+		stanza, next := interfaceStanza(lines, i)
+		i = next - 1
+		if body := stanzaWithoutAddresses(stanza); body != nil {
+			kept = append(kept, body...)
+		}
+	}
+	return strings.TrimRight(strings.Join(kept, "\n"), "\n") + "\n"
+}
+
+// interfaceStanza returns one `interface` block and the index after it,
+// including the `exit` that closes it and the `!` that follows.
+func interfaceStanza(lines []string, start int) ([]string, int) {
+	end := start + 1
+	for end < len(lines) {
+		trimmed := strings.TrimSpace(lines[end])
+		end++
+		if trimmed == "exit" {
+			break
+		}
+		if trimmed != "" && !strings.HasPrefix(lines[end-1], " ") {
+			// A file written without terminators: the stanza ends where the
+			// next top-level line begins.
+			end--
+			break
+		}
+	}
+	if end < len(lines) && strings.TrimSpace(lines[end]) == "!" {
+		end++
+	}
+	return lines[start:end], end
+}
+
+// stanzaWithoutAddresses returns the stanza with its address lines removed, or
+// nil if nothing but addresses was in it.
+func stanzaWithoutAddresses(stanza []string) []string {
+	kept := make([]string, 0, len(stanza))
+	configured := false
+	for _, line := range stanza {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "ip address ") || strings.HasPrefix(trimmed, "ipv6 address ") {
+			continue
+		}
+		if strings.HasPrefix(line, " ") && trimmed != "" {
+			configured = true
+		}
+		kept = append(kept, line)
+	}
+	if !configured {
+		return nil
+	}
+	return kept
+}
+
+// writeSubmissionConfig installs a routing configuration the way a restore
+// does and restarts FRR onto it, so nothing is left running that still knows
+// about addresses the configuration no longer mentions.
+func writeSubmissionConfig(t *testing.T, ctx context.Context, runtime rt.Runtime,
+	device *model.Device, body []byte,
+) {
+	t.Helper()
+	if err := runtime.CopyTo(ctx, device.Container, "/etc/frr/frr.conf", 0o640, body); err != nil {
+		t.Fatalf("installing the submission configuration of %s: %v", device.ID, err)
+	}
+	control := deploy.FRRControlContainer(device)
+	result, err := runtime.Exec(ctx, control, rt.ExecCmd{Cmd: []string{"sh", "-c",
+		"chown frr:frr /etc/frr/frr.conf && /usr/lib/frr/frrinit.sh restart"}})
+	if err != nil || result.Err() != nil {
+		t.Fatalf("restarting %s onto its submission: %+v, %v", device.ID, result, err)
+	}
+}
+
+// requireNoConfiguredAddresses proves the persistence boundary this test
+// exists for. If the routing configuration still carries the addresses, the
+// router can recover them from a file no matter what the deployment does, and
+// every assertion after this one would pass without the state store being
+// consulted at all.
+func requireNoConfiguredAddresses(t *testing.T, ctx context.Context, runtime rt.Runtime,
+	device *model.Device,
+) {
+	t.Helper()
+	for _, probe := range []struct {
+		what string
+		cmd  []string
+	}{
+		{"on disk", []string{"cat", "/etc/frr/frr.conf"}},
+		{"in the running configuration", []string{"vtysh", "-c", "show running-config"}},
+	} {
+		result, err := runtime.Exec(ctx, deploy.FRRControlContainer(device),
+			rt.ExecCmd{Cmd: probe.cmd})
+		if err != nil || result.Err() != nil {
+			t.Fatalf("reading the routing configuration of %s %s: %+v, %v",
+				device.ID, probe.what, result, err)
+		}
+		for _, line := range strings.Split(result.Stdout, "\n") {
+			if strings.HasPrefix(strings.TrimSpace(line), "ip address ") {
+				t.Fatalf("the submission of %s still configures addresses %s: %q",
+					device.ID, probe.what, strings.TrimSpace(line))
+			}
+		}
 	}
 }

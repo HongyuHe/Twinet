@@ -595,7 +595,7 @@ func (e *Engine) captureSelected(ctx context.Context, top *model.Topology, store
 			// Whatever was read is still stored: a partial snapshot is worth
 			// more than none, and the failure is reported either way.
 		}
-		for _, s := range captures[i] {
+		for _, s := range e.storableSnapshots(ctx, d, captures[i]) {
 			changed, err := store.Put(s)
 			if err != nil {
 				problems = append(problems, fmt.Sprintf("%s/%s: %v", d.ID, s.Kind, err))
@@ -906,16 +906,46 @@ done`
 	default:
 		return nil
 	}
-	res, err := r.Exec(ctx, d.Container, rt.ExecCmd{Cmd: []string{"sh", "-c", script}})
-	if err != nil {
-		return fmt.Errorf("reset restored %s state on %s: %w", kind, d.ID, err)
+	// Retried, because the moment a replay happens is the moment the routing
+	// daemons have just been restarted and are withdrawing everything they
+	// used to own. A flush issued into that produces "Failed to send flush
+	// request: Invalid argument" from a kernel that accepts the identical
+	// command a moment later, and one rejected command fails the restore, the
+	// device, and the deployment -- which after a namespace replacement means
+	// a student's router stays empty because a race was reported as a fault.
+	//
+	// Retrying is safe because the script only removes state: running it again
+	// on a namespace it already emptied is a no-op, and a reset that is
+	// genuinely impossible still fails, just later.
+	var last error
+	for attempt := 0; attempt < dynamicResetAttempts; attempt++ {
+		if attempt > 0 {
+			timer := time.NewTimer(dynamicResetBackoff)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+			}
+		}
+		res, err := r.Exec(ctx, d.Container, rt.ExecCmd{Cmd: []string{"sh", "-c", script}})
+		switch {
+		case err != nil:
+			last = fmt.Errorf("reset restored %s state on %s: %w", kind, d.ID, err)
+		case res.ExitCode != 0:
+			last = fmt.Errorf("reset restored %s state on %s exited %d: %s",
+				kind, d.ID, res.ExitCode, firstLine(res.Stderr))
+		default:
+			return nil
+		}
 	}
-	if res.ExitCode != 0 {
-		return fmt.Errorf("reset restored %s state on %s exited %d: %s",
-			kind, d.ID, res.ExitCode, firstLine(res.Stderr))
-	}
-	return nil
+	return last
 }
+
+const (
+	dynamicResetAttempts = 4
+	dynamicResetBackoff  = 250 * time.Millisecond
+)
 
 // waitForFRRRestoreReady avoids replaying a saved configuration while the
 // control sidecar has started but zebra's vty socket is not usable yet. A

@@ -94,6 +94,12 @@ type nodeObservedState struct {
 
 	Devices map[string]observedDeviceState `json:"devices"`
 	Links   map[string]observedLinkState   `json:"links"`
+	// Namespaces records the network namespace each device's state was last
+	// configured in. It is kept beside the hashes rather than inside them
+	// because the hashes describe what was asked for and this describes where
+	// it was put, and because the ready step rewrites a device's hashes after
+	// the configure step recorded this.
+	Namespaces map[string]runtime.NetnsIdentity `json:"namespaces,omitempty"`
 }
 
 type observedDeviceState struct {
@@ -131,11 +137,12 @@ func (e *Engine) loadObservation(lab string) (*observationTracker, error) {
 		e:    e,
 		path: e.observationPath(lab),
 		state: nodeObservedState{
-			Version: observationVersion,
-			Lab:     lab,
-			Node:    e.Node,
-			Devices: map[string]observedDeviceState{},
-			Links:   map[string]observedLinkState{},
+			Version:    observationVersion,
+			Lab:        lab,
+			Node:       e.Node,
+			Devices:    map[string]observedDeviceState{},
+			Links:      map[string]observedLinkState{},
+			Namespaces: map[string]runtime.NetnsIdentity{},
 		},
 	}
 	raw, err := os.ReadFile(tracker.path)
@@ -159,6 +166,9 @@ func (e *Engine) loadObservation(lab string) (*observationTracker, error) {
 	}
 	if decoded.Links == nil {
 		decoded.Links = map[string]observedLinkState{}
+	}
+	if decoded.Namespaces == nil {
+		decoded.Namespaces = map[string]runtime.NetnsIdentity{}
 	}
 	tracker.state = decoded
 	return tracker, nil
@@ -197,6 +207,29 @@ func (t *observationTracker) device(id string) (observedDeviceState, bool) {
 	defer t.mu.Unlock()
 	value, ok := t.state.Devices[id]
 	return value, ok
+}
+
+// namespace returns the network namespace this device's state was last
+// configured in, and whether one was ever recorded.
+func (t *observationTracker) namespace(id string) (runtime.NetnsIdentity, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	value, ok := t.state.Namespaces[id]
+	return value, ok
+}
+
+func (t *observationTracker) markNamespace(id string, value runtime.NetnsIdentity) error {
+	t.mu.Lock()
+	if t.state.Namespaces == nil {
+		t.state.Namespaces = map[string]runtime.NetnsIdentity{}
+	}
+	if t.state.Namespaces[id] != value {
+		t.state.Namespaces[id] = value
+		t.changed = true
+	}
+	err := t.saveLocked()
+	t.mu.Unlock()
+	return err
 }
 
 func (t *observationTracker) link(id string) (observedLinkState, bool) {
@@ -271,6 +304,12 @@ func (t *observationTracker) prune(devices map[string]bool, links map[string]boo
 	for id := range t.state.Links {
 		if !links[id] {
 			delete(t.state.Links, id)
+			t.changed = true
+		}
+	}
+	for id := range t.state.Namespaces {
+		if !devices[id] {
+			delete(t.state.Namespaces, id)
 			t.changed = true
 		}
 	}
@@ -402,6 +441,47 @@ func (e *Engine) observedControlNamespaceSplits(ctx context.Context, devices []*
 	return out, nil
 }
 
+// expandLostStateToPeers adds the neighbours of a device whose namespace-backed
+// state is gone.
+//
+// A veth is a pair, and netx rebuilds it as one: when only one half survives it
+// deletes the survivor so the pair can be recreated cleanly. So a router that
+// restarted into a new namespace takes its neighbours' interfaces with it, and
+// they come back bare -- which on a teaching deployment means with no address,
+// because a student-owned address is never rendered by the platform. That is
+// why a restarted router loses adjacencies its neighbour was not restarted for,
+// and why repairing only the router that moved leaves the link down at the far
+// end.
+//
+// The expansion is one hop. Only the links of the device that lost its
+// namespace are rebuilt; its neighbours' other links are untouched, and a
+// cross-node neighbour's half hangs off a shared overlay this node never
+// deletes.
+func expandLostStateToPeers(devices []*model.Device, lost map[string]bool, node string) {
+	if len(lost) == 0 {
+		return
+	}
+	peers := map[string]bool{}
+	for _, d := range devices {
+		if !lost[d.ID] {
+			continue
+		}
+		for _, iface := range d.Ifaces {
+			if iface.Link == nil || iface.Link.CrossNode() {
+				continue
+			}
+			other := iface.Link.Other(iface)
+			if other == nil || other.Device == nil || other.Device.Node != node {
+				continue
+			}
+			peers[other.Device.ID] = true
+		}
+	}
+	for id := range peers {
+		lost[id] = true
+	}
+}
+
 func (e *Engine) observeNode(ctx context.Context, top *model.Topology, devices []*model.Device) (
 	*observationTracker, map[string]desiredDeviceState, BuildDiff, error,
 ) {
@@ -493,18 +573,38 @@ func (e *Engine) observeNode(ctx context.Context, top *model.Topology, devices [
 	if err != nil {
 		return nil, nil, BuildDiff{}, err
 	}
+	// A device may also have been restarted into a new namespace without any
+	// sidecar to give it away. The sidecar split is one way of proving that;
+	// the namespace a device was last configured in is the general one.
+	replacedNamespaces := e.observedNamespaceReplacements(ctx, devices, byName, tracker)
+	// An orphaned sidecar is proof that its router's namespace was replaced:
+	// the sidecar joined that namespace when it was built and has not moved
+	// since. Both findings mean the same repair.
+	lost := map[string]bool{}
+	for _, d := range devices {
+		if splitControls[d.ID] || replacedNamespaces[d.ID] {
+			lost[d.ID] = true
+		}
+	}
+	expandLostStateToPeers(devices, lost, e.Node)
 	for i, d := range devices {
 		observation := observations[i]
 		if splitControls[d.ID] {
 			observation.create = true
-			if e.Renderer != nil {
-				observation.configure = true
-				if e.Renderer.Ready(d, e.Runtime) != nil {
-					// A rebuilt sidecar starts with no daemons. The readiness
-					// gate is the check that the control plane came back, so a
-					// deployment must not skip it here of all places.
-					observation.ready = true
-				}
+		}
+		if lost[d.ID] {
+			e.markNamespaceStateLost(d.ID)
+			// The configure step is where a device's saved state is replayed,
+			// so it is scheduled whether or not there is anything to render
+			// into the device. The replay is the reason, and it is not a
+			// rendering concern.
+			observation.configure = true
+			if e.Renderer != nil && e.Renderer.Ready(d, e.Runtime) != nil {
+				// A rebuilt sidecar starts with no daemons, and a replayed
+				// device has just had its addressing put back. The readiness
+				// gate is the check that the control plane came back, so a
+				// deployment must not skip it here of all places.
+				observation.ready = true
 			}
 			if studentOwned(top, d) {
 				observation.capture = true

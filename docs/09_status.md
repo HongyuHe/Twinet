@@ -305,6 +305,28 @@ reached students, and each motivated a permanent test.
    other, and the containerd lifecycle gate asserts the addresses and a Full
    OSPF neighbour after a restart repaired by an ordinary deploy.
 
+   That was still the wrong boundary. On a teaching deployment most of a
+   router's addresses are not in its FRR configuration and never were: where a
+   course leaves the router interfaces and loopbacks to its students, the
+   platform renders no `ip address` for them, so the running lab holds them
+   only because somebody configured them and a save splits the router into a
+   `.conf` of protocol configuration and a `.sh` of the `ip` commands that
+   recreate the addressing. Repairing the namespace put the sidecar back and
+   asked FRR to reload a file the addresses had never been in. The deployment
+   had the work — in the state store, where the save had put it — and never
+   looked, because nothing marked the router as owing a replay: its container
+   was joinable, its specification hash matched, and the only thing that had
+   changed was a namespace nobody was comparing. The gate could not have caught
+   it either, since a lab it had just solved carries those addresses in its
+   configuration. The namespace a device was last configured in is now recorded
+   beside the hashes that decide whether it is current, a device found in a
+   different one is rewired, reconfigured and replayed in that order, its
+   neighbours on the node are replayed with it because a veth is rebuilt as a
+   pair, and nothing captures over that state until the replay has happened --
+   the pass that finds a restarted router used to be the pass that overwrote the
+   snapshot it was about to restore. The gate now runs a restored submission
+   rather than a solved lab, and fails without the replay.
+
 10. **A release gate that answered yes without looking.** `make ci` printed
     "all CI gates passed" while skipping the lint and the shell check whenever
     their tools were absent, which on the development machine was always.
