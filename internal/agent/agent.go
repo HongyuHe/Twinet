@@ -243,6 +243,7 @@ type Server struct {
 	gcRemoveEmptyMultiplex func(string) ([]string, error)
 	gcFindOrphanBridges    func(map[string]bool) ([]netx.OrphanBridge, error)
 	gcRemoveOrphanBridge   func(string) error
+	gcLabRuntimeActive     func(context.Context, string) (bool, error)
 
 	// tools compares a container's programs against its image's, so that a
 	// mark never rests on a program the student under examination wrote. It is

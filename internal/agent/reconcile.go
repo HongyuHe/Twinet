@@ -795,6 +795,14 @@ func (s *Server) repairLab(ctx context.Context, top *model.Topology, broken []*m
 func (s *Server) repairSemanticDrift(ctx context.Context, eng *deploy.Engine,
 	top *model.Topology, d *model.Device, observation deviceObservation,
 ) error {
+	if isSemanticOnlyDrift(observation.Reason) && !locallyRepairableDrift(observation.Reason) {
+		// A missing remote route or session is not a local configuration
+		// defect. Reloading this router cannot create the peer's interface; it
+		// only resets healthy sessions and can keep the whole fabric from ever
+		// converging. Re-observe it through the bounded cycle and escalate if
+		// the distributed condition persists, without mutating local state.
+		return errors.New(semanticDriftReason(observation, observation))
+	}
 	if err := s.restoreDeviceOverlayBindings(ctx, eng, top, d); err != nil {
 		return err
 	}

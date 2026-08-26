@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -61,5 +62,17 @@ func TestNewGenerationClearsPriorTerminalRepairState(t *testing.T) {
 		len(s.repairFails) != 0 || len(s.repairNext) != 0 {
 		t.Fatalf("new generation retained old repair state: cycles=%v terminal=%v fails=%v next=%v",
 			s.semanticCycles, s.repairTerminal, s.repairFails, s.repairNext)
+	}
+}
+
+func TestRemoteOnlySemanticRepairDoesNotTouchLocalState(t *testing.T) {
+	s := &Server{}
+	observation := deviceObservation{
+		Health: healthBroken,
+		Reason: "network semantics drifted: as3/SFO has no route to reference host address(es) 29.101.0.1",
+	}
+	err := s.repairSemanticDrift(nil, nil, nil, nil, observation)
+	if err == nil || !strings.Contains(err.Error(), "no route to reference host") {
+		t.Fatalf("remote drift result = %v, want alert-only failure", err)
 	}
 }

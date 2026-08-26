@@ -605,7 +605,9 @@ func (s *Server) reconcileCommitOverlays(ctx context.Context, eng *deploy.Engine
 		return fmt.Errorf("reconcile overlays after semantic repair: %w", err)
 	}
 	if len(report.Failed) == 0 {
-		for _, device := range repairedLocalDevices(top, eng.Node, report.Repaired) {
+		devices := repairedLocalDevices(top, eng.Node, report.Repaired)
+		ids := make([]string, 0, len(devices))
+		for _, device := range devices {
 			// Recreating a missing host veth also recreates its container-side
 			// interface. The wire is healthy but its solved/student address is
 			// gone until the device contract is replayed.
@@ -617,6 +619,18 @@ func (s *Server) reconcileCommitOverlays(ctx context.Context, eng *deploy.Engine
 					return fmt.Errorf("restore %s after overlay endpoint repair: %w", device.ID, err)
 				}
 			}
+			ids = append(ids, device.ID)
+		}
+		if len(ids) > 0 {
+			// A successful command is not proof that the replacement
+			// interface retained its address or that FRR loaded the peer. Run
+			// the same local semantic proof used before pruning; in solve mode
+			// it gets one bounded repair and must then re-observe the result.
+			if err := s.verifyTopologySemantics(ctx, top, mode, ungraded, ids, nil); err != nil {
+				return fmt.Errorf("verify devices after overlay endpoint repair: %w", err)
+			}
+			s.recordEvent(top.Name, "", "deploy", "", "overlay_endpoint_replay", "success",
+				strings.Join(ids, ","))
 		}
 		return nil
 	}

@@ -266,3 +266,35 @@ func TestAnUnreadableBridgeScanStopsCollectionRatherThanGuessing(t *testing.T) {
 		t.Fatal("an unreadable link table was reported as a clean collection pass")
 	}
 }
+
+func TestStaleGCScanCannotRemoveAStartedLabsMultiplexBindings(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	server := gcFenceServer(&now)
+	server.gcListMultiplex = func(string) ([]netx.MultiplexOverlay, error) {
+		return []netx.MultiplexOverlay{{
+			Lab: "scale", Vxlan: "twvp0123456789a", VNIs: []uint32{7001},
+		}}, nil
+	}
+	server.gcLabRuntimeActive = func(context.Context, string) (bool, error) {
+		// The control-plane snapshot deliberately says nothing is protected;
+		// the final runtime proof sees a container that started afterwards.
+		return true, nil
+	}
+	server.gcDeleteHostLink = func(string) error {
+		t.Fatal("GC deleted a host veth of a lab that is now running")
+		return nil
+	}
+	server.gcRemoveOverlay = func(uint32) error {
+		t.Fatal("GC deleted a VNI of a lab that is now running")
+		return nil
+	}
+	if _, err := server.gcOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(2 * time.Second)
+	if summary, err := server.gcOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	} else if len(summary.RemovedOverlays) != 0 {
+		t.Fatalf("GC removed active overlays: %#v", summary)
+	}
+}

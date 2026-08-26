@@ -84,6 +84,25 @@ func (s *Server) gcOnce(ctx context.Context) (GCSummary, error) {
 	}
 	summary := GCSummary{ExpiredClaims: expired, Protected: len(protected)}
 	summary.ExpiredClaims += s.gcReleaseStaleLiveClaims(protected, now)
+	runtimeActiveMemo := map[string]bool{}
+	runtimeChecked := map[string]bool{}
+	runtimeActive := func(lab string) (bool, error) {
+		if lab == "" {
+			// An ownerless host object is intentionally left to the explicit
+			// operator sweep. Automatic collection cannot prove which live
+			// lab would lose it.
+			return true, nil
+		}
+		if runtimeChecked[lab] {
+			return runtimeActiveMemo[lab], nil
+		}
+		active, err := s.labRuntimeActive(ctx, lab)
+		if err != nil {
+			return false, err
+		}
+		runtimeChecked[lab], runtimeActiveMemo[lab] = true, active
+		return active, nil
+	}
 
 	findOrphans, removeOverlay, deleteHost, listMultiplex, removeEmpty := s.gcHooks()
 	orphans, err := findOrphans(protected)
@@ -92,6 +111,11 @@ func (s *Server) gcOnce(ctx context.Context) (GCSummary, error) {
 	}
 	for _, orphan := range orphans {
 		if orphan.Owner != "" && protected[orphan.Owner] {
+			continue
+		}
+		if active, activeErr := runtimeActive(orphan.Owner); activeErr != nil {
+			return summary, fmt.Errorf("recheck legacy overlay owner before garbage collection: %w", activeErr)
+		} else if active {
 			continue
 		}
 		key := fmt.Sprintf("legacy:%d", orphan.VNI)
@@ -125,6 +149,11 @@ func (s *Server) gcOnce(ctx context.Context) (GCSummary, error) {
 	}
 	for _, overlay := range multiplex {
 		if protected[overlay.Lab] {
+			continue
+		}
+		if active, activeErr := runtimeActive(overlay.Lab); activeErr != nil {
+			return summary, fmt.Errorf("recheck multiplex owner before garbage collection: %w", activeErr)
+		} else if active {
 			continue
 		}
 		for _, vni := range overlay.VNIs {
@@ -195,6 +224,23 @@ func (s *Server) gcOnce(ctx context.Context) (GCSummary, error) {
 	sort.Strings(summary.RemovedPairs)
 	sort.Strings(summary.RemovedBridges)
 	return summary, nil
+}
+
+func (s *Server) labRuntimeActive(ctx context.Context, lab string) (bool, error) {
+	if s.gcLabRuntimeActive != nil {
+		return s.gcLabRuntimeActive(ctx, lab)
+	}
+	if s.rt == nil {
+		return false, errors.New("cannot prove lab activity without a runtime")
+	}
+	containers, err := s.rt.List(ctx, rt.Filter{All: true, Labels: map[string]string{
+		deploy.LabelManaged: "true",
+		deploy.LabelLab:     lab,
+	}})
+	if err != nil {
+		return false, fmt.Errorf("list managed containers of %s: %w", lab, err)
+	}
+	return len(containers) > 0, nil
 }
 
 // collectLegacyOrphan performs the removal itself while the identifier is
