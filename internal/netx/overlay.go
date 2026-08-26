@@ -425,6 +425,81 @@ func ListOverlaysOfLab(lab string) ([]uint32, error) {
 	return listOverlays(lab)
 }
 
+// OverlayPortsOfLab counts, for every VNI a lab owns on this host, the
+// non-tunnel ports still attached to the object carrying it.
+//
+// It answers one question: is something still using this overlay? A count above
+// zero means a container's veth is on that bridge, so removing the overlay
+// would cut a cable that is carrying traffic -- which is exactly what a cleanup
+// run from partial information does when it works from a name alone. Callers
+// that remove overlays without a manifest use this to leave those alone and say
+// so, rather than reporting a success measured only by what they deleted.
+func OverlayPortsOfLab(lab string) (map[uint32]int, error) {
+	links, err := listHostLinks()
+	if err != nil {
+		return nil, fmt.Errorf("list host interfaces: %w", err)
+	}
+	ports := map[int]int{}
+	byName := map[string]netlink.Link{}
+	for _, l := range links {
+		a := l.Attrs()
+		byName[a.Name] = l
+		if a.MasterIndex == 0 {
+			continue
+		}
+		if _, isVx := l.(*netlink.Vxlan); isVx {
+			continue
+		}
+		ports[a.MasterIndex]++
+	}
+
+	out := map[uint32]int{}
+	for _, l := range links {
+		vx, ok := l.(*netlink.Vxlan)
+		if !ok || !strings.HasPrefix(vx.Name, "twvx") {
+			continue
+		}
+		if lab != "" && ownerFromAlias(vx.Attrs().Alias) != lab {
+			continue
+		}
+		vni := uint32(vx.VxlanId)
+		if br, ok := byName[BridgeName(vni)]; ok {
+			out[vni] = ports[br.Attrs().Index]
+			continue
+		}
+		out[vni] = 0
+	}
+
+	h, err := netlink.NewHandle()
+	if err != nil {
+		return nil, fmt.Errorf("open host netlink handle: %w", err)
+	}
+	defer h.Close()
+	devices, err := multiplexDevices(h, lab)
+	if err != nil {
+		return nil, err
+	}
+	for _, device := range devices {
+		vnis, err := multiplexVNIs(h, device.vx)
+		if err != nil {
+			return nil, err
+		}
+		attached := 0
+		if device.br != nil {
+			attached = ports[device.br.Attrs().Index]
+		}
+		for _, vni := range vnis {
+			// A shared tunnel carries many logical links. Any port on its
+			// bridge belongs to one of them, and this cannot tell which, so
+			// every binding on a busy pair is treated as in use.
+			if seen, ok := out[vni]; !ok || attached > seen {
+				out[vni] = attached
+			}
+		}
+	}
+	return out, nil
+}
+
 // OverlayOwners maps every Twinet overlay on this host to the lab that owns it.
 func OverlayOwners() (map[uint32]string, error) {
 	links, err := listHostLinks()

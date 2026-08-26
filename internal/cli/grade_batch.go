@@ -323,7 +323,8 @@ submission. Use --full-harness (normally with --keep-labs) for a dispute, or
 				return fmt.Errorf("the marks are written, but at least one grading harness " +
 					"could not be removed and is still using this cluster's containers and " +
 					"network identifiers; the failures are named above. Remove them with " +
-					"`twinet destroy --lab <name>` before the next run")
+					"`twinet -m <class manifest> destroy --lab <name> --yes` before the next " +
+					"run: the class manifest is what says which machines to reach")
 			}
 			return nil
 		},
@@ -516,7 +517,8 @@ func gradeOneHarness(ctx context.Context, class *model.Topology, rubric *grade.R
 			// were found on this cluster, and nothing had ever said so.
 			slog.Error("a grading harness could not be removed; it is still using this "+
 				"cluster's containers and network identifiers, and must be removed by hand "+
-				"with `twinet destroy --lab <name>` before the next class-scale run",
+				"with `twinet -m <class manifest> destroy --lab <name> --yes` before the next "+
+				"class-scale run",
 				"lab", h.Name, "submission", s.Group, "err", err)
 		}
 	}()

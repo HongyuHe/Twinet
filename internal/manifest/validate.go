@@ -1230,6 +1230,19 @@ func (l *Loaded) validatePlacement(d *Diagnostics, file string) {
 				p.Runtime, err),
 			"registered runtimes: "+strings.Join(runtime.RuntimeNames(), ", "))
 	}
+	// An omitted selection is a decision made by nobody. It means Docker, for
+	// compatibility with manifests written before the runtime registry existed,
+	// so a lab authored on a containerd or Podman cluster deploys nowhere and
+	// says nothing about why until an agent reports the wrong backend. Saying
+	// so here costs a line in the manifest and makes the engine part of what a
+	// reader can see.
+	if !l.Lab.RuntimeDeclared() {
+		d.Warn(file, "placement.runtime",
+			fmt.Sprintf("no container runtime is declared, so this lab uses %q; "+
+				"state placement.runtime (%s), or override it per run with --runtime",
+				model.DefaultRuntime, strings.Join(runtime.RuntimeNames(), ", ")),
+			nodeAt(root, "placement"))
+	}
 	names := map[string]bool{}
 	pools := map[string]bool{}
 	fronts := 0

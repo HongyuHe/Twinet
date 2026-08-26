@@ -35,18 +35,30 @@ operator / CLI
 
 ## Runtime and command boundary
 
-Docker and Podman are registered runtime backends. Docker's normal
+Docker, Podman, and containerd are registered runtime backends. Docker's normal
 implementation uses the Docker **Engine API**; a CLI fallback has narrower
-semantics. Podman's API contract has a bounded live integration result recorded
-in [09](09_status.md), but registration/testing does **not** make it a
-manifest-selectable or agent-selectable runtime: that selection work remains
-pending. The exact registered runtime and executable lists are generated in
+semantics. Podman and containerd each have a bounded live integration result
+recorded in [09](09_status.md).
+
+Selection is a manifest and agent contract, not an implicit property of the
+host. `placement.runtime` states the lab's backend and `placement.nodes[]`
+may narrow it per node; `--runtime`/`TWINET_RUNTIME` overrides both for one
+invocation and every node at once; `twinetd -runtime` is what an agent actually
+runs, and the controller refuses to mutate a node that reports a different
+backend. Validation checks the selection against the registry's declared
+capabilities before a deployment acquires a lease. Every bundled example
+declares its backend; an omitted selection still means Docker, for manifests
+written before the registry existed, and validation says so.
+
+The exact registered runtime and executable lists are generated in
 [09](09_status.md), so this document does not claim that Twinet consists of two
 binaries or one dependency-free binary.
 
-A deployment needs Linux networking privileges, a reachable Docker Engine, and
-the images selected by the manifest. Static Go linking can simplify packaging
-for individual helpers, but does not remove those operational dependencies.
+A deployment needs Linux networking privileges, a reachable container engine of
+the selected kind, and the images the manifest selects. Static Go linking can
+simplify packaging for individual helpers, but does not remove those
+operational dependencies. [12](12_operator_guide.md) is the runbook that
+installs them.
 
 ## Desired state, observed state, and durable state
 

@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 )
 
 // Documentation that names a command which does not exist is worse than
@@ -73,6 +74,90 @@ func TestEveryDocumentedCommandExists(t *testing.T) {
 			"planned (\"roadmap\", \"not yet\", \"planned\", \"will\", \"would\").",
 			len(problems), strings.Join(problems, "\n"))
 	}
+}
+
+// A documented flag that does not exist fails in exactly the same way as a
+// documented command that does not exist: the reader types the line, gets
+// "unknown flag", and cannot tell whether the tool or the manual is wrong.
+// Command names were checked and flags were not, so the guidance that told an
+// operator which flag to pass was unchecked prose next to checked prose.
+//
+// Every flag written after a command in the documentation must exist on that
+// command, or be inherited by it.
+func TestEveryDocumentedFlagExists(t *testing.T) {
+	root := Root()
+
+	docs, err := filepath.Glob("../../docs/*.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	docs = append(docs, "../../README.md")
+
+	// The command, then everything up to the end of the line or the start of
+	// another command: a pipe, a chained command, a redirection, or a comment.
+	invocation := regexp.MustCompile(`twinet((?: [a-z][a-z0-9-]*)+)([^|&;>#\n]*)`)
+	flagRef := regexp.MustCompile(`(^|\s)--([a-z][a-z0-9-]*)`)
+
+	var problems []string
+	for _, path := range docs {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i, line := range strings.Split(string(raw), "\n") {
+			if plannedContext(path, line) {
+				continue
+			}
+			for _, m := range invocation.FindAllStringSubmatch(line, -1) {
+				words := strings.Fields(m[1])
+				if len(words) == 0 {
+					continue
+				}
+				cmd, missing := resolve(root, words)
+				if missing != "" {
+					// The command itself is wrong, which the other gate
+					// reports. Its flags cannot be judged.
+					continue
+				}
+				for _, f := range flagRef.FindAllStringSubmatch(m[2], -1) {
+					name := f[2]
+					if cmd.Flags().Lookup(name) != nil ||
+						cmd.InheritedFlags().Lookup(name) != nil ||
+						root.PersistentFlags().Lookup(name) != nil {
+						continue
+					}
+					problems = append(problems, "  "+filepath.Base(path)+":"+
+						strconv.Itoa(i+1)+": "+cmd.CommandPath()+" has no --"+name+
+						"\n      "+strings.TrimSpace(line)+
+						"\n      it accepts: "+strings.Join(flagNames(cmd), ", "))
+				}
+			}
+		}
+	}
+	if len(problems) > 0 {
+		sort.Strings(problems)
+		t.Errorf("the documentation names %d flag(s) that do not exist:\n\n%s\n\n"+
+			"Either add them, correct the name, or say on the same line that they are planned.",
+			len(problems), strings.Join(problems, "\n"))
+	}
+}
+
+// flagNames lists what a command does accept, so a failure names the
+// alternative instead of only the mistake.
+func flagNames(cmd *cobra.Command) []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(f *pflag.Flag) {
+		if f.Hidden || seen[f.Name] {
+			return
+		}
+		seen[f.Name] = true
+		out = append(out, "--"+f.Name)
+	}
+	cmd.Flags().VisitAll(add)
+	cmd.InheritedFlags().VisitAll(add)
+	sort.Strings(out)
+	return out
 }
 
 // resolve walks as far down the command tree as the words allow. It returns the

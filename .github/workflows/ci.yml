@@ -76,6 +76,22 @@ jobs:
             ./bin/twinet validate -m "$lab"
           done
 
+      - name: Check that every bundled lab shares one runtime contract
+        run: |
+          # Six of seven labs once defaulted to Docker while the documented
+          # cluster ran containerd, so the bundle could not be deployed as a
+          # set anywhere. Each lab declares the cluster runtime, and each must
+          # still validate under an explicit override for a Docker or Podman
+          # machine.
+          for lab in examples/*/; do
+            grep -Eq '^[[:space:]]*runtime:[[:space:]]*containerd[[:space:]]*$' "$lab/twinet.yaml" || {
+              echo "$lab/twinet.yaml does not declare placement.runtime: containerd" >&2
+              exit 1
+            }
+            ./bin/twinet --runtime docker validate -m "$lab" >/dev/null
+            ./bin/twinet --runtime podman validate -m "$lab" >/dev/null
+          done
+
       - name: Validate the bundled rubrics
         run: |
           for rubric in examples/*/rubric/*.yaml; do

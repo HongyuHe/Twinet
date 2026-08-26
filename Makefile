@@ -39,6 +39,11 @@ IMAGE_LOCK ?= images/lock.json
 IMAGE_LOCK_SOURCE_REGISTRY ?= hyhe
 IMAGE_LOCK_SOURCE_TAG ?= 0.1
 PODMAN_ROOT ?= sudo -n podman
+# The image targets build and inspect with $(DOCKER), so the lock and its
+# verification read the same engine. The bundled manifests declare containerd
+# for the cluster; this states the engine for these Docker-side flows rather
+# than depending on whatever a manifest happens to say.
+LOCK_RUNTIME ?= docker
 # Must match .github/workflows/ci.yml, or local lint and CI can disagree.
 GOLANGCI_VERSION ?= v2.5.0
 TWINET_NIKA_KUBERNETES_CONTEXT ?= $(shell $(KUBECTL) config current-context 2>/dev/null)
@@ -139,6 +144,17 @@ ci: ci-tools naming fixture-sync lint test build tidy-check
 	@for m in examples/*/; do \
 		./bin/twinet validate -m "$$m" || exit 1; \
 	done
+	# One runtime contract for the whole bundle. Six of seven labs once defaulted
+	# to Docker while the documented cluster ran containerd, so following the
+	# guide produced a cluster that could deploy one of its own examples. Each
+	# lab must declare the cluster runtime, and must still validate when an
+	# operator overrides it for a Docker or Podman machine.
+	@for m in examples/*/; do \
+		grep -Eq '^[[:space:]]*runtime:[[:space:]]*containerd[[:space:]]*$$' $${m}twinet.yaml || { \
+			echo "$${m}twinet.yaml does not declare placement.runtime: containerd" >&2; exit 1; }; \
+		./bin/twinet --runtime docker validate -m "$$m" >/dev/null || exit 1; \
+		./bin/twinet --runtime podman validate -m "$$m" >/dev/null || exit 1; \
+	done
 	@for r in examples/*/rubric/*.yaml; do \
 		./bin/twinet grade validate "$$r" || exit 1; \
 	done
@@ -222,11 +238,11 @@ image-lock: build
 		test "$$channel_d" = "$$d" || { echo "$$channel does not match immutable $$immutable" >&2; exit 1; }; \
 		args="$$args --pin $$authored=$$authored@$$d"; \
 	done; \
-	./$(BIN)/twinet --manifest examples/mixed-substrate images lock --output "$(CURDIR)/$(IMAGE_LOCK)" $$args
+	./$(BIN)/twinet --runtime $(LOCK_RUNTIME) --manifest examples/mixed-substrate images lock --output "$(CURDIR)/$(IMAGE_LOCK)" $$args
 
 image-verify: build
 	@test -f "$(IMAGE_LOCK)" || { echo "missing $(IMAGE_LOCK); run make push or make image-lock"; exit 2; }
-	sudo -n env PATH="$$PATH" ./$(BIN)/twinet --manifest examples/mixed-substrate images verify --lock "$(CURDIR)/$(IMAGE_LOCK)"
+	sudo -n env PATH="$$PATH" ./$(BIN)/twinet --runtime $(LOCK_RUNTIME) --manifest examples/mixed-substrate images verify --lock "$(CURDIR)/$(IMAGE_LOCK)"
 
 # Compatibility alias retained for release scripts that used the old target.
 digests: image-lock

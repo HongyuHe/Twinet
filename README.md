@@ -20,12 +20,16 @@ routers, and switches.
   agent. The source-generated list, runtime/NOS registries, interior generators,
   fault count, and bundled-example statistics are checked in
   [`docs/09_status.md`](docs/09_status.md).
-- Docker and Podman are registered, selectable runtimes. `placement.runtime`
-  and per-node overrides are validated against runtime capabilities before
-  mutation; agent status exposes backend/version/socket and deployment rejects
-  a mismatch. `make podman-integration` is the explicit real-Podman lifecycle
-  gate. Twinet therefore has host and image dependencies; it is not a
-  one-binary, dependency-free deployment.
+- Docker, Podman, and containerd are registered, selectable runtimes.
+  `placement.runtime` and per-node overrides are validated against runtime
+  capabilities before mutation; agent status exposes backend/version/socket and
+  deployment rejects a mismatch. Every bundled example declares
+  `runtime: containerd`, the engine the
+  [operator guide](docs/12_operator_guide.md) installs, and `--runtime` or
+  `TWINET_RUNTIME` runs the same manifest unmodified on Docker or Podman.
+  `make podman-integration` and `make containerd-integration` are the explicit
+  real-engine lifecycle gates. Twinet therefore has host and image
+  dependencies; it is not a one-binary, dependency-free deployment.
 - Deterministic allocation still derives names, addresses, and link identifiers
   from a manifest. Student-owned configuration, topology/coordination records,
   event journals, and replica acknowledgements are instead persisted in the
@@ -71,19 +75,20 @@ in the status ledger.
 | [Implementation status](docs/09_status.md) | Canonical shipped/target/measured ledger |
 | [Fault injection and RCA](docs/10_fault_injection.md) | NIKA fault work (maintained separately) |
 | [Scalability and reliability objectives](docs/11_scalability_and_reliability_objectives.md) | Objectives and review gate (maintained separately) |
+| [Operator guide](docs/12_operator_guide.md) | Runbook from three clean machines to a deployed, graded, and safely removed lab |
 
 ## Validation
 
 Documentation gates are executable:
 
 ```sh
-go test ./internal/cli -run 'Test(EveryDocumentedCommandExists|Documentation)'
+go test ./internal/cli -run 'Test(EveryDocumented|Documentation)'
 python3 scripts/check_docs.py
 ```
 
-The first command checks documented commands and source-derived capability
-facts. The second checks Markdown local links, referenced paths, and benchmark
-labels. Full source validation remains:
+The first command checks documented commands, the flags written after them, and
+source-derived capability facts. The second checks Markdown local links,
+referenced paths, and benchmark labels. Full source validation remains:
 
 ```sh
 go test ./...

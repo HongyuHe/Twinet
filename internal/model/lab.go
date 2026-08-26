@@ -1310,7 +1310,68 @@ type NodeSpec struct {
 
 // DefaultRuntime is the compatibility selection for manifests written before
 // runtime selection was exposed.
+//
+// It is a fallback for legacy manifests, not the contract: every bundled
+// example states its backend in `placement.runtime`, because a manifest that
+// says nothing deploys on whichever engine the reader happens to have and
+// fails on the cluster the documentation recommends. Validation reports an
+// omitted selection so the fallback is visible where it is authored.
 const DefaultRuntime = "docker"
+
+// RecommendedRuntime is the backend the documented teaching cluster runs, and
+// the one every bundled example declares.
+//
+// One coherent selection is the point. A bundle in which most labs default to
+// Docker and one declares containerd cannot be deployed as a set on any single
+// cluster, and the operator finds out one lab at a time. Docker and Podman stay
+// available by saying so -- `--runtime`, `TWINET_RUNTIME`, or the manifest --
+// rather than by being what happens when nobody chose.
+const RecommendedRuntime = "containerd"
+
+// RuntimeDeclared reports whether the manifest states which container engine
+// the lab runs on, at the lab level or on every node.
+//
+// The distinction matters to anything that must not act on a guess: an
+// undeclared selection means DefaultRuntime, which is a compatibility answer
+// rather than an operator's intent.
+func (l *Lab) RuntimeDeclared() bool {
+	if l == nil {
+		return false
+	}
+	if strings.TrimSpace(l.Placement.Runtime) != "" {
+		return true
+	}
+	if len(l.Placement.Nodes) == 0 {
+		return false
+	}
+	for _, n := range l.Placement.Nodes {
+		if strings.TrimSpace(n.Runtime) == "" {
+			return false
+		}
+	}
+	return true
+}
+
+// SelectRuntime overrides the manifest's backend for every node.
+//
+// It exists so one lab can be deployed unmodified on a containerd cluster and
+// on a Docker or Podman workstation: the operator states the engine once, and
+// it wins over both the lab default and every per-node selection, so nothing
+// is left partly overridden. An empty name changes nothing.
+func (l *Lab) SelectRuntime(name, socket string) {
+	if l == nil || strings.TrimSpace(name) == "" {
+		return
+	}
+	name = strings.ToLower(strings.TrimSpace(name))
+	socket = strings.TrimSpace(socket)
+	l.Placement.Runtime = name
+	for i := range l.Placement.Nodes {
+		l.Placement.Nodes[i].Runtime = name
+		if socket != "" {
+			l.Placement.Nodes[i].RuntimeSocket = socket
+		}
+	}
+}
 
 // RuntimeForNode returns the requested backend for one placement node. A
 // node-specific selection wins over the lab default; an omitted selection keeps

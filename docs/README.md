@@ -32,16 +32,17 @@ CLI built from this source tree.
 | 09 | [Implementation status](09_status.md) | Canonical source facts, measurements, and remaining work |
 | 10 | [Fault injection and RCA](10_fault_injection.md) | Separately maintained NIKA work |
 | 11 | [Scalability and reliability objectives](11_scalability_and_reliability_objectives.md) | Separately maintained objectives and review gate |
+| 12 | [Operator guide](12_operator_guide.md) | Shipped runbook: prerequisites, PKI, bootstrap, deploy, grade, recover, and safe removal |
 
 ## Documentation checks
 
 Run both gates before changing documentation:
 
 ```sh
-go test ./internal/cli -run 'Test(EveryDocumentedCommandExists|Documentation)'
+go test ./internal/cli -run 'Test(EveryDocumented|Documentation)'
 python3 scripts/check_docs.py
 ```
 
-The Go test rejects stale command names and stale generated capability facts.
-The Python checker validates local Markdown links, referenced paths, and
-benchmark labels.
+The Go test rejects stale command names, flags no command accepts, and stale
+generated capability facts. The Python checker validates local Markdown links,
+referenced paths, and benchmark labels.

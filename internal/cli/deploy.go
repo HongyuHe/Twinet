@@ -444,32 +444,50 @@ func modeName(solve bool) string {
 
 func newDestroyCmd(opts *Options) *cobra.Command {
 	var (
-		yes   bool
-		lab   string
-		keep  bool
-		force bool
-		token string
+		yes       bool
+		lab       string
+		keep      bool
+		force     bool
+		token     string
+		localOnly bool
 	)
 	cmd := &cobra.Command{
 		Use:   "destroy",
 		Short: "Remove every container and overlay object belonging to the lab",
-		Long: `Destroy works from container labels, so it can clean up a deployment even
-if the manifest that created it is no longer available.`,
+		Long: `Destroy removes a lab from every machine its manifest places it on.
+
+Container labels say what belongs to the lab, so a deployment whose manifest has
+been edited since can still be removed. The manifest is what says which machines
+to reach. Without one there is nothing that can prove the lab is not still
+running on another node, so --lab NAME on its own refuses to remove anything
+rather than cleaning up this machine and reporting the lab gone.
+
+--this-node-only is the explicit exception, and its scope is exactly its name:
+the containers lab NAME has on this machine, and the overlay objects it owns
+here that no longer carry a cable. No other node is contacted or changed, and
+the removal is reported as this machine's alone. It needs --runtime as well,
+because without a manifest nothing says which container engine created the lab,
+and asking the wrong one reports an empty machine.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			var top *model.Topology
 			name := lab
 			var vnis []uint32
 			if name == "" {
+				if localOnly {
+					return fmt.Errorf("--this-node-only limits the scope of a named lab; " +
+						"pass --lab NAME, or drop it to destroy the manifest's own lab")
+				}
 				t, err := loadAndPlace(opts)
 				if err != nil {
-					return fmt.Errorf("%w\n(pass --lab NAME to destroy without a manifest)", err)
+					return fmt.Errorf("%w\n(pass --lab NAME with the lab's manifest to destroy "+
+						"a lab whose name you know)", err)
 				}
 				top = t
 				name = top.Name
 				for _, l := range top.Links {
 					vnis = append(vnis, l.VNI)
 				}
-			} else if t, err := load(opts); err == nil && clustered(t) {
+			} else if !localOnly {
 				// A name and a manifest together: the name says which lab, the
 				// manifest says which machines. Without this, naming a lab fell
 				// straight through to the local container runtime and tried to
@@ -478,7 +496,19 @@ if the manifest that created it is no longer available.`,
 				// fails to come down, so the documented recovery did not work.
 				// Three abandoned harnesses were found on this cluster and
 				// could not be removed with the command that names them.
-				top = t
+				//
+				// A manifest describing this very lab is used whether or not it
+				// is clustered: it carries the runtime, the node the devices
+				// are placed on, and the identifiers of the overlays to remove,
+				// none of which a container label can supply.
+				if t, err := load(opts); err == nil && (t.Name == name || clustered(t)) {
+					top = t
+					if t.Name == name {
+						for _, l := range top.Links {
+							vnis = append(vnis, l.VNI)
+						}
+					}
+				}
 			}
 
 			if top != nil && clustered(top) {
@@ -535,10 +565,59 @@ if the manifest that created it is no longer available.`,
 				return nil
 			}
 
-			rt, err := localRuntime(top)
-			if err != nil {
-				return err
+			// Everything below this point acts on this machine alone.
+			//
+			// With a manifest that is the whole lab, because the manifest is
+			// what says which machines the lab is on. Without one it is a claim
+			// nothing can check: `destroy --lab NAME` selected the default
+			// Docker backend, found none of a containerd cluster's containers,
+			// deleted the overlay objects this machine held for the lab,
+			// printed a success, and left the lab running on three nodes with
+			// its cross-node cables cut. A cleanup that cannot see the lab must
+			// not report having removed it, so it refuses instead.
+			if top == nil {
+				if !localOnly {
+					return fmt.Errorf("refusing to remove lab %q from a name alone: no manifest "+
+						"was loaded from %q, so nothing here can tell whether the lab is running "+
+						"on other machines, which engine created it, or which overlay objects are "+
+						"still carrying its traffic.\n"+
+						"  - to remove the whole lab, run this with its manifest: "+
+						"twinet -m PATH destroy --lab %s --yes\n"+
+						"  - to clean up abandoned objects across a cluster you can still reach, "+
+						"use: twinet -m PATH node sweep --remove\n"+
+						"  - to remove only what this one machine holds, say so explicitly: "+
+						"twinet --runtime ENGINE destroy --lab %s --this-node-only --yes",
+						name, opts.Manifest, name, name)
+				}
+				if strings.TrimSpace(opts.Runtime) == "" {
+					return fmt.Errorf("--this-node-only has no manifest to read the container "+
+						"engine from, and a lab is invisible to the wrong one: pass --runtime "+
+						"(%s) so that an empty answer means the machine is empty rather than "+
+						"that the wrong daemon was asked",
+						strings.Join(runtime.RuntimeNames(), ", "))
+				}
 			}
+
+			var rt runtime.Runtime
+			if top != nil {
+				local, err := localRuntime(top)
+				if err != nil {
+					return err
+				}
+				rt = local
+			} else {
+				local, err := localRuntimeNamed(opts.Runtime, opts.RuntimeSocket)
+				if err != nil {
+					return err
+				}
+				rt = local
+			}
+			// What this invocation can honestly speak for, named in every
+			// message it prints. "nothing to remove for lab x" and "removed lab
+			// x" mean different things on one machine and on a cluster, and the
+			// reader cannot tell which they got unless it is said.
+			machineOnly := top == nil
+			scope := destroyScope(name, machineOnly)
 			cs, err := rt.List(cmd.Context(), runtime.Filter{
 				All: true, Labels: map[string]string{deploy.LabelLab: name}})
 			if err != nil {
@@ -551,46 +630,74 @@ if the manifest that created it is no longer available.`,
 			// most expensive way, because the identifiers stayed in use and the
 			// next lab deriving the same ones would have joined its traffic to
 			// a lab that no longer exists.
-			var strayVNIs []uint32
-			if top == nil && !keep {
-				if owned, oerr := netx.ListOverlaysOfLab(name); oerr == nil {
-					strayVNIs = owned
+			//
+			// They carry the owning lab's name on the device itself, which is
+			// exactly so that this is possible without consulting anything.
+			var owned []uint32
+			var ownedErr error
+			if !keep {
+				owned, ownedErr = netx.ListOverlaysOfLab(name)
+				if ownedErr != nil {
+					fmt.Fprintf(cmd.ErrOrStderr(),
+						"note: this machine's overlay objects could not be listed (%v)\n", ownedErr)
 				}
 			}
-			if len(cs) == 0 && len(strayVNIs) == 0 {
-				fmt.Fprintf(cmd.OutOrStdout(), "nothing to remove for lab %q\n", name)
+			if len(cs) == 0 && len(owned) == 0 {
+				if ownedErr != nil {
+					// "Nothing to remove" would be a conclusion drawn from a
+					// question that failed, which is the same mistake in a
+					// smaller font.
+					return fmt.Errorf("%s has no containers, but its overlay objects could not "+
+						"be listed, so nothing here can say the lab is gone: %w", scope, ownedErr)
+				}
+				fmt.Fprint(cmd.OutOrStdout(), destroyNoOpMessage(name, machineOnly))
 				return nil
 			}
 			if len(cs) == 0 {
+				if !yes {
+					fmt.Fprintf(cmd.OutOrStdout(),
+						"%s has no containers left and %d overlay object(s) it still owns; "+
+							"pass --yes to remove them\n", scope, len(owned))
+					return nil
+				}
 				eng := &deploy.Engine{Runtime: rt, Node: "local"}
-				if err := eng.DestroyOverlays(strayVNIs); err != nil {
-					return fmt.Errorf("removing the overlays of lab %q: %w", name, err)
+				removed, kept, err := removeIdleOverlays(eng.DestroyOverlays, name, owned)
+				if err != nil {
+					return fmt.Errorf("removing the overlays of %s: %w", scope, err)
+				}
+				if len(removed) == 0 {
+					fmt.Fprintf(cmd.OutOrStdout(),
+						"%s had no containers left, and none of its %d overlay object(s) "+
+							"was removed\n", scope, len(owned))
+					reportKeptOverlays(cmd.OutOrStdout(), kept)
+					return nil
 				}
 				fmt.Fprintf(cmd.OutOrStdout(),
-					"lab %q had no containers left, and %d overlay object(s) that it still "+
-						"owned have been removed\n", name, len(strayVNIs))
+					"%s had no containers left, and %d overlay object(s) that it still "+
+						"owned have been removed\n", scope, len(removed))
+				reportKeptOverlays(cmd.OutOrStdout(), kept)
 				return nil
 			}
 			if !yes {
-				fmt.Fprintf(cmd.OutOrStdout(), "about to remove %d containers of lab %q; pass --yes to proceed\n",
-					len(cs), name)
+				fmt.Fprintf(cmd.OutOrStdout(), "about to remove %d containers of %s; pass --yes to proceed\n",
+					len(cs), scope)
 				return nil
 			}
 
 			// Without a manifest there is no topology, and everything below
 			// used to dereference one. `twinet destroy --lab NAME` -- the one
-			// path the command's own help recommends for a lab whose manifest
+			// path the command's own help recommended for a lab whose manifest
 			// is gone -- panicked with a nil pointer before removing anything.
 			//
 			// The containers carry their own identity in their labels, which is
-			// what makes the command possible at all, so the devices are
-			// reconstructed from them and the same preservation guarantee
-			// holds either way.
+			// what makes this possible at all, so the devices are reconstructed
+			// from them and the same preservation guarantee holds either way.
 			if top == nil {
 				fmt.Fprintf(cmd.ErrOrStderr(),
-					"no manifest, so this removes lab %q from this machine only. "+
-						"A lab spread over a cluster keeps running everywhere else; "+
-						"destroy it with its manifest, or run this on each node.\n", name)
+					"no manifest: this removes lab %q from this machine only -- its containers "+
+						"here, and the overlay endpoints those containers were using here. No "+
+						"other machine is contacted or changed, and a lab spread over a cluster "+
+						"keeps running everywhere else.\n", name)
 			}
 			store, err := destroyStore(top)
 			if err != nil {
@@ -633,23 +740,20 @@ if the manifest that created it is no longer available.`,
 			// `docker ps`, so the next deployment inherits it and fails in a
 			// way that has nothing to do with the cause -- and "removed 212
 			// containers" scrolling past is not something anybody re-reads.
-			// Without a manifest there are no VNIs to remove, and the overlays
-			// were simply left behind: 461 VXLAN devices across three nodes
-			// were found belonging to four labs whose containers had been
-			// removed weeks earlier. They carry the owning lab's name on the
-			// device itself, which is exactly so that this is possible without
-			// consulting anything.
-			if top == nil && !keep {
-				vnis = append(vnis, strayVNIs...)
-			}
+			// 461 VXLAN devices across three nodes were found belonging to four
+			// labs whose containers had been removed weeks earlier.
+			vnis = append(vnis, owned...)
 
 			var left []string
+			var keptOverlays []uint32
 			if !keep && len(vnis) > 0 {
-				if err := eng.DestroyOverlays(vnis); err != nil {
+				_, kept, err := removeIdleOverlays(eng.DestroyOverlays, name, vnis)
+				if err != nil {
 					left = append(left, fmt.Sprintf("the overlay bridges and tunnels are "+
 						"still in place (%v); the next deployment will find them and may "+
 						"reuse them for a different lab", err))
 				}
+				keptOverlays = kept
 			}
 			// The record describes containers that no longer exist. Leaving it
 			// would pin the next deployment to an arrangement chosen for a lab
@@ -662,7 +766,8 @@ if the manifest that created it is no longer available.`,
 						"arrangement chosen for the lab that has just been removed", err))
 				}
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "removed %d containers of lab %q\n", len(cs), name)
+			fmt.Fprint(cmd.OutOrStdout(), destroyRemovedMessage(len(cs), name, machineOnly))
+			reportKeptOverlays(cmd.OutOrStdout(), keptOverlays)
 			if len(left) > 0 {
 				return fmt.Errorf("the containers are gone but the lab is not fully "+
 					"removed:\n  %s", strings.Join(left, "\n  "))
@@ -671,12 +776,110 @@ if the manifest that created it is no longer available.`,
 		},
 	}
 	cmd.Flags().BoolVarP(&yes, "yes", "y", false, "do not ask for confirmation")
-	cmd.Flags().StringVar(&lab, "lab", "", "lab name, when no manifest is available")
+	cmd.Flags().StringVar(&lab, "lab", "",
+		"name of the lab to remove; needs this lab's manifest, or --this-node-only")
+	cmd.Flags().BoolVar(&localOnly, "this-node-only", false,
+		"remove only what the named lab has on this machine; no other node is contacted or "+
+			"changed, and overlay objects still carrying an interface are kept")
 	cmd.Flags().BoolVar(&keep, "keep-overlays", false, "leave VXLAN bridges and tunnels in place")
 	cmd.Flags().BoolVar(&force, "force", false,
 		"skip state capture and irreversibly remove an orphaned cluster lab")
 	cmd.Flags().StringVar(&token, "token", "", "agent token for cluster deployments (or set TWINET_TOKEN)")
 	return cmd
+}
+
+// destroyScope, destroyNoOpMessage, and destroyRemovedMessage keep the wording
+// of an outcome next to the thing that decides it.
+//
+// "nothing to remove for lab cos461" and "removed lab cos461" were printed by a
+// command that had inspected one machine of three, and nothing in either line
+// said so. The reader cannot check a scope they were not told about, which is
+// how a lab was reported gone while it was still running on two other nodes.
+func destroyScope(name string, machineOnly bool) string {
+	if machineOnly {
+		return fmt.Sprintf("lab %q on this machine", name)
+	}
+	return fmt.Sprintf("lab %q", name)
+}
+
+func destroyNoOpMessage(name string, machineOnly bool) string {
+	out := fmt.Sprintf("nothing to remove for %s\n", destroyScope(name, machineOnly))
+	if machineOnly {
+		out += "no other machine was inspected, and none was changed\n"
+	}
+	return out
+}
+
+func destroyRemovedMessage(containers int, name string, machineOnly bool) string {
+	out := fmt.Sprintf("removed %d containers of %s\n", containers, destroyScope(name, machineOnly))
+	if machineOnly {
+		out += "no other machine was contacted, and none was changed\n"
+	}
+	return out
+}
+
+// overlayPortsOfLab reports how many interfaces are still attached to each
+// overlay object a lab owns on this machine. It is a variable so the rule that
+// depends on it can be tested without a host to build overlays on.
+var overlayPortsOfLab = netx.OverlayPortsOfLab
+
+// removeIdleOverlays removes the overlay objects of a lab that nothing is
+// attached to any more, and reports the ones it deliberately left alone.
+//
+// An overlay whose bridge still has a port is carrying a cable for something,
+// whatever an ownership record says. Cutting it is not a cleanup: it is a
+// silent outage in whatever is still using it, and the machine that runs the
+// cleanup is rarely the machine that notices. This is the same rule `twinet
+// node sweep` applies, so a lab cannot be cleaned up more aggressively by
+// naming it than by sweeping for it.
+func removeIdleOverlays(remove func([]uint32) error, lab string, candidates []uint32) (removed, kept []uint32, err error) {
+	if len(candidates) == 0 {
+		return nil, nil, nil
+	}
+	ports, portErr := overlayPortsOfLab(lab)
+	if portErr != nil {
+		// Not knowing which overlays are in use is a reason to remove none of
+		// them. An identifier still held is recoverable; a live link cut by a
+		// cleanup that could not see it is not.
+		return nil, candidates, fmt.Errorf("cannot tell which overlay objects of lab %q are "+
+			"still carrying traffic, so none were removed: %w", lab, portErr)
+	}
+	seen := map[uint32]bool{}
+	for _, vni := range candidates {
+		if seen[vni] {
+			continue
+		}
+		seen[vni] = true
+		if ports[vni] > 0 {
+			kept = append(kept, vni)
+			continue
+		}
+		removed = append(removed, vni)
+	}
+	sort.Slice(removed, func(i, j int) bool { return removed[i] < removed[j] })
+	sort.Slice(kept, func(i, j int) bool { return kept[i] < kept[j] })
+	if len(removed) == 0 {
+		return nil, kept, nil
+	}
+	if err := remove(removed); err != nil {
+		return nil, append(kept, removed...), err
+	}
+	return removed, kept, nil
+}
+
+// reportKeptOverlays says what was left behind and why, rather than letting a
+// count of removals imply that everything is gone.
+func reportKeptOverlays(out io.Writer, kept []uint32) {
+	if len(kept) == 0 {
+		return
+	}
+	names := make([]string, 0, len(kept))
+	for _, vni := range kept {
+		names = append(names, strconv.FormatUint(uint64(vni), 10))
+	}
+	fmt.Fprintf(out, "kept %d overlay object(s) that still have an interface attached "+
+		"(VNI %s); something is using them, so they were not removed\n",
+		len(kept), strings.Join(names, ", "))
 }
 
 func newExecCmd(opts *Options) *cobra.Command {

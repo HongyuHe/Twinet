@@ -27,6 +27,9 @@ func load(opts *Options) (*model.Topology, error) { //nolint:revive
 	if err != nil {
 		return nil, err
 	}
+	if err := applyRuntimeSelection(opts, l, os.Stderr); err != nil {
+		return nil, err
+	}
 	diags := l.Validate()
 	if diags.HasErrors() {
 		return nil, diags.Err()
@@ -56,6 +59,9 @@ func newValidateCmd(opts *Options) *cobra.Command {
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			l, err := manifest.Load(opts.Manifest)
 			if err != nil {
+				return err
+			}
+			if err := applyRuntimeSelection(opts, l, cmd.ErrOrStderr()); err != nil {
 				return err
 			}
 			diags := l.Validate()

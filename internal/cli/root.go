@@ -3,6 +3,7 @@ package cli
 
 import (
 	"fmt"
+	"os"
 
 	"github.com/spf13/cobra"
 
@@ -26,6 +27,12 @@ type Options struct {
 	Manifest string
 	Verbose  bool
 	JSON     bool
+	// Runtime and RuntimeSocket override the manifest's container engine for
+	// every node of the lab. They are how a manifest written for the cluster
+	// is run unmodified on a workstation, and how a command that has no
+	// manifest at all is told which engine to talk to.
+	Runtime       string
+	RuntimeSocket string
 }
 
 // Root builds the top-level command tree.
@@ -53,6 +60,16 @@ across a cluster and graded automatically.`,
 		"path to the lab manifest or its directory")
 	root.PersistentFlags().BoolVarP(&opts.Verbose, "verbose", "v", false, "verbose logging")
 	root.PersistentFlags().BoolVar(&opts.JSON, "json", false, "emit machine-readable JSON")
+	// The engine is part of the manifest, and this is the one way to say
+	// something else. A bundled lab states `placement.runtime`, so it deploys
+	// on the documented containerd cluster without being edited; an operator
+	// running it on a Docker or Podman machine says so here, once, for every
+	// node. Nothing infers a backend from what happens to be installed.
+	root.PersistentFlags().StringVar(&opts.Runtime, "runtime", os.Getenv("TWINET_RUNTIME"),
+		"override the manifest's container runtime for every node "+
+			"(docker, podman, containerd; or set TWINET_RUNTIME)")
+	root.PersistentFlags().StringVar(&opts.RuntimeSocket, "runtime-socket", os.Getenv("TWINET_RUNTIME_SOCKET"),
+		"endpoint for the overridden runtime (or set TWINET_RUNTIME_SOCKET)")
 
 	root.AddCommand(
 		newValidateCmd(opts),

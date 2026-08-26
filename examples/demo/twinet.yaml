@@ -120,5 +120,11 @@ access:
 
 placement:
   strategy: single-node
+  # The engine every node of this lab runs on, stated rather than inherited.
+  # An omitted selection means Docker for compatibility with manifests older
+  # than the runtime registry, which does not deploy on the containerd cluster
+  # the operator guide sets up. Run it on Docker or Podman with an explicit
+  # override instead of editing the lab: twinet --runtime docker deploy.
+  runtime: containerd
   nodes:
     - {name: node-0, underlay_ip: 10.0.1.1, front: true}

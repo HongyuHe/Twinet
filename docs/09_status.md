@@ -129,7 +129,7 @@ claim.
 | Template expansion and generator registry | source-verified | `internal/expand` covers tiered peerings plus `explicit`, `ring`, `two-tier`, and `clos` interiors |
 | Netlink wiring and shared overlays | source-verified | `internal/netx` tests cover veths, shaping, and one external VXLAN/bridge per lab/node pair with VLAN-to-VNI bindings |
 | Docker Engine API runtime | source-verified | `internal/runtime` registers `docker`; API-client tests cover runtime operations and cancellation |
-| Docker/Podman/containerd runtime selection | source-verified; measured, bounded | Typed `placement.runtime` plus per-node overrides select registered backends before mutation; agents report backend/version/socket/namespace and controllers refuse a mismatch. Node-0 ran the source-built Podman 4.9.3 routed lifecycle gate and the native containerd lifecycle/routed gate (`make podman-integration`, `make containerd-integration`): events, create/start/stop/remove, exec/stdin/output, copy, netns wiring, FRR control, and cleanup completed. |
+| Docker/Podman/containerd runtime selection | source-verified; measured, bounded | Typed `placement.runtime` plus per-node overrides select registered backends before mutation; `--runtime`/`TWINET_RUNTIME` overrides both for one invocation and every node; agents report backend/version/socket/namespace and controllers refuse a mismatch. Every bundled example declares `runtime: containerd`, so the bundle deploys unmodified on the cluster [12](12_operator_guide.md) builds; a manifest that declares nothing still means `docker` and validation says so. Node-0 ran the source-built Podman 4.9.3 routed lifecycle gate and the native containerd lifecycle/routed gate (`make podman-integration`, `make containerd-integration`): events, create/start/stop/remove, exec/stdin/output, copy, netns wiring, FRR control, and cleanup completed. |
 | Image locks and rolling contracts | source-verified | `twinet images lock|verify` records registry manifest digests; release/grading mode requires a checked lock and agents verify after pull before create. Status separates exact source build from protocol, renderer, and state ranges, allowing compatible rolling bug-fix upgrades while refusing incompatible render/state contracts. |
 | BIRD NOS provider and capability validation | source-verified | `internal/nos` registers FRR/BIRD and tests refuse unsupported requests; this is not a blanket live mixed-NOS acceptance claim |
 | Service/state replication and endpoint policy | source-verified | model, expansion, placement, and durability tests cover replica identity, failure domains, and endpoint selection |
@@ -1554,6 +1554,14 @@ move it further, in the order they are worth doing:
 
 ## Measurements
 
+Every row is an observation from the named three-node environment. Re-running
+any of them produces new evidence rather than reproducing these numbers, and
+the machine-readable artifacts of a re-run are not kept in this tree:
+`scripts/scale_benchmark.sh`, `scripts/chaos_e2e.sh`, and
+`scripts/scale_soak.sh` write JSON under the untracked `reports/` path, which
+the cluster workflow uploads as a build artifact. [12](12_operator_guide.md)
+§11 is how they are run.
+
 | Metric | Value |
 |---|---|
 | 12-AS lab, 212 containers, 299 links, 3 nodes (current topology) | **44-58 s** |
@@ -1563,7 +1571,7 @@ move it further, in the order they are worth doing:
 | Links kept local by AS-granular placement, 84-AS lab | **89.7 %** (302 of 2927 cross) |
 | — of which inter-AS links crossing | **111 of 283 (39 %)**, against 201 (71 %) before the partitioner |
 | — intra-AS links crossing | 0 of 2324, by construction |
-| Placement cost, 84 ASes / 2012 containers | < 1 s |
+| Placement cost, 84 ASes / 2012 containers (the shape of that run) | < 1 s |
 | Grading, 3 submissions, 10 questions, 17 checks | 31 s |
 | Grading a class of 8 in waves, all scoring 10/10 | **22m 11s in 4 waves**, measured when the conflict relation was adjacency and submissions were loaded onto the solved lab. Both have since changed and this number is not comparable to anything current |
 | Waves needed for 8 student ASes / for 80, under `--per-wave 8` | **6 / 42** — the conflict relation is distance-two, so roughly one wave per two submissions. `--per-wave` is off by default; see [grading](06_grading.md) |
@@ -1573,7 +1581,7 @@ move it further, in the order they are worth doing:
 | Automatic repairs triggered on a lab while it was being graded, before / after the grading hold | **13 / 0** |
 | Grading 1 submission in its own private harness | ~12 minutes; measured, and the reason waves exist |
 | 8 private harnesses at once on 3 nodes | saturates the cluster; the failures are resource exhaustion, not marks |
-| **Class-scale deployment: 84 ASes, 2012 devices, 2927 links across 3 nodes** | **22m 38s, zero failures** |
+| **Class-scale deployment: 84 ASes, 2012 devices, 2927 links across 3 nodes** | **22m 38s, zero failures** -- taken at the 2,012-device shape of that revision. `examples/scale` now expands to 2,020 devices (see the generated facts above) and this run has not been repeated; the row is evidence about that revision, not about the current manifest |
 | Containers per node at that scale | 731 / 731 / 550 with `pack-by-as`, 660 / 675 / 677 with `spread-by-as` |
 | Node utilisation at that scale | 22 GiB of 251, load average 13 of 56 cores |
 | Emulated latency on a cross-node link at that scale | 20.07 ms for 20 ms configured |
@@ -2871,3 +2879,76 @@ The lesson is about the shape of the fix, not the bug. Finding 129 added a new
 kind of thing — a submission that is named but not graded — and every existing
 rule about names was written before that kind existed. A fix that introduces a
 new state has to be checked against every invariant that was true without it.
+
+### 132. A cleanup that reported success for a lab it could not see
+
+`twinet destroy --lab NAME` was documented as the way to remove a lab whose
+manifest is no longer available. With no manifest it had nothing to read a
+runtime from, so it opened the compatibility default — Docker — asked it for
+the lab's containers, and was told there were none. On the documented
+containerd cluster that is not "the lab is gone"; it is "the wrong daemon was
+asked". It then deleted the overlay objects this machine held for the lab,
+printed a success, and exited zero, while a 212-container lab kept running on
+three nodes with its cross-node cables cut.
+
+Three separate assumptions failed together, and each was invisible:
+
+- a lab name says nothing about which machines the lab is on;
+- an engine that was never chosen says nothing about which engine created it;
+- an empty answer to a question nobody could verify was treated as evidence.
+
+Naming a lab without a manifest now refuses before touching anything, and says
+what the three safe paths are: run it with the lab's manifest, sweep the
+cluster through its agents, or clean up one machine explicitly. The explicit
+path exists because it is genuinely needed on a node whose agent is gone, and
+its scope is in its name:
+
+```
+$ twinet destroy --lab cos461 --yes
+twinet: refusing to remove lab "cos461" from a name alone: no manifest was
+loaded from ".", so nothing here can tell whether the lab is running on other
+machines, which engine created it, or which overlay objects are still carrying
+its traffic.
+  - to remove the whole lab, run this with its manifest: twinet -m PATH destroy --lab cos461 --yes
+  - to clean up abandoned objects across a cluster you can still reach, use: twinet -m PATH node sweep --remove
+  - to remove only what this one machine holds, say so explicitly: twinet --runtime ENGINE destroy --lab cos461 --this-node-only --yes
+```
+
+`--this-node-only` requires `--runtime` for the same reason the default was
+wrong: without a manifest, nothing else says which engine to ask, and an empty
+answer from the wrong one is indistinguishable from an empty machine. It
+reports what it did as this machine's alone.
+
+Two rules were added underneath, which apply to every local removal and not
+only to the manifest-less one. An overlay whose bridge still has an interface
+attached is never removed — the same rule `twinet node sweep` already applied,
+so a lab cannot be cleaned up more aggressively by naming it than by sweeping
+for it — and it is reported rather than silently retained. And an overlay list
+that could not be read is a reason to remove nothing and to refuse, rather than
+a reason to print "nothing to remove": a conclusion drawn from a question that
+failed is the same mistake in a smaller font.
+
+The messages were the other half of the defect. "removed lab" and "nothing to
+remove" mean different things on one machine and on a cluster, and nothing in
+the output said which had happened. Every message now names the scope it can
+actually speak for.
+
+### 133. A bundle of examples with two runtime contracts
+
+Six of the seven bundled labs declared no container runtime at all, which means
+`docker` for compatibility with manifests written before the runtime registry
+existed. The seventh, `examples/scale`, declared `containerd`. The operator
+guide, the measured scale evidence, and the agent rollout all describe a
+containerd cluster — on which six of the seven bundled labs were refused by the
+backend check, one lab at a time, after the operator had built a cluster,
+issued a PKI, and rolled out agents by following the same documentation.
+
+The fallback was the problem, not the choice. A default that is invisible in
+the manifest cannot be reviewed, cannot be diffed, and is discovered only when
+something refuses it. Every bundled example now states `runtime: containerd`,
+validation reports a manifest that declares nothing, and Docker or Podman is
+selected by saying so — `--runtime` or `TWINET_RUNTIME`, which replaces the lab
+default and every per-node selection at once and announces that it has. Two
+tests keep the bundle coherent: one asserts every example declares the cluster
+runtime, and one asserts every example still validates under an explicit
+override to each registered backend.
