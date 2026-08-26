@@ -10,6 +10,17 @@ import (
 	"github.com/HongyuHe/twinet/internal/state"
 )
 
+// How `ip -o route show` really ends a line, and how it really folds a
+// multipath route onto one: a trailing space before the newline, and the
+// newline between nexthops written as a backslash followed by the indentation
+// the continuation line had. Both are part of what the parser has to survive,
+// so the fixtures below spell them as values rather than leaving whitespace at
+// the end of a line in this file, where any editor or hook would eat them.
+const (
+	onelineEnd  = " \n"
+	onelineWrap = ` \` + "\t"
+)
+
 // A snapshot of a converged router, in the kernel's own spelling.
 //
 // This is `ip -o route show` output as FRR leaves it: OSPF and BGP install
@@ -20,17 +31,18 @@ import (
 // `either "to" is duplicate, or " nexthop" is a garbage` -- so a snapshot
 // taken verbatim could not be replayed into the container it came from, and
 // every deployment after the first destroy failed on its first restore.
-const capturedRouterRoutes = `2: lo    inet 9.151.0.1/24 scope global lo
-2: port_CHI    inet 9.0.2.1/24 scope global port_CHI
----
-1.0.0.0/8 nhid 124 via 179.3.9.1 dev ext_3_SFO proto ospf metric 20 
-9.0.1.0/24 dev port_NYC proto kernel scope link src 9.0.1.1 
-9.0.11.0/24 nhid 140 proto ospf metric 20 \	nexthop via 9.0.2.2 dev port_CHI weight 1 \	nexthop via 9.0.3.2 dev port_SFO weight 1 
----
-10:201:1::/48 dev tun6 metric 1024 pref medium
----
----
-`
+const capturedRouterRoutes = "2: lo    inet 9.151.0.1/24 scope global lo\n" +
+	"2: port_CHI    inet 9.0.2.1/24 scope global port_CHI\n" +
+	"---\n" +
+	"1.0.0.0/8 nhid 124 via 179.3.9.1 dev ext_3_SFO proto ospf metric 20" + onelineEnd +
+	"9.0.1.0/24 dev port_NYC proto kernel scope link src 9.0.1.1" + onelineEnd +
+	"9.0.11.0/24 nhid 140 proto ospf metric 20" +
+	onelineWrap + "nexthop via 9.0.2.2 dev port_CHI weight 1" +
+	onelineWrap + "nexthop via 9.0.3.2 dev port_SFO weight 1" + onelineEnd +
+	"---\n" +
+	"10:201:1::/48 dev tun6 metric 1024 pref medium\n" +
+	"---\n" +
+	"---\n"
 
 // The same facts as they were already written to /var/lib/twinet/state by the
 // build that shipped this format. Fixing capture alone would leave every
@@ -72,6 +84,30 @@ func rejectsCommand(command string) string {
 		return "a nexthop-group id this container does not have"
 	}
 	return ""
+}
+
+// The fixture above is only worth testing against if it still has the things
+// that made real captured output unreplayable. They are invisible, so an
+// editor, a hook or a well-meant cleanup could take them out and leave every
+// test below passing against text no kernel ever printed.
+func TestTheCapturedFixtureStillLooksLikeWhatTheKernelPrinted(t *testing.T) {
+	lines := strings.Split(capturedRouterRoutes, "\n")
+	trailing := 0
+	for _, line := range lines {
+		if line != "" && strings.HasSuffix(line, " ") {
+			trailing++
+		}
+	}
+	if trailing < 3 {
+		t.Errorf("`ip -o` ends its route lines with a space; %d of the fixture's do", trailing)
+	}
+	if !strings.Contains(capturedRouterRoutes, onelineWrap+"nexthop") {
+		t.Error("the multipath route lost the backslash-and-indent `ip -o` folds a newline into")
+	}
+	if !strings.Contains(capturedRouterRoutes, "nhid 124 via ") ||
+		!strings.Contains(capturedRouterRoutes, "nhid 140 ") {
+		t.Error("the fixture lost the kernel-assigned nexthop-group ids the fix is about")
+	}
 }
 
 func TestCapturedNexthopObjectRoutesBecomeCommandsIprouteAccepts(t *testing.T) {
