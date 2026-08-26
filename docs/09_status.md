@@ -116,6 +116,39 @@ The executable list is intentionally generated from the current tree rather
 than summarized as “two binaries.” The source facts are not a live acceptance
 claim.
 
+## Current three-node acceptance (2026-08-26)
+
+Fresh Claude Opus 5 review round 1 rebuilt the source and independently
+deployed it on node-0/node-1/node-2. Its initial verdict was `FAIL`; the
+remediation evidence below is from the same 56-core, 251 GiB-per-node,
+containerd 2.3.3 cluster. Runtime source was `b86517a`; later commits through
+`3d573eb` change tests, bundled placement, documentation, and release locks,
+not the measured runtime path.
+
+| Gate | Measured result |
+|---|---|
+| 84-AS scale run 1 | 472.438 s deploy + 84.694 s convergence = **557.181 s**; focused **1/1**, full reference **10/10** |
+| 84-AS scale run 2 | 452.019 s deploy + 84.123 s convergence = **536.191 s**; focused **1/1**, full reference **10/10** |
+| 84-AS scale run 3 | 461.108 s deploy + 84.439 s convergence = **545.595 s**; focused **1/1**, full reference **10/10** |
+| Scale shape | 84 ASes, 2,020 primary devices, 2,927 links, 186 cross-node links; placement 556/731/733 |
+| Healthy no-change deploy | 2,020-device plan verified with zero mutations in the reviewer run; canonical COS461 no-op measured **1.14 s** |
+| Mixed FRR/BIRD canonical grade | **10.00/10.00**, no quarantine; BIRD alternate paths are retained by the normalized RIB provider |
+| Abandoned grading controller | Controller killed after ephemeral harness commit; 60-second test lease expired and all three agents recorded `lease_reclaim: success`; zero harness containers remained |
+| Unrelated work during reap | Canonical COS461 deployed successfully while the abandoned harness expired, remained at 278 managed containers, then graded **10.00/10.00** |
+| Bundled generated Clos | 11 devices / 12 links / 6 cross-node endpoints: **19.98 s** deploy, **1/1** grade, clean teardown |
+| Cleanup | Every run above ended at zero containers and zero `tw*` host links on all three nodes |
+| Immutable release images | Seven `hyhe/twinet-*` images published as `0.1-debfab5`; every bundled example carries a topology-bound `images.lock.json` with registry `sha256` manifests |
+
+The repeated overlay loss found during remediation was not a failure of the
+new agents: kernel probes identified an obsolete second
+`twinetd-containerd-scale` fleet, still enabled on port 7300 since Aug 23, as
+the process deleting active `twp*` veths. It used a different containerd
+metadata namespace but the same root host network namespace. Those services
+were stopped and disabled. Current agents hold `/run/twinet/agent.lock`, and
+`scripts/deploy_agents.sh` refuses any alternate `twinetd*` process before
+changing a node; a second agent start was live-tested and refused with the
+current lock owner.
+
 ## Built and verified
 
 | Area | State | Evidence |
@@ -130,8 +163,8 @@ claim.
 | Netlink wiring and shared overlays | source-verified | `internal/netx` tests cover veths, shaping, and one external VXLAN/bridge per lab/node pair with VLAN-to-VNI bindings |
 | Docker Engine API runtime | source-verified | `internal/runtime` registers `docker`; API-client tests cover runtime operations and cancellation |
 | Docker/Podman/containerd runtime selection | source-verified; measured, bounded | Typed `placement.runtime` plus per-node overrides select registered backends before mutation; `--runtime`/`TWINET_RUNTIME` overrides both for one invocation and every node; agents report backend/version/socket/namespace and controllers refuse a mismatch. Every bundled example declares `runtime: containerd`, so the bundle deploys unmodified on the cluster [12](12_operator_guide.md) builds; a manifest that declares nothing still means `docker` and validation says so. Node-0 ran the source-built Podman 4.9.3 routed lifecycle gate and the native containerd lifecycle/routed gate (`make podman-integration`, `make containerd-integration`): events, create/start/stop/remove, exec/stdin/output, copy, netns wiring, FRR control, and cleanup completed. |
-| Image locks and rolling contracts | source-verified | `twinet images lock|verify` records registry manifest digests; release/grading mode requires a checked lock and agents verify after pull before create. Status separates exact source build from protocol, renderer, and state ranges, allowing compatible rolling bug-fix upgrades while refusing incompatible render/state contracts. |
-| BIRD NOS provider and capability validation | source-verified | `internal/nos` registers FRR/BIRD and tests refuse unsupported requests; this is not a blanket live mixed-NOS acceptance claim |
+| Image locks and rolling contracts | source-verified; measured | `twinet images lock|verify` records registry manifest digests; release/grading mode requires a checked lock and agents verify after pull before create. Seven immutable `0.1-debfab5` images were remotely pushed/inspected, `make image-verify` passed, and every bundled example now pins that release with its own topology-bound lock. |
+| BIRD NOS provider and capability validation | source-verified; measured | `internal/nos` registers FRR/BIRD and tests refuse unsupported requests. The live canonical and 84-AS reference grades both scored 10/10 with staff transit routers on BIRD; the normalized provider retains BIRD non-best alternate paths needed by traffic-engineering evidence. |
 | Service/state replication and endpoint policy | source-verified | model, expansion, placement, and durability tests cover replica identity, failure domains, and endpoint selection |
 | Strict live-inventory admission | source-verified | `internal/place`, client, and CLI tests refuse unknown/overloaded capacity before mutation unless audited overcommit is requested |
 | Staged deployment DAG with per-scope failure isolation | source-verified | `internal/plan`; tests assert stage ordering, real concurrency, and that one broken AS does not stop a class |
@@ -158,7 +191,7 @@ claim.
 | Faults are reversible, and proved to be | done | The engine fingerprints a device before and after injecting and requires resolving to leave neither what it added nor a hole where something it removed used to be. Introducing the check immediately found five faults that satisfied their own predicate while leaving the device broken |
 | Fault secrecy | verified | No fault writes a self-identifying path into the device under test. A test reads the fault sources and fails on any such path; it found one on its first run |
 | Event-driven self-healing | done | Agents subscribe to managed runtime lifecycle events and target only the affected device; sampled and low-frequency full audits are the backstop. Forwarding probes are model/NOS-capability-aware: IXP route servers prove BGP sessions/RIB but are not expected to reach every host. FRR sidecars are audited separately, must have exactly one enabled daemon and a working vty socket, and are repaired/recreated without replacing the primary namespace. Live three-node acceptance: all 66 controls healthy, AS3 reaches AS5/AS10, and AS3/AS5 both grade 10.00/10.00 |
-| Automatic abandoned-object collection | done | The agent applies a configurable grace period and generation/active-lab proof before collecting legacy or multiplexed overlays, stale host veths, expired reservations, and stale local control/replica records. Active, busy, held, and fenced labs are never candidates; focused tests include node-0 with no managed containers and stale overlays |
+| Automatic abandoned-object collection | done; measured | The agent applies a configurable grace period and generation/active-lab plus final runtime-container proof before collecting legacy or multiplexed overlays, stale host veths, expired reservations, and stale local control/replica records. Active, busy, held, and fenced labs are never candidates. A killed grading controller's harness self-reaped on all three live nodes while an unrelated COS461 lab deployed and remained intact. |
 | Authenticated node sweep and overlay classification | measured, bounded | Upgraded agents returned zero orphans. The 28/24/14 observed overlays were active COS-461 links, correcting the earlier shell-only misclassification. |
 | Incident runner | done | `twinet incident run`; a two-fault scenario injects, holds and unwinds in 798 ms. It also runs an agent and scores what it says against the ground truth: four parts (detection, devices as a Jaccard overlap, category, root-cause names), and the agent is given the brief and never the answer, which the end-to-end suite asserts. Measured with a small agent that greps for a router with too few OSPF adjacencies: 0.70 of 1.00, blaming the router that lost an adjacency as a consequence rather than the one the fault was injected at |
 | Ground-truth isolation | verified | audited: 0 hits for the fault name, root cause or ground truth anywhere in a target container's files, environment or labels |
@@ -1564,7 +1597,13 @@ the cluster workflow uploads as a build artifact. [12](12_operator_guide.md)
 
 | Metric | Value |
 |---|---|
-| 12-AS lab, 212 containers, 299 links, 3 nodes (current topology) | **44-58 s** |
+| **84-AS current scale topology, three consecutive runs** | **557.181 s / 536.191 s / 545.595 s deploy+convergence**, each focused 1/1 and full reference 10/10 |
+| Current 84-AS deploy phase | **472.438 s / 452.019 s / 461.108 s** |
+| Current 84-AS focused convergence phase | **84.694 s / 84.123 s / 84.439 s** |
+| Current 84-AS placement / cross-node links | **556 / 731 / 733 primary devices; 186 / 2,927 links cross-node** |
+| Canonical 12-AS lab, 212 devices, 299 links, pack-by-AS | **133.64 s**, followed by 10/10 |
+| Generated Clos, 11 devices / 12 links / 6 cross-node endpoints | **19.98 s**, followed by 1/1 |
+| 12-AS lab at the earlier orchestration revision | **44-58 s** — historical; topology, runtime, readiness, and transaction proof are not comparable to the current gate |
 | The same lab as it was measured earlier, at 211 containers and 291 links | 83 s -- superseded; the topology and the deployment path have both changed since |
 | Same lab, single node | not attempted; 4-AS/57-container demo takes 64 s |
 | Cross-node link RTT (25 ms configured) | 50.22 ms, σ 9 µs |
@@ -1581,7 +1620,7 @@ the cluster workflow uploads as a build artifact. [12](12_operator_guide.md)
 | Automatic repairs triggered on a lab while it was being graded, before / after the grading hold | **13 / 0** |
 | Grading 1 submission in its own private harness | ~12 minutes; measured, and the reason waves exist |
 | 8 private harnesses at once on 3 nodes | saturates the cluster; the failures are resource exhaustion, not marks |
-| **Class-scale deployment: 84 ASes, 2012 devices, 2927 links across 3 nodes** | **22m 38s, zero failures** -- taken at the 2,012-device shape of that revision. `examples/scale` now expands to 2,020 devices (see the generated facts above) and this run has not been repeated; the row is evidence about that revision, not about the current manifest |
+| Historical class-scale deployment: 84 ASes, 2012 devices, 2927 links across 3 nodes | **22m 38s, zero failures** -- superseded by the three current 2,020-device runs above |
 | Containers per node at that scale | 731 / 731 / 550 with `pack-by-as`, 660 / 675 / 677 with `spread-by-as` |
 | Node utilisation at that scale | 22 GiB of 251, load average 13 of 56 cores |
 | Emulated latency on a cross-node link at that scale | 20.07 ms for 20 ms configured |

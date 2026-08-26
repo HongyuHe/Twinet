@@ -37,9 +37,10 @@ recorded at the audit that commissioned these objectives:
 
 Of those, the transactional gap (O4, O3, O7), the single-NOS and
 explicit-interior limits (O10, O11), and the missing chaos/soak automation
-(O15) have shipped contracts and gates; the two headline timings have not been
-re-measured since, and no re-run is claimed here. The scale manifest has also
-changed shape since that run — see [section 3](#3-evidence-that-drives-the-objectives).
+(O15) have shipped contracts and gates. The 2,020-device deployment target has
+now passed three consecutive live runs below ten minutes; the 100-submission
+grading target and required 24-hour soak remain open. See
+[section 3](#3-evidence-that-drives-the-objectives).
 
 Development cost in time or money is not a constraint. The objectives below
 therefore optimize solely for correctness, scalability, operability, and the
@@ -58,7 +59,7 @@ comparison follows its local manager, Docker, and Kubernetes implementations.
 |---|---|---|---|---|
 | Multi-node deployment | None; one Docker host | Core is single-host; manual VXLAN or separate Clabernetes for Kubernetes | Kubernetes backend distributes pods and collision domains | Native three-node placement and shared VXLAN; no HA scheduler. Node loss is an operator-driven fenced `twinet node drain` or an audited `on_node_loss: reschedule` deployment, never an automatic failover |
 | Topology model | Eight positional files and shell-derived state | Mature generic YAML and node-kind model | Simple Netkit-compatible `lab.conf` model | Strong typed course model, templates, IPAM, and inter-AS generation |
-| Vendor breadth | FRR-centric | More than 40 NOS kinds, plus vrnetlab VMs | Generic image/backend abstraction | Two registered NOS providers, FRR and BIRD, behind one capability-validated interface; no live mixed-NOS acceptance run is recorded |
+| Vendor breadth | FRR-centric | More than 40 NOS kinds, plus vrnetlab VMs | Generic image/backend abstraction | Two registered NOS providers, FRR and BIRD, behind one capability-validated interface; canonical and 84-AS mixed-NOS reference grades both passed live at 10/10 |
 | Runtime breadth | Docker-specific scripts | Docker and Podman abstractions | Docker and Kubernetes managers | Three registered backends: Docker, Podman, and native containerd. Every bundled example declares one of them, and `--runtime` overrides it per run |
 | Reconciliation | Teardown and rebuild | Real topology/link diff classes for supported changes | Kubernetes supplies declarative reconciliation in that backend | Idempotent apply, event-driven repair, and bounded desired/observed device classes (live, config, rewire, restart, recreate, delete, unknown) through `twinet node reconcile`; deploy still computes no minimal cluster-wide change plan |
 | Distributed scheduling | None | None in core; Kubernetes in Clabernetes | Kubernetes scheduler | Static AS placement from manifest-declared nodes |
@@ -76,8 +77,8 @@ Kubernetes-backed systems.
 
 ## 3. Evidence that drives the objectives
 
-Every row is an observation from the audit run named beside it. None has been
-re-run for this revision, and none is a claim about another environment.
+The first table is historical audit evidence. The second is current
+three-node evidence; neither is a claim about another environment.
 
 | Evidence | Result |
 |---|---:|
@@ -88,17 +89,22 @@ re-run for this revision, and none is a claim about another environment.
 | Fair reduced-harness grading at concurrency 8 | about 3h15m projected for 100; one observed infrastructure quarantine |
 | VNI test, 100 concurrent 300-link labs | 23 collisions before sequential deconfliction |
 | Authenticated cluster sweep after agent rollout | 0 orphan overlays; 28/24/14 active overlays on node-0/1/2 |
-| Production Go, recounted at this revision (`cmd` and `internal`, excluding `_test.go`) | 108,125 lines |
-| Core orchestration Go, recounted at this revision (agent, client, deploy, place, plan, netx, state) | 34,916 lines |
-| Go tests, recounted at this revision (every `_test.go`) | 52,736 lines |
+| Production Go, recounted at this revision (`cmd` and `internal`, excluding `_test.go`) | 112,046 lines |
+| Core orchestration Go, recounted at this revision (agent, client, deploy, place, plan, netx, state) | 38,225 lines |
+| Go tests, recounted at this revision (every `_test.go`) | 57,505 lines |
 
-**The scale topology has changed shape since that deployment.** The 22m38s run
-was measured at 2,012 devices. [`examples/scale`](../examples/scale) now
-expands to 84 ASes, 2,020 devices, and 2,927 links — the figure the generated
-facts block in [09](09_status.md#source-generated-capability-facts) derives from
-the manifest — and it has not been re-deployed since. The timing above
-therefore describes the shape of that revision, not the current manifest, and
-nothing here claims the current one has been run.
+| Current acceptance evidence | Result |
+|---|---:|
+| 84 AS / 2,020 devices / 2,927 links, run 1 | 472.438 s deploy + 84.694 s convergence = **557.181 s**; 1/1 and 10/10 |
+| Same source and cluster, run 2 | 452.019 s + 84.123 s = **536.191 s**; 1/1 and 10/10 |
+| Same source and cluster, run 3 | 461.108 s + 84.439 s = **545.595 s**; 1/1 and 10/10 |
+| Abandoned grading harness | Killed controller; all nodes self-reaped at lease expiry while COS461 deployed |
+| Immutable images | Seven `0.1-debfab5` manifests remotely verified; all bundled examples release-locked |
+
+**The scale topology changed shape after the historical deployment.** The
+22m38s run measured 2,012 devices. [`examples/scale`](../examples/scale) now
+expands to 84 ASes, 2,020 devices, and 2,927 links and is the topology used by
+the three current runs above.
 
 Machine-readable evidence from a re-run is not kept in this tree. The benchmark,
 chaos, and soak runners write JSON under the untracked `reports/` path and the
@@ -124,9 +130,10 @@ its contract is recorded underneath it and, canonically, in
 
 ### O1 - Meet the scale and grading targets
 
-**Problem.** The two headline acceptance targets were missed: deployment by
-more than 2x and grading by about 13x. The 24-hour stability claim was
-untested. Neither headline timing has been re-measured since.
+**Problem.** The two headline acceptance targets were missed at the audit:
+deployment by more than 2x and grading by about 13x. The current deployment
+target is now met in three consecutive runs; 100-submission throughput and the
+24-hour stability claim remain unproven.
 
 **Required outcome.**
 
@@ -623,8 +630,9 @@ prevented rolling upgrades.
 lab during a one-node-at-a-time compatible upgrade, and reproduce a grade using
 only its recorded source revision and image digests.
 
-**Shipped reproducibility contract.** `images.mode: development` is the
-explicit opt-in for mutable tags. `release` and `grading` require
+**Shipped reproducibility contract.** `images.mode: development` remains an
+explicit opt-in for mutable local tags. Every bundled example now uses
+`images.mode: release` and a topology-bound `images.lock.json`; `release` and `grading` require
 `images.lock`, a generated JSON lock whose entries are registry
 `repository@sha256:...` manifests and whose topology hash must match the lab.
 Each node checks the pulled digest before container creation and the
@@ -725,7 +733,7 @@ Each coherent milestone is developed on `dev`, tested, committed as
 
 After all objectives and acceptance tests pass:
 
-1. Start a **fresh** reviewer with model **GPT-5.6 Sol**, maximum reasoning
+1. Start a **fresh** reviewer with model **Claude Opus 5**, maximum reasoning
    effort, and long context.
 2. Give it this document, the implementation diff, test/benchmark evidence, and
    instructions to be objective, adversarial, and constructive.

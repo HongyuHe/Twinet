@@ -80,8 +80,12 @@ deployed. Build them yourself only if you are changing them:
 make images
 ```
 
-For a term whose grades must be reproducible, pin images by digest rather than
-by tag — `twinet images lock` and `twinet images verify`, described in
+Every bundled example is already in `release` mode and carries a
+topology-bound `images.lock.json`, so the documented deployment pulls the
+published registry digests rather than whatever a mutable tag means that day.
+After changing an image, publish one immutable commit tag and regenerate every
+affected lock with `twinet images lock`; verify it with `twinet images verify`
+before deployment. The format and grading provenance are described in
 [09](09_status.md) and [`docs/06_grading.md`](06_grading.md).
 
 ## 4. Describe the cluster in the manifest
