@@ -647,10 +647,35 @@ container — so resolving one through the model looked right, and was not when
 the two disagreed: a manifest that renames a device's container, or an older
 container still running under the same identifier, sent the reading to the
 *live* container and then deleted the leftover without ever looking inside it.
-A leftover is also not allowed to write the device's saved state when the
-manifest still gives that device a container on this node: there is one
-snapshot per device, the container the manifest names is the authority for it,
-and that container is captured by the ordinary path.
+
+More than one container can claim one device, and there is one slot in the
+store to hold it. A rename leaves the old container running under the same
+identifier; an interrupted deployment leaves two; a moved device keeps its name
+here while the manifest points elsewhere. Letting each of them write the slot in
+turn files a dead container's reading as a live device's work. Letting none of
+them write it and deleting them all is the same loss more quietly, because a
+container that is not the authority may still hold the newest thing anybody
+did, and two of them cannot be merged.
+
+So the authority writes, and **every other claimant has to prove it has nothing
+to lose before it is removed**. Authority comes from the topology and from
+container identity, never from preference: a device the manifest still places
+somewhere has exactly one container name, and the container carrying that name
+is the authority for it. Where nothing establishes one — two containers for a
+device the manifest has forgotten — there is no canonical source and every
+claimant is held to the same proof rather than chosen between.
+
+The proof is that the claimant's complete reading is the state already held for
+the device: every kind, filesystem-backed routing configuration as much as
+namespace-backed addressing, tunnels and ports, compared in the form a capture
+writes and compared for presence as well as content. A claimant holding
+something the store has nothing for, a claimant missing something the store
+holds, any difference in any kind, a saved snapshot that cannot be read, and a
+capture that only partly succeeded all refuse the removal, name the container,
+the device and the difference, and leave the container where it is. Its reading
+is never written over the authority's. An exact duplicate has nothing to lose
+and is removed. `twinet destroy` remains the way to say that a lab is genuinely
+disposable.
 
 Every device left in that state is reported. The node publishes them in its
 apply response as `unproven_namespaces`, keyed by device with the reason for

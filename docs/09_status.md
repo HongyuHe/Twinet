@@ -430,6 +430,21 @@ reached students, and each motivated a permanent test.
    identifier. That read a device that was never in danger, filed its state as
    this device's, and deleted the leftover unread.
 
+   Which left the harder half. A device has one slot in the store and can have
+   several containers claiming it -- a rename's leftover, an interrupted
+   deployment's duplicate, a moved device that kept its name. Writing each of
+   their readings into the slot in turn files a dead container's contents as a
+   live device's work; excluding them all and deleting them anyway is the same
+   loss with nobody watching, since a claimant that is not the authority may
+   hold the newest thing anyone did and two of them cannot be merged. The
+   authority is established by the topology and by container identity or not at
+   all, and every other claimant must show that its complete reading -- routing
+   configuration as much as addressing, tunnels and ports, present for present
+   -- is the state already saved for the device before it may be removed. Any
+   difference, anything saved that it lacks, anything it holds that is saved
+   nowhere, a snapshot that cannot be read, or a partial capture refuses by
+   name. An exact duplicate has nothing to lose and goes.
+
 10. **A release gate that answered yes without looking.** `make ci` printed
     "all CI gates passed" while skipping the lint and the shell check whenever
     their tools were absent, which on the development machine was always.

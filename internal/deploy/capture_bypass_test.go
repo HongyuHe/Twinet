@@ -515,9 +515,11 @@ func TestPruneReadsTheOrphanInFrontOfItAndNotTheDeviceTheManifestNowWants(t *tes
 	runtime.setContents("tw-atl-v2", namespaceProbeOutput(
 		[]string{"port_BOS"}, map[string][]string{"port_BOS": {"3.0.8.1/24"}}))
 	recordNamespace(t, engine, top, device, runtime.identity["tw-atl-v2"])
-	// The leftover holds something else entirely, so that what ends up in the
-	// store says which container was read.
+	// The leftover holds something else entirely -- both an address and a
+	// routing configuration -- so that what ends up in the store says which
+	// container was read, and so that deleting it would be a loss.
 	orphanHolding(runtime, map[string][]string{"port_BOS": {"3.0.9.1/24"}})
+	runtime.setFRR("tw-atl", "router ospf\n network 3.0.9.0/24 area 0\n")
 
 	namespaceSnapshot(t, store, top.Name, device, state.KindAddrs,
 		"addr inet port_BOS 3.0.8.1/24")
@@ -528,11 +530,22 @@ func TestPruneReadsTheOrphanInFrontOfItAndNotTheDeviceTheManifestNowWants(t *tes
 	}
 
 	removed, err := engine.PruneOrphans(context.Background(), top)
-	if err != nil {
-		t.Fatalf("prune: %v", err)
+	// The leftover holds a configuration and an address that are not the ones
+	// saved for this device, and there is one slot to hold either. Its reading
+	// was deliberately kept out of that slot, which makes the container the
+	// only copy of what is in it, and deleting it would settle the difference
+	// by destroying one side.
+	if err == nil {
+		t.Fatal("a leftover container holding state nothing else has was deleted without " +
+			"the difference ever being mentioned")
 	}
-	if len(removed) != 1 || removed[0] != "tw-atl" {
-		t.Fatalf("the prune removed %v rather than the leftover container", removed)
+	for _, want := range []string{"tw-atl", "as3/ATL", "tw-atl-v2", "frr", "addrs"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not name %q, so nobody can act on it: %v", want, err)
+		}
+	}
+	if len(removed) != 0 {
+		t.Fatalf("the prune removed %v after refusing", removed)
 	}
 	if runtime.readsOf("tw-atl") == 0 {
 		t.Error("the prune deleted a container without ever looking inside it, and read a " +
@@ -774,5 +787,199 @@ func TestAStoppedContainerStartedToBeReadIsNotAlsoTreatedAsUnaccountedFor(t *tes
 	if !hasFact(facts, "addr inet port_R1 10.0.0.1/24") {
 		t.Fatalf("the empty namespace a stopped container was started into was filed "+
 			"over the student's addressing: %v", facts)
+	}
+}
+
+// renamedInto gives the manifest a container for the device the orphan lab's
+// leftover still claims, on this same node, and returns it.
+func renamedInto(t *testing.T, engine *Engine, top *model.Topology,
+	runtime *namespaceAwareRuntime, name string,
+) *model.Device {
+	t.Helper()
+	device := &model.Device{
+		ID: "as3/ATL", Name: "ATL", Container: name, Image: "frr:stable",
+		Node: "node-a", ASN: 3, Kind: model.KindRouter,
+	}
+	top.Devices[device.ID] = device
+	runtime.containers = append(runtime.containers, rt.Container{
+		Name: name, State: rt.StateRunning, PID: 5151,
+		Labels: map[string]string{
+			LabelLab: top.Name, LabelNode: "node-a",
+			LabelDeviceID: "as3/ATL", LabelKind: "router",
+		},
+	})
+	runtime.setIdentity(name, rt.NetnsIdentity{Dev: 4, Inode: 4026532222})
+	runtime.setFRR(name, "router ospf\n network 3.0.8.0/24 area 0\n")
+	runtime.setContents(name, namespaceProbeOutput(
+		[]string{"port_BOS"}, map[string][]string{"port_BOS": {"3.0.8.1/24"}}))
+	recordNamespace(t, engine, top, device, runtime.identity[name])
+	return device
+}
+
+// durableATL puts the state the orphan lab's device is supposed to have into
+// the store, as a capture would have written it.
+func durableATL(t *testing.T, store *state.Store, top *model.Topology,
+	d *model.Device, addr, network string,
+) {
+	t.Helper()
+	namespaceSnapshot(t, store, top.Name, d, state.KindAddrs, "addr inet port_BOS "+addr)
+	if _, err := store.Put(state.Snapshot{Lab: top.Name, Device: d.ID,
+		Kind:    state.KindFRR,
+		Content: []byte("router ospf\n network " + network + " area 0\n"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A leftover that holds exactly what is already saved.
+//
+// Refusing this one would leave a stale container running after every rename
+// and every interrupted deployment, for a difference that does not exist. The
+// condition for removing a claimant is not that it is unimportant, it is that
+// nothing is lost by removing it -- and a claimant whose complete reading is
+// the state already held for the device has nothing to lose.
+func TestPruneRemovesALeftoverHoldingExactlyWhatIsAlreadySaved(t *testing.T) {
+	engine, top, runtime, store := orphanLab(t)
+	device := renamedInto(t, engine, top, runtime, "tw-atl-v2")
+	orphanHolding(runtime, map[string][]string{"port_BOS": {"3.0.8.1/24"}})
+	durableATL(t, store, top, device, "3.0.8.1/24", "3.0.8.0/24")
+
+	removed, err := engine.PruneOrphans(context.Background(), top)
+	if err != nil {
+		t.Fatalf("a leftover holding nothing that is not already saved was kept: %v", err)
+	}
+	if len(removed) != 1 || removed[0] != "tw-atl" {
+		t.Fatalf("the prune removed %v rather than the leftover container", removed)
+	}
+	if runtime.readsOf("tw-atl") == 0 {
+		t.Error("the leftover was removed without being read, so nothing established that " +
+			"what it held was already saved")
+	}
+	facts := savedFacts(t, store, top.Name, device, state.KindAddrs)
+	if !hasFact(facts, "addr inet port_BOS 3.0.8.1/24") {
+		t.Errorf("the leftover's reading was written over the device's saved state: %v", facts)
+	}
+}
+
+// The same leftover, and a store that cannot answer whether what it holds is
+// already saved.
+//
+// A missing snapshot is a device nobody has configured yet. A body whose
+// digest does not match what was written beside it is the one circumstance
+// where the saved copy is already in question, and it used to give the same
+// answer -- which made "the store is broken" the condition under which the
+// other copy gets deleted.
+func TestPruneKeepsALeftoverWhenTheSavedStateCannotBeRead(t *testing.T) {
+	engine, top, runtime, store := orphanLab(t)
+	device := renamedInto(t, engine, top, runtime, "tw-atl-v2")
+	orphanHolding(runtime, map[string][]string{"port_BOS": {"3.0.8.1/24"}})
+	durableATL(t, store, top, device, "3.0.8.1/24", "3.0.8.0/24")
+	corruptSavedBody(t, store, top.Name, device.ID, state.KindAddrs)
+
+	removed, err := engine.PruneOrphans(context.Background(), top)
+	if err == nil {
+		t.Fatal("a container was deleted on the strength of a comparison against a " +
+			"snapshot that could not be read")
+	}
+	if !strings.Contains(err.Error(), "could not be read") {
+		t.Errorf("the refusal does not say the saved state is what could not be read: %v", err)
+	}
+	if len(removed) != 0 {
+		t.Fatalf("the prune removed %v after refusing", removed)
+	}
+}
+
+// Two containers claiming one device the manifest has forgotten.
+//
+// Nothing left says which of them is the device: the manifest that would have
+// is the manifest that dropped it. Picking one and writing its reading into
+// the single slot, then deleting the other, decides whose work survives by
+// sort order.
+func TestPruneWillNotChooseBetweenTwoContainersClaimingAForgottenDevice(t *testing.T) {
+	engine, top, runtime, store := orphanLab(t)
+	runtime.containers = append(runtime.containers, rt.Container{
+		Name: "tw-atl-old", State: rt.StateRunning, PID: 4243,
+		Labels: map[string]string{
+			LabelLab: top.Name, LabelNode: "node-a",
+			LabelDeviceID: "as3/ATL", LabelKind: "router",
+		},
+	})
+	runtime.setIdentity("tw-atl-old", rt.NetnsIdentity{Dev: 4, Inode: 4026531112})
+	runtime.setFRR("tw-atl-old", "router ospf\n network 3.0.7.0/24 area 0\n")
+	runtime.setContents("tw-atl-old", namespaceProbeOutput(
+		[]string{"port_BOS"}, map[string][]string{"port_BOS": {"3.0.7.1/24"}}))
+	orphanHolding(runtime, map[string][]string{"port_BOS": {"3.0.8.1/24"}})
+	durableATL(t, store, top, orphanStandIn(), "3.0.8.1/24", "3.0.8.0/24")
+
+	removed, err := engine.PruneOrphans(context.Background(), top)
+	if err == nil {
+		t.Fatal("two containers claiming one device were both deleted, and whichever of " +
+			"them held the newer work went with them")
+	}
+	for _, want := range []string{"tw-atl-old", "claiming as3/ATL"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not say %q, so it is not the collision that "+
+				"stopped it: %v", want, err)
+		}
+	}
+	if len(removed) != 0 {
+		t.Fatalf("the prune removed %v after refusing: neither claimant is established as "+
+			"the device, so neither may be deleted on the other's evidence", removed)
+	}
+	facts := savedFacts(t, store, top.Name, orphanStandIn(), state.KindAddrs)
+	if !hasFact(facts, "addr inet port_BOS 3.0.8.1/24") {
+		t.Errorf("one claimant's reading was written into the device's only slot, over "+
+			"state that may have been the other's: %v", facts)
+	}
+}
+
+// The device moved to another node, and a second container here claims it too.
+//
+// A moved device keeps its container name, which is what establishes the
+// authority among the claimants: the container carrying that name is the one
+// the manifest is talking about, is captured, and is removed. The other is
+// not, and has to prove it has nothing to lose.
+func TestPruneRemovesAMovedDeviceButNotTheStrangerBesideIt(t *testing.T) {
+	engine, top, runtime, store := orphanLab(t)
+	moved := &model.Device{
+		ID: "as3/ATL", Name: "ATL", Container: "tw-atl", Image: "frr:stable",
+		Node: "node-b", ASN: 3, Kind: model.KindRouter,
+	}
+	top.Devices[moved.ID] = moved
+	runtime.containers = append(runtime.containers, rt.Container{
+		Name: "tw-atl-old", State: rt.StateRunning, PID: 4243,
+		Labels: map[string]string{
+			LabelLab: top.Name, LabelNode: "node-a",
+			LabelDeviceID: "as3/ATL", LabelKind: "router",
+		},
+	})
+	runtime.setIdentity("tw-atl-old", rt.NetnsIdentity{Dev: 4, Inode: 4026531112})
+	runtime.setFRR("tw-atl-old", "router ospf\n network 3.0.7.0/24 area 0\n")
+	runtime.setContents("tw-atl-old", namespaceProbeOutput(
+		[]string{"port_BOS"}, map[string][]string{"port_BOS": {"3.0.7.1/24"}}))
+	orphanHolding(runtime, map[string][]string{"port_BOS": {"3.0.8.1/24"}})
+
+	removed, err := engine.PruneOrphans(context.Background(), top)
+	if err == nil {
+		t.Fatal("a second container claiming a moved device was deleted with it, and " +
+			"nothing looked at what it held")
+	}
+	if !strings.Contains(err.Error(), "tw-atl-old") || strings.Contains(err.Error(), "tw-atl:") {
+		t.Errorf("the refusal should name only the stranger, not the moved device's own "+
+			"container: %v", err)
+	}
+	if len(removed) != 0 {
+		t.Fatalf("the prune removed %v: a refusal keeps every candidate, since a lab with "+
+			"a stale container is a nuisance and a deleted one is not", removed)
+	}
+	// The moved device is the authority among the claimants, so its reading is
+	// what is held for the device -- and the stranger's is not.
+	facts := savedFacts(t, store, top.Name, moved, state.KindAddrs)
+	if !hasFact(facts, "addr inet port_BOS 3.0.8.1/24") {
+		t.Errorf("the container the manifest moved is the one claimant it names, and its "+
+			"reading was not what was saved: %v", facts)
+	}
+	if hasFact(facts, "addr inet port_BOS 3.0.7.1/24") {
+		t.Errorf("a stranger's reading was written as the moved device's state: %v", facts)
 	}
 }
