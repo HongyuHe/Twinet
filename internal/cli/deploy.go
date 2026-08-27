@@ -306,7 +306,7 @@ after a partial failure, a reboot, or a topology edit.`,
 				return nil
 			}
 
-			rt, err := localRuntime(top)
+			rt, err := localDeployRuntime(top)
 			if err != nil {
 				return err
 			}
@@ -367,7 +367,7 @@ after a partial failure, a reboot, or a topology edit.`,
 				RequireImmutableImages: top.Lab.Images.RequiresImmutableImages(),
 			}
 
-			p, err := eng.Build(top)
+			p, err := buildLocalDeployPlan(eng, top)
 			if err != nil {
 				return err
 			}
@@ -1150,7 +1150,7 @@ func resolveImageIDs(ctx context.Context, top *model.Topology, token string) err
 			}
 		}
 	} else {
-		rt, err := localRuntime(top)
+		rt, err := localDeployRuntime(top)
 		if err != nil {
 			return err
 		}
@@ -1638,6 +1638,26 @@ func (p *progress) done() {
 
 var _ = sort.Strings
 var _ = context.Background
+
+// localDeployRuntime is the container engine one single-node deployment talks
+// to, from its image survey through to its prune.
+//
+// It is one variable rather than two, so that a deployment cannot survey
+// images on one engine and mutate containers on another, and it is a variable
+// at all for the same reason overlayPortsOfLab is: what this command does to a
+// lab has to be checkable without a container engine to do it to.
+var localDeployRuntime = localRuntime
+
+// buildLocalDeployPlan is the deployment DAG a single-node run executes.
+//
+// Also a variable, and for the same reason: the order this command performs a
+// solve transition in -- resume gate, preservation, the first reference
+// command, prune, and only then the mode marker -- is a property of the
+// command rather than of the DAG, and proving it must not require a container
+// engine, a privileged namespace, or the agent's own /run state.
+var buildLocalDeployPlan = func(eng *deploy.Engine, top *model.Topology) (*plan.Plan, error) {
+	return eng.Build(top)
+}
 
 // localStore opens the snapshot store a single-node lab keeps beside its
 // manifest, so that the same preservation guarantees hold whether a lab runs on
