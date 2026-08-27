@@ -497,25 +497,36 @@ func controlPlaneFingerprint(ctx context.Context, env *Env) (string, int, error)
 		}
 		state.Sort()
 		fmt.Fprintf(h, "%s|", router.ID)
+		var facts []string
 		for _, peer := range state.OSPF {
-			fmt.Fprintf(h, "o:%s:%s:%s:%s|",
-				peer.RouterID, peer.Address, peer.Interface, peer.State)
+			facts = append(facts, fmt.Sprintf("o:%s:%s:%s:%s",
+				peer.RouterID, peer.Address, peer.Interface, peer.State))
 		}
 		for _, session := range state.BGP.Sessions {
-			fmt.Fprintf(h, "s:%s:%d:%s:%d:%d|",
+			facts = append(facts, fmt.Sprintf("s:%s:%d:%s:%d:%d",
 				session.Neighbor, session.RemoteAS, session.State,
-				session.PrefixesIn, session.PrefixesOut)
+				session.PrefixesIn, session.PrefixesOut))
 		}
 		for _, path := range state.BGP.Paths {
-			fmt.Fprintf(h, "p:%s:%s:%t:%t:%d:%s:%s:%s|",
+			var fact strings.Builder
+			fmt.Fprintf(&fact, "p:%s:%s:%t:%t:%d:%s:%s:%s",
 				path.Prefix, path.ASPath, path.Best, path.Valid, path.LocalPref,
 				path.Origin, path.Peer, path.RPKI)
+			var nextHops []string
 			for _, nextHop := range path.NextHops {
-				fmt.Fprintf(h, "n:%s:%s:%d|", nextHop.Address, nextHop.Device, nextHop.Weight)
+				nextHops = append(nextHops,
+					fmt.Sprintf("%s:%s:%d", nextHop.Address, nextHop.Device, nextHop.Weight))
 			}
+			sort.Strings(nextHops)
+			fmt.Fprintf(&fact, ":n=%s", strings.Join(nextHops, ","))
 			communities := append([]string(nil), path.Communities...)
 			sort.Strings(communities)
-			fmt.Fprintf(h, "c:%s|", strings.Join(communities, ","))
+			fmt.Fprintf(&fact, ":c=%s", strings.Join(communities, ","))
+			facts = append(facts, fact.String())
+		}
+		sort.Strings(facts)
+		for _, fact := range facts {
+			fmt.Fprintf(h, "%s|", fact)
 		}
 	}
 	return hex.EncodeToString(h.Sum(nil))[:16], len(routers), nil

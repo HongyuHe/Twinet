@@ -41,7 +41,10 @@ func TestControlPlaneFingerprintTracksStateButNotLiveCounters(t *testing.T) {
 			}},
 			Paths: []netstate.BGPPath{{
 				Prefix: "1.0.0.0/8", ASPath: "1", Best: true, Valid: true,
-				LocalPref: 100,
+				LocalPref: 100, Peer: "192.0.2.1",
+			}, {
+				Prefix: "1.0.0.0/8", ASPath: "1", Valid: true,
+				LocalPref: 100, Peer: "192.0.2.2",
 			}},
 		},
 	}}
@@ -57,6 +60,8 @@ func TestControlPlaneFingerprintTracksStateButNotLiveCounters(t *testing.T) {
 	}
 	reader.state.OSPF[0].DeadTimerMsec = 29000
 	reader.state.BGP.Sessions[0].UpdatesReceived = 11
+	reader.state.BGP.Paths[0], reader.state.BGP.Paths[1] =
+		reader.state.BGP.Paths[1], reader.state.BGP.Paths[0]
 	second, _, err := controlPlaneFingerprint(context.Background(), env)
 	if err != nil {
 		t.Fatal(err)
