@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/HongyuHe/twinet/internal/deploy"
 	"github.com/HongyuHe/twinet/internal/model"
 	"github.com/HongyuHe/twinet/internal/netx"
 	"github.com/HongyuHe/twinet/internal/render"
@@ -219,14 +220,20 @@ type applyTransaction struct {
 	// legacy topology blob. Recovery must know whether old runtime state was
 	// reference/solve, a harness submission AS, or teaching mode before it
 	// decides whether a student snapshot may be replayed.
-	PreviousMode         string               `json:"previous_mode"`
-	PreviousUngraded     int                  `json:"previous_ungraded_as,omitempty"`
-	Mode                 string               `json:"mode"`
-	Ungraded             int                  `json:"ungraded_as,omitempty"`
-	PeerUnderlay         map[string]string    `json:"peer_underlay,omitempty"`
-	Prune                bool                 `json:"prune,omitempty"`
-	OnlySteps            []string             `json:"only_steps,omitempty"`
-	StateProofs          []StateProof         `json:"state_proofs,omitempty"`
+	PreviousMode     string            `json:"previous_mode"`
+	PreviousUngraded int               `json:"previous_ungraded_as,omitempty"`
+	Mode             string            `json:"mode"`
+	Ungraded         int               `json:"ungraded_as,omitempty"`
+	PeerUnderlay     map[string]string `json:"peer_underlay,omitempty"`
+	Prune            bool              `json:"prune,omitempty"`
+	OnlySteps        []string          `json:"only_steps,omitempty"`
+	StateProofs      []StateProof      `json:"state_proofs,omitempty"`
+	// SolveTransition is what this node preserved before the apply phase wrote
+	// any part of the reference solution. A transaction that installs the
+	// answer and was asked to prune may not apply without it, and the prune --
+	// here, in a forward recovery, or in the rollback that undoes this -- may
+	// remove only what it covers.
+	SolveTransition      *solveTransition     `json:"solve_transition,omitempty"`
 	DirtyCapture         []string             `json:"dirty_capture,omitempty"`
 	DirtyCaptureKnown    bool                 `json:"dirty_capture_known,omitempty"`
 	Semantic             []string             `json:"semantic_devices,omitempty"`
@@ -1293,6 +1300,42 @@ func (s *Server) markGenerationApplied(lab string, fence Fence, generation strin
 	s.transactions[lab] = tx
 	if err := s.saveCoordinationLocked(); err != nil {
 		return fmt.Errorf("persisting applied generation: %w", err)
+	}
+	return nil
+}
+
+// recordGenerationSolveTransition journals what this node preserved before the
+// apply phase writes any part of the reference solution.
+//
+// It is a separate write from the prepared transaction on purpose. The
+// preservation reads containers and replicates their contents, which can fail
+// or be refused; the transaction record must already exist for the apply phase
+// to consult, and the apply phase refuses to run a solve that was asked to
+// prune until this record is in it. A crash between the two therefore leaves a
+// transaction that will not apply rather than one that will apply and then
+// delete something nothing has read.
+func (s *Server) recordGenerationSolveTransition(lab string, fence Fence, generation string,
+	record *solveTransition,
+) error {
+	if record == nil {
+		return errors.New("a solve transition record is required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initCoordination()
+	if err := s.fenceErrorLocked(lab, fence, s.nowTime()); err != nil {
+		return err
+	}
+	tx, ok := s.transactions[lab]
+	if !ok || tx.Generation != generation || tx.FenceGeneration != fence.Generation {
+		return fmt.Errorf("generation %q of lab %q was not prepared by this fence", generation, lab)
+	}
+	stored := *record
+	stored.Preserved = append([]deploy.OrphanPreservation(nil), record.Preserved...)
+	tx.SolveTransition = &stored
+	s.transactions[lab] = tx
+	if err := s.saveCoordinationLocked(); err != nil {
+		return fmt.Errorf("persisting what the solve preserved: %w", err)
 	}
 	return nil
 }

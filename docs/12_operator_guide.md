@@ -850,6 +850,59 @@ acknowledged work. `--strategy forward` resumes the intended transaction, and
 requires `--acknowledge-forward-data-loss` when the historical replicas it
 would need are unavailable.
 
+### The same transition across a cluster
+
+`deploy --solve --prune` is the same two destructive halves on a cluster, and
+the clustered path did not need an interruption to lose the second one. Prepare
+captures and replicates every dirty student-owned device the manifest still
+places on a node; a container the manifest has forgotten is not in the topology
+to be enumerated, so it is in no such set. Commit's prune runs on an engine that
+installs the reference solution, which is exactly the engine that reads nothing
+— so the container was removed having been read by nobody, on an uninterrupted
+run where every node reported success.
+
+Each node therefore preserves the other half during its own prepare, before the
+apply phase writes a line of the reference solution. It reads every container a
+requested `--prune` will later remove, through the same guarded funnel and the
+same claimant and namespace checks as any other capture, and replicates the
+copies to the peer failure domains the lab's state policy asks for. What it
+preserved is journalled into that node's prepared transaction — lab, node,
+generation, fence, manifest hash, mode, prune intent, and each container with
+the device identifier it carried. Nothing about `--prune` changes: a successful
+deployment still prunes, at the end, as it always has.
+
+The record is what a later process is entitled to act on, and the node fails
+closed without it:
+
+| What the node finds | What it does |
+| --- | --- |
+| A pruning solve with no preservation record | Refuses to apply — the reference solution is never written |
+| A prune candidate the record does not cover | Refuses, names the container, removes nothing |
+| A candidate now carrying a different device identifier | Refuses, names both identifiers |
+| A record for another lab, node, generation or fence | Refuses and names whose record it is |
+| A manifest edited since the record was written | Refuses: which containers are stale was decided against a different lab |
+| Peers the state policy requires but cannot reach | Refuses the solve before anything is written, unless the manifest sets `fail_closed: false`, which is audited |
+
+One unprovable candidate stops the whole prune, and a commit that reports a
+prune failure is a transaction to be recovered rather than a success. The way
+out of any of them is to return the lab to teaching mode by deploying it without
+`--solve`, which replays the preserved student state, and then to run the solve
+and its prune again; or to re-run the deployment without `--prune` and leave the
+stale containers where they are. `twinet destroy` remains the way to say that a
+lab is genuinely disposable.
+
+Two consequences are worth knowing before you meet them. A node that is already
+inside an unfinished solve transaction refuses to prepare another generation,
+and refuses it *before* reading anything, because the devices on that node may
+already hold the answer and prepare's first act is to capture what it is about
+to destroy — recover or abort that transaction first, with `twinet recover`. And
+a rollback of a failed solve does not read the containers the forward half wrote
+to: it removes those without capturing them, which loses nothing because either
+the transaction created them or the state they replaced is what prepare captured
+and proved durable, and it reads and preserves the containers that transaction
+never touched exactly as an ordinary prune does. A rollback whose prepared state
+was never proven durable keeps what it cannot account for and names it.
+
 To empty a node for maintenance while the lab keeps running:
 
 ```sh
@@ -992,6 +1045,9 @@ than clearing the store.
 | an admission refusal naming a resource | requests exceed live allocatable inventory | reduce the lab, add capacity, or use the audited `--overcommit` |
 | an admission refusal saying a resource is *unknown* | the agent could not read that dimension at all; it is neither zero nor unlimited | fix the node, declare a safe `placement.nodes[].capacity`, or use the audited `--overcommit`. A dimension the kernel simply does not bound is reported as `unlimited-` and never refused |
 | `refusing to remove lab ... from a name alone` | destroy has no manifest and cannot prove the scope | [§12](#when-there-is-no-manifest) |
+| `refusing to install the reference solution ... asked to prune, and there is no record` | a node reached the apply phase of a pruning solve with nothing preserved for the containers it would remove | prepare the generation again, or re-run the deployment without `--prune` ([§10](#the-same-transition-across-a-cluster)) |
+| `refusing to prune ... could be neither read as a student's work nor told apart from the answer` | a prune candidate is not covered by what that node preserved before it wrote the reference solution | deploy the lab without `--solve` to replay the preserved state, then solve and prune again; never delete the container by hand until you have compared it ([§10](#the-same-transition-across-a-cluster)) |
+| `refusing to prepare generation ... was installing the reference solution here and has not finished` | a second deployment met an unfinished solve on that node; capturing now would file the answer as student work | `twinet recover` that transaction first, then redeploy ([§10](#10-reconcile-repair-and-recover)) |
 | `its saved configuration could not be replayed` | a captured command was rejected by the device | [§12](#when-a-devices-saved-configuration-will-not-replay) — re-run `deploy`; never delete `/var/lib/twinet/state` |
 | `this node is not idle, so sweeping now could remove an overlay that is being built or recovered` | a removing sweep met an operation, mutation lease, transaction, hold, or prepared generation | wait for the named owner, or sweep without `--remove` to report only |
 | a sweep that reports objects under `FENCED` | a deployment claimed those overlays between the scan and the deletion | nothing: they belong to a live lab. Re-run the sweep later if they are still orphaned |

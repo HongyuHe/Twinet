@@ -59,6 +59,24 @@ type OrphanPreservation struct {
 // established. A prune given one may remove only what it covers.
 type OrphanPreservationSet struct {
 	Preserved []OrphanPreservation `json:"preserved"`
+	// Unreadable names containers this pass must not read.
+	//
+	// A deployment knows whether *it* is writing the reference solution;
+	// WritesReference says so for the whole pass. It cannot know that another
+	// pass already wrote the answer into some of the containers in front of
+	// it, which is exactly the position a rollback is in: the transaction it
+	// is undoing solved the devices it created or adopted, and reading those
+	// now would file the answer as the students' work -- while the containers
+	// that transaction never touched still hold the students' own and must
+	// still be read before they are removed. One flag cannot say both, so the
+	// transition names the containers it wrote to.
+	Unreadable []string `json:"unreadable,omitempty"`
+	// Removable names containers this pass may remove although nothing was
+	// preserved for them, because the transition proved they hold nothing
+	// that predates it -- it created them itself, or the state they replaced
+	// is already durable. Naming them is what keeps "nothing was preserved
+	// for this" from meaning "and therefore it can never be removed".
+	Removable []string `json:"removable,omitempty"`
 }
 
 func (s *OrphanPreservationSet) find(container string) (OrphanPreservation, bool) {
@@ -71,6 +89,35 @@ func (s *OrphanPreservationSet) find(container string) (OrphanPreservation, bool
 		}
 	}
 	return OrphanPreservation{}, false
+}
+
+// unreadable says this transition has already written something into the
+// container that is not the students' work.
+func (s *OrphanPreservationSet) unreadable(container string) bool {
+	if s == nil {
+		return false
+	}
+	for _, name := range s.Unreadable {
+		if name == container {
+			return true
+		}
+	}
+	return false
+}
+
+// removable says the transition proved the container holds nothing worth
+// preserving, so a prune carrying this set may remove it without a record of
+// its contents.
+func (s *OrphanPreservationSet) removable(container string) bool {
+	if s == nil {
+		return false
+	}
+	for _, name := range s.Removable {
+		if name == container {
+			return true
+		}
+	}
+	return false
 }
 
 // candidateDeviceID is the canonical identifier a container carries.
@@ -147,16 +194,20 @@ func (e *Engine) preserveOrphans(ctx context.Context, top *model.Topology,
 	var preCaptureProblems []string
 	for i, c := range candidates {
 		var refusal string
-		targets[i], refusal = e.orphanDevice(top, c)
+		targets[i], refusal = e.orphanTarget(top, c)
 		records[i] = OrphanPreservation{Container: c.Name, Device: candidateDeviceID(c)}
 		if refusal != "" {
 			preCaptureProblems = append(preCaptureProblems, refusal)
 		}
 		if targets[i] == nil {
 			records[i].Detail = "it holds no student-owned state of its own"
-			if e.WritesReference {
+			switch {
+			case e.WritesReference:
 				records[i].Detail = "this deployment installs the reference solution, " +
 					"so nothing was read out of it"
+			case e.PreservedOrphans.unreadable(c.Name):
+				records[i].Detail = "the transition being undone had already written to " +
+					"it, so nothing was read out of it"
 			}
 		}
 	}
@@ -295,6 +346,22 @@ func (e *Engine) preserveOrphans(ctx context.Context, top *model.Topology,
 	return records, problems, ctxErr
 }
 
+// orphanTarget is the device a preservation pass may read out of a candidate.
+//
+// It is orphanDevice with the one refusal only a transition can know about. A
+// deployment knows whether it is itself writing the reference solution; it
+// cannot know that the transaction it is undoing already wrote the answer into
+// the container in front of it. Reading that container would file the answer
+// as somebody's work just as surely, so the transition names it and this
+// declines to read it -- while the containers that transaction never touched
+// are read exactly as before.
+func (e *Engine) orphanTarget(top *model.Topology, c runtime.Container) (*model.Device, string) {
+	if e.PreservedOrphans.unreadable(c.Name) {
+		return nil, ""
+	}
+	return e.orphanDevice(top, c)
+}
+
 // PreserveOrphans captures everything a prune of this topology would delete,
 // and removes nothing.
 //
@@ -323,12 +390,24 @@ func (e *Engine) PreserveOrphans(ctx context.Context, top *model.Topology) ([]Or
 // and filing that as a student's work is its own kind of loss. So it does not
 // guess. Either the pre-reference preservation covers the container in front
 // of it, or the container stays and the command says why.
+//
+// It is asked only about the candidates this pass was not allowed to read. One
+// it did read it read a moment ago, through the same guarded funnel, and
+// refused the removal itself if it could not save what was in it -- a record
+// written down by an earlier phase is what a pass with its eyes closed needs,
+// not something to demand of a pass that has just looked.
 func (e *Engine) unpreservedCandidates(candidates []runtime.Container) []string {
 	if e.PreservedOrphans == nil {
 		return nil
 	}
 	var problems []string
 	for _, c := range candidates {
+		if !e.WritesReference && !e.PreservedOrphans.unreadable(c.Name) {
+			continue
+		}
+		if e.PreservedOrphans.removable(c.Name) {
+			continue
+		}
 		record, known := e.PreservedOrphans.find(c.Name)
 		switch {
 		case !known:

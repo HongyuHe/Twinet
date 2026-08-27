@@ -3372,3 +3372,80 @@ succeeded. The regressions drive the durable boundary rather than a policy
 helper: they run the preservation, kill the deployment, re-read the record from
 disk in the state a second process would find it, and assert both what is
 removed and what the state store holds afterwards.
+
+### 137. The same solve, on a cluster, losing the same container without being interrupted
+
+The single-node repair above needed an interruption to lose anything: the prune
+is the deployment's last step, so a solve that failed part way left the stale
+container unread, and it was the retry that deleted it. The clustered path did
+not need the interruption.
+
+A lab spread over several nodes had, on one of them, a container the manifest no
+longer wanted — an autonomous system a course had dropped, still running, still
+holding the group's configuration and the only copy of it. The class was solved
+with `--prune`. Prepare did what it exists to do: it captured every dirty
+student-owned device the manifest still places on that node and proved the
+copies had reached the failure domains the lab's state policy asks for. That set
+does not contain a container the manifest has forgotten, because a device that
+is not in the topology cannot be enumerated from it. The apply phase wrote the
+reference solution. Commit then reached its prune, holding an engine whose
+`WritesReference` is set because the transaction's desired mode is solve — which
+is precisely the condition under which a prune reads nothing at all, since
+capturing then would file the answer as somebody's work. It removed the
+container having read nothing, and every node reported success.
+
+Retries and recoveries made it worse rather than causing it. A transaction that
+had begun installing the reference solution and had not finished was still
+readable by the next prepare, whose first act is to capture the state it is
+about to destroy: on a node whose apply phase had solved half its routers, that
+capture files the reference answer as the saved work of every one of those
+students, to be replayed onto their routers by the next deployment that
+recreates a container. And a rollback of that transaction pruned the objects the
+forward half had created or adopted with `WritesReference` derived from the
+*previous* mode, which is teaching — so it read them, and stored the answer over
+the very snapshots prepare had taken to make the rollback possible.
+
+The fix is the single-node one, made durable in the place a cluster keeps
+durable things. A transaction whose desired mode is solve, whose committed mode
+is not, and which was asked to prune, preserves every prune candidate during
+prepare — through the same guarded funnel, the same claimant resolution and the
+same namespace proof as any other capture, using an engine that is deliberately
+not the transaction's own — and replicates the copies to the peer failure
+domains the policy requires before the apply phase runs. What it preserved is
+journalled into the prepared transaction: lab, node, generation, fence, manifest
+hash, mode, prune intent, and each container with the device identifier it
+carried. The apply phase refuses to write a line of the reference solution for a
+pruning solve that has no such record, so a crash between the two leaves a
+transaction that will not apply rather than one that applies and then deletes.
+
+Commit's prune is then entitled to remove precisely what that record covers. A
+missing record, a first attempt that was not asked to prune, a record taken on
+another node or for another lab, a record from an earlier generation or under an
+older fence, a manifest edited since, a container that appeared in the meantime,
+and a container now carrying a different device identifier are each a refusal
+that names what is wrong and the remedy, before anything is deleted; one
+unprovable candidate stops the whole prune and the commit reports it as a
+failure, which is a rollback rather than a silent success.
+
+The two adjacent hazards are closed by the same record. A prepare that finds
+this node already inside an unfinished solve transaction refuses before it reads
+anything, rather than at the transaction compare-and-swap a moment after the
+capture has already run. And a rollback of a solve is given the one thing the
+engine's own flag cannot express: which containers the failed forward half wrote
+to. Those are not read — removing them loses nothing, because either the
+transaction created them or the student state they replaced is the state prepare
+captured and proved durable — while the containers that transaction never
+touched are read and preserved exactly as an ordinary prune reads them. A
+rollback whose prepared state was never proven durable keeps what it cannot
+account for and says so.
+
+Unchanged and covered: an ordinary teaching deployment still reads and removes
+its own orphans; a lab that already holds the reference still reads nothing and
+writes nothing when it prunes; a deployment that was not asked to prune preserves
+nothing and removes nothing; a node never preserves or removes a container
+another node owns; a policy that cannot reach its peer failure domains refuses
+the solve outright unless the manifest explicitly opts into the audited bypass,
+in which case the record says the copies never left. The regressions drive the
+durable boundary rather than a policy helper: they preserve, abandon the node,
+re-read the transaction off the coordination journal as a restarted agent finds
+it, and assert both what is removed and what the state store holds afterwards.

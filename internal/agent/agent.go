@@ -1777,6 +1777,16 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		mode, ungraded = persistedMode, tx.Ungraded
 		previousMode, previousUngraded = tx.PreviousMode, tx.PreviousUngraded
 		peerUnderlay, prune, onlySteps = tx.PeerUnderlay, tx.Prune, tx.OnlySteps
+		// The reference solution is written by the plan below. A deployment
+		// that will then remove containers must already have preserved them:
+		// after this point nothing on this node can be read as a student's
+		// work, so a prune with no record behind it deletes containers nothing
+		// has ever looked inside. Prepare journals the record before this
+		// phase is reachable, and a crash between the two lands here.
+		if err := s.solveApplyRefusal(top.Name, tx); err != nil {
+			httpError(w, http.StatusConflict, err)
+			return
+		}
 	}
 	if previousMode != "" {
 		if _, err := requiredTransactionMode(previousMode); err != nil {

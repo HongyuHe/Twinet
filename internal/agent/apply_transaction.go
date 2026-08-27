@@ -125,6 +125,15 @@ func (s *Server) handleApplyPrepare(w http.ResponseWriter, r *http.Request, req 
 		httpError(w, http.StatusConflict, errors.New(why))
 		return
 	}
+	// Before this prepare reads anything. An attempt that has already started
+	// installing the reference solution here leaves devices whose contents are
+	// the answer, and the first thing prepare does is capture the state it is
+	// about to destroy -- which would file that answer as every one of those
+	// students' own work.
+	if err := s.solveRecaptureRefusal(top.Name, req.Generation, req.Fence); err != nil {
+		httpError(w, http.StatusConflict, err)
+		return
+	}
 	prestate, err := s.snapshotTransactionInventory(r.Context(), top.Name)
 	if err != nil {
 		httpError(w, http.StatusConflict, fmt.Errorf("capture pre-transaction inventory: %w", err))
@@ -237,6 +246,33 @@ func (s *Server) handleApplyPrepare(w http.ResponseWriter, r *http.Request, req 
 	s.recordEvent(top.Name, req.Generation, "coordination", s.requestCorrelation(r),
 		"transaction_mode", "success", fmt.Sprintf("previous=%s/%d desired=%s/%d",
 			prepared.PreviousMode, prepared.PreviousUngraded, prepared.Mode, prepared.Ungraded))
+	// The other half of what this transaction may destroy.
+	//
+	// The capture above covers the devices the manifest still places here.
+	// The containers it no longer places here are removed by the prune at the
+	// end of commit, by which point this node is writing the reference
+	// solution and can no longer read anything as a student's work. They are
+	// read now, while what is in them is still demonstrably the students', and
+	// what was preserved is journalled before the apply phase is allowed to
+	// run at all. The previous mode comes from the prepared record rather than
+	// the request, so prepare and commit decide this from one durable source.
+	if solvePreservationRequired(mode, prepared.PreviousMode, prepared.Prune) {
+		record, err := s.preserveSolveTransition(r.Context(), top, prepared, req.Fence)
+		if err != nil {
+			s.recordEvent(top.Name, req.Generation, "deploy", s.requestCorrelation(r),
+				"solve_preservation", "error", err.Error())
+			httpError(w, http.StatusConflict, err)
+			return
+		}
+		if err := s.recordGenerationSolveTransition(top.Name, req.Fence, req.Generation, record); err != nil {
+			httpError(w, http.StatusConflict, fmt.Errorf("refusing to install the reference "+
+				"solution because what it preserved could not be recorded: %w", err))
+			return
+		}
+		s.recordEvent(top.Name, req.Generation, "deploy", s.requestCorrelation(r),
+			"solve_preservation", "success", fmt.Sprintf("preserved=%v replicated=%t",
+				preservedContainerNames(record.Preserved), record.Replicated))
+	}
 	if err := s.recordGenerationDirtyCapture(top.Name, req.Fence, req.Generation, dirtyCapture); err != nil {
 		httpError(w, http.StatusConflict, err)
 		return
@@ -459,6 +495,17 @@ func (s *Server) commitAppliedTopology(ctx context.Context, top *model.Topology,
 		if err := s.transactionFail("prune"); err != nil {
 			return ApplyResponse{}, fmt.Errorf("commit prune failpoint: %w", err)
 		}
+		// What this prune is entitled to remove was settled before the apply
+		// phase wrote its first reference command, and is settled again here
+		// before anything is deleted. A solve cannot read its own orphans --
+		// what is in them may be the answer by now -- so either the record
+		// covers the container in front of it or the container stays.
+		preserved, err := solvePruneEntitlement(tx, top, s.cfg.Node, desiredMode)
+		if err != nil {
+			addApplyFailure(&resp, "prune", err)
+			return resp, nil
+		}
+		eng.PreservedOrphans = preserved
 		gone, err := eng.PruneOrphans(ctx, top)
 		if err != nil {
 			addApplyFailure(&resp, "prune", err)
@@ -901,6 +948,16 @@ func (s *Server) rollbackPreparedApply(ctx context.Context, lab string, fence Fe
 	if err := s.transactionFail("prune"); err != nil {
 		return fmt.Errorf("rollback prune failpoint: %w", err)
 	}
+	// Undoing a solve is the one prune that meets both kinds of container at
+	// once: the objects the failed forward half wrote the answer into, which
+	// must not be read, and the ones it never touched, which hold the only
+	// copy of somebody's work and must be. The engine's own flag speaks for a
+	// whole pass, so the transition names the containers instead.
+	forward, err := transactionForwardTopology(tx)
+	if err != nil {
+		return err
+	}
+	eng.PreservedOrphans = rollbackPrunePreservation(tx, forward, s.cfg.Node, previousMode)
 	if _, err := eng.PruneOrphans(ctx, oldTop); err != nil {
 		return fmt.Errorf("prune after rollback: %w", err)
 	}
