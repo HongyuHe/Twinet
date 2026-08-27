@@ -590,16 +590,25 @@ adjacency; the repaired router had zero OSPF neighbours and the agent logged
   replayed and before the device is let go of; without that, every later capture
   would find a mismatch, call the namespace replaced and withhold the device's
   state indefinitely — repaired, reported repaired, and never backed up again.
+  That the record can be *written* is proven before the repair starts, not
+  assumed: the check republishes it exactly as it already stands, so a
+  filesystem that has gone read-only or filled up since it was last written
+  refuses the repair while every device is still working, rather than after the
+  interfaces are gone and there is nowhere left to record where they came back.
   Each device's marker is cleared only after both of those have happened, so a
   repair that fails partway leaves the devices it did not finish withheld rather
   than overwritten.
 
 A repair that refuses names the device and the reason, records it as a node
 event, and reports it as a repair failure rather than as a rewire that broke
-something — nothing was changed. A repair that failed partway leaves the devices
-it did not finish marked as owing a restore, which withholds their
-namespace-backed snapshots until a later repair or deploy replays them; that is
-deliberate, and is why the failure is loud.
+something — nothing was unplugged. A refusal that had already marked some
+devices takes those marks back, and if one of them will not come back off it
+names that device too: a container left carrying a stale mark is withheld from
+every capture until something clears it, which is the same quiet, permanent
+stop-being-backed-up the mark exists to prevent. A repair that failed partway
+leaves the devices it did not finish marked as owing a restore, which withholds
+their namespace-backed snapshots until a later repair or deploy replays them;
+that is deliberate, and is why the failure is loud.
 
 The comparison needs something to compare against, and the first deployment
 after an upgrade has nothing recorded for any device. A device that is healthy

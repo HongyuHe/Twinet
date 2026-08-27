@@ -3,6 +3,7 @@ package deploy
 import (
 	"context"
 	"errors"
+	"os"
 	"strings"
 	"testing"
 
@@ -308,5 +309,245 @@ func TestARefusedRewireLeavesAnEarlierUnfinishedRepairMarked(t *testing.T) {
 	if !runtime.owes(target.Container) {
 		t.Fatal("the rollback cleared a marker an earlier unfinished repair had left, so " +
 			"the next capture would file the target's bare namespace over its saved state")
+	}
+}
+
+// A refusal that quietly leaves a marker behind is the failure the marker
+// exists to prevent, wearing the refusal's clothes.
+//
+// The rollback of a refused hold is best-effort by nature -- it is undoing
+// work on a node that has just proved it is having trouble -- and every one of
+// its failures used to be discarded. What that leaves is a device that is
+// working, was never unplugged, is carrying a restore-pending file for a
+// rewire that never happened, and is therefore withheld from every capture
+// from then on. The caller was told "nothing was unplugged" and had no reason
+// to look. So every marker that could not be taken back is named, with the
+// device and what could not be done to it, and the rollback goes on to the
+// devices after it either way.
+func TestARefusedRewireReportsTheMarkersItCouldNotTakeBack(t *testing.T) {
+	top, _ := rewireScopeLab()
+	runtime := newRewireScopeRuntime()
+	engine := &Engine{Runtime: runtime, Node: "n0", ObservationRoot: t.TempDir()}
+	// as2/B is the one device in this lab with two same-node neighbours, so a
+	// hold that fails on the last of the three has two markers to take back
+	// and can be shown not to stop at the first one it cannot.
+	target := top.Devices["as2/B"]
+	if ids := LocalRewirePeers(top, "n0", target); len(ids) != 2 {
+		t.Fatalf("this test needs a target with two local peers, got %d", len(ids))
+	}
+	refused := errors.New("no space left on device")
+	stuck := errors.New("the container stopped answering")
+	runtime.failMarkerWrite("c-d", refused)
+	runtime.failMarkerRelease("c-b", stuck)
+
+	err := engine.RewireDeviceAndPeers(context.Background(), top, target,
+		func(context.Context, *model.Device) error { return nil })
+	if err == nil {
+		t.Fatal("a rewire that could not mark what it was about to empty went ahead anyway")
+	}
+	if !errors.Is(err, ErrRewireNotStarted) {
+		t.Fatalf("the refusal is not reported as one: %v", err)
+	}
+	if !errors.Is(err, refused) || !strings.Contains(err.Error(), "as2/D") {
+		t.Fatalf("the refusal does not carry the device it could not mark: %v", err)
+	}
+	// The rollback failed on the target itself, which is still carrying the
+	// marker. Nothing else will ever mention it.
+	if !runtime.owes("c-b") {
+		t.Fatal("the fake released a marker it was told it could not release, so nothing " +
+			"below is about reporting one that is stuck")
+	}
+	if !errors.Is(err, stuck) {
+		t.Fatalf("the rollback failure was swallowed, so an operator is told a device that "+
+			"is now withheld from every capture had nothing done to it: %v", err)
+	}
+	if !strings.Contains(err.Error(), "as2/B") {
+		t.Fatalf("the refusal does not name the device left owing a restore it was never "+
+			"given: %v", err)
+	}
+	// And the device after it is still let go of. A marker stuck on one device
+	// is not a reason to leave one on the next.
+	if runtime.owes("c-a") {
+		t.Fatal("the rollback stopped at the first marker it could not take back and left " +
+			"the rest of them behind")
+	}
+}
+
+// A refusal says nothing was unplugged, and that has to be true of this engine
+// as well as of the devices.
+//
+// The distrust a rewire establishes is not free-standing bookkeeping. It makes
+// this engine withhold those devices' namespace-backed state from every
+// capture it takes afterwards, and names them to the caller as devices a
+// repair disturbed. Establishing it before the gates that refuse meant a
+// rewire could decline to touch a working device and still leave it
+// unbackupable and reported as repaired, on the strength of a repair that
+// never began.
+func TestARewireRefusedAtTheRecordLeavesNothingMarkedOrDistrusted(t *testing.T) {
+	engine, top, devices, runtime, store := capturableNamespaceLab(t)
+	ctx := context.Background()
+	target, neighbour := devices[0], devices[1]
+	for _, d := range devices {
+		wiredNamespace(runtime, d, map[string][]string{
+			modelledNamespaceInterfaces(d)[0]: {"10.0.0." + d.Name[1:] + "/24"},
+		})
+	}
+	if _, err := engine.CaptureDevices(ctx, top, store,
+		[]string{target.ID, neighbour.ID}); err != nil {
+		t.Fatalf("the first capture: %v", err)
+	}
+	// A record that cannot be read at all: the first of the two gates.
+	record := engine.observationPath(top.Name)
+	if err := os.Remove(record); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(record, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	replayed := 0
+
+	err := engine.RewireDeviceAndPeers(ctx, top, target,
+		func(context.Context, *model.Device) error {
+			replayed++
+			return nil
+		})
+	if !errors.Is(err, ErrRewireNotStarted) {
+		t.Fatalf("a rewire that could not reach the record it has to update did not refuse "+
+			"as one: %v", err)
+	}
+	if replayed != 0 {
+		t.Fatalf("a refused rewire replayed state onto %d devices", replayed)
+	}
+	for _, d := range devices {
+		if runtime.owes(d.Container) {
+			t.Fatalf("%s is marked as owing a restore for a rewire that refused before it "+
+				"unplugged anything, so it is withheld from every later capture", d.ID)
+		}
+	}
+	if dirty := engine.DirtyNamespaceStateDevices(); len(dirty) != 0 {
+		t.Fatalf("a rewire that refused before it changed anything already refuses to vouch "+
+			"for %v: this engine withholds their addressing from every capture it takes and "+
+			"reports them to the caller as devices a repair disturbed, and no repair ran",
+			dirty)
+	}
+}
+
+// Reading the record is not the question a rewire needs answered.
+//
+// What it does at the end is write it: a directory, a temporary file beside the
+// record, and a rename over it. A filesystem that has gone read-only or filled
+// up since the record was written answers a read perfectly and refuses that
+// write -- and the discovery lands after the interfaces are gone, at which
+// point the device is repaired and recorded nowhere. Every capture from then on
+// compares it against the namespace that died with its old task, calls it
+// replaced, and withholds its addressing from the store for ever.
+func TestARewireRefusesWhenTheRecordCannotBeWritten(t *testing.T) {
+	engine, top, devices, runtime, store := capturableNamespaceLab(t)
+	ctx := context.Background()
+	target, neighbour := devices[0], devices[1]
+	for _, d := range devices {
+		wiredNamespace(runtime, d, map[string][]string{
+			modelledNamespaceInterfaces(d)[0]: {"10.0.0." + d.Name[1:] + "/24"},
+		})
+	}
+	if _, err := engine.CaptureDevices(ctx, top, store,
+		[]string{target.ID, neighbour.ID}); err != nil {
+		t.Fatalf("the first capture, which is what baselines them: %v", err)
+	}
+	baseline := recordedNamespaceOf(t, engine, top.Name, target.ID)
+	if !baseline.Known() {
+		t.Fatal("the first capture wrote down no namespace, so nothing here is about " +
+			"keeping the record intact")
+	}
+	// The record reads exactly as it did. What it cannot do is publish an
+	// update, because the file every write goes through on its way in cannot
+	// be created.
+	if err := os.Mkdir(engine.observationPath(top.Name)+".next", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// If the guard lets this through, the wiring is what it reaches next, and
+	// that fails as something other than a refusal.
+	runtime.nsPathErr = errors.New("a unit test builds no veth pairs")
+
+	err := engine.RewireDeviceAndPeers(ctx, top, target,
+		func(context.Context, *model.Device) error { return nil })
+	if !errors.Is(err, ErrRewireNotStarted) {
+		t.Fatalf("a rewire went ahead over a record it could not have written the repaired "+
+			"device into, so the device would come back repaired and permanently unbacked: %v",
+			err)
+	}
+	for _, d := range devices {
+		if runtime.owes(d.Container) {
+			t.Fatalf("%s was marked as owing a restore by a rewire that refused: %v", d.ID, err)
+		}
+	}
+	if dirty := engine.DirtyNamespaceStateDevices(); len(dirty) != 0 {
+		t.Fatalf("a rewire that refused at the record already refuses to vouch for %v", dirty)
+	}
+	// And the proof left the record exactly as it found it. It is the only
+	// copy of what this node believes about every device's namespace, and a
+	// check that damaged it would cost far more than the one it prevents.
+	if now := recordedNamespaceOf(t, engine, top.Name, target.ID); !now.SameAs(baseline) {
+		t.Fatalf("the writeability check moved %s's recorded namespace from %s to %s",
+			target.ID, baseline, now)
+	}
+	if now := recordedNamespaceOf(t, engine, top.Name, neighbour.ID); !now.Known() {
+		t.Fatalf("the writeability check dropped %s's baseline out of the record", neighbour.ID)
+	}
+}
+
+// The proof is a write, so it has to be a write that changes nothing.
+//
+// Republishing the record is how the check earns its answer, and the record is
+// the only copy of what this node believes about every device's namespace. A
+// check that moved a baseline would make the next capture call a device
+// replaced -- which is the exact failure the record exists to prevent, caused
+// by the code that checks it.
+func TestTheRecordWriteabilityCheckMovesNoBaseline(t *testing.T) {
+	engine, top, devices, runtime, store := capturableNamespaceLab(t)
+	ctx := context.Background()
+	for _, d := range devices {
+		wiredNamespace(runtime, d, map[string][]string{
+			modelledNamespaceInterfaces(d)[0]: {"10.0.0." + d.Name[1:] + "/24"},
+		})
+	}
+	if _, err := engine.CaptureDevices(ctx, top, store,
+		[]string{devices[0].ID, devices[1].ID}); err != nil {
+		t.Fatalf("the first capture, which is what baselines them: %v", err)
+	}
+	before, err := os.ReadFile(engine.observationPath(top.Name))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := engine.checkNamespaceRecordable(top); err != nil {
+		t.Fatalf("a record that can be read and written was refused: %v", err)
+	}
+	after, err := os.ReadFile(engine.observationPath(top.Name))
+	if err != nil {
+		t.Fatalf("the check left no record where one was: %v", err)
+	}
+	if string(before) != string(after) {
+		t.Fatalf("proving the record could be written rewrote what it says:\nbefore: %s\nafter:  %s",
+			before, after)
+	}
+	// A lab that has never had a record is not a lab that cannot have one.
+	fresh := &Engine{
+		Runtime: runtime, Node: engine.Node, ObservationRoot: t.TempDir(),
+		Renderer: engine.Renderer, State: store,
+	}
+	if err := fresh.checkNamespaceRecordable(top); err != nil {
+		t.Fatalf("a lab whose record does not exist yet was refused a rewire: %v", err)
+	}
+	written, err := os.ReadFile(fresh.observationPath(top.Name))
+	if err != nil {
+		t.Fatalf("the check did not prove it could write the record: %v", err)
+	}
+	empty, err := fresh.loadObservation(top.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, known := empty.namespace(devices[0].ID); known {
+		t.Fatalf("the check invented a baseline for a lab it knows nothing about: %s", written)
 	}
 }

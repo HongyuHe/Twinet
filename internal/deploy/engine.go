@@ -2573,22 +2573,33 @@ func (e *Engine) RewireDeviceAndPeers(ctx context.Context, top *model.Topology, 
 	}
 	peers := LocalRewirePeers(top, e.Node, d)
 	affected := append([]*model.Device{d}, peers...)
-	// What is in these namespaces stops being the students' work the moment
-	// the cables are rebuilt, so nothing on this engine may file it as theirs
-	// until the replay below has put it back.
-	for _, dev := range affected {
-		e.markNamespaceStateLost(dev.ID)
-	}
 	if replay != nil {
-		// Refused, not attempted, if the record cannot be read: a rewire that
-		// cannot write down the namespace it ends in leaves the target looking
-		// permanently replaced to every later capture.
+		// Refused, not attempted, if the record cannot be read and written: a
+		// rewire that cannot write down the namespace it ends in leaves the
+		// target looking permanently replaced to every later capture.
 		if err := e.checkNamespaceRecordable(top); err != nil {
 			return fmt.Errorf("%w: %w", ErrRewireNotStarted, err)
 		}
 		if err := e.holdRewiredState(ctx, affected); err != nil {
 			return fmt.Errorf("%w: %w", ErrRewireNotStarted, err)
 		}
+	}
+	// What is in these namespaces stops being the students' work the moment
+	// the cables are rebuilt, so nothing on this engine may file it as theirs
+	// until the replay below has put it back.
+	//
+	// After the gates, not before them. Every refusal above is reported as
+	// ErrRewireNotStarted, whose whole meaning is that the device the caller
+	// asked about is still working and nothing is owed -- and a refusal that
+	// had already distrusted the target and its neighbours contradicts itself
+	// in the two places this engine is asked about them afterwards. It names
+	// them to DirtyNamespaceStateDevices, so their cached health verdicts are
+	// refreshed for a repair that never happened; and it makes every capture
+	// this engine takes withhold their namespace-backed state, so a device
+	// that was never unplugged silently stops being backed up by the pass that
+	// declined to touch it.
+	for _, dev := range affected {
+		e.markNamespaceStateLost(dev.ID)
 	}
 	if err := e.RewireDevice(ctx, top, d); err != nil {
 		return err
@@ -2609,12 +2620,10 @@ func (e *Engine) holdRewiredState(ctx context.Context, affected []*model.Device)
 	for _, dev := range affected {
 		already := e.restoreIsPending(ctx, dev)
 		if err := e.holdNamespaceState(ctx, dev); err != nil {
-			for _, done := range written {
-				_ = e.releaseNamespaceState(ctx, done)
-			}
-			return fmt.Errorf("rewiring empties the network namespaces it rebuilds, and %s "+
+			refusal := fmt.Errorf("rewiring empties the network namespaces it rebuilds, and %s "+
 				"could not be marked as owing its saved state back first, so nothing was "+
-				"changed: %w", dev.ID, err)
+				"unplugged: %w", dev.ID, err)
+			return errors.Join(append([]error{refusal}, e.releaseHeldState(ctx, written)...)...)
 		}
 		if !already {
 			written = append(written, dev)
@@ -2623,23 +2632,78 @@ func (e *Engine) holdRewiredState(ctx context.Context, affected []*model.Device)
 	return nil
 }
 
+// releaseHeldState takes back the markers a refused hold wrote, and reports
+// every one it could not take back.
+//
+// Every device is attempted whatever the ones before it did: a marker that is
+// stuck on one device is not a reason to leave one on the next. What comes
+// back is one error per device still carrying a marker for a rewire that never
+// happened, and those have to reach the operator. A leftover marker withholds
+// that device from every later capture until something clears it, so a refusal
+// that reported only "nothing was unplugged" would be describing a device that
+// is working, unrepaired, and has quietly stopped being backed up.
+func (e *Engine) releaseHeldState(ctx context.Context, written []*model.Device) []error {
+	var failures []error
+	for _, done := range written {
+		if err := e.releaseNamespaceState(ctx, done); err != nil {
+			failures = append(failures, fmt.Errorf("%s was marked as owing its saved state "+
+				"back for a rewire that was then refused, and the marker could not be taken "+
+				"back, so nothing will capture from it until it is: %w", done.ID, err))
+		}
+	}
+	return failures
+}
+
 // checkNamespaceRecordable proves, before anything is mutated, that the record
-// a rewire has to update at the end of it can be reached at all.
+// a rewire has to update at the end of it can be reached -- and written.
+//
+// Reading it was never the whole question. What a rewire ends with is
+// markNamespace, and that is a directory that has to exist, a temporary file
+// written beside the record and an atomic rename over it. A record that reads
+// perfectly well on a filesystem that has since gone read-only, or filled up,
+// passes a read check and fails that write -- after the interfaces are gone,
+// which is the most expensive moment there is to find out. The device is then
+// repaired and recorded nowhere, so every later capture compares it against
+// the namespace that died with its old task, calls it replaced, and withholds
+// its addressing from the store for ever.
+//
+// So the record is republished exactly as it already stands. Nothing this node
+// believes changes: every writer of this file rewrites it whole from the state
+// it has just loaded, so re-publishing an unchanged state moves no baseline
+// and drops nothing a later markNamespace would have kept. A lab that has
+// never had a record gets an empty one, which is the same record to every
+// reader here as no record at all. The load and the write are adjacent for the
+// reason recordRewiredNamespace loads late: the smaller the window, the less
+// of a concurrent capture's work a whole-file rewrite can stand on.
 func (e *Engine) checkNamespaceRecordable(top *model.Topology) error {
 	if e.Runtime == nil || top == nil || e.ObservationReadOnly ||
 		!runtime.SupportsNetnsIdentity(e.Runtime) {
 		return nil
 	}
-	if _, err := e.loadObservation(top.Name); err != nil {
-		if e.ObservationRoot == "" && errors.Is(err, os.ErrPermission) {
-			// The same exemption every other reader of this file makes: the
-			// record belongs to the agent, and a lab run by hand without one
-			// has never had it.
+	tracker, err := e.loadObservation(top.Name)
+	if err != nil {
+		if e.observationBelongsToNoAgent(err) {
 			return nil
 		}
 		return fmt.Errorf("read the recorded network namespaces before rewiring: %w", err)
 	}
+	if err := tracker.rewrite(); err != nil {
+		if e.observationBelongsToNoAgent(err) {
+			return nil
+		}
+		return fmt.Errorf("write the recorded network namespaces before rewiring: %w", err)
+	}
 	return nil
+}
+
+// observationBelongsToNoAgent reports whether a failure to reach the observed
+// state record is the one a lab run by hand always produces.
+//
+// The same exemption every other reader and writer of this file makes: the
+// default root under /run belongs to the agent, and a lab run without one has
+// never had the record nor the privilege to make it.
+func (e *Engine) observationBelongsToNoAgent(err error) bool {
+	return e.ObservationRoot == "" && errors.Is(err, os.ErrPermission)
 }
 
 // recordRewiredNamespace writes down the namespace a device was just replayed
@@ -2659,7 +2723,7 @@ func (e *Engine) recordRewiredNamespace(ctx context.Context, top *model.Topology
 	}
 	tracker, err := e.loadObservation(top.Name)
 	if err != nil {
-		if e.ObservationRoot == "" && errors.Is(err, os.ErrPermission) {
+		if e.observationBelongsToNoAgent(err) {
 			return nil
 		}
 		return err

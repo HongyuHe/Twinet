@@ -206,6 +206,23 @@ func (t *observationTracker) save() error {
 	return t.saveLocked()
 }
 
+// rewrite publishes the record as it already stands, which is how a caller
+// proves it can be written before doing something that depends on writing it
+// afterwards.
+//
+// save() is a no-op when nothing has changed, and "nothing has changed" is
+// precisely the state such a proof has to be in: it must not move a baseline
+// to find out whether a baseline could be moved. So the write is forced,
+// through the same directory creation, the same temporary file and the same
+// atomic rename every real update uses, carrying content identical to what the
+// next load would have produced either way.
+func (t *observationTracker) rewrite() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.changed = true
+	return t.saveLocked()
+}
+
 func (t *observationTracker) device(id string) (observedDeviceState, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()

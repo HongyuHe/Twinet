@@ -22,12 +22,36 @@ type rewireScopeRuntime struct {
 	mu       sync.Mutex
 	identity map[string]rt.NetnsIdentity
 	markers  map[string]bool
+	// writeErr and releaseErr make one container refuse to have the
+	// restore-pending file written or removed. They are separate because the
+	// two failures mean opposite things: a mark that cannot be written refuses
+	// a rewire, and a mark that cannot be removed afterwards is a device left
+	// owing a restore for a rewire that never happened.
+	writeErr   map[string]error
+	releaseErr map[string]error
 }
 
 func newRewireScopeRuntime() *rewireScopeRuntime {
 	return &rewireScopeRuntime{
 		identity: map[string]rt.NetnsIdentity{}, markers: map[string]bool{},
+		writeErr: map[string]error{}, releaseErr: map[string]error{},
 	}
+}
+
+// failMarkerWrite is a container that cannot be marked as owing its saved
+// state back, which is what refuses a rewire before it unplugs anything.
+func (r *rewireScopeRuntime) failMarkerWrite(container string, err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.writeErr[container] = err
+}
+
+// failMarkerRelease is a container whose marker cannot be taken back, which is
+// what a rollback runs into.
+func (r *rewireScopeRuntime) failMarkerRelease(container string, err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.releaseErr[container] = err
 }
 
 func (*rewireScopeRuntime) Name() string { return "containerd" }
@@ -65,8 +89,14 @@ func (r *rewireScopeRuntime) Exec(_ context.Context, container string,
 		}
 		return rt.ExecResult{ExitCode: 1}, nil
 	case strings.HasPrefix(joined, "rm -f "+restoreMarker):
+		if err := r.releaseErr[container]; err != nil {
+			return rt.ExecResult{}, err
+		}
 		delete(r.markers, container)
 	case len(cmd.Cmd) == 3 && cmd.Cmd[0] == "sh" && cmd.Cmd[2] == restoreMarkerScript:
+		if err := r.writeErr[container]; err != nil {
+			return rt.ExecResult{}, err
+		}
 		r.markers[container] = true
 	}
 	return rt.ExecResult{}, nil
