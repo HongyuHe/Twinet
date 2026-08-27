@@ -31,7 +31,7 @@ cases:
     required: {question_id: q1.2, check_id: dataplane.internal_reachability, check_index: 3}
     expected_check_status: partial
     transforms:
-      - {file: ATL_host.sh, append: "ip link set ATLrouter down"}
+      - {file: ATL_host.sh, append: "ip route replace unreachable 3.107.0.1/32"}
   - name: q1_2_no_external_ospf
     required: {question_id: q1.2, check_id: config.no_forbidden_ospf, check_index: 4}
     expected_check_status: fail
@@ -68,9 +68,6 @@ cases:
     transforms:
       - {file: MSP.conf, find: "  neighbor 3.156.0.1 next-hop-self", replace: "  ! next-hop-self deliberately omitted"}
       - {file: NYC.conf, find: "  neighbor 3.156.0.1 next-hop-self", replace: "  ! next-hop-self deliberately omitted"}
-      - {file: BOS.conf, find: "  neighbor 3.156.0.1 next-hop-self", replace: "  ! next-hop-self deliberately omitted"}
-      - {file: CHI.conf, find: "  neighbor 3.156.0.1 next-hop-self", replace: "  ! next-hop-self deliberately omitted"}
-      - {file: SFO.conf, find: "  neighbor 3.156.0.1 next-hop-self", replace: "  ! next-hop-self deliberately omitted"}
   - name: q2_2_own_prefix
     required: {question_id: q2.2, check_id: bgp.own_prefix_only, check_index: 2}
     expected_check_status: partial

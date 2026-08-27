@@ -467,7 +467,7 @@ func WaitControlPlaneStable(ctx context.Context, env *Env, timeout time.Duration
 		Describe:  fmt.Sprintf("the control plane of AS %d to stop changing", env.AS),
 		Interval:  700 * time.Millisecond,
 		Timeout:   timeout,
-		StableFor: 8,
+		StableFor: 30,
 		Check: func(ctx context.Context) (bool, error) {
 			fingerprint, routers, err := controlPlaneFingerprint(ctx, env)
 			if err != nil {
