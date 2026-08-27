@@ -260,7 +260,7 @@ func TestSliceRetainsTransitObservabilityAtDepthTwo(t *testing.T) {
 	}
 }
 
-func TestNeighboursAreNeverGradedAsStudents(t *testing.T) {
+func TestNeighboursKeepPolicyRolesWithoutRemainingGradeable(t *testing.T) {
 	full := classTopology(t)
 	h, err := Slice(full, 3, Options{Depth: 2})
 	if err != nil {
@@ -270,8 +270,8 @@ func TestNeighboursAreNeverGradedAsStudents(t *testing.T) {
 		if asn == 3 {
 			continue
 		}
-		if as.Role == model.RoleStudent {
-			t.Errorf("AS %d is still marked as a student AS in a harness for AS 3", asn)
+		if as.Role != full.ASes[asn].Role {
+			t.Errorf("AS %d policy role changed from %q to %q", asn, full.ASes[asn].Role, as.Role)
 		}
 		if as.OwnerGroup != "" {
 			t.Errorf("AS %d still carries owner group %q", asn, as.OwnerGroup)
@@ -408,15 +408,19 @@ func TestFullBreadthKeepsEverythingButStillIsolates(t *testing.T) {
 		t.Fatalf("%d VXLAN identifiers are shared by two harnesses", shared)
 	}
 
-	// Only the target may be marked as a student AS, so no other group's
-	// configuration is ever what is being graded.
-	students := 0
-	for _, as := range a.ASes {
-		if as.Role == model.RoleStudent {
-			students++
+	// Only the target retains an owner group, so no other system is gradeable;
+	// policy roles remain unchanged because region/relationship semantics use
+	// them.
+	gradeable := 0
+	for asn, as := range a.ASes {
+		if as.OwnerGroup != "" {
+			gradeable++
+			if asn != 3 {
+				t.Errorf("non-target AS %d retains gradeable owner %q", asn, as.OwnerGroup)
+			}
 		}
 	}
-	if students != 1 {
-		t.Errorf("full-breadth harness has %d student ASes, want exactly 1", students)
+	if gradeable != 1 {
+		t.Errorf("full-breadth harness has %d gradeable ASes, want exactly 1", gradeable)
 	}
 }

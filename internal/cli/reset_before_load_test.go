@@ -163,7 +163,7 @@ func TestThePreviousSubmissionsTunnelsAndRoutesAreRemoved(t *testing.T) {
 
 	for _, d := range top.ASes[asn].Devices {
 		all := strings.Join(rec.ran[d.ID], "\n")
-		for _, want := range []string{"ip tunnel del", "route del", "addr flush"} {
+		for _, want := range []string{"ip tunnel del", "route del", "link set dev", "addr flush"} {
 			if !strings.Contains(all, want) {
 				t.Errorf("%s: the reset never runs %q, so a previous submission's state "+
 					"is still installed when the next one is loaded", d.ID, want)

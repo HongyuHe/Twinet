@@ -149,7 +149,7 @@ func TestAttestationUsesStableCompactContractAndExactBuild(t *testing.T) {
 	if err := attestation.Verify(pub, "top", "rubric", CompactCompilerContract, sourceB, "lock", testCoverage); err == nil {
 		t.Fatal("changed full source identity accepted stale attestation")
 	}
-	if err := attestation.Verify(pub, "top", "rubric", "compact-harness/v3", sourceA, "lock", testCoverage); err == nil {
+	if err := attestation.Verify(pub, "top", "rubric", "compact-harness/v4", sourceA, "lock", testCoverage); err == nil {
 		t.Fatal("changed compact compiler contract accepted old attestation")
 	}
 	tampered := attestation

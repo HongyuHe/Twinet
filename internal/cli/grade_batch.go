@@ -1296,6 +1296,7 @@ func wipeDeviceState(ctx context.Context, exec execFn, d *model.Device) error {
 		if i.Name == "" {
 			continue
 		}
+		lines = append(lines, fmt.Sprintf("ip link set dev %s up 2>/dev/null", i.Name))
 		// The loopback is included.
 		//
 		// It was skipped, and a restart of FRR does not flush kernel

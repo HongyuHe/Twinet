@@ -39,7 +39,7 @@ import (
 // or its generated reference peers changes. It deliberately is not the CLI
 // source version: an ordinary controller bug-fix release must still verify a
 // previously proven compact/full equivalence artifact.
-const CompactCompilerContract = "compact-harness/v2"
+const CompactCompilerContract = "compact-harness/v3"
 
 // Options controls how much of the class topology a harness keeps.
 type Options struct {
@@ -164,23 +164,11 @@ func Slice(top *model.Topology, target int, opts Options) (*model.Topology, erro
 		}
 		if asn != target {
 			// A neighbour exists only to be a credible peer. It keeps its
-			// number and its address block, because that is what the target is
-			// marked on seeing, but it is no longer the class's copy of that
-			// AS and must never itself be graded.
+			// number, policy role, region and address block, because those are
+			// what the target is marked on seeing. Clearing its owner group is
+			// what makes it ungradeable; rewriting Role to staff changes IXP
+			// region membership and therefore changes the reference policy.
 			dst.OwnerGroup = ""
-			dst.Role = model.RoleStaff
-			// Except an exchange, which is not a peer at all.
-			//
-			// The role is what tells the renderer to build a route server: one
-			// that reflects between members and originates nothing. Rewriting
-			// it to staff turned the exchange into an ordinary transit system,
-			// so the session the target opens to the route server was to
-			// something that was not one -- and a correct submission was
-			// quarantined with "CHI->180.140.0.140 Active". Measured on the
-			// cluster before this line existed.
-			if src.Role == model.RoleIXP {
-				dst.Role = model.RoleIXP
-			}
 		}
 		for _, d := range src.Devices {
 			if nd, ok := out.Devices[d.ID]; ok {
