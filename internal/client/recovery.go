@@ -298,6 +298,9 @@ func (c *Cluster) readRecoveryStatuses(ctx context.Context, lab string) (Recover
 				pending = true
 			}
 		}
+		if status.CommittedPending {
+			pending = true
+		}
 		if status.Phase != "idle" && (!status.Consistent || status.Phase != "committed") {
 			pending = true
 		}
@@ -362,6 +365,12 @@ func (c *Cluster) recoverWithLeaseStrategyOptions(ctx context.Context, lab strin
 			}
 		}
 	}
+	if len(problems) == 0 {
+		observed := c.observeNodes(ctx, lab, report)
+		if err := c.finalizeConvergedCommit(ctx, lab, lease, observed); err != nil {
+			problems = append(problems, err.Error())
+		}
+	}
 
 	for _, node := range nodes {
 		status, err := node.RecoveryStatus(ctx, lab)
@@ -372,6 +381,11 @@ func (c *Cluster) recoverWithLeaseStrategyOptions(ctx context.Context, lab strin
 		report.Nodes[node.Name] = status
 		if status.Phase != "idle" && !status.Consistent {
 			problems = append(problems, fmt.Sprintf("%s is %s: %s", node.Name, status.Phase, status.Error))
+			continue
+		}
+		if status.CommittedPending {
+			problems = append(problems, fmt.Sprintf(
+				"%s still holds committed generation %q pending finalization", node.Name, status.Generation))
 			continue
 		}
 		if status.Generation != "" {
@@ -391,6 +405,60 @@ func (c *Cluster) recoverWithLeaseStrategyOptions(ctx context.Context, lab strin
 		return report, fmt.Errorf("recovery for lab %q is incomplete: %s", lab, strings.Join(problems, "; "))
 	}
 	return report, nil
+}
+
+// finalizeConvergedCommit clears rollback material only after every configured
+// node independently reports the same committed generation and exact inventory.
+// Once commit succeeded everywhere, finalization is the only safe outcome:
+// rolling one node back would create the split generation recovery exists to
+// prevent.
+func (c *Cluster) finalizeConvergedCommit(ctx context.Context, lab string, lease *MutationLease,
+	report RecoveryReport,
+) error {
+	generation := ""
+	var pending []string
+	for _, node := range c.sortedNodes() {
+		status, ok := report.Nodes[node.Name]
+		if !ok || status.Phase != "committed" || !status.Consistent || status.Generation == "" {
+			return nil
+		}
+		if generation == "" {
+			generation = status.Generation
+		} else if status.Generation != generation {
+			return nil
+		}
+		if status.CommittedPending {
+			pending = append(pending, node.Name)
+		}
+	}
+	if len(pending) == 0 {
+		return nil
+	}
+
+	var problems []string
+	for _, name := range pending {
+		node := c.node(name)
+		if node == nil {
+			problems = append(problems, fmt.Sprintf("%s is not in this cluster", name))
+			continue
+		}
+		fence, ok := lease.Fence(name)
+		if !ok {
+			problems = append(problems, fmt.Sprintf("%s has no recovery fence", name))
+			continue
+		}
+		if _, err := node.Apply(ctx, agent.ApplyRequest{
+			Lab: lab, Phase: "finalize", Fence: fence, Generation: generation,
+		}); err != nil {
+			problems = append(problems, fmt.Sprintf("%s finalize committed generation: %v", name, err))
+		}
+	}
+	if len(problems) == 0 {
+		return nil
+	}
+	sort.Strings(problems)
+	return fmt.Errorf("finalizing recovered generation %q of lab %q: %s",
+		generation, lab, strings.Join(problems, "; "))
 }
 
 // observeNodes re-reads every node's state, keeping whatever the caller

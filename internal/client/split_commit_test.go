@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/HongyuHe/twinet/internal/agent"
 )
@@ -22,6 +23,7 @@ type splitCommitNode struct {
 	previous          string
 	committedPending  bool
 	rollbackRequests  []agent.RecoveryRequest
+	finalizeRequests  int
 	refuseUnqualified bool
 	lease             agent.Fence
 }
@@ -81,6 +83,20 @@ func (n *splitCommitNode) handler(w http.ResponseWriter, r *http.Request) {
 		n.committedPending = false
 		n.generation = n.previous
 		write(agent.RecoveryResponse{Status: n.status()})
+	case "/v1/apply":
+		var req agent.ApplyRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.Fence != n.lease {
+			fail(http.StatusConflict, fmt.Errorf("stale fence"))
+			return
+		}
+		if req.Phase != "finalize" || req.Generation != n.generation {
+			fail(http.StatusConflict, fmt.Errorf("invalid finalization"))
+			return
+		}
+		n.finalizeRequests++
+		n.committedPending = false
+		write(agent.ApplyResponse{Node: "node", Generation: n.generation, Phase: "finalize"})
 	default:
 		fail(http.StatusNotFound, fmt.Errorf("unexpected path %s", r.URL.Path))
 	}
@@ -156,6 +172,43 @@ func TestAWholeClusterAwaitingFinalizationIsNotTreatedAsSplit(t *testing.T) {
 	}}
 	if split, found := detectSplitCommit(report); found {
 		t.Fatalf("a cluster that committed everywhere was rolled back to %q", split.Target)
+	}
+}
+
+func TestRecoveryFinalizesAnEverywhereCommittedGeneration(t *testing.T) {
+	finalized := &splitCommitNode{generation: "new-generation"}
+	pendingA := &splitCommitNode{
+		generation: "new-generation", previous: "old-generation", committedPending: true,
+	}
+	pendingB := &splitCommitNode{
+		generation: "new-generation", previous: "old-generation", committedPending: true,
+	}
+	cluster := splitCommitCluster(t, map[string]*splitCommitNode{
+		"node-0": finalized, "node-1": pendingA, "node-2": pendingB,
+	})
+
+	report, err := cluster.RecoverWithOptions(t.Context(), "lab", "forward",
+		RecoveryOptions{Wait: time.Second, ForwardAcknowledged: true})
+	if err != nil {
+		t.Fatalf("an everywhere-committed generation was not finalized: %v", err)
+	}
+	for node, status := range report.Nodes {
+		if status.Generation != "new-generation" || status.CommittedPending {
+			t.Fatalf("%s was not finalized at the committed generation: %+v", node, status)
+		}
+	}
+	finalized.mu.Lock()
+	finalizedCalls := finalized.finalizeRequests
+	finalized.mu.Unlock()
+	pendingA.mu.Lock()
+	pendingACalls := pendingA.finalizeRequests
+	pendingA.mu.Unlock()
+	pendingB.mu.Lock()
+	pendingBCalls := pendingB.finalizeRequests
+	pendingB.mu.Unlock()
+	if finalizedCalls != 0 || pendingACalls != 1 || pendingBCalls != 1 {
+		t.Fatalf("finalize calls = already-finalized:%d pending-a:%d pending-b:%d",
+			finalizedCalls, pendingACalls, pendingBCalls)
 	}
 }
 
