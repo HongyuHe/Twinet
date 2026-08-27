@@ -290,9 +290,6 @@ func runCompactAttestationSuite(ctx context.Context, top *model.Topology, rubric
 	if err != nil {
 		return harness.Attestation{}, "", err
 	}
-	if !audit.Equivalent {
-		return harness.Attestation{}, "", fmt.Errorf("compact equivalence audit did not pass")
-	}
 	for index := range audit.Records {
 		recordArtifacts, ok := artifacts[audit.Records[index].Case.Name]
 		if !ok {
@@ -301,6 +298,22 @@ func runCompactAttestationSuite(ctx context.Context, top *model.Topology, rubric
 		audit.Records[index].MutationBundle = recordArtifacts.mutation
 		audit.Records[index].FullReport = recordArtifacts.full
 		audit.Records[index].SyntheticReport = recordArtifacts.compact
+	}
+	if !audit.Equivalent {
+		raw, err := json.MarshalIndent(audit, "", "  ")
+		if err != nil {
+			return harness.Attestation{}, "", fmt.Errorf("encode rejected compact audit: %w", err)
+		}
+		if _, err := evidence.Write("audit-failure.json", append(raw, '\n'), 0); err != nil {
+			return harness.Attestation{}, "", fmt.Errorf("retain rejected compact audit: %w", err)
+		}
+		if err := evidence.Publish(); err != nil {
+			return harness.Attestation{}, "", fmt.Errorf("publish rejected compact audit evidence: %w", err)
+		}
+		published = true
+		return harness.Attestation{}, evidence.FinalDir(), fmt.Errorf(
+			"compact equivalence audit did not pass (%s); rejected evidence retained at %s",
+			compactAuditFailureSummary(audit), evidence.FinalDir())
 	}
 	attestation := harness.Attestation{
 		TopologyHash: top.Hash, RubricHash: compactRubricHash(rubric),
@@ -323,6 +336,25 @@ func runCompactAttestationSuite(ctx context.Context, top *model.Topology, rubric
 	}
 	published = true
 	return attestation, evidence.FinalDir(), nil
+}
+
+func compactAuditFailureSummary(audit harness.AuditResult) string {
+	var failures []string
+	for _, record := range audit.Records {
+		if record.Equal && record.Error == "" &&
+			!record.Full.NeedsReview && !record.Synthetic.NeedsReview {
+			continue
+		}
+		reason := record.Error
+		if reason == "" {
+			reason = "one harness requires review"
+		}
+		failures = append(failures, record.Case.Name+": "+reason)
+	}
+	if len(failures) == 0 {
+		return "no equivalent record was produced"
+	}
+	return strings.Join(failures, "; ")
 }
 
 func applyMutationCase(sub *submission, mutation harness.MutationCase) error {

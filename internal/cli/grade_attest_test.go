@@ -7,6 +7,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"io"
@@ -416,7 +417,7 @@ cases:
 	); err == nil {
 		t.Fatal("masked compact mutation produced an attestation")
 	}
-	assertNoAttestationOutput(t, failedOut)
+	assertRejectedAttestationEvidence(t, failedOut)
 
 	reviewRunner := &fakeCompactAttestRunner{review: true}
 	newCompactAttestRunner = func(context.Context, *model.Topology, *grade.Rubric, batchOpts, int) (compactAttestRunner, error) {
@@ -430,7 +431,7 @@ cases:
 	); err == nil {
 		t.Fatal("infrastructure-review audit produced an attestation")
 	}
-	assertNoAttestationOutput(t, reviewOut)
+	assertRejectedAttestationEvidence(t, reviewOut)
 }
 
 type fakeCompactAttestRunner struct {
@@ -462,6 +463,28 @@ func assertNoAttestationOutput(t *testing.T, out string) {
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			t.Fatalf("failed audit left output %s: %v", path, err)
 		}
+	}
+}
+
+func assertRejectedAttestationEvidence(t *testing.T, out string) {
+	t.Helper()
+	if _, err := os.Stat(out); !os.IsNotExist(err) {
+		t.Fatalf("rejected audit published a signed attestation %s: %v", out, err)
+	}
+	if _, err := os.Stat(out + ".evidence.staging"); !os.IsNotExist(err) {
+		t.Fatalf("rejected audit left staging output: %v", err)
+	}
+	failure := filepath.Join(out+".evidence", "audit-failure.json")
+	raw, err := os.ReadFile(failure)
+	if err != nil {
+		t.Fatalf("rejected audit did not retain %s: %v", failure, err)
+	}
+	var audit harness.AuditResult
+	if err := json.Unmarshal(raw, &audit); err != nil {
+		t.Fatalf("rejected audit evidence is invalid: %v", err)
+	}
+	if audit.Equivalent || len(audit.Records) == 0 {
+		t.Fatalf("rejected audit evidence does not explain the rejection: %+v", audit)
 	}
 }
 
