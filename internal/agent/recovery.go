@@ -1098,6 +1098,35 @@ func exactRuntimeSpecMatches(container rt.Container, spec *rt.Spec) bool {
 	return true
 }
 
+// recoveryReplacementIdentity proves that a name conflict belongs to the same
+// managed lab object as the rollback contract before recovery removes it.
+//
+// Runtime names are namespace-global. A user container or another lab can own
+// the expected name after an interrupted cleanup; a mismatching spec hash says
+// only that it is not the object recovery wants, not that recovery owns it.
+func recoveryReplacementIdentity(container rt.Container, spec *rt.Spec) error {
+	if spec == nil || spec.Labels == nil {
+		return errors.New("recovery contract has no identity labels")
+	}
+	if container.Label(deploy.LabelManaged) != "true" {
+		return errors.New("the name is owned by a container Twinet does not manage")
+	}
+	for _, label := range []string{deploy.LabelLab, deploy.LabelDeviceID} {
+		want := spec.Labels[label]
+		if want == "" {
+			return fmt.Errorf("recovery contract has no %s identity", label)
+		}
+		if got := container.Label(label); got != want {
+			return fmt.Errorf("%s identity is %q, expected %q", label, got, want)
+		}
+	}
+	if want, got := spec.Labels[deploy.LabelFRRControl],
+		container.Label(deploy.LabelFRRControl); want != got {
+		return fmt.Errorf("%s identity is %q, expected %q", deploy.LabelFRRControl, got, want)
+	}
+	return nil
+}
+
 // ensureExactRecoveryContainer resolves Docker's duplicate-name race by
 // inspecting the object that owns the expected name. A matching running or
 // exited container is reused/startable; only a known mismatching contract is
@@ -1116,6 +1145,10 @@ func (s *Server) ensureExactRecoveryContainer(ctx context.Context, spec *rt.Spec
 				return fmt.Errorf("inspect exact recovery container %s: %w", spec.Name, err)
 			}
 			if observed.State != rt.StateAbsent && !exactRuntimeSpecMatches(observed, spec) {
+				if err := recoveryReplacementIdentity(observed, spec); err != nil {
+					return fmt.Errorf("refusing to remove mismatching recovery container %s: %w",
+						spec.Name, err)
+				}
 				if err := s.rt.Remove(ctx, spec.Name, true); err != nil {
 					return fmt.Errorf("remove mismatching recovery container %s: %w", spec.Name, err)
 				}
@@ -1184,20 +1217,23 @@ func recoveryNameRetry(ctx context.Context) error {
 	}
 }
 
-func (s *Server) removeRecoveryContainerIfPresent(ctx context.Context, name string) error {
-	if name == "" {
+func (s *Server) removeRecoveryContainerIfPresent(ctx context.Context, spec *rt.Spec) error {
+	if spec == nil || spec.Name == "" {
 		return nil
 	}
 	return s.workLimiter().Run(ctx, []limiter.Kind{limiter.Apply, limiter.Lifecycle}, func() error {
-		current, err := s.rt.Inspect(ctx, name)
+		current, err := s.rt.Inspect(ctx, spec.Name)
 		if err != nil {
-			return fmt.Errorf("inspect recovery container %s: %w", name, err)
+			return fmt.Errorf("inspect recovery container %s: %w", spec.Name, err)
 		}
 		if current.State == rt.StateAbsent {
 			return nil
 		}
-		if err := s.rt.Remove(ctx, name, true); err != nil {
-			return fmt.Errorf("remove recovery container %s: %w", name, err)
+		if err := recoveryReplacementIdentity(current, spec); err != nil {
+			return fmt.Errorf("refusing to remove recovery container %s: %w", spec.Name, err)
+		}
+		if err := s.rt.Remove(ctx, spec.Name, true); err != nil {
+			return fmt.Errorf("remove recovery container %s: %w", spec.Name, err)
 		}
 		return nil
 	})
@@ -2796,7 +2832,7 @@ func (s *Server) rollbackExactContracts(ctx context.Context, lab string, fence F
 			// healthy restored control merely because another object stalled.
 			replacePrimary := current.State == rt.StateAbsent || !exactRuntimeSpecMatches(current, &entry.Spec)
 			if replacePrimary && entry.Control != nil {
-				if err := s.removeRecoveryContainerIfPresent(phaseCtx, entry.Control.Name); err != nil {
+				if err := s.removeRecoveryContainerIfPresent(phaseCtx, entry.Control); err != nil {
 					return fmt.Errorf("remove rollback control %s before primary replacement: %w",
 						entry.Control.Name, err)
 				}

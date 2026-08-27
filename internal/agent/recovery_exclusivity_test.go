@@ -250,13 +250,7 @@ func TestRecoveryCannotObserveZeroThenAllowLateScaleRecreation(t *testing.T) {
 }
 
 func TestExactRecoveryContainerReusesExitedAndConflictContracts(t *testing.T) {
-	spec := &rt.Spec{
-		Name: "expected",
-		Labels: map[string]string{
-			deploy.LabelSpec:            "old-spec",
-			deploy.LabelRuntimeContract: deploy.RuntimeSpecContractVersion,
-		},
-	}
+	spec := exactRecoverySpec()
 	t.Run("exited matching contract starts without create", func(t *testing.T) {
 		runtime := &exactRecoveryRuntime{container: rt.Container{
 			Name: spec.Name, State: rt.StateExited, Labels: cloneRecoveryLabels(spec.Labels),
@@ -282,13 +276,7 @@ func TestExactRecoveryContainerReusesExitedAndConflictContracts(t *testing.T) {
 }
 
 func TestExactRecoveryContainerReturnsDelayedStartDeadline(t *testing.T) {
-	spec := &rt.Spec{
-		Name: "expected",
-		Labels: map[string]string{
-			deploy.LabelSpec:            "old-spec",
-			deploy.LabelRuntimeContract: deploy.RuntimeSpecContractVersion,
-		},
-	}
+	spec := exactRecoverySpec()
 	runtime := &exactRecoveryRuntime{container: rt.Container{
 		Name: spec.Name, State: rt.StateExited, Labels: cloneRecoveryLabels(spec.Labels),
 	}, waitStart: true}
@@ -297,6 +285,70 @@ func TestExactRecoveryContainerReturnsDelayedStartDeadline(t *testing.T) {
 	defer cancel()
 	if err := server.ensureExactRecoveryContainer(ctx, spec); err == nil {
 		t.Fatal("delayed Docker start was accepted after its context deadline")
+	}
+}
+
+func TestExactRecoveryRefusesToDeleteANameOwnedByAnotherScope(t *testing.T) {
+	spec := exactRecoverySpec()
+	tests := []struct {
+		name   string
+		labels map[string]string
+	}{
+		{name: "unmanaged", labels: map[string]string{
+			deploy.LabelLab: "lab", deploy.LabelDeviceID: "as3/ATL",
+		}},
+		{name: "another lab", labels: map[string]string{
+			deploy.LabelManaged: "true", deploy.LabelLab: "another",
+			deploy.LabelDeviceID: "as3/ATL",
+		}},
+		{name: "another device", labels: map[string]string{
+			deploy.LabelManaged: "true", deploy.LabelLab: "lab",
+			deploy.LabelDeviceID: "as4/ATL",
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			test.labels[deploy.LabelSpec] = "foreign-spec"
+			runtime := &exactRecoveryRuntime{container: rt.Container{
+				Name: spec.Name, State: rt.StateRunning, Labels: test.labels,
+			}}
+			server := &Server{rt: runtime}
+			if err := server.ensureExactRecoveryContainer(context.Background(), spec); err == nil {
+				t.Fatal("recovery deleted a mismatching name without proving it owned the container")
+			}
+			if runtime.removes != 0 {
+				t.Fatalf("recovery removed a container from another scope %d time(s)", runtime.removes)
+			}
+		})
+	}
+}
+
+func TestExactRecoveryMayReplaceItsOwnMismatchingGeneration(t *testing.T) {
+	spec := exactRecoverySpec()
+	labels := cloneRecoveryLabels(spec.Labels)
+	labels[deploy.LabelSpec] = "forward-generation-spec"
+	runtime := &exactRecoveryRuntime{container: rt.Container{
+		Name: spec.Name, State: rt.StateRunning, Labels: labels,
+	}}
+	server := &Server{rt: runtime}
+	if err := server.ensureExactRecoveryContainer(context.Background(), spec); err != nil {
+		t.Fatal(err)
+	}
+	if runtime.removes != 1 || runtime.creates != 1 || runtime.starts != 1 {
+		t.Fatalf("own mismatching generation lifecycle = %+v", runtime)
+	}
+}
+
+func exactRecoverySpec() *rt.Spec {
+	return &rt.Spec{
+		Name: "expected",
+		Labels: map[string]string{
+			deploy.LabelManaged:         "true",
+			deploy.LabelLab:             "lab",
+			deploy.LabelDeviceID:        "as3/ATL",
+			deploy.LabelSpec:            "old-spec",
+			deploy.LabelRuntimeContract: deploy.RuntimeSpecContractVersion,
+		},
 	}
 }
 
@@ -314,15 +366,20 @@ type exactRecoveryRuntime struct {
 	spec           *rt.Spec
 	creates        int
 	starts         int
+	removes        int
 	createConflict bool
 	waitStart      bool
 }
 
-func (r *exactRecoveryRuntime) Inspect(context.Context, string) (rt.Container, error) {
+func (r *exactRecoveryRuntime) Inspect(_ context.Context, name string) (rt.Container, error) {
+	if r.container.Name == "" {
+		return rt.Container{Name: name, State: rt.StateAbsent}, nil
+	}
 	return r.container, nil
 }
 
 func (r *exactRecoveryRuntime) Remove(context.Context, string, bool) error {
+	r.removes++
 	r.container = rt.Container{State: rt.StateAbsent}
 	return nil
 }
