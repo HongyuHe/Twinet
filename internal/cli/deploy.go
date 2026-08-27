@@ -402,6 +402,14 @@ after a partial failure, a reboot, or a topology edit.`,
 						"the current namespace state could not be proven: %s",
 						strings.Join(devices, "; "))
 				}
+				// Persisted before the first reference command. If execution
+				// fails halfway, a retry or destroy must not capture the
+				// already-solved half as student work; the complete platform
+				// snapshot taken above remains the recovery source.
+				if err := recordLabMode(top, localModeSolvePending); err != nil {
+					return fmt.Errorf("refusing to install the reference solution because "+
+						"its captured transition could not be recorded: %w", err)
+				}
 			}
 
 			obs := newProgress(cmd.OutOrStdout(), p.Len(), quiet)
@@ -1994,12 +2002,15 @@ func topologyFromLabels(lab string, cs []runtime.Container) *model.Topology {
 	return top
 }
 
-// labWasSolved reports whether a single-node lab's recorded state says it was
-// last deployed with the reference solution on it.
+// labWasSolved reports whether a single-node lab must be treated as containing
+// reference state.
 //
 // A cluster records the mode with the topology on each node. A single-node lab
-// keeps its state beside the manifest, so the same question is answered from
-// the marker the deploy writes there.
+// keeps its state beside the manifest. A pending solve counts too: some devices
+// may already hold the answer, so capturing the mixed lab would file that
+// answer as student work; the complete pre-solve snapshot is already durable.
+const localModeSolvePending = "solve-pending"
+
 func labWasSolved(top *model.Topology) bool {
 	if top == nil {
 		// Without a manifest there is nothing that says otherwise, and the
@@ -2010,7 +2021,12 @@ func labWasSolved(top *model.Topology) bool {
 	if err != nil {
 		return false
 	}
-	return strings.TrimSpace(string(raw)) == string(render.ModeSolve)
+	switch strings.TrimSpace(string(raw)) {
+	case string(render.ModeSolve), localModeSolvePending:
+		return true
+	default:
+		return false
+	}
 }
 
 // recordLabMode remembers how a single-node lab was last deployed.

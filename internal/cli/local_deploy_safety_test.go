@@ -61,6 +61,12 @@ func TestLocalModeIsRecordedOnlyThroughAVisibleAtomicWrite(t *testing.T) {
 	if !labWasSolved(top) {
 		t.Fatal("a successful solve was not recorded, so destroy would capture the answer as student work")
 	}
+	if err := recordLabMode(top, localModeSolvePending); err != nil {
+		t.Fatal(err)
+	}
+	if !labWasSolved(top) {
+		t.Fatal("a partial solve would be captured as student work on retry or destroy")
+	}
 	if err := recordLabMode(top, string(render.ModePlatform)); err != nil {
 		t.Fatal(err)
 	}
