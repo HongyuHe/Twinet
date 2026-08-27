@@ -24,6 +24,7 @@ PKI=""
 BIND_UNDERLAY=""
 RUNTIME=""
 RUNTIME_SOCKET=""
+EXPECTED_COMMIT=""
 ARGS=()
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -31,6 +32,7 @@ while [ $# -gt 0 ]; do
         --bind-underlay) BIND_UNDERLAY=1; shift ;;
         --runtime) RUNTIME="$2"; shift 2 ;;
         --runtime-socket) RUNTIME_SOCKET="$2"; shift 2 ;;
+        --expect-commit) EXPECTED_COMMIT="$2"; shift 2 ;;
         *) ARGS+=("$1"); shift ;;
     esac
 done
@@ -38,9 +40,36 @@ set -- "${ARGS[@]+"${ARGS[@]}"}"
 
 NODES=("$@")
 if [ ${#NODES[@]} -eq 0 ]; then
-    echo "usage: $0 [--pki DIR] [--bind-underlay] [--runtime docker|podman|containerd] [--runtime-socket ENDPOINT] <node> [node...]" >&2
+    echo "usage: $0 [--pki DIR] [--bind-underlay] [--runtime docker|podman|containerd] [--runtime-socket ENDPOINT] [--expect-commit SHA] <node> [node...]" >&2
     exit 2
 fi
+
+# A rollout is a release boundary, not a development build. Running this
+# script by relative path from the wrong checkout still produces a perfectly
+# executable agent and still passes the checksum check below -- on every node,
+# consistently wrong. Refuse dirty source unconditionally, and let release
+# automation bind the checkout to an explicit commit when it has one.
+if ! SOURCE_COMMIT=$(git rev-parse --verify HEAD 2>/dev/null); then
+    echo "agent rollout requires a Git checkout with a committed HEAD" >&2
+    exit 2
+fi
+if [ -n "$(git status --porcelain --untracked-files=normal)" ]; then
+    echo "refusing agent rollout from a dirty worktree at $SOURCE_COMMIT" >&2
+    echo "Commit the exact release candidate and retry; the installed binary must be reproducible." >&2
+    exit 2
+fi
+if [ -n "$EXPECTED_COMMIT" ]; then
+    if ! RESOLVED_EXPECTED=$(git rev-parse --verify "${EXPECTED_COMMIT}^{commit}" 2>/dev/null); then
+        echo "--expect-commit does not resolve to a commit in this checkout: $EXPECTED_COMMIT" >&2
+        exit 2
+    fi
+    if [ "$SOURCE_COMMIT" != "$RESOLVED_EXPECTED" ]; then
+        echo "refusing agent rollout from $SOURCE_COMMIT; expected $RESOLVED_EXPECTED" >&2
+        exit 2
+    fi
+fi
+echo "rolling out committed source $SOURCE_COMMIT"
+
 case "$RUNTIME" in
     "")
         [ -z "$RUNTIME_SOCKET" ] || {

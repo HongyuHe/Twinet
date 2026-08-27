@@ -326,6 +326,7 @@ script-tests:
 	bash scripts/test_release_runners.sh
 	bash scripts/test_remote_image_digest.sh
 	bash scripts/test_push_images.sh
+	bash scripts/test_deploy_agents_source.sh
 	bash scripts/test_source_digest.sh
 	bash scripts/test_reproducible_build.sh
 	python3 contrib/nika/test_kubernetes_bridge.py

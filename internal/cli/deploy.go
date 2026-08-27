@@ -324,6 +324,8 @@ after a partial failure, a reboot, or a topology edit.`,
 				mode = render.ModeSolve
 			}
 			node := localNode(top)
+			previousSolved := labWasSolved(top)
+			modePolicy := localModeTransitionPolicy(previousSolved, mode)
 			// Without a state store the engine's preservation path is dead
 			// code: a container replaced by a redeploy comes back with the
 			// image's configuration and the student's work is gone. The local
@@ -333,11 +335,6 @@ after a partial failure, a reboot, or a topology edit.`,
 			if err != nil {
 				return err
 			}
-			// Remembered so that a later destroy of a solved lab does not file
-			// the reference as each student's saved configuration.
-			if !dryRun {
-				recordLabMode(top, string(mode))
-			}
 			eng := &deploy.Engine{
 				Runtime:                rt,
 				Node:                   node,
@@ -346,6 +343,10 @@ after a partial failure, a reboot, or a topology edit.`,
 				Renderer:               render.New(top, mode),
 				Authoritative:          mode == render.ModeSolve,
 				WritesReference:        mode == render.ModeSolve,
+				ModeKey:                string(mode) + "/ungraded=0",
+				ForceStudentReset:      modePolicy.forceStudentReset,
+				RestoreStudentState:    modePolicy.forceStudentReset,
+				PreviousMode:           modePolicy.previousMode,
 				UnderlayIP:             underlayOf(top, node),
 				PeerUnderlay:           peerUnderlays(top),
 				RequireImmutableImages: top.Lab.Images.RequiresImmutableImages(),
@@ -366,10 +367,41 @@ after a partial failure, a reboot, or a topology edit.`,
 				if len(scope) > 0 {
 					return fmt.Errorf("nothing is placed on node %q; check placement.nodes", node)
 				}
+				if !dryRun {
+					if err := pruneLocalDeployment(cmd.Context(), eng, top, store, node,
+						previousSolved, prune, quiet, cmd.OutOrStdout()); err != nil {
+						return err
+					}
+					if err := recordLabMode(top, string(mode)); err != nil {
+						return fmt.Errorf("record successful local deployment mode: %w", err)
+					}
+				}
 				if !quiet {
 					fmt.Fprintln(cmd.OutOrStdout(), "no changes; lab is already converged")
 				}
 				return nil
+			}
+
+			// Solving is destructive to student configuration by design. Save
+			// the current teaching state before any reference command runs;
+			// captureBeforeReplace cannot do this because the desired solve
+			// engine must never capture the answer on a later solve pass.
+			if modePolicy.captureBeforeReference && !dryRun {
+				capture := &deploy.Engine{Runtime: rt, Node: node, State: store}
+				if _, err := capture.CaptureAll(cmd.Context(), top, store); err != nil {
+					return fmt.Errorf("refusing to install the reference solution because "+
+						"the current student state could not be captured: %w", err)
+				}
+				if unproven := capture.UnprovenNamespaceDevices(); len(unproven) > 0 {
+					var devices []string
+					for id, reason := range unproven {
+						devices = append(devices, id+": "+reason)
+					}
+					sort.Strings(devices)
+					return fmt.Errorf("refusing to install the reference solution because "+
+						"the current namespace state could not be proven: %s",
+						strings.Join(devices, "; "))
+				}
 			}
 
 			obs := newProgress(cmd.OutOrStdout(), p.Len(), quiet)
@@ -405,6 +437,19 @@ after a partial failure, a reboot, or a topology edit.`,
 				printScopeFailures(cmd.ErrOrStderr(), rep)
 				return fmt.Errorf("%d scope(s) degraded; re-run deploy to converge them",
 					len(rep.FailedScopes()))
+			}
+			if err := pruneLocalDeployment(cmd.Context(), eng, top, store, node,
+				previousSolved, prune && len(scope) == 0, quiet, cmd.OutOrStdout()); err != nil {
+				return err
+			}
+			// Remembered only after every requested mutation succeeded. Writing
+			// "solve" before execution made a failed solve suppress capture on
+			// the next destroy, which is the exact moment the marker exists to
+			// protect.
+			if len(scope) == 0 {
+				if err := recordLabMode(top, string(mode)); err != nil {
+					return fmt.Errorf("deployment succeeded but its mode could not be recorded: %w", err)
+				}
 			}
 			_ = start
 			return nil
@@ -1598,6 +1643,57 @@ func localStore(top *model.Topology) (*state.Store, error) {
 	return st, nil
 }
 
+type localModeTransition struct {
+	previousMode           string
+	captureBeforeReference bool
+	forceStudentReset      bool
+}
+
+func localModeTransitionPolicy(previousSolved bool, desired render.Mode) localModeTransition {
+	previous := render.ModePlatform
+	if previousSolved {
+		previous = render.ModeSolve
+	}
+	return localModeTransition{
+		previousMode:           string(previous),
+		captureBeforeReference: previous == render.ModePlatform && desired == render.ModeSolve,
+		forceStudentReset:      previous == render.ModeSolve && desired == render.ModePlatform,
+	}
+}
+
+// pruneLocalDeployment gives the single-node path the same explicit prune
+// semantics as the cluster path.
+//
+// The state in a stale container belongs to the mode that was running before
+// this command, not the mode just applied to desired containers. A
+// platform-to-solve transition therefore captures an orphan as student work,
+// while a repeated solved deployment must not file the reference answer as
+// theirs.
+func pruneLocalDeployment(ctx context.Context, desired *deploy.Engine, top *model.Topology,
+	store *state.Store, node string, previousSolved, requested, quiet bool, out io.Writer,
+) error {
+	if !requested {
+		return nil
+	}
+	pruner := &deploy.Engine{
+		Runtime: desired.Runtime, Node: node, State: store,
+		WritesReference: previousSolved,
+	}
+	containers, err := pruner.PruneOrphans(ctx, top)
+	if err != nil {
+		return fmt.Errorf("prune stale local containers: %w", err)
+	}
+	overlays, err := desired.PruneOverlaysContext(ctx, top)
+	if err != nil {
+		return fmt.Errorf("prune stale local overlays: %w", err)
+	}
+	if !quiet {
+		fmt.Fprintf(out, "pruned %d stale container(s) and %d overlay binding(s)\n",
+			len(containers), len(overlays))
+	}
+	return nil
+}
+
 // strategyOf names the strategy the record was produced with.
 func strategyOf(top *model.Topology, rebalance, adopted bool) string {
 	s := top.Lab.Placement.Strategy
@@ -1918,10 +2014,10 @@ func labWasSolved(top *model.Topology) bool {
 }
 
 // recordLabMode remembers how a single-node lab was last deployed.
-func recordLabMode(top *model.Topology, mode string) {
+func recordLabMode(top *model.Topology, mode string) error {
 	dir := labPrivateDir(top)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return
+		return err
 	}
-	_ = os.WriteFile(filepath.Join(dir, "mode"), []byte(mode), 0o644)
+	return writeAtomic(dir, "mode", []byte(mode), 0o644)
 }
