@@ -627,6 +627,31 @@ removing it would destroy the only thing that could still answer the question.
 Both keep the routing configuration. `twinet destroy` remains the way to say
 that a lab is genuinely disposable.
 
+The same policy now governs the first of those two paths, for the same reason:
+the container is deleted immediately afterwards, so it is the last object that
+could say what was in it. A device whose namespace was proven replaced is
+rebuilt as before — that is what the guard exists to make safe — but a device
+whose namespace could not be accounted for has its replacement refused, after
+whatever was safe to keep has been kept. A capture that skips one doubtful
+snapshot costs a deferred backup of state the store already holds; a
+replacement that skips one destroys the evidence and then replays a copy that
+may be older than the work, unreadable, or absent. A container that is stopped
+when the replacement reaches it is a case of the first kind, not the second:
+starting it to read its filesystem is what empties its namespace, so the loss
+is recorded as one this pass caused rather than left as an open question, and
+the device is rebuilt.
+
+A prune reads the container in front of it. An orphan almost always still has
+the name the manifest gave it — a device that moves to another node keeps its
+container — so resolving one through the model looked right, and was not when
+the two disagreed: a manifest that renames a device's container, or an older
+container still running under the same identifier, sent the reading to the
+*live* container and then deleted the leftover without ever looking inside it.
+A leftover is also not allowed to write the device's saved state when the
+manifest still gives that device a container on this node: there is one
+snapshot per device, the container the manifest names is the authority for it,
+and that container is captured by the ordinary path.
+
 Every device left in that state is reported. The node publishes them in its
 apply response as `unproven_namespaces`, keyed by device with the reason for
 each, and `twinet deploy` prints one `UNPROVEN NAMESPACE:` line per device and

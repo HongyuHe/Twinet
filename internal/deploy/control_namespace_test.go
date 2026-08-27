@@ -46,6 +46,11 @@ type namespaceAwareRuntime struct {
 	// onStart runs when a stopped container is started, so a test can give it
 	// the new and empty namespace a started task actually gets.
 	onStart func(container string)
+	// read counts the commands run in each container, so a test can ask which
+	// container something looked inside. Reading the wrong one is a defect
+	// that leaves no trace in the store when both hold the same state, and a
+	// silent one when the reading is thrown away.
+	read map[string]int
 	// nsMu guards the three maps above. A pass settles every unbaselined
 	// device concurrently, and a test that moves one of them mid-proof is
 	// writing from one goroutine what another is reading.
@@ -80,6 +85,13 @@ func (r *namespaceAwareRuntime) setPorts(name, body string) {
 		r.ports = map[string]string{}
 	}
 	r.ports[name] = body
+}
+
+// readsOf reports how many commands were run inside a container.
+func (r *namespaceAwareRuntime) readsOf(name string) int {
+	r.nsMu.Lock()
+	defer r.nsMu.Unlock()
+	return r.read[name]
 }
 
 func (r *namespaceAwareRuntime) setFRR(name, body string) {
@@ -159,6 +171,12 @@ func vrfLinkLine(name, table string) string {
 // every device in every fixture claiming it still owes its student a replay and
 // every namespace answering that it holds whatever it was asked about.
 func (r *namespaceAwareRuntime) Exec(ctx context.Context, c string, cmd rt.ExecCmd) (rt.ExecResult, error) {
+	r.nsMu.Lock()
+	if r.read == nil {
+		r.read = map[string]int{}
+	}
+	r.read[c]++
+	r.nsMu.Unlock()
 	if strings.HasPrefix(strings.Join(cmd.Cmd, " "), "test -f "+restoreMarker) {
 		return rt.ExecResult{ExitCode: 1}, nil
 	}

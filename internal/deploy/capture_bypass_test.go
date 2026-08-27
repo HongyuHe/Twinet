@@ -2,6 +2,8 @@ package deploy
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -478,5 +480,299 @@ func TestSavedNamespaceObjectsAreReadForADeviceTheManifestHasForgotten(t *testin
 	if len(saved) != 0 {
 		t.Fatalf("a staff-owned device the manifest still describes was judged against "+
 			"saved state a capture never writes: %v", saved)
+	}
+}
+
+// The container a prune is holding, and the container the manifest has moved
+// the device into.
+//
+// An orphan usually has the same name the manifest gave it -- a device that
+// moved to another node keeps its container name, which is why the resolution
+// looked correct. When it does not, because the manifest renamed the device's
+// container or because an older container is still running under the same
+// identifier, the model answered with the *new* container and the prune read
+// that one instead: it captured a live device that was never in danger, filed
+// its reading as this device's saved state, and then deleted the container it
+// had never looked inside.
+func TestPruneReadsTheOrphanInFrontOfItAndNotTheDeviceTheManifestNowWants(t *testing.T) {
+	engine, top, runtime, store := orphanLab(t)
+	// The manifest keeps the device and its identifier, and gives it a
+	// different container on this same node.
+	device := &model.Device{
+		ID: "as3/ATL", Name: "ATL", Container: "tw-atl-v2", Image: "frr:stable",
+		Node: "node-a", ASN: 3, Kind: model.KindRouter,
+	}
+	top.Devices[device.ID] = device
+	runtime.containers = append(runtime.containers, rt.Container{
+		Name: "tw-atl-v2", State: rt.StateRunning, PID: 5151,
+		Labels: map[string]string{
+			LabelLab: top.Name, LabelNode: "node-a",
+			LabelDeviceID: "as3/ATL", LabelKind: "router",
+		},
+	})
+	runtime.setIdentity("tw-atl-v2", rt.NetnsIdentity{Dev: 4, Inode: 4026532222})
+	runtime.setFRR("tw-atl-v2", "router ospf\n network 3.0.99.0/24 area 0\n")
+	runtime.setContents("tw-atl-v2", namespaceProbeOutput(
+		[]string{"port_BOS"}, map[string][]string{"port_BOS": {"3.0.8.1/24"}}))
+	recordNamespace(t, engine, top, device, runtime.identity["tw-atl-v2"])
+	// The leftover holds something else entirely, so that what ends up in the
+	// store says which container was read.
+	orphanHolding(runtime, map[string][]string{"port_BOS": {"3.0.9.1/24"}})
+
+	namespaceSnapshot(t, store, top.Name, device, state.KindAddrs,
+		"addr inet port_BOS 3.0.8.1/24")
+	if _, err := store.Put(state.Snapshot{Lab: top.Name, Device: device.ID,
+		Kind: state.KindFRR, Content: []byte("router ospf\n network 3.0.8.0/24 area 0\n"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	removed, err := engine.PruneOrphans(context.Background(), top)
+	if err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	if len(removed) != 1 || removed[0] != "tw-atl" {
+		t.Fatalf("the prune removed %v rather than the leftover container", removed)
+	}
+	if runtime.readsOf("tw-atl") == 0 {
+		t.Error("the prune deleted a container without ever looking inside it, and read a " +
+			"different one instead")
+	}
+	if got := runtime.readsOf("tw-atl-v2"); got != 0 {
+		t.Errorf("the prune read the live container the manifest gives this device (%d "+
+			"commands): that container is not an orphan, is not in danger, and is not "+
+			"what was about to be deleted", got)
+	}
+	config, err := store.Current(top.Name, device.ID, state.KindFRR)
+	if err != nil {
+		t.Fatalf("read the saved configuration of %s: %v", device.ID, err)
+	}
+	if !strings.Contains(string(config.Content), "3.0.8.0/24") {
+		t.Errorf("a leftover container's reading replaced the saved state of the live "+
+			"device that carries the same identifier: %q", string(config.Content))
+	}
+	facts := savedFacts(t, store, top.Name, device, state.KindAddrs)
+	if !hasFact(facts, "addr inet port_BOS 3.0.8.1/24") {
+		t.Errorf("a leftover container's namespace was filed as the live device's: %v", facts)
+	}
+}
+
+// staleSpec makes a device's running container disagree with what the manifest
+// now asks for, which is what sends a deployment down the replacement path.
+func staleSpec(t *testing.T, engine *Engine, top *model.Topology, runtime *namespaceAwareRuntime,
+	d *model.Device,
+) finalDeviceSpec {
+	t.Helper()
+	final, err := engine.finalRuntimeSpecs(top, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime.mu.Lock()
+	for i := range runtime.containers {
+		if runtime.containers[i].Name == d.Container {
+			runtime.containers[i].Labels[LabelSpec] = "a-previous-specification"
+		}
+	}
+	runtime.mu.Unlock()
+	return final
+}
+
+// A destructive replacement of a device nothing can vouch for.
+//
+// The capture guard withholds what it read and does not fail, which is right
+// for a capture: one deferred snapshot of state the store already holds. It is
+// not right for a replacement. The container is deleted immediately afterwards
+// and it is the last object that could still answer what was in it -- a term's
+// work this pass declined to save, or an empty room. Going ahead settled the
+// question by destroying the evidence and reported success.
+func TestAReplacementRefusesToDestroyANamespaceItCannotAccountFor(t *testing.T) {
+	engine, top, devices, runtime, store := capturableNamespaceLab(t)
+	replaced := devices[0]
+	// No baseline for anything: the upgrade window, before any pass has
+	// recorded which namespace a device was configured in.
+	namespaceSnapshot(t, store, top.Name, replaced, state.KindAddrs,
+		"addr inet port_R1 10.0.0.1/24")
+	runtime.setContents(replaced.Container, namespaceProbeOutput(nil, nil))
+	final := staleSpec(t, engine, top, runtime, replaced)
+
+	err := engine.ensureContainer(context.Background(), top, replaced, final)
+	if err == nil {
+		t.Fatal("a replacement destroyed the only container that could still say what was " +
+			"in a namespace this pass could not account for")
+	}
+	if !strings.Contains(err.Error(), "could not be established") {
+		t.Fatalf("the refusal does not say what it could not establish: %v", err)
+	}
+	if len(runtime.removed) != 0 {
+		t.Fatalf("the refusal did not stop the deletion: %v", runtime.removed)
+	}
+	facts := savedFacts(t, store, top.Name, replaced, state.KindAddrs)
+	if !hasFact(facts, "addr inet port_R1 10.0.0.1/24") {
+		t.Fatalf("the saved addressing was overwritten on the way to refusing: %v", facts)
+	}
+	if _, err := store.Current(top.Name, replaced.ID, state.KindFRR); err != nil {
+		t.Fatalf("refusing threw away the routing configuration, which was safe to keep "+
+			"and was read before anything was decided: %v", err)
+	}
+}
+
+// The same refusal, with the doubt coming from the store rather than from the
+// namespace.
+//
+// A saved snapshot that cannot be read -- a corrupted body, a digest that does
+// not match it -- means there is nothing trustworthy to compare the namespace
+// against. That is the case where going ahead is worst: the container is
+// deleted, and the replacement then replays a copy that could not be read.
+func TestAReplacementRefusesWhenTheSavedStateCannotBeRead(t *testing.T) {
+	engine, top, devices, runtime, store := capturableNamespaceLab(t)
+	replaced := devices[0]
+	namespaceSnapshot(t, store, top.Name, replaced, state.KindAddrs,
+		"addr inet port_R1 10.0.0.1/24")
+	// The namespace is intact and holds exactly what is saved, so the only
+	// thing standing between this and a clean proof is the unreadable copy.
+	wiredNamespace(runtime, replaced, map[string][]string{"port_R1": {"10.0.0.1/24"}})
+	corrupted := corruptSavedBody(t, store, top.Name, replaced.ID, state.KindAddrs)
+	final := staleSpec(t, engine, top, runtime, replaced)
+
+	err := engine.ensureContainer(context.Background(), top, replaced, final)
+	if err == nil {
+		t.Fatal("a replacement deleted a container whose saved state could not be read, " +
+			"which is the one case where the container is the better copy")
+	}
+	if len(runtime.removed) != 0 {
+		t.Fatalf("the refusal did not stop the deletion: %v", runtime.removed)
+	}
+	body, readErr := os.ReadFile(corrupted)
+	if readErr != nil {
+		t.Fatalf("read back the damaged snapshot: %v", readErr)
+	}
+	if string(body) != "not what the digest says" {
+		t.Fatalf("the damaged snapshot was written over rather than left for somebody to "+
+			"recover: %q", string(body))
+	}
+}
+
+// And the other half of that policy: a namespace positively known to have been
+// replaced does not block anything.
+//
+// There is no doubt here to preserve. What is in the namespace demonstrably is
+// not the student's work, the saved copy is intact and was left alone, and the
+// replacement is precisely the thing that puts it back. Refusing this would
+// strand every device the guard is meant to repair.
+func TestAReplacementGoesAheadWhenTheNamespaceIsKnownToHaveBeenReplaced(t *testing.T) {
+	engine, top, devices, runtime, store := capturableNamespaceLab(t)
+	replaced := devices[0]
+	for _, d := range devices {
+		recordNamespace(t, engine, top, d, runtime.identity[d.Container])
+	}
+	namespaceSnapshot(t, store, top.Name, replaced, state.KindAddrs,
+		"addr inet port_R1 10.0.0.1/24")
+	// The task died and came back somewhere else, which the recorded namespace
+	// is what proves.
+	runtime.setIdentity(replaced.Container, rt.NetnsIdentity{Dev: 4, Inode: 4026579995})
+	runtime.setContents(replaced.Container, namespaceProbeOutput(nil, nil))
+	final := staleSpec(t, engine, top, runtime, replaced)
+
+	// Whatever the rebuild that follows does -- it needs a good deal more of a
+	// machine than this fixture is -- the container being gone is what says
+	// the capture let the replacement through.
+	err := engine.ensureContainer(context.Background(), top, replaced, final)
+	if err != nil && strings.Contains(err.Error(), "could not be established") {
+		t.Fatalf("a namespace this pass proved had been replaced was refused as one it "+
+			"could not account for: %v", err)
+	}
+	if len(runtime.removed) == 0 {
+		t.Fatal("a device whose namespace was proven replaced was refused instead of rebuilt")
+	}
+	if _, unproven := engine.unprovenNamespaceReason(replaced.ID); unproven {
+		t.Error("a namespace this proved had been replaced was also filed as one it could " +
+			"not account for, which is the finding that refuses the replacement")
+	}
+	facts := savedFacts(t, store, top.Name, replaced, state.KindAddrs)
+	if !hasFact(facts, "addr inet port_R1 10.0.0.1/24") {
+		t.Fatalf("the empty namespace was filed over the state the rebuild replays: %v", facts)
+	}
+}
+
+// corruptSavedBody damages the body of a saved snapshot so that reading it
+// back fails its digest, and returns the file it damaged.
+func corruptSavedBody(t *testing.T, store *state.Store, lab, device string,
+	kind state.Kind,
+) string {
+	t.Helper()
+	var found string
+	err := filepath.Walk(store.Root(), func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() || !strings.HasSuffix(path, ".body") {
+			return nil
+		}
+		if filepath.Base(filepath.Dir(path)) == string(kind) {
+			found = path
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found == "" {
+		t.Fatalf("no saved %s body to damage for %s/%s", kind, lab, device)
+	}
+	if err := os.WriteFile(found, []byte("not what the digest says"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Current(lab, device, kind); err == nil {
+		t.Fatal("the damaged snapshot still reads back cleanly, so this proves nothing")
+	}
+	return found
+}
+
+// The same stopped container, on the pass that has no record of where it used
+// to be -- which is every device on the first pass after an upgrade.
+//
+// Starting it to read its filesystem is what empties its namespace, and the
+// reading that follows is therefore of a namespace holding none of the saved
+// state and carrying no evidence of ever having held it. That is exactly what
+// a device nothing can vouch for looks like, and the policy for those is to
+// refuse the replacement -- which here would strand every stopped device
+// instead of rebuilding it, for a loss this pass caused deliberately and knows
+// the extent of. The distinction has to be recorded rather than inferred.
+func TestAStoppedContainerStartedToBeReadIsNotAlsoTreatedAsUnaccountedFor(t *testing.T) {
+	engine, top, devices, runtime, store := capturableNamespaceLab(t)
+	replaced := devices[0]
+	// No baseline: nothing has ever recorded which namespace this was in.
+	namespaceSnapshot(t, store, top.Name, replaced, state.KindAddrs,
+		"addr inet port_R1 10.0.0.1/24")
+	for i := range runtime.containers {
+		if runtime.containers[i].Name == replaced.Container {
+			runtime.containers[i].State = rt.StateExited
+		}
+	}
+	runtime.onStart = func(container string) {
+		runtime.setIdentity(container, rt.NetnsIdentity{Dev: 4, Inode: 4026579996})
+		runtime.setContents(container, namespaceProbeOutput(nil, nil))
+	}
+
+	if err := engine.captureBeforeReplace(context.Background(), top, replaced); err != nil {
+		t.Fatalf("a stopped device was stranded rather than rebuilt, because the empty "+
+			"namespace this pass started it into was read as one it could not account "+
+			"for: %v", err)
+	}
+	if !engine.namespaceStateLost(replaced.ID) {
+		t.Error("starting the container emptied its namespace and nothing recorded that, " +
+			"so what the reading proves rests on whether a baseline happened to exist")
+	}
+	if reason, unproven := engine.unprovenNamespaceReason(replaced.ID); unproven {
+		t.Errorf("a loss this pass caused on purpose was filed as an open question: %s", reason)
+	}
+	if _, err := store.Current(top.Name, replaced.ID, state.KindFRR); err != nil {
+		t.Fatalf("starting the container to recover its configuration stopped recovering "+
+			"it: %v", err)
+	}
+	facts := savedFacts(t, store, top.Name, replaced, state.KindAddrs)
+	if !hasFact(facts, "addr inet port_R1 10.0.0.1/24") {
+		t.Fatalf("the empty namespace a stopped container was started into was filed "+
+			"over the student's addressing: %v", facts)
 	}
 }

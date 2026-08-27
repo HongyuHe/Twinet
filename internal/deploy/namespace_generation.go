@@ -129,10 +129,21 @@ func (e *Engine) markNamespaceUnproven(id, reason string) {
 // about any of them -- would refuse to baseline every device it built, and a
 // lab that is deployed once and left alone would never be protected at all.
 func (e *Engine) namespaceUnproven(id string) bool {
-	if _, ok := e.unprovenNamespace.Load(id); !ok {
-		return false
+	_, unproven := e.unprovenNamespaceReason(id)
+	return unproven
+}
+
+// unprovenNamespaceReason is that question and its answer together, so that
+// the exemption above is written once. A caller acting on the doubt rather
+// than only recording it -- a destructive replacement refusing to go ahead, a
+// report to an operator -- has to be able to say what the doubt was.
+func (e *Engine) unprovenNamespaceReason(id string) (string, bool) {
+	value, ok := e.unprovenNamespace.Load(id)
+	if !ok || e.containerCreatedThisPass(id) {
+		return "", false
 	}
-	return !e.containerCreatedThisPass(id)
+	reason, _ := value.(string)
+	return reason, true
 }
 
 // UnprovenNamespaceDevices names the devices this pass could neither baseline
@@ -149,10 +160,12 @@ func (e *Engine) namespaceUnproven(id string) bool {
 // doubt was settled by the deployment rather than left for somebody to chase.
 func (e *Engine) UnprovenNamespaceDevices() map[string]string {
 	out := map[string]string{}
-	e.unprovenNamespace.Range(func(key, value any) bool {
-		id, idOK := key.(string)
-		reason, reasonOK := value.(string)
-		if idOK && reasonOK && !e.containerCreatedThisPass(id) {
+	e.unprovenNamespace.Range(func(key, _ any) bool {
+		id, ok := key.(string)
+		if !ok {
+			return true
+		}
+		if reason, unproven := e.unprovenNamespaceReason(id); unproven {
 			out[id] = reason
 		}
 		return true

@@ -414,6 +414,22 @@ reached students, and each motivated a permanent test.
    an orphan's saved state, because a device the manifest has forgotten has no
    autonomous system left to own it and the store is the only evidence there is.
 
+   Two things followed from putting them behind one funnel and were not there
+   before. A replacement now follows the prune's policy rather than the
+   capture's: a capture that cannot vouch for a namespace withholds what it
+   read and does not fail, which is right when the cost is a deferred backup
+   and wrong when the container is deleted a moment later and the store's copy
+   may be older than the work, unreadable, or absent. A namespace known to have
+   been replaced is not blocked -- repairing those is the point -- and a
+   stopped container started so its filesystem can be read has that loss
+   recorded rather than inferred, so it is rebuilt instead of stranded. And a
+   prune reads the container in front of it: resolving an orphan through the
+   model returned the container the manifest *now* wants, which is the same one
+   in every case this was written for and a different, live one when a manifest
+   renames a device's container or an older container still carries its
+   identifier. That read a device that was never in danger, filed its state as
+   this device's, and deleted the leftover unread.
+
 10. **A release gate that answered yes without looking.** `make ci` printed
     "all CI gates passed" while skipping the lint and the shell check whenever
     their tools were absent, which on the development machine was always.

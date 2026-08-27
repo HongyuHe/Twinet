@@ -1158,6 +1158,20 @@ func (e *Engine) captureBeforeReplace(ctx context.Context, top *model.Topology, 
 			return fmt.Errorf("refusing to replace %s: it is not running and could not be "+
 				"started to read its configuration: %w", d.ID, serr)
 		}
+		// Starting it settles what is in its namespace, rather than leaving it
+		// a question. A task takes its network namespace with it when it dies,
+		// so a container that was stopped a moment ago is started into a new
+		// and empty one, and what was in the old one is gone -- known to be
+		// gone, by this pass, for a reason this pass caused.
+		//
+		// Saying so explicitly is what keeps the two apart. Without it the
+		// reading below is of a namespace holding none of the student's saved
+		// state and carrying no record of ever having held it, which is
+		// indistinguishable from a device nothing can vouch for -- and the
+		// policy for those is to refuse the replacement, which would strand
+		// every stopped device instead of rebuilding it. The saved state is
+		// intact, untouched, and is what the replacement replays.
+		e.markNamespaceStateLost(d.ID)
 		err = e.limited(ctx, []limiter.Kind{limiter.Capture}, func() error {
 			var captureErr error
 			snaps, captureErr = Capture(ctx, e.Runtime, d, top.Name, top.Hash)
@@ -1186,6 +1200,29 @@ func (e *Engine) captureBeforeReplace(ctx context.Context, top *model.Topology, 
 		[]*model.Device{d}, [][]state.Snapshot{snaps}, false); len(problems) > 0 {
 		return fmt.Errorf("refusing to replace %s: its configuration could not be saved: %s",
 			d.ID, strings.Join(problems, "; "))
+	}
+	// And then the same policy a prune follows, because this is the same kind
+	// of boundary.
+	//
+	// A capture that cannot vouch for a namespace withholds what it read and
+	// does not fail, which is right for a capture: skipping one doubtful
+	// snapshot costs a deferred backup of state the store already holds. It is
+	// not right here. The container is destroyed a moment after this returns,
+	// and it is the last object that could answer the question -- whether what
+	// is in it is a term's work this pass declined to save, or an empty room.
+	// Going ahead settles it by deleting the evidence and then replaying
+	// whatever the store happens to hold, which may be older than the work
+	// that was in there, or unreadable, or absent.
+	//
+	// A namespace known to have been replaced is not this, and is not blocked.
+	// There what is in it demonstrably is not the student's work, the saved
+	// copy is intact and was left alone, and the replacement is precisely the
+	// thing that puts it back.
+	if reason, unproven := e.unprovenNamespaceReason(d.ID); unproven {
+		return fmt.Errorf("refusing to replace %s: what is in its network namespace could "+
+			"not be established (%s), so it was not saved over the state already held for "+
+			"it and the container holding it has been left alone. Its configuration was "+
+			"kept. Destroy the lab explicitly if it is genuinely disposable", d.ID, reason)
 	}
 	return nil
 }
@@ -1342,8 +1379,9 @@ func (e *Engine) PruneOrphans(ctx context.Context, top *model.Topology) ([]strin
 	// capture, the safety check that decides what may be stored, and the
 	// refusal that may follow are all talking about the same device.
 	targets := make([]*model.Device, len(candidates))
+	duplicates := make([]bool, len(candidates))
 	for i, c := range candidates {
-		targets[i] = e.orphanDevice(top, c)
+		targets[i], duplicates[i] = e.orphanDevice(top, c)
 	}
 	captures := make([][]state.Snapshot, len(candidates))
 	_, captureErrs, ctxErr := e.runBounded(ctx, len(candidates), func(i int) error {
@@ -1369,6 +1407,16 @@ func (e *Engine) PruneOrphans(ctx context.Context, top *model.Topology) ([]strin
 	)
 	for i := range candidates {
 		if targets[i] == nil || len(captures[i]) == 0 {
+			continue
+		}
+		// A container that is not the one the manifest gives this device does
+		// not get to write the device's saved state. There is one slot in the
+		// store per device, the container the manifest names is the authority
+		// for it, and that container is on this node and was captured by the
+		// ordinary path a moment ago. Filing a leftover's reading there would
+		// replace an authoritative record with a dead one -- which is not the
+		// namespace hazard, it is the whole snapshot.
+		if duplicates[i] {
 			continue
 		}
 		writable = append(writable, targets[i])
@@ -1443,26 +1491,27 @@ func (e *Engine) PruneOrphans(ctx context.Context, top *model.Topology) ([]strin
 }
 
 // orphanDevice names the device a prune candidate is, or nil if there is
-// nothing about it worth reading.
+// nothing about it worth reading. The second result says the candidate is not
+// the container the manifest gives that device on this node.
 //
 // Resolving it separately from the capture is what lets the safety check, the
 // store write and any refusal all speak about one device. It is also the only
 // description of the device there is: an orphan is usually gone from the
 // manifest, so the model cannot be asked.
-func (e *Engine) orphanDevice(top *model.Topology, c runtime.Container) *model.Device {
+func (e *Engine) orphanDevice(top *model.Topology, c runtime.Container) (*model.Device, bool) {
 	if c.Labels[LabelFRRControl] == "true" {
 		// The sidecar has only the router's shared config/vty mounts. The
 		// student-owned snapshot belongs to the shell container, and capturing
 		// the sidecar would duplicate or race that state.
-		return nil
+		return nil, false
 	}
 	if e.State == nil {
-		return nil
+		return nil, false
 	}
 	// Nothing is captured while the reference solution is what is on the
 	// device: the snapshot would be the answer filed as the student's work.
 	if e.WritesReference {
-		return nil
+		return nil, false
 	}
 	// The device is gone from the topology, so its identity comes from the
 	// labels the deployment stamped on it.
@@ -1477,10 +1526,28 @@ func (e *Engine) orphanDevice(top *model.Topology, c runtime.Container) *model.D
 		id = c.Labels[LabelDevice]
 	}
 	if id == "" {
-		return nil
+		return nil, false
 	}
-	d, ok := top.Device(id)
-	if !ok {
+	modelled, known := top.Device(id)
+	var d *model.Device
+	duplicate := false
+	if known {
+		// On a copy, always. The manifest's device is shared with every other
+		// reader of the topology, and what follows rewrites part of it.
+		clone := *modelled
+		d = &clone
+		// The container in front of us, not the one the manifest now wants.
+		//
+		// They are the same container in the case this is written for -- a
+		// device that moved to another node keeps its name -- and they are not
+		// when a manifest renames a device's container, or when an older one
+		// is still running under the same identifier. Reading the modelled
+		// container then read a different, live container, stored *its*
+		// namespace and configuration as this device's, and deleted the
+		// candidate without ever having looked inside it.
+		d.Container = c.Name
+		duplicate = modelled.Node == e.Node && modelled.Container != c.Name
+	} else {
 		// Not in the manifest any more, which is exactly why it is an orphan.
 		// A minimal stand-in is enough for the capture, which reads the
 		// container rather than the model, and enough for the safety check,
@@ -1488,14 +1555,9 @@ func (e *Engine) orphanDevice(top *model.Topology, c runtime.Container) *model.D
 		d = &model.Device{ID: id, Container: c.Name, Kind: model.DeviceKind(c.Labels[LabelKind])}
 	}
 	if d.Kind == "" {
-		// On a copy: a device the manifest still describes is shared with
-		// every other reader of the topology, and a prune has no business
-		// rewriting what it is.
-		clone := *d
-		clone.Kind = model.KindRouter
-		d = &clone
+		d.Kind = model.KindRouter
 	}
-	return d
+	return d, duplicate
 }
 
 // PruneOverlays removes stale VNI bindings and any now-empty shared
