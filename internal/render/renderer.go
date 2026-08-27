@@ -382,26 +382,29 @@ func (r *Renderer) routerCommands(d *model.Device) []deploy.Command {
 			Describe: "configure loopback",
 		})
 	}
-	if r.modeFor(d) == ModeSolve {
-		var addresses []string
-		for _, iface := range d.Ifaces {
-			if iface.Name == "lo" || iface.Addr4 == "" && iface.Addr6 == "" {
-				continue
-			}
-			addresses = append(addresses, "ip link set dev "+iface.Name+" up")
-			if iface.Addr4 != "" {
-				addresses = append(addresses, "ip addr replace "+iface.Addr4+" dev "+iface.Name)
-			}
-			if iface.Addr6 != "" {
-				addresses = append(addresses, "ip -6 addr replace "+iface.Addr6+" dev "+iface.Name)
-			}
+	var addresses []string
+	for _, iface := range d.Ifaces {
+		if iface.Name == "lo" || iface.Addr4 == "" && iface.Addr6 == "" ||
+			iface.Owner != model.OwnerPlatform && r.modeFor(d) != ModeSolve {
+			continue
 		}
-		if len(addresses) > 0 {
-			cmds = append(cmds, deploy.Command{
-				Args:     []string{"sh", "-c", strings.Join(addresses, "\n")},
-				Describe: "configure solved interface addresses",
-			})
+		addresses = append(addresses, "ip link set dev "+iface.Name+" up")
+		if iface.Addr4 != "" {
+			addresses = append(addresses, "ip addr replace "+iface.Addr4+" dev "+iface.Name)
 		}
+		if iface.Addr6 != "" {
+			addresses = append(addresses, "ip -6 addr replace "+iface.Addr6+" dev "+iface.Name)
+		}
+	}
+	if len(addresses) > 0 {
+		describe := "configure platform-owned interface addresses"
+		if r.modeFor(d) == ModeSolve {
+			describe = "configure solved interface addresses"
+		}
+		cmds = append(cmds, deploy.Command{
+			Args:     []string{"sh", "-c", strings.Join(addresses, "\n")},
+			Describe: describe,
+		})
 	}
 	return cmds
 }
