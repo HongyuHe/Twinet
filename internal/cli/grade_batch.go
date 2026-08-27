@@ -855,13 +855,17 @@ func harnessDeployWorkers(devices int) int {
 }
 
 func destroyLab(ctx context.Context, c *client.Cluster, h *model.Topology) error {
+	return destroyLabHeld(ctx, c, h, "")
+}
+
+func destroyLabHeld(ctx context.Context, c *client.Cluster, h *model.Topology, hold string) error {
 	vnis := make([]uint32, 0, len(h.Links))
 	for _, l := range h.Links {
 		if l.VNI != 0 {
 			vnis = append(vnis, l.VNI)
 		}
 	}
-	results := c.DestroyEphemeral(ctx, h.Name, vnis)
+	results := c.DestroyEphemeralHeld(ctx, h.Name, vnis, hold)
 	for _, r := range results {
 		if r.Err != nil {
 			return r.Err

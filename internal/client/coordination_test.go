@@ -35,6 +35,7 @@ type coordinationStub struct {
 	// every node has acknowledged commit.
 	failFinalize  bool
 	staleRecovery bool
+	destroyHold   string
 	// failApply breaks a stage that runs before any node commits.
 	failApply bool
 	// unproven is what this node's forward apply reports it could not vouch
@@ -175,6 +176,7 @@ func (s *coordinationStub) handler(w http.ResponseWriter, r *http.Request) {
 		}
 		delete(s.generations, req.Lab)
 		delete(s.prepared, req.Lab)
+		s.destroyHold = req.Hold
 		s.mu.Unlock()
 		write(agent.DestroyResponse{Status: "destroyed", Lab: req.Lab})
 	case "/v1/apply":
@@ -419,6 +421,24 @@ func TestCoordinatedDestroyAllowsCleanRedeploy(t *testing.T) {
 		if generation != "redeployed" || calls != 2 {
 			t.Fatalf("%s redeploy state = generation %q apply calls %d", stub.name, generation, calls)
 		}
+	}
+}
+
+func TestEphemeralDestroyPresentsItsGradingHold(t *testing.T) {
+	stub := newCoordinationStub("node-0", nil)
+	node, closeNode := stubNode("node-0", stub)
+	defer closeNode()
+	cluster := &Cluster{Nodes: []*Node{node}}
+
+	results := cluster.DestroyEphemeralHeld(t.Context(), "harness", nil, "hold-token")
+	if len(results) != 1 || results[0].Err != nil {
+		t.Fatalf("held ephemeral destroy = %+v", results)
+	}
+	stub.mu.Lock()
+	hold := stub.destroyHold
+	stub.mu.Unlock()
+	if hold != "hold-token" {
+		t.Fatalf("destroy hold = %q, want the grading owner's token", hold)
 	}
 }
 

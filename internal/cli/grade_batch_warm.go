@@ -281,7 +281,11 @@ func (w *warmBatchHarness) Destroy(ctx context.Context) error {
 		if w.heartbeat != nil {
 			w.heartbeat.Stop()
 		}
-		w.destroyErr = destroyLab(ctx, w.c, w.top)
+		hold := ""
+		if w.hold != nil {
+			hold = w.hold.token
+		}
+		w.destroyErr = destroyLabHeld(ctx, w.c, w.top, hold)
 		if w.hold != nil {
 			w.hold.Release()
 		}

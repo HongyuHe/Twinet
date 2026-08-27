@@ -776,7 +776,7 @@ func mutationFailure[T any](nodes []*Node, values map[string]T, cause error) []N
 }
 
 func (c *Cluster) coordinatedDestroy(ctx context.Context, lab string, vnis []uint32,
-	ephemeral, force bool,
+	ephemeral, force bool, hold string,
 ) []NodeResult[struct{}] {
 	ctx = operationContext(ctx)
 	nodes := c.sortedNodes()
@@ -805,7 +805,7 @@ func (c *Cluster) coordinatedDestroy(ctx context.Context, lab string, vnis []uin
 			return struct{}{}, fmt.Errorf("no mutation fence for node %s", node.Name)
 		}
 		return struct{}{}, node.destroy(ctx, agent.DestroyRequest{
-			Lab: lab, VNIs: vnis, Ephemeral: ephemeral, Force: force, Fence: fence,
+			Lab: lab, VNIs: vnis, Ephemeral: ephemeral, Force: force, Hold: hold, Fence: fence,
 			WorkItems: workItems[node.Name],
 		})
 	})

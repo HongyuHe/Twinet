@@ -1335,19 +1335,29 @@ func short(id string) string {
 
 // Destroy removes the lab from every node.
 func (c *Cluster) Destroy(ctx context.Context, lab string, vnis []uint32) []NodeResult[struct{}] {
-	return c.coordinatedDestroy(ctx, lab, vnis, false, false)
+	return c.coordinatedDestroy(ctx, lab, vnis, false, false, "")
 }
 
 // DestroyForce removes an orphaned lab under the normal cluster mutation
 // fence, but deliberately skips state capture.
 func (c *Cluster) DestroyForce(ctx context.Context, lab string, vnis []uint32) []NodeResult[struct{}] {
-	return c.coordinatedDestroy(ctx, lab, vnis, false, true)
+	return c.coordinatedDestroy(ctx, lab, vnis, false, true, "")
 }
 
 // DestroyEphemeral removes a disposable lab from every node and discards its
 // saved state, so a lab of the same name later starts from the manifest.
 func (c *Cluster) DestroyEphemeral(ctx context.Context, lab string, vnis []uint32) []NodeResult[struct{}] {
-	return c.coordinatedDestroy(ctx, lab, vnis, true, true)
+	return c.coordinatedDestroy(ctx, lab, vnis, true, true, "")
+}
+
+// DestroyEphemeralHeld removes a disposable lab while presenting the grading
+// hold that protects it. The hold remains active throughout fenced teardown,
+// so reconciliation cannot race cleanup and the owner is not refused by its
+// own lease.
+func (c *Cluster) DestroyEphemeralHeld(ctx context.Context, lab string, vnis []uint32,
+	hold string,
+) []NodeResult[struct{}] {
+	return c.coordinatedDestroy(ctx, lab, vnis, true, true, hold)
 }
 
 // Hold asks every node to leave a lab alone. Failures are returned per node so
