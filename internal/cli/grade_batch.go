@@ -1278,6 +1278,7 @@ func wipeDeviceState(ctx context.Context, exec execFn, d *model.Device) error {
 		// A switch's VLAN assignments are a submitted answer too.
 		`if command -v ovs-vsctl >/dev/null 2>&1; then ` +
 			`for b in $(ovs-vsctl list-br 2>/dev/null); do ` +
+			`ovs-vsctl del-fail-mode "$b" 2>/dev/null; ` +
 			`for p in $(ovs-vsctl list-ports "$b" 2>/dev/null); do ` +
 			`ovs-vsctl clear port "$p" tag 2>/dev/null; ` +
 			`ovs-vsctl clear port "$p" trunks 2>/dev/null; ` +

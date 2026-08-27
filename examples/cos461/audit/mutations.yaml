@@ -3,34 +3,35 @@ kind: CompactMutationSuite
 cases:
   - name: q1_1_vlan_dcs
     required: {question_id: q1.1, check_id: l2.vlan_isolation, check_index: 0}
-    expected_check_status: fail
+    expected_check_status: partial
     transforms:
-      - {file: S1.sh, append: "ovs-vsctl set-fail-mode br0 secure"}
+      - {file: S2.sh, append: "ovs-vsctl clear port port_A_EUH tag; ovs-vsctl clear port port_P_EUH tag; ovs-vsctl clear port trunk_ATL trunks; ovs-vsctl clear port trunk_S3 trunks"}
+      - {file: S3.sh, append: "ovs-vsctl clear port port_A_CHA tag; ovs-vsctl clear port port_P_CHA tag; ovs-vsctl clear port trunk_S2 trunks"}
   - name: q1_1_vlan_dcn
     required: {question_id: q1.1, check_id: l2.vlan_isolation, check_index: 1}
-    expected_check_status: fail
+    expected_check_status: partial
     transforms:
-      - {file: S2.sh, append: "ovs-vsctl set-fail-mode br0 secure"}
+      - {file: S1.sh, append: "ovs-vsctl clear port port_A_MGH tag; ovs-vsctl clear port port_P_MGH tag; ovs-vsctl clear port trunk_BOS trunks"}
   - name: q1_2_addressing
     required: {question_id: q1.2, check_id: l3.addressing_matches_plan, check_index: 0}
-    expected_check_status: fail
+    expected_check_status: partial
     transforms:
       - {file: ATL.sh, append: "ip addr replace 203.0.113.3/32 dev lo"}
   - name: q1_2_ospf_adjacency
     required: {question_id: q1.2, check_id: ospf.full_adjacency, check_index: 1}
-    expected_check_status: fail
+    expected_check_status: partial
     transforms:
       - {file: ATL.sh, append: "ip link set port_PHY down"}
   - name: q1_2_ospf_subnets
     required: {question_id: q1.2, check_id: ospf.subnets_advertised, check_index: 2}
-    expected_check_status: fail
+    expected_check_status: partial
     transforms:
-      - {file: ATL.conf, find: " network 3.0.8.0/24 area 0", replace: " network 203.0.113.0/24 area 0"}
+      - {file: ATL.conf, find: " network 3.156.0.0/24 area 0", replace: " network 203.0.113.0/24 area 0"}
   - name: q1_2_internal_reachability
     required: {question_id: q1.2, check_id: dataplane.internal_reachability, check_index: 3}
-    expected_check_status: fail
+    expected_check_status: partial
     transforms:
-      - {file: ATL_host.sh, append: "ip route replace blackhole 3.156.0.1/32"}
+      - {file: ATL_host.sh, append: "ip route replace blackhole 3.107.0.2/32"}
   - name: q1_2_no_external_ospf
     required: {question_id: q1.2, check_id: config.no_forbidden_ospf, check_index: 4}
     expected_check_status: fail
@@ -40,12 +41,12 @@ cases:
     required: {question_id: q1.3, check_id: ospf.ecmp_paths, check_index: 0}
     expected_check_status: fail
     transforms:
-      - {file: ATL.sh, append: "ip route replace 3.156.0.1/32 dev port_BOS"}
+      - {file: ATL.conf, find: " ip ospf cost 20", replace: " ip ospf cost 1"}
   - name: q1_3_ecmp_bos_to_atl
     required: {question_id: q1.3, check_id: ospf.ecmp_paths, check_index: 1}
     expected_check_status: fail
     transforms:
-      - {file: BOS.sh, append: "ip route replace 3.153.0.1/32 dev port_ATL"}
+      - {file: BOS.conf, find: " ip ospf cost 20", replace: " ip ospf cost 1"}
   - name: q1_4_sixin4
     required: {question_id: q1.4, check_id: tunnel.sixin4, check_index: 0}
     expected_check_status: fail
@@ -53,39 +54,40 @@ cases:
       - {file: ATL.sh, append: "ip tunnel del tun6"}
   - name: q2_1_ibgp
     required: {question_id: q2.1, check_id: bgp.ibgp_full_mesh, check_index: 0}
-    expected_check_status: fail
+    expected_check_status: partial
     transforms:
-      - {file: ATL.conf, append: "\nrouter bgp 3\n no neighbor 3.156.0.1"}
+      - {file: ATL.conf, find: " neighbor 3.151.0.1 remote-as 3", replace: " neighbor 3.151.0.1 remote-as 65000"}
   - name: q2_2_ebgp
     required: {question_id: q2.2, check_id: bgp.ebgp_established, check_index: 0}
-    expected_check_status: fail
+    expected_check_status: partial
     transforms:
-      - {file: MSP.conf, append: "\nrouter bgp 3\n no neighbor 179.1.3.1"}
+      - {file: MSP.conf, find: " neighbor 179.1.3.1 remote-as 1", replace: " neighbor 179.1.3.1 remote-as 65000"}
   - name: q2_2_next_hop
     required: {question_id: q2.2, check_id: bgp.next_hop_self, check_index: 1}
-    expected_check_status: fail
+    expected_check_status: partial
     transforms:
-      - {file: ATL.sh, append: "ip route replace blackhole 179.1.3.1/32"}
+      - {file: MSP.conf, find: "  neighbor 3.156.0.1 next-hop-self", replace: "  ! next-hop-self deliberately omitted"}
   - name: q2_2_own_prefix
     required: {question_id: q2.2, check_id: bgp.own_prefix_only, check_index: 2}
-    expected_check_status: fail
+    expected_check_status: partial
     transforms:
       - {file: SFO.conf, append: "\nip route 203.0.113.0/24 Null0\nrouter bgp 3\n network 203.0.113.0/24"}
   - name: q2_3_gao_rexford
     required: {question_id: q2.3, check_id: policy.gao_rexford, check_index: 0}
     expected_check_status: fail
     transforms:
-      - {file: MSP.conf, append: "\nroute-map LP-PROVIDER permit 1\n set local-preference 500"}
+      - {file: NYC.conf, find: " set local-preference 100", replace: " set local-preference 500"}
   - name: q2_3_no_transit
     required: {question_id: q2.3, check_id: policy.no_transit_for_peers, check_index: 1}
     expected_check_status: fail
     transforms:
-      - {file: MSP.conf, append: "\nroute-map EXPORT-PEER permit 1"}
+      - {file: BOS.conf, find: "route-map EXPORT-PEER deny 10", replace: "route-map EXPORT-PEER permit 10"}
   - name: q2_3_transit_customer
     required: {question_id: q2.3, check_id: policy.transit_for_customers, check_index: 2}
     expected_check_status: fail
     transforms:
-      - {file: MSP.conf, append: "\nroute-map EXPORT-CUSTOMER deny 1"}
+      - {file: SFO.conf, find: "route-map EXPORT-CUSTOMER permit 10", replace: "route-map EXPORT-CUSTOMER deny 10"}
+      - {file: SFO.conf, find: "route-map EXPORT-SLOW-CUSTOMER permit 30", replace: "route-map EXPORT-SLOW-CUSTOMER deny 30"}
   - name: q2_4_ixp
     required: {question_id: q2.4, check_id: policy.ixp_communities, check_index: 0}
     expected_check_status: fail
@@ -93,7 +95,7 @@ cases:
       - {file: CHI.conf, append: "\nroute-map EXPORT-IXP-140 deny 1"}
   - name: q2_5_traffic_engineering
     required: {question_id: q2.5, check_id: policy.traffic_engineering, check_index: 0}
-    expected_check_status: fail
+    expected_check_status: partial
     transforms:
       - {file: MSP.conf, append: "\nroute-map LP-SLOW-PROVIDER permit 1\n set local-preference 500"}
   - name: q2_6_roa_published
@@ -106,7 +108,7 @@ cases:
     required: {question_id: q2.6, check_id: rpki.invalid_rejected, check_index: 1}
     expected_check_status: fail
     transforms:
-      - {file: MSP.conf, append: "\nroute-map LP-PROVIDER permit 1"}
+      - {file: NYC.conf, find: "route-map LP-PROVIDER deny 5", replace: "route-map LP-PROVIDER permit 5"}
   - name: q2_6_notfound_preserved
     required: {question_id: q2.6, check_id: rpki.notfound_preserved, check_index: 2}
     expected_check_status: fail

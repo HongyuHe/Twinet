@@ -114,7 +114,7 @@ func WaitRIBStable(ctx context.Context, env *Env, timeout time.Duration) error {
 		Describe:  fmt.Sprintf("the BGP table of AS %d to stop changing", env.AS),
 		Interval:  700 * time.Millisecond,
 		Timeout:   timeout,
-		StableFor: 3,
+		StableFor: 8,
 		Check: func(ctx context.Context) (bool, error) {
 			fp, n, err := ribFingerprint(ctx, env)
 			if err != nil {
@@ -137,12 +137,10 @@ func WaitRIBStable(ctx context.Context, env *Env, timeout time.Duration) error {
 func ribFingerprint(ctx context.Context, env *Env) (string, int, error) {
 	h := sha256.New()
 	total := 0
-	var lastErr error
 	for _, r := range env.Routers() {
 		tbl, err := bgpTable(ctx, env, r.Name)
 		if err != nil {
-			lastErr = err
-			continue
+			return "", 0, fmt.Errorf("%s BGP table: %w", r.Name, err)
 		}
 		table := tbl.Table()
 		prefixes := make([]string, 0, len(table))
@@ -163,9 +161,6 @@ func ribFingerprint(ctx context.Context, env *Env) (string, int, error) {
 			}
 			h.Write([]byte("|"))
 		}
-	}
-	if total == 0 && lastErr != nil {
-		return "", 0, lastErr
 	}
 	return hex.EncodeToString(h.Sum(nil))[:16], total, nil
 }
@@ -461,34 +456,85 @@ func (w *transportWatch) failure() error {
 	return w.first
 }
 
+// WaitControlPlaneStable waits for the observable OSPF/BGP state to stop
+// changing, whether the settled answer is healthy or wrong. Requiring every
+// session to become healthy makes an intentionally broken submission spend the
+// whole timeout before the checks can grade it. A stable wrong state is a mark;
+// a changing state is not.
+func WaitControlPlaneStable(ctx context.Context, env *Env, timeout time.Duration) error {
+	var last string
+	return plan.Wait(ctx, plan.Waiter{
+		Describe:  fmt.Sprintf("the control plane of AS %d to stop changing", env.AS),
+		Interval:  700 * time.Millisecond,
+		Timeout:   timeout,
+		StableFor: 8,
+		Check: func(ctx context.Context) (bool, error) {
+			fingerprint, routers, err := controlPlaneFingerprint(ctx, env)
+			if err != nil {
+				return false, err
+			}
+			if routers == 0 {
+				return true, nil
+			}
+			stable := fingerprint == last
+			last = fingerprint
+			if !stable {
+				return false, fmt.Errorf("the control plane is still changing across %d router(s)", routers)
+			}
+			return true, nil
+		},
+	})
+}
+
+func controlPlaneFingerprint(ctx context.Context, env *Env) (string, int, error) {
+	h := sha256.New()
+	routers := env.Routers()
+	for _, router := range routers {
+		state, err := env.RouterState(ctx, router.Name,
+			netstate.QueryOSPF|netstate.QueryBGPSessions|netstate.QueryBGPRIB)
+		if err != nil {
+			return "", 0, fmt.Errorf("%s control-plane state: %w", router.ID, err)
+		}
+		state.Sort()
+		fmt.Fprintf(h, "%s|", router.ID)
+		for _, peer := range state.OSPF {
+			fmt.Fprintf(h, "o:%s:%s:%s:%s|",
+				peer.RouterID, peer.Address, peer.Interface, peer.State)
+		}
+		for _, session := range state.BGP.Sessions {
+			fmt.Fprintf(h, "s:%s:%d:%s:%d:%d|",
+				session.Neighbor, session.RemoteAS, session.State,
+				session.PrefixesIn, session.PrefixesOut)
+		}
+		for _, path := range state.BGP.Paths {
+			fmt.Fprintf(h, "p:%s:%s:%t:%t:%d:%s:%s:%s|",
+				path.Prefix, path.ASPath, path.Best, path.Valid, path.LocalPref,
+				path.Origin, path.Peer, path.RPKI)
+			for _, nextHop := range path.NextHops {
+				fmt.Fprintf(h, "n:%s:%s:%d|", nextHop.Address, nextHop.Device, nextHop.Weight)
+			}
+			communities := append([]string(nil), path.Communities...)
+			sort.Strings(communities)
+			fmt.Fprintf(h, "c:%s|", strings.Join(communities, ","))
+		}
+	}
+	return hex.EncodeToString(h.Sum(nil))[:16], len(routers), nil
+}
+
 // WaitConverged waits for the whole control plane of the AS to settle.
 func WaitConverged(ctx context.Context, env *Env, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
-	remaining := func() time.Duration {
-		d := time.Until(deadline)
-		if d < 15*time.Second {
-			// A phase given a second or two cannot finish, and its probe is
-			// cancelled mid-flight, so the report blames whichever router was
-			// being asked rather than saying the lab did not converge. A floor
-			// large enough to complete one poll keeps the message honest.
-			return 15 * time.Second
-		}
-		return d
-	}
-	// OSPF first: BGP next hops cannot resolve until the interior is up, so
-	// waiting on BGP before OSPF would just time out with a confusing message.
-	if err := WaitOSPF(ctx, env, remaining()); err != nil {
+	if err := WaitControlPlaneStable(ctx, env, timeout); err != nil {
 		return err
 	}
-	// Label distribution is part of the interior too, and a lab that does not
-	// run it passes straight through.
-	if err := WaitLDP(ctx, env, remaining()); err != nil {
-		return err
+	// Label distribution is not represented by the routing protocol snapshot.
+	// Labs without MPLS pass straight through; MPLS labs retain their explicit
+	// operational adjacency gate.
+	remaining := time.Until(deadline)
+	if remaining < 15*time.Second {
+		remaining = 15 * time.Second
 	}
-	if err := WaitBGPSessions(ctx, env, remaining()); err != nil {
-		return err
-	}
-	return WaitRIBStable(ctx, env, remaining())
+	return WaitLDP(ctx, env, remaining)
 }
 
 func truncate(v []string, n int) []string {

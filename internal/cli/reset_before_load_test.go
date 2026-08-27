@@ -169,5 +169,8 @@ func TestThePreviousSubmissionsTunnelsAndRoutesAreRemoved(t *testing.T) {
 					"is still installed when the next one is loaded", d.ID, want)
 			}
 		}
+		if d.Kind == model.KindSwitch && !strings.Contains(all, "del-fail-mode") {
+			t.Errorf("%s: the reset leaves a previous submission's OVS fail mode in place", d.ID)
+		}
 	}
 }

@@ -63,14 +63,14 @@ func TestCOSFixtureTransformsMatchReferenceEquivalentContent(t *testing.T) {
 		byName[mutation.Name] = mutation
 	}
 	sub := submission{
-		Files:   map[string]string{"ATL": "router ospf\n network 3.0.8.0/24 area 0\n"},
+		Files:   map[string]string{"ATL": "router ospf\n network 3.156.0.0/24 area 0\n"},
 		ROAs:    []byte("[\n  {\"prefix\": \"3.0.0.0/8\", \"maxLength\": 8, \"asn\": 3}\n]\n"),
 		Scripts: map[string]string{},
 	}
 	if err := applyMutationCase(&sub, byName["q1_2_ospf_subnets"]); err != nil {
 		t.Fatalf("OSPF fixture did not apply to reference-equivalent content: %v", err)
 	}
-	if strings.Contains(sub.Files["ATL"], "network 3.0.8.0/24 area 0") {
+	if strings.Contains(sub.Files["ATL"], "network 3.156.0.0/24 area 0") {
 		t.Fatal("OSPF fixture left original network in place")
 	}
 	if err := applyMutationCase(&sub, byName["q2_6_roa_published"]); err != nil {
