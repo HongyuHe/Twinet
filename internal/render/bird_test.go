@@ -59,6 +59,69 @@ func TestBirdRendererUsesBirdPaths(t *testing.T) {
 	}
 }
 
+func TestBirdStudentHarnessHasAProviderBaselineBeforeSubmissionLoad(t *testing.T) {
+	student := &model.Device{
+		ID: "as3/ATL", Name: "ATL", Kind: model.KindRouter, ASN: 3, NOS: "bird", RouterID: 1,
+	}
+	peer := &model.Device{
+		ID: "as3/CHI", Name: "CHI", Kind: model.KindRouter, ASN: 3, NOS: "bird", RouterID: 2,
+	}
+	link := &model.Link{}
+	studentIface := &model.Iface{
+		Device: student, Name: "port_CHI", Role: model.RoleIntraAS,
+		Addr4: "3.0.1.1/24", Link: link,
+	}
+	peerIface := &model.Iface{
+		Device: peer, Name: "port_ATL", Role: model.RoleIntraAS,
+		Addr4: "3.0.1.2/24", Link: link,
+	}
+	studentIface.Peer, peerIface.Peer = peerIface, studentIface
+	link.A, link.B = studentIface, peerIface
+	student.Ifaces = []*model.Iface{
+		{Device: student, Name: "lo", Addr4: "3.151.0.1/24"},
+		studentIface,
+	}
+	peer.Ifaces = []*model.Iface{
+		{Device: peer, Name: "lo", Addr4: "3.152.0.1/24"},
+		peerIface,
+	}
+	topology := &model.Topology{
+		Devices: map[string]*model.Device{student.ID: student, peer.ID: peer},
+		ASes: map[int]*model.AS{
+			3: {
+				ASN: 3, Role: model.RoleStudent, Block: "3.0.0.0/8",
+				Routers: []*model.Device{student, peer},
+			},
+		},
+	}
+
+	files, err := NewHarness(topology, 3).Files(student)
+	if err != nil {
+		t.Fatalf("render platform BIRD baseline for an ungraded student AS: %v", err)
+	}
+	baseline := string(files["/etc/bird/bird.conf"].Content)
+	for _, want := range []string{
+		"router id 3.151.0.1", "protocol device", "protocol kernel kernel4",
+	} {
+		if !strings.Contains(baseline, want) {
+			t.Fatalf("platform BIRD baseline is missing %q:\n%s", want, baseline)
+		}
+	}
+	for _, answer := range []string{"protocol ospf", "protocol bgp", "route 3.0.0.0/8"} {
+		if strings.Contains(baseline, answer) {
+			t.Fatalf("platform BIRD baseline leaks student answer %q:\n%s", answer, baseline)
+		}
+	}
+
+	solved, err := New(topology, ModeSolve).Files(student)
+	if err != nil {
+		t.Fatalf("render solved BIRD student AS: %v", err)
+	}
+	if body := string(solved["/etc/bird/bird.conf"].Content); !strings.Contains(body, "protocol ospf") {
+		t.Fatalf("solved BIRD configuration omitted the student answer:\n%s", body)
+	}
+}
+
 func TestBirdRendererOriginsDeclaredInvalidPrefixAndSlowPolicy(t *testing.T) {
 	bird := &model.Device{ID: "as1/ALL", Name: "ALL", Kind: model.KindRouter, ASN: 1, NOS: "bird", RouterID: 1}
 	peer := &model.Device{ID: "as3/EDGE", Name: "EDGE", Kind: model.KindRouter, ASN: 3, RouterID: 1}
