@@ -16,11 +16,11 @@
 | M3 — cluster fabric | Source-verified and measured in part | HTTP+mTLS agents, fenced coordination, shared overlays, and placement exist; named cluster observations are in 09 |
 | M4 — operations | Partly shipped | Holds, repair, events, persistence, and fencing exist; minimal desired/observed reconciliation is not claimed complete |
 | M5 — grading | Source-verified and measured in part | Rubrics, checks, class/batch modes, and reports exist; throughput claims remain qualified measurements |
-| M6 — scale validation | Measured target not met | The recorded class-scale deployment is evidence, not completion of the original target |
+| M6 — scale validation | Deployment target met; grading/soak open | Four 2,020-device runs met the ten-minute deploy+convergence target; the 100-submission and 24-hour gates remain open |
 | M7 — course parity | Partly shipped | Advanced MPLS/VRF and multicast examples exist; no blanket course-parity acceptance is claimed |
 | M8 — fault/RCA | Separately maintained | See [10](10_fault_injection.md); do not infer its live acceptance from this roadmap |
-| M9 — heterogeneous NOS | Source-verified in part | FRR/BIRD providers, capability validation, and provider-owned configuration capture/load, state commands and route refresh exist, so a student AS may run either; broad mixed-vendor live acceptance, and any live student-AS BIRD grade, are not claimed |
-| M10 — generated interiors | Source-verified in part | The registered interior generators exist; full live-cluster acceptance remains unmeasured |
+| M9 — heterogeneous NOS | Source-verified and measured | FRR students grade against BIRD staff transit at 10/10; a five-router student-owned BIRD AS passed signed save, deliberate break, restore, and full private batch regrade |
+| M10 — generated interiors | Source-verified and measured | Explicit/ring/two-tier/Clos are registered; the shipped Clos deployed across three nodes, formed all 12 adjacencies, graded 1/1, and re-adopted its exact split placement |
 
 ## Open acceptance work
 
@@ -32,9 +32,9 @@ authoritative list. In particular, a source capability must not silently become
 
 <!-- benchmark: target -->
 The original plan set targets for a class-scale deployment, class-sized grading,
-soak duration, and broad course parity. They remain **targets**, not achieved
-performance claims. The measured class-scale run is explicitly recorded as
-above the original deployment target in
+soak duration, and broad course parity. The deployment target is now measured
+as met; grading throughput, soak, and broad course parity remain targets rather
+than achieved performance claims. Exact runs are recorded in
 [09 — Measurements](09_status.md#measurements).
 
 <!-- benchmark: target -->

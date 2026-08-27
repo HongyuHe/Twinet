@@ -116,26 +116,29 @@ The executable list is intentionally generated from the current tree rather
 than summarized as “two binaries.” The source facts are not a live acceptance
 claim.
 
-## Current three-node acceptance (2026-08-26)
+## Current three-node acceptance (2026-08-26 through 2026-08-27)
 
 Fresh Claude Opus 5 review round 1 rebuilt the source and independently
 deployed it on node-0/node-1/node-2. Its initial verdict was `FAIL`; the
 remediation evidence below is from the same 56-core, 251 GiB-per-node,
-containerd 2.3.3 cluster. Runtime source was `b86517a`; later commits through
-`3d573eb` change tests, bundled placement, documentation, and release locks,
-not the measured runtime path.
+containerd 2.3.3 cluster. The first three scale runs used runtime source
+`b86517a`. Later rows name their exact source revision; a measurement belongs
+only to the revision in its row.
 
 | Gate | Measured result |
 |---|---|
 | 84-AS scale run 1 | 472.438 s deploy + 84.694 s convergence = **557.181 s**; focused **1/1**, full reference **10/10** |
 | 84-AS scale run 2 | 452.019 s deploy + 84.123 s convergence = **536.191 s**; focused **1/1**, full reference **10/10** |
 | 84-AS scale run 3 | 461.108 s deploy + 84.439 s convergence = **545.595 s**; focused **1/1**, full reference **10/10** |
+| 84-AS scale run 4 (`28591c0`) | 464.128 s deploy + 41.564 s focused convergence/grade = **505.692 s**; focused **1/1**, full reference **10/10** |
 | Scale shape | 84 ASes, 2,020 primary devices, 2,927 links, 186 cross-node links; placement 556/731/733 |
-| Healthy no-change deploy | 2,020-device plan verified with zero mutations in the reviewer run; canonical COS461 no-op measured **1.14 s** |
+| Healthy no-change deploy | 2,020-device plan verified with zero mutations in the reviewer run; run 4 re-verified zero steps through the agent read-only plan/CAS path in **28.047 s** |
 | Mixed FRR/BIRD canonical grade | **10.00/10.00**, no quarantine; BIRD alternate paths are retained by the normalized RIB provider |
+| Student-owned BIRD lifecycle (`a2da9b0`) | Five-router BIRD student Clos: live **1/1**, signed save recorded all five configs as BIRD, deliberate OSPF removal restored to three Full neighbours, full private `grade batch` **1/1 in 64 s**, clean teardown |
+| Namespace recovery (`6d04a9d`) | Two consecutive `as3/ATL` task kills: each replacement namespace was persisted, target/control namespaces matched, all three OSPF neighbours returned Full, peer addresses and unrelated task PIDs were unchanged, restore markers cleared, and a fresh signed save succeeded |
 | Abandoned grading controller | Controller killed after ephemeral harness commit; 60-second test lease expired and all three agents recorded `lease_reclaim: success`; zero harness containers remained |
 | Unrelated work during reap | Canonical COS461 deployed successfully while the abandoned harness expired, remained at 278 managed containers, then graded **10.00/10.00** |
-| Bundled generated Clos | 11 devices / 12 links / 6 cross-node endpoints: **19.98 s** deploy, **1/1** grade, clean teardown |
+| Bundled generated Clos (`8d69516`) | 11 devices / 12 links / 6 cross-node endpoints across all three nodes: **20.337 s** deploy, all 12 adjacencies Full, **1/1** grade, exact placement re-adoption after deleting the controller record, clean teardown |
 | Cleanup | Every run above ended at zero containers and zero `tw*` host links on all three nodes |
 | Immutable release images | Seven `hyhe/twinet-*` images published as `0.1-e8d207d`; every bundled example carries a topology-bound `images.lock.json` with registry `sha256` manifests |
 
@@ -165,7 +168,7 @@ current lock owner.
 | Docker/Podman/containerd runtime selection | source-verified; measured, bounded | Typed `placement.runtime` plus per-node overrides select registered backends before mutation; `--runtime`/`TWINET_RUNTIME` overrides both for one invocation and every node; agents report backend/version/socket/namespace and controllers refuse a mismatch. Every bundled example declares `runtime: containerd`, so the bundle deploys unmodified on the cluster [12](12_operator_guide.md) builds; a manifest that declares nothing still means `docker` and validation says so. Node-0 ran the source-built Podman 4.9.3 routed lifecycle gate and the native containerd lifecycle/routed gate (`make podman-integration`, `make containerd-integration`): events, create/start/stop/remove, exec/stdin/output, copy, netns wiring, FRR control, and cleanup completed. |
 | Image locks and rolling contracts | source-verified; measured | `twinet images lock|verify` records registry manifest digests; release/grading mode requires a checked lock and agents verify after pull before create. Seven immutable `0.1-e8d207d` images were remotely pushed/inspected, `make image-verify` passed, and every bundled example now pins that release with its own topology-bound lock. |
 | BIRD NOS provider and capability validation | source-verified; measured | `internal/nos` registers FRR/BIRD and tests refuse unsupported requests. The live canonical and 84-AS reference grades both scored 10/10 with staff transit routers on BIRD; the normalized provider retains BIRD non-best alternate paths needed by traffic-engineering evidence. |
-| Student-owned BIRD lifecycle | source-verified | The provider owns configuration capture/load/reload, the observation command list, and the BGP route refresh; `twinet save` records the NOS in the signed manifest and loading refuses a mismatched archive by name. `TestSaveAndRestoreOfABIRDStudentAS`, `TestSubmissionLoadingSelectsTheProvider`, `TestAnArchiveForAnotherNOSIsRefusedByName`, `TestNoFRRBinaryReachesABIRDDevice` and `TestBIRDStudentASGradesTheUnchangedRubricSubset` are the gates. No live student-AS BIRD deployment or grade has been measured. |
+| Student-owned BIRD lifecycle | source-verified; measured | The provider owns configuration capture/load/reload, the observation command list, and the BGP route refresh; `twinet save` records the NOS in the signed manifest and loading refuses a mismatched archive by name. The live five-router student BIRD run above passed save, deliberate break, restore, and full private batch regrade. `TestSaveAndRestoreOfABIRDStudentAS`, `TestSubmissionLoadingSelectsTheProvider`, `TestAnArchiveForAnotherNOSIsRefusedByName`, `TestNoFRRBinaryReachesABIRDDevice`, `TestBIRDStudentASGradesTheUnchangedRubricSubset`, and the platform-baseline/runtime-name regressions keep those boundaries. |
 | Explicit NOS capability status in reports | source-verified | A check whose subject its NOS cannot express returns `unsupported`: excluded from the question's weighting, never scored zero, and always marking the question `needs_review` with a note naming the NOS. A verdict reached from fewer witnesses than designed carries `reduced_evidence` and marks the question for review when it awarded marks. |
 | Service/state replication and endpoint policy | source-verified | model, expansion, placement, and durability tests cover replica identity, failure domains, and endpoint selection |
 | Strict live-inventory admission | source-verified | `internal/place`, client, and CLI tests refuse unknown/overloaded capacity before mutation unless audited overcommit is requested |
@@ -1640,9 +1643,6 @@ someone has checked.
 | Diff-and-converge `apply` | M4 | Deploy is idempotent and now self-healing, but does not compute a minimal change plan |
 | Course-wide acceptance beyond recorded advanced examples | M7 | MPLS/VRF and multicast examples have source support and the named measured discrimination evidence below this table. That is not an assertion that every course question, migration path, or live classroom workflow has completed acceptance. |
 | NIKA coverage acceptance | M8 | This work is maintained in [10](10_fault_injection.md). Its registry-backed table, rather than a duplicated count here, states the current supported/gap set and any substrate limitations. |
-| Load-balancer service, traffic generation | M8 | Prerequisites for two of those |
-| Mixed-NOS live acceptance | M9 | FRR and BIRD providers, a vendor-neutral state path, capability validation, and the full provider-owned save/restore/submission-load path are source-verified. A live deployment and grade of a *student-owned* BIRD AS -- including `twinet save`, restore, and `grade batch` against its own archive -- has not been recorded as measured evidence. |
-| Generated-interior live acceptance | M10 | `explicit`, `ring`, `two-tier`, and `clos` are source-verified generator kinds. A live three-node Clos deployment/convergence/grading acceptance run is not recorded here. |
 
 ### Addresses the assignment lets students choose
 
@@ -1807,11 +1807,12 @@ the cluster workflow uploads as a build artifact. [12](12_operator_guide.md)
 | Metric | Value |
 |---|---|
 | **84-AS current scale topology, three consecutive runs** | **557.181 s / 536.191 s / 545.595 s deploy+convergence**, each focused 1/1 and full reference 10/10 |
+| **84-AS run on `28591c0`** | **505.692 s deploy+focused convergence/grade** (464.128 s + 41.564 s), focused 1/1 and full reference 10/10 |
 | Current 84-AS deploy phase | **472.438 s / 452.019 s / 461.108 s** |
 | Current 84-AS focused convergence phase | **84.694 s / 84.123 s / 84.439 s** |
 | Current 84-AS placement / cross-node links | **556 / 731 / 733 primary devices; 186 / 2,927 links cross-node** |
 | Canonical 12-AS lab, 212 devices, 299 links, pack-by-AS | **133.64 s**, followed by 10/10 |
-| Generated Clos, 11 devices / 12 links / 6 cross-node endpoints | **19.98 s**, followed by 1/1 |
+| Generated Clos, 11 devices / 12 links / 6 cross-node endpoints | **20.337 s** on `8d69516`, all 12 adjacencies Full, followed by 1/1 in 23.867 s |
 | 12-AS lab at the earlier orchestration revision | **44-58 s** — historical; topology, runtime, readiness, and transaction proof are not comparable to the current gate |
 | The same lab as it was measured earlier, at 211 containers and 291 links | 83 s -- superseded; the topology and the deployment path have both changed since |
 | Same lab, single node | not attempted; 4-AS/57-container demo takes 64 s |
@@ -3449,3 +3450,42 @@ in which case the record says the copies never left. The regressions drive the
 durable boundary rather than a policy helper: they preserve, abandon the node,
 re-read the transaction off the coordination journal as a restarted agent finds
 it, and assert both what is removed and what the state store holds afterwards.
+
+### 138. A BIRD submission that could be saved but whose harness could not start
+
+The first live student-owned BIRD batch run failed before loading the signed
+submission. A student router put its whole reference configuration in the
+expected half, leaving the platform half empty; BIRD correctly refuses an empty
+configuration, so the private harness could not start. Splitting the
+provider-safe router/device/direct/kernel baseline from the student-owned
+OSPF/BGP half made platform mode valid without putting an answer in it.
+
+The next run reached commit-time durability and found a second BIRD-only path:
+the NOS save interface addresses a canonical device ID, while the runtime
+addresses its generated container name. The preservation adapter passed the ID
+straight through. FRR's separate capture path had hidden the mismatch; BIRD
+reported the missing container. The adapter now translates and validates the
+one device/container pair explicitly. The live rerun saved five native BIRD
+files, restored a deliberately removed OSPF configuration, graded the signed
+archive in a full private harness at 1/1, and removed the harness and class lab.
+
+### 139. Recovery evidence that said complete while mutation was still refused
+
+A controller with no placement record reconstructed the live AS locations, but
+an exact no-op returned before saving them; every later exec/save recomputed a
+different placement. A distributable Clos was worse: adoption treated its
+declared group split as an impossible split AS. A verified no-op now persists
+the observed record, and adoption reconstructs and validates the spine/leaf
+group boundaries. The live Clos test deleted its record, adopted the exact
+three-node split, and returned zero mutation steps.
+
+The same acceptance sequence found a committed recovery that still had
+`committed_pending` nodes. Status did not count that as pending, so `recover`
+reported success while ordinary destroy correctly refused. Recovery now
+requires a fresh fence, proves every node holds the same committed generation,
+finalizes only the pending nodes, and treats any remaining pending record as an
+error. Finally, platform-owned non-loopback addresses are now applied through
+idempotent kernel commands as well as rendered into FRR: restarting an already
+running daemon does not reload its file, which is why bounded semantic repair
+could previously retry a missing measurement address three times without
+changing it.

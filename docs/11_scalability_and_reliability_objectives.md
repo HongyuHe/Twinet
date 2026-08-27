@@ -38,7 +38,7 @@ recorded at the audit that commissioned these objectives:
 Of those, the transactional gap (O4, O3, O7), the single-NOS and
 explicit-interior limits (O10, O11), and the missing chaos/soak automation
 (O15) have shipped contracts and gates. The 2,020-device deployment target has
-now passed three consecutive live runs below ten minutes; the 100-submission
+now passed four live runs below ten minutes; the 100-submission
 grading target and required 24-hour soak remain open. See
 [section 3](#3-evidence-that-drives-the-objectives).
 
@@ -59,7 +59,7 @@ comparison follows its local manager, Docker, and Kubernetes implementations.
 |---|---|---|---|---|
 | Multi-node deployment | None; one Docker host | Core is single-host; manual VXLAN or separate Clabernetes for Kubernetes | Kubernetes backend distributes pods and collision domains | Native three-node placement and shared VXLAN; no HA scheduler. Node loss is an operator-driven fenced `twinet node drain` or an audited `on_node_loss: reschedule` deployment, never an automatic failover |
 | Topology model | Eight positional files and shell-derived state | Mature generic YAML and node-kind model | Simple Netkit-compatible `lab.conf` model | Strong typed course model, templates, IPAM, and inter-AS generation |
-| Vendor breadth | FRR-centric | More than 40 NOS kinds, plus vrnetlab VMs | Generic image/backend abstraction | Two registered NOS providers, FRR and BIRD, behind one capability-validated interface that also owns configuration capture/load and the grading route refresh; canonical and 84-AS mixed-NOS reference grades both passed live at 10/10 with BIRD on staff transit. A student-owned BIRD AS is source-supported and not yet measured live |
+| Vendor breadth | FRR-centric | More than 40 NOS kinds, plus vrnetlab VMs | Generic image/backend abstraction | Two registered NOS providers, FRR and BIRD, behind one capability-validated interface that also owns configuration capture/load and the grading route refresh; canonical and 84-AS mixed-NOS reference grades passed live at 10/10 with BIRD on staff transit, and a five-router student BIRD AS passed signed save, restore, and full private batch regrade |
 | Runtime breadth | Docker-specific scripts | Docker and Podman abstractions | Docker and Kubernetes managers | Three registered backends: Docker, Podman, and native containerd. Every bundled example declares one of them, and `--runtime` overrides it per run |
 | Reconciliation | Teardown and rebuild | Real topology/link diff classes for supported changes | Kubernetes supplies declarative reconciliation in that backend | Idempotent apply, event-driven repair, and bounded desired/observed device classes (live, config, rewire, restart, recreate, delete, unknown) through `twinet node reconcile`; deploy still computes no minimal cluster-wide change plan |
 | Distributed scheduling | None | None in core; Kubernetes in Clabernetes | Kubernetes scheduler | Static AS placement from manifest-declared nodes |
@@ -132,7 +132,7 @@ its contract is recorded underneath it and, canonically, in
 
 **Problem.** The two headline acceptance targets were missed at the audit:
 deployment by more than 2x and grading by about 13x. The current deployment
-target is now met in three consecutive runs; 100-submission throughput and the
+target is now met in four live runs; 100-submission throughput and the
 24-hour stability claim remain unproven.
 
 **Required outcome.**
@@ -486,8 +486,11 @@ report must name every question its NOS cannot answer. The save/restore,
 submission-load and no-FRR-binary-reaches-BIRD parts of that are source-verified
 by `TestSaveAndRestoreOfABIRDStudentAS`, `TestSubmissionLoadingSelectsTheProvider`,
 `TestNoFRRBinaryReachesABIRDDevice` and
-`TestBIRDStudentASGradesTheUnchangedRubricSubset`; a live student-AS BIRD grade
-has not been measured.
+`TestBIRDStudentASGradesTheUnchangedRubricSubset`. Live acceptance then deployed
+a five-router student-owned BIRD Clos, scored its vendor-neutral rubric 1/1,
+saved all five configurations with native NOS identity, removed OSPF from one
+router, restored the signed archive to three Full neighbours, and batch regraded
+that archive in a full private harness at 1/1.
 
 #### O10 implementation boundary
 
@@ -567,6 +570,10 @@ explicit and AS-granular placement forbade distributing a large Clos.
 **Acceptance.** Existing labs represented as `kind: explicit` retain identical
 topology hashes. A generated Clos deploys, converges, grades, and distributes
 across three nodes with deterministic placement.
+
+The shipped 11-device Clos met that gate on `8d69516`: six cross-node
+endpoints, all 12 adjacencies Full, 20.337 s deployment, 1/1 grade, and an exact
+three-node no-op placement re-adoption after its controller record was removed.
 
 ### O12 - Harden tenant and operator security
 
