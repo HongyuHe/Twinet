@@ -2,6 +2,7 @@ package deploy
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -14,16 +15,7 @@ func TestCaptureAndRestoreUseBIRDProviderSemantics(t *testing.T) {
 	router := &model.Device{
 		ID: "as1/ALL", ASN: 1, Kind: model.KindRouter, NOS: "bird", Container: "bird-as1",
 	}
-	captureRuntime := &readFailingRuntime{exec: func(command []string) (rt.ExecResult, error) {
-		switch {
-		case len(command) == 2 && command[0] == "cat" && command[1] == "/etc/bird/bird.conf":
-			return rt.ExecResult{Stdout: "router id 1.151.0.1;\nprotocol device {}\n"}, nil
-		default:
-			// Generic tunnel/address capture is deliberately empty but
-			// readable; the provider configuration is the fact under test.
-			return rt.ExecResult{}, nil
-		}
-	}}
+	captureRuntime := &birdCaptureRuntime{container: router.Container}
 	snapshots, err := Capture(context.Background(), captureRuntime, router, "mixed", "topology")
 	if err != nil {
 		t.Fatal(err)
@@ -55,6 +47,32 @@ func TestCaptureAndRestoreUseBIRDProviderSemantics(t *testing.T) {
 	}
 	if !strings.Contains(strings.Join(restoreRuntime.command, " "), "birdc") {
 		t.Fatalf("BIRD restore did not reload BIRD: %v", restoreRuntime.command)
+	}
+}
+
+type birdCaptureRuntime struct {
+	rt.Runtime
+	container string
+}
+
+func (r *birdCaptureRuntime) Inspect(_ context.Context, name string) (rt.Container, error) {
+	if name != r.container {
+		return rt.Container{}, fmt.Errorf("inspected %q, want runtime container %q", name, r.container)
+	}
+	return rt.Container{State: rt.StateRunning}, nil
+}
+
+func (r *birdCaptureRuntime) Exec(_ context.Context, name string, command rt.ExecCmd) (rt.ExecResult, error) {
+	if name != r.container {
+		return rt.ExecResult{}, fmt.Errorf("executed in %q, want runtime container %q", name, r.container)
+	}
+	switch {
+	case len(command.Cmd) == 2 && command.Cmd[0] == "cat" && command.Cmd[1] == "/etc/bird/bird.conf":
+		return rt.ExecResult{Stdout: "router id 1.151.0.1;\nprotocol device {}\n"}, nil
+	default:
+		// Generic tunnel/address capture is deliberately empty but readable;
+		// the provider configuration is the fact under test.
+		return rt.ExecResult{}, nil
 	}
 }
 

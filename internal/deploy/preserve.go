@@ -96,12 +96,24 @@ done`
 // whose work was thrown away.
 var ErrNotRunning = errors.New("the container is not running")
 
-// preserveExecutor adapts the existing Runtime to the NOS save contract
-// without making preservation depend on a particular container backend.
-type preserveExecutor struct{ runtime rt.Runtime }
+// preserveExecutor adapts the existing Runtime to the NOS save contract.
+// Providers address devices by canonical ID, while runtimes address the
+// concrete container name. Keeping that translation here prevents a provider
+// from accidentally relying on the two names being equal.
+type preserveExecutor struct {
+	runtime   rt.Runtime
+	deviceID  string
+	container string
+}
 
 func (e preserveExecutor) Exec(ctx context.Context, deviceID string, command []string) (rt.ExecResult, error) {
-	return e.runtime.Exec(ctx, deviceID, rt.ExecCmd{Cmd: command})
+	if deviceID != e.deviceID {
+		return rt.ExecResult{}, fmt.Errorf("preserve executor for %s cannot execute on %s", e.deviceID, deviceID)
+	}
+	if e.container == "" {
+		return rt.ExecResult{}, fmt.Errorf("device %s has no runtime container identity", deviceID)
+	}
+	return e.runtime.Exec(ctx, e.container, rt.ExecCmd{Cmd: command})
 }
 
 func Capture(ctx context.Context, r rt.Runtime, d *model.Device, lab, topoHash string) ([]state.Snapshot, error) {
@@ -210,7 +222,9 @@ func Capture(ctx context.Context, r rt.Runtime, d *model.Device, lab, topoHash s
 				add(state.KindFRR, cleanRunningConfig(body))
 			}
 		} else {
-			snaps, saveErr := provider.Save(ctx, d, preserveExecutor{runtime: r}, lab, topoHash)
+			snaps, saveErr := provider.Save(ctx, d, preserveExecutor{
+				runtime: r, deviceID: d.ID, container: d.Container,
+			}, lab, topoHash)
 			if saveErr != nil {
 				missed = append(missed, fmt.Sprintf("the %s configuration of %s could not be read: %v",
 					provider.Name(), d.ID, saveErr))
