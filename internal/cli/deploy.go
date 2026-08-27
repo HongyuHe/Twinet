@@ -325,7 +325,12 @@ after a partial failure, a reboot, or a topology edit.`,
 			}
 			node := localNode(top)
 			previousSolved := labWasSolved(top)
+			pendingSolve := labModeRecord(top) == localModeSolvePending
 			modePolicy := localModeTransitionPolicy(previousSolved, mode)
+			// A prune is only ever the whole node's: --only restricts the work
+			// to a scope, and a scope cannot say what the rest of the lab no
+			// longer wants.
+			prunePlanned := prune && len(scope) == 0
 			// Without a state store the engine's preservation path is dead
 			// code: a container replaced by a redeploy comes back with the
 			// image's configuration and the student's work is gone. The local
@@ -334,6 +339,16 @@ after a partial failure, a reboot, or a topology edit.`,
 			store, err := localStore(top)
 			if err != nil {
 				return err
+			}
+			// A deployment finishing a solve that was interrupted may remove
+			// only what the interrupted one preserved before it wrote its
+			// first reference command, and it settles that here -- before any
+			// mutation, so a refusal costs nothing but the command.
+			var preserved *deploy.OrphanPreservationSet
+			if prunePlanned && pendingSolve && !dryRun {
+				if preserved, err = resumeLocalSolveTransition(top, node); err != nil {
+					return err
+				}
 			}
 			eng := &deploy.Engine{
 				Runtime:                rt,
@@ -369,10 +384,10 @@ after a partial failure, a reboot, or a topology edit.`,
 				}
 				if !dryRun {
 					if err := pruneLocalDeployment(cmd.Context(), eng, top, store, node,
-						previousSolved, prune, quiet, cmd.OutOrStdout()); err != nil {
+						previousSolved, prunePlanned, quiet, cmd.OutOrStdout(), preserved); err != nil {
 						return err
 					}
-					if err := recordLabMode(top, string(mode)); err != nil {
+					if err := finishLocalDeployment(top, string(mode)); err != nil {
 						return fmt.Errorf("record successful local deployment mode: %w", err)
 					}
 				}
@@ -382,33 +397,18 @@ after a partial failure, a reboot, or a topology edit.`,
 				return nil
 			}
 
-			// Solving is destructive to student configuration by design. Save
-			// the current teaching state before any reference command runs;
-			// captureBeforeReplace cannot do this because the desired solve
-			// engine must never capture the answer on a later solve pass.
+			// Solving is destructive to student configuration by design, and
+			// what it may destroy is not only the devices the manifest still
+			// wants: a prune it was asked for removes containers as well.
+			// Everything in either group is saved before any reference command
+			// runs, and what was saved is written down for the deployment that
+			// may have to finish this one. captureBeforeReplace cannot do this
+			// because the desired solve engine must never capture the answer on
+			// a later solve pass.
 			if modePolicy.captureBeforeReference && !dryRun {
-				capture := &deploy.Engine{Runtime: rt, Node: node, State: store}
-				if _, err := capture.CaptureAll(cmd.Context(), top, store); err != nil {
-					return fmt.Errorf("refusing to install the reference solution because "+
-						"the current student state could not be captured: %w", err)
-				}
-				if unproven := capture.UnprovenNamespaceDevices(); len(unproven) > 0 {
-					var devices []string
-					for id, reason := range unproven {
-						devices = append(devices, id+": "+reason)
-					}
-					sort.Strings(devices)
-					return fmt.Errorf("refusing to install the reference solution because "+
-						"the current namespace state could not be proven: %s",
-						strings.Join(devices, "; "))
-				}
-				// Persisted before the first reference command. If execution
-				// fails halfway, a retry or destroy must not capture the
-				// already-solved half as student work; the complete platform
-				// snapshot taken above remains the recovery source.
-				if err := recordLabMode(top, localModeSolvePending); err != nil {
-					return fmt.Errorf("refusing to install the reference solution because "+
-						"its captured transition could not be recorded: %w", err)
+				if preserved, err = preserveLocalSolveTransition(cmd.Context(), rt, top,
+					store, node, prunePlanned); err != nil {
+					return err
 				}
 			}
 
@@ -447,7 +447,7 @@ after a partial failure, a reboot, or a topology edit.`,
 					len(rep.FailedScopes()))
 			}
 			if err := pruneLocalDeployment(cmd.Context(), eng, top, store, node,
-				previousSolved, prune && len(scope) == 0, quiet, cmd.OutOrStdout()); err != nil {
+				previousSolved, prunePlanned, quiet, cmd.OutOrStdout(), preserved); err != nil {
 				return err
 			}
 			// Remembered only after every requested mutation succeeded. Writing
@@ -455,7 +455,7 @@ after a partial failure, a reboot, or a topology edit.`,
 			// the next destroy, which is the exact moment the marker exists to
 			// protect.
 			if len(scope) == 0 {
-				if err := recordLabMode(top, string(mode)); err != nil {
+				if err := finishLocalDeployment(top, string(mode)); err != nil {
 					return fmt.Errorf("deployment succeeded but its mode could not be recorded: %w", err)
 				}
 			}
@@ -1677,15 +1677,22 @@ func localModeTransitionPolicy(previousSolved bool, desired render.Mode) localMo
 // platform-to-solve transition therefore captures an orphan as student work,
 // while a repeated solved deployment must not file the reference answer as
 // theirs.
+//
+// A transition that preserved its candidates before it began does neither: it
+// has already saved them, at the one moment when what was in them was still
+// demonstrably the students', so this pass reads nothing and removes only what
+// that preservation covers.
 func pruneLocalDeployment(ctx context.Context, desired *deploy.Engine, top *model.Topology,
 	store *state.Store, node string, previousSolved, requested, quiet bool, out io.Writer,
+	preserved *deploy.OrphanPreservationSet,
 ) error {
 	if !requested {
 		return nil
 	}
 	pruner := &deploy.Engine{
 		Runtime: desired.Runtime, Node: node, State: store,
-		WritesReference: previousSolved,
+		WritesReference:  previousSolved || preserved != nil,
+		PreservedOrphans: preserved,
 	}
 	containers, err := pruner.PruneOrphans(ctx, top)
 	if err != nil {
@@ -2012,21 +2019,29 @@ func topologyFromLabels(lab string, cs []runtime.Container) *model.Topology {
 const localModeSolvePending = "solve-pending"
 
 func labWasSolved(top *model.Topology) bool {
-	if top == nil {
-		// Without a manifest there is nothing that says otherwise, and the
-		// safe assumption is the one that does not file the answer as work.
-		return false
-	}
-	raw, err := os.ReadFile(filepath.Join(labPrivateDir(top), "mode"))
-	if err != nil {
-		return false
-	}
-	switch strings.TrimSpace(string(raw)) {
+	switch labModeRecord(top) {
 	case string(render.ModeSolve), localModeSolvePending:
 		return true
 	default:
 		return false
 	}
+}
+
+// labModeRecord is the mode a single-node lab was last deployed in, exactly as
+// it was written down. labWasSolved answers the question destroy and capture
+// ask; a transition that has to tell an interrupted solve from a finished one
+// needs the marker itself.
+func labModeRecord(top *model.Topology) string {
+	if top == nil {
+		// Without a manifest there is nothing that says otherwise, and the
+		// safe assumption is the one that does not file the answer as work.
+		return ""
+	}
+	raw, err := os.ReadFile(filepath.Join(labPrivateDir(top), "mode"))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(raw))
 }
 
 // recordLabMode remembers how a single-node lab was last deployed.
@@ -2036,4 +2051,22 @@ func recordLabMode(top *model.Topology, mode string) error {
 		return err
 	}
 	return writeAtomic(dir, "mode", []byte(mode), 0o644)
+}
+
+// finishLocalDeployment records the mode a completed deployment left the lab
+// in and forgets what its transition preserved.
+//
+// In that order. A crash between the two leaves a record describing a
+// transition that has finished, which the next deployment ignores because the
+// marker no longer says one is pending; the other order would leave a pending
+// marker with nothing to prove what may be removed, and refuse a prune that
+// had every right to run.
+func finishLocalDeployment(top *model.Topology, mode string) error {
+	if err := recordLabMode(top, mode); err != nil {
+		return err
+	}
+	if err := clearSolveTransition(top); err != nil {
+		return fmt.Errorf("forget what the completed transition preserved: %w", err)
+	}
+	return nil
 }

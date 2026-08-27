@@ -29,8 +29,9 @@ func TestOnlyTheGuardedFunnelWritesACapture(t *testing.T) {
 		"captureSelected": true,
 		// Reads one device before its container is replaced.
 		"captureBeforeReplace": true,
-		// Reads each candidate before its container is deleted.
-		"PruneOrphans": true,
+		// Reads each prune candidate, whether the removal follows immediately
+		// or a later phase of the same transition does it.
+		"preserveOrphans": true,
 	}
 	writers := map[string]bool{"storeCaptured": true}
 

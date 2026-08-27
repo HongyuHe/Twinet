@@ -749,6 +749,64 @@ snapshot slot without risking another device's saved state. Internal FRR
 control sidecars remain exempt: they own no independent student state and share
 their routing files with the primary container.
 
+### A solve is a transition, and both of its halves are destructive
+
+On a single machine `deploy --solve` writes the reference answer over the
+devices the manifest still places here, and, when it was asked to prune, removes
+the containers the manifest no longer wants. The first half was preserved before
+it ran and the second was not, because the prune is the deployment's last step:
+a stale container that a course had dropped, still holding the group's
+configuration, was captured by nothing at all until the moment it was deleted.
+
+Both halves are therefore preserved before either of them runs. A
+platform-to-solve deployment on one node captures every device the manifest
+still wants **and** every container a requested `--prune` could later remove,
+through the same guarded funnel and the same namespace and claimant checks, and
+only then marks the lab as one that may hold the answer. Anything that cannot be
+preserved refuses the deployment while the lab is still exactly as the students
+left it: no reference command has run, no marker has been written, and the
+containers are all where they were. The prune itself still happens after a
+successful deployment, so `--prune` means what it has always meant.
+
+What was preserved is written down beside the mode marker, in
+`<manifest>/.twinet/solve-transition.json`, because the process that preserves a
+container is not necessarily the process that removes it. If the reference plan
+fails part way, the retry finds the lab marked `solve-pending` — a lab whose
+containers must never be read as student work again, since some of them now hold
+the answer — and removes exactly the containers that record covers, and nothing
+else. The record names the lab, the node, the manifest hash it was taken
+against, and each container with the device identifier it carried.
+
+Everything else about that retry is a refusal, before it changes anything:
+
+| What the retry finds | What it does |
+| --- | --- |
+| No record, or one that cannot be read | Refuses the prune and names the remedy |
+| A first attempt that was not asked to prune | Refuses: nothing was preserved for these containers |
+| A manifest edited since the record was written | Refuses: which containers are stale was decided against a different lab |
+| A container the record does not cover | Refuses, names the container, removes nothing |
+| A container now carrying a different device identifier | Refuses, names both identifiers |
+
+One unprovable candidate stops the whole prune, as it does everywhere else on
+this boundary: a lab with one stale container is a nuisance, and a lab that has
+quietly eaten a group's configuration is not something an apology fixes. The way
+out of any of them is to return the lab to teaching mode with `twinet deploy`,
+which replays the preserved student state, and then to run the solve and its
+prune again; or to finish the solve without `--prune` and leave the stale
+containers where they are. `twinet destroy` remains the way to say that a lab is
+genuinely disposable, and it goes on treating `solve-pending` as a lab that
+holds the reference solution.
+
+The mode is recorded only after every requested mutation has succeeded, and the
+record of what was preserved is forgotten only after that. A crash in between
+leaves a record describing a transition that has finished, which the next
+deployment ignores; the other order would leave a pending marker with nothing to
+prove what may be removed, and refuse a prune that had every right to run. A
+prune of a lab that is already solved reads nothing and writes nothing, so a
+repeated `deploy --solve --prune` never files the answer as anybody's work, and
+`--only` is unaffected: a scope cannot say what the rest of the lab no longer
+wants, so a scoped deployment does not prune at all.
+
 Every device left in that state is reported. The node publishes them in its
 apply response as `unproven_namespaces`, keyed by device with the reason for
 each, and `twinet deploy` prints one `UNPROVEN NAMESPACE:` line per device and

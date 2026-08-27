@@ -3304,3 +3304,71 @@ The reading taken before the rewire is also replicated to the lab's policy
 before anything is unplugged. It is the only record of interfaces that are about
 to stop existing, and a copy that exists solely on the node that is about to
 break is not a copy.
+
+### 136. The container a solve was told to save, deleted by the solve's own retry
+
+A single-node lab had one stale container: an autonomous system the course had
+dropped from the manifest, still running, still holding the group's
+configuration, and holding the only copy of it. The operator ran
+`deploy --solve --prune`.
+
+Everything that happened next was what each part had been written to do. The
+pre-solve capture saves the lab's teaching state before any reference command
+runs — every device the manifest places on this node, which is not that
+container, because a container the manifest has forgotten is not in the
+topology to be enumerated. The lab was then marked `solve-pending`, which is
+what makes a later destroy or capture treat it as one that may hold the answer.
+The reference plan failed part way. The prune is the deployment's last step, so
+it never ran, and the stale container ended the command exactly as it started
+it: untouched, and read by nothing.
+
+The retry was the loss. It found `solve-pending`, correctly declined to read a
+lab whose containers may now hold the reference solution, and deleted the stale
+container without ever having looked inside it. Nothing failed. The deployment
+reported success, and the group's work existed nowhere.
+
+Neither of the two obvious repairs is safe, and they fail in opposite
+directions. Treating `solve-pending` as "the orphan is still the students'" and
+capturing it files the reference answer as their work as soon as one of those
+containers was in fact solved — which is exactly what a manifest edited between
+the attempts produces, since a device that was desired and got the answer
+written to it becomes an orphan the moment the manifest stops wanting it.
+Treating it as "the orphan is the reference" and deleting it is the loss above.
+The information needed to tell them apart does not exist at the time of the
+retry: it existed before the first reference command ran, and was not written
+down.
+
+So it is written down now. A solve is a transition with two destructive halves,
+and both are preserved before either runs. `PruneOrphans` was already the one
+place that captured a candidate through the guarded funnel, resolved which
+container speaks for a device, and refused by name anything it could not safely
+save; that half is now `PreserveOrphans`, which does all of it and removes
+nothing, and the prune is preservation followed by removal. A single-node
+platform-to-solve deployment that was asked to prune calls it before its first
+reference command, alongside the capture of the devices the manifest still
+wants, and records what it preserved in `.twinet/solve-transition.json` — the
+lab, the node, the manifest hash, and each container with the device identifier
+it carried — before it writes the `solve-pending` marker. If anything cannot be
+preserved, the deployment refuses with the marker unwritten and the lab exactly
+as the students left it.
+
+The retry is then entitled to remove precisely what that record covers. A
+missing or unreadable record, a first attempt that was never asked to prune, a
+manifest edited since, a container that appeared in the meantime, and a
+container now carrying a different device identifier are each a refusal that
+names the container and the remedy, before the deployment mutates anything;
+one unprovable candidate stops the whole prune. The way out is to return the lab
+to teaching mode with `twinet deploy`, which replays the preserved state, and
+run the solve and its prune again; or to finish the solve without `--prune` and
+leave the stale containers where they are.
+
+The rest of the contract is unchanged and checked: an ordinary successful
+`deploy --solve --prune` still prunes, a prune of an already-solved lab still
+reads nothing and writes nothing, a `solve-pending` lab still restores its
+students' work on the way back to teaching mode, `destroy` still treats
+`solve-pending` as holding the reference solution, `--only` still does not
+prune, and the mode is still recorded only after every requested mutation has
+succeeded. The regressions drive the durable boundary rather than a policy
+helper: they run the preservation, kill the deployment, re-read the record from
+disk in the state a second process would find it, and assert both what is
+removed and what the state store holds afterwards.

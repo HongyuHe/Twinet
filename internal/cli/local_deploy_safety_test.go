@@ -117,7 +117,7 @@ func TestLocalPruneFlagReachesTheDestructiveSafetyBoundary(t *testing.T) {
 	desired := &deploy.Engine{Runtime: runtime, Node: "local", State: store}
 	var output bytes.Buffer
 	if err := pruneLocalDeployment(context.Background(), desired, top, store,
-		"local", false, true, false, &output); err != nil {
+		"local", false, true, false, &output, nil); err != nil {
 		t.Fatal(err)
 	}
 	if len(runtime.removed) != 1 || runtime.removed[0] != "stale-control" {
