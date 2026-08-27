@@ -677,6 +677,14 @@ is never written over the authority's. An exact duplicate has nothing to lose
 and is removed. `twinet destroy` remains the way to say that a lab is genuinely
 disposable.
 
+The same boundary refuses before reading when there is nowhere trustworthy to
+put the result. A teaching-mode replacement or prune without a state store is
+an error, not permission to delete the container, and a prune candidate without
+a canonical device identifier is left alone because it cannot be assigned a
+snapshot slot without risking another device's saved state. Internal FRR
+control sidecars remain exempt: they own no independent student state and share
+their routing files with the primary container.
+
 Every device left in that state is reported. The node publishes them in its
 apply response as `unproven_namespaces`, keyed by device with the reason for
 each, and `twinet deploy` prints one `UNPROVEN NAMESPACE:` line per device and

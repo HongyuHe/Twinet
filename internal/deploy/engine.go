@@ -1128,7 +1128,7 @@ func (e *Engine) removeFRRControl(ctx context.Context, d *model.Device) error {
 
 // captureBeforeReplace snapshots a student-owned device before it is destroyed.
 func (e *Engine) captureBeforeReplace(ctx context.Context, top *model.Topology, d *model.Device) error {
-	if e.State == nil || !studentOwned(top, d) {
+	if !studentOwned(top, d) {
 		return nil
 	}
 	// Not while the reference solution is what is on the device.
@@ -1139,6 +1139,10 @@ func (e *Engine) captureBeforeReplace(ctx context.Context, top *model.Topology, 
 	// would happen to every student on every class run.
 	if e.WritesReference {
 		return nil
+	}
+	if e.State == nil {
+		return fmt.Errorf("refusing to replace %s: this deployment has no state store in which "+
+			"to preserve the student's configuration", d.ID)
 	}
 	var (
 		snaps []state.Snapshot
@@ -1379,8 +1383,13 @@ func (e *Engine) PruneOrphans(ctx context.Context, top *model.Topology) ([]strin
 	// capture, the safety check that decides what may be stored, and the
 	// refusal that may follow are all talking about the same device.
 	targets := make([]*model.Device, len(candidates))
+	var preCaptureProblems []string
 	for i, c := range candidates {
-		targets[i] = e.orphanDevice(top, c)
+		var refusal string
+		targets[i], refusal = e.orphanDevice(top, c)
+		if refusal != "" {
+			preCaptureProblems = append(preCaptureProblems, refusal)
+		}
 	}
 	// Which container speaks for each device, before anything is read, so that
 	// the capture, the store write and any refusal all agree about it.
@@ -1427,6 +1436,7 @@ func (e *Engine) PruneOrphans(ctx context.Context, top *model.Topology) ([]strin
 		written = append(written, captures[i])
 	}
 	_, problems := e.storeCaptured(ctx, top, e.State, writable, written, true)
+	problems = append(preCaptureProblems, problems...)
 	for i := range problems {
 		problems[i] = "refusing to remove an orphan: its state could not be safely saved (" +
 			problems[i] + "). Destroy the lab explicitly if it is genuinely disposable"
@@ -1489,17 +1499,17 @@ func (e *Engine) PruneOrphans(ctx context.Context, top *model.Topology) ([]strin
 		if same {
 			continue
 		}
-		held := "the container the topology keeps for it"
+		authority := "no container is established as the authority"
 		if claims[i].authority != "" {
-			held = claims[i].authority
+			authority = "the established authority is " + claims[i].authority
 		}
 		problems = append(problems, fmt.Sprintf(
-			"refusing to remove %s: it is one of several containers claiming %s, whose saved "+
-				"state belongs to %s, and what it holds is not what is saved (%s). Its "+
+			"refusing to remove %s: it is one of several containers claiming %s; %s, and "+
+				"what this claimant holds is not what is saved (%s). Its "+
 				"reading was deliberately not written over that state, so removing it "+
 				"would destroy the only copy. Compare the two and remove it by hand, or "+
 				"destroy the lab explicitly if it is genuinely disposable",
-			c.Name, targets[i].ID, held, why))
+			c.Name, targets[i].ID, authority, why))
 	}
 	if err := deterministicError(ctxErr, problems); err != nil {
 		return nil, err
@@ -1531,20 +1541,26 @@ func (e *Engine) PruneOrphans(ctx context.Context, top *model.Topology) ([]strin
 // store write and any refusal all speak about one device. It is also the only
 // description of the device there is: an orphan is usually gone from the
 // manifest, so the model cannot be asked.
-func (e *Engine) orphanDevice(top *model.Topology, c runtime.Container) *model.Device {
+func (e *Engine) orphanDevice(top *model.Topology, c runtime.Container) (*model.Device, string) {
 	if c.Labels[LabelFRRControl] == "true" {
 		// The sidecar has only the router's shared config/vty mounts. The
 		// student-owned snapshot belongs to the shell container, and capturing
 		// the sidecar would duplicate or race that state.
-		return nil
+		return nil, ""
 	}
 	if e.State == nil {
-		return nil
+		if !e.WritesReference {
+			return nil, fmt.Sprintf(
+				"refusing to remove %s: this deployment has no state store in which to "+
+					"preserve what the container holds. Destroy the lab explicitly if it "+
+					"is genuinely disposable", c.Name)
+		}
+		return nil, ""
 	}
 	// Nothing is captured while the reference solution is what is on the
 	// device: the snapshot would be the answer filed as the student's work.
 	if e.WritesReference {
-		return nil
+		return nil, ""
 	}
 	// The device is gone from the topology, so its identity comes from the
 	// labels the deployment stamped on it.
@@ -1559,7 +1575,10 @@ func (e *Engine) orphanDevice(top *model.Topology, c runtime.Container) *model.D
 		id = c.Labels[LabelDevice]
 	}
 	if id == "" {
-		return nil
+		return nil, fmt.Sprintf(
+			"refusing to remove %s: it has no canonical device identifier, so its state "+
+				"cannot be captured without risking another device's saved work. Destroy "+
+				"the lab explicitly if it is genuinely disposable", c.Name)
 	}
 	modelled, known := top.Device(id)
 	var d *model.Device
@@ -1592,7 +1611,7 @@ func (e *Engine) orphanDevice(top *model.Topology, c runtime.Container) *model.D
 	if d.Kind == "" {
 		d.Kind = model.KindRouter
 	}
-	return d
+	return d, ""
 }
 
 // PruneOverlays removes stale VNI bindings and any now-empty shared

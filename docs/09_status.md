@@ -445,6 +445,13 @@ reached students, and each motivated a permanent test.
    nowhere, a snapshot that cannot be read, or a partial capture refuses by
    name. An exact duplicate has nothing to lose and goes.
 
+   The absence of a capture target is no longer overloaded as permission
+   either. A student replacement or prune with no state store now refuses
+   before deletion, and an orphan without a canonical device identifier is
+   left in place rather than guessed into a snapshot slot that may belong to
+   another AS. Only internal control sidecars, which own no independent state,
+   retain the no-capture removal path.
+
 10. **A release gate that answered yes without looking.** `make ci` printed
     "all CI gates passed" while skipping the lint and the shell check whenever
     their tools were absent, which on the development machine was always.

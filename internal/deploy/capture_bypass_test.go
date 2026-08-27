@@ -790,6 +790,61 @@ func TestAStoppedContainerStartedToBeReadIsNotAlsoTreatedAsUnaccountedFor(t *tes
 	}
 }
 
+// A preservation path without anywhere to preserve to is not a preservation
+// path. Engine is also used directly by the local deployment and integration
+// surfaces, so the agent's always-present store cannot be an implicit
+// precondition for replacing a student container.
+func TestAReplacementRefusesWhenThereIsNoStateStore(t *testing.T) {
+	engine, top, devices, runtime, _ := capturableNamespaceLab(t)
+	replaced := devices[0]
+	engine.State = nil
+	final := staleSpec(t, engine, top, runtime, replaced)
+
+	err := engine.ensureContainer(context.Background(), top, replaced, final)
+	if err == nil || !strings.Contains(err.Error(), "no state store") {
+		t.Fatalf("replacement without a state store was not explicitly refused: %v", err)
+	}
+	if len(runtime.removed) != 0 {
+		t.Fatalf("replacement removed %v despite having nowhere to save the student's work",
+			runtime.removed)
+	}
+}
+
+// The same fail-closed rule at the prune boundary. Returning no capture target
+// used to mean both "this internal sidecar owns no student state" and "there is
+// no store"; the latter then flowed through the former's safe-removal path.
+func TestPruneRefusesWhenThereIsNoStateStore(t *testing.T) {
+	engine, top, runtime, _ := orphanLab(t)
+	engine.State = nil
+	orphanHolding(runtime, map[string][]string{"port_BOS": {"3.0.8.1/24"}})
+
+	removed, err := engine.PruneOrphans(context.Background(), top)
+	if err == nil || !strings.Contains(err.Error(), "no state store") {
+		t.Fatalf("prune without a state store was not explicitly refused: %v", err)
+	}
+	if len(removed) != 0 || len(runtime.removed) != 0 {
+		t.Fatalf("prune removed %v / %v despite having nowhere to save the container",
+			removed, runtime.removed)
+	}
+}
+
+// A container whose canonical identifier is unreadable cannot be assigned a
+// state-store slot safely. Treating it like a control sidecar silently removed
+// it; guessing from its short name risks overwriting a different AS's device.
+func TestPruneRefusesAContainerWithoutACanonicalDeviceIdentifier(t *testing.T) {
+	engine, top, runtime, _ := orphanLab(t)
+	delete(runtime.containers[0].Labels, LabelDeviceID)
+	delete(runtime.containers[0].Labels, LabelDevice)
+
+	removed, err := engine.PruneOrphans(context.Background(), top)
+	if err == nil || !strings.Contains(err.Error(), "no canonical device identifier") {
+		t.Fatalf("unidentified container was not explicitly refused: %v", err)
+	}
+	if len(removed) != 0 || len(runtime.removed) != 0 {
+		t.Fatalf("prune removed unidentified container: %v / %v", removed, runtime.removed)
+	}
+}
+
 // renamedInto gives the manifest a container for the device the orphan lab's
 // leftover still claims, on this same node, and returns it.
 func renamedInto(t *testing.T, engine *Engine, top *model.Topology,
