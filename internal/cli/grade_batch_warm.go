@@ -209,7 +209,9 @@ func newWarmBatchHarness(ctx context.Context, class *model.Topology, rubric *gra
 	held, err := holdLab(ctx, top, opts.token, io.Discard)
 	if err != nil {
 		heartbeat.Stop()
-		tctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
+		tctx, cancel := context.WithTimeout(
+			context.WithoutCancel(ctx), warmHarnessCleanupTimeout(len(top.Devices)),
+		)
 		defer cancel()
 		_ = destroyLab(tctx, cluster, top)
 		return nil, err
@@ -218,7 +220,9 @@ func newWarmBatchHarness(ctx context.Context, class *model.Topology, rubric *gra
 	if err != nil {
 		heartbeat.Stop()
 		held.Release()
-		tctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
+		tctx, cancel := context.WithTimeout(
+			context.WithoutCancel(ctx), warmHarnessCleanupTimeout(len(top.Devices)),
+		)
 		defer cancel()
 		_ = destroyLab(tctx, cluster, top)
 		return nil, err
@@ -227,7 +231,9 @@ func newWarmBatchHarness(ctx context.Context, class *model.Topology, rubric *gra
 	if err := grade.WaitReferenceBaseline(ctx, top, asn, exec, nil, baselineTimeout); err != nil {
 		heartbeat.Stop()
 		held.Release()
-		tctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
+		tctx, cancel := context.WithTimeout(
+			context.WithoutCancel(ctx), warmHarnessCleanupTimeout(len(top.Devices)),
+		)
 		defer cancel()
 		_ = destroyLab(tctx, cluster, top)
 		return nil, fmt.Errorf("verifying solved reference baseline: %w", err)
