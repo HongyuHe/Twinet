@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/HongyuHe/twinet/internal/model"
@@ -52,6 +53,11 @@ func WaitReferenceBaseline(ctx context.Context, top *model.Topology, target int,
 func checkReferenceBaseline(ctx context.Context, top *model.Topology, target int, targets []string,
 	exec func(context.Context, string, []string) (rt.ExecResult, error), stateReader netstate.Reader,
 ) error {
+	type routerCheck struct {
+		asn    int
+		router *model.Device
+	}
+	var checks []routerCheck
 	for _, asn := range top.SortedASNs() {
 		if asn == target {
 			continue
@@ -66,33 +72,72 @@ func checkReferenceBaseline(ctx context.Context, top *model.Topology, target int
 			if router == nil {
 				continue
 			}
-			caps := top.SemanticHealthCapabilities(router)
-			env := &Env{Topology: top, AS: asn, Exec: exec, StateReader: stateReader}
-			if caps.BGPControl && routerHasReferenceBGPPeer(router, target) {
-				state, err := env.LiveDeviceState(ctx, router.ID, netstate.QueryBGPSessions)
-				if err != nil {
-					return fmt.Errorf("%s read solved BGP control state: %w", router.ID, err)
+			checks = append(checks, routerCheck{asn: asn, router: router})
+		}
+	}
+	if len(checks) == 0 {
+		return nil
+	}
+
+	const maxWorkers = 32
+	workers := min(maxWorkers, len(checks))
+	jobs := make(chan int, len(checks))
+	for i := range checks {
+		jobs <- i
+	}
+	close(jobs)
+	errs := make([]error, len(checks))
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for index := range jobs {
+				item := checks[index]
+				router := item.router
+				if ctx.Err() != nil {
+					errs[index] = ctx.Err()
+					continue
 				}
-				seen := 0
-				for _, session := range state.BGP.Sessions {
-					if session.RemoteAS == uint32(target) {
+				caps := top.SemanticHealthCapabilities(router)
+				env := &Env{Topology: top, AS: item.asn, Exec: exec, StateReader: stateReader}
+				if caps.BGPControl && routerHasReferenceBGPPeer(router, target) {
+					state, err := env.LiveDeviceState(ctx, router.ID, netstate.QueryBGPSessions)
+					if err != nil {
+						errs[index] = fmt.Errorf("%s read solved BGP control state: %w", router.ID, err)
 						continue
 					}
-					seen++
-					if !strings.EqualFold(session.State, "Established") {
-						return fmt.Errorf("%s solved BGP session to %s is %q, want Established",
-							router.ID, session.Neighbor, session.State)
+					seen := 0
+					for _, session := range state.BGP.Sessions {
+						if session.RemoteAS == uint32(target) {
+							continue
+						}
+						seen++
+						if !strings.EqualFold(session.State, "Established") {
+							errs[index] = fmt.Errorf(
+								"%s solved BGP session to %s is %q, want Established",
+								router.ID, session.Neighbor, session.State)
+							break
+						}
+					}
+					if errs[index] != nil {
+						continue
+					}
+					if seen == 0 {
+						errs[index] = fmt.Errorf("%s has no solved non-target BGP session", router.ID)
+						continue
 					}
 				}
-				if seen == 0 {
-					return fmt.Errorf("%s has no solved non-target BGP session", router.ID)
+				if caps.Forwarding && len(targets) > 0 {
+					errs[index] = verifyReferenceForwarding(ctx, exec, router.ID, targets)
 				}
 			}
-			if caps.Forwarding && len(targets) > 0 {
-				if err := verifyReferenceForwarding(ctx, exec, router.ID, targets); err != nil {
-					return err
-				}
-			}
+		}()
+	}
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			return err
 		}
 	}
 	return nil
@@ -125,7 +170,10 @@ func referenceBaselineTargets(top *model.Topology, target int) []string {
 		if as == nil {
 			continue
 		}
-		for _, device := range as.Devices {
+		devices := append([]*model.Device(nil), as.Devices...)
+		sort.Slice(devices, func(i, j int) bool { return devices[i].ID < devices[j].ID })
+		found := false
+		for _, device := range devices {
 			if device == nil || device.Kind != model.KindHost {
 				continue
 			}
@@ -142,6 +190,10 @@ func referenceBaselineTargets(top *model.Topology, target int) []string {
 					seen[address] = true
 					out = append(out, address)
 				}
+				found = true
+				break
+			}
+			if found {
 				break
 			}
 		}

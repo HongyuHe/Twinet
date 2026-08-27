@@ -2,8 +2,11 @@ package grade
 
 import (
 	"context"
+	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/HongyuHe/twinet/internal/model"
 	"github.com/HongyuHe/twinet/internal/netstate"
@@ -69,6 +72,73 @@ func TestReferenceBaselineRejectsBrokenSolvedForwarding(t *testing.T) {
 		}, baselineStateReader{state: "Established"})
 	if err == nil || !strings.Contains(err.Error(), "as4/R") || !strings.Contains(err.Error(), "3.5.0.1") {
 		t.Fatalf("broken solved forwarding passed reference baseline: %v", err)
+	}
+}
+
+func TestReferenceBaselineUsesOneForwardingWitnessPerAS(t *testing.T) {
+	top := referenceBaselineTopology()
+	for _, spec := range []struct {
+		id, address string
+		asn         int
+	}{
+		{"as4/H1", "4.101.0.2/24", 4},
+		{"as4/H2", "4.102.0.2/24", 4},
+		{"as5/H1", "5.101.0.2/24", 5},
+	} {
+		host := &model.Device{ID: spec.id, Name: spec.id, Kind: model.KindHost, ASN: spec.asn}
+		host.Ifaces = []*model.Iface{{Device: host, Name: "host", Addr4: spec.address}}
+		top.Devices[host.ID] = host
+		top.ASes[spec.asn].Devices = append(top.ASes[spec.asn].Devices, host)
+	}
+	targets := referenceBaselineTargets(top, 3)
+	if got, want := fmt.Sprint(targets), "[4.101.0.2 5.101.0.2]"; got != want {
+		t.Fatalf("reference targets = %s, want one deterministic host per AS %s", got, want)
+	}
+}
+
+func TestReferenceBaselineChecksRoutersConcurrently(t *testing.T) {
+	target := &model.Device{ID: "as3/R", Name: "R", Kind: model.KindRouter, ASN: 3}
+	host := &model.Device{ID: "as4/H", Name: "H", Kind: model.KindHost, ASN: 4}
+	host.Ifaces = []*model.Iface{{Device: host, Name: "host", Addr4: "4.101.0.2/24"}}
+	top := &model.Topology{
+		Devices: map[string]*model.Device{target.ID: target, host.ID: host},
+		ASes: map[int]*model.AS{
+			3: {ASN: 3, Role: model.RoleStudent, Routers: []*model.Device{target}, Devices: []*model.Device{target}},
+			4: {ASN: 4, Role: model.RoleStaff, Devices: []*model.Device{host}},
+		},
+	}
+	for asn := 10; asn < 50; asn++ {
+		router := &model.Device{
+			ID: fmt.Sprintf("as%d/R", asn), Name: "R", Kind: model.KindRouter, ASN: asn,
+		}
+		top.Devices[router.ID] = router
+		top.ASes[asn] = &model.AS{
+			ASN: asn, Role: model.RoleStaff,
+			Routers: []*model.Device{router}, Devices: []*model.Device{router},
+		}
+	}
+	var active, peak atomic.Int32
+	exec := func(context.Context, string, []string) (rt.ExecResult, error) {
+		current := active.Add(1)
+		for {
+			previous := peak.Load()
+			if current <= previous || peak.CompareAndSwap(previous, current) {
+				break
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+		active.Add(-1)
+		return rt.ExecResult{}, nil
+	}
+	if err := checkReferenceBaseline(context.Background(), top, 3,
+		referenceBaselineTargets(top, 3), exec, nil); err != nil {
+		t.Fatal(err)
+	}
+	if peak.Load() < 2 {
+		t.Fatalf("reference baseline peak concurrency = %d, want more than one", peak.Load())
+	}
+	if peak.Load() > 32 {
+		t.Fatalf("reference baseline peak concurrency = %d, exceeds bound 32", peak.Load())
 	}
 }
 
