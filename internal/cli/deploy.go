@@ -129,6 +129,9 @@ after a partial failure, a reboot, or a topology edit.`,
 					return err
 				}
 				if noop {
+					if err := persistAdoptedNoopPlacement(top, rec, adopted); err != nil {
+						return err
+					}
 					phases.print(cmd.ErrOrStderr())
 					return nil
 				}
@@ -1895,9 +1898,15 @@ func adoptRunningPlacement(ctx context.Context, top *model.Topology, token strin
 	if len(cs) == 0 {
 		return nil, nil
 	}
+	return runningPlacementRecord(top, cs)
+}
+
+func runningPlacementRecord(top *model.Topology, cs []runtime.Container) (*place.Record, error) {
 	r := &place.Record{Lab: top.Name, Strategy: "adopted", ByAS: map[int]string{},
-		ByService: map[string]string{}, ByServiceReplica: map[string]string{}}
+		ByGroup: map[string]string{}, ByService: map[string]string{},
+		ByServiceReplica: map[string]string{}}
 	conflict := map[int]string{}
+	groupConflict := map[string]string{}
 	for _, c := range cs {
 		node := c.Label(deploy.LabelNode)
 		asn, err := strconv.Atoi(c.Label(deploy.LabelAS))
@@ -1918,23 +1927,80 @@ func adoptRunningPlacement(ctx context.Context, top *model.Topology, token strin
 			}
 			continue
 		}
+		as := top.ASes[asn]
+		if as != nil && as.Distributable && len(as.PlacementGroups) > 0 {
+			deviceID := c.Label(deploy.LabelDeviceID)
+			device := top.Devices[deviceID]
+			if device == nil || device.ASN != asn || device.PlacementGroup == "" {
+				return nil, fmt.Errorf(
+					"the running container %s in distributable AS %d cannot be mapped to a current placement group; "+
+						"restore the matching manifest or pass --rebalance and accept that containers move",
+					c.Name, asn)
+			}
+			if previous, ok := r.ByGroup[device.PlacementGroup]; ok && previous != node {
+				groupConflict[device.PlacementGroup] = previous + " and " + node
+				continue
+			}
+			r.ByGroup[device.PlacementGroup] = node
+			continue
+		}
 		if prev, ok := r.ByAS[asn]; ok && prev != node {
 			conflict[asn] = prev + " and " + node
 			continue
 		}
 		r.ByAS[asn] = node
 	}
-	if len(conflict) > 0 {
+	for _, asn := range top.SortedASNs() {
+		as := top.ASes[asn]
+		if as == nil || !as.Distributable || len(as.PlacementGroups) == 0 {
+			continue
+		}
+		for _, group := range as.SortedPlacementGroups() {
+			if group.Class == "leaf" {
+				continue
+			}
+			if node := r.ByGroup[group.ID]; node != "" {
+				r.ByAS[asn] = node
+				break
+			}
+		}
+		if r.ByAS[asn] != "" {
+			continue
+		}
+		for _, group := range as.SortedPlacementGroups() {
+			if node := r.ByGroup[group.ID]; node != "" {
+				r.ByAS[asn] = node
+				break
+			}
+		}
+	}
+	if len(conflict) > 0 || len(groupConflict) > 0 {
 		var parts []string
 		for asn, where := range conflict {
 			parts = append(parts, fmt.Sprintf("AS %d has containers on %s", asn, where))
 		}
+		for group, where := range groupConflict {
+			parts = append(parts, fmt.Sprintf("placement group %s has containers on %s", group, where))
+		}
 		sort.Strings(parts)
-		return nil, fmt.Errorf("the running lab is already split across nodes, which placement "+
-			"never produces:\n  %s\nRun `twinet destroy` and deploy again, or pass --rebalance",
+		return nil, fmt.Errorf("the running lab is split across nodes outside a declared placement boundary:\n"+
+			"  %s\nRun `twinet destroy` and deploy again, or pass --rebalance",
 			strings.Join(parts, "\n  "))
 	}
 	return r, nil
+}
+
+func persistAdoptedNoopPlacement(top *model.Topology, record *place.Record, adopted bool) error {
+	if !adopted {
+		return nil
+	}
+	if top == nil || record == nil {
+		return errors.New("cannot persist an adopted placement without its topology and record")
+	}
+	if err := place.SaveRecord(labPrivateDir(top), record); err != nil {
+		return fmt.Errorf("the running lab is healthy but its adopted placement record could not be saved: %w", err)
+	}
+	return nil
 }
 
 // serviceRecordKeyOf maps a service container name to its service and stable
