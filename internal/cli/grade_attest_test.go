@@ -441,6 +441,50 @@ type fakeCompactAttestRunner struct {
 	review bool
 }
 
+type blockingAttestManager struct {
+	started chan<- string
+	release <-chan struct{}
+	name    string
+}
+
+func (m *blockingAttestManager) grade(context.Context, submission) *grade.Report {
+	m.started <- m.name
+	<-m.release
+	return &grade.Report{}
+}
+
+func (m *blockingAttestManager) close(context.Context) error { return nil }
+
+func TestFullAndCompactAuditPairRunConcurrently(t *testing.T) {
+	started := make(chan string, 2)
+	release := make(chan struct{})
+	runner := &warmCompactAttestRunner{
+		full:    &blockingAttestManager{started: started, release: release, name: "full"},
+		compact: &blockingAttestManager{started: started, release: release, name: "compact"},
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := runner.Run(context.Background(), submission{}, "case")
+		done <- err
+	}()
+	seen := map[string]bool{}
+	for range 2 {
+		select {
+		case name := <-started:
+			seen[name] = true
+		case <-time.After(time.Second):
+			t.Fatal("full and compact audit pair ran serially")
+		}
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if !seen["full"] || !seen["compact"] {
+		t.Fatalf("started audit sides = %v", seen)
+	}
+}
+
 func (r *fakeCompactAttestRunner) Run(_ context.Context, _ submission, name string) (compactAttestResult, error) {
 	r.runs = append(r.runs, name)
 	full := fakeAttestReport(name == "reference")

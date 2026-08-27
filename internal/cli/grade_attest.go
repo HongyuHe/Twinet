@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -469,12 +470,25 @@ func newWarmCompactAttestRunner(ctx context.Context, top *model.Topology, rubric
 }
 
 func (r *warmCompactAttestRunner) Run(ctx context.Context, sub submission, _ string) (compactAttestResult, error) {
-	started := time.Now()
-	full := r.full.grade(ctx, sub)
-	fullDuration := time.Since(started)
-	started = time.Now()
-	compact := r.compact.grade(ctx, sub)
-	compactDuration := time.Since(started)
+	var (
+		full, compact                 *grade.Report
+		fullDuration, compactDuration time.Duration
+		wg                            sync.WaitGroup
+	)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		started := time.Now()
+		full = r.full.grade(ctx, sub)
+		fullDuration = time.Since(started)
+	}()
+	go func() {
+		defer wg.Done()
+		started := time.Now()
+		compact = r.compact.grade(ctx, sub)
+		compactDuration = time.Since(started)
+	}()
+	wg.Wait()
 	if full == nil || compact == nil {
 		return compactAttestResult{}, fmt.Errorf("warm audit runner produced a nil report")
 	}
