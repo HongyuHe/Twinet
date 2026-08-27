@@ -341,10 +341,20 @@ func modelledPlatformAddresses(d *model.Device) []string {
 // that needs this most is a capture, and the store a capture must be judged
 // against is the one it is about to write. An engine assembled only to capture
 // need not have been given the same one.
+//
+// Ownership is allowed to rule a device out only while the manifest still
+// describes it. A prune's candidates are exactly the devices it no longer
+// does: one removed from the manifest has no autonomous system left to hold a
+// role, so asking whether a student owns it answers no for every orphan --
+// including the orphan whose only copy of a term's work is the snapshot this
+// exists to protect. For those the store is the evidence, and it is read.
 func savedNamespaceObjects(store *state.Store, top *model.Topology, d *model.Device,
 ) (map[state.Kind][]string, error) {
 	out := map[state.Kind][]string{}
-	if store == nil || top == nil || d == nil || !studentOwned(top, d) {
+	if store == nil || top == nil || d == nil {
+		return out, nil
+	}
+	if _, modelled := top.Device(d.ID); modelled && !studentOwned(top, d) {
 		return out, nil
 	}
 	for _, kind := range namespaceBackedKinds {
@@ -722,8 +732,15 @@ var namespaceBackedKinds = []state.Kind{state.KindAddrs, state.KindTunnels, stat
 // no baseline -- because none was ever taken, or because the file holding them
 // could not be read -- has to prove continuity against what is saved before it
 // may overwrite it, which is the same answer by a longer route.
+//
+// recordBaselines says whether a baseline this proves may be written back.
+// A capture taken inside a running deployment must not: the configure steps
+// executing beside it are writing the same file through the build's own
+// tracker, and this one was loaded from disk before they started. The proof
+// still decides what this capture may store -- that is held on the engine --
+// and the next pass proves it again.
 func (e *Engine) ensureCaptureSafety(ctx context.Context, top *model.Topology,
-	store *state.Store, devices []*model.Device,
+	store *state.Store, devices []*model.Device, recordBaselines bool,
 ) []string {
 	if e.Runtime == nil || top == nil || store == nil || len(devices) == 0 {
 		return nil
@@ -770,7 +787,7 @@ func (e *Engine) ensureCaptureSafety(ctx context.Context, top *model.Topology,
 			tracker.bootstrapNamespace(d.ID, baselines[i])
 		}
 	}
-	if e.ObservationReadOnly {
+	if e.ObservationReadOnly || !recordBaselines {
 		return problems
 	}
 	if err := tracker.save(); err != nil &&

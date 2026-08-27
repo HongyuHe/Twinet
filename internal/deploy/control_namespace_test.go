@@ -39,6 +39,13 @@ type namespaceAwareRuntime struct {
 	// onProbe runs when a container's namespace is read, so a test can restart
 	// a device in the middle of the proof that brackets that reading.
 	onProbe func(container string)
+	// onCapture runs when a capture reads a container's addressing, so a test
+	// can restart a device between the reading and the identity resolved after
+	// it -- which is the window the capture guard exists to close.
+	onCapture func(container string)
+	// onStart runs when a stopped container is started, so a test can give it
+	// the new and empty namespace a started task actually gets.
+	onStart func(container string)
 	// nsMu guards the three maps above. A pass settles every unbaselined
 	// device concurrently, and a test that moves one of them mid-proof is
 	// writing from one goroutine what another is reading.
@@ -170,8 +177,11 @@ func (r *namespaceAwareRuntime) Exec(ctx context.Context, c string, cmd rt.ExecC
 			// reads, out of the same namespace. A fake that let the two
 			// disagree could pass a test the kernel would fail.
 			r.nsMu.Lock()
-			body := r.contents[c]
+			body, moved := r.contents[c], r.onCapture
 			r.nsMu.Unlock()
+			if moved != nil {
+				moved(c)
+			}
 			_, addrs := splitNamespaceProbe(body)
 			return rt.ExecResult{Stdout: addrs}, nil
 		case tunnelCapture:
@@ -221,6 +231,23 @@ func (r *namespaceAwareRuntime) Inspect(_ context.Context, name string) (rt.Cont
 
 func (r *namespaceAwareRuntime) Remove(_ context.Context, name string, _ bool) error {
 	r.removed = append(r.removed, name)
+	return nil
+}
+
+// Start brings a stopped container back, in a new and empty network namespace,
+// which is what actually happens: a task's namespace dies with the task, and
+// starting the container makes another one.
+func (r *namespaceAwareRuntime) Start(_ context.Context, name string) error {
+	r.mu.Lock()
+	for i := range r.containers {
+		if r.containers[i].Name == name {
+			r.containers[i].State = rt.StateRunning
+		}
+	}
+	r.mu.Unlock()
+	if r.onStart != nil {
+		r.onStart(name)
+	}
 	return nil
 }
 

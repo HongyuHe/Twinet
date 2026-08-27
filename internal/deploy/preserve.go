@@ -591,14 +591,7 @@ func (e *Engine) captureSelected(ctx context.Context, top *model.Topology, store
 		})
 	})
 
-	saved := 0
 	var problems []string
-	// After the readings and before anything is written. A device that
-	// restarted between the two is caught, because the identity is resolved
-	// once the namespace has already been read; a device that restarts after
-	// this does not matter, because what was read came out of the namespace
-	// this proved.
-	problems = append(problems, e.ensureCaptureSafety(ctx, top, store, devices)...)
 	for i, d := range devices {
 		err := captureErrs[i]
 		if err != nil && !errors.Is(err, ErrNotRunning) {
@@ -611,6 +604,47 @@ func (e *Engine) captureSelected(ctx context.Context, top *model.Topology, store
 			// Whatever was read is still stored: a partial snapshot is worth
 			// more than none, and the failure is reported either way.
 		}
+	}
+	saved, storeProblems := e.storeCaptured(ctx, top, store, devices, captures, true)
+	problems = append(problems, storeProblems...)
+	if len(problems) > 0 {
+		return saved, deterministicError(ctxErr, problems)
+	}
+	return saved, ctxErr
+}
+
+// storeCaptured writes what a capture read into the state store, and is the
+// only place in the engine that writes a captured snapshot.
+//
+// The guard that decides whether a device's namespace is still the one its
+// saved state came out of hangs off this, so that a path which captures
+// without going through the capture API cannot exist by accident. Three did.
+// A destructive replacement read a container and stored it directly; a prune
+// read a container it was about to delete and stored it directly; and the
+// state export that hands a device to another node did the same. Each was
+// written before the guard, each looked complete on its own, and each was a
+// way for an empty namespace to be filed over a term's work by a pass that
+// then reported success.
+//
+// The safety check runs after the readings and before anything is written. A
+// device that restarted between the two is caught, because the identity is
+// resolved once the namespace has already been read; a device that restarts
+// after this does not matter, because what was read came out of the namespace
+// this proved.
+//
+// Devices whose namespace could not be vouched for are not named in the
+// returned problems: withholding their namespace-backed snapshots is the
+// correct, non-failing outcome for a capture, and the engine already carries
+// the finding for the callers -- a prune, a report -- that must act on it.
+func (e *Engine) storeCaptured(ctx context.Context, top *model.Topology, store *state.Store,
+	devices []*model.Device, captures [][]state.Snapshot, recordBaselines bool,
+) (int, []string) {
+	if store == nil || len(devices) == 0 {
+		return 0, nil
+	}
+	problems := e.ensureCaptureSafety(ctx, top, store, devices, recordBaselines)
+	saved := 0
+	for i, d := range devices {
 		for _, s := range e.storableSnapshots(ctx, d, captures[i]) {
 			changed, err := store.Put(s)
 			if err != nil {
@@ -622,10 +656,7 @@ func (e *Engine) captureSelected(ctx context.Context, top *model.Topology, store
 			}
 		}
 	}
-	if len(problems) > 0 {
-		return saved, deterministicError(ctxErr, problems)
-	}
-	return saved, ctxErr
+	return saved, problems
 }
 
 // cleanRunningConfig strips the preamble vtysh prints before a configuration.

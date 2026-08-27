@@ -395,6 +395,25 @@ reached students, and each motivated a permanent test.
    the containers itself and never went through the capture API at all, goes
    through it now.
 
+   The two paths that write on the way to deleting a container. A destructive
+   replacement captures the container it is about to rebuild, and a prune
+   captures each orphan it is about to remove; both read the container and
+   wrote what they read straight into the store, past the API and past the
+   guard on it. Both were the same defect as the rest with the recovery removed
+   -- the container stops existing immediately afterwards, so what they store is
+   the last word on what was in it. The replacement is worse than it looks,
+   because a stopped container is *started* first so its configuration can be
+   recovered, and starting it is exactly what gives it a new empty namespace.
+   Both now write through one funnel, and reading a container anywhere in this
+   package is checked against a list. What a prune does with an orphan it cannot
+   account for changed with it: a namespace proven replaced is still removed,
+   since what is in it is demonstrably not the student's work and a device that
+   moved must not go on announcing its prefixes from two places; a namespace
+   nothing could account for is refused and named, since this pass deliberately
+   did not save what is in it. Ownership stopped being the question asked about
+   an orphan's saved state, because a device the manifest has forgotten has no
+   autonomous system left to own it and the store is the only evidence there is.
+
 10. **A release gate that answered yes without looking.** `make ci` printed
     "all CI gates passed" while skipping the lint and the shell check whenever
     their tools were absent, which on the development machine was always.

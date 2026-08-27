@@ -612,6 +612,21 @@ rather than being credited with it. Configuration files are captured either
 way: they are on a filesystem, they survived, and withholding them would be a
 different way of losing the same work.
 
+Two paths used to write a capture without going through that API at all, and
+both were paths where the container is about to stop existing. A device whose
+specification changed is captured and then replaced; a device that left the
+manifest, or moved to another node, is captured and then deleted. Both now go
+through the same guarded write. The consequence for the second is worth stating
+plainly, because it changes what a prune does: an orphan whose namespace was
+*proven* to have been replaced is still removed — what is in it now demonstrably
+is not the student's work, the saved copy was left alone, and leaving a moved
+device running would have it announcing its prefixes from two places — while an
+orphan whose namespace could *not* be accounted for is refused, named, and left
+where it is, because this pass deliberately did not save what is in it and
+removing it would destroy the only thing that could still answer the question.
+Both keep the routing configuration. `twinet destroy` remains the way to say
+that a lab is genuinely disposable.
+
 Every device left in that state is reported. The node publishes them in its
 apply response as `unproven_namespaces`, keyed by device with the reason for
 each, and `twinet deploy` prints one `UNPROVEN NAMESPACE:` line per device and
