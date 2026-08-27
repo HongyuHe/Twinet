@@ -75,6 +75,7 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 			Runtime: s.rt, Node: s.cfg.Node, Limiter: s.workLimiter(),
 			UnderlayIP: s.cfg.UnderlayIP, UnderlayDev: s.cfg.UnderlayDev,
 			PeerUnderlay: s.peerUnderlay(req.Lab), ForceOverlayReconcile: true,
+			ObservationRoot: s.observationRoot,
 		})
 		report, err := repair.ReconcileOverlayBindings(r.Context(), top)
 		s.release(req.Lab)

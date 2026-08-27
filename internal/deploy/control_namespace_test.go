@@ -51,6 +51,15 @@ type namespaceAwareRuntime struct {
 	// that leaves no trace in the store when both hold the same state, and a
 	// silent one when the reading is thrown away.
 	read map[string]int
+	// markers is the restore-pending file, per container, as a filesystem
+	// would hold it: written, read back and removed. It is the only part of
+	// "this device owes its student a replay" that another process can see,
+	// and a fake that answered "no marker" to everything would let a test
+	// prove a guard that does not hold.
+	markers map[string]bool
+	// markerErr makes writing that file fail, which is what a device that
+	// cannot be marked before it is emptied looks like.
+	markerErr map[string]error
 	// nsMu guards the three maps above. A pass settles every unbaselined
 	// device concurrently, and a test that moves one of them mid-proof is
 	// writing from one goroutine what another is reading.
@@ -92,6 +101,26 @@ func (r *namespaceAwareRuntime) readsOf(name string) int {
 	r.nsMu.Lock()
 	defer r.nsMu.Unlock()
 	return r.read[name]
+}
+
+// failMarker makes writing the restore-pending file fail, which is what a
+// device that cannot be marked before it is emptied looks like.
+func (r *namespaceAwareRuntime) failMarker(name string, err error) {
+	r.nsMu.Lock()
+	defer r.nsMu.Unlock()
+	if r.markerErr == nil {
+		r.markerErr = map[string]error{}
+	}
+	r.markerErr[name] = err
+}
+
+// owes reports whether this container is carrying the restore-pending marker,
+// which is how one engine tells every other engine and every later process
+// that what is in a namespace is not the student's work yet.
+func (r *namespaceAwareRuntime) owes(name string) bool {
+	r.nsMu.Lock()
+	defer r.nsMu.Unlock()
+	return r.markers[name]
 }
 
 func (r *namespaceAwareRuntime) setFRR(name, body string) {
@@ -178,7 +207,30 @@ func (r *namespaceAwareRuntime) Exec(ctx context.Context, c string, cmd rt.ExecC
 	r.read[c]++
 	r.nsMu.Unlock()
 	if strings.HasPrefix(strings.Join(cmd.Cmd, " "), "test -f "+restoreMarker) {
+		r.nsMu.Lock()
+		defer r.nsMu.Unlock()
+		if r.markers[c] {
+			return rt.ExecResult{}, nil
+		}
 		return rt.ExecResult{ExitCode: 1}, nil
+	}
+	if strings.HasPrefix(strings.Join(cmd.Cmd, " "), "rm -f "+restoreMarker) {
+		r.nsMu.Lock()
+		defer r.nsMu.Unlock()
+		delete(r.markers, c)
+		return rt.ExecResult{}, nil
+	}
+	if len(cmd.Cmd) == 3 && cmd.Cmd[0] == "sh" && cmd.Cmd[2] == restoreMarkerScript {
+		r.nsMu.Lock()
+		defer r.nsMu.Unlock()
+		if err := r.markerErr[c]; err != nil {
+			return rt.ExecResult{}, err
+		}
+		if r.markers == nil {
+			r.markers = map[string]bool{}
+		}
+		r.markers[c] = true
+		return rt.ExecResult{}, nil
 	}
 	if len(cmd.Cmd) == 3 && cmd.Cmd[0] == "sh" {
 		switch cmd.Cmd[2] {

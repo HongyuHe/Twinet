@@ -1450,6 +1450,7 @@ func (s *Server) snapshotRollbackContracts(ctx context.Context, top *model.Topol
 		Renderer:   renderer(top, render.Mode(mode), ungraded),
 		UnderlayIP: s.cfg.UnderlayIP, UnderlayDev: s.cfg.UnderlayDev,
 		PeerUnderlay: s.peerUnderlay(top.Name), Generation: generation,
+		ObservationRoot: s.observationRoot,
 	}
 	if top.Lab != nil {
 		engine.RequireImmutableImages = top.Lab.Images.RequiresImmutableImages()
@@ -1826,6 +1827,7 @@ func (s *Server) migrateLegacyCommittedInventory(ctx context.Context, lab string
 		Runtime: s.rt, Node: s.cfg.Node, Limiter: s.workLimiter(),
 		UnderlayIP: s.cfg.UnderlayIP, UnderlayDev: s.cfg.UnderlayDev,
 		PeerUnderlay: peer, Generation: committed.Generation,
+		ObservationRoot: s.observationRoot,
 	}
 	expected, err := eng.ExpectedOverlayInventory(top)
 	if err != nil {

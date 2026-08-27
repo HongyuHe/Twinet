@@ -514,7 +514,8 @@ func (s *Server) captureAndReplicateSelected(ctx context.Context, top *model.Top
 	mode, ungraded := s.modeAndUngraded(top.Name)
 	eng := &deploy.Engine{
 		Runtime: s.rt, Node: s.cfg.Node, Limiter: s.workLimiter(), State: s.store,
-		Renderer: renderer(top, render.ModePlatform, 0),
+		Renderer:        renderer(top, render.ModePlatform, 0),
+		ObservationRoot: s.observationRoot,
 	}
 	eligible := map[string]bool{}
 	for _, device := range top.DevicesOnNode(s.cfg.Node) {

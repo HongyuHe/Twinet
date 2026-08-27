@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/HongyuHe/twinet/internal/model"
@@ -12,14 +13,69 @@ import (
 
 // rewireScopeRuntime cannot enter any namespace, which is how a unit test
 // reaches the wiring step without building a veth pair on the host.
+//
+// It does keep the two things the rewire bookkeeping is made of honestly: the
+// identity of each container's namespace, and the restore-pending file inside
+// it.
 type rewireScopeRuntime struct {
 	rt.Runtime
+	mu       sync.Mutex
+	identity map[string]rt.NetnsIdentity
+	markers  map[string]bool
+}
+
+func newRewireScopeRuntime() *rewireScopeRuntime {
+	return &rewireScopeRuntime{
+		identity: map[string]rt.NetnsIdentity{}, markers: map[string]bool{},
+	}
 }
 
 func (*rewireScopeRuntime) Name() string { return "containerd" }
 
 func (*rewireScopeRuntime) NSPath(context.Context, string) (string, error) {
 	return "", errors.New("no namespace path in a unit test")
+}
+
+func (r *rewireScopeRuntime) NetnsIdentity(_ context.Context, name string) (rt.NetnsIdentity, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	identity, ok := r.identity[name]
+	if !ok {
+		return rt.NetnsIdentity{Dev: 4, Inode: 4026530000 + uint64(len(name))}, nil
+	}
+	return identity, nil
+}
+
+func (r *rewireScopeRuntime) ObservedNetnsIdentity(ctx context.Context,
+	container rt.Container,
+) (rt.NetnsIdentity, error) {
+	return r.NetnsIdentity(ctx, container.Name)
+}
+
+func (r *rewireScopeRuntime) Exec(_ context.Context, container string,
+	cmd rt.ExecCmd,
+) (rt.ExecResult, error) {
+	joined := strings.Join(cmd.Cmd, " ")
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	switch {
+	case strings.HasPrefix(joined, "test -f "+restoreMarker):
+		if r.markers[container] {
+			return rt.ExecResult{}, nil
+		}
+		return rt.ExecResult{ExitCode: 1}, nil
+	case strings.HasPrefix(joined, "rm -f "+restoreMarker):
+		delete(r.markers, container)
+	case len(cmd.Cmd) == 3 && cmd.Cmd[0] == "sh" && cmd.Cmd[2] == restoreMarkerScript:
+		r.markers[container] = true
+	}
+	return rt.ExecResult{}, nil
+}
+
+func (r *rewireScopeRuntime) owes(container string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.markers[container]
 }
 
 // rewireScopeLab is two routers on this node with a cable between them, one
@@ -94,7 +150,7 @@ func TestTheScopeOfARewireIsOneHopOnThisNode(t *testing.T) {
 // re-rendered or replayed as though the repair had happened.
 func TestAFailedRewireReplaysNothingAndTrustsNothing(t *testing.T) {
 	top, target := rewireScopeLab()
-	engine := &Engine{Runtime: &rewireScopeRuntime{}, Node: "n0"}
+	engine := &Engine{Runtime: newRewireScopeRuntime(), Node: "n0", ObservationRoot: t.TempDir()}
 	replayed := []string{}
 
 	err := engine.RewireDeviceAndPeers(context.Background(), top, target,
@@ -136,13 +192,19 @@ func TestAFailedRewireReplaysNothingAndTrustsNothing(t *testing.T) {
 // reported success.
 func TestARewirePutsBackEveryNeighbourItRebuilt(t *testing.T) {
 	top, target := rewireScopeLab()
-	engine := &Engine{Runtime: &rewireScopeRuntime{}, Node: "n0"}
+	runtime := newRewireScopeRuntime()
+	engine := &Engine{Runtime: runtime, Node: "n0", ObservationRoot: t.TempDir()}
 	engine.markNamespaceStateLost(target.ID)
 	engine.markNamespaceStateLost("as2/B")
 	var replayed []string
 
 	peers := LocalRewirePeers(top, "n0", target)
-	if err := engine.restoreRewiredPeers(context.Background(), target, peers,
+	for _, d := range append([]*model.Device{target}, peers...) {
+		if err := engine.holdNamespaceState(context.Background(), d); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := engine.restoreRewiredPeers(context.Background(), top, target, peers,
 		func(_ context.Context, d *model.Device) error {
 			replayed = append(replayed, d.ID)
 			return nil
@@ -161,18 +223,32 @@ func TestARewirePutsBackEveryNeighbourItRebuilt(t *testing.T) {
 			t.Fatalf("%s was put back and the engine still refuses to vouch for it", id)
 		}
 	}
+	// And nothing is left owing a replay it has already had. A marker that
+	// outlives its restore withholds the device from every later capture, so
+	// the next thing the student does on it is never saved.
+	for _, container := range []string{"c-a", "c-b"} {
+		if runtime.owes(container) {
+			t.Fatalf("%s was put back and is still marked as owing its saved state", container)
+		}
+	}
 }
 
 // A replay that fails leaves the device it failed on distrusted, so a later
 // capture cannot file the bare namespace it is still sitting in.
 func TestARewireWhoseReplayFailsKeepsRefusingToVouchForIt(t *testing.T) {
 	top, target := rewireScopeLab()
-	engine := &Engine{Runtime: &rewireScopeRuntime{}, Node: "n0"}
+	runtime := newRewireScopeRuntime()
+	engine := &Engine{Runtime: runtime, Node: "n0", ObservationRoot: t.TempDir()}
 	engine.markNamespaceStateLost(target.ID)
 	engine.markNamespaceStateLost("as2/B")
 
 	peers := LocalRewirePeers(top, "n0", target)
-	err := engine.restoreRewiredPeers(context.Background(), target, peers,
+	for _, d := range append([]*model.Device{target}, peers...) {
+		if err := engine.holdNamespaceState(context.Background(), d); err != nil {
+			t.Fatal(err)
+		}
+	}
+	err := engine.restoreRewiredPeers(context.Background(), top, target, peers,
 		func(_ context.Context, d *model.Device) error {
 			if d.ID == "as2/B" {
 				return errors.New("the neighbour would not take its addressing back")
@@ -185,5 +261,11 @@ func TestARewireWhoseReplayFailsKeepsRefusingToVouchForIt(t *testing.T) {
 	if !engine.namespaceStateLost("as2/B") {
 		t.Fatal("the neighbour whose replay failed is vouched for anyway; a capture would " +
 			"file its bare interfaces over the only copy of the student's addressing")
+	}
+	// The marker is what carries that refusal to every other engine and every
+	// later process, which is where the periodic capture lives.
+	if !runtime.owes("c-b") {
+		t.Fatal("the neighbour whose replay failed is no longer marked as owing one, so " +
+			"the next capture from any other engine would file its bare interfaces")
 	}
 }

@@ -460,7 +460,7 @@ placement:
 	assertContainerdCaptureOutsideADeployRefusesAReplacedNamespace(t, ctx, runtime, teaching,
 		top, device, store, lab, filepath.Join(work, "observed"))
 	assertContainerdRepairPutsTheNeighbourBackToo(t, ctx, runtime, teaching, top, device,
-		store, lab)
+		store, lab, filepath.Join(work, "observed"))
 	if err := engine.Destroy(ctx, lab); err != nil {
 		t.Fatal(err)
 	}
@@ -1403,7 +1403,7 @@ func recordedContainerdNamespace(t *testing.T, observedRoot, id string) (rt.Netn
 // production entry point, called once, with the production replay.
 func assertContainerdRepairPutsTheNeighbourBackToo(t *testing.T, ctx context.Context,
 	runtime rt.Runtime, engine *deploy.Engine, top *model.Topology, device *model.Device,
-	store *state.Store, lab string,
+	store *state.Store, lab, observedRoot string,
 ) {
 	t.Helper()
 	peers := deploy.LocalRewirePeers(top, engine.Node, device)
@@ -1494,4 +1494,52 @@ func assertContainerdRepairPutsTheNeighbourBackToo(t *testing.T, ctx context.Con
 		120*time.Second)
 	requireFullOSPFNeighbour(t, ctx, runtime, neighbour, "after the neighbour-aware repair",
 		120*time.Second)
+
+	// A repair also has to hand the device back to everything else that reads
+	// it. The record still names the namespace that died with the old task
+	// unless the repair rewrites it, and every later capture compares against
+	// the record: it would find a mismatch, call the namespace replaced, and
+	// withhold this router's addressing from the store from now on. The device
+	// would be repaired, reported repaired, and quietly never backed up again.
+	repaired, err := rt.NetnsIdentityOf(ctx, runtime, device.Container)
+	if err != nil {
+		t.Fatalf("proving the network namespace of %s after the repair: %v", device.ID, err)
+	}
+	recorded, known := recordedContainerdNamespace(t, observedRoot, device.ID)
+	if !known || !recorded.SameAs(repaired) {
+		t.Fatalf("the repair put %s back in %s and the record says %v/%s; every later "+
+			"capture compares against the record", device.ID, repaired, known, recorded)
+	}
+	for _, affected := range append([]*model.Device{device}, peers...) {
+		result, err := runtime.Exec(ctx, affected.Container,
+			rt.ExecCmd{Cmd: []string{"test", "-f", "/etc/twinet/restore-pending"}})
+		if err != nil {
+			t.Fatalf("asking %s whether it still owes a restore: %v", affected.ID, err)
+		}
+		if result.ExitCode == 0 {
+			t.Fatalf("%s was repaired and is still marked as owing its saved state, so "+
+				"nothing will capture from it again", affected.ID)
+		}
+	}
+	// And the proof of both: a capture by an engine that did none of the above,
+	// which is what periodic durability is, stores what is on the repaired
+	// router now.
+	fresh := &deploy.Engine{
+		Runtime: runtime, Node: engine.Node, State: store,
+		Renderer:        engine.Renderer,
+		ObservationRoot: observedRoot,
+		FRRControlRoot:  engine.FRRControlRoot,
+		WritableRoot:    engine.WritableRoot,
+	}
+	if _, err := fresh.CaptureDevices(ctx, top, store, []string{device.ID}); err != nil {
+		t.Fatalf("capturing %s after the repair: %v", device.ID, err)
+	}
+	requireSavedAddress(t, store, lab, device, modelledLoopback(t, device))
+	if unproven := fresh.UnprovenNamespaceDevices(); len(unproven) > 0 {
+		t.Fatalf("a capture after the repair still cannot vouch for %v", unproven)
+	}
+	if dirty := fresh.DirtyNamespaceStateDevices(); len(dirty) > 0 {
+		t.Fatalf("a capture after the repair still treats %v as having lost its namespace, "+
+			"so its addressing is being withheld from the store", dirty)
+	}
 }

@@ -2,12 +2,15 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"io/fs"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -293,8 +296,14 @@ func rewireLab(t *testing.T) (*Server, *model.Topology, *state.Store, *rewireRun
 
 	server := &Server{
 		cfg: Config{Node: "n0"}, store: store, rt: runtime,
-		current: map[string]*model.Topology{top.Name: top},
-		modes:   map[string]string{}, ungraded: map[string]int{},
+		// A writable record of what this node observed. The real default is a
+		// root-owned directory under /run, and without one every device looks
+		// unbaselined for ever -- which hides exactly the distinction these
+		// tests are about, between a namespace that is known to have been
+		// replaced and one nothing can account for.
+		observationRoot: t.TempDir(),
+		current:         map[string]*model.Topology{top.Name: top},
+		modes:           map[string]string{}, ungraded: map[string]int{},
 		peers: map[string]map[string]string{}, ops: map[string]*lease{},
 		holds: map[string]*hold{}, lastCapture: map[string]time.Time{},
 		durabilityBusy: map[string]bool{},
@@ -519,6 +528,165 @@ func baselineNamespaces(t *testing.T, server *Server, top *model.Topology, ids [
 	t.Helper()
 	if _, err := server.captureAndReplicateDirty(context.Background(), top, ids); err != nil {
 		t.Fatalf("baseline capture: %v", err)
+	}
+	// The premise every "it restarted" test below rests on. A restart is only
+	// a *known* replacement if there was a namespace written down to compare
+	// against; without one the device is not a known loss at all, it is one
+	// nothing can account for, and the two are deliberately treated in
+	// opposite ways. If baselining ever silently stops happening, the tests
+	// that matter would go on passing for the wrong reason.
+	recorded := recordedNamespaces(t, server)
+	for _, id := range ids {
+		if !recorded[id] {
+			t.Fatalf("%s was captured but the namespace it was captured from was not "+
+				"written down, so nothing after this is about a namespace that is known "+
+				"to have changed", id)
+		}
+	}
+}
+
+// recordedNamespaces reads back the namespaces this node has written down.
+func recordedNamespaces(t *testing.T, server *Server) map[string]bool {
+	t.Helper()
+	out := map[string]bool{}
+	entries, err := os.ReadDir(server.observationRoot)
+	if err != nil {
+		t.Fatalf("read the observed-state directory: %v", err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		raw, err := os.ReadFile(filepath.Join(server.observationRoot, entry.Name()))
+		if err != nil {
+			t.Fatalf("read %s: %v", entry.Name(), err)
+		}
+		var decoded struct {
+			Namespaces map[string]rt.NetnsIdentity `json:"namespaces"`
+		}
+		if err := json.Unmarshal(raw, &decoded); err != nil {
+			t.Fatalf("decode %s: %v", entry.Name(), err)
+		}
+		for id, identity := range decoded.Namespaces {
+			if identity.Known() {
+				out[id] = true
+			}
+		}
+	}
+	return out
+}
+
+// The other half of that rule, and the half that is easy to get wrong.
+//
+// "Unproven" is not a weaker form of "broken": it is a namespace nothing can
+// account for. It may be the original one, still holding work that was never
+// captured, and rewiring deletes every interface in it and replays a snapshot
+// over the top. The device having been reported broken is not evidence about
+// what is in its namespace, so it earns no exemption -- the exemption belongs
+// to a namespace that is *provably* a replacement, which is a different
+// finding and is tested above.
+func TestARewireRefusesWhenTheBrokenDeviceItselfCannotBeVouchedFor(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		break_ func(*rewireRuntime, *model.Device)
+	}{
+		{
+			// The namespace will not answer at all. Nothing can be read out of
+			// it, so nothing can be saved out of it either.
+			name: "its namespace will not answer",
+			break_: func(runtime *rewireRuntime, target *model.Device) {
+				runtime.unreadable[target.Container] = true
+			},
+		},
+		{
+			// The namespace answers, and what is in it is not what was saved
+			// out of it. This is the one the exemption used to wave through:
+			// the capture succeeds, so nothing fails, and the only thing
+			// standing between the student's work and a rewire is whether this
+			// node is willing to say it does not know.
+			name: "its namespace answers and does not hold what was saved from it",
+			break_: func(runtime *rewireRuntime, target *model.Device) {
+				runtime.mu.Lock()
+				defer runtime.mu.Unlock()
+				runtime.namespace[target.Container] = namespaceHolding(nil, nil)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server, top, store, runtime := rewireLab(t)
+			target := top.Devices["as1/A"]
+			saveAddrs(t, store, top, target.ID,
+				"twinet-state/v2 addrs\naddr inet port_B 1.0.1.1/24\naddr inet port_C 1.0.2.1/24\n")
+			// Never baselined: no capture has ever been able to say which
+			// namespace this device's saved state came out of.
+			tc.break_(runtime, target)
+			engine := &fakeRewireEngine{runtime: runtime, top: top, node: "n0"}
+
+			err := server.rewireWithPeers(context.Background(), rewireRequest{
+				engine: engine, top: top, device: target, mode: render.ModePlatform,
+			})
+			if err == nil {
+				t.Fatal("a rewire emptied a namespace nothing could account for and " +
+					"reported success")
+			}
+			if !strings.Contains(err.Error(), target.ID) {
+				t.Fatalf("the refusal does not name the device it is protecting: %v", err)
+			}
+			if rewireStageOf(err) != stagePreserve {
+				t.Fatalf("the refusal is reported as stage %q, not as a refusal before "+
+					"any mutation", rewireStageOf(err))
+			}
+			if len(engine.calls) != 0 {
+				t.Fatalf("the wiring ran anyway: %v", engine.calls)
+			}
+			if saved := savedAddrsOf(t, store, top.Name, target.ID); !strings.Contains(saved,
+				"addr inet port_B 1.0.1.1/24") {
+				t.Fatalf("the refusal still overwrote the saved state it was "+
+					"protecting:\n%s", saved)
+			}
+			if recorded := recordedNamespaces(t, server); recorded[target.ID] {
+				t.Fatal("a namespace nothing could account for was written down as this " +
+					"device's own")
+			}
+		})
+	}
+}
+
+// A capture that only exists on the node that is about to break is not a copy.
+//
+// The reading taken here is the sole record of interfaces that are about to
+// stop existing, and this lab's policy says it must live on more than one
+// node. If it cannot get there, the interfaces stay up.
+func TestARewireWillNotUnplugAnythingItCouldNotCopyOffThisNode(t *testing.T) {
+	server, top, store, runtime := rewireLab(t)
+	top.Lab.State.ReplicationFactor = 2
+	saveAddrs(t, store, top, "as1/B", "twinet-state/v2 addrs\naddr inet port_A 1.0.1.2/24\n")
+	dialled := 0
+	server.peerDial = func(context.Context, model.NodeSpec) (peerStateClient, error) {
+		dialled++
+		return nil, errors.New("the other node is down")
+	}
+	engine := &fakeRewireEngine{runtime: runtime, top: top, node: "n0"}
+
+	err := server.rewireWithPeers(context.Background(), rewireRequest{
+		engine: engine, top: top, device: top.Devices["as1/A"], mode: render.ModePlatform,
+	})
+	if err == nil {
+		t.Fatal("a rewire destroyed interfaces whose only reading it could not copy anywhere")
+	}
+	if rewireStageOf(err) != stagePreserve {
+		t.Fatalf("the refusal is reported as stage %q, not as a refusal before any mutation",
+			rewireStageOf(err))
+	}
+	if len(engine.calls) != 0 {
+		t.Fatalf("the wiring ran anyway: %v", engine.calls)
+	}
+	if dialled == 0 {
+		t.Fatal("the lab asks for two copies and the rewire never tried to make the second")
+	}
+	if saved := savedAddrsOf(t, store, top.Name, "as1/B"); !strings.Contains(saved,
+		"addr inet port_A 1.0.1.2/24") {
+		t.Fatalf("the refusal still overwrote the neighbour's saved state:\n%s", saved)
 	}
 }
 

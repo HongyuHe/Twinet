@@ -564,6 +564,42 @@ adjacency; the repaired router had zero OSPF neighbours and the agent logged
 - **asks each device's own mode.** A private grading harness is solved
   everywhere except the system under evaluation, so that system's work is saved
   and replayed and the solved routers around it are neither read nor written.
+- **accounts for the device it was called about, too.** "Cannot be vouched for"
+  means nothing on this node can say whether the namespace holds work that was
+  never captured or an empty room somebody's name is still on. Having been
+  reported broken is not evidence about what is inside, so the target is held to
+  the same rule as its neighbours. Only a namespace that is provably a
+  replacement — recorded identity, different live identity — is exempt.
+- **copies what it saved off the node first.** The reading is the only record of
+  interfaces that are about to stop existing, and the lab's replication factor
+  decides how many nodes it has to be on. If it cannot get there, nothing is
+  unplugged.
+- **leaves a durable mark on everything it is about to empty.** The repair is
+  not the only thing on the node that captures: periodic durability builds its
+  own engine every few minutes, the CLI builds one, a second agent process
+  builds one, and none of them knows a repair is halfway through. A neighbour's
+  container never restarted, so its namespace identity is exactly what was
+  recorded and every identity check calls a reading of it trustworthy — but what
+  was in it has just been deleted. So every affected device is marked as owing
+  its saved state back, inside the device, *before* the first interface goes;
+  any other engine sees the marker and withholds that device's addresses,
+  tunnels and bridge ports. A device that cannot be marked stops the repair
+  before it starts.
+- **writes down where it put the device back.** The namespace a replaced task
+  landed in is one nobody recorded. The record is updated after the state is
+  replayed and before the device is let go of; without that, every later capture
+  would find a mismatch, call the namespace replaced and withhold the device's
+  state indefinitely — repaired, reported repaired, and never backed up again.
+  Each device's marker is cleared only after both of those have happened, so a
+  repair that fails partway leaves the devices it did not finish withheld rather
+  than overwritten.
+
+A repair that refuses names the device and the reason, records it as a node
+event, and reports it as a repair failure rather than as a rewire that broke
+something — nothing was changed. A repair that failed partway leaves the devices
+it did not finish marked as owing a restore, which withholds their
+namespace-backed snapshots until a later repair or deploy replays them; that is
+deliberate, and is why the failure is loud.
 
 The comparison needs something to compare against, and the first deployment
 after an upgrade has nothing recorded for any device. A device that is healthy

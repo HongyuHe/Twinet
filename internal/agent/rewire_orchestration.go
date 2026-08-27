@@ -69,6 +69,13 @@ func rewireStageOf(err error) rewireStage {
 	if errors.As(err, &failure) {
 		return failure.stage
 	}
+	if errors.Is(err, deploy.ErrRewireNotStarted) {
+		// The engine refused before it deleted anything -- it could not
+		// establish the durable marker that protects what it was about to
+		// empty, or could not reach the record it would have to update
+		// afterwards. Nothing was changed, so it is a refusal, not a break.
+		return stagePreserve
+	}
 	return stageRewire
 }
 
@@ -178,6 +185,11 @@ func (s *Server) rewireWithPeers(ctx context.Context, req rewireRequest) error {
 // device whose namespace was provably replaced has its bare namespace withheld
 // and keeps the snapshot it already had, which is exactly what the target of
 // this repair is.
+//
+// What is read is then replicated to the lab's policy before anything is
+// unplugged. A capture that is only on this node's disk is not a copy of
+// anything if this node is what fails next, and the whole point of taking it
+// here is that the interfaces it describes are about to stop existing.
 func (s *Server) preserveBeforeRewire(ctx context.Context, req rewireRequest,
 	peers []*model.Device,
 ) error {
@@ -186,8 +198,9 @@ func (s *Server) preserveBeforeRewire(ctx context.Context, req rewireRequest,
 		// without a state store has never had its work saved anywhere.
 		return nil
 	}
+	affected := append([]*model.Device{req.device}, peers...)
 	var selected []string
-	for _, d := range append([]*model.Device{req.device}, peers...) {
+	for _, d := range affected {
 		if capturesStudentState(req.top, req.mode, req.ungraded, d) {
 			selected = append(selected, d.ID)
 		}
@@ -204,7 +217,8 @@ func (s *Server) preserveBeforeRewire(ctx context.Context, req rewireRequest,
 	// state is the only thing being marked.
 	guard := &deploy.Engine{
 		Runtime: s.rt, Node: s.cfg.Node, Limiter: s.workLimiter(), State: s.store,
-		Renderer: renderer(req.top, render.ModePlatform, 0),
+		Renderer:        renderer(req.top, render.ModePlatform, 0),
+		ObservationRoot: s.observationRoot,
 	}
 	if _, err := guard.CaptureDevices(ctx, req.top, s.store, selected); err != nil {
 		return fmt.Errorf("rewiring %s would rebuild the interfaces of %s, and what is on "+
@@ -213,15 +227,17 @@ func (s *Server) preserveBeforeRewire(ctx context.Context, req rewireRequest,
 	}
 	unproven := guard.UnprovenNamespaceDevices()
 	var refused []string
-	for _, peer := range peers {
-		// The target is not held to this. It is the device that was reported
-		// broken, and an unproven namespace is one whose live state is missing
-		// something the store still holds -- so replaying the store onto it is
-		// the repair, not a loss. A namespace that is provably a replacement is
-		// not unproven at all: it is a known loss, and its snapshot is the only
-		// copy of what used to be in it.
-		if reason, ok := unproven[peer.ID]; ok {
-			refused = append(refused, peer.ID+": "+reason)
+	for _, d := range affected {
+		// Every device the rewire touches, including the one it was called
+		// about. "Unproven" is not "broken": it is a namespace nothing can
+		// account for, which may hold work that was never saved and is about
+		// to be deleted. The device that was reported broken is not a reason
+		// to guess -- a namespace that is provably a replacement is a known
+		// loss rather than an open question, and a known loss never lands
+		// here, so refusing this set does not refuse the fault this repair
+		// exists for.
+		if reason, ok := unproven[d.ID]; ok {
+			refused = append(refused, d.ID+": "+reason)
 		}
 	}
 	if len(refused) > 0 {
@@ -229,6 +245,11 @@ func (s *Server) preserveBeforeRewire(ctx context.Context, req rewireRequest,
 			"this node cannot vouch for, so the repair is refused rather than taken out of "+
 			"their namespaces: %s", req.device.ID, refusedDeviceList(refused),
 			strings.Join(refused, "; "))
+	}
+	if err := s.replicateDurableState(ctx, req.top); err != nil {
+		return fmt.Errorf("rewiring %s would rebuild the interfaces of %s, and what was just "+
+			"read off them could not be copied to the other nodes this lab's policy requires, "+
+			"so nothing was unplugged: %w", req.device.ID, strings.Join(selected, ", "), err)
 	}
 	return nil
 }

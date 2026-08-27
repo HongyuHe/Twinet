@@ -3251,3 +3251,56 @@ An AST test keeps the fifth direct call from being written, and the real
 containerd lifecycle gate now replaces a router's task and asserts that the
 neighbour it never restarted still holds its modelled addressing and still forms
 a Full adjacency afterwards.
+
+### 135. The three things a repair still owed to everyone who was not in the room
+
+The repair above is correct about the lab and was, for a while, wrong about
+everything outside the one call doing it. Three separate ways.
+
+**It exempted the device it was repairing from having to be accounted for.**
+"This device's namespace cannot be vouched for" is not a weaker form of "this
+device is broken". It means nothing on the node can say whether the namespace
+holds a student's work that was never captured or an empty room somebody's name
+is still on. A rewire deletes every interface in it and replays a snapshot over
+the top, so being the device that was *reported* broken is not evidence about
+what is in its namespace, and it earns no exemption. The exemption belongs to a
+namespace that is *provably* a replacement — a recorded identity and a different
+live one — which is a different finding, is the fault the repair exists for, and
+is still allowed through. Both the target and its neighbours are now refused on
+an unproven namespace, before any mutation.
+
+**It never wrote down where it put the device back.** After a task is replaced
+the device is in a namespace nobody recorded. The repair replayed the state into
+it and left the record naming the namespace that died with the old task; every
+capture from then on compared the two, found a mismatch, called the namespace
+replaced, and withheld the device's addresses, tunnels and bridge ports from the
+store. For ever, because nothing else revisits it. The device was repaired,
+reported repaired, and quietly stopped being backed up. The namespace a device
+was replayed in is now recorded before it is let go of, and a failure to record
+it is loud rather than silent.
+
+**It protected the interval it was destroying with a flag in its own memory.**
+The engine doing a repair is not the only engine on the node: periodic
+durability builds its own every few minutes, in the same process, and knows
+nothing about a repair in progress. It could read a neighbour whose veths had
+been deleted a moment earlier and store what it found, which was nothing — and
+every identity-based guard agreed the reading was trustworthy, because the
+neighbour's container never restarted and its namespace really was the recorded
+one. What had gone was the contents. Every device a rewire is about to disturb
+is now marked, durably and inside the device, as owing its saved state back
+*before* the first interface is deleted; the marker is what `storableSnapshots`
+already consults at the moment it writes, so any other engine — or any later
+process — withholds its namespace-backed snapshots. A device that cannot be
+marked stops the rewire before it starts, a marker an earlier unfinished repair
+left is never taken back by a rollback, and each is cleared only after that
+device's state is back and the namespace it is back in is on disk.
+
+Marking rather than serialising against the durability loop is deliberate: the
+loop is not the only thing that captures, the CLI and a second agent process are
+not reachable from a mutex, and a marker in the container is visible to all of
+them and survives the agent being killed halfway through.
+
+The reading taken before the rewire is also replicated to the lab's policy
+before anything is unplugged. It is the only record of interfaces that are about
+to stop existing, and a copy that exists solely on the node that is about to
+break is not a copy.

@@ -242,6 +242,19 @@ type Server struct {
 	store       *state.Store
 	started     time.Time
 
+	// observationRoot is where every engine this agent builds keeps its
+	// node-local record of what it observed, including the network namespace
+	// each device's state was last configured in.
+	//
+	// Empty selects deploy's own default, which is what a real agent uses. It
+	// exists as a field because that default is a root-owned directory under
+	// /run, so nothing the record decides -- a namespace proved, a replacement
+	// detected, a capture withheld because a device restarted -- can otherwise
+	// be exercised by a test that is not running as root. Every engine built
+	// here reads the same one, because two engines that disagree about where
+	// the record lives is precisely the bug the record exists to catch.
+	observationRoot string
+
 	metrics *agentMetrics
 	eventMu sync.Mutex
 	events  *eventRing
@@ -1804,6 +1817,7 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 			}
 			return auditedDriftError(s.auditedDriftReason(ctx, top.Name, device))
 		},
+		ObservationRoot: s.observationRoot,
 	}
 	if !req.DryRun && req.Phase == "apply" {
 		if err := s.markGenerationApplying(top.Name, req.Fence, req.Generation); err != nil {
@@ -2192,7 +2206,7 @@ func (s *Server) handleDestroy(w http.ResponseWriter, r *http.Request) {
 	defer stopFence()
 	r = r.WithContext(fenced)
 
-	eng := &deploy.Engine{Runtime: s.rt, Node: s.cfg.Node, State: s.store, Limiter: s.workLimiter()}
+	eng := &deploy.Engine{Runtime: s.rt, Node: s.cfg.Node, State: s.store, Limiter: s.workLimiter(), ObservationRoot: s.observationRoot}
 
 	// Destroying a lab must not lose a class's work: everything is captured
 	// first, and refusing is better than proceeding blind.

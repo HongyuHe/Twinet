@@ -158,6 +158,7 @@ func (s *Server) handleApplyPrepare(w http.ResponseWriter, r *http.Request, req 
 				}
 				return auditedDriftError(s.auditedDriftReason(ctx, top.Name, device))
 			},
+			ObservationRoot: s.observationRoot,
 		}
 		if _, err := observed.BuildContext(r.Context(), top); err != nil {
 			httpError(w, http.StatusConflict, fmt.Errorf("observe prepared deployment: %w", err))
@@ -732,6 +733,7 @@ func (s *Server) transactionEngine(top *model.Topology, tx applyTransaction) (*d
 			}
 			return auditedDriftError(s.auditedDriftReason(ctx, top.Name, device))
 		},
+		ObservationRoot: s.observationRoot,
 	}, nil
 }
 
@@ -823,7 +825,8 @@ func (s *Server) rollbackPreparedApply(ctx context.Context, lab string, fence Fe
 	if len(tx.Previous) == 0 {
 		eng := &deploy.Engine{
 			Runtime: s.rt, Node: s.cfg.Node, State: s.store, Limiter: s.workLimiter(),
-			Workers: s.recoveryWorkerCount(),
+			Workers:         s.recoveryWorkerCount(),
+			ObservationRoot: s.observationRoot,
 		}
 		if err := eng.Destroy(ctx, lab); err != nil {
 			return fmt.Errorf("removing partially applied lab %q: %w", lab, err)

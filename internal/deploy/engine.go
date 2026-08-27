@@ -1274,19 +1274,79 @@ func (e *Engine) restoreIfNeeded(ctx context.Context, top *model.Topology, d *mo
 // finds it, whatever happened to the process that created it.
 const restoreMarker = "/etc/twinet/restore-pending"
 
+const restoreMarkerScript = "mkdir -p /etc/twinet && echo 'this device was recreated or " +
+	"rewired and its saved configuration has not been replayed yet' > " + restoreMarker
+
 func (e *Engine) markRestorePending(ctx context.Context, d *model.Device) {
 	// Best effort: the in-memory marker covers this request, and failing to
 	// write the file must not fail a deployment. What it costs is the ability
 	// to recover from a crash, which is exactly what the in-memory marker
 	// cannot do either.
-	_, _ = e.Runtime.Exec(ctx, d.Container, runtime.ExecCmd{Cmd: []string{"sh", "-c",
-		"mkdir -p /etc/twinet && echo 'this device was recreated and its saved " +
-			"configuration has not been replayed yet' > " + restoreMarker}})
+	//
+	// A caller that is about to empty the namespace on purpose does not get
+	// this version. See holdNamespaceState.
+	_, _ = e.Runtime.Exec(ctx, d.Container, runtime.ExecCmd{
+		Cmd: []string{"sh", "-c", restoreMarkerScript}})
 }
 
 func (e *Engine) clearRestorePending(ctx context.Context, d *model.Device) {
 	_, _ = e.Runtime.Exec(ctx, d.Container, runtime.ExecCmd{
 		Cmd: []string{"rm", "-f", restoreMarker}})
+}
+
+// holdNamespaceState writes the restore-pending marker and says whether it
+// managed to, which is the difference that matters when the caller is about to
+// destroy what is in the namespace rather than having just created an empty
+// one.
+//
+// The marker is the only part of "this device owes a restore" that another
+// process can see. markNamespaceStateLost is a map on one Engine, and the
+// engine that is about to delete a veth is never the engine that captures on a
+// timer: periodic durability builds its own, every few minutes, in the same
+// process. It reads a namespace that has just had its interfaces removed, and
+// nothing on it knows that a repair is halfway through putting them back --
+// but storableSnapshots consults this marker, inside the container, at the
+// moment it writes. So the marker has to exist before the first interface is
+// deleted, and it has to be known to exist.
+func (e *Engine) holdNamespaceState(ctx context.Context, d *model.Device) error {
+	if e.Runtime == nil || d == nil {
+		return errors.New("holding namespace state needs a runtime and a device")
+	}
+	res, err := e.Runtime.Exec(ctx, d.Container, runtime.ExecCmd{
+		Cmd: []string{"sh", "-c", restoreMarkerScript}})
+	if err != nil {
+		return fmt.Errorf("mark %s as owing its saved state back: %w", d.ID, err)
+	}
+	if res.ExitCode != 0 {
+		return fmt.Errorf("mark %s as owing its saved state back: %s",
+			d.ID, strings.TrimSpace(res.Stderr+res.Stdout))
+	}
+	e.pendingRestore.Store(d.ID, true)
+	return nil
+}
+
+// releaseNamespaceState removes the marker, and says whether it managed to.
+//
+// A marker that outlives the restore it was waiting for is not dangerous the
+// way a missing one is -- it withholds captures and asks for one more replay of
+// what is already there -- but it is still wrong, and a device that silently
+// stops being backed up is exactly the failure this whole guard exists to
+// prevent. So it is reported.
+func (e *Engine) releaseNamespaceState(ctx context.Context, d *model.Device) error {
+	if e.Runtime == nil || d == nil {
+		return errors.New("releasing namespace state needs a runtime and a device")
+	}
+	res, err := e.Runtime.Exec(ctx, d.Container, runtime.ExecCmd{
+		Cmd: []string{"rm", "-f", restoreMarker}})
+	if err != nil {
+		return fmt.Errorf("clear the restore owed by %s: %w", d.ID, err)
+	}
+	if res.ExitCode != 0 {
+		return fmt.Errorf("clear the restore owed by %s: %s",
+			d.ID, strings.TrimSpace(res.Stderr+res.Stdout))
+	}
+	e.pendingRestore.Delete(d.ID)
+	return nil
 }
 
 // restoreIsPending reports whether this device still owes a restore, from
@@ -2636,6 +2696,14 @@ func LocalRewirePeers(top *model.Topology, node string, d *model.Device) []*mode
 	return peers
 }
 
+// ErrRewireNotStarted marks a rewire that refused before it changed anything.
+//
+// The distinction is not cosmetic. A rewire that stopped before the first veth
+// was deleted has left a working device working, and the caller may report it
+// as a refusal and try again; one that stopped afterwards has left interfaces
+// down and state owed, and the caller has to say so.
+var ErrRewireNotStarted = errors.New("the rewire was refused before anything was changed")
+
 // RewireDeviceAndPeers rebuilds one device's links and puts back every
 // neighbour whose end of those links was rebuilt with them.
 //
@@ -2650,25 +2718,115 @@ func LocalRewirePeers(top *model.Topology, node string, d *model.Device) []*mode
 // replay is called for the target first and then for each neighbour, after the
 // wiring and the rendered configuration are back, and is where a caller's
 // durability policy puts saved student state on top. It is nil for a caller
-// that has none.
+// that has none, and then none of the durability machinery below runs either:
+// there is nothing to protect and nothing to owe.
+//
+// Between the first deletion and the last replay every affected device is
+// carrying state that is neither the student's work nor recoverable from the
+// device, and the durable marker that says so is established before the first
+// deletion and cleared one device at a time, each only after that device's
+// state is back and the namespace it is back in has been written down.
 func (e *Engine) RewireDeviceAndPeers(ctx context.Context, top *model.Topology, d *model.Device,
 	replay func(context.Context, *model.Device) error,
 ) error {
 	if e == nil || top == nil || d == nil {
-		return errors.New("a rewire needs an engine, a topology, and a device")
+		return fmt.Errorf("%w: %w", ErrRewireNotStarted,
+			errors.New("a rewire needs an engine, a topology, and a device"))
 	}
 	peers := LocalRewirePeers(top, e.Node, d)
+	affected := append([]*model.Device{d}, peers...)
 	// What is in these namespaces stops being the students' work the moment
 	// the cables are rebuilt, so nothing on this engine may file it as theirs
 	// until the replay below has put it back.
-	e.markNamespaceStateLost(d.ID)
-	for _, peer := range peers {
-		e.markNamespaceStateLost(peer.ID)
+	for _, dev := range affected {
+		e.markNamespaceStateLost(dev.ID)
+	}
+	if replay != nil {
+		// Refused, not attempted, if the record cannot be read: a rewire that
+		// cannot write down the namespace it ends in leaves the target looking
+		// permanently replaced to every later capture.
+		if err := e.checkNamespaceRecordable(top); err != nil {
+			return fmt.Errorf("%w: %w", ErrRewireNotStarted, err)
+		}
+		if err := e.holdRewiredState(ctx, affected); err != nil {
+			return fmt.Errorf("%w: %w", ErrRewireNotStarted, err)
+		}
 	}
 	if err := e.RewireDevice(ctx, top, d); err != nil {
 		return err
 	}
-	return e.restoreRewiredPeers(ctx, d, peers, replay)
+	return e.restoreRewiredPeers(ctx, top, d, peers, replay)
+}
+
+// holdRewiredState marks every device a rewire is about to disturb as owing
+// its saved state back, before the rewire disturbs any of them.
+//
+// All or nothing. If one device cannot be marked the rewire does not start,
+// and the markers this call wrote are taken back -- but only those. A device
+// that arrived already owing a restore from an earlier failed pass keeps its
+// marker, because clearing that one is the way an empty namespace gets filed
+// over a term's work by the very code that was meant to stop it.
+func (e *Engine) holdRewiredState(ctx context.Context, affected []*model.Device) error {
+	var written []*model.Device
+	for _, dev := range affected {
+		already := e.restoreIsPending(ctx, dev)
+		if err := e.holdNamespaceState(ctx, dev); err != nil {
+			for _, done := range written {
+				_ = e.releaseNamespaceState(ctx, done)
+			}
+			return fmt.Errorf("rewiring empties the network namespaces it rebuilds, and %s "+
+				"could not be marked as owing its saved state back first, so nothing was "+
+				"changed: %w", dev.ID, err)
+		}
+		if !already {
+			written = append(written, dev)
+		}
+	}
+	return nil
+}
+
+// checkNamespaceRecordable proves, before anything is mutated, that the record
+// a rewire has to update at the end of it can be reached at all.
+func (e *Engine) checkNamespaceRecordable(top *model.Topology) error {
+	if e.Runtime == nil || top == nil || e.ObservationReadOnly ||
+		!runtime.SupportsNetnsIdentity(e.Runtime) {
+		return nil
+	}
+	if _, err := e.loadObservation(top.Name); err != nil {
+		if e.ObservationRoot == "" && errors.Is(err, os.ErrPermission) {
+			// The same exemption every other reader of this file makes: the
+			// record belongs to the agent, and a lab run by hand without one
+			// has never had it.
+			return nil
+		}
+		return fmt.Errorf("read the recorded network namespaces before rewiring: %w", err)
+	}
+	return nil
+}
+
+// recordRewiredNamespace writes down the namespace a device was just replayed
+// in, so the next capture recognises it.
+//
+// The record is loaded immediately before it is written rather than held open
+// across the rewire. The file holds every device on the node and is rewritten
+// whole, and a rewire is long: a periodic capture that baselines a different
+// device in the middle of one would have its work dropped by a tracker read
+// before it started.
+func (e *Engine) recordRewiredNamespace(ctx context.Context, top *model.Topology,
+	d *model.Device,
+) error {
+	if e.Runtime == nil || top == nil || e.ObservationReadOnly ||
+		!runtime.SupportsNetnsIdentity(e.Runtime) {
+		return nil
+	}
+	tracker, err := e.loadObservation(top.Name)
+	if err != nil {
+		if e.ObservationRoot == "" && errors.Is(err, os.ErrPermission) {
+			return nil
+		}
+		return err
+	}
+	return e.recordDeviceNamespace(ctx, tracker, d)
 }
 
 // restoreRewiredPeers is the second half of a rewire: the neighbours whose
@@ -2679,7 +2837,14 @@ func (e *Engine) RewireDeviceAndPeers(ctx context.Context, top *model.Topology, 
 // replaced -- interfaces, then the rendered contract, then the student's work
 // -- because an address cannot be put on an interface that does not exist yet,
 // and a replay that lands before the rendering is overwritten by it.
-func (e *Engine) restoreRewiredPeers(ctx context.Context, d *model.Device,
+//
+// Each device is then let go of in one order and only in that order: its state
+// is back, the namespace it is back in is on disk, the marker saying it owed a
+// restore is gone, and only then may anything file what is in it as the
+// student's work again. A failure anywhere stops there and leaves every device
+// after it holding its marker, which is the truth -- they do still owe a
+// restore -- and is what the next repair pass acts on.
+func (e *Engine) restoreRewiredPeers(ctx context.Context, top *model.Topology, d *model.Device,
 	peers []*model.Device, replay func(context.Context, *model.Device) error,
 ) error {
 	var failed []string
@@ -2701,6 +2866,23 @@ func (e *Engine) restoreRewiredPeers(ctx context.Context, d *model.Device,
 	for _, dev := range append([]*model.Device{d}, peers...) {
 		if err := replay(ctx, dev); err != nil {
 			return err
+		}
+		// The namespace a lifecycle restart put this device in is not the one
+		// the record still names. Leaving it stale is not a small bookkeeping
+		// miss: every later capture compares against it, finds a mismatch,
+		// calls the namespace replaced and withholds the device's addresses,
+		// tunnels and bridge ports from the store -- for ever, because nothing
+		// else ever revisits it. The device is repaired and quietly stops
+		// being backed up.
+		if err := e.recordRewiredNamespace(ctx, top, dev); err != nil {
+			return fmt.Errorf("%s was rewired and its saved state replayed, but the network "+
+				"namespace it is now in could not be recorded, so every later capture would "+
+				"treat it as replaced and withhold its state: %w", dev.ID, err)
+		}
+		if err := e.releaseNamespaceState(ctx, dev); err != nil {
+			return fmt.Errorf("%s was rewired, replayed and recorded, but it could not be "+
+				"unmarked as owing a restore, so it will not be captured again until it "+
+				"is: %w", dev.ID, err)
 		}
 		e.clearNamespaceStateLost(dev.ID)
 	}

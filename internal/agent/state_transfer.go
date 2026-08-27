@@ -308,7 +308,8 @@ func (s *Server) captureBeforeExport(ctx context.Context, lab string, devices []
 	if len(selected) > 0 {
 		eng := &deploy.Engine{
 			Runtime: s.rt, Node: s.cfg.Node, Limiter: s.workLimiter(), State: s.store,
-			Renderer: renderer(top, render.ModePlatform, 0),
+			Renderer:        renderer(top, render.ModePlatform, 0),
+			ObservationRoot: s.observationRoot,
 		}
 		if _, err := eng.CaptureDevices(ctx, top, s.store, selected); err != nil {
 			return fmt.Errorf("capture %s: %w", lab, err)

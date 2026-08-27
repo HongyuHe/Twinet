@@ -222,7 +222,8 @@ func (s *Server) verifyTopologyChecks(ctx context.Context, top *model.Topology,
 				Runtime: s.rt, Node: s.cfg.Node, State: s.store, Limiter: s.workLimiter(),
 				Renderer: r, Authoritative: true, WritesReference: true,
 				UnderlayIP: s.cfg.UnderlayIP, UnderlayDev: s.cfg.UnderlayDev,
-				PeerUnderlay: s.peerUnderlay(top.Name),
+				PeerUnderlay:    s.peerUnderlay(top.Name),
+				ObservationRoot: s.observationRoot,
 			}
 			repairKind := "reconfiguration"
 			var repairErr error

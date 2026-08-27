@@ -1055,6 +1055,7 @@ func (s *Server) autoRepairEngine(top *model.Topology) *deploy.Engine {
 		PeerUnderlay:          s.peerUnderlay(top.Name),
 		ModeKey:               rendererModeKey(render.Mode(mode), ungraded),
 		ForceOverlayReconcile: false,
+		ObservationRoot:       s.observationRoot,
 	}
 }
 
@@ -1529,6 +1530,7 @@ func (s *Server) finalSpecHash(lab string, d *model.Device) (string, error) {
 		UnderlayIP:      s.cfg.UnderlayIP,
 		UnderlayDev:     s.cfg.UnderlayDev,
 		PeerUnderlay:    s.peerUnderlay(top.Name),
+		ObservationRoot: s.observationRoot,
 	}
 	return eng.FinalSpecHash(top, d)
 }

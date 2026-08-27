@@ -129,6 +129,7 @@ func (s *Server) handlePlan(w http.ResponseWriter, r *http.Request) {
 			// devices at the same moment.
 			return auditedDriftError(s.auditedDriftReason(ctx, req.Lab, device))
 		},
+		ObservationRoot: s.observationRoot,
 	}
 	plan, err := eng.BuildContext(r.Context(), top)
 	if err != nil {

@@ -467,7 +467,7 @@ func (s *Server) destroyEphemeralObjects(ctx context.Context, lab string) []stri
 		return nil
 	}
 	var problems []string
-	eng := &deploy.Engine{Runtime: s.rt, Node: s.cfg.Node, State: s.store, Limiter: s.workLimiter()}
+	eng := &deploy.Engine{Runtime: s.rt, Node: s.cfg.Node, State: s.store, Limiter: s.workLimiter(), ObservationRoot: s.observationRoot}
 	if err := eng.Destroy(ctx, lab); err != nil {
 		problems = append(problems, "containers: "+err.Error())
 	}
