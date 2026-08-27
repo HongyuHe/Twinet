@@ -153,9 +153,17 @@ func TestSyntheticSliceCollapsesReferenceInteriorsWithoutDroppingOrigins(t *test
 	}
 	seen := map[string]bool{}
 	for _, d := range h.SortedDevices() {
+		names := map[string]bool{}
+		for _, iface := range d.Ifaces {
+			names[iface.Name] = true
+		}
 		for _, iface := range d.Ifaces {
 			if len(iface.Name) > 15 {
 				t.Errorf("%s interface %q exceeds IFNAMSIZ", d.ID, iface.Name)
+			}
+			if iface.Parent != "" && !names[iface.Parent] {
+				t.Errorf("%s retained child interface %q after dropping parent %q",
+					d.ID, iface.Name, iface.Parent)
 			}
 			key := d.ID + "/" + iface.Name
 			if seen[key] {

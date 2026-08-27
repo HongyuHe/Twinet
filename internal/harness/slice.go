@@ -39,7 +39,7 @@ import (
 // or its generated reference peers changes. It deliberately is not the CLI
 // source version: an ordinary controller bug-fix release must still verify a
 // previously proven compact/full equivalence artifact.
-const CompactCompilerContract = "compact-harness/v1"
+const CompactCompilerContract = "compact-harness/v2"
 
 // Options controls how much of the class topology a harness keeps.
 type Options struct {
@@ -271,6 +271,9 @@ func Slice(top *model.Topology, target int, opts Options) (*model.Topology, erro
 		uniquifySyntheticIfaces(out, target)
 	}
 	rebind(out)
+	if opts.Synthetic {
+		pruneSyntheticDanglingSubinterfaces(out, target)
+	}
 	out.Hash = hashTopology(out)
 	return out, nil
 }
@@ -732,6 +735,38 @@ func rebind(top *model.Topology) {
 		}
 		d.Ifaces = append(unlinked, byDev[id]...)
 		sort.SliceStable(d.Ifaces, func(a, b int) bool { return d.Ifaces[a].Name < d.Ifaces[b].Name })
+	}
+}
+
+// pruneSyntheticDanglingSubinterfaces removes child interfaces whose physical
+// parent disappeared when a remote AS was collapsed to one reference router.
+// The target and route servers are never reduced, so their authored interface
+// contract remains exact.
+func pruneSyntheticDanglingSubinterfaces(top *model.Topology, target int) {
+	for _, device := range top.Devices {
+		as := top.ASes[device.ASN]
+		if device.ASN == target || as == nil || as.Role == model.RoleIXP {
+			continue
+		}
+		for {
+			present := make(map[string]bool, len(device.Ifaces))
+			for _, iface := range device.Ifaces {
+				present[iface.Name] = true
+			}
+			kept := device.Ifaces[:0]
+			removed := false
+			for _, iface := range device.Ifaces {
+				if iface.Parent != "" && !present[iface.Parent] {
+					removed = true
+					continue
+				}
+				kept = append(kept, iface)
+			}
+			device.Ifaces = kept
+			if !removed {
+				break
+			}
+		}
 	}
 }
 
