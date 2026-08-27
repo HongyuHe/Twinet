@@ -228,7 +228,14 @@ func (s *Server) verifyTopologyChecks(ctx context.Context, top *model.Topology,
 			var repairErr error
 			if requiresSemanticRewire(firstErr) {
 				repairKind = "rewiring"
-				repairErr = repair.RewireDevice(verifyCtx, top, device)
+				// Solved here, but not necessarily next door: a private
+				// grading harness is solved everywhere except the one system
+				// under evaluation, and rewiring this router rebuilds that
+				// system's end of the cable between them.
+				repairErr = s.rewireWithPeers(verifyCtx, rewireRequest{
+					engine: repair, top: top, device: device,
+					mode: mode, ungraded: ungraded,
+				})
 			} else {
 				repairErr = repair.ReconfigureDevice(verifyCtx, device)
 			}

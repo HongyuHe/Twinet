@@ -537,6 +537,34 @@ an unreplayed container. A backend that cannot prove namespace identity is not
 asked to: its containers are replaced rather than restarted when a task dies,
 which the ordinary create path already restores through.
 
+Automatic repair does the same, and for a while it did not. It does not run
+through the deployment planner — an event-driven repair, a semantic-drift
+repair, an operator's `node reconcile --force` and solved-reference recovery all
+rewire one device directly — and rewiring one device deletes its neighbours'
+ends of the cables between them. On a live three-node lab holding a restored
+group submission, killing one router's PID 1 rebuilt that router, replayed its
+addressing, rebound its sidecar, and left the three routers on the far ends of
+its cables with interfaces that were up, carried no address, and formed no
+adjacency; the repaired router had zero OSPF neighbours and the agent logged
+`device repaired and its configuration put back`. Every automatic rewire now:
+
+- **saves first.** Every affected device holding a student's work — the target
+  and each same-node neighbour whose end of a cable is about to be deleted — is
+  captured through the guarded capture funnel *before* anything is unplugged.
+  The periodic snapshot may be an hour old, which is long enough for somebody to
+  have addressed the interface that is about to go.
+- **refuses rather than guesses.** A capture that fails, or a neighbour whose
+  namespace this node cannot vouch for, stops the repair before any mutation and
+  names the device and the reason. A namespace that is *provably* a replacement
+  is a known loss, not an open question, so the device that was reported broken
+  is never refused for the fault it was reported for.
+- **puts the neighbours back.** After the wiring, each rebuilt neighbour's
+  rendered contract is reapplied and its saved state replayed, after the
+  target's. Their containers and their other cables are left alone.
+- **asks each device's own mode.** A private grading harness is solved
+  everywhere except the system under evaluation, so that system's work is saved
+  and replayed and the solved routers around it are neither read nor written.
+
 The comparison needs something to compare against, and the first deployment
 after an upgrade has nothing recorded for any device. A device that is healthy
 and stays healthy never configures, so it would never acquire a baseline and its

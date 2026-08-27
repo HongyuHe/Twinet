@@ -3200,3 +3200,54 @@ default and every per-node selection at once and announces that it has. Two
 tests keep the bundle coherent: one asserts every example declares the cluster
 runtime, and one asserts every example still validates under an explicit
 override to each registered backend.
+
+### 134. One router repaired, three broken, reported as a success
+
+A restored, signed group-3 submission was running on the three-node containerd
+lab. `as3/ATL`'s PID 1 was killed. Automatic repair did everything it was
+written to do: it rebuilt ATL's local veths, replayed ATL's addresses, VLAN and
+tunnel out of the state store, rebound its FRR control sidecar, re-observed it
+as healthy, and logged `device repaired and its configuration put back`.
+
+`as3/BOS`, `as3/HOU` and `as3/PHY` came back bare. Their `port_ATL` interfaces
+were `UP,LOWER_UP` and carried no `3.0.x` address; ping failed across all three
+cables; ATL had zero OSPF neighbours. Restoring the signed archive by hand
+brought all three adjacencies back. The repair was a success at device scope
+and a failure at lab scope, and nothing anywhere reported the difference,
+because nothing had asked about the three routers that were never broken.
+
+A veth pair is rebuilt as a pair — when only one half survives, netx deletes the
+survivor so the pair can be recreated cleanly — so rewiring one router deletes
+its neighbours' ends of the cables between them. On a teaching deployment those
+ends come back with nothing on them: COS-461 leaves `router_interfaces` and
+`loopbacks` to the students, so the platform renders no `ip address` for them
+and the addressing exists in the kernel and in the state store and nowhere else.
+
+The deployment planner already knew this and expanded a lost namespace to its
+one-hop neighbours before scheduling any work. Automatic repair does not go
+through the planner: it called `Engine.RewireDevice` directly, from four
+places — the lifecycle repair loop, semantic drift repair, the operator's forced
+reconcile, and solved-reference recovery — and every one of them repaired one
+device and silently broke its neighbours.
+
+There is now one way to rewire, and every one of those four goes through it. It
+determines the target plus its one-hop same-node neighbours over the cables the
+rewire will rebuild; captures every affected device that is holding a student's
+work rather than the reference answer, through the guarded capture funnel,
+*before* anything is unplugged, because a neighbour can have addressed an
+interface since the last periodic snapshot; refuses the whole repair, before any
+mutation, if a capture fails or if a neighbour's namespace cannot be vouched
+for; rewires the target's links only; puts every rebuilt neighbour's rendered
+contract back; and replays the saved state of the target and of every neighbour,
+in that order. A namespace that is *provably* a replacement is a known loss
+rather than an open question — its snapshot is the only copy of what used to be
+in it, and replaying it is the repair — so the device that was actually reported
+broken is never refused for it. Neighbours' containers and their other cables
+are not touched, and the per-device render mode decides what may be read and
+replayed, so a private grading harness preserves the one system it is marking
+and never installs the reference answer on it.
+
+An AST test keeps the fifth direct call from being written, and the real
+containerd lifecycle gate now replaces a router's task and asserts that the
+neighbour it never restarted still holds its modelled addressing and still forms
+a Full adjacency afterwards.

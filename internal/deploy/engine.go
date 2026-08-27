@@ -2571,6 +2571,12 @@ func (e *Engine) RewireDevice(ctx context.Context, top *model.Topology, d *model
 	// the idempotent `ip addr replace` and `ip route replace` commands. Apply
 	// the pre-rendered desired commands directly while retaining the
 	// student-owned-file protection in configureDesired.
+	return e.reapplyDesired(ctx, d)
+}
+
+// reapplyDesired writes one device's rendered contract back into it without
+// consulting the observation markers a no-change deploy compares against.
+func (e *Engine) reapplyDesired(ctx context.Context, d *model.Device) error {
 	return e.limited(ctx, []limiter.Kind{limiter.ExecProbe}, func() error {
 		state, err := e.renderDesired(d)
 		if err != nil {
@@ -2578,6 +2584,127 @@ func (e *Engine) RewireDevice(ctx context.Context, top *model.Topology, d *model
 		}
 		return e.configureDesired(ctx, d, state)
 	})
+}
+
+// LocalRewirePeers names the devices on this node whose interfaces a rewire of
+// d will destroy and build again.
+//
+// A veth is a pair and netx rebuilds it as one: when only one half survives it
+// deletes the survivor so the pair can be recreated cleanly. So rewiring one
+// router takes its neighbours' ends of those cables with it, and they come
+// back bare -- which on a teaching deployment means with no address, because a
+// student-owned address is never rendered by the platform and exists only in
+// the kernel and in the state store.
+//
+// The expansion is one hop, over local cables, and it is deliberately the same
+// set the deployment planner derives in expandLostStateToPeers. A cross-node
+// link is excluded on both counts: its far end is another node's to rebuild,
+// and this node's half hangs off a shared overlay that a bounded repair never
+// deletes. Only the links of the device being rewired are rebuilt, so a
+// neighbour's other links are not disturbed.
+func LocalRewirePeers(top *model.Topology, node string, d *model.Device) []*model.Device {
+	if top == nil || d == nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	var peers []*model.Device
+	for _, l := range top.Links {
+		if l == nil || l.A == nil || l.B == nil || l.A.Device == nil || l.B.Device == nil {
+			continue
+		}
+		if l.A.Device.ID != d.ID && l.B.Device.ID != d.ID {
+			continue
+		}
+		if l.CrossNode() {
+			continue
+		}
+		if l.A.Device.Node != node && l.B.Device.Node != node {
+			// RewireDevice does not rebuild this link at all.
+			continue
+		}
+		peer := l.A.Device
+		if peer.ID == d.ID {
+			peer = l.B.Device
+		}
+		if peer.ID == d.ID || peer.Node != node || seen[peer.ID] {
+			continue
+		}
+		seen[peer.ID] = true
+		peers = append(peers, peer)
+	}
+	sort.Slice(peers, func(i, j int) bool { return peers[i].ID < peers[j].ID })
+	return peers
+}
+
+// RewireDeviceAndPeers rebuilds one device's links and puts back every
+// neighbour whose end of those links was rebuilt with them.
+//
+// RewireDevice on its own repairs the device it is given and silently damages
+// everything attached to it. On a live three-node lab, killing one router's
+// pid 1 produced exactly that: the restarted router was rewired, reconfigured
+// and reported repaired, while its three neighbours were left holding cables
+// that were up, carried no address, and formed no adjacency. Nothing observed
+// the neighbours, because nothing had asked for them to be repaired -- so the
+// repair was a success at device scope and a failure at lab scope.
+//
+// replay is called for the target first and then for each neighbour, after the
+// wiring and the rendered configuration are back, and is where a caller's
+// durability policy puts saved student state on top. It is nil for a caller
+// that has none.
+func (e *Engine) RewireDeviceAndPeers(ctx context.Context, top *model.Topology, d *model.Device,
+	replay func(context.Context, *model.Device) error,
+) error {
+	if e == nil || top == nil || d == nil {
+		return errors.New("a rewire needs an engine, a topology, and a device")
+	}
+	peers := LocalRewirePeers(top, e.Node, d)
+	// What is in these namespaces stops being the students' work the moment
+	// the cables are rebuilt, so nothing on this engine may file it as theirs
+	// until the replay below has put it back.
+	e.markNamespaceStateLost(d.ID)
+	for _, peer := range peers {
+		e.markNamespaceStateLost(peer.ID)
+	}
+	if err := e.RewireDevice(ctx, top, d); err != nil {
+		return err
+	}
+	return e.restoreRewiredPeers(ctx, d, peers, replay)
+}
+
+// restoreRewiredPeers is the second half of a rewire: the neighbours whose
+// ends of the rebuilt cables came back bare, and the saved state that has to go
+// back on top of all of it.
+//
+// The order is the deployment planner's order for a device whose namespace was
+// replaced -- interfaces, then the rendered contract, then the student's work
+// -- because an address cannot be put on an interface that does not exist yet,
+// and a replay that lands before the rendering is overwritten by it.
+func (e *Engine) restoreRewiredPeers(ctx context.Context, d *model.Device,
+	peers []*model.Device, replay func(context.Context, *model.Device) error,
+) error {
+	var failed []string
+	for _, peer := range peers {
+		// Only the rendered contract, and only for the endpoint that was
+		// rebuilt: the neighbour's container is not replaced and its other
+		// links are not touched.
+		if err := e.reapplyDesired(ctx, peer); err != nil {
+			failed = append(failed, fmt.Sprintf("%s: %v", peer.ID, err))
+		}
+	}
+	if len(failed) > 0 {
+		return fmt.Errorf("reconfiguring the neighbours of %s after rewiring it: %s",
+			d.ID, strings.Join(failed, "; "))
+	}
+	if replay == nil {
+		return nil
+	}
+	for _, dev := range append([]*model.Device{d}, peers...) {
+		if err := replay(ctx, dev); err != nil {
+			return err
+		}
+		e.clearNamespaceStateLost(dev.ID)
+	}
+	return nil
 }
 
 // ReconfigureDevice reapplies one device's desired rendered contract without

@@ -752,32 +752,34 @@ func (s *Server) repairLab(ctx context.Context, top *model.Topology, broken []*m
 			s.metricRegistry().observeRepair("recovery")
 			return
 		}
-		if err := eng.RewireDevice(ctx, top, d); err != nil {
-			s.repairFailed(top.Name, d.ID, "rewiring failed", err)
+		// One rewire, and everything it disturbs. Rewiring this device rebuilds
+		// its neighbours' ends of the cables between them, so their state is
+		// saved first and put back afterwards; repairing this device alone is
+		// what left three routers holding bare interfaces while the repair
+		// reported success.
+		//
+		// The suppression re-check is kept where it was, between the wiring
+		// and the replay: a rollback may take the lab in that window and a
+		// student's snapshot must not be replayed underneath it.
+		err := s.rewireWithPeers(ctx, rewireRequest{
+			engine: eng, top: top, device: d,
+			mode: render.Mode(mode), ungraded: ungraded,
+			beforeReplay: func() error {
+				if reason := s.ordinaryMaintenanceSuppression(top.Name); reason != "" {
+					return errRepairSuppressed
+				}
+				return nil
+			},
+		})
+		if errors.Is(err, errRepairSuppressed) {
+			s.metricRegistry().observeRepair("recovery")
+			return
+		}
+		if err != nil {
+			s.repairFailed(top.Name, d.ID, rewireFailureLabel(err), err)
 			s.recordEvent(top.Name, "", "reconcile", "", "repair", "error",
 				d.ID+": "+err.Error())
 			continue
-		}
-		// Not while the lab is deployed at the reference.
-		//
-		// The deployment path has refused this for a while; the repair loop
-		// did it anyway. Replaying a student's snapshot over a solved router
-		// leaves that system holding somebody's old work while the class is
-		// being marked against it -- and every check on it passes, because it
-		// is a converged network, just not the answer. A repair runs
-		// unattended every few seconds, so this needed no unusual sequence of
-		// events to happen.
-		if renderModeForDevice(render.Mode(mode), ungraded, d) != render.ModeSolve {
-			if reason := s.ordinaryMaintenanceSuppression(top.Name); reason != "" {
-				s.metricRegistry().observeRepair("recovery")
-				return
-			}
-			if _, err := deploy.Restore(ctx, s.rt, d, top.Name, s.store); err != nil {
-				s.repairFailed(top.Name, d.ID, "configuration could not be put back after rewiring", err)
-				s.recordEvent(top.Name, "", "reconcile", "", "repair", "error",
-					d.ID+": "+err.Error())
-				continue
-			}
 		}
 		// A rewire gives the router its cables back; it does nothing for a
 		// control sidecar that is still attached to the namespace the router
@@ -859,20 +861,18 @@ func (s *Server) repairSemanticDrift(ctx context.Context, eng *deploy.Engine,
 		return errors.New(semanticDriftReason(after, observation))
 	}
 	// A missing address or interface is a local fact this node owns, so it is
-	// worth one bounded rewire of this device -- and only this device.
-	if err := eng.RewireDevice(ctx, top, d); err != nil {
-		return err
-	}
+	// worth one bounded rewire of this device -- and of the neighbours whose
+	// interfaces that rewire rebuilds. Rewiring re-renders the platform's own
+	// files; anything a student wrote comes back from the snapshot store, and
+	// never over a lab deployed at the reference.
 	s.mu.Lock()
 	mode, ungraded := s.modes[top.Name], s.ungraded[top.Name]
 	s.mu.Unlock()
-	// Rewiring re-renders the platform's own files. Anything a student wrote
-	// comes back from the snapshot store, exactly as the lifecycle repair
-	// path does it, and never over a lab deployed at the reference.
-	if renderModeForDevice(render.Mode(mode), ungraded, d) != render.ModeSolve {
-		if _, err := deploy.Restore(ctx, s.rt, d, top.Name, s.store); err != nil {
-			return fmt.Errorf("configuration could not be put back after rewiring %s: %w", d.ID, err)
-		}
+	if err := s.rewireWithPeers(ctx, rewireRequest{
+		engine: eng, top: top, device: d,
+		mode: render.Mode(mode), ungraded: ungraded,
+	}); err != nil {
+		return err
 	}
 	final := s.observeDevice(ctx, top.Name, d, false)
 	s.rememberHealth(top.Name, d.ID, final)
@@ -996,7 +996,10 @@ func (s *Server) forceRewireDevice(ctx context.Context, top *model.Topology, d *
 	}
 	defer s.releaseOperation(top.Name, opID, done)
 	eng := s.repairEngine(top)
-	if err := eng.RewireDevice(repairCtx, top, d); err != nil {
+	mode, ungraded := s.modeAndUngraded(top.Name)
+	if err := s.rewireWithPeers(repairCtx, rewireRequest{
+		engine: eng, top: top, device: d, mode: mode, ungraded: ungraded,
+	}); err != nil {
 		return err
 	}
 	after := s.observeDevice(repairCtx, top.Name, d, false)

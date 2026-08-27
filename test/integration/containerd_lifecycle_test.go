@@ -459,6 +459,8 @@ placement:
 		store, lab, filepath.Join(work, "observed"))
 	assertContainerdCaptureOutsideADeployRefusesAReplacedNamespace(t, ctx, runtime, teaching,
 		top, device, store, lab, filepath.Join(work, "observed"))
+	assertContainerdRepairPutsTheNeighbourBackToo(t, ctx, runtime, teaching, top, device,
+		store, lab)
 	if err := engine.Destroy(ctx, lab); err != nil {
 		t.Fatal(err)
 	}
@@ -1381,4 +1383,115 @@ func recordedContainerdNamespace(t *testing.T, observedRoot, id string) (rt.Netn
 		}
 	}
 	return rt.NetnsIdentity{}, false
+}
+
+// assertContainerdRepairPutsTheNeighbourBackToo is the lab-scope half of the
+// repair, on a live containerd node.
+//
+// A veth pair is rebuilt as a pair, so repairing the router whose task was
+// replaced deletes and recreates its neighbours' ends of the cables between
+// them. The neighbours were not restarted, nothing observed them as broken, and
+// on a restored teaching submission a router's address is not in any rendered
+// file: it is in the kernel and in the state store and nowhere else. So a
+// repair that stops at the device it was asked about leaves its neighbours with
+// interfaces that are up, carry no address, and form no adjacency -- which is
+// exactly what a live three-node lab was left with, while the agent logged
+// "device repaired and its configuration put back".
+//
+// The fault is already in place when this runs: the assertion above left the
+// router's task replaced and its namespace empty. The repair here is the one
+// production entry point, called once, with the production replay.
+func assertContainerdRepairPutsTheNeighbourBackToo(t *testing.T, ctx context.Context,
+	runtime rt.Runtime, engine *deploy.Engine, top *model.Topology, device *model.Device,
+	store *state.Store, lab string,
+) {
+	t.Helper()
+	peers := deploy.LocalRewirePeers(top, engine.Node, device)
+	if len(peers) == 0 {
+		t.Fatalf("the routed fixture gives %s no same-node neighbours, so there is nothing "+
+			"here about the neighbours a rewire unplugs", device.ID)
+	}
+	var neighbour *model.Device
+	for _, peer := range peers {
+		if peer.ID == device.ID {
+			t.Fatal("the fixture expanded a rewire to the device being rewired")
+		}
+		if peer.Kind == model.KindRouter {
+			neighbour = peer
+		}
+	}
+	if neighbour == nil {
+		t.Fatalf("none of %s's same-node neighbours is a router, so no adjacency can be "+
+			"proven across a rebuilt cable", device.ID)
+	}
+	// The neighbours are intact, and the router among them keeps its addressing
+	// in the store rather than in any file: that is what makes rebuilding its
+	// interface destructive.
+	intact := map[string]bool{}
+	for _, peer := range peers {
+		if missing, err := routedAddressesPresent(ctx, runtime, peer); err == nil && len(missing) == 0 {
+			intact[peer.ID] = true
+		}
+	}
+	if !intact[neighbour.ID] {
+		t.Fatalf("%s does not hold its modelled addressing before the repair, so nothing "+
+			"here would prove it survived one", neighbour.ID)
+	}
+	requireNoConfiguredAddresses(t, ctx, runtime, neighbour)
+	before := map[string]rt.NetnsIdentity{}
+	for _, peer := range peers {
+		identity, err := rt.NetnsIdentityOf(ctx, runtime, peer.Container)
+		if err != nil {
+			t.Fatalf("proving the network namespace of %s: %v", peer.ID, err)
+		}
+		before[peer.ID] = identity
+	}
+	if missing, err := routedAddressesPresent(ctx, runtime, device); err == nil && len(missing) == 0 {
+		t.Fatal("the router still holds its addressing, so its task was not replaced and " +
+			"there is no repair here to make")
+	}
+
+	var replayed []string
+	if err := engine.RewireDeviceAndPeers(ctx, top, device,
+		func(ctx context.Context, d *model.Device) error {
+			replayed = append(replayed, d.ID)
+			_, err := deploy.Restore(ctx, runtime, d, lab, store)
+			return err
+		}); err != nil {
+		dumpControlDiagnostics(t, ctx, runtime, device)
+		t.Fatalf("repairing %s and everything its repair unplugs: %v", device.ID, err)
+	}
+	want := []string{device.ID}
+	for _, peer := range peers {
+		want = append(want, peer.ID)
+	}
+	if strings.Join(replayed, ",") != strings.Join(want, ",") {
+		t.Fatalf("the repair replayed %v, want %v: the device it repaired first and then "+
+			"every neighbour whose cable it rebuilt", replayed, want)
+	}
+
+	// The neighbours' containers were not replaced: only their ends of the
+	// cables were, and their other links and their namespaces are their own.
+	for _, peer := range peers {
+		after, err := rt.NetnsIdentityOf(ctx, runtime, peer.Container)
+		if err != nil {
+			t.Fatalf("proving the network namespace of %s after the repair: %v", peer.ID, err)
+		}
+		if !after.SameAs(before[peer.ID]) {
+			t.Fatalf("the repair moved %s from %s to %s; it may rebuild a cable, not a "+
+				"container", peer.ID, before[peer.ID], after)
+		}
+	}
+	requireRoutedAddresses(t, ctx, runtime, device, "after the neighbour-aware repair")
+	for _, peer := range peers {
+		if !intact[peer.ID] {
+			continue
+		}
+		requireRoutedAddresses(t, ctx, runtime, peer,
+			"after the neighbour-aware repair of "+device.ID)
+	}
+	requireFullOSPFNeighbour(t, ctx, runtime, device, "after the neighbour-aware repair",
+		120*time.Second)
+	requireFullOSPFNeighbour(t, ctx, runtime, neighbour, "after the neighbour-aware repair",
+		120*time.Second)
 }
