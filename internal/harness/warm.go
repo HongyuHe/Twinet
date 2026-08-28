@@ -6,7 +6,10 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"time"
 )
+
+const warmPoolInitCleanupTimeout = 10 * time.Minute
 
 // WarmIdentity binds a reusable harness to the same safety boundaries as an
 // ordinary isolated deployment. Namespace must be unique per worker; Fence and
@@ -108,11 +111,13 @@ func NewWarmPool(ctx context.Context, workers int, factory WarmFactory) (*WarmPo
 		}
 	}
 	if initErr != nil {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), warmPoolInitCleanupTimeout)
+		defer cancel()
 		for _, harness := range created {
 			if harness == nil {
 				continue
 			}
-			if err := harness.Destroy(context.WithoutCancel(ctx)); err != nil {
+			if err := harness.Destroy(cleanupCtx); err != nil {
 				initErr = errors.Join(initErr,
 					fmt.Errorf("destroying failed warm worker %s: %w",
 						harness.WarmIdentity().Namespace, err))

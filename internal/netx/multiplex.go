@@ -537,6 +537,13 @@ func ensurePairBridge(h *netlink.Handle, name, alias string, mtu int) (*netlink.
 			return nil, false, fmt.Errorf("create multiplex bridge %s: %w", name, err)
 		}
 		created = true
+		// LinkAdd does not apply IFLA_IFALIAS reliably on every supported
+		// kernel. Stamp it before re-reading the object so this newly created,
+		// known-empty bridge never needs a full link dump to prove it is safe
+		// to adopt while another deployment is mutating the host.
+		if err := h.LinkSetAlias(bridge, alias); err != nil {
+			return nil, false, fmt.Errorf("stamp new multiplex bridge %s owner: %w", name, err)
+		}
 		link, err = h.LinkByName(name)
 		if err != nil {
 			return nil, false, fmt.Errorf("re-resolve multiplex bridge %s: %w", name, err)
@@ -599,6 +606,9 @@ func ensurePairVXLAN(h *netlink.Handle, name, alias string, mtu int, local net.I
 			return nil, false, fmt.Errorf("create multiplex VXLAN %s: %w", name, err)
 		}
 		created = true
+		if err := h.LinkSetAlias(vxlan, alias); err != nil {
+			return nil, false, fmt.Errorf("stamp new multiplex VXLAN %s owner: %w", name, err)
+		}
 		link, err = h.LinkByName(name)
 		if err != nil {
 			return nil, false, fmt.Errorf("re-resolve multiplex VXLAN %s: %w", name, err)
