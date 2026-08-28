@@ -85,17 +85,25 @@ grading command that only works on a spread lab would still be broken.
 
 The compact `harness.Options.Synthetic` substrate keeps the target AS and IXPs
 intact while collapsing each other retained AS to one deterministic
-policy/origin router. It is enabled only by a signed release attestation keyed
-to the topology hash, rubric hash, compiler version, exact grader-source
-digest, and verified image lock; an unattested development lab falls back to a
-full isolated harness. The source digest is a deterministic SHA-256 over
+policy/origin router. Compiler contract `compact-harness/v4` also retains one
+deterministic routed host in every remote ordinary AS and reattaches it to that
+AS's collapsed router. Those hosts are data-plane witnesses: without them a
+remote origin can exist in the routing table while an end-to-end check passes
+without sending a packet to that AS. Attested compact grading therefore forces
+host retention even if a caller supplies `--keep-hosts=false`; that switch can
+only affect the explicitly requested legacy reducer.
+
+The compact substrate is enabled only by a signed release attestation keyed to
+the topology hash, rubric hash, compiler version, exact grader-source digest,
+and verified image lock; an unattested development lab falls back to a full
+isolated harness. The source digest is a deterministic SHA-256 over
 `cmd/**/*.go`, `internal/**/*.go`, `go.mod`, and `go.sum`, so source edits and
 untracked compiled files receive a distinct identity while documentation does
-not. Commit and version remain signed audit provenance. Full
-topology fallback remains available through `grade batch --full-harness`,
-particularly for disputed marks. The attestation's
-`harness.AuditEquivalence` suite must include reference and wrong-answer
-fixtures; a compact result is not release evidence by itself.
+not. Commit and version remain signed audit provenance. Full topology fallback
+remains available through `grade batch --full-harness`, particularly for
+disputed marks. The attestation's `harness.AuditEquivalence` suite must include
+reference and wrong-answer fixtures; a compact result is not release evidence
+by itself.
 
 `grade attest compact` requires a separate, existing submission-signing
 private key to derive and re-sign each mutation. It writes a sibling

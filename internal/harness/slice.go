@@ -39,7 +39,7 @@ import (
 // or its generated reference peers changes. It deliberately is not the CLI
 // source version: an ordinary controller bug-fix release must still verify a
 // previously proven compact/full equivalence artifact.
-const CompactCompilerContract = "compact-harness/v3"
+const CompactCompilerContract = "compact-harness/v4"
 
 // Options controls how much of the class topology a harness keeps.
 type Options struct {
@@ -375,7 +375,7 @@ func devicesToKeep(top *model.Topology, target int, keepAS map[int]bool, opts Op
 	}
 
 	if opts.Synthetic {
-		return syntheticDevicesToKeep(top, target, keepAS)
+		return syntheticDevicesToKeep(top, target, keepAS, opts.KeepHosts)
 	}
 
 	// The target is kept whole: it is the thing under test, and any check that
@@ -487,8 +487,11 @@ func devicesToKeep(top *model.Topology, target int, keepAS map[int]bool, opts Op
 // deterministic reference router for every other ordinary AS. Links are
 // rebound to those selected routers in Slice, which retains the real
 // relationship graph and AS-level policy while removing remote interiors.
-func syntheticDevicesToKeep(top *model.Topology, target int, keepAS map[int]bool) map[string]bool {
+func syntheticDevicesToKeep(top *model.Topology, target int, keepAS map[int]bool,
+	keepHosts bool,
+) map[string]bool {
 	keep := map[string]bool{}
+	var remoteASNs []int
 	for asn := range keepAS {
 		as := top.ASes[asn]
 		if as == nil {
@@ -508,6 +511,15 @@ func syntheticDevicesToKeep(top *model.Topology, target int, keepAS map[int]bool
 		default:
 			if router := syntheticAnchor(as); router != nil {
 				keep[router.ID] = true
+			}
+			remoteASNs = append(remoteASNs, asn)
+		}
+	}
+	if keepHosts {
+		sort.Ints(remoteASNs)
+		for _, asn := range remoteASNs {
+			if host := firstSyntheticHost(top.ASes[asn]); host != nil {
+				keep[host.ID] = true
 			}
 		}
 	}
@@ -534,6 +546,36 @@ func syntheticDevicesToKeep(top *model.Topology, target int, keepAS map[int]bool
 	return keep
 }
 
+// firstSyntheticHost selects a deterministic data-plane endpoint whose link
+// can be rebound directly to the collapsed reference router. Keeping the
+// origin without an endpoint lets reachability checks report success without
+// sending a packet.
+func firstSyntheticHost(as *model.AS) *model.Device {
+	if as == nil {
+		return nil
+	}
+	var candidates []*model.Device
+	for _, device := range as.Devices {
+		if device == nil || device.Kind != model.KindHost || device.L2Domain != "" {
+			continue
+		}
+		for _, iface := range device.Ifaces {
+			if iface == nil || iface.Peer == nil || iface.Peer.Device == nil {
+				continue
+			}
+			if iface.Peer.Device.ASN == as.ASN && iface.Peer.Device.IsRouter() {
+				candidates = append(candidates, device)
+				break
+			}
+		}
+	}
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].ID < candidates[j].ID })
+	if len(candidates) == 0 {
+		return nil
+	}
+	return candidates[0]
+}
+
 // syntheticDeviceMap maps every remote ordinary-AS device to its selected
 // synthetic router. Target and IXP devices keep their original identity.
 func syntheticDeviceMap(top *model.Topology, target int, keepAS map[int]bool, opts Options) map[string]string {
@@ -551,6 +593,9 @@ func syntheticDeviceMap(top *model.Topology, target int, keepAS map[int]bool, op
 			continue
 		}
 		for _, device := range as.Devices {
+			if device.Kind == model.KindHost {
+				continue
+			}
 			out[device.ID] = anchor.ID
 		}
 	}

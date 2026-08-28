@@ -42,6 +42,26 @@ func TestBatchedPingFailuresUsesOneExecPerSource(t *testing.T) {
 	}
 }
 
+func TestBatchedPingObservationsIdentifyTheFailedPair(t *testing.T) {
+	a := &model.Device{ID: "as3/A", Name: "A"}
+	b := &model.Device{ID: "as3/B", Name: "B"}
+	env := &Env{Exec: func(_ context.Context, device string, _ []string) (rt.ExecResult, error) {
+		if device == a.ID {
+			return rt.ExecResult{Stdout: "@ 0 1\n"}, nil
+		}
+		return rt.ExecResult{Stdout: "@ 1 0\n"}, nil
+	}}
+	probes := []reachabilityProbe{{from: a, to: b}, {from: b, to: a}}
+	observed := batchedPingObservations(context.Background(), env, probes,
+		map[string]string{a.ID: "192.0.2.1", b.ID: "192.0.2.2"})
+	if !observed.complete || len(observed.failures) != 1 {
+		t.Fatalf("observation = %#v", observed)
+	}
+	if !observed.failedPairs[hostPairKey(a, b)] || observed.failedPairs[hostPairKey(b, a)] {
+		t.Fatalf("failed pairs = %v, want only A to B", observed.failedPairs)
+	}
+}
+
 func TestBatchedPingFailuresBoundsSourceSidePressure(t *testing.T) {
 	source := &model.Device{ID: "as3/A", Name: "A"}
 	probes := make([]reachabilityProbe, 0, sourceBatchWidth+1)
@@ -88,5 +108,61 @@ func TestTransportBatchRequiresExactPortsAndCounters(t *testing.T) {
 		map[string]transportTapReading{b.ID: {live: true, ports: map[string]int{}}},
 		1) {
 		t.Fatal("a batch without the exact source-port witness passed")
+	}
+}
+
+func TestTransportBatchRetriesOnlyTheUnprovenFlow(t *testing.T) {
+	a := &model.Device{ID: "as3/A", Name: "A"}
+	b := &model.Device{ID: "as3/B", Name: "B"}
+	dst := &model.Device{ID: "as3/D", Name: "D"}
+	attempts := []transportAttempt{
+		{index: 0, from: a, to: dst, sourcePort: "31001", destPort: "32001"},
+		{index: 1, from: b, to: dst, sourcePort: "31002", destPort: "32001"},
+	}
+	retry := transportBatchRetries(attempts, map[int]bool{0: true, 1: true}, true,
+		map[string]counterWitness{dst.ID: {global: 10}},
+		map[string]counterWitness{dst.ID: {global: 11}},
+		map[string]transportTapReading{
+			dst.ID: {live: true, ports: map[string]int{"31001": 1}},
+		},
+		1)
+	if retry[0] || !retry[1] || len(retry) != 1 {
+		t.Fatalf("retry = %v, want only the flow without an exact capture", retry)
+	}
+}
+
+func TestTransportBatchRetriesDestinationWhenCountersCannotProveDelivery(t *testing.T) {
+	a := &model.Device{ID: "as3/A", Name: "A"}
+	b := &model.Device{ID: "as3/B", Name: "B"}
+	dst := &model.Device{ID: "as3/D", Name: "D"}
+	attempts := []transportAttempt{
+		{index: 0, from: a, to: dst, sourcePort: "31001", destPort: "32001"},
+		{index: 1, from: b, to: dst, sourcePort: "31002", destPort: "32001"},
+	}
+	retry := transportBatchRetries(attempts, map[int]bool{0: true, 1: true}, true,
+		map[string]counterWitness{dst.ID: {global: 10}},
+		map[string]counterWitness{dst.ID: {global: 11}},
+		map[string]transportTapReading{
+			dst.ID: {live: true, ports: map[string]int{"31001": 1, "31002": 1}},
+		},
+		1)
+	if !retry[0] || !retry[1] || len(retry) != 2 {
+		t.Fatalf("retry = %v, want every flow to the under-counted destination", retry)
+	}
+}
+
+func TestTransportAttemptsSkipPairsAlreadyProvedUnreachable(t *testing.T) {
+	a := &model.Device{ID: "as3/A", Name: "A"}
+	b := &model.Device{ID: "as3/B", Name: "B"}
+	attempts, ok := makeTransportAttempts(
+		[]*model.Device{a, b},
+		map[string]string{a.ID: "192.0.2.1", b.ID: "192.0.2.2"},
+		map[string]bool{hostPairKey(a, b): true},
+	)
+	if !ok || len(attempts) != 1 {
+		t.Fatalf("attempts = %#v, ok=%v", attempts, ok)
+	}
+	if attempts[0].from != b || attempts[0].to != a {
+		t.Fatalf("retained attempt = %#v, want B to A", attempts[0])
 	}
 }

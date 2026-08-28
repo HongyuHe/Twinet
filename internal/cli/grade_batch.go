@@ -398,6 +398,10 @@ func batchHarnessOptions(depth int, reduce, full, compact, keepHosts bool, suffi
 	case compact:
 		options.Depth = 0
 		options.Synthetic = true
+		// Compact attestations are produced with remote data-plane witnesses.
+		// Do not let a runtime flag select a weaker topology than the one the
+		// signed equivalence audit proved.
+		options.KeepHosts = true
 	default:
 		options.Depth = 0
 		options.Reduce = false

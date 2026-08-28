@@ -3760,8 +3760,9 @@ func checkInternalReachability(ctx context.Context, env *Env) Result {
 	// reads and not 112.
 	echoesBefore := receivedEchoes(ctx, env, hosts)
 
-	failed, batchedPings := batchedPingFailures(ctx, env, pairs, addrOf)
-	if !batchedPings {
+	pingObservation := batchedPingObservations(ctx, env, pairs, addrOf)
+	failed := pingObservation.failures
+	if !pingObservation.complete {
 		failed = legacyPingFailures(ctx, env, pairs, addrOf)
 	}
 
@@ -3774,15 +3775,15 @@ func checkInternalReachability(ctx context.Context, env *Env) Result {
 	// arranged, and the destination's own count of what reached it is read --
 	// a refusal proves only that somebody answered, and any router on the way
 	// can send one carrying the destination's address.
-	var pingOnly []string
-	if !batchedTransportVerified(ctx, env, hosts, addrOf) {
-		// A batch that cannot prove every flow falls back to the original
-		// per-destination witnesses. Wrong submissions therefore retain the
-		// full discriminator; healthy references avoid hundreds of remote
-		// command round trips.
-		pingOnly = unreachableByTCP(ctx, env, hosts, addrOf)
-		pingOnly = append(pingOnly, unreachableByUDP(ctx, env, hosts, addrOf)...)
+	// A pair already proved unreachable by ICMP cannot earn more of this mark
+	// by also timing out under TCP and UDP. Excluding it from the transport
+	// sweep keeps a real blackhole from forcing the whole quadratic legacy
+	// witness, while protocol-selective failures still receive exact retries.
+	var skipTransport map[string]bool
+	if pingObservation.complete {
+		skipTransport = pingObservation.failedPairs
 	}
+	pingOnly := batchedTransportFailures(ctx, env, hosts, addrOf, skipTransport)
 	sort.Strings(pingOnly)
 	failed = append(failed, pingOnly...)
 
@@ -3909,28 +3910,23 @@ func serviceAttachments(env *Env) []svcAttachment {
 // something on the path swallowing the attempt.
 func unreachableByTCP(ctx context.Context, env *Env, hosts []*model.Device,
 	addrOf map[string]string) []string {
-	type attempt struct{ from, to *model.Device }
-	var pairs []attempt
-	for _, a := range hosts {
-		for _, b := range hosts {
-			if a.ID == b.ID || addrOf[b.ID] == "" {
-				continue
-			}
-			pairs = append(pairs, attempt{a, b})
-		}
-	}
+	return unreachableByTCPPairs(ctx, env, hostPairs(hosts, addrOf, nil), addrOf)
+}
 
+func unreachableByTCPPairs(ctx context.Context, env *Env, pairs []hostPair,
+	addrOf map[string]string,
+) []string {
 	// Serialised by destination, so a counter that moved belongs to the
 	// attempt that moved it rather than to somebody else's probe.
-	rounds := roundsByDestinationOf(pairs, func(p attempt) string { return p.to.ID })
-	try := func(round []attempt) map[string]string {
+	rounds := roundsByDestinationOf(pairs, func(p hostPair) string { return p.to.ID })
+	try := func(round []hostPair) map[string]string {
 		var mu sync.Mutex
 		bad := map[string]string{}
 		var wg sync.WaitGroup
 		sem := make(chan struct{}, 16)
 		for _, p := range round {
 			wg.Add(1)
-			go func(p attempt) {
+			go func(p hostPair) {
 				defer wg.Done()
 				sem <- struct{}{}
 				defer func() { <-sem }()
@@ -3993,17 +3989,20 @@ func unreachableByTCP(ctx context.Context, env *Env, hosts []*model.Device,
 // first. This is finding 116's rule in the place it was not applied.
 func unreachableByUDP(ctx context.Context, env *Env, hosts []*model.Device,
 	addrOf map[string]string) []string {
-	n := len(hosts)
-	if n < 2 {
-		return nil
-	}
+	return unreachableByUDPPairs(ctx, env, hostPairs(hosts, addrOf, nil), addrOf)
+}
+
+func unreachableByUDPPairs(ctx context.Context, env *Env, pairs []hostPair,
+	addrOf map[string]string,
+) []string {
 	var out []string
-	for k := 1; k < n; k++ {
-		bad := udpRound(ctx, env, hosts, addrOf, k)
+	rounds := roundsByDestinationOf(pairs, func(pair hostPair) string { return pair.to.ID })
+	for _, round := range rounds {
+		bad := udpPairRound(ctx, env, round, addrOf)
 		if len(bad) == 0 {
 			continue
 		}
-		for pair, why := range udpRound(ctx, env, hosts, addrOf, k) {
+		for pair, why := range udpPairRound(ctx, env, round, addrOf) {
 			if _, both := bad[pair]; both {
 				out = append(out, why)
 			}
@@ -4013,29 +4012,30 @@ func unreachableByUDP(ctx context.Context, env *Env, hosts []*model.Device,
 	return out
 }
 
-// udpRound sends a datagram between every pair of one round and returns the
+// udpPairRound sends a datagram between every pair of one round and returns the
 // ones that did not arrive, keyed by the pair so that a second round can be
 // compared with the first.
-func udpRound(ctx context.Context, env *Env, hosts []*model.Device,
-	addrOf map[string]string, k int) map[string]string {
-	n := len(hosts)
+func udpPairRound(ctx context.Context, env *Env, pairs []hostPair,
+	addrOf map[string]string,
+) map[string]string {
 	out := map[string]string{}
 	// One port per destination for this round, so that each capture
 	// watches for exactly the datagram aimed at that host.
 	ports := map[string]string{}
-	for i := range hosts {
-		dst := hosts[(i+k)%n]
-		if addrOf[dst.ID] != "" {
-			ports[dst.ID] = probePort()
+	var destinations []*model.Device
+	for _, pair := range pairs {
+		if addrOf[pair.to.ID] != "" {
+			ports[pair.to.ID] = probePort()
+			destinations = append(destinations, pair.to)
 		}
 	}
 	taps := startTaps(ctx, env, ports)
-	before := udpCounters(ctx, env, hosts)
+	before := udpCounters(ctx, env, destinations)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	unsent := map[string]bool{}
-	for i, src := range hosts {
-		dst := hosts[(i+k)%n]
+	for _, pair := range pairs {
+		src, dst := pair.from, pair.to
 		if addrOf[dst.ID] == "" {
 			continue
 		}
@@ -4055,10 +4055,10 @@ func udpRound(ctx context.Context, env *Env, hosts []*model.Device,
 		}(src, dst)
 	}
 	wg.Wait()
-	after := udpCounters(ctx, env, hosts)
+	after := udpCounters(ctx, env, destinations)
 	seen := readTaps(ctx, env, taps)
-	for i, src := range hosts {
-		dst := hosts[(i+k)%n]
+	for _, pair := range pairs {
+		src, dst := pair.from, pair.to
 		b, okB := before[dst.ID]
 		a, okA := after[dst.ID]
 		frames, live := seen[dst.ID].counts, seen[dst.ID].live

@@ -11,8 +11,8 @@ import (
 )
 
 func TestBatchHarnessOptionsUseAttestedCompactSynthetic(t *testing.T) {
-	compact := batchHarnessOptions(0, false, false, true, true, "group")
-	if !compact.Synthetic || compact.Reduce || compact.Depth != 0 {
+	compact := batchHarnessOptions(0, false, false, true, false, "group")
+	if !compact.Synthetic || compact.Reduce || compact.Depth != 0 || !compact.KeepHosts {
 		t.Fatalf("default batch options = %#v, want compact synthetic", compact)
 	}
 	full := batchHarnessOptions(0, false, true, false, false, "group")

@@ -18,6 +18,23 @@ type reachabilityProbe struct {
 	srcIface string
 }
 
+type hostPair struct {
+	from, to *model.Device
+}
+
+func hostPairKey(from, to *model.Device) string {
+	if from == nil || to == nil {
+		return ""
+	}
+	return from.ID + "\x00" + to.ID
+}
+
+type pingBatchObservation struct {
+	failures    []string
+	failedPairs map[string]bool
+	complete    bool
+}
+
 // sourceBatchWidth bounds the number of child probes one source-side agent
 // shell may have in flight. Agent-side ExecProbe limits bound calls across the
 // node; this bound prevents one accepted batch from turning into an unbounded
@@ -31,10 +48,17 @@ const sourceBatchWidth = 8
 func batchedPingFailures(ctx context.Context, env *Env, probes []reachabilityProbe,
 	addresses map[string]string,
 ) (failed []string, complete bool) {
+	observed := batchedPingObservations(ctx, env, probes, addresses)
+	return observed.failures, observed.complete
+}
+
+func batchedPingObservations(ctx context.Context, env *Env, probes []reachabilityProbe,
+	addresses map[string]string,
+) pingBatchObservation {
 	bySource := map[string][]int{}
 	for index, probe := range probes {
 		if _, err := netip.ParseAddr(addresses[probe.to.ID]); err != nil {
-			return nil, false
+			return pingBatchObservation{}
 		}
 		key := probe.from.ID + "\x00" + probe.srcIface
 		bySource[key] = append(bySource[key], index)
@@ -99,8 +123,9 @@ func batchedPingFailures(ctx context.Context, env *Env, probes []reachabilityPro
 	}
 	wg.Wait()
 	if !ok {
-		return nil, false
+		return pingBatchObservation{}
 	}
+	observed := pingBatchObservation{complete: true, failedPairs: map[string]bool{}}
 	for index, probe := range probes {
 		if results[index] {
 			continue
@@ -109,11 +134,12 @@ func batchedPingFailures(ctx context.Context, env *Env, probes []reachabilityPro
 		if probe.srcIface != "" {
 			from = probe.from.ID + " (the " + probe.from.Name + " network)"
 		}
-		failed = append(failed, fmt.Sprintf("%s cannot reach %s (%s)",
+		observed.failures = append(observed.failures, fmt.Sprintf("%s cannot reach %s (%s)",
 			from, probe.to.Name, addresses[probe.to.ID]))
+		observed.failedPairs[hostPairKey(probe.from, probe.to)] = true
 	}
-	sort.Strings(failed)
-	return failed, true
+	sort.Strings(observed.failures)
+	return observed
 }
 
 // legacyPingFailures retains the original per-pair evidence path for a batch
@@ -158,22 +184,29 @@ func legacyPingFailures(ctx context.Context, env *Env, probes []reachabilityProb
 	return failed
 }
 
-// batchedTransportVerified verifies every TCP and UDP pair with one capture
-// per destination and one source-side agent exec per host. Captures identify
-// each attempt by a unique source port; aggregate kernel counters ensure that
-// frames observed at an interface were delivered to the destination kernel.
-//
-// Any ambiguity falls back to the established per-pair witnesses. The fast
-// path therefore changes only scheduling on healthy networks, not the evidence
-// standard or the way a wrong submission is detected.
-func batchedTransportVerified(ctx context.Context, env *Env, hosts []*model.Device,
-	addresses map[string]string,
-) bool {
-	attempts, ok := makeTransportAttempts(hosts, addresses)
-	if !ok || len(attempts) == 0 {
-		return false
+// batchedTransportFailures verifies every still-reachable TCP and UDP pair
+// with one capture per destination and one source-side agent exec per host.
+// Only attempts whose batch evidence is inconclusive are repeated through the
+// established per-pair witnesses. A single blackholed flow therefore cannot
+// turn an otherwise bounded check into a complete quadratic retry.
+func batchedTransportFailures(ctx context.Context, env *Env, hosts []*model.Device,
+	addresses map[string]string, skip map[string]bool,
+) []string {
+	attempts, ok := makeTransportAttempts(hosts, addresses, skip)
+	if !ok {
+		pairs := hostPairs(hosts, addresses, skip)
+		out := unreachableByTCPPairs(ctx, env, pairs, addresses)
+		out = append(out, unreachableByUDPPairs(ctx, env, pairs, addresses)...)
+		sort.Strings(out)
+		return out
 	}
-	return batchedTCPVerified(ctx, env, attempts) && batchedUDPVerified(ctx, env, attempts)
+	if len(attempts) == 0 {
+		return nil
+	}
+	out := batchedTCPFailures(ctx, env, attempts, addresses)
+	out = append(out, batchedUDPFailures(ctx, env, attempts, addresses)...)
+	sort.Strings(out)
+	return out
 }
 
 type transportAttempt struct {
@@ -183,7 +216,9 @@ type transportAttempt struct {
 	sourcePort, destPort string
 }
 
-func makeTransportAttempts(hosts []*model.Device, addresses map[string]string) ([]transportAttempt, bool) {
+func makeTransportAttempts(hosts []*model.Device, addresses map[string]string,
+	skip map[string]bool,
+) ([]transportAttempt, bool) {
 	ports := map[string]string{}
 	used := map[string]bool{}
 	nextPort := func() string {
@@ -204,7 +239,7 @@ func makeTransportAttempts(hosts []*model.Device, addresses map[string]string) (
 	var out []transportAttempt
 	for _, from := range hosts {
 		for _, to := range hosts {
-			if from.ID == to.ID {
+			if from.ID == to.ID || skip[hostPairKey(from, to)] {
 				continue
 			}
 			out = append(out, transportAttempt{
@@ -216,22 +251,53 @@ func makeTransportAttempts(hosts []*model.Device, addresses map[string]string) (
 	return out, true
 }
 
-func batchedTCPVerified(ctx context.Context, env *Env, attempts []transportAttempt) bool {
+func hostPairs(hosts []*model.Device, addresses map[string]string,
+	skip map[string]bool,
+) []hostPair {
+	var out []hostPair
+	for _, from := range hosts {
+		for _, to := range hosts {
+			if from.ID == to.ID || addresses[to.ID] == "" || skip[hostPairKey(from, to)] {
+				continue
+			}
+			out = append(out, hostPair{from: from, to: to})
+		}
+	}
+	return out
+}
+
+func batchedTCPFailures(ctx context.Context, env *Env, attempts []transportAttempt,
+	addresses map[string]string,
+) []string {
 	before := tcpAnswerBatch(ctx, env, attempts)
 	taps := startTransportTaps(ctx, env, attempts)
 	sent, complete := sendTransportBatch(ctx, env, attempts, false)
 	after := tcpAnswerBatch(ctx, env, attempts)
 	readings := readTransportTapFlows(ctx, env, taps)
-	return transportBatchVerified(attempts, sent, complete, before, after, readings, 1)
+	retry := transportBatchRetries(attempts, sent, complete, before, after, readings, 1)
+	return unreachableByTCPPairs(ctx, env, retryHostPairs(attempts, retry), addresses)
 }
 
-func batchedUDPVerified(ctx context.Context, env *Env, attempts []transportAttempt) bool {
+func batchedUDPFailures(ctx context.Context, env *Env, attempts []transportAttempt,
+	addresses map[string]string,
+) []string {
 	before := udpAnswerBatch(ctx, env, attempts)
 	taps := startTransportTaps(ctx, env, attempts)
 	sent, complete := sendTransportBatch(ctx, env, attempts, true)
 	after := udpAnswerBatch(ctx, env, attempts)
 	readings := readTransportTapFlows(ctx, env, taps)
-	return transportBatchVerified(attempts, sent, complete, before, after, readings, datagramAttempts)
+	retry := transportBatchRetries(attempts, sent, complete, before, after, readings, datagramAttempts)
+	return unreachableByUDPPairs(ctx, env, retryHostPairs(attempts, retry), addresses)
+}
+
+func retryHostPairs(attempts []transportAttempt, retry map[int]bool) []hostPair {
+	var out []hostPair
+	for _, attempt := range attempts {
+		if retry[attempt.index] {
+			out = append(out, hostPair{from: attempt.from, to: attempt.to})
+		}
+	}
+	return out
 }
 
 func startTransportTaps(ctx context.Context, env *Env, attempts []transportAttempt) map[string]*arrivalTap {
@@ -406,33 +472,55 @@ func sendTransportBatch(ctx context.Context, env *Env, attempts []transportAttem
 func transportBatchVerified(attempts []transportAttempt, sent map[int]bool, complete bool,
 	before, after map[string]counterWitness, readings map[string]transportTapReading, packetsPerAttempt int,
 ) bool {
+	return len(transportBatchRetries(
+		attempts, sent, complete, before, after, readings, packetsPerAttempt,
+	)) == 0
+}
+
+// transportBatchRetries returns only flows the aggregate batch could not
+// prove. Exact source-port captures identify a missing flow; destination
+// counters prove that the captured set reached the kernel. A dead capture or
+// insufficient counter evidence retries that destination, never unrelated
+// destinations.
+func transportBatchRetries(attempts []transportAttempt, sent map[int]bool, complete bool,
+	before, after map[string]counterWitness, readings map[string]transportTapReading, packetsPerAttempt int,
+) map[int]bool {
+	retry := map[int]bool{}
 	if !complete {
-		return false
+		for _, attempt := range attempts {
+			retry[attempt.index] = true
+		}
+		return retry
 	}
-	expected := map[string]int{}
+	byDestination := map[string][]transportAttempt{}
 	captured := map[string]int{}
 	for _, attempt := range attempts {
+		byDestination[attempt.to.ID] = append(byDestination[attempt.to.ID], attempt)
 		if !sent[attempt.index] {
-			return false
+			retry[attempt.index] = true
 		}
-		expected[attempt.to.ID]++
 		reading, ok := readings[attempt.to.ID]
-		if !ok || !reading.live || reading.ports[attempt.sourcePort] == 0 {
-			return false
+		if !ok || !reading.live {
+			continue
 		}
-		// Source ports are unique over this batch, so a frame on one is
-		// evidence for this exact ordered pair rather than merely this host.
+		if reading.ports[attempt.sourcePort] == 0 {
+			retry[attempt.index] = true
+			continue
+		}
 		captured[attempt.to.ID]++
 	}
-	for destination, count := range expected {
+	for destination, destinationAttempts := range byDestination {
+		reading, readable := readings[destination]
 		b, okB := before[destination]
 		a, okA := after[destination]
-		if !okB || !okA || captured[destination] != count ||
-			offBoxDelta(b, a) < count*packetsPerAttempt {
-			return false
+		if !readable || !reading.live || !okB || !okA ||
+			offBoxDelta(b, a) < captured[destination]*packetsPerAttempt {
+			for _, attempt := range destinationAttempts {
+				retry[attempt.index] = true
+			}
 		}
 	}
-	return true
+	return retry
 }
 
 func shellWord(value string) string {

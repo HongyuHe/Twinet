@@ -186,6 +186,40 @@ func TestSyntheticSliceCollapsesReferenceInteriorsWithoutDroppingOrigins(t *test
 	}
 }
 
+func TestSyntheticSliceKeepHostsRetainsRemoteDataPlaneWitnesses(t *testing.T) {
+	full := classTopology(t)
+	h, err := Slice(full, 3, Options{Synthetic: true, KeepHosts: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for asn, as := range h.ASes {
+		if asn == 3 || as.Role == model.RoleIXP {
+			continue
+		}
+		var hosts []*model.Device
+		for _, device := range as.Devices {
+			if device.Kind == model.KindHost {
+				hosts = append(hosts, device)
+			}
+		}
+		if len(hosts) != 1 {
+			t.Errorf("AS %d retained %d data-plane witnesses, want one", asn, len(hosts))
+			continue
+		}
+		host := hosts[0]
+		attached := false
+		for _, iface := range host.Ifaces {
+			if iface.Peer != nil && iface.Peer.Device != nil &&
+				iface.Peer.Device.ASN == asn && iface.Peer.Device.IsRouter() {
+				attached = true
+			}
+		}
+		if !attached {
+			t.Errorf("AS %d witness %s is not attached to its collapsed router", asn, host.ID)
+		}
+	}
+}
+
 func TestSliceKeepsBothEndsOfEveryLink(t *testing.T) {
 	full := classTopology(t)
 	h, err := Slice(full, 5, Options{Depth: 2, KeepHosts: true})
