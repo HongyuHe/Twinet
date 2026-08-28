@@ -201,6 +201,24 @@ func TestConflictAwareSchedulerSerializesOnlySharedResources(t *testing.T) {
 	}
 }
 
+func TestECMPChecksShareTransportResources(t *testing.T) {
+	check, ok := Lookup("ospf.ecmp_paths")
+	if !ok {
+		t.Fatal("ospf.ecmp_paths is not registered")
+	}
+	env := &Env{Topology: observationTestTopology(), AS: 3}
+	resources := resourcesFor(scheduledCheck{check: check, env: env})
+	if len(resources) != 2 {
+		t.Fatalf("ECMP resources = %#v, want TCP and UDP resources", resources)
+	}
+	running := map[int][]ProbeResource{0: resources}
+	owners, conflicts := blockingResources(resources, running)
+	if len(owners) != 1 || owners[0] != 0 || len(conflicts) != len(resources) {
+		t.Fatalf("second ECMP check did not conflict: owners=%v conflicts=%v resources=%v",
+			owners, conflicts, resources)
+	}
+}
+
 func TestSchedulerTimeoutStaysAnInfrastructureError(t *testing.T) {
 	check := &Check{Name: "timeout", Run: func(ctx context.Context, _ *Env) Result {
 		<-ctx.Done()

@@ -2,7 +2,11 @@ package grade
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
+
+	rt "github.com/HongyuHe/twinet/internal/runtime"
 )
 
 // stillRunning marks a capture that was still watching when it was read. It is
@@ -190,6 +194,52 @@ func TestNilTapIsNotAWitness(t *testing.T) {
 	}
 }
 
+func TestFailedTapStartIsCleanedUp(t *testing.T) {
+	var calls []string
+	env := &Env{Exec: func(_ context.Context, _ string, cmd []string) (rt.ExecResult, error) {
+		calls = append(calls, strings.Join(cmd, " "))
+		if len(calls) == 1 {
+			return rt.ExecResult{ExitCode: 4}, nil
+		}
+		return rt.ExecResult{}, nil
+	}}
+	tap := startArrivalTap(t.Context(), env, "as3/BOS", "33456")
+	if tap.begun {
+		t.Fatal("failed capture start was marked live")
+	}
+	if len(calls) != 2 || !strings.Contains(calls[1], "kill -TERM") ||
+		!strings.Contains(calls[1], "rm -f") {
+		t.Fatalf("failed capture was not stopped and removed: %#v", calls)
+	}
+}
+
+func TestFailedTapReadUsesUncancelledCleanupContext(t *testing.T) {
+	var calls int
+	var cleanupContextLive bool
+	env := &Env{Exec: func(ctx context.Context, _ string, cmd []string) (rt.ExecResult, error) {
+		calls++
+		switch calls {
+		case 1:
+			return rt.ExecResult{}, nil
+		case 2:
+			return rt.ExecResult{}, errors.New("read interrupted")
+		default:
+			cleanupContextLive = ctx.Err() == nil &&
+				strings.Contains(strings.Join(cmd, " "), "kill -TERM")
+			return rt.ExecResult{}, nil
+		}
+	}}
+	tap := startArrivalTap(t.Context(), env, "as3/BOS", "33456")
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, ok := tap.seen(ctx, env); ok {
+		t.Fatal("failed read was treated as a witness")
+	}
+	if !cleanupContextLive {
+		t.Fatal("failed read did not clean up with a live context")
+	}
+}
+
 func TestParseTapOutputAStoppedCaptureIsNoWitness(t *testing.T) {
 	// A capture that ended before it was read -- its own timeout expired, or
 	// it hit its frame limit -- was not watching for the whole of the flow.
@@ -241,6 +291,23 @@ func TestTapSourcePortsCountsEveryFrameOfAFlow(t *testing.T) {
 	}
 	if len(got) != 1 {
 		t.Fatalf("flows = %d, want 1", len(got))
+	}
+}
+
+func TestDepartureTapCreditsOnlyRealOutboundInterfaces(t *testing.T) {
+	outbound := strings.Replace(frameFromATL, " In  ", " Out ", 1)
+	loopback := strings.Replace(frameSelfRoutable, " In  ", " Out ", 1)
+	_, ports, ok := parseTapFlowsDirection(
+		stillRunning(tapBanner+"---\n"+outbound+loopback), "out",
+	)
+	if !ok || ports["36229"] != 1 {
+		t.Fatalf("outbound capture: ok=%v ports=%v", ok, ports)
+	}
+	if ports["35201"] != 0 {
+		t.Fatalf("loopback source was credited as a departure: %v", ports)
+	}
+	if got := tapSourcePorts(outbound); len(got) != 0 {
+		t.Fatalf("an inbound reader credited an outbound frame: %v", got)
 	}
 }
 

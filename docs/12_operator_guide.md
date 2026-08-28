@@ -405,6 +405,27 @@ report a quarantine rather than a mark when the infrastructure — not the
 submission — failed. Their relative costs are recorded in
 [09](09_status.md#measurements); do not infer them from this guide.
 
+On a cluster, initial grading holds are taken one node at a time in sorted
+node-name order. Competing graders meet at the same first node instead of
+fragmenting the lab between them. If any node refuses, Twinet immediately
+releases that node and every hold already acquired; a release failure is named
+and remains bounded by the lease. The controller does not admit its own grading
+execs until every node holds the lab.
+
+Packet checks treat silence as evidence only from a capture that was listening
+and remained live. UDP filter claims need two independent negative observations,
+and ECMP path claims compare four spaced 32-flow populations using synchronized
+source-egress and destination-ingress captures. A packet counts as lost only
+when it was seen leaving, and a deduction requires at least five such losses
+across at least three populations. This tolerates isolated queue or capture
+loss while preserving persistent path and protocol faults.
+
+For an equal-cost-path check, every installed next hop in the prescribed
+forwarding graph must also have the same effective Linux weight. Omitted and
+zero route-view weights mean the kernel default of one. A 9:1 weighted group
+therefore fails even when both expected next hops are present; inspect it with
+`ip -details route show to match ADDRESS`.
+
 Collect and replay student work with `twinet save` and `twinet restore`. Every
 archive carries the topology hash it was written against, and an archive from a
 different topology is refused rather than silently replayed against addresses

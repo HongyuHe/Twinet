@@ -94,9 +94,10 @@ func tunnelCarriesTransport(ctx context.Context, env *Env, hosts map[string]*mod
 		// side counts the datagrams it received for a port nothing is bound
 		// to, which is a fact about arrival and not about any answer.
 		udpBefore, okU := udpNoPorts(ctx, env, dst.ID)
-		udpSent := sendDatagrams(ctx, env, src.ID, datagramProbe{
+		udpProbe := datagramProbe{
 			dstAddr: addr, port: port, v6: true,
-		})
+		}
+		udpSent := sendDatagrams(ctx, env, src.ID, udpProbe)
 		udpAfter, okU2 := udpNoPorts(ctx, env, dst.ID)
 		frames, live := tap.seen(ctx, env)
 
@@ -122,14 +123,21 @@ func tunnelCarriesTransport(ctx context.Context, env *Env, hosts map[string]*mod
 			tapped: frames.udp, tapLive: live,
 			counted: offBoxDelta(udpBefore, udpAfter), counterOK: okU && okU2,
 		}
-		if !gotUDP.attributable() || !udpSent {
+		gotUDP, udpStatus := confirmedDatagramArrival(gotUDP, udpSent,
+			func() (arrival, bool) {
+				return probeDatagramArrival(
+					ctx, env, src.ID, dst.ID, udpProbe, udpNoPorts,
+				)
+			})
+		if udpStatus == datagramArrivalUnknown {
 			continue
 		}
-		if !gotUDP.arrived() {
+		if udpStatus == datagramArrivalMissing {
 			return fmt.Sprintf(
 				"IPv6 pings and connections cross the tunnel, but a datagram from %s to %s "+
-					"at %s never arrived -- %s: something on the path is filtering by "+
-					"protocol", src.Name, dst.Name, addr, gotUDP.why()), false, true
+					"at %s never arrived in two attributable rounds -- %s: something on "+
+					"the path is filtering by protocol",
+				src.Name, dst.Name, addr, gotUDP.why()), false, true
 		}
 		observed = true
 	}

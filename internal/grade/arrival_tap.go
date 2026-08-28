@@ -6,6 +6,7 @@ import (
 	"math/rand/v2"
 	"strings"
 	"sync"
+	"time"
 )
 
 // What a machine's own counters can and cannot witness.
@@ -99,9 +100,11 @@ const tapFrames = 64
 
 // arrivalTap watches one machine's interfaces for the frames of a single flow.
 type arrivalTap struct {
-	device string
-	file   string
-	begun  bool
+	device    string
+	file      string
+	direction string
+	begun     bool
+	cleaned   bool
 }
 
 // startArrivalTap begins watching a machine for frames addressed to a port,
@@ -125,23 +128,56 @@ func startArrivalTap(ctx context.Context, env *Env, device, port string) *arriva
 // probes has to raise it or lose the evidence it went to the trouble of
 // creating.
 func startArrivalTapN(ctx context.Context, env *Env, device, port string, frames int) *arrivalTap {
+	return startDirectionalTapN(ctx, env, device, port, frames, "in")
+}
+
+// startDepartureTapN is the source-side counterpart to startArrivalTapN. It
+// proves that a packet whose absence may become a verdict actually left a real
+// interface rather than merely being handed to a sender command.
+func startDepartureTapN(ctx context.Context, env *Env, device, port string, frames int) *arrivalTap {
+	return startDirectionalTapN(ctx, env, device, port, frames, "out")
+}
+
+func startDirectionalTapN(ctx context.Context, env *Env, device, port string,
+	frames int, direction string,
+) *arrivalTap {
 	t := &arrivalTap{
-		device: device,
-		file:   fmt.Sprintf("/tmp/twinet-tap-%d-%d", rand.Uint32(), rand.Uint32()),
+		device:    device,
+		file:      fmt.Sprintf("/tmp/twinet-tap-%d-%d", rand.Uint32(), rand.Uint32()),
+		direction: direction,
 	}
 	script := fmt.Sprintf(
 		"command -v tcpdump >/dev/null 2>&1 || exit 3; "+
 			"rm -f %[1]s %[1]s.err %[1]s.pid %[1]s.end; "+
-			"( ( timeout %[3]d tcpdump -i any -n -l -Q in -c %[4]d 'dst port %[2]s' "+
+			"( ( timeout %[3]d tcpdump -i any -n -l -Q %[5]s -c %[4]d 'dst port %[2]s' "+
 			">%[1]s 2>%[1]s.err & echo $! >%[1]s.pid; wait; : >%[1]s.end ) "+
 			">/dev/null 2>&1 & ); "+
 			"n=0; while [ $n -lt 100 ]; do "+
 			"grep -q 'listening on' %[1]s.err 2>/dev/null && exit 0; "+
 			"n=$((n+1)); sleep 0.05; done; exit 4",
-		t.file, port, tapSeconds, frames)
+		t.file, port, tapSeconds, frames, direction)
 	res, err := env.Probe(ctx, device, []string{"sh", "-c", script})
 	t.begun = err == nil && res.ExitCode == 0
+	if !t.begun {
+		t.cleanup(ctx, env)
+	}
 	return t
+}
+
+// cleanup stops and removes a capture using a context that survives a
+// cancelled grading check. It is the last-resort path for a failed start or
+// read; successful reads stop and remove the capture themselves.
+func (t *arrivalTap) cleanup(ctx context.Context, env *Env) {
+	if t == nil || t.cleaned || env == nil {
+		return
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	res, err := env.Probe(cleanupCtx, t.device, []string{"sh", "-c",
+		fmt.Sprintf("[ -f %[1]s.pid ] && kill -TERM \"$(cat %[1]s.pid)\" 2>/dev/null; "+
+			"n=0; while [ $n -lt 40 ] && [ ! -f %[1]s.end ]; do n=$((n+1)); sleep 0.05; done; "+
+			"rm -f %[1]s %[1]s.err %[1]s.pid %[1]s.end; exit 0", t.file)})
+	t.cleaned = err == nil && res.ExitCode == 0
 }
 
 // tapCounts is how many frames of each kind arrived on a real interface.
@@ -183,9 +219,11 @@ func (t *arrivalTap) seenFlows(ctx context.Context, env *Env) (tapCounts, map[st
 			"cat %[1]s 2>/dev/null; "+
 			"rm -f %[1]s %[1]s.err %[1]s.pid %[1]s.end; exit 0", t.file)})
 	if err != nil || res.ExitCode != 0 {
+		t.cleanup(ctx, env)
 		return tapCounts{}, nil, false
 	}
-	return parseTapFlows(res.Stdout)
+	t.cleaned = true
+	return parseTapFlowsDirection(res.Stdout, t.direction)
 }
 
 // parseTapOutput separates what tcpdump said about itself from what it
@@ -199,6 +237,10 @@ func parseTapOutput(out string) (tapCounts, bool) {
 // parseTapFlows is parseTapOutput, also grouping the arrivals by the source
 // port they came from.
 func parseTapFlows(out string) (tapCounts, map[string]int, bool) {
+	return parseTapFlowsDirection(out, "in")
+}
+
+func parseTapFlowsDirection(out, direction string) (tapCounts, map[string]int, bool) {
 	marker, rest, ok := strings.Cut(out, "\n")
 	if !ok || !strings.HasPrefix(marker, "EARLY=") {
 		return tapCounts{}, nil, false
@@ -218,7 +260,11 @@ func parseTapFlows(out string) (tapCounts, map[string]int, bool) {
 	if !strings.Contains(head, "LINUX_SLL2") {
 		return tapCounts{}, nil, false
 	}
-	return countTapFrames(body), tapSourcePorts(body), true
+	label := "In"
+	if direction == "out" {
+		label = "Out"
+	}
+	return countTapFramesDirection(body, label), tapSourcePortsDirection(body, label), true
 }
 
 // tapSourcePorts counts the arriving frames by the port they were sent from.
@@ -229,10 +275,14 @@ func parseTapFlows(out string) (tapCounts, map[string]int, bool) {
 // flow as lost when its port is absent, and a misparse would be an accusation
 // against a submission that did nothing wrong.
 func tapSourcePorts(body string) map[string]int {
+	return tapSourcePortsDirection(body, "In")
+}
+
+func tapSourcePortsDirection(body, direction string) map[string]int {
 	out := map[string]int{}
 	for _, line := range strings.Split(body, "\n") {
 		f := strings.Fields(line)
-		if len(f) < 5 || f[2] != "In" || f[1] == "lo" {
+		if len(f) < 5 || f[2] != direction || f[1] == "lo" {
 			continue
 		}
 		if !strings.Contains(line, "UDP,") && !strings.Contains(line, "Flags [") {
@@ -257,10 +307,14 @@ func tapSourcePorts(body string) map[string]int {
 // Frames delivered over the loopback device are the machine talking to itself
 // and are not arrivals.
 func countTapFrames(body string) tapCounts {
+	return countTapFramesDirection(body, "In")
+}
+
+func countTapFramesDirection(body, direction string) tapCounts {
 	var c tapCounts
 	for _, line := range strings.Split(body, "\n") {
 		f := strings.Fields(line)
-		if len(f) < 4 || f[2] != "In" || f[1] == "lo" {
+		if len(f) < 4 || f[2] != direction || f[1] == "lo" {
 			continue
 		}
 		switch {
@@ -398,9 +452,58 @@ const datagramAttempts = 3
 // attempts are left to the kernel.
 type datagramProbe struct {
 	srcAddr string
+	srcPort string
 	dstAddr string
 	port    string
 	v6      bool
+}
+
+type datagramArrivalStatus uint8
+
+const (
+	datagramArrivalUnknown datagramArrivalStatus = iota
+	datagramArrivalSeen
+	datagramArrivalMissing
+)
+
+// probeDatagramArrival creates an attributable UDP witness independent of any
+// earlier capture. A negative observation is not a verdict by itself; callers
+// pass it through confirmedDatagramArrival.
+func probeDatagramArrival(ctx context.Context, env *Env, from, to string,
+	p datagramProbe, counter func(context.Context, *Env, string) (counterWitness, bool),
+) (arrival, bool) {
+	tap := startArrivalTap(ctx, env, to, p.port)
+	before, okB := counter(ctx, env, to)
+	sent := sendDatagrams(ctx, env, from, p)
+	after, okA := counter(ctx, env, to)
+	frames, live := tap.seen(ctx, env)
+	return arrival{
+		tapped: frames.udp, tapLive: live,
+		counted: offBoxDelta(before, after), counterOK: okB && okA,
+	}, sent
+}
+
+// confirmedDatagramArrival accepts one positive observation but requires two
+// independent attributable negatives. Datagram probes are uniquely vulnerable
+// to transient loss and capture scheduling; one silent round must not become a
+// protocol-filter accusation.
+func confirmedDatagramArrival(first arrival, sent bool,
+	retry func() (arrival, bool),
+) (arrival, datagramArrivalStatus) {
+	if !sent || !first.attributable() {
+		return first, datagramArrivalUnknown
+	}
+	if first.arrived() {
+		return first, datagramArrivalSeen
+	}
+	second, sent := retry()
+	if !sent || !second.attributable() {
+		return second, datagramArrivalUnknown
+	}
+	if second.arrived() {
+		return second, datagramArrivalSeen
+	}
+	return second, datagramArrivalMissing
 }
 
 // sendDatagrams sends the same datagram several times and reports whether the
@@ -441,7 +544,11 @@ func sendDatagrams(ctx context.Context, env *Env, from string, p datagramProbe) 
 	if p.srcAddr != "" {
 		// One port for every attempt, drawn once. UDP has no lingering state
 		// to stop it being bound again a moment later.
-		fmt.Fprintf(&b, "sport=%s; ", probePort())
+		srcPort := p.srcPort
+		if srcPort == "" {
+			srcPort = probePort()
+		}
+		fmt.Fprintf(&b, "sport=%s; ", srcPort)
 	}
 	for range datagramAttempts {
 		if p.srcAddr != "" {

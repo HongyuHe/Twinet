@@ -7,6 +7,12 @@ import (
 	"time"
 )
 
+func TestRPKINotFoundReachabilityUsesActivePool(t *testing.T) {
+	if got := inferredCheckClass("rpki.notfound_preserved"); got != CheckActive {
+		t.Fatalf("rpki.notfound_preserved class = %q, want %q", got, CheckActive)
+	}
+}
+
 func TestActivePoolBoundsConcurrencyAndStartsTimeoutAfterQueue(t *testing.T) {
 	var active, maxActive atomic.Int64
 	check := &Check{

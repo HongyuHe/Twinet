@@ -668,36 +668,29 @@ func vpnTCPGap(ctx context.Context, env *Env, d directedPair) (string, bool) {
 // vpnUDPGap sends one datagram across a site pair and reads, at the far side,
 // whether it arrived.
 func vpnUDPGap(ctx context.Context, env *Env, d directedPair) (string, bool) {
-	port := probePort()
-	tap := startArrivalTap(ctx, env, d.to.host, port)
-	before, okB := datagramsDelivered(ctx, env, d.to)
+	probe := datagramProbe{dstAddr: d.to.addr, port: probePort()}
+	counter := func(ctx context.Context, env *Env, _ string) (counterWitness, bool) {
+		return datagramsDelivered(ctx, env, d.to)
+	}
 	// A datagram that was never sent cannot have been filtered. Reaching a
 	// closed port exits zero here and a blocked one times out and also exits
 	// zero, so a sender that could not get a single attempt away is not
 	// evidence -- and reading that as a datagram that did not arrive accused
 	// the VPN of filtering by protocol on no evidence.
-	if !sendDatagrams(ctx, env, d.from.host, datagramProbe{
-		dstAddr: d.to.addr, port: port,
-	}) {
-		_, _ = tap.seen(ctx, env) // clear the capture off the machine
-		return "", false
-	}
-	after, okA := datagramsDelivered(ctx, env, d.to)
-	frames, live := tap.seen(ctx, env)
-	got := arrival{
-		tapped: frames.udp, tapLive: live,
-		counted: offBoxDelta(before, after), counterOK: okB && okA,
-	}
+	got, sent := probeDatagramArrival(ctx, env, d.from.host, d.to.host, probe, counter)
+	got, status := confirmedDatagramArrival(got, sent, func() (arrival, bool) {
+		return probeDatagramArrival(ctx, env, d.from.host, d.to.host, probe, counter)
+	})
 	// A datagram is invisible to whoever sent it, so the far side's own record
 	// is the whole of the evidence. Without it there is no verdict either way.
-	if !got.attributable() {
+	if status == datagramArrivalUnknown {
 		return "", false
 	}
-	if got.arrived() {
+	if status == datagramArrivalSeen {
 		return "", true
 	}
-	return fmt.Sprintf("a datagram from %s to %s (%s) never arrived -- %s -- though pings do: "+
-		"the VPN is filtering by protocol",
+	return fmt.Sprintf("a datagram from %s to %s (%s) never arrived in two attributable "+
+		"rounds -- %s -- though pings do: the VPN is filtering by protocol",
 		d.from.host, d.to.host, d.to.addr, got.why()), true
 }
 

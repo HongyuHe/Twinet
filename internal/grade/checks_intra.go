@@ -1290,85 +1290,160 @@ func deadHops(ctx context.Context, env *Env, paths [][]string) []string {
 	return broken
 }
 
-// sweepFlowCount is how many flows are aimed at the destination to find out
-// whether every path carries them.
+// One five-tuple does not identify one complete path on a multi-hop Linux ECMP
+// graph. Live measurement showed ten identical TCP tuples all leaving ATL
+// through PHY while PHY sent four directly to BOS and six through NYC. A new
+// socket can receive a new skb hash even when its visible tuple is unchanged.
 //
-// The routers hash the source port to choose between equal-cost next hops, so
-// distinct source ports spread over the paths -- and they do so at every
-// router along the way, not only the first, which is what makes a path of
-// three routers reachable by this. Thirty-two flows over the three paths of
-// the shipped lab leave a chance of about one in ten thousand of never trying
-// one of them, and failing to try a path can only understate a fault.
-const sweepFlowCount = 32
+// Therefore the carriage witness samples a population rather than pretending
+// one tuple is path-stable. A path or protocol blackhole removes a sustained
+// fraction in repeated populations; incidental queue or capture loss removes
+// an isolated packet. Four groups of 32 keep the shipped three-path exercise
+// well sampled while staying cheap when sent in bounded parallel batches.
+const (
+	sweepFlowCount           = 32
+	ecmpSweepCount           = 4
+	ecmpLossRequiredSweeps   = 3
+	ecmpLossRequiredFlows    = 5
+	ecmpSweepSpacing         = 250 * time.Millisecond
+	ecmpSweepSendParallelism = 8
+)
 
-// everyFlowArrives sends many flows between two routers and reports the ones
-// that never arrived.
+// everyFlowArrives sends repeated flow populations between two routers and
+// reports sustained, attributable loss.
 //
-// A single end-to-end probe answers for a single path: which one it takes is a
-// hash of the flow, and the same flow takes the same path every time. With
-// three paths installed between two routers, one of them can discard
-// everything sent along it while the probe, hashed onto another, reports the
-// pair as healthy. That is not a hypothetical -- a rule dropping forwarded
-// connections on one middle router cost a quarter of the traffic between two
-// routers and left this question on full marks.
+// A single end-to-end probe answers for whichever forwarding decisions that
+// packet received. With three paths installed between two routers, one can
+// discard everything while a probe sent over another reports the pair healthy.
 //
 // The path a flow will take is not predicted. The kernel can be asked, but its
 // answer for a forwarded packet turned out not to be what it then did with the
 // packet, and a check that grades on a prediction grades on the wrong thing.
-// What is asked instead is the question the mark is actually for: of the flows
-// sent between these two, did every one of them arrive? A lost flow means some
-// path is discarding traffic, and which one it is the student can find.
+// What is asked instead is the question the mark is actually for: does a
+// repeated population lose enough traffic, in enough separately captured
+// rounds, to establish that an installed path is not carrying it? Each
+// negative is dual-ended: the same source port must be captured leaving the
+// source and remain absent at the destination.
 //
 // Both protocols are spread across the sweep, alternating by port, because a
 // filter is written per protocol as easily as per path.
-func everyFlowArrives(ctx context.Context, env *Env, from, to string) (string, bool) {
+func everyFlowArrives(ctx context.Context, env *Env, from, to string) (string, bool, error) {
 	src, sok := env.Device(from)
 	dst, dok := env.Device(to)
 	if !sok || !dok {
-		return "", true
+		return "", false, fmt.Errorf("ECMP endpoints are absent: source=%t destination=%t",
+			sok, dok)
 	}
 	slo, sok := src.IfaceByName("lo")
 	dlo, dok := dst.IfaceByName("lo")
 	if !sok || !dok || slo.Addr4 == "" || dlo.Addr4 == "" {
-		return "", true
+		return "", false, fmt.Errorf(
+			"ECMP endpoint loopbacks are unavailable: source=%t destination=%t",
+			sok && slo.Addr4 != "", dok && dlo.Addr4 != "")
 	}
 	srcAddr, dstAddr := addrOnly(slo.Addr4), addrOnly(dlo.Addr4)
 
-	base := 20000 + rand.IntN(20000)
-	first := make([]string, 0, sweepFlowCount)
-	second := make([]string, 0, sweepFlowCount)
-	for i := range sweepFlowCount {
-		first = append(first, strconv.Itoa(base+i))
-		second = append(second, strconv.Itoa(base+sweepFlowCount+i))
+	losses := make([]int, 0, ecmpSweepCount)
+	var labels, diagnostics []string
+	for round := range ecmpSweepCount {
+		if round > 0 {
+			timer := time.NewTimer(ecmpSweepSpacing)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return "", false, fmt.Errorf("ECMP flow witness was cancelled: %w", ctx.Err())
+			case <-timer.C:
+			}
+		}
+		flows := newSweepFlows()
+		dport := probePort()
+		lost, ok, diagnostic := lostFlows(
+			ctx, env, src.ID, dst.ID, srcAddr, dstAddr, dport, flows,
+		)
+		if !ok {
+			return "", false, fmt.Errorf("ECMP flow witness round %d was inconclusive: %s",
+				round+1, diagnostic)
+		}
+		if diagnostic != "" {
+			diagnostics = append(diagnostics, fmt.Sprintf("round %d: %s", round+1, diagnostic))
+		}
+		losses = append(losses, len(lost))
+		for _, flow := range lost {
+			labels = append(labels, fmt.Sprintf("r%d:%s", round+1,
+				describeSweepFlow(flow, dport)))
+		}
 	}
-	lost, ok := lostFlows(ctx, env, src.ID, dst.ID, srcAddr, dstAddr, first)
-	if !ok || len(lost) == 0 {
-		return "", true
-	}
-	// A flow can go missing for reasons that are nobody's fault -- a frame
-	// lost while a neighbour entry is resolved, a scheduler delay on a loaded
-	// node -- and a mark should not turn on one of those. So the whole sweep
-	// is repeated, from a fresh set of source ports, and the fault has to
-	// still be there. A path that discards traffic discards the second sweep
-	// as surely as the first; a frame lost once does not come back.
-	//
-	// Repeating only the flows that failed would not do, because a source port
-	// is not a path: the second attempt would be hashed afresh and would
-	// mostly land on the paths that work, which is a test that clears a real
-	// fault most of the time.
-	again, ok := lostFlows(ctx, env, src.ID, dst.ID, srcAddr, dstAddr, second)
-	if !ok || len(again) == 0 {
-		return "", true
+	if !sustainedECMPLoss(losses) {
+		total := 0
+		for _, count := range losses {
+			total += count
+		}
+		if total == 0 && len(diagnostics) == 0 {
+			return "", true, nil
+		}
+		note := fmt.Sprintf(
+			"the transport sweep tolerated %d of %d attributable losses across rounds %v",
+			total, sweepFlowCount*ecmpSweepCount, losses)
+		if len(diagnostics) > 0 {
+			note += "; " + strings.Join(diagnostics, "; ")
+		}
+		return note, true, nil
 	}
 	return fmt.Sprintf(
-		"%d of %d flows from %s to %s never arrived, and %d did: the paths are installed "+
-			"and at least one of them is discarding what is sent along it",
-		len(again), len(second), from, to, len(second)-len(again)), false
+		"%d of %d sampled flows from %s to %s were observed leaving %s but absent at %s "+
+			"across %d of %d spaced capture pairs (round losses %v; examples %s): "+
+			"the paths are installed and at least one of them is persistently discarding traffic",
+		len(labels), sweepFlowCount*ecmpSweepCount, from, to, from, to,
+		nonzeroInts(losses), ecmpSweepCount, losses,
+		strings.Join(truncate(labels, 12), ", ")), false, nil
 }
 
-// lostFlows aims one flow from each of the given source ports at a port on the
-// far side that nothing is listening on, and returns the ports whose flows
-// were not seen arriving there.
+type sweepFlow struct {
+	sourcePort string
+	udp        bool
+}
+
+func newSweepFlows() []sweepFlow {
+	base := 20000 + rand.IntN(20000)
+	flows := make([]sweepFlow, 0, sweepFlowCount)
+	for i := range sweepFlowCount {
+		flows = append(flows, sweepFlow{
+			sourcePort: strconv.Itoa(base + i),
+			udp:        i%2 != 0,
+		})
+	}
+	return flows
+}
+
+func describeSweepFlow(flow sweepFlow, dport string) string {
+	protocol := "tcp"
+	if flow.udp {
+		protocol = "udp"
+	}
+	return protocol + "/" + flow.sourcePort + "->" + dport
+}
+
+func sustainedECMPLoss(losses []int) bool {
+	total := 0
+	for _, count := range losses {
+		total += count
+	}
+	return nonzeroInts(losses) >= ecmpLossRequiredSweeps && total >= ecmpLossRequiredFlows
+}
+
+func nonzeroInts(values []int) int {
+	count := 0
+	for _, value := range values {
+		if value > 0 {
+			count++
+		}
+	}
+	return count
+}
+
+// lostFlows aims the given five-tuples at a port on the far side that nothing
+// is listening on, and returns only flows observed leaving the source but not
+// arriving at the destination.
 //
 // A flow that could not be sent is not a flow that was lost: a source port
 // already in use fails to bind, and counting that as a discarded packet would
@@ -1376,45 +1451,91 @@ func everyFlowArrives(ctx context.Context, env *Env, from, to string) (string, b
 // which ports it managed to use and only those are looked for.
 //
 // The second return says whether the capture was in a position to testify at
-// all. It is false when there was no witness, and also when the witness saw
-// nothing whatsoever -- which is either a total blackhole, already reported by
-// the end-to-end probe that runs before this, or a capture whose output could
-// not be read. Neither is a per-path finding.
+// all. A live empty capture is valid negative evidence; a capture that could
+// not start, stopped early, or produced frames that could not be attributed to
+// sampled source ports is not.
 func lostFlows(ctx context.Context, env *Env, srcDev, dstDev, srcAddr, dstAddr string,
-	ports []string) ([]string, bool) {
+	dport string, flows []sweepFlow) ([]sweepFlow, bool, string) {
 
-	if len(ports) == 0 {
-		return nil, false
+	if len(flows) == 0 {
+		return nil, false, "no flows"
 	}
-	dport := probePort()
 	// Every flow of the sweep lands on the same port, so the capture has to
 	// hold all of them: a frame limit reached partway through stops the
 	// capture, and a capture that stopped early is not a witness.
-	tap := startArrivalTapN(ctx, env, dstDev, dport, 8*len(ports)+32)
+	frames := 8*len(flows) + 32
+	arrivalTap := startArrivalTapN(ctx, env, dstDev, dport, frames)
+	defer arrivalTap.cleanup(ctx, env)
+	departureTap := startDepartureTapN(ctx, env, srcDev, dport, frames)
+	defer departureTap.cleanup(ctx, env)
+	res, err := env.Probe(ctx, srcDev, []string{"sh", "-c",
+		sweepSendCommand(srcAddr, dstAddr, dport, flows)})
+	departed, departureCounts, departureLive := tapFlowsOf(ctx, env, departureTap)
+	arrived, arrivalCounts, arrivalLive := tapFlowsOf(ctx, env, arrivalTap)
+	if err != nil {
+		return nil, false, fmt.Sprintf("source probe failed: %v", err)
+	}
+	if res.ExitCode != 0 {
+		return nil, false, fmt.Sprintf("source probe exited %d: %s",
+			res.ExitCode, strings.TrimSpace(res.Stderr))
+	}
+	if !departureLive || !arrivalLive {
+		return nil, false, fmt.Sprintf("capture live state source=%t destination=%t",
+			departureLive, arrivalLive)
+	}
+	// A live capture that saw no frame is evidence that none arrived. Frames
+	// it counted but could not attribute to source ports are different: the
+	// parser cannot safely say which sampled flow was lost.
+	if len(departed) == 0 && (departureCounts.tcp > 0 || departureCounts.udp > 0) {
+		return nil, false, fmt.Sprintf("source capture could not attribute %d TCP/%d UDP frames",
+			departureCounts.tcp, departureCounts.udp)
+	}
+	if len(arrived) == 0 && (arrivalCounts.tcp > 0 || arrivalCounts.udp > 0) {
+		return nil, false, fmt.Sprintf("destination capture could not attribute %d TCP/%d UDP frames",
+			arrivalCounts.tcp, arrivalCounts.udp)
+	}
+	sent := map[string]int{}
+	for _, port := range strings.Fields(res.Stdout) {
+		sent[port]++
+	}
+	var lost []sweepFlow
+	var omitted []string
+	for _, flow := range flows {
+		if arrived[flow.sourcePort] > 0 {
+			continue
+		}
+		if sent[flow.sourcePort] != 1 || departed[flow.sourcePort] < 1 {
+			omitted = append(omitted, fmt.Sprintf("%s sent=%d/1 departed=%d/1",
+				describeSweepFlow(flow, dport), sent[flow.sourcePort],
+				departed[flow.sourcePort]))
+			continue
+		}
+		lost = append(lost, flow)
+	}
+	if len(omitted) > 0 {
+		return lost, false, strings.Join(omitted, ", ")
+	}
+	return lost, true, ""
+}
+
+func sweepSendCommand(srcAddr, dstAddr, dport string, flows []sweepFlow) string {
 	var b strings.Builder
-	for i, p := range ports {
-		if i%2 == 0 {
+	for i, flow := range flows {
+		b.WriteString("( ")
+		if !flow.udp {
 			fmt.Fprintf(&b, "e=$(nc -w 1 -s %s -p %s %s %s </dev/null 2>&1 >/dev/null); ",
-				srcAddr, p, dstAddr, dport)
+				srcAddr, flow.sourcePort, dstAddr, dport)
 		} else {
 			fmt.Fprintf(&b, "e=$(echo twinet | nc -u -w 1 -s %s -p %s %s %s 2>&1 >/dev/null); ",
-				srcAddr, p, dstAddr, dport)
+				srcAddr, flow.sourcePort, dstAddr, dport)
 		}
-		fmt.Fprintf(&b, "case \"$e\" in *bind*) ;; *) echo %s;; esac; ", p)
-	}
-	res, err := env.Probe(ctx, srcDev, []string{"sh", "-c", b.String()})
-	arrived, _, live := tapFlowsOf(ctx, env, tap)
-	if err != nil || !live || len(arrived) == 0 {
-		return nil, false
-	}
-	var lost []string
-	for _, p := range strings.Fields(res.Stdout) {
-		if arrived[p] == 0 {
-			lost = append(lost, p)
+		fmt.Fprintf(&b, "case \"$e\" in *bind*) ;; *) echo %s;; esac ) & ", flow.sourcePort)
+		if (i+1)%ecmpSweepSendParallelism == 0 {
+			b.WriteString("wait; ")
 		}
 	}
-	sort.Strings(lost)
-	return lost, true
+	b.WriteString("wait")
+	return b.String()
 }
 
 // tapFlowsOf reads a capture's arrivals by source port, in the order the rest
@@ -1422,79 +1543,6 @@ func lostFlows(ctx context.Context, env *Env, srcDev, dstDev, srcAddr, dstAddr s
 func tapFlowsOf(ctx context.Context, env *Env, t *arrivalTap) (map[string]int, tapCounts, bool) {
 	counts, byPort, live := t.seenFlows(ctx, env)
 	return byPort, counts, live
-}
-
-// carriesTCPBothWays opens a connection each way between two routers, to a
-// resets it sent -- together with a capture on the far side of the flow the
-// probe creates, which is what makes the count attributable to this probe
-// rather than to any traffic the submission cares to generate.
-func carriesTCPBothWays(ctx context.Context, env *Env, from, to string) (string, bool) {
-	ends := [][2]string{{from, to}, {to, from}}
-	for _, e := range ends {
-		src, ok := env.Device(e[0])
-		if !ok {
-			return "", true
-		}
-		dst, ok := env.Device(e[1])
-		if !ok {
-			return "", true
-		}
-		lo, ok := dst.IfaceByName("lo")
-		if !ok || lo.Addr4 == "" {
-			return "", true
-		}
-		addr := addrOnly(lo.Addr4)
-		// One port for both protocols, drawn for this pair alone, so that a
-		// single capture on the far side covers the connection and the
-		// datagram and neither can be confused with anything else in flight.
-		port := probePort()
-		tap := startArrivalTap(ctx, env, dst.ID, port)
-		// Between the loopbacks, which is the pair the question is about and
-		// the pair a rule aimed at this traffic would name. Sourced from an
-		// interface address instead, a probe misses a drop written against the
-		// routers themselves and reads as a healthy path.
-		args := []string{"nc", "-w", "3", "-z"}
-		src4 := ""
-		if slo, ok := src.IfaceByName("lo"); ok && slo.Addr4 != "" {
-			src4 = addrOnly(slo.Addr4)
-			args = append(args, "-s", src4)
-		}
-		args = append(args, addr, port)
-		before, okB := tcpAnswers(ctx, env, dst.ID)
-		_, _ = env.Probe(ctx, src.ID, args)
-		after, okA := tcpAnswers(ctx, env, dst.ID)
-		// And a datagram. A filter is written per protocol as easily as per
-		// port: dropping UDP between the two loopbacks left the pings and the
-		// connections working and the paths carrying two thirds of what they
-		// should.
-		udpBefore, okU := udpNoPortsV4(ctx, env, dst.ID)
-		udpSent := sendDatagrams(ctx, env, src.ID, datagramProbe{
-			srcAddr: src4, dstAddr: addr, port: port,
-		})
-		udpAfter, okU2 := udpNoPortsV4(ctx, env, dst.ID)
-		frames, live := tap.seen(ctx, env)
-
-		gotTCP := arrival{
-			tapped: frames.tcp, tapLive: live,
-			counted: offBoxDelta(before, after), counterOK: okB && okA,
-		}
-		if gotTCP.attributable() && !gotTCP.arrived() {
-			return fmt.Sprintf(
-				"%s answers pings from %s but no connection to it arrives -- %s: the paths "+
-					"carry ICMP and nothing else", e[1], e[0], gotTCP.why()), false
-		}
-		gotUDP := arrival{
-			tapped: frames.udp, tapLive: live,
-			counted: offBoxDelta(udpBefore, udpAfter), counterOK: okU && okU2,
-		}
-		if udpSent && gotUDP.attributable() && !gotUDP.arrived() {
-			return fmt.Sprintf(
-				"%s answers pings and connections from %s but no datagram from it arrives "+
-					"-- %s: something on the paths is filtering by protocol",
-				e[1], e[0], gotUDP.why()), false
-		}
-	}
-	return "", true
 }
 
 // udpNoPortsV4 reads a host's count of datagrams delivered to it for a port
@@ -1507,8 +1555,14 @@ func udpNoPortsV4(ctx context.Context, env *Env, device string) (counterWitness,
 }
 
 // installedHop is one next hop of an installed route: the interface it leaves
-// by, the address it is handed to, or both.
-type installedHop struct{ iface, ip string }
+// by, the address it is handed to, or both. Linux reports zero when a
+// single-hop route has no explicit weight; normalizedHopWeight treats that as
+// the kernel's effective weight of one.
+type installedHop struct {
+	iface  string
+	ip     string
+	weight int
+}
 
 // kernelLPM returns the selected/installed main-table route set that Linux
 // would use for target. Kernel snapshots contain route prefixes rather than a
@@ -1596,6 +1650,50 @@ func (h installedHop) label() string {
 	default:
 		return h.ip
 	}
+}
+
+func normalizedHopWeight(weight int) int {
+	if weight < 1 {
+		return 1
+	}
+	return weight
+}
+
+// unequalNextHopWeights describes a multipath route whose installed next hops
+// do not share traffic equally. Merely having every prescribed next hop is not
+// enough for an equal-cost-path question when one of them has a larger weight.
+func unequalNextHopWeights(hops []installedHop) string {
+	weights := map[string]int{}
+	for _, hop := range hops {
+		if hop.label() == "" {
+			continue
+		}
+		weights[hop.label()] = normalizedHopWeight(hop.weight)
+	}
+	if len(weights) < 2 {
+		return ""
+	}
+	labels := make([]string, 0, len(weights))
+	for label := range weights {
+		labels = append(labels, label)
+	}
+	sort.Strings(labels)
+	want := weights[labels[0]]
+	equal := true
+	for _, label := range labels[1:] {
+		if weights[label] != want {
+			equal = false
+			break
+		}
+	}
+	if equal {
+		return ""
+	}
+	parts := make([]string, 0, len(labels))
+	for _, label := range labels {
+		parts = append(parts, fmt.Sprintf("%s weight %d", label, weights[label]))
+	}
+	return strings.Join(parts, ", ")
 }
 
 // hopToward is how a forwarding table can show that a router sends traffic to
@@ -1714,7 +1812,9 @@ func checkECMP(ctx context.Context, env *Env) Result {
 				if nh.Device == "" && nh.Address == "" {
 					continue
 				}
-				hops = append(hops, installedHop{iface: nh.Device, ip: nh.Address})
+				hops = append(hops, installedHop{
+					iface: nh.Device, ip: nh.Address, weight: nh.Weight,
+				})
 			}
 		}
 		if env.ShadowBatches && env.UsesDefaultNOS(router) {
@@ -1880,6 +1980,28 @@ func checkECMP(ctx context.Context, env *Env) Result {
 		})
 	}
 
+	var unequalWeights []string
+	for _, router := range pathRouters(wantPaths) {
+		hops, err := fetch(router)
+		if err != nil {
+			return Errored("ospf.ecmp_paths", err)
+		}
+		if issue := unequalNextHopWeights(hops); issue != "" {
+			unequalWeights = append(unequalWeights, router+": "+issue)
+		}
+	}
+	if len(unequalWeights) > 0 {
+		return Partial("ospf.ecmp_paths", 0, Evidence{
+			Expected: fmt.Sprintf("%d equal-cost paths from %s to %s with equal next-hop weights",
+				len(wantPaths), from, to),
+			Observed: "unequal installed next-hop weights",
+			Detail:   strings.Join(unequalWeights, "\n"),
+			Hint: "equal-cost paths must have the same effective kernel weight; remove " +
+				"weighted nexthops or configure every prescribed nexthop with the same weight",
+			Command: "ip -details route show to match " + target,
+		})
+	}
+
 	// And the paths have to carry a packet.
 	//
 	// Everything above reads the forwarding tables, which say exactly which
@@ -1890,7 +2012,7 @@ func checkECMP(ctx context.Context, env *Env) Result {
 	// and every packet discarded, and that scored full marks for a question
 	// about how traffic is carried. So the tables decide which paths exist and
 	// a probe decides whether they work; neither substitutes for the other.
-	var dead string
+	var dead, probeNote string
 	if src, ok := env.Device(from); ok {
 		addr := addrOnly(lo.Addr4)
 		reached, err := env.reaches(ctx, src.ID, addr)
@@ -1917,23 +2039,20 @@ func checkECMP(ctx context.Context, env *Env) Result {
 				}
 			}
 		}
-		// And something other than a ping. A path that answers ICMP and
-		// discards the rest is not carrying traffic in any sense the question
-		// means.
-		if dead == "" {
-			if why, ok := carriesTCPBothWays(ctx, env, from, to); !ok {
-				dead = why
-				fmt.Fprintf(&detail, "%s\n", why)
-			}
-		}
-		// And on every path, not just the one the probe above was hashed
-		// onto. Two of three paths can discard everything while a single
-		// end-to-end flow, which takes one of them and the same one every
-		// time, arrives and reports the pair healthy.
+		// And on every path with both TCP and UDP, not just the one the probe
+		// above was hashed onto. Two of three paths can discard everything
+		// while a single end-to-end flow, which takes one of them and the same
+		// one every time, arrives and reports the pair healthy.
 		if dead == "" && len(wantPaths) > 1 {
-			if why, ok := everyFlowArrives(ctx, env, from, to); !ok {
+			why, ok, err := everyFlowArrives(ctx, env, from, to)
+			if err != nil {
+				return Errored("ospf.ecmp_paths", err)
+			}
+			if !ok {
 				dead = why
 				fmt.Fprintf(&detail, "%s\n", why)
+			} else if why != "" {
+				probeNote = why
 			}
 		}
 	}
@@ -1965,7 +2084,9 @@ func checkECMP(ctx context.Context, env *Env) Result {
 	if present == len(wantPaths) && len(extra) == 0 {
 		return Pass("ospf.ecmp_paths", Evidence{
 			Observed: fmt.Sprintf("all %d prescribed paths installed; %s balances over %s",
-				len(wantPaths), from, strings.Join(got, ", "))})
+				len(wantPaths), from, strings.Join(got, ", ")),
+			Detail: probeNote,
+		})
 	}
 	score := ratio(present, len(wantPaths))
 	if len(extra) > 0 {

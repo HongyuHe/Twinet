@@ -21,6 +21,13 @@ is a quarantine condition, not a successful grade. `grade batch` schedules
 workloads against live inventory and retries work that was not admitted rather
 than treating host pressure as a student result.
 
+Initial cluster-wide holds are acquired serially in canonical node-name order.
+Concurrent graders therefore contend on the same first node rather than each
+holding a different subset until lease expiry. An acquisition failure releases
+the failing node and the acquired prefix in reverse order with a fresh bounded
+cleanup context; the controller publishes its local hold token only after every
+node succeeds. Renewals remain concurrent after that atomic boundary.
+
 ## Observation and scheduling
 
 One grade builds a shared passive observation snapshot: normalized kernel/NOS
@@ -47,6 +54,35 @@ Reports include machine-readable `phase_timings` and `observation_snapshot`
 records, per-check cache/exec accounting, lock waits, and a scheduler critical
 path. `grade run --check-parallel` bounds total/passive checks; the smaller
 `--active-check-parallel` pool protects node runtime pressure.
+
+Negative packet evidence is deliberately stricter than positive evidence.
+One attributable arrival is enough to establish delivery; silence penalizes a
+submission only when a capture announced that it was listening, remained live
+for the whole probe, and could attribute what it saw. A stopped, unreadable, or
+unparseable capture is infrastructure uncertainty, never non-arrival.
+
+Protocol-filter checks send three datagrams on one five-tuple per observation
+and require two independently captured negative observations. The ECMP
+carriage check uses four spaced populations of 32 alternating TCP/UDP flows.
+Each population has synchronized source-egress and destination-ingress
+captures; a loss counts only when the same source port was observed leaving
+the source and remained absent at the destination. At least five losses across
+at least three populations are required.
+
+This is intentionally a population test. Live Linux forwarding showed that
+successive sockets with the same visible five-tuple can take different
+downstream branches in a multi-hop ECMP graph, so an “exact tuple means exact
+path” retry contract would be false. The bounded batches distinguish a
+sustained path/protocol blackhole from isolated queue or capture loss without
+claiming a path identity the kernel does not preserve. Active ECMP, tunnel, and
+MPLS checks declare their transport and device resources so two checks cannot
+manufacture loss by probing the same endpoint concurrently.
+
+An ECMP route must also give every installed next hop the same effective kernel
+weight. Linux omits the default weight from some route views, so Twinet
+normalizes an omitted or zero value to one before comparing the complete
+prescribed forwarding graph. A route with all expected next hops but a 9:1
+weight split is not equal-cost forwarding and does not earn the mark.
 
 ### How many systems are read at once
 

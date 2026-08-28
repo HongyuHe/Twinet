@@ -116,7 +116,7 @@ The executable list is intentionally generated from the current tree rather
 than summarized as “two binaries.” The source facts are not a live acceptance
 claim.
 
-## Current three-node acceptance (2026-08-26 through 2026-08-27)
+## Current three-node acceptance (2026-08-26 through 2026-08-28)
 
 Fresh Claude Opus 5 review round 1 rebuilt the source and independently
 deployed it on node-0/node-1/node-2. Its initial verdict was `FAIL`; the
@@ -141,6 +141,9 @@ only to the revision in its row.
 | Bundled generated Clos (`8d69516`) | 11 devices / 12 links / 6 cross-node endpoints across all three nodes: **20.337 s** deploy, all 12 adjacencies Full, **1/1** grade, exact placement re-adoption after deleting the controller record, clean teardown |
 | Cleanup | Every run above ended at zero containers and zero `tw*` host links on all three nodes |
 | Immutable release images | Seven `hyhe/twinet-*` images published as `0.1-e8d207d`; every bundled example carries a topology-bound `images.lock.json` with registry `sha256` manifests |
+| ECMP population stability (source digest `28069a8`) | **100/100** clean q1.3 grades passed in **1,952 s**; zero wrong grades, command failures, source mismatches, or scheduler-lock failures |
+| ECMP fault discrimination (source digest `28069a8`) | Clean **1/1 in 19.269 s**; an NYC TCP-forwarding drop reduced q1.3 to **0.5/1** with 16/128 dual-capture-attributed losses in rounds `[2 6 3 5]`; five repeat faulted grades were identically **0.5/1**; cleanup restored **1/1 in 16.744 s** |
+| Unequal ECMP weights (source digest `28069a8`) | A live ATL 1:9 kernel nexthop group was rejected with `unequal installed next-hop weights`; after FRR supervision reconverged, the isolated ATL-to-BOS check returned **1/1 in 8.692 s** |
 
 The repeated overlay loss found during remediation was not a failure of the
 new agents: kernel probes identified an obsolete second
@@ -204,7 +207,7 @@ current lock owner.
 | Matrix, looking glass, policy analyzer | done | `twinet web` serves an overview, the connectivity matrix and a looking glass restricted to nine read-only commands. Matrix refresh batches reachability and path-policy probes source-side, using at most two container execs per source AS while preserving down/unknown/policy verdicts; runtime/repair events invalidate the cache. What it does not have, and the original had, is the time slider over historical snapshots, per-group VPN status and the Krill proxy |
 | Agent metrics and event stream | done | `GET /metrics` emits bounded Prometheus text for operations, queues, runtime events, inventory, overlays, reservations, convergence, repairs, grading infrastructure, and underlay health. `GET /v1/events` is a durable bounded scoped stream; `twinet events [--json] [--follow]` merges node pages deterministically and diagnostic credentials remain confined to their lab |
 | _(collectors)_ | done | control-plane collectors; the analyzer reads structured paths and the declared relationships rather than scraping text |
-| CI gates | done | `make ci` refuses to run without golangci-lint and shellcheck rather than reporting a pass it did not verify, and includes `go mod tidy -diff`. Turning the lint on found five real problems. The GitHub workflow is disabled on push by request; `make ci` runs the identical gates |
+| CI gates | done | `make ci` refuses to run without golangci-lint and shellcheck rather than reporting a pass it did not verify, and includes `go mod tidy -diff`. Turning the lint on found five real problems. The GitHub workflow runs for pushes and tags on `main`, pull requests into `main`, and explicit dispatches; `dev` uses the identical local gate without consuming hosted runs on every intermediate commit. |
 | Grading marks behaviour, not text | done | The exchange check requires the policy to be bound to the route server, the 6in4 check requires a tunnel that carried the packets rather than the kernel's own `sit0`, and the RPKI check requires a connected validator holding ROAs before an empty invalid table means anything |
 
 ## Defects found by the platform's own checks
@@ -3489,3 +3492,94 @@ idempotent kernel commands as well as rendered into FRR: restarting an already
 running daemon does not reload its file, which is why bounded semantic repair
 could previously retry a missing measurement address three times without
 changing it.
+
+### 140. A cluster-wide grading hold that fragmented under contention
+
+The compact-attestation investigation launched competing graders and exposed a
+distributed-lock failure rather than a grading failure. Each controller asked
+all nodes for a hold concurrently. Two controllers could therefore acquire
+different subsets, discover one another on the remaining nodes, and both fail
+while retaining their partial holds until the 180-second leases expired. No
+controller owned the lab, but no controller could use it either.
+
+Initial acquisition is now serial in sorted node-name order, so every contender
+meets at the same first node. If a later node refuses, the controller asks that
+node to release too — an agent may have made a hold durable before reporting an
+error — then releases the acquired prefix in reverse order. Cleanup uses a
+fresh 30-second context that survives cancellation of the grading request, and
+any release failure is returned explicitly with the lease bound. The
+process-local bypass token is not published until every node has accepted.
+Renewal remains parallel only after that atomic boundary.
+
+The regression drives canonical ordering, reverse rollback, cleanup of the
+rejecting node, and rollback-error reporting. In the three-node live race one
+grader acquired the lab, its contender failed immediately at `node-0`, and an
+immediate third grade succeeded after the winner released it. No fragmented
+hold remained on any node.
+
+### 141. Packet silence that became a mark after overlapping captures
+
+The first complete compact-v4 attestation rejected one of 23 cases because an
+unrelated q1.3 ECMP witness disagreed between the full and compact runs. This
+was not a reduced-topology difference: historical runs showed the same UDP
+accusation in the opposite mode. It exposed two independent evidence defects.
+
+First, a transiently silent capture had too much authority. Protocol-filter
+checks now send three datagrams per attributable observation and require two
+independent negative observations. A capture that did not become ready, stopped
+early, could not be read, or saw frames it could not attribute yields no
+negative verdict.
+
+An intermediate remedy sampled 32 alternating TCP/UDP five-tuples and retried
+each missing tuple through two fresh captures. A live fault on `as3/NYC`
+dropped TCP destined for `3.153.0.1`; this remedy reduced q1.3 from `1.00` to
+`0.50`, and removing the rule restored `1.00`. Later evidence below disproved
+its assumption that a visible tuple identifies one complete multi-hop path.
+
+Second, active checks were allowed to share their witnesses. A 100-grade run of
+the three-capture binary produced 99 clean grades and no command errors; run 36
+falsely claimed ATL-to-BOS UDP loss in both attributable rounds. The whole grade
+took 8.368 seconds while its two directional checks individually took 7.674 and
+7.883 seconds, proving that their captures and counters overlapped. The failure
+was in the general UDP witness before exact-flow sampling.
+
+`ospf.ecmp_paths` now reserves the TCP and UDP transport resources of every
+target-AS router. Same-AS directional checks serialize, while checks in other
+ASes remain independent. A live source-digest `5080075e` smoke run scored both
+directions `pass`, recorded the second check waiting 6.741 seconds on the exact
+resource keys, and completed in 14.211 seconds. The scheduler regression proves
+that two instances share those resources rather than relying on timing.
+
+Serialization did not make the tuple contract true. A source-bound 100-grade
+gate at digest `5080075e` produced five false deductions — runs 10, 55, 64, 82,
+and 93 — with zero command, source, or scheduler-lock errors. Direct measurement
+then sent one recorded TCP tuple ten times: all ten packets left ATL through
+PHY, but four arrived directly at BOS while six followed the branch through
+faulted NYC and disappeared. A downstream Linux forwarder can therefore choose
+different branches for successive sockets even when their visible addresses,
+ports, and protocol are identical.
+
+The final witness tests populations rather than inventing a path-stability
+guarantee. Four spaced rounds each send 32 alternating TCP/UDP flows in bounded
+parallel batches. Every round runs synchronized source-egress and
+destination-ingress captures, and only a source port observed leaving but absent
+at the destination counts as lost. A deduction requires at least five such
+losses across at least three rounds. At source digest `28069a8`, the NYC fault
+produced round losses `[2 6 3 5]`, or 16 of 128, and reduced q1.3 to `0.50`;
+five more faulted grades produced the same score. Cleanup restored both
+directions to `pass`, then 100 consecutive clean grades completed with zero
+wrong grades, command failures, source mismatches, or scheduler-lock failures.
+
+### 142. Equal-cost routes whose kernel weights were not equal
+
+The ECMP check once required the prescribed nexthops but ignored the effective
+weights Linux assigned them. A 1:9 group therefore contained both expected
+paths and received full marks while sending almost all traffic to one path.
+Missing and zero JSON weights are now normalized to Linux's effective weight
+one, and every prescribed member must have the same effective weight.
+
+The parser and grading regressions cover implicit, explicit, equal, unequal,
+and malformed weights. At source digest `28069a8`, a live 1:9 group on ATL was
+rejected with `unequal installed next-hop weights` and evidence naming weights
+9 and 1. FRR supervision then restored the equal-weight route, and the isolated
+ATL-to-BOS recovery check passed `1.00/1.00`.

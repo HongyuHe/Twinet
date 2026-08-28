@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -86,9 +87,6 @@ func holdLab(ctx context.Context, top *model.Topology, token string, out io.Writ
 		return nil, err
 	}
 	id := hex.EncodeToString(idBytes[:])
-	// Recorded where the exec path can find it: a lab this process is holding
-	// must still admit this process's own commands.
-	setHoldToken(id)
 	holder := fmt.Sprintf("grading (pid %d)", os.Getpid())
 
 	ask := func(ctx context.Context, secs int) error {
@@ -105,13 +103,26 @@ func holdLab(ctx context.Context, top *model.Topology, token string, out io.Writ
 		return nil
 	}
 
-	if err := ask(ctx, holdSeconds); err != nil {
+	targets := make([]initialHoldTarget, 0, len(c.Nodes))
+	for _, node := range c.Nodes {
+		node := node
+		targets = append(targets, initialHoldTarget{
+			name: node.Name,
+			set: func(ctx context.Context, seconds int) error {
+				return node.Hold(ctx, top.Name, holder, id, seconds)
+			},
+		})
+	}
+	if err := acquireInitialHold(ctx, targets); err != nil {
 		return nil, fmt.Errorf("%w.\nWhile a node is repairing devices by itself, a "+
 			"submission can be loaded onto a device that is being rewired, and in a lab "+
 			"deployed at the reference a repair writes the model answer over a student's "+
 			"work. Neither is visible in the marks. Fix the node, or upgrade its agent if "+
 			"it does not recognise the request, and grade again", err)
 	}
+	// Recorded where the exec path can find it only after every node holds the
+	// lab. A failed acquisition must not leave a token that can bypass a hold.
+	setHoldToken(id)
 
 	lost := make(chan struct{})
 	stop := make(chan struct{})
@@ -191,6 +202,47 @@ func holdLab(ctx context.Context, top *model.Topology, token string, out io.Writ
 				time.Duration(holdSeconds)*time.Second)
 		},
 	}, nil
+}
+
+type initialHoldTarget struct {
+	name string
+	set  func(context.Context, int) error
+}
+
+// acquireInitialHold takes node holds in canonical order. Competing graders
+// therefore contend on the same first node instead of each acquiring a
+// different subset and deadlocking the cluster until every lease expires.
+func acquireInitialHold(ctx context.Context, targets []initialHoldTarget) error {
+	targets = append([]initialHoldTarget(nil), targets...)
+	sort.Slice(targets, func(i, j int) bool { return targets[i].name < targets[j].name })
+	acquired := make([]initialHoldTarget, 0, len(targets))
+	for _, target := range targets {
+		if err := target.set(ctx, holdSeconds); err != nil {
+			rollback, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+			var releaseFailures []string
+			// A service-unavailable response can be returned after the local
+			// hold was installed, so ask the failing target to release too.
+			if releaseErr := target.set(rollback, 0); releaseErr != nil {
+				releaseFailures = append(releaseFailures,
+					fmt.Sprintf("%s (%v)", target.name, releaseErr))
+			}
+			for i := len(acquired) - 1; i >= 0; i-- {
+				if releaseErr := acquired[i].set(rollback, 0); releaseErr != nil {
+					releaseFailures = append(releaseFailures,
+						fmt.Sprintf("%s (%v)", acquired[i].name, releaseErr))
+				}
+			}
+			cancel()
+			if len(releaseFailures) > 0 {
+				return fmt.Errorf("node %s would not hold the lab (%w); partial holds "+
+					"could not be rolled back on %v and remain bounded by their lease",
+					target.name, err, releaseFailures)
+			}
+			return fmt.Errorf("node %s would not hold the lab: %w", target.name, err)
+		}
+		acquired = append(acquired, target)
+	}
+	return nil
 }
 
 // The grading hold token of this process, if it holds one.

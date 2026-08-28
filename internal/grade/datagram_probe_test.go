@@ -125,6 +125,62 @@ func TestEveryAttemptLeavesFromTheSameSourcePort(t *testing.T) {
 	}
 }
 
+func TestAnExplicitSourcePortIsReusedForConfirmation(t *testing.T) {
+	dir, log := stubNC(t, "exit 0")
+	env := runningEnv(t, dir)
+
+	sendDatagrams(context.Background(), env, "as3/BOS_host", datagramProbe{
+		srcAddr: "3.101.0.1", srcPort: "24567", dstAddr: "3.102.0.1", port: "33456",
+	})
+	for _, c := range callsIn(t, log) {
+		if !strings.Contains(c, "-p 24567") {
+			t.Fatalf("confirmation changed the flow's source port: %q", c)
+		}
+	}
+}
+
+func TestDatagramLossNeedsTwoAttributableRounds(t *testing.T) {
+	missing := arrival{tapLive: true}
+	seen := arrival{tapLive: true, tapped: 1}
+	unknown := arrival{}
+
+	tests := []struct {
+		name       string
+		first      arrival
+		firstSent  bool
+		second     arrival
+		secondSent bool
+		want       datagramArrivalStatus
+		wantRetry  bool
+	}{
+		{name: "not sent", first: missing, want: datagramArrivalUnknown},
+		{name: "first unknown", first: unknown, firstSent: true, want: datagramArrivalUnknown},
+		{name: "first arrived", first: seen, firstSent: true, want: datagramArrivalSeen},
+		{name: "retry not sent", first: missing, firstSent: true, second: missing,
+			want: datagramArrivalUnknown, wantRetry: true},
+		{name: "retry unknown", first: missing, firstSent: true, second: unknown,
+			secondSent: true, want: datagramArrivalUnknown, wantRetry: true},
+		{name: "transient loss", first: missing, firstSent: true, second: seen,
+			secondSent: true, want: datagramArrivalSeen, wantRetry: true},
+		{name: "confirmed loss", first: missing, firstSent: true, second: missing,
+			secondSent: true, want: datagramArrivalMissing, wantRetry: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			retried := false
+			_, got := confirmedDatagramArrival(tc.first, tc.firstSent,
+				func() (arrival, bool) {
+					retried = true
+					return tc.second, tc.secondSent
+				})
+			if got != tc.want || retried != tc.wantRetry {
+				t.Fatalf("status=%v retry=%v, want status=%v retry=%v",
+					got, retried, tc.want, tc.wantRetry)
+			}
+		})
+	}
+}
+
 // A datagram that could not be sent is not a datagram that was lost. The
 // grader picks the source port, so a collision is the grader's fault, and a
 // probe that cannot bind falls back rather than accusing the submission.

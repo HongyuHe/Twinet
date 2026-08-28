@@ -45,6 +45,7 @@ func inferredCheckClass(name string) CheckClass {
 	case "bgp.ibgp_full_mesh", "bgp.ebgp_established",
 		"dataplane.internal_reachability", "l2.vlan_isolation", "ospf.ecmp_paths",
 		"tunnel.sixin4", "policy.transit_for_customers", "policy.traffic_engineering",
+		"rpki.notfound_preserved",
 		"vpn.site_reachability", "vpn.label_switched", "vpn.isolation",
 		"multicast.delivery", "multicast.no_flooding":
 		return CheckActive
@@ -428,10 +429,12 @@ func inferredProbeResources(name string, env *Env) []ProbeResource {
 		return bgpRefreshResources(name, env)
 	case "dataplane.internal_reachability":
 		return internalReachabilityResources(env)
-	case "l2.vlan_isolation", "ospf.ecmp_paths":
-		// VLAN uses ARP/neighbour-table evidence and ECMP uses ordinary
-		// ping/table lookups; neither attributes a shared counter/capture.
+	case "l2.vlan_isolation":
+		// VLAN uses ARP and neighbour-table evidence without a shared
+		// counter or capture.
 		return nil
+	case "ospf.ecmp_paths":
+		return ecmpResources(env)
 	case "tunnel.sixin4":
 		return sixIn4Resources(env)
 	case "policy.transit_for_customers":
@@ -488,6 +491,13 @@ func internalReachabilityResources(env *Env) []ProbeResource {
 		}
 	}
 	return ipv4TransportResources(devices)
+}
+
+func ecmpResources(env *Env) []ProbeResource {
+	if env == nil || env.Topology == nil {
+		return nil
+	}
+	return counterResources(env.Routers(), "tcp", "udp4")
 }
 
 func sixIn4Resources(env *Env) []ProbeResource {
