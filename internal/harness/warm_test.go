@@ -58,14 +58,14 @@ func (h *fakeWarmHarness) get() string {
 }
 
 func TestWarmPoolResetsEverySubmissionAndDestroysAtEnd(t *testing.T) {
-	var created []*fakeWarmHarness
+	created := make([]*fakeWarmHarness, 2)
 	pool, err := NewWarmPool(context.Background(), 2, func(_ context.Context, worker int) (WarmHarness, error) {
 		harness := &fakeWarmHarness{identity: WarmIdentity{
 			Namespace: fmt.Sprintf("grade-worker-%d", worker),
 			Fence:     fmt.Sprintf("fence-%d", worker),
 			ImageLock: "sha256:locked",
 		}}
-		created = append(created, harness)
+		created[worker] = harness
 		return harness, nil
 	})
 	if err != nil {
@@ -103,6 +103,65 @@ func TestWarmPoolResetsEverySubmissionAndDestroysAtEnd(t *testing.T) {
 		// after every use it happened to serve.
 		if harness.resets < 1 {
 			t.Errorf("%s was never reset", harness.identity.Namespace)
+		}
+	}
+}
+
+func TestWarmPoolInitializesWorkersConcurrently(t *testing.T) {
+	const workers = 4
+	started := make(chan int, workers)
+	release := make(chan struct{})
+	result := make(chan error, 1)
+	go func() {
+		pool, err := NewWarmPool(context.Background(), workers,
+			func(_ context.Context, worker int) (WarmHarness, error) {
+				started <- worker
+				<-release
+				return &fakeWarmHarness{identity: WarmIdentity{
+					Namespace: fmt.Sprintf("grade-worker-%d", worker),
+					Fence:     fmt.Sprintf("fence-%d", worker),
+					ImageLock: "sha256:locked",
+				}}, nil
+			})
+		if pool != nil {
+			err = errors.Join(err, pool.Close(context.Background()))
+		}
+		result <- err
+	}()
+	for worker := 0; worker < workers; worker++ {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatalf("only %d of %d warm factories started before release", worker, workers)
+		}
+	}
+	close(release)
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWarmPoolDestroysEveryCreatedWorkerWhenInitializationFails(t *testing.T) {
+	created := make([]*fakeWarmHarness, 3)
+	_, err := NewWarmPool(context.Background(), len(created),
+		func(_ context.Context, worker int) (WarmHarness, error) {
+			harness := &fakeWarmHarness{identity: WarmIdentity{
+				Namespace: fmt.Sprintf("grade-worker-%d", worker),
+				Fence:     fmt.Sprintf("fence-%d", worker),
+				ImageLock: "sha256:locked",
+			}}
+			created[worker] = harness
+			if worker == 1 {
+				return harness, fmt.Errorf("deployment failed")
+			}
+			return harness, nil
+		})
+	if err == nil {
+		t.Fatal("partial warm pool initialization succeeded")
+	}
+	for worker, harness := range created {
+		if harness == nil || harness.destroyed != 1 {
+			t.Errorf("worker %d cleanup = %#v, want one destroy", worker, harness)
 		}
 	}
 }

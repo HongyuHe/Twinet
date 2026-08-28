@@ -192,89 +192,34 @@ submission. Use --full-harness (normally with --keep-labs) for a dispute, or
 					continue
 				}
 				plans = append(plans, &batchHarness{
-					index: i, queueIndex: len(plans), submission: sub, topology: h,
+					index: i, submission: sub, topology: h,
 				})
 			}
 
 			c := client.NewCluster(class.Lab, tok)
-			workloads := make([]place.Workload, 0, len(plans))
-			for _, plan := range plans {
-				workloads = append(workloads, place.Workload{
-					Name: plan.submission.Identity(), DemandByNode: place.TopologyDemandByNode(plan.topology),
-				})
-			}
-			var waves [][]int
-			if len(workloads) > 0 {
-				inventory, err := c.Inventories(cmd.Context())
-				if err != nil {
-					return fmt.Errorf("cannot schedule grading harnesses before marking: %w", err)
-				}
-				parallel, err = place.SafeWorkerCount(class.Lab, inventory, workloads, parallel)
-				if err != nil {
-					return fmt.Errorf("cannot derive a capacity-safe grading worker count: %w", err)
-				}
-				if parallel < 1 {
-					return fmt.Errorf("cannot derive a non-zero capacity-safe grading worker count")
-				}
-				waves, err = place.ScheduleWaves(class.Lab, inventory, workloads, parallel)
-				if err != nil {
-					return fmt.Errorf("cannot schedule grading harnesses before marking: %w", err)
-				}
-			}
-			fmt.Fprintf(cmd.ErrOrStderr(),
-				"grading %d submission(s) in %d capacity-safe wave(s), at most %d at a time\n",
-				len(plans), len(waves), parallel)
-
-			var warm *warmBatchManager
-			if !keepLabs && compact {
-				workersByASN := map[int]int{}
-				for _, plan := range plans {
-					workersByASN[plan.submission.AS]++
-				}
-				for asn, workers := range workersByASN {
-					if workers > parallel {
-						workersByASN[asn] = parallel
-					}
-				}
-				warm = newWarmBatchManager(class, rubric, batchOpts{
-					token: tok, depth: depth, keepHosts: keepHosts, reduce: reduce, fullHarness: fullHarness,
-					compact: compact, auditHash: auditHash,
-					keepLab: false, converge: converge, settle: settle, outDir: outDir,
-				}, workersByASN)
+			useWarmHarnesses := !keepLabs && compact
+			warmGroups, coldPlans := splitBatchHarnesses(plans, useWarmHarnesses)
+			batchOptions := batchOpts{
+				token: tok, depth: depth, keepHosts: keepHosts, reduce: reduce, fullHarness: fullHarness,
+				compact: compact, auditHash: auditHash,
+				keepLab: false, converge: converge, settle: settle, outDir: outDir,
 			}
 			var mu sync.Mutex
 			done := 0
-			for waveIndex := 0; waveIndex < len(waves); waveIndex++ {
-				wave := waves[waveIndex]
-				wavePlans := make([]*batchHarness, 0, len(wave))
-				waveWorkloads := make([]place.Workload, 0, len(wave))
-				for _, index := range wave {
-					wavePlans = append(wavePlans, plans[index])
-					waveWorkloads = append(waveWorkloads, workloads[index])
-				}
-				if err := waitForHarnessCapacity(cmd.Context(), c, class.Lab, waveWorkloads); err != nil {
-					return fmt.Errorf("harness wave was not admitted before marking: %w", err)
-				}
+			gradeWave := func(wavePlans []*batchHarness,
+				one func(context.Context, *batchHarness) *grade.Report,
+			) []*batchHarness {
 				var wg sync.WaitGroup
 				var retryMu sync.Mutex
-				var retry []int
+				var retry []*batchHarness
 				for _, plan := range wavePlans {
 					wg.Add(1)
 					go func(plan *batchHarness) {
 						defer wg.Done()
-						var rep *grade.Report
-						if warm != nil {
-							rep = warm.grade(cmd.Context(), plan.submission)
-						} else {
-							rep = gradeOneHarness(cmd.Context(), class, rubric, plan.submission, plan.topology, batchOpts{
-								token: tok, depth: depth, keepHosts: keepHosts, reduce: reduce, fullHarness: fullHarness,
-								keepLab: keepLabs, converge: converge, settle: settle,
-								outDir: outDir,
-							})
-						}
+						rep := one(cmd.Context(), plan)
 						if capacityBlockedReport(rep) {
 							retryMu.Lock()
-							retry = append(retry, plan.queueIndex)
+							retry = append(retry, plan)
 							retryMu.Unlock()
 							return
 						}
@@ -288,26 +233,106 @@ submission. Use --full-harness (normally with --keep-labs) for a dispute, or
 					}(plan)
 				}
 				wg.Wait()
+				sort.Slice(retry, func(i, j int) bool {
+					return retry[i].index < retry[j].index
+				})
+				return retry
+			}
+
+			for _, group := range warmGroups {
+				waves, width, err := scheduleBatchPlans(cmd.Context(), c, class.Lab, group.plans, parallel)
+				if err != nil {
+					return fmt.Errorf("cannot schedule reusable grading harnesses for AS %d: %w",
+						group.asn, err)
+				}
+				fmt.Fprintf(cmd.ErrOrStderr(),
+					"grading %d repeated submission(s) for AS %d in %d reusable wave(s), at most %d at a time\n",
+					len(group.plans), group.asn, len(waves), width)
+				warm := newWarmBatchManager(class, rubric, batchOptions, map[int]int{group.asn: width})
+				err = withWarmBatchManager(cmd.Context(), warm,
+					len(group.plans[0].topology.Devices), fmt.Sprintf(" for AS %d", group.asn),
+					func() error {
+						if err := waitForHarnessCapacity(cmd.Context(), c, class.Lab,
+							batchPlanWorkloads(waves[0])); err != nil {
+							return fmt.Errorf("reusable harness pool was not admitted before marking: %w", err)
+						}
+						if err := warm.prepare(cmd.Context(), []int{group.asn}); err != nil {
+							return fmt.Errorf("creating reusable harness pool for AS %d: %w", group.asn, err)
+						}
+						for _, wavePlans := range waves {
+							retry := gradeWave(wavePlans,
+								func(ctx context.Context, plan *batchHarness) *grade.Report {
+									return warm.grade(ctx, plan.submission)
+								})
+							if len(retry) > 0 {
+								return fmt.Errorf("reusable harness pool unexpectedly reported capacity pressure")
+							}
+						}
+						return nil
+					})
+				if err != nil {
+					return err
+				}
+			}
+
+			coldWaves, coldWidth, err := scheduleBatchPlans(cmd.Context(), c, class.Lab, coldPlans, parallel)
+			if err != nil {
+				return fmt.Errorf("cannot schedule disposable grading harnesses: %w", err)
+			}
+			if len(coldPlans) > 0 {
+				fmt.Fprintf(cmd.ErrOrStderr(),
+					"grading %d one-off submission(s) in %d capacity-safe wave(s), at most %d at a time\n",
+					len(coldPlans), len(coldWaves), coldWidth)
+			}
+			for waveIndex := 0; waveIndex < len(coldWaves); waveIndex++ {
+				wavePlans := coldWaves[waveIndex]
+				if err := waitForHarnessCapacity(cmd.Context(), c, class.Lab,
+					batchPlanWorkloads(wavePlans)); err != nil {
+					return fmt.Errorf("harness wave was not admitted before marking: %w", err)
+				}
+				if useWarmHarnesses {
+					workersByASN := make(map[int]int, len(wavePlans))
+					asns := make([]int, 0, len(wavePlans))
+					for _, plan := range wavePlans {
+						workersByASN[plan.submission.AS] = 1
+						asns = append(asns, plan.submission.AS)
+					}
+					warm := newWarmBatchManager(class, rubric, batchOptions, workersByASN)
+					err := withWarmBatchManager(cmd.Context(), warm, maxBatchDevices(wavePlans),
+						fmt.Sprintf(" for one-off wave %d", waveIndex+1), func() error {
+							if err := warm.prepare(cmd.Context(), asns); err != nil {
+								return fmt.Errorf("creating one-off warm harnesses: %w", err)
+							}
+							retry := gradeWave(wavePlans,
+								func(ctx context.Context, plan *batchHarness) *grade.Report {
+									return warm.grade(ctx, plan.submission)
+								})
+							if len(retry) > 0 {
+								return fmt.Errorf("one-off warm harness unexpectedly reported capacity pressure")
+							}
+							return nil
+						})
+					if err != nil {
+						return err
+					}
+					continue
+				}
+				retry := gradeWave(wavePlans,
+					func(ctx context.Context, plan *batchHarness) *grade.Report {
+						options := batchOptions
+						options.keepLab = keepLabs
+						return gradeOneHarness(ctx, class, rubric, plan.submission, plan.topology, options)
+					})
 				if len(retry) > 0 {
 					// A concurrent external deployment won capacity between
 					// the preflight and agent admission. These submissions
 					// have not been marked; queue them for a fresh capacity
 					// check instead of quarantining correct work for host
 					// pressure.
-					sort.Ints(retry)
-					waves = append(waves, retry)
+					coldWaves = append(coldWaves, retry)
 					fmt.Fprintf(cmd.ErrOrStderr(),
 						"  capacity changed during admission; queued %d harness(es) for a later safe wave\n",
 						len(retry))
-				}
-			}
-			if warm != nil {
-				tctx, cancel := context.WithTimeout(context.WithoutCancel(cmd.Context()), 3*time.Minute)
-				err := warm.close(tctx)
-				cancel()
-				if err != nil {
-					teardownFailed.Store(true)
-					return fmt.Errorf("destroying warm grading harnesses: %w", err)
 				}
 			}
 
@@ -412,9 +437,108 @@ func batchHarnessOptions(depth int, reduce, full, compact, keepHosts bool, suffi
 
 type batchHarness struct {
 	index      int
-	queueIndex int
 	submission submission
 	topology   *model.Topology
+}
+
+type batchHarnessGroup struct {
+	asn   int
+	plans []*batchHarness
+}
+
+func splitBatchHarnesses(plans []*batchHarness, reuse bool) ([]batchHarnessGroup, []*batchHarness) {
+	counts := map[int]int{}
+	for _, plan := range plans {
+		counts[plan.submission.AS]++
+	}
+	grouped := map[int][]*batchHarness{}
+	var cold []*batchHarness
+	for _, plan := range plans {
+		if reuse && counts[plan.submission.AS] > 1 {
+			grouped[plan.submission.AS] = append(grouped[plan.submission.AS], plan)
+			continue
+		}
+		cold = append(cold, plan)
+	}
+	asns := make([]int, 0, len(grouped))
+	for asn := range grouped {
+		asns = append(asns, asn)
+	}
+	sort.Ints(asns)
+	groups := make([]batchHarnessGroup, 0, len(asns))
+	for _, asn := range asns {
+		groups = append(groups, batchHarnessGroup{asn: asn, plans: grouped[asn]})
+	}
+	return groups, cold
+}
+
+func batchPlanWorkloads(plans []*batchHarness) []place.Workload {
+	workloads := make([]place.Workload, 0, len(plans))
+	for _, plan := range plans {
+		workloads = append(workloads, place.Workload{
+			Name:         plan.submission.Identity(),
+			DemandByNode: place.TopologyDemandByNode(plan.topology),
+		})
+	}
+	return workloads
+}
+
+func scheduleBatchPlans(ctx context.Context, cluster *client.Cluster, lab *model.Lab,
+	plans []*batchHarness, requested int,
+) ([][]*batchHarness, int, error) {
+	if len(plans) == 0 {
+		return nil, 0, nil
+	}
+	inventory, err := cluster.Inventories(ctx)
+	if err != nil {
+		return nil, 0, fmt.Errorf("reading cluster inventory: %w", err)
+	}
+	workloads := batchPlanWorkloads(plans)
+	width, err := place.SafeWorkerCount(lab, inventory, workloads, requested)
+	if err != nil {
+		return nil, 0, fmt.Errorf("deriving a capacity-safe worker count: %w", err)
+	}
+	if width < 1 {
+		return nil, 0, fmt.Errorf("could not derive a non-zero capacity-safe worker count")
+	}
+	indices, err := place.ScheduleWaves(lab, inventory, workloads, width)
+	if err != nil {
+		return nil, 0, fmt.Errorf("packing capacity-safe waves: %w", err)
+	}
+	waves := make([][]*batchHarness, 0, len(indices))
+	for _, waveIndices := range indices {
+		wave := make([]*batchHarness, 0, len(waveIndices))
+		for _, index := range waveIndices {
+			wave = append(wave, plans[index])
+		}
+		waves = append(waves, wave)
+	}
+	return waves, width, nil
+}
+
+func maxBatchDevices(plans []*batchHarness) int {
+	maximum := 0
+	for _, plan := range plans {
+		if plan.topology != nil && len(plan.topology.Devices) > maximum {
+			maximum = len(plan.topology.Devices)
+		}
+	}
+	return maximum
+}
+
+func withWarmBatchManager(ctx context.Context, warm *warmBatchManager, devices int,
+	label string, run func() error,
+) (retErr error) {
+	defer func() {
+		tctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), warmHarnessCleanupTimeout(devices))
+		closeErr := warm.close(tctx)
+		cancel()
+		if closeErr != nil {
+			teardownFailed.Store(true)
+			retErr = errors.Join(retErr, fmt.Errorf("destroying warm grading harnesses%s: %w", label, closeErr))
+		}
+	}()
+	return run()
 }
 
 func ungradeableReport(s submission, rubric *grade.Rubric, stage string, err error) *grade.Report {

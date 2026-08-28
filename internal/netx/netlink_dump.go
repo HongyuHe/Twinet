@@ -36,6 +36,10 @@ func retryNetlinkDump[T any](fn func() (T, error)) (T, error) {
 	return zero, err
 }
 
+func isInterruptedNetlinkDump(err error) bool {
+	return errors.Is(err, nl.ErrDumpInterrupted)
+}
+
 func listHostLinks() ([]netlink.Link, error) {
 	return retryNetlinkDump(netlink.LinkList)
 }

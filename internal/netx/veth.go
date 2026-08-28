@@ -516,9 +516,31 @@ func HostLinksPresent(names []string) (map[string]bool, error) {
 		return nil, fmt.Errorf("open host netlink handle: %w", err)
 	}
 	defer h.Close()
-	links, err := listHandleLinks(h)
+	return hostLinksPresentFrom(want, out, h.LinkByName, func() ([]netlink.Link, error) {
+		return listHandleLinks(h)
+	})
+}
+
+func hostLinksPresentFrom(want map[string]struct{}, out map[string]bool,
+	lookup func(string) (netlink.Link, error), list func() ([]netlink.Link, error),
+) (map[string]bool, error) {
+	links, err := list()
 	if err != nil {
-		return nil, fmt.Errorf("list host interfaces: %w", err)
+		if !isInterruptedNetlinkDump(err) {
+			return nil, fmt.Errorf("list host interfaces: %w", err)
+		}
+		// A link dump can be interrupted continuously while a wide deployment
+		// creates interfaces. Targeted lookups do not use a dump and are a
+		// complete fallback for this name-only presence query.
+		for name := range want {
+			if _, lookupErr := lookup(name); lookupErr == nil {
+				out[name] = true
+			} else if !IsNotFound(lookupErr) {
+				return nil, fmt.Errorf("look up host interface %s after interrupted dump: %w",
+					name, lookupErr)
+			}
+		}
+		return out, nil
 	}
 	for _, link := range links {
 		name := link.Attrs().Name

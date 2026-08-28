@@ -70,6 +70,33 @@ func TestBatchHarnessTypeReportsActualMode(t *testing.T) {
 	}
 }
 
+func TestOnlyRepeatedASesUseReusableHarnessPools(t *testing.T) {
+	plans := []*batchHarness{
+		{index: 0, submission: submission{Group: "g5", AS: 5, Attempt: "a"}},
+		{index: 1, submission: submission{Group: "g3", AS: 3, Attempt: "a"}},
+		{index: 2, submission: submission{Group: "g7", AS: 7}},
+		{index: 3, submission: submission{Group: "g3", AS: 3, Attempt: "b"}},
+		{index: 4, submission: submission{Group: "g5", AS: 5, Attempt: "b"}},
+	}
+	groups, cold := splitBatchHarnesses(plans, true)
+	if len(groups) != 2 || groups[0].asn != 3 || groups[1].asn != 5 {
+		t.Fatalf("reusable groups = %#v, want AS 3 then AS 5", groups)
+	}
+	if len(groups[0].plans) != 2 || len(groups[1].plans) != 2 {
+		t.Fatalf("reusable group sizes = %d/%d, want 2/2",
+			len(groups[0].plans), len(groups[1].plans))
+	}
+	if len(cold) != 1 || cold[0].submission.AS != 7 {
+		t.Fatalf("one-off plans = %#v, want only AS 7", cold)
+	}
+
+	groups, cold = splitBatchHarnesses(plans, false)
+	if len(groups) != 0 || len(cold) != len(plans) {
+		t.Fatalf("reuse-disabled split = %d groups/%d cold, want 0/%d",
+			len(groups), len(cold), len(plans))
+	}
+}
+
 func TestBatchAllAttemptsRequiresExplicitOptInFlag(t *testing.T) {
 	cmd := newGradeBatchCmd(&Options{})
 	flag := cmd.Flags().Lookup("all-attempts")

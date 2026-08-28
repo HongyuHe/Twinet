@@ -191,6 +191,20 @@ a controller certificate for the cluster. Omitting `--dir` writes it into the
 lab's own `.twinet/pki/` instead, which [`.gitignore`](../.gitignore) excludes
 from version control for the same reason.
 
+Export the controller identity before the first command that contacts an
+agent. These variables are inherited by every controller command and avoid
+silently selecting an unrelated CA from a previous lab:
+
+```sh
+export TWINET_TLS_CERT="$TWINET_PKI/controller_cert.pem"
+export TWINET_TLS_KEY="$TWINET_PKI/controller_key.pem"
+export TWINET_CA="$TWINET_PKI/ca_cert.pem"
+```
+
+Keep these paths paired with the manifest and PKI that created the agents. A
+certificate-verification failure means the controller and agents are using
+different cluster CAs; do not bypass verification.
+
 Peer certificates are deliberately separate from server certificates: a peer
 identity may only replicate state, so a stolen one cannot deploy or destroy.
 Rotate either with `--rotate`, and replace a whole CA with `--force`, which

@@ -2,6 +2,7 @@ package harness
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
@@ -72,18 +73,54 @@ func NewWarmPool(ctx context.Context, workers int, factory WarmFactory) (*WarmPo
 		slots: make(chan WarmHarness, workers), all: map[string]WarmHarness{},
 		unavailable: make(chan struct{}), closeDone: make(chan struct{}),
 	}
+	created := make([]WarmHarness, workers)
+	initErrs := make([]error, workers)
+	var wg sync.WaitGroup
 	for worker := 0; worker < workers; worker++ {
-		harness, err := factory(ctx, worker)
-		if err == nil {
-			err = pool.add(harness)
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			harness, err := factory(ctx, worker)
+			if harness != nil {
+				created[worker] = harness
+			}
+			if err == nil && harness == nil {
+				err = fmt.Errorf("warm factory returned nil harness")
+			}
+			if err == nil {
+				err = harness.Reset(ctx)
+			}
+			if err != nil {
+				initErrs[worker] = fmt.Errorf("initializing warm worker %d: %w", worker, err)
+			}
+		}(worker)
+	}
+	wg.Wait()
+	var initErr error
+	for _, err := range initErrs {
+		initErr = errors.Join(initErr, err)
+	}
+	if initErr == nil {
+		for _, harness := range created {
+			if err := pool.add(harness); err != nil {
+				initErr = errors.Join(initErr, err)
+			}
 		}
-		if err == nil {
-			err = harness.Reset(ctx)
+	}
+	if initErr != nil {
+		for _, harness := range created {
+			if harness == nil {
+				continue
+			}
+			if err := harness.Destroy(context.WithoutCancel(ctx)); err != nil {
+				initErr = errors.Join(initErr,
+					fmt.Errorf("destroying failed warm worker %s: %w",
+						harness.WarmIdentity().Namespace, err))
+			}
 		}
-		if err != nil {
-			_ = pool.Close(context.WithoutCancel(ctx))
-			return nil, fmt.Errorf("initializing warm worker %d: %w", worker, err)
-		}
+		return nil, initErr
+	}
+	for _, harness := range created {
 		pool.slots <- harness
 	}
 	return pool, nil

@@ -2,8 +2,10 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -145,6 +147,28 @@ func (m *warmBatchManager) pool(ctx context.Context, asn int) (*harness.WarmPool
 	delete(m.creating, asn)
 	close(done)
 	return pool, nil
+}
+
+func (m *warmBatchManager) prepare(ctx context.Context, asns []int) error {
+	asns = append([]int(nil), asns...)
+	sort.Ints(asns)
+	errs := make([]error, len(asns))
+	var wg sync.WaitGroup
+	for index, asn := range asns {
+		wg.Add(1)
+		go func(index, asn int) {
+			defer wg.Done()
+			if _, err := m.pool(ctx, asn); err != nil {
+				errs[index] = fmt.Errorf("AS %d: %w", asn, err)
+			}
+		}(index, asn)
+	}
+	wg.Wait()
+	var err error
+	for _, prepareErr := range errs {
+		err = errors.Join(err, prepareErr)
+	}
+	return err
 }
 
 func (m *warmBatchManager) close(ctx context.Context) error {
