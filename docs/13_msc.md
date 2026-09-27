@@ -65,7 +65,7 @@ sudo docker exec -it OF_A1 vtysh
 sudo docker exec -it G_A1 bash
 sudo bin/twinet msc console BLACK -- bash
 sudo bin/twinet msc exec BLACK -- vtysh -c 'show ip route ospf'
-sudo bin/twinet msc exec I_A1 -- swanctl --list-sas
+sudo docker exec I_A1 swanctl --list-sas
 ```
 
 `console --no-tty DEVICE -- COMMAND` supports streamed automation. `exec` is the
@@ -122,7 +122,8 @@ R_An -- I_An -- G_An -- O_An -- OF_An -- BLACK -- OF_Bn -- O_Bn -- G_Bn -- I_Bn 
 A shared Outer Firewall connects several outer encryptors through distinct
 inside interfaces. Its filters allow each encryptor's configured remote peer.
 OSPF advertises the outer endpoint subnets over BLACK; management, Red, and Gray
-prefixes are excluded. Outer encryptors never run OSPF or BGP.
+prefixes are excluded. Startup waits for the required routes in both FRR and the
+kernel forwarding table, as well as Full neighbor adjacencies. Outer encryptors never run OSPF or BGP.
 
 A shared Gray layout places each inner encryptor behind a Gray Firewall before
 the common OVS switch:
@@ -147,8 +148,8 @@ labels prevent removal or reuse of another lab's containers.
 
 ```sh
 sudo bin/twinet msc down
-sudo bin/twinet msc --spec /tmp/shared.json up
-sudo bin/twinet msc --spec /tmp/shared.json check > /tmp/shared-check.json
+sudo bin/twinet msc up --spec /tmp/shared.json
+sudo bin/twinet msc check --spec /tmp/shared.json > /tmp/shared-check.json
 ```
 
 ## Export configurations and live facts
@@ -196,6 +197,7 @@ management TLS authentication, and ESP carriage without observed Red plaintext.
 sudo bin/twinet msc check > /tmp/check.json
 jq '{passed, checks: (.checks | length)}' /tmp/check.json
 sudo bin/twinet msc test-failures > /tmp/failures.json
+sudo bin/twinet msc test-failures --native-only > /tmp/native-failures.json
 sudo bin/twinet msc restart BLACK
 sudo bin/twinet msc restart G_A1
 ```

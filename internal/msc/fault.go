@@ -263,3 +263,22 @@ func (e *Engine) testNativeFailures(ctx context.Context, r *Report, black, gray 
 	}
 	return nil
 }
+
+// TestNativeFailures limits the disruptive suite to native CLI and restart work.
+func (e *Engine) TestNativeFailures(ctx context.Context) (Report, error) {
+	r := Report{Lab: e.Spec.Name, At: time.Now().UTC(), SpecHash: e.Spec.Hash(), Passed: true}
+	if e.Spec.Version != 2 {
+		return r, fmt.Errorf("native failure tests require MSC version 2")
+	}
+	for _, id := range []string{"R_A1", "R_A2", "R_B1", "R_B2"} {
+		if e.Spec.Device(id) == nil {
+			return r, fmt.Errorf("native failure tests require the generated two-site profile with at least two levels")
+		}
+	}
+	black, gray, err := e.captureDevices()
+	if err != nil {
+		return r, err
+	}
+	err = e.testNativeFailures(ctx, &r, black, gray)
+	return r, err
+}

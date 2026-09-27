@@ -137,13 +137,16 @@ func newMSCCmd(opts *Options) *cobra.Command {
 		}
 		return output(cmd, s)
 	})})
+	var nativeOnly bool
 	for _, verb := range []string{"check", "test-failures"} {
 		v := verb
-		root.AddCommand(&cobra.Command{Use: v, Short: map[string]string{"check": "Verify reachability, isolation, management, filters and encrypted captures", "test-failures": "Exercise SA loss, wrong peer, revocation and container restart with recovery"}[v], Args: cobra.NoArgs, RunE: run(func(cmd *cobra.Command, e *msc.Engine, _ []string) error {
+		checkCmd := &cobra.Command{Use: v, Short: map[string]string{"check": "Verify reachability, isolation, management, filters and encrypted captures", "test-failures": "Exercise SA loss, wrong peer, revocation and container restart with recovery"}[v], Args: cobra.NoArgs, RunE: run(func(cmd *cobra.Command, e *msc.Engine, _ []string) error {
 			var report msc.Report
 			var err error
 			if v == "check" {
 				report, err = e.Check(cmd.Context())
+			} else if nativeOnly {
+				report, err = e.TestNativeFailures(cmd.Context())
 			} else {
 				report, err = e.TestFailures(cmd.Context())
 			}
@@ -162,7 +165,11 @@ func newMSCCmd(opts *Options) *cobra.Command {
 				return fmt.Errorf("MSC checks failed; inspect the JSON report")
 			}
 			return nil
-		})})
+		})}
+		if v == "test-failures" {
+			checkCmd.Flags().BoolVar(&nativeOnly, "native-only", false, "exercise only native CLI mistakes and router/switch restarts")
+		}
+		root.AddCommand(checkCmd)
 	}
 	root.AddCommand(&cobra.Command{Use: "exec DEVICE -- COMMAND [ARG...]", Short: "Execute a command in an owned MSC appliance", Args: cobra.MinimumNArgs(2), RunE: run(func(cmd *cobra.Command, e *msc.Engine, args []string) error {
 		r, err := e.Exec(cmd.Context(), args[0], args[1:])

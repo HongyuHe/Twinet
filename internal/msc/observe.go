@@ -58,6 +58,7 @@ func (e *Engine) Status(ctx context.Context) (Status, error) {
 			}
 			if e.Spec.IsOSPF(d) {
 				commands["ospf"] = []string{"vtysh", "-c", "show ip ospf neighbor json"}
+				commands["ospf-kernel-routes"] = []string{"ip", "-j", "route", "show", "proto", "ospf"}
 				commands["ospf-routes"] = []string{"vtysh", "-c", "show ip route ospf json"}
 			}
 			if e.Spec.IsOVS(d) {

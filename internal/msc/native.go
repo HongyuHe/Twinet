@@ -354,7 +354,14 @@ func (e *Engine) waitOSPF(ctx context.Context) error {
 				continue
 			}
 			raw, err := e.exec(ctx, d.ID, "vtysh", "-c", "show ip ospf neighbor json")
-			if err != nil || fullNeighbors(raw) != e.Spec.ospfNeighbors(&d) {
+			frr, frErr := e.exec(ctx, d.ID, "vtysh", "-c", "show ip route ospf json")
+			kernel, kernErr := e.exec(ctx, d.ID, "ip", "-j", "route", "show", "proto", "ospf")
+			installed := installedOSPF(frr, kernel)
+			converged := err == nil && frErr == nil && kernErr == nil && fullNeighbors(raw) == e.Spec.ospfNeighbors(&d)
+			for _, prefix := range e.Spec.ospfPrefixes(&d) {
+				converged = converged && installed[prefix]
+			}
+			if !converged {
 				ready = false
 				pending = append(pending, d.ID)
 			}
@@ -378,23 +385,11 @@ func (e *Engine) checkNative(ctx context.Context, r *Report, d *Device, o Observ
 		r.add("frr-config/"+d.ID, err == nil && canonicalFRR(o.Facts["frr-config"]) == canonicalFRR(string(expected)), "running configuration matches declared baseline")
 		if e.Spec.IsOSPF(d) {
 			r.add("ospf-neighbors/"+d.ID, fullNeighbors(o.Facts["ospf"]) == e.Spec.ospfNeighbors(d), fmt.Sprintf("expected %d Full adjacencies", e.Spec.ospfNeighbors(d)))
-			var routes map[string]json.RawMessage
-			err = json.Unmarshal([]byte(o.Facts["ospf-routes"]), &routes)
-			for _, outer := range e.Spec.Role("outer") {
-				prefix, _ := netip.ParsePrefix(outer.Interface(outer.Tunnel.Outside).Address)
-				p := prefix.Masked().String()
-				connected := false
-				for _, i := range d.Interfaces {
-					q, er := netip.ParsePrefix(i.Address)
-					if er == nil && q.Masked() == prefix.Masked() {
-						connected = true
-					}
-				}
-				if !connected {
-					_, found := routes[p]
-					r.add("ospf-route/"+d.ID+"/"+outer.ID, err == nil && found, p)
-				}
+			installed := installedOSPF(o.Facts["ospf-routes"], o.Facts["ospf-kernel-routes"])
+			for _, prefix := range e.Spec.ospfPrefixes(d) {
+				r.add("ospf-route/"+d.ID+"/"+prefix, installed[prefix], "selected OSPF route installed in both FRR and the kernel")
 			}
+
 		}
 	}
 	if e.Spec.IsOVS(d) {
@@ -432,4 +427,47 @@ func (e *Engine) Console(ctx context.Context, id string, args []string, stdin io
 		return fmt.Errorf("console exited %d", code)
 	}
 	return nil
+}
+
+func (s *Spec) ospfPrefixes(d *Device) []string {
+	var out []string
+	for _, outer := range s.Role("outer") {
+		prefix, _ := netip.ParsePrefix(outer.Interface(outer.Tunnel.Outside).Address)
+		connected := false
+		for _, p := range d.Interfaces {
+			q, err := netip.ParsePrefix(p.Address)
+			if err == nil && q.Masked() == prefix.Masked() {
+				connected = true
+			}
+		}
+		if !connected {
+			out = append(out, prefix.Masked().String())
+		}
+	}
+	return out
+}
+
+// An adjacency can reach Full before SPF and FIB installation finish. Startup
+// must wait for data-plane routes as well as the neighbor state machine.
+func installedOSPF(frr, kernel string) map[string]bool {
+	var rib map[string][]struct {
+		Protocol  string `json:"protocol"`
+		Selected  bool   `json:"selected"`
+		Installed bool   `json:"installed"`
+	}
+	var fib []struct {
+		Prefix string `json:"dst"`
+	}
+	out := map[string]bool{}
+	if json.Unmarshal([]byte(frr), &rib) != nil || json.Unmarshal([]byte(kernel), &fib) != nil {
+		return out
+	}
+	for _, route := range fib {
+		for _, candidate := range rib[route.Prefix] {
+			if candidate.Protocol == "ospf" && candidate.Selected && candidate.Installed {
+				out[route.Prefix] = true
+			}
+		}
+	}
+	return out
 }

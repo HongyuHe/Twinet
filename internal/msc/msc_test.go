@@ -384,3 +384,20 @@ func TestExportAllowlistAndHashes(t *testing.T) {
 		t.Fatal("invented observations for an absent router")
 	}
 }
+
+func TestOSPFReadinessRequiresKernelInstallation(t *testing.T) {
+	prefix := "172.20.11.0/30"
+	frr := `{"172.20.11.0/30":[{"protocol":"ospf","selected":true,"installed":true}]}`
+	kernel := `[{"dst":"172.20.11.0/30"}]`
+	if !installedOSPF(frr, kernel)[prefix] {
+		t.Fatal("installed route rejected")
+	}
+	for _, candidate := range []string{`{}`, strings.ReplaceAll(frr, `"installed":true`, `"installed":false`), strings.ReplaceAll(frr, `"selected":true`, `"selected":false`), strings.ReplaceAll(frr, `"ospf"`, `"static"`)} {
+		if installedOSPF(candidate, kernel)[prefix] {
+			t.Fatal("uninstalled or non-OSPF route accepted")
+		}
+	}
+	if installedOSPF(frr, `[]`)[prefix] || installedOSPF(frr, `invalid`)[prefix] {
+		t.Fatal("missing kernel route accepted")
+	}
+}
