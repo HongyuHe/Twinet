@@ -1,0 +1,1006 @@
+{
+  "lab": "msc",
+  "at": "2026-09-27T18:40:05.876836433Z",
+  "spec_sha256": "18e499872207c3ec28b6c32b397057e261f749c164cbb71bb9e7a2149a8c56ba",
+  "passed": true,
+  "checks": [
+    {
+      "name": "running/BLACK",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/BLACK",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/BLACK",
+      "passed": true,
+      "detail": "expected 1"
+    },
+    {
+      "name": "filter/BLACK",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "running/GF_A",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/GF_A",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/GF_A",
+      "passed": true,
+      "detail": "expected 1"
+    },
+    {
+      "name": "filter/GF_A",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "running/R_A1",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/R_A1",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/R_A1",
+      "passed": true,
+      "detail": "expected 0"
+    },
+    {
+      "name": "filter/R_A1",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "running/I_A1",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/I_A1",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/I_A1",
+      "passed": true,
+      "detail": "expected 1"
+    },
+    {
+      "name": "filter/I_A1",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "ipsec/I_A1",
+      "passed": true,
+      "detail": "msc: #1, ESTABLISHED, IKEv2, f94b1756f0602d36_i* e60026b741cd1794_r\n  local  'I_A1.msc.test' @ 10.100.1.2[500]\n  remote 'I_B1.msc.test' @ 10.200.1.2[500]\n  AES_GCM_16-256/PRF_HMAC_SHA2_384/ECP_384\n  established 19s ago, reauth in 10301s\n  active:  IKE_DPD\n  protected: #2, reqid 101, INSTALLED, TUNNEL, ESP:AES_GCM_16-256\n    installed 19s ago, rekeying in 2429s, expires in 3581s\n    in  c2cd002c,      0 bytes,     0 packets\n    out cb22ce61,      0 bytes,     0 packets\n    local  10.1.1.0/24\n    remote 10.2.1.0/24\n"
+    },
+    {
+      "name": "running/G_A1",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/G_A1",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/G_A1",
+      "passed": true,
+      "detail": "expected 0"
+    },
+    {
+      "name": "filter/G_A1",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "running/O_A1",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/O_A1",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/O_A1",
+      "passed": true,
+      "detail": "expected 1"
+    },
+    {
+      "name": "no-routing-daemon/O_A1",
+      "passed": true,
+      "detail": "outer encryption appliances use static crypto forwarding"
+    },
+    {
+      "name": "filter/O_A1",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "ipsec/O_A1",
+      "passed": true,
+      "detail": "msc: #1, ESTABLISHED, IKEv2, e952ca48a4f2d006_i* 8b7db0fc102f4e56_r\n  local  'O_A1.msc.test' @ 172.20.11.1[500]\n  remote 'O_B1.msc.test' @ 172.20.21.1[500]\n  AES_GCM_16-256/PRF_HMAC_SHA2_384/ECP_384\n  established 21s ago, reauth in 10204s\n  active:  IKE_DPD\n  protected: #2, reqid 201, INSTALLED, TUNNEL, ESP:AES_GCM_16-256\n    installed 21s ago, rekeying in 2442s, expires in 3579s\n    in  c5935970,   1169 bytes,     2 packets,    21s ago\n    out c47d91d5,   1217 bytes,     2 packets,    21s ago\n    local  10.100.1.2/32\n    remote 10.200.1.2/32\n"
+    },
+    {
+      "name": "running/OF_A1",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/OF_A1",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/OF_A1",
+      "passed": true,
+      "detail": "expected 1"
+    },
+    {
+      "name": "filter/OF_A1",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "running/R_A2",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/R_A2",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/R_A2",
+      "passed": true,
+      "detail": "expected 0"
+    },
+    {
+      "name": "filter/R_A2",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "running/I_A2",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/I_A2",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/I_A2",
+      "passed": true,
+      "detail": "expected 1"
+    },
+    {
+      "name": "filter/I_A2",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "ipsec/I_A2",
+      "passed": true,
+      "detail": "msc: #1, ESTABLISHED, IKEv2, 480317156d70bfee_i* 349a487e65810936_r\n  local  'I_A2.msc.test' @ 10.100.2.2[500]\n  remote 'I_B2.msc.test' @ 10.200.2.2[500]\n  AES_GCM_16-256/PRF_HMAC_SHA2_384/ECP_384\n  established 21s ago, reauth in 10286s\n  protected: #2, reqid 102, INSTALLED, TUNNEL, ESP:AES_GCM_16-256\n    installed 21s ago, rekeying in 2462s, expires in 3579s\n    in  cb888eab,      0 bytes,     0 packets\n    out c599d8d7,      0 bytes,     0 packets\n    local  10.1.2.0/24\n    remote 10.2.2.0/24\n"
+    },
+    {
+      "name": "running/G_A2",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/G_A2",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/G_A2",
+      "passed": true,
+      "detail": "expected 0"
+    },
+    {
+      "name": "filter/G_A2",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "running/O_A2",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/O_A2",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/O_A2",
+      "passed": true,
+      "detail": "expected 1"
+    },
+    {
+      "name": "no-routing-daemon/O_A2",
+      "passed": true,
+      "detail": "outer encryption appliances use static crypto forwarding"
+    },
+    {
+      "name": "filter/O_A2",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "ipsec/O_A2",
+      "passed": true,
+      "detail": "msc: #1, ESTABLISHED, IKEv2, 99d62b6178413101_i* ea7d346916c3f8a9_r\n  local  'O_A2.msc.test' @ 172.20.12.1[500]\n  remote 'O_B2.msc.test' @ 172.20.22.1[500]\n  AES_GCM_16-256/PRF_HMAC_SHA2_384/ECP_384\n  established 23s ago, reauth in 10202s\n  protected: #2, reqid 202, INSTALLED, TUNNEL, ESP:AES_GCM_16-256\n    installed 23s ago, rekeying in 2440s, expires in 3577s\n    in  c4ae4b79,   1342 bytes,     4 packets,     1s ago\n    out c0ab2e26,   1387 bytes,     4 packets,     1s ago\n    local  10.100.2.2/32\n    remote 10.200.2.2/32\n"
+    },
+    {
+      "name": "running/OF_A2",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/OF_A2",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/OF_A2",
+      "passed": true,
+      "detail": "expected 1"
+    },
+    {
+      "name": "filter/OF_A2",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "running/M_A1",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/M_A1",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/M_A1",
+      "passed": true,
+      "detail": "expected 0"
+    },
+    {
+      "name": "filter/M_A1",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "running/AW_A1",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/AW_A1",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/AW_A1",
+      "passed": true,
+      "detail": "expected 0"
+    },
+    {
+      "name": "filter/AW_A1",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "running/M_A2",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/M_A2",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/M_A2",
+      "passed": true,
+      "detail": "expected 0"
+    },
+    {
+      "name": "filter/M_A2",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "running/AW_A2",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/AW_A2",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/AW_A2",
+      "passed": true,
+      "detail": "expected 0"
+    },
+    {
+      "name": "filter/AW_A2",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "running/M_A99",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/M_A99",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/M_A99",
+      "passed": true,
+      "detail": "expected 0"
+    },
+    {
+      "name": "filter/M_A99",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "running/AW_A99",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/AW_A99",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/AW_A99",
+      "passed": true,
+      "detail": "expected 0"
+    },
+    {
+      "name": "filter/AW_A99",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "running/GF_B",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/GF_B",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/GF_B",
+      "passed": true,
+      "detail": "expected 1"
+    },
+    {
+      "name": "filter/GF_B",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "running/R_B1",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/R_B1",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/R_B1",
+      "passed": true,
+      "detail": "expected 0"
+    },
+    {
+      "name": "filter/R_B1",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "running/I_B1",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/I_B1",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/I_B1",
+      "passed": true,
+      "detail": "expected 1"
+    },
+    {
+      "name": "filter/I_B1",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "ipsec/I_B1",
+      "passed": true,
+      "detail": "msc: #1, ESTABLISHED, IKEv2, f94b1756f0602d36_i e60026b741cd1794_r*\n  local  'I_B1.msc.test' @ 10.200.1.2[500]\n  remote 'I_A1.msc.test' @ 10.100.1.2[500]\n  AES_GCM_16-256/PRF_HMAC_SHA2_384/ECP_384\n  established 26s ago, reauth in 10281s\n  protected: #2, reqid 101, INSTALLED, TUNNEL, ESP:AES_GCM_16-256\n    installed 26s ago, rekeying in 2457s, expires in 3574s\n    in  cb22ce61,      0 bytes,     0 packets\n    out c2cd002c,      0 bytes,     0 packets\n    local  10.2.1.0/24\n    remote 10.1.1.0/24\n"
+    },
+    {
+      "name": "running/G_B1",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/G_B1",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/G_B1",
+      "passed": true,
+      "detail": "expected 0"
+    },
+    {
+      "name": "filter/G_B1",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "running/O_B1",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/O_B1",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/O_B1",
+      "passed": true,
+      "detail": "expected 1"
+    },
+    {
+      "name": "no-routing-daemon/O_B1",
+      "passed": true,
+      "detail": "outer encryption appliances use static crypto forwarding"
+    },
+    {
+      "name": "filter/O_B1",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "ipsec/O_B1",
+      "passed": true,
+      "detail": "msc: #1, ESTABLISHED, IKEv2, e952ca48a4f2d006_i 8b7db0fc102f4e56_r*\n  local  'O_B1.msc.test' @ 172.20.21.1[500]\n  remote 'O_A1.msc.test' @ 172.20.11.1[500]\n  AES_GCM_16-256/PRF_HMAC_SHA2_384/ECP_384\n  established 28s ago, reauth in 10451s\n  protected: #2, reqid 201, INSTALLED, TUNNEL, ESP:AES_GCM_16-256\n    installed 28s ago, rekeying in 2781s, expires in 3572s\n    in  c47d91d5,   1387 bytes,     4 packets,     7s ago\n    out c5935970,   1339 bytes,     4 packets,     7s ago\n    local  10.200.1.2/32\n    remote 10.100.1.2/32\n"
+    },
+    {
+      "name": "running/OF_B1",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/OF_B1",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/OF_B1",
+      "passed": true,
+      "detail": "expected 1"
+    },
+    {
+      "name": "filter/OF_B1",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "running/R_B2",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/R_B2",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/R_B2",
+      "passed": true,
+      "detail": "expected 0"
+    },
+    {
+      "name": "filter/R_B2",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "running/I_B2",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/I_B2",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/I_B2",
+      "passed": true,
+      "detail": "expected 1"
+    },
+    {
+      "name": "filter/I_B2",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "ipsec/I_B2",
+      "passed": true,
+      "detail": "msc: #1, ESTABLISHED, IKEv2, 480317156d70bfee_i 349a487e65810936_r*\n  local  'I_B2.msc.test' @ 10.200.2.2[500]\n  remote 'I_A2.msc.test' @ 10.100.2.2[500]\n  AES_GCM_16-256/PRF_HMAC_SHA2_384/ECP_384\n  established 29s ago, reauth in 10278s\n  protected: #2, reqid 102, INSTALLED, TUNNEL, ESP:AES_GCM_16-256\n    installed 29s ago, rekeying in 2454s, expires in 3571s\n    in  c599d8d7,      0 bytes,     0 packets\n    out cb888eab,      0 bytes,     0 packets\n    local  10.2.2.0/24\n    remote 10.1.2.0/24\n"
+    },
+    {
+      "name": "running/G_B2",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/G_B2",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/G_B2",
+      "passed": true,
+      "detail": "expected 0"
+    },
+    {
+      "name": "filter/G_B2",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "running/O_B2",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/O_B2",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/O_B2",
+      "passed": true,
+      "detail": "expected 1"
+    },
+    {
+      "name": "no-routing-daemon/O_B2",
+      "passed": true,
+      "detail": "outer encryption appliances use static crypto forwarding"
+    },
+    {
+      "name": "filter/O_B2",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "ipsec/O_B2",
+      "passed": true,
+      "detail": "msc: #1, ESTABLISHED, IKEv2, 99d62b6178413101_i ea7d346916c3f8a9_r*\n  local  'O_B2.msc.test' @ 172.20.22.1[500]\n  remote 'O_A2.msc.test' @ 172.20.12.1[500]\n  AES_GCM_16-256/PRF_HMAC_SHA2_384/ECP_384\n  established 31s ago, reauth in 10448s\n  protected: #2, reqid 202, INSTALLED, TUNNEL, ESP:AES_GCM_16-256\n    installed 31s ago, rekeying in 2778s, expires in 3569s\n    in  c0ab2e26,   1387 bytes,     4 packets,     9s ago\n    out c4ae4b79,   1342 bytes,     4 packets,     9s ago\n    local  10.200.2.2/32\n    remote 10.100.2.2/32\n"
+    },
+    {
+      "name": "running/OF_B2",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/OF_B2",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/OF_B2",
+      "passed": true,
+      "detail": "expected 1"
+    },
+    {
+      "name": "filter/OF_B2",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "running/M_B1",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/M_B1",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/M_B1",
+      "passed": true,
+      "detail": "expected 0"
+    },
+    {
+      "name": "filter/M_B1",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "running/AW_B1",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/AW_B1",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/AW_B1",
+      "passed": true,
+      "detail": "expected 0"
+    },
+    {
+      "name": "filter/AW_B1",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "running/M_B2",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/M_B2",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/M_B2",
+      "passed": true,
+      "detail": "expected 0"
+    },
+    {
+      "name": "filter/M_B2",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "running/AW_B2",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/AW_B2",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/AW_B2",
+      "passed": true,
+      "detail": "expected 0"
+    },
+    {
+      "name": "filter/AW_B2",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "running/M_B99",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/M_B99",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/M_B99",
+      "passed": true,
+      "detail": "expected 0"
+    },
+    {
+      "name": "filter/M_B99",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "running/AW_B99",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/AW_B99",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/AW_B99",
+      "passed": true,
+      "detail": "expected 0"
+    },
+    {
+      "name": "filter/AW_B99",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "reachability/R_A1/R_A2",
+      "passed": true,
+      "detail": "want delivery=false; PING 10.1.2.10 (10.1.2.10) 56(84) bytes of data.\nFrom 10.1.1.1 icmp_seq=1 Destination Net Unreachable\nFrom 10.1.1.1 icmp_seq=2 Destination Net Unreachable\n\n--- 10.1.2.10 ping statistics ---\n2 packets transmitted, 0 received, +2 errors, 100% packet loss, time 1039ms"
+    },
+    {
+      "name": "reachability/R_A1/R_B1",
+      "passed": true,
+      "detail": "want delivery=true; PING 10.2.1.10 (10.2.1.10) 56(84) bytes of data.\n64 bytes from 10.2.1.10: icmp_seq=1 ttl=62 time=0.282 ms\n64 bytes from 10.2.1.10: icmp_seq=2 ttl=62 time=0.193 ms\n\n--- 10.2.1.10 ping statistics ---\n2 packets transmitted, 2 received, 0% packet loss, time 1018ms\nrtt min/avg/max/mdev = 0.193/0.237/0.282/0.044 ms"
+    },
+    {
+      "name": "reachability/R_A1/R_B2",
+      "passed": true,
+      "detail": "want delivery=false; PING 10.2.2.10 (10.2.2.10) 56(84) bytes of data.\nFrom 10.1.1.1 icmp_seq=1 Destination Net Unreachable\nFrom 10.1.1.1 icmp_seq=2 Destination Net Unreachable\n\n--- 10.2.2.10 ping statistics ---\n2 packets transmitted, 0 received, +2 errors, 100% packet loss, time 1029ms"
+    },
+    {
+      "name": "reachability/R_A2/R_A1",
+      "passed": true,
+      "detail": "want delivery=false; PING 10.1.1.10 (10.1.1.10) 56(84) bytes of data.\nFrom 10.1.2.1 icmp_seq=1 Destination Net Unreachable\nFrom 10.1.2.1 icmp_seq=2 Destination Net Unreachable\n\n--- 10.1.1.10 ping statistics ---\n2 packets transmitted, 0 received, +2 errors, 100% packet loss, time 1018ms"
+    },
+    {
+      "name": "reachability/R_A2/R_B1",
+      "passed": true,
+      "detail": "want delivery=false; PING 10.2.1.10 (10.2.1.10) 56(84) bytes of data.\nFrom 10.1.2.1 icmp_seq=1 Destination Net Unreachable\n\n--- 10.2.1.10 ping statistics ---\n2 packets transmitted, 0 received, +1 errors, 100% packet loss, time 1021ms"
+    },
+    {
+      "name": "reachability/R_A2/R_B2",
+      "passed": true,
+      "detail": "want delivery=true; PING 10.2.2.10 (10.2.2.10) 56(84) bytes of data.\n64 bytes from 10.2.2.10: icmp_seq=1 ttl=62 time=0.307 ms\n64 bytes from 10.2.2.10: icmp_seq=2 ttl=62 time=0.221 ms\n\n--- 10.2.2.10 ping statistics ---\n2 packets transmitted, 2 received, 0% packet loss, time 1045ms\nrtt min/avg/max/mdev = 0.221/0.264/0.307/0.043 ms"
+    },
+    {
+      "name": "reachability/R_B1/R_A1",
+      "passed": true,
+      "detail": "want delivery=true; PING 10.1.1.10 (10.1.1.10) 56(84) bytes of data.\n64 bytes from 10.1.1.10: icmp_seq=1 ttl=62 time=0.330 ms\n64 bytes from 10.1.1.10: icmp_seq=2 ttl=62 time=0.216 ms\n\n--- 10.1.1.10 ping statistics ---\n2 packets transmitted, 2 received, 0% packet loss, time 1016ms\nrtt min/avg/max/mdev = 0.216/0.273/0.330/0.057 ms"
+    },
+    {
+      "name": "reachability/R_B1/R_A2",
+      "passed": true,
+      "detail": "want delivery=false; PING 10.1.2.10 (10.1.2.10) 56(84) bytes of data.\nFrom 10.2.1.1 icmp_seq=1 Destination Net Unreachable\nFrom 10.2.1.1 icmp_seq=2 Destination Net Unreachable\n\n--- 10.1.2.10 ping statistics ---\n2 packets transmitted, 0 received, +2 errors, 100% packet loss, time 1023ms"
+    },
+    {
+      "name": "reachability/R_B1/R_B2",
+      "passed": true,
+      "detail": "want delivery=false; PING 10.2.2.10 (10.2.2.10) 56(84) bytes of data.\nFrom 10.2.1.1 icmp_seq=1 Destination Net Unreachable\n\n--- 10.2.2.10 ping statistics ---\n2 packets transmitted, 0 received, +1 errors, 100% packet loss, time 1019ms"
+    },
+    {
+      "name": "reachability/R_B2/R_A1",
+      "passed": true,
+      "detail": "want delivery=false; PING 10.1.1.10 (10.1.1.10) 56(84) bytes of data.\nFrom 10.2.2.1 icmp_seq=1 Destination Net Unreachable\nFrom 10.2.2.1 icmp_seq=2 Destination Net Unreachable\n\n--- 10.1.1.10 ping statistics ---\n2 packets transmitted, 0 received, +2 errors, 100% packet loss, time 1044ms"
+    },
+    {
+      "name": "reachability/R_B2/R_A2",
+      "passed": true,
+      "detail": "want delivery=true; PING 10.1.2.10 (10.1.2.10) 56(84) bytes of data.\n64 bytes from 10.1.2.10: icmp_seq=1 ttl=62 time=0.304 ms\n64 bytes from 10.1.2.10: icmp_seq=2 ttl=62 time=0.197 ms\n\n--- 10.1.2.10 ping statistics ---\n2 packets transmitted, 2 received, 0% packet loss, time 1027ms\nrtt min/avg/max/mdev = 0.197/0.250/0.304/0.053 ms"
+    },
+    {
+      "name": "reachability/R_B2/R_B1",
+      "passed": true,
+      "detail": "want delivery=false; PING 10.2.1.10 (10.2.1.10) 56(84) bytes of data.\nFrom 10.2.2.1 icmp_seq=1 Destination Net Unreachable\nFrom 10.2.2.1 icmp_seq=2 Destination Net Unreachable\n\n--- 10.2.1.10 ping statistics ---\n2 packets transmitted, 0 received, +2 errors, 100% packet loss, time 1024ms"
+    },
+    {
+      "name": "capture/black/esp",
+      "passed": true,
+      "detail": "32 ESP observations"
+    },
+    {
+      "name": "capture/black/no-red-plaintext",
+      "passed": true
+    },
+    {
+      "name": "capture/gray/esp",
+      "passed": true,
+      "detail": "16 ESP observations"
+    },
+    {
+      "name": "capture/gray/no-red-plaintext",
+      "passed": true
+    },
+    {
+      "name": "gray-firewall-cut/A",
+      "passed": true,
+      "detail": "all modeled Gray paths cross a Gray Firewall"
+    },
+    {
+      "name": "gray-cross-level/A",
+      "passed": true,
+      "detail": "probe blocked and firewall counters changed"
+    },
+    {
+      "name": "gray-firewall-cut/B",
+      "passed": true,
+      "detail": "all modeled Gray paths cross a Gray Firewall"
+    },
+    {
+      "name": "gray-cross-level/B",
+      "passed": true,
+      "detail": "probe blocked and firewall counters changed"
+    },
+    {
+      "name": "management/AW_A99/GF_A",
+      "passed": true,
+      "detail": "\u003cnil\u003e"
+    },
+    {
+      "name": "management-client-auth/GF_A",
+      "passed": true,
+      "detail": "reachable endpoint rejects a client without a certificate"
+    },
+    {
+      "name": "management/AW_A1/I_A1",
+      "passed": true,
+      "detail": "\u003cnil\u003e"
+    },
+    {
+      "name": "management-client-auth/I_A1",
+      "passed": true,
+      "detail": "reachable endpoint rejects a client without a certificate"
+    },
+    {
+      "name": "management/AW_A99/O_A1",
+      "passed": true,
+      "detail": "\u003cnil\u003e"
+    },
+    {
+      "name": "management-client-auth/O_A1",
+      "passed": true,
+      "detail": "reachable endpoint rejects a client without a certificate"
+    },
+    {
+      "name": "management/AW_A99/OF_A1",
+      "passed": true,
+      "detail": "\u003cnil\u003e"
+    },
+    {
+      "name": "management-client-auth/OF_A1",
+      "passed": true,
+      "detail": "reachable endpoint rejects a client without a certificate"
+    },
+    {
+      "name": "management/AW_A2/I_A2",
+      "passed": true,
+      "detail": "\u003cnil\u003e"
+    },
+    {
+      "name": "management-client-auth/I_A2",
+      "passed": true,
+      "detail": "reachable endpoint rejects a client without a certificate"
+    },
+    {
+      "name": "management/AW_A99/O_A2",
+      "passed": true,
+      "detail": "\u003cnil\u003e"
+    },
+    {
+      "name": "management-client-auth/O_A2",
+      "passed": true,
+      "detail": "reachable endpoint rejects a client without a certificate"
+    },
+    {
+      "name": "management/AW_A99/OF_A2",
+      "passed": true,
+      "detail": "\u003cnil\u003e"
+    },
+    {
+      "name": "management-client-auth/OF_A2",
+      "passed": true,
+      "detail": "reachable endpoint rejects a client without a certificate"
+    },
+    {
+      "name": "management/AW_B99/GF_B",
+      "passed": true,
+      "detail": "\u003cnil\u003e"
+    },
+    {
+      "name": "management-client-auth/GF_B",
+      "passed": true,
+      "detail": "reachable endpoint rejects a client without a certificate"
+    },
+    {
+      "name": "management/AW_B1/I_B1",
+      "passed": true,
+      "detail": "\u003cnil\u003e"
+    },
+    {
+      "name": "management-client-auth/I_B1",
+      "passed": true,
+      "detail": "reachable endpoint rejects a client without a certificate"
+    },
+    {
+      "name": "management/AW_B99/O_B1",
+      "passed": true,
+      "detail": "\u003cnil\u003e"
+    },
+    {
+      "name": "management-client-auth/O_B1",
+      "passed": true,
+      "detail": "reachable endpoint rejects a client without a certificate"
+    },
+    {
+      "name": "management/AW_B99/OF_B1",
+      "passed": true,
+      "detail": "\u003cnil\u003e"
+    },
+    {
+      "name": "management-client-auth/OF_B1",
+      "passed": true,
+      "detail": "reachable endpoint rejects a client without a certificate"
+    },
+    {
+      "name": "management/AW_B2/I_B2",
+      "passed": true,
+      "detail": "\u003cnil\u003e"
+    },
+    {
+      "name": "management-client-auth/I_B2",
+      "passed": true,
+      "detail": "reachable endpoint rejects a client without a certificate"
+    },
+    {
+      "name": "management/AW_B99/O_B2",
+      "passed": true,
+      "detail": "\u003cnil\u003e"
+    },
+    {
+      "name": "management-client-auth/O_B2",
+      "passed": true,
+      "detail": "reachable endpoint rejects a client without a certificate"
+    },
+    {
+      "name": "management/AW_B99/OF_B2",
+      "passed": true,
+      "detail": "\u003cnil\u003e"
+    },
+    {
+      "name": "management-client-auth/OF_B2",
+      "passed": true,
+      "detail": "reachable endpoint rejects a client without a certificate"
+    }
+  ]
+}
