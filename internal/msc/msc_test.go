@@ -6,6 +6,7 @@ import (
 	"encoding/pem"
 	"errors"
 	rt "github.com/HongyuHe/twinet/internal/runtime"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -202,5 +203,22 @@ func TestPingObservationErrorsCannotPassIsolation(t *testing.T) {
 	}
 	if _, _, err := pingOutcome(rt.ExecResult{}, errors.New("container absent")); err == nil {
 		t.Fatal("runtime error accepted as packet evidence")
+	}
+}
+
+func TestInterfaceMACsSurviveRecreation(t *testing.T) {
+	seen := map[string]bool{}
+	for _, d := range Example().Devices {
+		for _, iface := range d.Interfaces {
+			mac := interfaceMAC("msc", d.ID, iface.Name)
+			parsed, err := net.ParseMAC(mac)
+			if err != nil || parsed[0]&3 != 2 || seen[mac] {
+				t.Fatalf("invalid or duplicate MAC %s", mac)
+			}
+			if interfaceMAC("msc", d.ID, iface.Name) != mac || interfaceMAC("other", d.ID, iface.Name) == mac {
+				t.Fatal("interface identity does not determine its MAC")
+			}
+			seen[mac] = true
+		}
 	}
 }

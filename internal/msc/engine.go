@@ -210,7 +210,7 @@ func (e *Engine) Up(ctx context.Context, recoverFault bool) error {
 			if err != nil {
 				return err
 			}
-			p := netx.EndpointSpec{NSPath: ns, Name: i.Name, MTU: e.Spec.MTU, OwnAddrs: true, Up: true, Altname: fmt.Sprintf("msc-%s-%d-%s", e.Spec.Name, n, d.ID)}
+			p := netx.EndpointSpec{NSPath: ns, Name: i.Name, MAC: interfaceMAC(e.Spec.Name, d.ID, i.Name), MTU: e.Spec.MTU, OwnAddrs: true, Up: true, Altname: fmt.Sprintf("msc-%s-%d-%s", e.Spec.Name, n, d.ID)}
 			if i.Address != "" {
 				p.Addrs = []string{i.Address}
 			}
@@ -224,6 +224,10 @@ func (e *Engine) Up(ctx context.Context, recoverFault bool) error {
 	}
 	for i := range e.Spec.Devices {
 		d := &e.Spec.Devices[i]
+		// Drop cached peers after repairing links or changing their addresses.
+		if _, err = e.exec(ctx, d.ID, "ip", "neigh", "flush", "all"); err != nil {
+			return err
+		}
 		if d.Role == "switch" {
 			if err = e.shell(ctx, d.ID, "ip link show br0 >/dev/null 2>&1 || ip link add br0 type bridge; ip link set br0 up"); err != nil {
 				return err
@@ -442,4 +446,10 @@ func pairedSAs(a, b string) bool {
 	ai, ao := parse(a)
 	bi, bo := parse(b)
 	return ai != "" && ao != "" && ai == bo && ao == bi
+}
+
+// interfaceMAC keeps neighbors valid when a container or veth is recreated.
+func interfaceMAC(lab, device, iface string) string {
+	hash := sha256.Sum256([]byte(lab + "\x00" + device + "\x00" + iface))
+	return fmt.Sprintf("02:%02x:%02x:%02x:%02x:%02x", hash[0], hash[1], hash[2], hash[3], hash[4])
 }

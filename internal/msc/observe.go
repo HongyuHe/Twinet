@@ -202,14 +202,8 @@ func (e *Engine) Check(ctx context.Context) (Report, error) {
 		if d.Admin == "" {
 			continue
 		}
-		var aw string
-		for _, a := range e.Spec.Devices {
-			if a.Role == "admin" && strings.Split(a.Interface("mgmt").Address, "/")[0] == d.Admin {
-				aw = a.ID
-			}
-		}
-		ip := strings.Split(d.Interface("mgmt").Address, "/")[0]
-		_, err = e.exec(ctx, aw, "python3", "-c", `import ssl,urllib.request,sys;c=ssl.create_default_context(cafile='/run/msc-tls/x509ca/ca.pem');c.load_cert_chain('/run/msc-tls/x509/cert.pem','/run/msc-tls/private/key.pem');print(urllib.request.urlopen('https://'+sys.argv[1]+':8443',context=c,timeout=3).read().decode())`, ip)
+		aw, ip := e.managementPeer(&d)
+		err = e.managementProbe(ctx, &d)
 		r.add("management/"+aw+"/"+d.ID, err == nil, fmt.Sprint(err))
 		_, unauthErr := e.exec(ctx, aw, "python3", "-c", `import ssl,urllib.request,sys;c=ssl.create_default_context(cafile='/run/msc-tls/x509ca/ca.pem');urllib.request.urlopen('https://'+sys.argv[1]+':8443',context=c,timeout=3).read()`, ip)
 		r.add("management-client-auth/"+d.ID, err == nil && unauthErr != nil, "reachable endpoint rejects a client without a certificate")
@@ -281,4 +275,22 @@ func (e *Engine) abortCapture(id, name string) {
 	defer cancel()
 	prefix := "/tmp/msc-" + name
 	_ = e.shell(ctx, id, "if ! test -f "+prefix+".done; then kill -INT $(cat "+prefix+".pid) 2>/dev/null || true; fi")
+}
+
+func (e *Engine) managementPeer(d *Device) (string, string) {
+	for _, a := range e.Spec.Devices {
+		if a.Role == "admin" && strings.Split(a.Interface("mgmt").Address, "/")[0] == d.Admin {
+			return a.ID, strings.Split(d.Interface("mgmt").Address, "/")[0]
+		}
+	}
+	return "", ""
+}
+
+func (e *Engine) managementProbe(ctx context.Context, d *Device) error {
+	aw, ip := e.managementPeer(d)
+	if aw == "" {
+		return fmt.Errorf("no management peer for %s", d.ID)
+	}
+	_, err := e.exec(ctx, aw, "python3", "-c", `import ssl,urllib.request,sys;c=ssl.create_default_context(cafile='/run/msc-tls/x509ca/ca.pem');c.load_cert_chain('/run/msc-tls/x509/cert.pem','/run/msc-tls/private/key.pem');print(urllib.request.urlopen('https://'+sys.argv[1]+':8443',context=c,timeout=3).read().decode())`, ip)
+	return err
 }

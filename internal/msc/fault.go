@@ -160,6 +160,8 @@ func (e *Engine) TestFailures(ctx context.Context) (Report, error) {
 		if err := e.Restart(ctx, id); err != nil {
 			return r, err
 		}
+		err := e.managementProbe(ctx, e.Spec.Device(id))
+		r.add("restart/"+id+"/management-TLS", err == nil, fmt.Sprint(err))
 		for _, level := range []int{1, 2} {
 			ok, detail, probeErr := e.ping(ctx, fmt.Sprintf("R_A%d", level), fmt.Sprintf("10.2.%d.10", level))
 			if probeErr != nil {

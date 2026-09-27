@@ -210,7 +210,9 @@ The runner has no background credential refresh service.
 A host reboot stops the containers. Run `msc up` after Docker starts to restore
 links, filters, configuration, and fresh tunnel state. Live SA keys and replay
 windows are never serialized for restoration. `msc restart DEVICE` exercises a
-container restart without rebooting the worker.
+container restart without rebooting the worker. Veth interfaces have stable
+MAC addresses, and reconciliation clears neighbor caches after wiring repairs.
+The restart checks verify management TLS as well as data connectivity.
 
 ```sh
 sudo bin/twinet msc down
