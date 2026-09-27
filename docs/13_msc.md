@@ -12,6 +12,255 @@ The prepared native deployment runs on **node-1**,
 retained in `examples/msc/legacy.json`; its container names and runtime remain
 compatible. Do not use the version 2 manifest to operate the node-0 deployment.
 
+## Current topology on node-1
+
+Node-1 runs the default two-site, two-level topology from
+[msc.json](../examples/msc/msc.json). On 2026-09-27, the deployed manifest at
+`/var/lib/twinet/msc/spec.json` matched that file, and all 42 containers were
+running. The deployment has 35 logical devices, 44 veth links, and seven private
+FRR control containers. The control containers share their device's network
+namespace and do not add logical nodes or cables.
+
+The deployed layout uses two Outer Firewalls and one Gray Firewall per site,
+with a separate Gray switch for each security level. Its generator config is
+[layouts/default.json](../examples/msc/layouts/default.json):
+
+```json
+{
+  "name": "msc",
+  "levels": 2,
+  "outer_firewalls": 2,
+  "gray_firewalls": 1,
+  "shared_gray": false
+}
+```
+
+The data topology below contains 23 devices and 24 physical links. Every solid
+line represents a cable, including the Gray Firewall attachments. `GF_A` and
+`GF_B` block forwarding between their S1 and S2 segments. Same-level traffic
+passes directly between the inner and outer encryptors through its Gray switch.
+
+```mermaid
+flowchart LR
+  subgraph site_a["Site A"]
+    R_A1 --- I_A1 --- G_A1 --- O_A1 --- OF_A1
+    R_A2 --- I_A2 --- G_A2 --- O_A2 --- OF_A2
+    G_A1 ---|s1| GF_A
+    G_A2 ---|s2| GF_A
+  end
+  BLACK["BLACK: FRR / OSPF"]
+  subgraph site_b["Site B"]
+    OF_B1 --- O_B1 --- G_B1 --- I_B1 --- R_B1
+    OF_B2 --- O_B2 --- G_B2 --- I_B2 --- R_B2
+    G_B1 ---|s1| GF_B
+    G_B2 ---|s2| GF_B
+  end
+  OF_A1 ---|OSPF| BLACK
+  OF_A2 ---|OSPF| BLACK
+  BLACK ---|OSPF| OF_B1
+  BLACK ---|OSPF| OF_B2
+```
+
+The device inventory includes six separate management networks in addition to
+the data topology:
+
+| Role | Device IDs | Count |
+|---|---|---:|
+| Black transport router | `BLACK` | 1 |
+| Outer Firewalls | `OF_A1`, `OF_A2`, `OF_B1`, `OF_B2` | 4 |
+| Gray Firewalls | `GF_A`, `GF_B` | 2 |
+| Red hosts | `R_A1`, `R_A2`, `R_B1`, `R_B2` | 4 |
+| Inner encryptors | `I_A1`, `I_A2`, `I_B1`, `I_B2` | 4 |
+| Outer encryptors | `O_A1`, `O_A2`, `O_B1`, `O_B2` | 4 |
+| Gray OVS switches | `G_A1`, `G_A2`, `G_B1`, `G_B2` | 4 |
+| Management OVS switches | `M_A1`, `M_A2`, `M_A99`, `M_B1`, `M_B2`, `M_B99` | 6 |
+| Admin workstations | `AW_A1`, `AW_A2`, `AW_A99`, `AW_B1`, `AW_B2`, `AW_B99` | 6 |
+
+Red and Gray addresses are assigned per site and security level. All addresses
+in the following table use `/24`; each Gray Firewall has one interface in each
+of its site's Gray subnets.
+
+| Site / level | Red host | Inner Red interface | Inner Gray interface | Outer Gray interface | Gray Firewall interface |
+|---|---|---|---|---|---|
+| A / S1 | `R_A1: 10.1.1.10` | `I_A1: 10.1.1.1` | `I_A1: 10.100.1.2` | `O_A1: 10.100.1.1` | `GF_A/s1: 10.100.1.254` |
+| A / S2 | `R_A2: 10.1.2.10` | `I_A2: 10.1.2.1` | `I_A2: 10.100.2.2` | `O_A2: 10.100.2.1` | `GF_A/s2: 10.100.2.254` |
+| B / S1 | `R_B1: 10.2.1.10` | `I_B1: 10.2.1.1` | `I_B1: 10.200.1.2` | `O_B1: 10.200.1.1` | `GF_B/s1: 10.200.1.254` |
+| B / S2 | `R_B2: 10.2.2.10` | `I_B2: 10.2.2.1` | `I_B2: 10.200.2.2` | `O_B2: 10.200.2.1` | `GF_B/s2: 10.200.2.254` |
+
+Each outer encryptor connects to its Outer Firewall over a dedicated `/30`.
+Each Outer Firewall has another `/30` link to BLACK. OSPF runs only on the
+firewall-to-BLACK links and advertises the outer-encryptor subnets as passive
+networks.
+
+| Outer encryptor / Black address | Outer Firewall / inside address | Outer Firewall / outside address | BLACK port / address |
+|---|---|---|---|
+| `O_A1: 172.20.11.1/30` | `OF_A1: 172.20.11.2/30` | `OF_A1: 172.21.11.1/30` | `p11: 172.21.11.2/30` |
+| `O_A2: 172.20.12.1/30` | `OF_A2: 172.20.12.2/30` | `OF_A2: 172.21.12.1/30` | `p12: 172.21.12.2/30` |
+| `O_B1: 172.20.21.1/30` | `OF_B1: 172.20.21.2/30` | `OF_B1: 172.21.21.1/30` | `p21: 172.21.21.2/30` |
+| `O_B2: 172.20.22.1/30` | `OF_B2: 172.20.22.2/30` | `OF_B2: 172.21.22.1/30` | `p22: 172.21.22.2/30` |
+
+Management adds 12 devices and 20 links. Each admin workstation and every
+listed appliance connect directly to that row's OVS switch. Appliance suffixes
+such as `.20` refer to addresses in the listed subnet. Management links remain
+separate from the Red, Gray, and Black data paths.
+
+| Domain | Admin workstation / address | OVS switch | Subnet | Appliance management addresses |
+|---|---|---|---|---|
+| A / S1 | `AW_A1: 172.30.11.10` | `M_A1` | `172.30.11.0/24` | `I_A1: .20` |
+| A / S2 | `AW_A2: 172.30.12.10` | `M_A2` | `172.30.12.0/24` | `I_A2: .20` |
+| A / outer and firewalls | `AW_A99: 172.30.109.10` | `M_A99` | `172.30.109.0/24` | `GF_A: .20`, `O_A1: .21`, `O_A2: .22`, `OF_A1: .23`, `OF_A2: .24` |
+| B / S1 | `AW_B1: 172.30.21.10` | `M_B1` | `172.30.21.0/24` | `I_B1: .20` |
+| B / S2 | `AW_B2: 172.30.22.10` | `M_B2` | `172.30.22.0/24` | `I_B2: .20` |
+| B / outer and firewalls | `AW_B99: 172.30.119.10` | `M_B99` | `172.30.119.0/24` | `GF_B: .20`, `O_B1: .21`, `O_B2: .22`, `OF_B1: .23`, `OF_B2: .24` |
+
+Four logical IPsec tunnels protect the two levels across sites. Inner peers are
+`I_A1` to `I_B1` and `I_A2` to `I_B2`; outer peers are `O_A1` to `O_B1` and
+`O_A2` to `O_B2`. S1 and S2 share BLACK, but retain distinct Red subnets, Gray
+segments, inner trust domains, and tunnel policies. The shared-Gray layouts
+described below are supported alternatives; they are not the current node-1
+deployment.
+
+## Firewall and encryption implementation
+
+The security stack combines FRR routing, Linux Netfilter packet filtering, and
+strongSwan IPsec. Each logical device has its own network namespace, interfaces,
+routing table, firewall rules, and IPsec state where applicable. All containers
+share the worker's Linux kernel.
+
+| Device | Routing or switching | Security enforcement |
+|---|---|---|
+| Outer Firewalls, `OF_*` | FRR with OSPF toward BLACK | Netfilter permits declared outer-encryptor peer traffic |
+| Gray Firewalls, `GF_*` | FRR with connected and declared static routes | Netfilter separates security levels and filters shared-Gray paths |
+| Encryptors, `I_*` and `O_*` | Fixed routes | strongSwan and Linux XFRM encrypt packets; Netfilter requires IPsec protection |
+| Gray switches, `G_*` | OVS | Connect the declared segments; the firewall appliances enforce security policy |
+
+### Firewall enforcement
+
+Twinet generates firewall rules from the manifest and loads them with
+`iptables-restore`. The verified node-1 appliances use `iptables` with the
+`nf_tables` backend. FRR's `vtysh` manages routing; operators inspect and change
+the packet filters with `iptables`. OVS provides switching through `ovs-vsctl`
+and `ovs-ofctl`.
+
+Security appliances begin with `INPUT DROP` and `FORWARD DROP`, then permit
+specific traffic. Locally generated traffic uses `OUTPUT ACCEPT`. Twinet
+disables forwarding while it prepares devices and installs filters before
+enabling data forwarding. The rules come from
+[`filterRules`](../internal/msc/render.go); the deployment sequence is in
+[`engine.go`](../internal/msc/engine.go).
+
+Outer Firewalls permit only the declared outer-encryptor endpoint pairs on the
+expected interfaces. For example, `OF_A1` permits `172.20.11.1` to communicate
+with `172.20.21.1` using ESP or UDP destination ports 500 and 4500. Reverse rules
+permit the corresponding return traffic. Separate input rules admit OSPF from
+the adjacent BLACK router and management traffic from the designated admin.
+The firewall checks headers and protocols without decrypting ESP payloads.
+
+Gray Firewalls block cross-level forwarding in the default layout. Each level
+has a separate OVS switch, so same-level inner-to-outer traffic stays within
+that segment. Routed attempts to reach another level pass through `GF_A` or
+`GF_B` and meet the default DROP policy. The default Gray Firewall has no
+forwarding accept rules.
+
+Shared-Gray layouts place the Gray Firewall inline between each inner encryptor
+and the common OVS fabric. Generated rules permit only ESP and IKE traffic
+between that inner encryptor and its declared remote peer. Cross-level traffic
+remains blocked. Sharing an Outer Firewall similarly adds a distinct inside
+interface and peer-specific rules for each attached outer encryptor.
+
+Management access uses both packet filtering and TLS authentication. An
+appliance admits ICMP and TCP port 8443 only from its designated admin address
+on the management interface. The HTTPS health endpoint requires a trusted
+client certificate and TLS 1.3. The endpoint demonstrates management
+authentication; interactive device access uses worker SSH followed by
+`msc console` or `docker exec`.
+
+### Two layers of IPsec encryption
+
+strongSwan's `charon` daemon authenticates peers and negotiates keys through
+IKEv2. Its `kernel-netlink` plugin installs security associations and policies
+into Linux XFRM, which encrypts and decrypts the actual data packets. `swanctl`
+loads the generated configuration and exposes live tunnel state. The image
+configuration is in [images/msc/Dockerfile](../images/msc/Dockerfile).
+
+Inner tunnels protect the Red subnets for one security level. For S1,
+`I_A1` and `I_B1` use Gray endpoints `10.100.1.2` and `10.200.1.2`; their traffic
+selectors are `10.1.1.0/24` and `10.2.1.0/24`. Outer tunnels protect traffic
+between those inner endpoints. `O_A1` and `O_B1` use Black endpoints
+`172.20.11.1` and `172.20.21.1`, with selectors `10.100.1.2/32` and
+`10.200.1.2/32`. The encryptors use explicit routes, and strongSwan's automatic
+route installation is disabled.
+
+A packet from `R_A1` to `R_B1` gains one encryption layer at each encryptor.
+Braces in the following notation denote encrypted and authenticated contents:
+
+```text
+Red, before I_A1:
+  IP 10.1.1.10 -> 10.2.1.10 | original payload
+
+Gray, after I_A1:
+  IP 10.100.1.2 -> 10.200.1.2 | ESP_inner{original Red packet}
+
+Black, after O_A1:
+  IP 172.20.11.1 -> 172.20.21.1 | ESP_outer{entire Gray packet}
+```
+
+`O_B1` removes the outer layer and forwards the remaining inner ciphertext.
+`I_B1` removes the inner layer and delivers the original packet to `R_B1`.
+Outer encryptors handle inner ciphertext and do not receive the Red plaintext.
+Twinet establishes outer tunnels first so they can carry the inner tunnels'
+IKE exchanges. Permitted IKE and OSPF control packets remain distinct from the
+nested ESP data traffic.
+
+Both layers use AES-256-GCM with a 128-bit authentication tag. The configured
+IKE proposal is `aes256gcm16-prfsha384-ecp384`; the ESP proposal is
+`aes256gcm16-ecp384`. IKE uses a SHA-384-based pseudorandom function and ECP-384
+key exchange. CHILD SAs have a configured rekey time of 50 minutes and lifetime
+of one hour; IKE reauthentication is configured for three hours. The settings
+are generated by [`swanConfig`](../internal/msc/render.go), and the algorithm
+names follow [strongSwan's proposal definitions](https://docs.strongswan.org/docs/latest/config/proposals.html).
+
+Certificates restrict tunnel establishment to the expected peer identities.
+Twinet generates ECDSA P-384 keys and certificates, and each connection names a
+specific remote identity such as `I_B1.msc.test`. S1 and S2 use separate inner
+trust domains, `inner-s1` and `inner-s2`. The outer layer uses its own `outer`
+trust domain. Strict certificate-revocation checking is enabled. CA private
+keys stay in the worker's private state directory; each encryptor receives its
+own credentials, trust anchor, and CRL. Certificate generation and renewal are
+implemented in [`pki.go`](../internal/msc/pki.go).
+
+### Requiring encryption before forwarding
+
+Encryptor firewall rules require the packet to match the correct IPsec tunnel
+policy as well as its interfaces and traffic selectors. For example, the S1
+inner encryptor's outbound rule requires:
+
+```text
+input interface:  red
+output interface: gray
+source:           10.1.1.0/24
+destination:      10.2.1.0/24
+IPsec match:      --dir out --pol ipsec --mode tunnel --reqid 101
+```
+
+The reverse rule requires an inbound IPsec policy match before forwarding to
+Red. Outer encryptors apply the same mechanism with their outer tunnel policy,
+such as `reqid 201`, and additionally restrict tunnel payloads to inner ESP or
+IKE traffic. Arbitrary Gray plaintext does not match those forwarding rules.
+
+Missing encryption state does not authorize plaintext fallback. If a required
+SA is absent while its policy remains, XFRM requires tunnel establishment rather
+than forwarding the protected packet in cleartext. If both the SA and policy
+are removed, the firewall's IPsec match fails and the default DROP policy
+applies. Encryptors have no blanket `ESTABLISHED,RELATED` forwarding exemption
+that would bypass the IPsec requirement. The failure suite explicitly removes
+both SAs and policies and checks for blocked delivery and visible Red plaintext.
+
+The two encryption layers have separate keys, certificates, processes, and
+network namespaces. Both layers use the same strongSwan implementation and
+share the worker kernel. Their separation models layered network protection;
+it does not provide independent hardware or vendor implementations.
+
 ## Log in and use native device commands
 
 Run the following commands on node-1:
