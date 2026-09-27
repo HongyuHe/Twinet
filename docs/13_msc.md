@@ -182,6 +182,10 @@ directory. Intended and observed values remain separate, including during a
 misconfiguration. Missing or failed observations carry explicit errors and must
 be treated as unknown facts.
 
+Each device records its deployed specification hash separately from the chosen
+manifest. Editing a manifest does not relabel the running deployment, and `check`
+rejects a mismatch.
+
 The snapshot is sampled sequentially, not atomically. Export does not run active
 probes or certify an invariant. Save `msc check` output separately when packet
 or reachability evidence is needed. `manifest.json` is written last; an export

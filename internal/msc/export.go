@@ -42,13 +42,14 @@ func (e *Engine) Export(ctx context.Context, dir string) error {
 		return err
 	}
 	type facts struct {
-		Device     string            `json:"device"`
-		Role       string            `json:"role"`
-		ObservedAt time.Time         `json:"observed_at"`
-		State      string            `json:"state"`
-		Image      string            `json:"image_id"`
-		Values     map[string]any    `json:"values"`
-		Errors     map[string]string `json:"errors,omitempty"`
+		Device           string            `json:"device"`
+		Role             string            `json:"role"`
+		ObservedAt       time.Time         `json:"observed_at"`
+		DeployedSpecHash string            `json:"deployed_spec_sha256,omitempty"`
+		State            string            `json:"state"`
+		Image            string            `json:"image_id"`
+		Values           map[string]any    `json:"values"`
+		Errors           map[string]string `json:"errors,omitempty"`
 	}
 	normalized := []facts{}
 	for _, o := range status.Devices {
@@ -61,7 +62,7 @@ func (e *Engine) Export(ctx context.Context, dir string) error {
 				values[key] = raw
 			}
 		}
-		normalized = append(normalized, facts{o.Device, o.Role, o.ObservedAt, string(o.State), o.Image, values, o.Errors})
+		normalized = append(normalized, facts{o.Device, o.Role, o.ObservedAt, o.DeployedSpecHash, string(o.State), o.Image, values, o.Errors})
 		d := e.Spec.Device(o.Device)
 		base := "devices/" + d.ID + "/"
 		if err = putJSON(base+"declared.json", d); err != nil {

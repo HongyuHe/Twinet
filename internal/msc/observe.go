@@ -12,13 +12,14 @@ import (
 )
 
 type Observation struct {
-	Device     string            `json:"device"`
-	ObservedAt time.Time         `json:"observed_at"`
-	Role       string            `json:"role"`
-	State      rt.State          `json:"state"`
-	Image      string            `json:"image"`
-	Facts      map[string]string `json:"facts"`
-	Errors     map[string]string `json:"errors,omitempty"`
+	Device           string            `json:"device"`
+	ObservedAt       time.Time         `json:"observed_at"`
+	DeployedSpecHash string            `json:"deployed_spec_sha256,omitempty"`
+	Role             string            `json:"role"`
+	State            rt.State          `json:"state"`
+	Image            string            `json:"image"`
+	Facts            map[string]string `json:"facts"`
+	Errors           map[string]string `json:"errors,omitempty"`
 }
 type Status struct {
 	Lab      string          `json:"lab"`
@@ -43,7 +44,7 @@ func (e *Engine) Status(ctx context.Context) (Status, error) {
 		if err != nil {
 			return out, err
 		}
-		o := Observation{ObservedAt: time.Now().UTC(), Device: d.ID, Role: d.Role, State: c.State, Image: c.ImageID, Facts: map[string]string{}, Errors: map[string]string{}}
+		o := Observation{DeployedSpecHash: c.Labels["twinet.msc.spec"], ObservedAt: time.Now().UTC(), Device: d.ID, Role: d.Role, State: c.State, Image: c.ImageID, Facts: map[string]string{}, Errors: map[string]string{}}
 		if c.State == rt.StateRunning {
 			commands := map[string][]string{"interfaces": {"ip", "-j", "address", "show"}, "routes": {"ip", "-j", "route", "show", "table", "all"}, "rules": {"ip", "-j", "rule", "show"}, "filter": {"iptables-save", "-t", "filter"}, "forwarding": {"sysctl", "-n", "net.ipv4.ip_forward"}, "processes": {"ps", "-eo", "comm="}}
 			if d.Tunnel != nil {
@@ -136,6 +137,7 @@ func (e *Engine) Check(ctx context.Context) (Report, error) {
 			continue
 		}
 		d := e.Spec.Device(o.Device)
+		r.add("deployed-spec/"+d.ID, o.DeployedSpecHash == e.Spec.Hash(), "running device belongs to the declared specification")
 		wantForward := "1"
 		if d.Role == "host" || d.Role == "admin" || d.Role == "switch" {
 			wantForward = "0"

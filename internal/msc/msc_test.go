@@ -439,3 +439,45 @@ func TestLayoutChangesReissueManagementIdentity(t *testing.T) {
 		before = after
 	}
 }
+
+type staleSpecRuntime struct {
+	rt.Runtime
+	lab, dir string
+}
+
+func (r staleSpecRuntime) Inspect(context.Context, string) (rt.Container, error) {
+	return rt.Container{State: rt.StateRunning, Labels: map[string]string{"twinet.msc.lab": r.lab, "twinet.msc.state": r.dir, "twinet.msc.spec": "previous-deployment"}}, nil
+}
+func (staleSpecRuntime) Exec(context.Context, string, rt.ExecCmd) (rt.ExecResult, error) {
+	return rt.ExecResult{Stdout: "{}"}, nil
+}
+
+func TestExportKeepsDeployedAndIntendedSpecsDistinct(t *testing.T) {
+	e := &Engine{Spec: Example(), Dir: t.TempDir()}
+	e.Runtime = staleSpecRuntime{lab: e.Spec.Name, dir: e.Dir}
+	destination := filepath.Join(t.TempDir(), "export")
+	if err := e.Export(context.Background(), destination); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(destination, "facts.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var facts struct {
+		SpecHash string `json:"spec_sha256"`
+		Devices  []struct {
+			Deployed string `json:"deployed_spec_sha256"`
+		} `json:"devices"`
+	}
+	if err = json.Unmarshal(raw, &facts); err != nil {
+		t.Fatal(err)
+	}
+	if facts.SpecHash != e.Spec.Hash() || len(facts.Devices) != len(e.Spec.Devices) {
+		t.Fatal("missing intended specification")
+	}
+	for _, d := range facts.Devices {
+		if d.Deployed != "previous-deployment" {
+			t.Fatal("relabelled old observations as the new specification")
+		}
+	}
+}
