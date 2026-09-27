@@ -1,0 +1,1096 @@
+{
+  "lab": "msc",
+  "at": "2026-09-27T20:44:39.009738295Z",
+  "spec_sha256": "2c7cf1955d886511fb7002b0c8fab39605cb3f7ccae004c4849691d916f27107",
+  "passed": true,
+  "checks": [
+    {
+      "name": "running/BLACK",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/BLACK",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/BLACK",
+      "passed": true,
+      "detail": "expected 1"
+    },
+    {
+      "name": "filter/BLACK",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "frr-config/BLACK",
+      "passed": true,
+      "detail": "running configuration matches declared baseline"
+    },
+    {
+      "name": "ospf-neighbors/BLACK",
+      "passed": true,
+      "detail": "expected 2 Full adjacencies"
+    },
+    {
+      "name": "ospf-route/BLACK/172.20.11.0/30",
+      "passed": true,
+      "detail": "selected OSPF route installed in both FRR and the kernel"
+    },
+    {
+      "name": "ospf-route/BLACK/172.20.12.0/30",
+      "passed": true,
+      "detail": "selected OSPF route installed in both FRR and the kernel"
+    },
+    {
+      "name": "ospf-route/BLACK/172.20.21.0/30",
+      "passed": true,
+      "detail": "selected OSPF route installed in both FRR and the kernel"
+    },
+    {
+      "name": "ospf-route/BLACK/172.20.22.0/30",
+      "passed": true,
+      "detail": "selected OSPF route installed in both FRR and the kernel"
+    },
+    {
+      "name": "running/GF_A1",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/GF_A1",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/GF_A1",
+      "passed": true,
+      "detail": "expected 1"
+    },
+    {
+      "name": "filter/GF_A1",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "frr-config/GF_A1",
+      "passed": true,
+      "detail": "running configuration matches declared baseline"
+    },
+    {
+      "name": "running/GF_A2",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/GF_A2",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/GF_A2",
+      "passed": true,
+      "detail": "expected 1"
+    },
+    {
+      "name": "filter/GF_A2",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "frr-config/GF_A2",
+      "passed": true,
+      "detail": "running configuration matches declared baseline"
+    },
+    {
+      "name": "running/G_A",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/G_A",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/G_A",
+      "passed": true,
+      "detail": "expected 0"
+    },
+    {
+      "name": "filter/G_A",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "ovs-config/G_A",
+      "passed": true,
+      "detail": "OVS ports, VLANs, OpenFlow rules and control mode match baseline"
+    },
+    {
+      "name": "running/OF_A1",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/OF_A1",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/OF_A1",
+      "passed": true,
+      "detail": "expected 1"
+    },
+    {
+      "name": "filter/OF_A1",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "frr-config/OF_A1",
+      "passed": true,
+      "detail": "running configuration matches declared baseline"
+    },
+    {
+      "name": "ospf-neighbors/OF_A1",
+      "passed": true,
+      "detail": "expected 1 Full adjacencies"
+    },
+    {
+      "name": "ospf-route/OF_A1/172.20.21.0/30",
+      "passed": true,
+      "detail": "selected OSPF route installed in both FRR and the kernel"
+    },
+    {
+      "name": "ospf-route/OF_A1/172.20.22.0/30",
+      "passed": true,
+      "detail": "selected OSPF route installed in both FRR and the kernel"
+    },
+    {
+      "name": "running/R_A1",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/R_A1",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/R_A1",
+      "passed": true,
+      "detail": "expected 0"
+    },
+    {
+      "name": "filter/R_A1",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "running/I_A1",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/I_A1",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/I_A1",
+      "passed": true,
+      "detail": "expected 1"
+    },
+    {
+      "name": "filter/I_A1",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "ipsec/I_A1",
+      "passed": true,
+      "detail": "msc: #1, ESTABLISHED, IKEv2, 13f5b1eb5720b34b_i* 7d8da606a9a516cb_r\n  local  'I_A1.msc.test' @ 10.100.1.2[500]\n  remote 'I_B1.msc.test' @ 10.200.1.2[500]\n  AES_GCM_16-256/PRF_HMAC_SHA2_384/ECP_384\n  established 5s ago, reauth in 10743s\n  protected: #2, reqid 101, INSTALLED, TUNNEL, ESP:AES_GCM_16-256\n    installed 5s ago, rekeying in 2484s, expires in 3595s\n    in  cfbfc3c3,      0 bytes,     0 packets\n    out c08f93cb,      0 bytes,     0 packets\n    local  10.1.1.0/24\n    remote 10.2.1.0/24\n"
+    },
+    {
+      "name": "running/O_A1",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/O_A1",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/O_A1",
+      "passed": true,
+      "detail": "expected 1"
+    },
+    {
+      "name": "no-routing-daemon/O_A1",
+      "passed": true,
+      "detail": "outer encryption appliances use static crypto forwarding"
+    },
+    {
+      "name": "filter/O_A1",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "ipsec/O_A1",
+      "passed": true,
+      "detail": "msc: #1, ESTABLISHED, IKEv2, f869c4e28217778f_i* b588b84de9262bd4_r\n  local  'O_A1.msc.test' @ 172.20.11.1[500]\n  remote 'O_B1.msc.test' @ 172.20.21.1[500]\n  AES_GCM_16-256/PRF_HMAC_SHA2_384/ECP_384\n  established 7s ago, reauth in 10741s\n  protected: #2, reqid 201, INSTALLED, TUNNEL, ESP:AES_GCM_16-256\n    installed 7s ago, rekeying in 2482s, expires in 3593s\n    in  ca619ab6,   1172 bytes,     2 packets,     6s ago\n    out c8f2e807,   1216 bytes,     2 packets,     6s ago\n    local  10.100.1.2/32\n    remote 10.200.1.2/32\n"
+    },
+    {
+      "name": "running/R_A2",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/R_A2",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/R_A2",
+      "passed": true,
+      "detail": "expected 0"
+    },
+    {
+      "name": "filter/R_A2",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "running/I_A2",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/I_A2",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/I_A2",
+      "passed": true,
+      "detail": "expected 1"
+    },
+    {
+      "name": "filter/I_A2",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "ipsec/I_A2",
+      "passed": true,
+      "detail": "msc: #1, ESTABLISHED, IKEv2, f0a6aae2b2120322_i* 5ae195060d856cb4_r\n  local  'I_A2.msc.test' @ 10.100.2.2[500]\n  remote 'I_B2.msc.test' @ 10.200.2.2[500]\n  AES_GCM_16-256/PRF_HMAC_SHA2_384/ECP_384\n  established 7s ago, reauth in 10367s\n  protected: #2, reqid 102, INSTALLED, TUNNEL, ESP:AES_GCM_16-256\n    installed 7s ago, rekeying in 2685s, expires in 3593s\n    in  cfd6a1f0,      0 bytes,     0 packets\n    out cc77aef7,      0 bytes,     0 packets\n    local  10.1.2.0/24\n    remote 10.2.2.0/24\n"
+    },
+    {
+      "name": "running/O_A2",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/O_A2",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/O_A2",
+      "passed": true,
+      "detail": "expected 1"
+    },
+    {
+      "name": "no-routing-daemon/O_A2",
+      "passed": true,
+      "detail": "outer encryption appliances use static crypto forwarding"
+    },
+    {
+      "name": "filter/O_A2",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "ipsec/O_A2",
+      "passed": true,
+      "detail": "msc: #1, ESTABLISHED, IKEv2, fc77319c9f63c5d3_i* bc9555980aee29ee_r\n  local  'O_A2.msc.test' @ 172.20.12.1[500]\n  remote 'O_B2.msc.test' @ 172.20.22.1[500]\n  AES_GCM_16-256/PRF_HMAC_SHA2_384/ECP_384\n  established 8s ago, reauth in 10366s\n  protected: #2, reqid 202, INSTALLED, TUNNEL, ESP:AES_GCM_16-256\n    installed 8s ago, rekeying in 2684s, expires in 3592s\n    in  caca52df,   1170 bytes,     2 packets,     8s ago\n    out c7c2e684,   1218 bytes,     2 packets,     8s ago\n    local  10.100.2.2/32\n    remote 10.200.2.2/32\n"
+    },
+    {
+      "name": "running/M_A1",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/M_A1",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/M_A1",
+      "passed": true,
+      "detail": "expected 0"
+    },
+    {
+      "name": "filter/M_A1",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "ovs-config/M_A1",
+      "passed": true,
+      "detail": "OVS ports, VLANs, OpenFlow rules and control mode match baseline"
+    },
+    {
+      "name": "running/AW_A1",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/AW_A1",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/AW_A1",
+      "passed": true,
+      "detail": "expected 0"
+    },
+    {
+      "name": "filter/AW_A1",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "running/M_A2",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/M_A2",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/M_A2",
+      "passed": true,
+      "detail": "expected 0"
+    },
+    {
+      "name": "filter/M_A2",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "ovs-config/M_A2",
+      "passed": true,
+      "detail": "OVS ports, VLANs, OpenFlow rules and control mode match baseline"
+    },
+    {
+      "name": "running/AW_A2",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/AW_A2",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/AW_A2",
+      "passed": true,
+      "detail": "expected 0"
+    },
+    {
+      "name": "filter/AW_A2",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "running/M_A99",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/M_A99",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/M_A99",
+      "passed": true,
+      "detail": "expected 0"
+    },
+    {
+      "name": "filter/M_A99",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "ovs-config/M_A99",
+      "passed": true,
+      "detail": "OVS ports, VLANs, OpenFlow rules and control mode match baseline"
+    },
+    {
+      "name": "running/AW_A99",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/AW_A99",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/AW_A99",
+      "passed": true,
+      "detail": "expected 0"
+    },
+    {
+      "name": "filter/AW_A99",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "running/GF_B1",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/GF_B1",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/GF_B1",
+      "passed": true,
+      "detail": "expected 1"
+    },
+    {
+      "name": "filter/GF_B1",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "frr-config/GF_B1",
+      "passed": true,
+      "detail": "running configuration matches declared baseline"
+    },
+    {
+      "name": "running/GF_B2",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/GF_B2",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/GF_B2",
+      "passed": true,
+      "detail": "expected 1"
+    },
+    {
+      "name": "filter/GF_B2",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "frr-config/GF_B2",
+      "passed": true,
+      "detail": "running configuration matches declared baseline"
+    },
+    {
+      "name": "running/G_B",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/G_B",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/G_B",
+      "passed": true,
+      "detail": "expected 0"
+    },
+    {
+      "name": "filter/G_B",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "ovs-config/G_B",
+      "passed": true,
+      "detail": "OVS ports, VLANs, OpenFlow rules and control mode match baseline"
+    },
+    {
+      "name": "running/OF_B1",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/OF_B1",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/OF_B1",
+      "passed": true,
+      "detail": "expected 1"
+    },
+    {
+      "name": "filter/OF_B1",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "frr-config/OF_B1",
+      "passed": true,
+      "detail": "running configuration matches declared baseline"
+    },
+    {
+      "name": "ospf-neighbors/OF_B1",
+      "passed": true,
+      "detail": "expected 1 Full adjacencies"
+    },
+    {
+      "name": "ospf-route/OF_B1/172.20.11.0/30",
+      "passed": true,
+      "detail": "selected OSPF route installed in both FRR and the kernel"
+    },
+    {
+      "name": "ospf-route/OF_B1/172.20.12.0/30",
+      "passed": true,
+      "detail": "selected OSPF route installed in both FRR and the kernel"
+    },
+    {
+      "name": "running/R_B1",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/R_B1",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/R_B1",
+      "passed": true,
+      "detail": "expected 0"
+    },
+    {
+      "name": "filter/R_B1",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "running/I_B1",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/I_B1",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/I_B1",
+      "passed": true,
+      "detail": "expected 1"
+    },
+    {
+      "name": "filter/I_B1",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "ipsec/I_B1",
+      "passed": true,
+      "detail": "msc: #1, ESTABLISHED, IKEv2, 13f5b1eb5720b34b_i 7d8da606a9a516cb_r*\n  local  'I_B1.msc.test' @ 10.200.1.2[500]\n  remote 'I_A1.msc.test' @ 10.100.1.2[500]\n  AES_GCM_16-256/PRF_HMAC_SHA2_384/ECP_384\n  established 16s ago, reauth in 10642s\n  protected: #2, reqid 101, INSTALLED, TUNNEL, ESP:AES_GCM_16-256\n    installed 16s ago, rekeying in 2485s, expires in 3584s\n    in  c08f93cb,      0 bytes,     0 packets\n    out cfbfc3c3,      0 bytes,     0 packets\n    local  10.2.1.0/24\n    remote 10.1.1.0/24\n"
+    },
+    {
+      "name": "running/O_B1",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/O_B1",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/O_B1",
+      "passed": true,
+      "detail": "expected 1"
+    },
+    {
+      "name": "no-routing-daemon/O_B1",
+      "passed": true,
+      "detail": "outer encryption appliances use static crypto forwarding"
+    },
+    {
+      "name": "filter/O_B1",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "ipsec/O_B1",
+      "passed": true,
+      "detail": "msc: #1, ESTABLISHED, IKEv2, f869c4e28217778f_i b588b84de9262bd4_r*\n  local  'O_B1.msc.test' @ 172.20.21.1[500]\n  remote 'O_A1.msc.test' @ 172.20.11.1[500]\n  AES_GCM_16-256/PRF_HMAC_SHA2_384/ECP_384\n  established 17s ago, reauth in 10731s\n  protected: #2, reqid 201, INSTALLED, TUNNEL, ESP:AES_GCM_16-256\n    installed 17s ago, rekeying in 2472s, expires in 3583s\n    in  c8f2e807,   1301 bytes,     3 packets,     6s ago\n    out ca619ab6,   1257 bytes,     3 packets,     6s ago\n    local  10.200.1.2/32\n    remote 10.100.1.2/32\n"
+    },
+    {
+      "name": "running/R_B2",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/R_B2",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/R_B2",
+      "passed": true,
+      "detail": "expected 0"
+    },
+    {
+      "name": "filter/R_B2",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "running/I_B2",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/I_B2",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/I_B2",
+      "passed": true,
+      "detail": "expected 1"
+    },
+    {
+      "name": "filter/I_B2",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "ipsec/I_B2",
+      "passed": true,
+      "detail": "msc: #1, ESTABLISHED, IKEv2, f0a6aae2b2120322_i 5ae195060d856cb4_r*\n  local  'I_B2.msc.test' @ 10.200.2.2[500]\n  remote 'I_A2.msc.test' @ 10.100.2.2[500]\n  AES_GCM_16-256/PRF_HMAC_SHA2_384/ECP_384\n  established 18s ago, reauth in 10356s\n  protected: #2, reqid 102, INSTALLED, TUNNEL, ESP:AES_GCM_16-256\n    installed 18s ago, rekeying in 2674s, expires in 3582s\n    in  cc77aef7,      0 bytes,     0 packets\n    out cfd6a1f0,      0 bytes,     0 packets\n    local  10.2.2.0/24\n    remote 10.1.2.0/24\n"
+    },
+    {
+      "name": "running/O_B2",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/O_B2",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/O_B2",
+      "passed": true,
+      "detail": "expected 1"
+    },
+    {
+      "name": "no-routing-daemon/O_B2",
+      "passed": true,
+      "detail": "outer encryption appliances use static crypto forwarding"
+    },
+    {
+      "name": "filter/O_B2",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "ipsec/O_B2",
+      "passed": true,
+      "detail": "msc: #1, ESTABLISHED, IKEv2, fc77319c9f63c5d3_i bc9555980aee29ee_r*\n  local  'O_B2.msc.test' @ 172.20.22.1[500]\n  remote 'O_A2.msc.test' @ 172.20.12.1[500]\n  AES_GCM_16-256/PRF_HMAC_SHA2_384/ECP_384\n  established 18s ago, reauth in 10730s\n  protected: #2, reqid 202, INSTALLED, TUNNEL, ESP:AES_GCM_16-256\n    installed 18s ago, rekeying in 2471s, expires in 3582s\n    in  c7c2e684,   1303 bytes,     3 packets,     9s ago\n    out caca52df,   1255 bytes,     3 packets,     9s ago\n    local  10.200.2.2/32\n    remote 10.100.2.2/32\n"
+    },
+    {
+      "name": "running/M_B1",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/M_B1",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/M_B1",
+      "passed": true,
+      "detail": "expected 0"
+    },
+    {
+      "name": "filter/M_B1",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "ovs-config/M_B1",
+      "passed": true,
+      "detail": "OVS ports, VLANs, OpenFlow rules and control mode match baseline"
+    },
+    {
+      "name": "running/AW_B1",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/AW_B1",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/AW_B1",
+      "passed": true,
+      "detail": "expected 0"
+    },
+    {
+      "name": "filter/AW_B1",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "running/M_B2",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/M_B2",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/M_B2",
+      "passed": true,
+      "detail": "expected 0"
+    },
+    {
+      "name": "filter/M_B2",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "ovs-config/M_B2",
+      "passed": true,
+      "detail": "OVS ports, VLANs, OpenFlow rules and control mode match baseline"
+    },
+    {
+      "name": "running/AW_B2",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/AW_B2",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/AW_B2",
+      "passed": true,
+      "detail": "expected 0"
+    },
+    {
+      "name": "filter/AW_B2",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "running/M_B99",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/M_B99",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/M_B99",
+      "passed": true,
+      "detail": "expected 0"
+    },
+    {
+      "name": "filter/M_B99",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "ovs-config/M_B99",
+      "passed": true,
+      "detail": "OVS ports, VLANs, OpenFlow rules and control mode match baseline"
+    },
+    {
+      "name": "running/AW_B99",
+      "passed": true,
+      "detail": "running"
+    },
+    {
+      "name": "observations/AW_B99",
+      "passed": true,
+      "detail": "map[]"
+    },
+    {
+      "name": "forwarding/AW_B99",
+      "passed": true,
+      "detail": "expected 0"
+    },
+    {
+      "name": "filter/AW_B99",
+      "passed": true,
+      "detail": "kernel-normalized baseline comparison"
+    },
+    {
+      "name": "reachability/R_A1/R_A2",
+      "passed": true,
+      "detail": "want delivery=false; PING 10.1.2.10 (10.1.2.10) 56(84) bytes of data.\nFrom 10.1.1.1 icmp_seq=1 Destination Net Unreachable\nFrom 10.1.1.1 icmp_seq=2 Destination Net Unreachable\n\n--- 10.1.2.10 ping statistics ---\n2 packets transmitted, 0 received, +2 errors, 100% packet loss, time 1000ms"
+    },
+    {
+      "name": "reachability/R_A1/R_B1",
+      "passed": true,
+      "detail": "want delivery=true; PING 10.2.1.10 (10.2.1.10) 56(84) bytes of data.\n64 bytes from 10.2.1.10: icmp_seq=1 ttl=62 time=0.375 ms\n64 bytes from 10.2.1.10: icmp_seq=2 ttl=62 time=0.218 ms\n\n--- 10.2.1.10 ping statistics ---\n2 packets transmitted, 2 received, 0% packet loss, time 1018ms\nrtt min/avg/max/mdev = 0.218/0.296/0.375/0.078 ms"
+    },
+    {
+      "name": "reachability/R_A1/R_B2",
+      "passed": true,
+      "detail": "want delivery=false; PING 10.2.2.10 (10.2.2.10) 56(84) bytes of data.\nFrom 10.1.1.1 icmp_seq=1 Destination Net Unreachable\nFrom 10.1.1.1 icmp_seq=2 Destination Net Unreachable\n\n--- 10.2.2.10 ping statistics ---\n2 packets transmitted, 0 received, +2 errors, 100% packet loss, time 1022ms"
+    },
+    {
+      "name": "reachability/R_A2/R_A1",
+      "passed": true,
+      "detail": "want delivery=false; PING 10.1.1.10 (10.1.1.10) 56(84) bytes of data.\nFrom 10.1.2.1 icmp_seq=1 Destination Net Unreachable\nFrom 10.1.2.1 icmp_seq=2 Destination Net Unreachable\n\n--- 10.1.1.10 ping statistics ---\n2 packets transmitted, 0 received, +2 errors, 100% packet loss, time 1012ms"
+    },
+    {
+      "name": "reachability/R_A2/R_B1",
+      "passed": true,
+      "detail": "want delivery=false; PING 10.2.1.10 (10.2.1.10) 56(84) bytes of data.\nFrom 10.1.2.1 icmp_seq=1 Destination Net Unreachable\n\n--- 10.2.1.10 ping statistics ---\n2 packets transmitted, 0 received, +1 errors, 100% packet loss, time 1010ms"
+    },
+    {
+      "name": "reachability/R_A2/R_B2",
+      "passed": true,
+      "detail": "want delivery=true; PING 10.2.2.10 (10.2.2.10) 56(84) bytes of data.\n64 bytes from 10.2.2.10: icmp_seq=1 ttl=62 time=0.426 ms\n64 bytes from 10.2.2.10: icmp_seq=2 ttl=62 time=0.349 ms\n\n--- 10.2.2.10 ping statistics ---\n2 packets transmitted, 2 received, 0% packet loss, time 1041ms\nrtt min/avg/max/mdev = 0.349/0.387/0.426/0.038 ms"
+    },
+    {
+      "name": "reachability/R_B1/R_A1",
+      "passed": true,
+      "detail": "want delivery=true; PING 10.1.1.10 (10.1.1.10) 56(84) bytes of data.\n64 bytes from 10.1.1.10: icmp_seq=1 ttl=62 time=0.386 ms\n64 bytes from 10.1.1.10: icmp_seq=2 ttl=62 time=0.375 ms\n\n--- 10.1.1.10 ping statistics ---\n2 packets transmitted, 2 received, 0% packet loss, time 1011ms\nrtt min/avg/max/mdev = 0.375/0.380/0.386/0.005 ms"
+    },
+    {
+      "name": "reachability/R_B1/R_A2",
+      "passed": true,
+      "detail": "want delivery=false; PING 10.1.2.10 (10.1.2.10) 56(84) bytes of data.\nFrom 10.2.1.1 icmp_seq=1 Destination Net Unreachable\nFrom 10.2.1.1 icmp_seq=2 Destination Net Unreachable\n\n--- 10.1.2.10 ping statistics ---\n2 packets transmitted, 0 received, +2 errors, 100% packet loss, time 1019ms"
+    },
+    {
+      "name": "reachability/R_B1/R_B2",
+      "passed": true,
+      "detail": "want delivery=false; PING 10.2.2.10 (10.2.2.10) 56(84) bytes of data.\nFrom 10.2.1.1 icmp_seq=1 Destination Net Unreachable\n\n--- 10.2.2.10 ping statistics ---\n2 packets transmitted, 0 received, +1 errors, 100% packet loss, time 1008ms"
+    },
+    {
+      "name": "reachability/R_B2/R_A1",
+      "passed": true,
+      "detail": "want delivery=false; PING 10.1.1.10 (10.1.1.10) 56(84) bytes of data.\nFrom 10.2.2.1 icmp_seq=1 Destination Net Unreachable\nFrom 10.2.2.1 icmp_seq=2 Destination Net Unreachable\n\n--- 10.1.1.10 ping statistics ---\n2 packets transmitted, 0 received, +2 errors, 100% packet loss, time 1005ms"
+    },
+    {
+      "name": "reachability/R_B2/R_A2",
+      "passed": true,
+      "detail": "want delivery=true; PING 10.1.2.10 (10.1.2.10) 56(84) bytes of data.\n64 bytes from 10.1.2.10: icmp_seq=1 ttl=62 time=0.363 ms\n64 bytes from 10.1.2.10: icmp_seq=2 ttl=62 time=0.347 ms\n\n--- 10.1.2.10 ping statistics ---\n2 packets transmitted, 2 received, 0% packet loss, time 1008ms\nrtt min/avg/max/mdev = 0.347/0.355/0.363/0.008 ms"
+    },
+    {
+      "name": "reachability/R_B2/R_B1",
+      "passed": true,
+      "detail": "want delivery=false; PING 10.2.1.10 (10.2.1.10) 56(84) bytes of data.\nFrom 10.2.2.1 icmp_seq=1 Destination Net Unreachable\nFrom 10.2.2.1 icmp_seq=2 Destination Net Unreachable\n\n--- 10.2.1.10 ping statistics ---\n2 packets transmitted, 0 received, +2 errors, 100% packet loss, time 1015ms"
+    },
+    {
+      "name": "capture/black/esp",
+      "passed": true,
+      "detail": "36 ESP observations"
+    },
+    {
+      "name": "capture/black/no-red-plaintext",
+      "passed": true
+    },
+    {
+      "name": "capture/gray/esp",
+      "passed": true,
+      "detail": "32 ESP observations"
+    },
+    {
+      "name": "capture/gray/no-red-plaintext",
+      "passed": true
+    },
+    {
+      "name": "gray-firewall-cut/I_A1/I_A2",
+      "passed": true,
+      "detail": "all modeled physical Gray paths cross a Gray Firewall"
+    },
+    {
+      "name": "gray-cross-level/I_A1/I_A2",
+      "passed": true,
+      "detail": "probe blocked and firewall counters changed"
+    },
+    {
+      "name": "gray-firewall-cut/I_B1/I_B2",
+      "passed": true,
+      "detail": "all modeled physical Gray paths cross a Gray Firewall"
+    },
+    {
+      "name": "gray-cross-level/I_B1/I_B2",
+      "passed": true,
+      "detail": "probe blocked and firewall counters changed"
+    },
+    {
+      "name": "management/AW_A99/GF_A1",
+      "passed": true,
+      "detail": "\u003cnil\u003e"
+    },
+    {
+      "name": "management-client-auth/GF_A1",
+      "passed": true,
+      "detail": "reachable endpoint rejects a client without a certificate"
+    },
+    {
+      "name": "management/AW_A99/GF_A2",
+      "passed": true,
+      "detail": "\u003cnil\u003e"
+    },
+    {
+      "name": "management-client-auth/GF_A2",
+      "passed": true,
+      "detail": "reachable endpoint rejects a client without a certificate"
+    },
+    {
+      "name": "management/AW_A99/OF_A1",
+      "passed": true,
+      "detail": "\u003cnil\u003e"
+    },
+    {
+      "name": "management-client-auth/OF_A1",
+      "passed": true,
+      "detail": "reachable endpoint rejects a client without a certificate"
+    },
+    {
+      "name": "management/AW_A1/I_A1",
+      "passed": true,
+      "detail": "\u003cnil\u003e"
+    },
+    {
+      "name": "management-client-auth/I_A1",
+      "passed": true,
+      "detail": "reachable endpoint rejects a client without a certificate"
+    },
+    {
+      "name": "management/AW_A99/O_A1",
+      "passed": true,
+      "detail": "\u003cnil\u003e"
+    },
+    {
+      "name": "management-client-auth/O_A1",
+      "passed": true,
+      "detail": "reachable endpoint rejects a client without a certificate"
+    },
+    {
+      "name": "management/AW_A2/I_A2",
+      "passed": true,
+      "detail": "\u003cnil\u003e"
+    },
+    {
+      "name": "management-client-auth/I_A2",
+      "passed": true,
+      "detail": "reachable endpoint rejects a client without a certificate"
+    },
+    {
+      "name": "management/AW_A99/O_A2",
+      "passed": true,
+      "detail": "\u003cnil\u003e"
+    },
+    {
+      "name": "management-client-auth/O_A2",
+      "passed": true,
+      "detail": "reachable endpoint rejects a client without a certificate"
+    },
+    {
+      "name": "management/AW_B99/GF_B1",
+      "passed": true,
+      "detail": "\u003cnil\u003e"
+    },
+    {
+      "name": "management-client-auth/GF_B1",
+      "passed": true,
+      "detail": "reachable endpoint rejects a client without a certificate"
+    },
+    {
+      "name": "management/AW_B99/GF_B2",
+      "passed": true,
+      "detail": "\u003cnil\u003e"
+    },
+    {
+      "name": "management-client-auth/GF_B2",
+      "passed": true,
+      "detail": "reachable endpoint rejects a client without a certificate"
+    },
+    {
+      "name": "management/AW_B99/OF_B1",
+      "passed": true,
+      "detail": "\u003cnil\u003e"
+    },
+    {
+      "name": "management-client-auth/OF_B1",
+      "passed": true,
+      "detail": "reachable endpoint rejects a client without a certificate"
+    },
+    {
+      "name": "management/AW_B1/I_B1",
+      "passed": true,
+      "detail": "\u003cnil\u003e"
+    },
+    {
+      "name": "management-client-auth/I_B1",
+      "passed": true,
+      "detail": "reachable endpoint rejects a client without a certificate"
+    },
+    {
+      "name": "management/AW_B99/O_B1",
+      "passed": true,
+      "detail": "\u003cnil\u003e"
+    },
+    {
+      "name": "management-client-auth/O_B1",
+      "passed": true,
+      "detail": "reachable endpoint rejects a client without a certificate"
+    },
+    {
+      "name": "management/AW_B2/I_B2",
+      "passed": true,
+      "detail": "\u003cnil\u003e"
+    },
+    {
+      "name": "management-client-auth/I_B2",
+      "passed": true,
+      "detail": "reachable endpoint rejects a client without a certificate"
+    },
+    {
+      "name": "management/AW_B99/O_B2",
+      "passed": true,
+      "detail": "\u003cnil\u003e"
+    },
+    {
+      "name": "management-client-auth/O_B2",
+      "passed": true,
+      "detail": "reachable endpoint rejects a client without a certificate"
+    }
+  ]
+}

@@ -17,4 +17,5 @@ uses seven private control containers. The small files under `layouts/` select
 firewall counts and Gray sharing. `legacy.json` preserves version 1.
 
 [VALIDATION.md](VALIDATION.md) and the original `evidence/` files document the
-historical node-0 implementation. New native evidence is recorded separately.
+historical node-0 implementation. [VALIDATION_NATIVE.md](VALIDATION_NATIVE.md)
+records the native node-1 checks and links to their evidence.

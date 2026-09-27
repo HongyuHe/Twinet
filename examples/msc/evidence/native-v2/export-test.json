@@ -1,0 +1,7 @@
+{
+  "passed": true,
+  "native_write_memory": true,
+  "observed_config_preserves_cli_edit": true,
+  "intended_config_remains_declared": true,
+  "structured_facts_preserve_cli_edit": true
+}

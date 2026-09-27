@@ -1,0 +1,58 @@
+{
+  "lab": "msc",
+  "at": "2026-09-27T20:34:42.255002821Z",
+  "spec_sha256": "7b47169d7a1726e7599e9b9931cf9b9817df446c6b3902909bfd5a4aca2e8f61",
+  "passed": true,
+  "checks": [
+    {
+      "name": "native-mistake/ospf/blocks-data",
+      "passed": true,
+      "detail": "native CLI change affects the forwarding path"
+    },
+    {
+      "name": "native-mistake/ospf/detects-drift",
+      "passed": true,
+      "detail": "live configuration differs from the recorded baseline"
+    },
+    {
+      "name": "native-mistake/ospf/recovered",
+      "passed": true,
+      "detail": "PING 10.2.1.10 (10.2.1.10) 56(84) bytes of data.\n64 bytes from 10.2.1.10: icmp_seq=1 ttl=62 time=0.406 ms\n64 bytes from 10.2.1.10: icmp_seq=2 ttl=62 time=0.158 ms\n\n--- 10.2.1.10 ping statistics ---\n2 packets transmitted, 2 received, 0% packet loss, time 1035ms\nrtt min/avg/max/mdev = 0.158/0.282/0.406/0.124 ms"
+    },
+    {
+      "name": "native-mistake/ovs/blocks-data",
+      "passed": true,
+      "detail": "native CLI change affects the forwarding path"
+    },
+    {
+      "name": "native-mistake/ovs/detects-drift",
+      "passed": true,
+      "detail": "live configuration differs from the recorded baseline"
+    },
+    {
+      "name": "native-mistake/ovs/recovered",
+      "passed": true,
+      "detail": "PING 10.2.1.10 (10.2.1.10) 56(84) bytes of data.\n64 bytes from 10.2.1.10: icmp_seq=1 ttl=62 time=0.279 ms\n64 bytes from 10.2.1.10: icmp_seq=2 ttl=62 time=0.225 ms\n\n--- 10.2.1.10 ping statistics ---\n2 packets transmitted, 2 received, 0% packet loss, time 1016ms\nrtt min/avg/max/mdev = 0.225/0.252/0.279/0.027 ms"
+    },
+    {
+      "name": "native-restart/BLACK/S1",
+      "passed": true,
+      "detail": "PING 10.2.1.10 (10.2.1.10) 56(84) bytes of data.\n64 bytes from 10.2.1.10: icmp_seq=1 ttl=62 time=1.24 ms\n64 bytes from 10.2.1.10: icmp_seq=2 ttl=62 time=0.240 ms\n\n--- 10.2.1.10 ping statistics ---\n2 packets transmitted, 2 received, 0% packet loss, time 1001ms\nrtt min/avg/max/mdev = 0.240/0.742/1.244/0.502 ms"
+    },
+    {
+      "name": "native-restart/BLACK/S2",
+      "passed": true,
+      "detail": "PING 10.2.2.10 (10.2.2.10) 56(84) bytes of data.\n64 bytes from 10.2.2.10: icmp_seq=1 ttl=62 time=1.62 ms\n64 bytes from 10.2.2.10: icmp_seq=2 ttl=62 time=0.258 ms\n\n--- 10.2.2.10 ping statistics ---\n2 packets transmitted, 2 received, 0% packet loss, time 1002ms\nrtt min/avg/max/mdev = 0.258/0.938/1.618/0.680 ms"
+    },
+    {
+      "name": "native-restart/G_A1/S1",
+      "passed": true,
+      "detail": "PING 10.2.1.10 (10.2.1.10) 56(84) bytes of data.\n64 bytes from 10.2.1.10: icmp_seq=1 ttl=62 time=2.73 ms\n64 bytes from 10.2.1.10: icmp_seq=2 ttl=62 time=0.215 ms\n\n--- 10.2.1.10 ping statistics ---\n2 packets transmitted, 2 received, 0% packet loss, time 1002ms\nrtt min/avg/max/mdev = 0.215/1.474/2.734/1.259 ms"
+    },
+    {
+      "name": "native-restart/G_A1/S2",
+      "passed": true,
+      "detail": "PING 10.2.2.10 (10.2.2.10) 56(84) bytes of data.\n64 bytes from 10.2.2.10: icmp_seq=1 ttl=62 time=2.88 ms\n64 bytes from 10.2.2.10: icmp_seq=2 ttl=62 time=0.147 ms\n\n--- 10.2.2.10 ping statistics ---\n2 packets transmitted, 2 received, 0% packet loss, time 1002ms\nrtt min/avg/max/mdev = 0.147/1.515/2.883/1.368 ms"
+    }
+  ]
+}

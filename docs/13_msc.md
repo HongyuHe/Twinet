@@ -284,4 +284,5 @@ The profile runs on one worker. It shares the worker kernel and does not use
 Twinet's distributed AS placement or automatic HA. The prototype models network
 behavior; it does not establish CSfC product approval, hardware diversity,
 physical protection, or full package compliance. The historical node-0 results
-remain in `examples/msc/VALIDATION.md`; native results are recorded separately.
+remain in `examples/msc/VALIDATION.md`; native results are recorded in
+[VALIDATION_NATIVE.md](../examples/msc/VALIDATION_NATIVE.md).

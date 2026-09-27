@@ -1,0 +1,200 @@
+{
+  "lab": "msc",
+  "at": "2026-09-27T20:18:48.724226425Z",
+  "spec_sha256": "7b47169d7a1726e7599e9b9931cf9b9817df446c6b3902909bfd5a4aca2e8f61",
+  "passed": false,
+  "checks": [
+    {
+      "name": "ipsec-down/I_A1/blocks-S1",
+      "passed": true,
+      "detail": "PING 10.2.1.10 (10.2.1.10) 56(84) bytes of data.\n\n--- 10.2.1.10 ping statistics ---\n2 packets transmitted, 0 received, 100% packet loss, time 1055ms"
+    },
+    {
+      "name": "ipsec-down/I_A1/S2-unaffected",
+      "passed": true,
+      "detail": "PING 10.2.2.10 (10.2.2.10) 56(84) bytes of data.\n64 bytes from 10.2.2.10: icmp_seq=1 ttl=62 time=0.391 ms\n64 bytes from 10.2.2.10: icmp_seq=2 ttl=62 time=0.259 ms\n\n--- 10.2.2.10 ping statistics ---\n2 packets transmitted, 2 received, 0% packet loss, time 1041ms\nrtt min/avg/max/mdev = 0.259/0.325/0.391/0.066 ms"
+    },
+    {
+      "name": "ipsec-down/I_A1/no-stale-protection",
+      "passed": true,
+      "detail": "SAs and policies were removed"
+    },
+    {
+      "name": "ipsec-down/I_A1/no-plaintext/BLACK",
+      "passed": true
+    },
+    {
+      "name": "ipsec-down/I_A1/no-plaintext/G_A1",
+      "passed": true
+    },
+    {
+      "name": "ipsec-down/I_A1/recovered",
+      "passed": true,
+      "detail": "PING 10.2.1.10 (10.2.1.10) 56(84) bytes of data.\n64 bytes from 10.2.1.10: icmp_seq=1 ttl=62 time=0.405 ms\n64 bytes from 10.2.1.10: icmp_seq=2 ttl=62 time=0.136 ms\n\n--- 10.2.1.10 ping statistics ---\n2 packets transmitted, 2 received, 0% packet loss, time 1016ms\nrtt min/avg/max/mdev = 0.136/0.270/0.405/0.134 ms"
+    },
+    {
+      "name": "ipsec-down/O_A1/blocks-S1",
+      "passed": true,
+      "detail": "PING 10.2.1.10 (10.2.1.10) 56(84) bytes of data.\n\n--- 10.2.1.10 ping statistics ---\n2 packets transmitted, 0 received, 100% packet loss, time 1022ms"
+    },
+    {
+      "name": "ipsec-down/O_A1/S2-unaffected",
+      "passed": true,
+      "detail": "PING 10.2.2.10 (10.2.2.10) 56(84) bytes of data.\n64 bytes from 10.2.2.10: icmp_seq=1 ttl=62 time=0.397 ms\n64 bytes from 10.2.2.10: icmp_seq=2 ttl=62 time=0.277 ms\n\n--- 10.2.2.10 ping statistics ---\n2 packets transmitted, 2 received, 0% packet loss, time 1037ms\nrtt min/avg/max/mdev = 0.277/0.337/0.397/0.060 ms"
+    },
+    {
+      "name": "ipsec-down/O_A1/no-stale-protection",
+      "passed": true,
+      "detail": "SAs and policies were removed"
+    },
+    {
+      "name": "ipsec-down/O_A1/no-plaintext/BLACK",
+      "passed": true
+    },
+    {
+      "name": "ipsec-down/O_A1/no-plaintext/G_A1",
+      "passed": true
+    },
+    {
+      "name": "ipsec-down/O_A1/recovered",
+      "passed": true,
+      "detail": "PING 10.2.1.10 (10.2.1.10) 56(84) bytes of data.\n64 bytes from 10.2.1.10: icmp_seq=1 ttl=62 time=0.370 ms\n64 bytes from 10.2.1.10: icmp_seq=2 ttl=62 time=0.230 ms\n\n--- 10.2.1.10 ping statistics ---\n2 packets transmitted, 2 received, 0% packet loss, time 1017ms\nrtt min/avg/max/mdev = 0.230/0.300/0.370/0.070 ms"
+    },
+    {
+      "name": "wrong-peer/I_A1/blocks-S1",
+      "passed": true,
+      "detail": "PING 10.2.1.10 (10.2.1.10) 56(84) bytes of data.\n\n--- 10.2.1.10 ping statistics ---\n2 packets transmitted, 0 received, 100% packet loss, time 1024ms"
+    },
+    {
+      "name": "wrong-peer/I_A1/S2-unaffected",
+      "passed": true,
+      "detail": "PING 10.2.2.10 (10.2.2.10) 56(84) bytes of data.\n64 bytes from 10.2.2.10: icmp_seq=1 ttl=62 time=0.342 ms\n64 bytes from 10.2.2.10: icmp_seq=2 ttl=62 time=0.307 ms\n\n--- 10.2.2.10 ping statistics ---\n2 packets transmitted, 2 received, 0% packet loss, time 1046ms\nrtt min/avg/max/mdev = 0.307/0.324/0.342/0.017 ms"
+    },
+    {
+      "name": "wrong-peer/I_A1/authentication-rejection",
+      "passed": true,
+      "detail": "fresh IKE logs contain unintended-peer.msc.test"
+    },
+    {
+      "name": "wrong-peer/I_A1/no-plaintext/BLACK",
+      "passed": true
+    },
+    {
+      "name": "wrong-peer/I_A1/no-plaintext/G_A1",
+      "passed": true
+    },
+    {
+      "name": "wrong-peer/I_A1/recovered",
+      "passed": true,
+      "detail": "PING 10.2.1.10 (10.2.1.10) 56(84) bytes of data.\n64 bytes from 10.2.1.10: icmp_seq=1 ttl=62 time=0.305 ms\n64 bytes from 10.2.1.10: icmp_seq=2 ttl=62 time=0.150 ms\n\n--- 10.2.1.10 ping statistics ---\n2 packets transmitted, 2 received, 0% packet loss, time 1014ms\nrtt min/avg/max/mdev = 0.150/0.227/0.305/0.077 ms"
+    },
+    {
+      "name": "revoke/I_A1/blocks-S1",
+      "passed": true,
+      "detail": "PING 10.2.1.10 (10.2.1.10) 56(84) bytes of data.\n\n--- 10.2.1.10 ping statistics ---\n2 packets transmitted, 0 received, 100% packet loss, time 1006ms"
+    },
+    {
+      "name": "revoke/I_A1/S2-unaffected",
+      "passed": true,
+      "detail": "PING 10.2.2.10 (10.2.2.10) 56(84) bytes of data.\n64 bytes from 10.2.2.10: icmp_seq=1 ttl=62 time=0.317 ms\n64 bytes from 10.2.2.10: icmp_seq=2 ttl=62 time=0.158 ms\n\n--- 10.2.2.10 ping statistics ---\n2 packets transmitted, 2 received, 0% packet loss, time 1049ms\nrtt min/avg/max/mdev = 0.158/0.237/0.317/0.079 ms"
+    },
+    {
+      "name": "revoke/I_A1/authentication-rejection",
+      "passed": true,
+      "detail": "fresh IKE logs contain revoked"
+    },
+    {
+      "name": "revoke/I_A1/no-plaintext/BLACK",
+      "passed": true
+    },
+    {
+      "name": "revoke/I_A1/no-plaintext/G_A1",
+      "passed": true
+    },
+    {
+      "name": "revoke/I_A1/recovered",
+      "passed": true,
+      "detail": "PING 10.2.1.10 (10.2.1.10) 56(84) bytes of data.\n64 bytes from 10.2.1.10: icmp_seq=1 ttl=62 time=0.463 ms\n64 bytes from 10.2.1.10: icmp_seq=2 ttl=62 time=0.259 ms\n\n--- 10.2.1.10 ping statistics ---\n2 packets transmitted, 2 received, 0% packet loss, time 1061ms\nrtt min/avg/max/mdev = 0.259/0.361/0.463/0.102 ms"
+    },
+    {
+      "name": "restart/I_A1/management-TLS",
+      "passed": true,
+      "detail": "\u003cnil\u003e"
+    },
+    {
+      "name": "restart/I_A1/S1",
+      "passed": true,
+      "detail": "PING 10.2.1.10 (10.2.1.10) 56(84) bytes of data.\n64 bytes from 10.2.1.10: icmp_seq=1 ttl=62 time=0.302 ms\n64 bytes from 10.2.1.10: icmp_seq=2 ttl=62 time=0.143 ms\n\n--- 10.2.1.10 ping statistics ---\n2 packets transmitted, 2 received, 0% packet loss, time 1041ms\nrtt min/avg/max/mdev = 0.143/0.222/0.302/0.079 ms"
+    },
+    {
+      "name": "restart/I_A1/S2",
+      "passed": true,
+      "detail": "PING 10.2.2.10 (10.2.2.10) 56(84) bytes of data.\n64 bytes from 10.2.2.10: icmp_seq=2 ttl=62 time=1.40 ms\n\n--- 10.2.2.10 ping statistics ---\n2 packets transmitted, 1 received, 50% packet loss, time 1020ms\nrtt min/avg/max/mdev = 1.398/1.398/1.398/0.000 ms"
+    },
+    {
+      "name": "restart/O_B2/management-TLS",
+      "passed": true,
+      "detail": "\u003cnil\u003e"
+    },
+    {
+      "name": "restart/O_B2/S1",
+      "passed": true,
+      "detail": "PING 10.2.1.10 (10.2.1.10) 56(84) bytes of data.\n64 bytes from 10.2.1.10: icmp_seq=1 ttl=62 time=1.49 ms\n64 bytes from 10.2.1.10: icmp_seq=2 ttl=62 time=0.250 ms\n\n--- 10.2.1.10 ping statistics ---\n2 packets transmitted, 2 received, 0% packet loss, time 1002ms\nrtt min/avg/max/mdev = 0.250/0.868/1.487/0.618 ms"
+    },
+    {
+      "name": "restart/O_B2/S2",
+      "passed": true,
+      "detail": "PING 10.2.2.10 (10.2.2.10) 56(84) bytes of data.\n64 bytes from 10.2.2.10: icmp_seq=1 ttl=62 time=1.87 ms\n64 bytes from 10.2.2.10: icmp_seq=2 ttl=62 time=0.243 ms\n\n--- 10.2.2.10 ping statistics ---\n2 packets transmitted, 2 received, 0% packet loss, time 1002ms\nrtt min/avg/max/mdev = 0.243/1.054/1.866/0.811 ms"
+    },
+    {
+      "name": "native-mistake/ospf/blocks-data",
+      "passed": true,
+      "detail": "native CLI change affects the forwarding path"
+    },
+    {
+      "name": "native-mistake/ospf/detects-drift",
+      "passed": true,
+      "detail": "live configuration differs from the recorded baseline"
+    },
+    {
+      "name": "native-mistake/ospf/recovered",
+      "passed": true,
+      "detail": "PING 10.2.1.10 (10.2.1.10) 56(84) bytes of data.\n64 bytes from 10.2.1.10: icmp_seq=1 ttl=62 time=0.368 ms\n64 bytes from 10.2.1.10: icmp_seq=2 ttl=62 time=0.205 ms\n\n--- 10.2.1.10 ping statistics ---\n2 packets transmitted, 2 received, 0% packet loss, time 1019ms\nrtt min/avg/max/mdev = 0.205/0.286/0.368/0.081 ms"
+    },
+    {
+      "name": "native-mistake/ovs/blocks-data",
+      "passed": true,
+      "detail": "native CLI change affects the forwarding path"
+    },
+    {
+      "name": "native-mistake/ovs/detects-drift",
+      "passed": true,
+      "detail": "live configuration differs from the recorded baseline"
+    },
+    {
+      "name": "native-mistake/ovs/recovered",
+      "passed": true,
+      "detail": "PING 10.2.1.10 (10.2.1.10) 56(84) bytes of data.\n64 bytes from 10.2.1.10: icmp_seq=1 ttl=62 time=0.304 ms\n64 bytes from 10.2.1.10: icmp_seq=2 ttl=62 time=0.174 ms\n\n--- 10.2.1.10 ping statistics ---\n2 packets transmitted, 2 received, 0% packet loss, time 1007ms\nrtt min/avg/max/mdev = 0.174/0.239/0.304/0.065 ms"
+    },
+    {
+      "name": "native-restart/BLACK/S1",
+      "passed": true,
+      "detail": "PING 10.2.1.10 (10.2.1.10) 56(84) bytes of data.\n64 bytes from 10.2.1.10: icmp_seq=1 ttl=62 time=0.954 ms\n64 bytes from 10.2.1.10: icmp_seq=2 ttl=62 time=0.268 ms\n\n--- 10.2.1.10 ping statistics ---\n2 packets transmitted, 2 received, 0% packet loss, time 1044ms\nrtt min/avg/max/mdev = 0.268/0.611/0.954/0.343 ms"
+    },
+    {
+      "name": "native-restart/BLACK/S2",
+      "passed": false,
+      "detail": "PING 10.2.2.10 (10.2.2.10) 56(84) bytes of data.\n\n--- 10.2.2.10 ping statistics ---\n2 packets transmitted, 0 received, 100% packet loss, time 1016ms"
+    },
+    {
+      "name": "native-restart/G_A1/S1",
+      "passed": true,
+      "detail": "PING 10.2.1.10 (10.2.1.10) 56(84) bytes of data.\n64 bytes from 10.2.1.10: icmp_seq=1 ttl=62 time=2.77 ms\n64 bytes from 10.2.1.10: icmp_seq=2 ttl=62 time=0.278 ms\n\n--- 10.2.1.10 ping statistics ---\n2 packets transmitted, 2 received, 0% packet loss, time 1002ms\nrtt min/avg/max/mdev = 0.278/1.522/2.767/1.244 ms"
+    },
+    {
+      "name": "native-restart/G_A1/S2",
+      "passed": true,
+      "detail": "PING 10.2.2.10 (10.2.2.10) 56(84) bytes of data.\n64 bytes from 10.2.2.10: icmp_seq=2 ttl=62 time=1.25 ms\n\n--- 10.2.2.10 ping statistics ---\n2 packets transmitted, 1 received, 50% packet loss, time 1022ms\nrtt min/avg/max/mdev = 1.253/1.253/1.253/0.000 ms"
+    }
+  ]
+}
