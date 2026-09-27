@@ -409,3 +409,33 @@ func TestOVSObservationPreservesFlowTable(t *testing.T) {
 		t.Fatal("flow table change disappeared from observations")
 	}
 }
+
+func TestLayoutChangesReissueManagementIdentity(t *testing.T) {
+	e := &Engine{Spec: Example(), Dir: t.TempDir()}
+	d := e.Spec.Device("O_A1")
+	if err := e.prepare(d, false); err != nil {
+		t.Fatal(err)
+	}
+	before, err := readCert(filepath.Join(e.tlsDir(d), "x509", "cert.pem"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, address := range []string{"172.30.109.42/24", "172.31.109.42/24"} {
+		d.Interface("mgmt").Address = address
+		if err := e.prepare(d, false); err != nil {
+			t.Fatal(err)
+		}
+		after, err := readCert(filepath.Join(e.tlsDir(d), "x509", "cert.pem"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		ca, err := readCert(filepath.Join(e.tlsDir(d), "x509ca", "ca.pem"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if after.SerialNumber.Cmp(before.SerialNumber) == 0 || after.VerifyHostname(strings.Split(address, "/")[0]) != nil || after.CheckSignatureFrom(ca) != nil {
+			t.Fatal("layout retained an obsolete identity or issuer")
+		}
+		before = after
+	}
+}

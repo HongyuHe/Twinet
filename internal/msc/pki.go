@@ -121,7 +121,17 @@ func (e *Engine) leaf(d *Device, trust, dir, ip string, renew bool) error {
 	if err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	if err != nil || renew || cert.NotAfter.Before(time.Now().Add(24*time.Hour)) {
+	// Layout edits can move a device to a new management address or trust
+	// domain while retaining its private state directory. Reissue that leaf.
+	identityMatches := cert != nil && cert.Subject.CommonName == d.ID+".msc.test" && cert.VerifyHostname(d.ID+".msc.test") == nil && cert.CheckSignatureFrom(ca) == nil
+	if identityMatches {
+		if ip != "" {
+			identityMatches = len(cert.IPAddresses) == 1 && cert.IPAddresses[0].Equal(net.ParseIP(ip))
+		} else {
+			identityMatches = len(cert.IPAddresses) == 0
+		}
+	}
+	if err != nil || renew || !identityMatches || cert.NotAfter.Before(time.Now().Add(24*time.Hour)) {
 		priv, kb, err := keyPair()
 		if err != nil {
 			return err
