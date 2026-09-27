@@ -401,3 +401,11 @@ func TestOSPFReadinessRequiresKernelInstallation(t *testing.T) {
 		t.Fatal("missing kernel route accepted")
 	}
 }
+
+func TestOVSObservationPreservesFlowTable(t *testing.T) {
+	baseline := strings.Join(canonicalOVSFlows(" priority=0 actions=NORMAL\n"), "\n")
+	moved := strings.Join(canonicalOVSFlows(" table=1, priority=0 actions=NORMAL\n"), "\n")
+	if baseline == moved {
+		t.Fatal("flow table change disappeared from observations")
+	}
+}

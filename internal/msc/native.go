@@ -282,18 +282,12 @@ func (e *Engine) ovsState(ctx context.Context, d *Device) (string, error) {
 	members := strings.Fields(membership)
 	sort.Strings(members)
 	out = append(out, strings.Join(members, ","))
-	flows, err := e.exec(ctx, d.ID, "ovs-ofctl", "dump-flows", "br0")
+	flows, err := e.exec(ctx, d.ID, "ovs-ofctl", "--no-stats", "dump-flows", "br0")
 	if err != nil {
 		return "", err
 	}
-	var policy []string
-	for _, line := range strings.Split(flows, "\n") {
-		if pos := strings.Index(line, "priority="); pos >= 0 {
-			policy = append(policy, line[pos:])
-		}
-	}
-	sort.Strings(policy)
-	out = append(out, policy...)
+	out = append(out, canonicalOVSFlows(flows)...)
+
 	mode, err := e.exec(ctx, d.ID, "ovs-vsctl", "get-fail-mode", "br0")
 	if err != nil {
 		return "", err
@@ -470,4 +464,17 @@ func installedOSPF(frr, kernel string) map[string]bool {
 		}
 	}
 	return out
+}
+
+// --no-stats removes changing counters. Keep table, match, timeout and action
+// fields so a flow moved out of table zero cannot masquerade as the baseline.
+func canonicalOVSFlows(raw string) []string {
+	var lines []string
+	for _, line := range strings.Split(raw, "\n") {
+		if strings.Contains(line, "actions=") {
+			lines = append(lines, strings.TrimSpace(line))
+		}
+	}
+	sort.Strings(lines)
+	return lines
 }
