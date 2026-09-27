@@ -16,18 +16,8 @@
           "zone": "black"
         },
         {
-          "name": "p12",
-          "address": "172.21.12.2/30",
-          "zone": "black"
-        },
-        {
           "name": "p21",
           "address": "172.21.21.2/30",
-          "zone": "black"
-        },
-        {
-          "name": "p22",
-          "address": "172.21.22.2/30",
           "zone": "black"
         }
       ]
@@ -37,6 +27,11 @@
       "role": "gray-firewall",
       "site": "A",
       "interfaces": [
+        {
+          "name": "fabric",
+          "address": "10.110.0.241/24",
+          "zone": "gray"
+        },
         {
           "name": "s1",
           "address": "10.100.1.254/24",
@@ -53,7 +48,40 @@
           "zone": "management"
         }
       ],
+      "routes": [
+        {
+          "prefix": "10.200.1.2/32",
+          "via": "10.110.0.1"
+        },
+        {
+          "prefix": "10.200.2.2/32",
+          "via": "10.110.0.2"
+        }
+      ],
       "admin": "172.30.109.10"
+    },
+    {
+      "id": "G_A",
+      "role": "switch",
+      "site": "A",
+      "level": "shared-gray",
+      "interfaces": [
+        {
+          "name": "gf1",
+          "zone": "gray",
+          "bridge": true
+        },
+        {
+          "name": "outer1",
+          "zone": "gray",
+          "bridge": true
+        },
+        {
+          "name": "outer2",
+          "zone": "gray",
+          "bridge": true
+        }
+      ]
     },
     {
       "id": "OF_A1",
@@ -66,36 +94,18 @@
           "zone": "black"
         },
         {
-          "name": "inside",
+          "name": "in1",
           "address": "172.20.11.2/30",
           "zone": "black"
         },
         {
-          "name": "mgmt",
-          "address": "172.30.109.23/24",
-          "zone": "management"
-        }
-      ],
-      "admin": "172.30.109.10"
-    },
-    {
-      "id": "OF_A2",
-      "role": "firewall",
-      "site": "A",
-      "interfaces": [
-        {
-          "name": "outside",
-          "address": "172.21.12.1/30",
-          "zone": "black"
-        },
-        {
-          "name": "inside",
+          "name": "in2",
           "address": "172.20.12.2/30",
           "zone": "black"
         },
         {
           "name": "mgmt",
-          "address": "172.30.109.24/24",
+          "address": "172.30.109.23/24",
           "zone": "management"
         }
       ],
@@ -145,11 +155,11 @@
       "routes": [
         {
           "prefix": "10.2.1.0/24",
-          "via": "10.100.1.1"
+          "via": "10.100.1.254"
         },
         {
           "prefix": "10.200.1.2/32",
-          "via": "10.100.1.1"
+          "via": "10.100.1.254"
         },
         {
           "prefix": "10.100.2.0/24",
@@ -177,7 +187,7 @@
       "interfaces": [
         {
           "name": "gray",
-          "address": "10.100.1.1/24",
+          "address": "10.110.0.1/24",
           "zone": "gray"
         },
         {
@@ -192,6 +202,10 @@
         }
       ],
       "routes": [
+        {
+          "prefix": "10.100.1.2/32",
+          "via": "10.110.0.241"
+        },
         {
           "prefix": "10.200.1.2/32",
           "via": "172.20.11.2"
@@ -213,29 +227,6 @@
         "outside": "black"
       },
       "admin": "172.30.109.10"
-    },
-    {
-      "id": "G_A1",
-      "role": "switch",
-      "site": "A",
-      "level": "S1",
-      "interfaces": [
-        {
-          "name": "inner",
-          "zone": "gray",
-          "bridge": true
-        },
-        {
-          "name": "outer",
-          "zone": "gray",
-          "bridge": true
-        },
-        {
-          "name": "filter",
-          "zone": "gray",
-          "bridge": true
-        }
-      ]
     },
     {
       "id": "R_A2",
@@ -281,11 +272,11 @@
       "routes": [
         {
           "prefix": "10.2.2.0/24",
-          "via": "10.100.2.1"
+          "via": "10.100.2.254"
         },
         {
           "prefix": "10.200.2.2/32",
-          "via": "10.100.2.1"
+          "via": "10.100.2.254"
         },
         {
           "prefix": "10.100.1.0/24",
@@ -313,7 +304,7 @@
       "interfaces": [
         {
           "name": "gray",
-          "address": "10.100.2.1/24",
+          "address": "10.110.0.2/24",
           "zone": "gray"
         },
         {
@@ -328,6 +319,10 @@
         }
       ],
       "routes": [
+        {
+          "prefix": "10.100.2.2/32",
+          "via": "10.110.0.241"
+        },
         {
           "prefix": "10.200.2.2/32",
           "via": "172.20.12.2"
@@ -349,29 +344,6 @@
         "outside": "black"
       },
       "admin": "172.30.109.10"
-    },
-    {
-      "id": "G_A2",
-      "role": "switch",
-      "site": "A",
-      "level": "S2",
-      "interfaces": [
-        {
-          "name": "inner",
-          "zone": "gray",
-          "bridge": true
-        },
-        {
-          "name": "outer",
-          "zone": "gray",
-          "bridge": true
-        },
-        {
-          "name": "filter",
-          "zone": "gray",
-          "bridge": true
-        }
-      ]
     },
     {
       "id": "M_A1",
@@ -465,11 +437,6 @@
           "name": "d3",
           "zone": "management",
           "bridge": true
-        },
-        {
-          "name": "d4",
-          "zone": "management",
-          "bridge": true
         }
       ]
     },
@@ -492,6 +459,11 @@
       "site": "B",
       "interfaces": [
         {
+          "name": "fabric",
+          "address": "10.210.0.241/24",
+          "zone": "gray"
+        },
+        {
           "name": "s1",
           "address": "10.200.1.254/24",
           "zone": "gray"
@@ -507,7 +479,40 @@
           "zone": "management"
         }
       ],
+      "routes": [
+        {
+          "prefix": "10.100.1.2/32",
+          "via": "10.210.0.1"
+        },
+        {
+          "prefix": "10.100.2.2/32",
+          "via": "10.210.0.2"
+        }
+      ],
       "admin": "172.30.119.10"
+    },
+    {
+      "id": "G_B",
+      "role": "switch",
+      "site": "B",
+      "level": "shared-gray",
+      "interfaces": [
+        {
+          "name": "gf1",
+          "zone": "gray",
+          "bridge": true
+        },
+        {
+          "name": "outer1",
+          "zone": "gray",
+          "bridge": true
+        },
+        {
+          "name": "outer2",
+          "zone": "gray",
+          "bridge": true
+        }
+      ]
     },
     {
       "id": "OF_B1",
@@ -520,36 +525,18 @@
           "zone": "black"
         },
         {
-          "name": "inside",
+          "name": "in1",
           "address": "172.20.21.2/30",
           "zone": "black"
         },
         {
-          "name": "mgmt",
-          "address": "172.30.119.23/24",
-          "zone": "management"
-        }
-      ],
-      "admin": "172.30.119.10"
-    },
-    {
-      "id": "OF_B2",
-      "role": "firewall",
-      "site": "B",
-      "interfaces": [
-        {
-          "name": "outside",
-          "address": "172.21.22.1/30",
-          "zone": "black"
-        },
-        {
-          "name": "inside",
+          "name": "in2",
           "address": "172.20.22.2/30",
           "zone": "black"
         },
         {
           "name": "mgmt",
-          "address": "172.30.119.24/24",
+          "address": "172.30.119.23/24",
           "zone": "management"
         }
       ],
@@ -599,11 +586,11 @@
       "routes": [
         {
           "prefix": "10.1.1.0/24",
-          "via": "10.200.1.1"
+          "via": "10.200.1.254"
         },
         {
           "prefix": "10.100.1.2/32",
-          "via": "10.200.1.1"
+          "via": "10.200.1.254"
         },
         {
           "prefix": "10.200.2.0/24",
@@ -631,7 +618,7 @@
       "interfaces": [
         {
           "name": "gray",
-          "address": "10.200.1.1/24",
+          "address": "10.210.0.1/24",
           "zone": "gray"
         },
         {
@@ -646,6 +633,10 @@
         }
       ],
       "routes": [
+        {
+          "prefix": "10.200.1.2/32",
+          "via": "10.210.0.241"
+        },
         {
           "prefix": "10.100.1.2/32",
           "via": "172.20.21.2"
@@ -667,29 +658,6 @@
         "outside": "black"
       },
       "admin": "172.30.119.10"
-    },
-    {
-      "id": "G_B1",
-      "role": "switch",
-      "site": "B",
-      "level": "S1",
-      "interfaces": [
-        {
-          "name": "inner",
-          "zone": "gray",
-          "bridge": true
-        },
-        {
-          "name": "outer",
-          "zone": "gray",
-          "bridge": true
-        },
-        {
-          "name": "filter",
-          "zone": "gray",
-          "bridge": true
-        }
-      ]
     },
     {
       "id": "R_B2",
@@ -735,11 +703,11 @@
       "routes": [
         {
           "prefix": "10.1.2.0/24",
-          "via": "10.200.2.1"
+          "via": "10.200.2.254"
         },
         {
           "prefix": "10.100.2.2/32",
-          "via": "10.200.2.1"
+          "via": "10.200.2.254"
         },
         {
           "prefix": "10.200.1.0/24",
@@ -767,7 +735,7 @@
       "interfaces": [
         {
           "name": "gray",
-          "address": "10.200.2.1/24",
+          "address": "10.210.0.2/24",
           "zone": "gray"
         },
         {
@@ -782,6 +750,10 @@
         }
       ],
       "routes": [
+        {
+          "prefix": "10.200.2.2/32",
+          "via": "10.210.0.241"
+        },
         {
           "prefix": "10.100.2.2/32",
           "via": "172.20.22.2"
@@ -803,29 +775,6 @@
         "outside": "black"
       },
       "admin": "172.30.119.10"
-    },
-    {
-      "id": "G_B2",
-      "role": "switch",
-      "site": "B",
-      "level": "S2",
-      "interfaces": [
-        {
-          "name": "inner",
-          "zone": "gray",
-          "bridge": true
-        },
-        {
-          "name": "outer",
-          "zone": "gray",
-          "bridge": true
-        },
-        {
-          "name": "filter",
-          "zone": "gray",
-          "bridge": true
-        }
-      ]
     },
     {
       "id": "M_B1",
@@ -919,11 +868,6 @@
           "name": "d3",
           "zone": "management",
           "bridge": true
-        },
-        {
-          "name": "d4",
-          "zone": "management",
-          "bridge": true
         }
       ]
     },
@@ -944,22 +888,22 @@
   "links": [
     {
       "a": {
+        "device": "GF_A",
+        "interface": "fabric"
+      },
+      "b": {
+        "device": "G_A",
+        "interface": "gf1"
+      }
+    },
+    {
+      "a": {
         "device": "OF_A1",
         "interface": "outside"
       },
       "b": {
         "device": "BLACK",
         "interface": "p11"
-      }
-    },
-    {
-      "a": {
-        "device": "OF_A2",
-        "interface": "outside"
-      },
-      "b": {
-        "device": "BLACK",
-        "interface": "p12"
       }
     },
     {
@@ -978,8 +922,8 @@
         "interface": "gray"
       },
       "b": {
-        "device": "G_A1",
-        "interface": "inner"
+        "device": "GF_A",
+        "interface": "s1"
       }
     },
     {
@@ -988,18 +932,8 @@
         "interface": "gray"
       },
       "b": {
-        "device": "G_A1",
-        "interface": "outer"
-      }
-    },
-    {
-      "a": {
-        "device": "GF_A",
-        "interface": "s1"
-      },
-      "b": {
-        "device": "G_A1",
-        "interface": "filter"
+        "device": "G_A",
+        "interface": "outer1"
       }
     },
     {
@@ -1009,7 +943,7 @@
       },
       "b": {
         "device": "OF_A1",
-        "interface": "inside"
+        "interface": "in1"
       }
     },
     {
@@ -1028,8 +962,8 @@
         "interface": "gray"
       },
       "b": {
-        "device": "G_A2",
-        "interface": "inner"
+        "device": "GF_A",
+        "interface": "s2"
       }
     },
     {
@@ -1038,18 +972,8 @@
         "interface": "gray"
       },
       "b": {
-        "device": "G_A2",
-        "interface": "outer"
-      }
-    },
-    {
-      "a": {
-        "device": "GF_A",
-        "interface": "s2"
-      },
-      "b": {
-        "device": "G_A2",
-        "interface": "filter"
+        "device": "G_A",
+        "interface": "outer2"
       }
     },
     {
@@ -1058,8 +982,8 @@
         "interface": "black"
       },
       "b": {
-        "device": "OF_A2",
-        "interface": "inside"
+        "device": "OF_A1",
+        "interface": "in2"
       }
     },
     {
@@ -1154,12 +1078,12 @@
     },
     {
       "a": {
-        "device": "OF_A2",
-        "interface": "mgmt"
+        "device": "GF_B",
+        "interface": "fabric"
       },
       "b": {
-        "device": "M_A99",
-        "interface": "d4"
+        "device": "G_B",
+        "interface": "gf1"
       }
     },
     {
@@ -1170,16 +1094,6 @@
       "b": {
         "device": "BLACK",
         "interface": "p21"
-      }
-    },
-    {
-      "a": {
-        "device": "OF_B2",
-        "interface": "outside"
-      },
-      "b": {
-        "device": "BLACK",
-        "interface": "p22"
       }
     },
     {
@@ -1198,8 +1112,8 @@
         "interface": "gray"
       },
       "b": {
-        "device": "G_B1",
-        "interface": "inner"
+        "device": "GF_B",
+        "interface": "s1"
       }
     },
     {
@@ -1208,18 +1122,8 @@
         "interface": "gray"
       },
       "b": {
-        "device": "G_B1",
-        "interface": "outer"
-      }
-    },
-    {
-      "a": {
-        "device": "GF_B",
-        "interface": "s1"
-      },
-      "b": {
-        "device": "G_B1",
-        "interface": "filter"
+        "device": "G_B",
+        "interface": "outer1"
       }
     },
     {
@@ -1229,7 +1133,7 @@
       },
       "b": {
         "device": "OF_B1",
-        "interface": "inside"
+        "interface": "in1"
       }
     },
     {
@@ -1248,8 +1152,8 @@
         "interface": "gray"
       },
       "b": {
-        "device": "G_B2",
-        "interface": "inner"
+        "device": "GF_B",
+        "interface": "s2"
       }
     },
     {
@@ -1258,18 +1162,8 @@
         "interface": "gray"
       },
       "b": {
-        "device": "G_B2",
-        "interface": "outer"
-      }
-    },
-    {
-      "a": {
-        "device": "GF_B",
-        "interface": "s2"
-      },
-      "b": {
-        "device": "G_B2",
-        "interface": "filter"
+        "device": "G_B",
+        "interface": "outer2"
       }
     },
     {
@@ -1278,8 +1172,8 @@
         "interface": "black"
       },
       "b": {
-        "device": "OF_B2",
-        "interface": "inside"
+        "device": "OF_B1",
+        "interface": "in2"
       }
     },
     {
@@ -1370,16 +1264,6 @@
       "b": {
         "device": "M_B99",
         "interface": "d3"
-      }
-    },
-    {
-      "a": {
-        "device": "OF_B2",
-        "interface": "mgmt"
-      },
-      "b": {
-        "device": "M_B99",
-        "interface": "d4"
       }
     }
   ]

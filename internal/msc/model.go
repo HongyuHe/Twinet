@@ -16,12 +16,14 @@ import (
 )
 
 type Spec struct {
-	Version int      `json:"version"`
-	Name    string   `json:"name"`
-	Image   string   `json:"image"`
-	MTU     int      `json:"mtu"`
-	Devices []Device `json:"devices"`
-	Links   []Link   `json:"links"`
+	Version     int      `json:"version"`
+	Name        string   `json:"name"`
+	Image       string   `json:"image"`
+	RouterImage string   `json:"router_image,omitempty"`
+	SwitchImage string   `json:"switch_image,omitempty"`
+	MTU         int      `json:"mtu"`
+	Devices     []Device `json:"devices"`
+	Links       []Link   `json:"links"`
 }
 type Device struct {
 	ID         string      `json:"id"`
@@ -105,16 +107,27 @@ func (s *Spec) Hash() string {
 	h := sha256.Sum256(b)
 	return hex.EncodeToString(h[:])
 }
-func (s *Spec) Container(id string) string { return "twinet-" + s.Name + "-" + strings.ToLower(id) }
+func (s *Spec) Container(id string) string {
+	if s.Version == 2 {
+		return id
+	}
+	return "twinet-" + s.Name + "-" + strings.ToLower(id)
+}
 func (s *Spec) Validate() error {
-	if s.Version != 1 || !identifier.MatchString(s.Name) || s.Image == "" || s.MTU < 1280 || s.MTU > 9000 {
-		return fmt.Errorf("version=1, a safe name, image, and MTU 1280..9000 are required")
+	if (s.Version != 1 && s.Version != 2) || !identifier.MatchString(s.Name) || s.Image == "" || s.MTU < 1280 || s.MTU > 9000 {
+		return fmt.Errorf("version=1 or 2, a safe name, image, and MTU 1280..9000 are required")
+	}
+	if s.Version == 2 && (s.RouterImage == "" || s.SwitchImage == "") {
+		return fmt.Errorf("MSC v2 requires router_image and switch_image")
 	}
 	ids := map[string]bool{}
 	endpoints := map[string]bool{}
 	addresses := map[string]bool{}
 	roles := map[string]bool{"host": true, "inner": true, "outer": true, "firewall": true, "gray-firewall": true, "switch": true, "transport": true, "admin": true}
 	for _, d := range s.Devices {
+		if s.IsOSPF(&d) && len(d.Routes) > 0 {
+			return fmt.Errorf("%s uses OSPF; static underlay routes are not allowed", d.ID)
+		}
 		key := strings.ToLower(d.ID)
 		if !identifier.MatchString(d.ID) || ids[key] || !roles[d.Role] {
 			return fmt.Errorf("invalid/duplicate device or role: %s", d.ID)
@@ -163,6 +176,19 @@ func (s *Spec) Validate() error {
 		}
 	}
 	for _, d := range s.Devices {
+		if s.IsFRR(&d) && ids[strings.ToLower(d.ID)+"-frr"] {
+			return fmt.Errorf("device ID conflicts with FRR control container for %s", d.ID)
+		}
+		if s.IsFRR(&d) {
+			for _, port := range d.Interfaces {
+				if port.Address == "" {
+					return fmt.Errorf("FRR interface %s/%s requires an IPv4 address", d.ID, port.Name)
+				}
+			}
+		}
+	}
+
+	for _, d := range s.Devices {
 		if t := d.Tunnel; t != nil {
 			p := s.Device(t.Peer)
 			if p == nil || p.Tunnel == nil || p.Tunnel.Peer != d.ID || p.Role != d.Role || p.Level != d.Level || p.Site == d.Site {
@@ -205,19 +231,7 @@ func (s *Spec) Validate() error {
 	if len(endpoints) > 0 {
 		return fmt.Errorf("interfaces without links: %v", endpoints)
 	}
-	for _, required := range Example().Devices {
-		d := s.Device(required.ID)
-		if d == nil || d.Role != required.Role || d.Site != required.Site || d.Level != required.Level {
-			return fmt.Errorf("MSC profile requires %s with role/site/level %s/%s/%s", required.ID, required.Role, required.Site, required.Level)
-		}
 
-		for _, expected := range required.Interfaces {
-			actual := d.Interface(expected.Name)
-			if actual == nil || actual.Zone != expected.Zone || (actual.Address == "") != (expected.Address == "") {
-				return fmt.Errorf("MSC profile requires %s/%s in zone %s with its declared addressing role", d.ID, expected.Name, expected.Zone)
-			}
-		}
-	}
 	for _, d := range s.Devices {
 		if d.Admin != "" {
 			found := false
@@ -241,4 +255,43 @@ func (s *Spec) Validate() error {
 		return fmt.Errorf("empty topology")
 	}
 	return nil
+}
+
+func (s *Spec) IsFRR(d *Device) bool {
+	return s.Version == 2 && (d.Role == "transport" || d.Role == "firewall" || d.Role == "gray-firewall")
+}
+func (s *Spec) IsOVS(d *Device) bool { return s.Version == 2 && d.Role == "switch" }
+func (s *Spec) ImageFor(d *Device) string {
+	if s.IsFRR(d) {
+		return s.RouterImage
+	}
+	if s.IsOVS(d) {
+		return s.SwitchImage
+	}
+	return s.Image
+}
+
+func (s *Spec) IsOSPF(d *Device) bool {
+	return s.Version == 2 && (d.Role == "transport" || d.Role == "firewall")
+}
+
+func (s *Spec) Peer(id, iface string) (*Device, *Interface) {
+	for _, l := range s.Links {
+		for _, pair := range [][2]Endpoint{{l.A, l.B}, {l.B, l.A}} {
+			if pair[0].Device == id && pair[0].Interface == iface {
+				d := s.Device(pair[1].Device)
+				return d, d.Interface(pair[1].Interface)
+			}
+		}
+	}
+	return nil, nil
+}
+func (s *Spec) Role(role string) []*Device {
+	var out []*Device
+	for i := range s.Devices {
+		if s.Devices[i].Role == role {
+			out = append(out, &s.Devices[i])
+		}
+	}
+	return out
 }

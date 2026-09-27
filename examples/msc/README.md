@@ -1,17 +1,20 @@
-# MSC two-site example
+# MSC emulation
 
-See [the MSC operator guide](../../docs/13_msc.md) for setup, topology, checks,
-faults, recovery, and cleanup. `msc.json` is the explicit 35-device / 44-link
-profile. Generate a separate editable copy with:
+The [operator guide](../../docs/13_msc.md) covers native CLI access, configuration,
+shared firewall/Gray layouts, exports, testing, and recovery. Node-1 hosts the
+FRR/OVS version. Node-0 retains the earlier deployment.
 
 ```sh
-bin/twinet msc init --spec /tmp/my-msc.json
-bin/twinet msc plan --spec /tmp/my-msc.json
+bin/twinet msc init --config examples/msc/layouts/shared.json --spec /tmp/shared.json
+bin/twinet msc plan --spec /tmp/shared.json
+sudo bin/twinet msc console BLACK
+sudo bin/twinet msc console G_A1
+sudo bin/twinet msc export --output /tmp/msc-snapshot-001
 ```
 
-The runtime requires root on Linux, Docker, and the published
-[`hyhe/twinet-msc`](https://hub.docker.com/r/hyhe/twinet-msc) image. The spec pins
-the tested registry digest. Its build source is `images/msc/Dockerfile`. The default commands operate on one worker.
+`msc.json` is the default native 35-device/44-link topology. FRR additionally
+uses seven private control containers. The small files under `layouts/` select
+firewall counts and Gray sharing. `legacy.json` preserves version 1.
 
-See [the recorded validation](VALIDATION.md) for the tested environment and
-packet, fault, restart, and regression results.
+[VALIDATION.md](VALIDATION.md) and the original `evidence/` files document the
+historical node-0 implementation. New native evidence is recorded separately.

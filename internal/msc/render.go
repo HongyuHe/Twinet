@@ -61,6 +61,14 @@ func filterRules(s *Spec, d *Device) string {
 	case "host", "admin":
 		b.WriteString("-A INPUT -p icmp -j ACCEPT\n-A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT\n")
 	case "transport", "switch":
+		if s.IsOSPF(d) {
+			for _, port := range d.Interfaces {
+				peer, pi := s.Peer(d.ID, port.Name)
+				if peer != nil && s.IsOSPF(peer) {
+					fmt.Fprintf(&b, "-A INPUT -i %s -s %s -p ospf -j ACCEPT\n", port.Name, strings.Split(pi.Address, "/")[0])
+				}
+			}
+		}
 		b.WriteString("-A INPUT -p icmp -j ACCEPT\n-A FORWARD -j ACCEPT\n")
 	case "inner", "outer":
 		t := d.Tunnel
@@ -74,14 +82,34 @@ func filterRules(s *Spec, d *Device) string {
 			fmt.Fprintf(&b, "-A FORWARD -i %s -o %s -s %s -d %s%s -m policy --dir in --pol ipsec --mode tunnel --reqid %d -j ACCEPT\n", t.Outside, t.Inside, t.RemoteTS, t.LocalTS, proto, t.ReqID)
 		}
 	case "firewall":
-		outer := s.Device(strings.Replace(d.ID, "OF_", "O_", 1))
-		if outer != nil && outer.Tunnel != nil {
-			t := outer.Tunnel
-			for _, r := range []struct{ in, out, src, dst string }{{"inside", "outside", t.Local, t.Remote}, {"outside", "inside", t.Remote, t.Local}} {
-				fmt.Fprintf(&b, "-A FORWARD -i %s -o %s -s %s -d %s -p esp -j ACCEPT\n", r.in, r.out, r.src, r.dst)
-				fmt.Fprintf(&b, "-A FORWARD -i %s -o %s -s %s -d %s -p udp -m multiport --dports 500,4500 -j ACCEPT\n", r.in, r.out, r.src, r.dst)
+		for _, port := range d.Interfaces {
+			peer, pi := s.Peer(d.ID, port.Name)
+			if peer == nil {
+				continue
+			}
+			if s.IsOSPF(d) && s.IsOSPF(peer) {
+				fmt.Fprintf(&b, "-A INPUT -i %s -s %s -p ospf -j ACCEPT\n", port.Name, strings.Split(pi.Address, "/")[0])
+			}
+			if peer.Role != "outer" {
+				continue
+			}
+			t := peer.Tunnel
+			for _, r := range []struct{ in, out, src, dst string }{{port.Name, "outside", t.Local, t.Remote}, {"outside", port.Name, t.Remote, t.Local}} {
+				writePeerFilter(&b, r.in, r.out, r.src, r.dst)
 			}
 		}
+	case "gray-firewall":
+		// Only inline shared-Gray paths carry authorized inner peer traffic.
+		for _, port := range d.Interfaces {
+			peer, _ := s.Peer(d.ID, port.Name)
+			if peer == nil || peer.Role != "inner" || d.Interface("fabric") == nil {
+				continue
+			}
+			t := peer.Tunnel
+			writePeerFilter(&b, port.Name, "fabric", t.Local, t.Remote)
+			writePeerFilter(&b, "fabric", port.Name, t.Remote, t.Local)
+		}
+
 	}
 	b.WriteString("COMMIT\n")
 	return b.String()
@@ -117,3 +145,8 @@ server = http.server.HTTPServer(('0.0.0.0', 8443), Health)
 server.socket = ctx.wrap_socket(server.socket, server_side=True)
 server.serve_forever()
 `
+
+func writePeerFilter(b *strings.Builder, in, out, src, dst string) {
+	fmt.Fprintf(b, "-A FORWARD -i %s -o %s -s %s -d %s -p esp -j ACCEPT\n", in, out, src, dst)
+	fmt.Fprintf(b, "-A FORWARD -i %s -o %s -s %s -d %s -p udp -m multiport --dports 500,4500 -j ACCEPT\n", in, out, src, dst)
+}

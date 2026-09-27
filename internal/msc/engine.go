@@ -3,6 +3,7 @@ package msc
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -132,19 +133,29 @@ func (e *Engine) Up(ctx context.Context, recoverFault bool) error {
 			return fmt.Errorf("specification changed; run msc down using the old spec before deploying the new one")
 		}
 	}
-	exists, err := e.Runtime.ImageExists(ctx, e.Spec.Image)
-	if err != nil {
-		return err
+	images := map[string]string{}
+	for _, d := range e.Spec.Devices {
+		ref := e.Spec.ImageFor(&d)
+		if _, ok := images[ref]; ok {
+			continue
+		}
+		exists, err := e.Runtime.ImageExists(ctx, ref)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			return fmt.Errorf("pull or build image %s first", ref)
+		}
+		digest, err := e.Runtime.ImageDigest(ctx, ref)
+		if err != nil {
+			return err
+		}
+		images[ref] = digest
 	}
-	if !exists {
-		return fmt.Errorf("pull image %s first (or build a custom image from images/msc/Dockerfile)", e.Spec.Image)
-	}
-	imageID, err := e.Runtime.ImageDigest(ctx, e.Spec.Image)
-	if err != nil {
-		return err
-	}
+	var err error
 	for i := range e.Spec.Devices {
 		d := &e.Spec.Devices[i]
+		imageID := images[e.Spec.ImageFor(d)]
 		if err = e.prepare(d, recoverFault); err != nil {
 			return err
 		}
@@ -160,12 +171,18 @@ func (e *Engine) Up(ctx context.Context, recoverFault bool) error {
 			if d.Tunnel != nil {
 				caps = append(caps, "SETUID", "SETGID", "CHOWN")
 			}
-			spec := &rt.Spec{Name: e.Spec.Container(d.ID), Hostname: strings.ToLower(d.ID), Image: e.Spec.Image, Command: []string{"sleep", "infinity"}, NetworkMode: "none", Capabilities: caps, CapDrop: []string{"ALL"}, CPUs: 2, Memory: "256Mi", PidsLimit: 128, Labels: map[string]string{"twinet.msc.lab": e.Spec.Name, "twinet.msc.state": e.Dir, "twinet.msc.spec": hash, "twinet.msc.image": imageID, "twinet.msc.device": d.ID}, Sysctls: map[string]string{"net.ipv4.ip_forward": "0", "net.ipv4.conf.all.rp_filter": "0", "net.ipv4.conf.default.rp_filter": "0", "net.ipv4.conf.all.send_redirects": "0", "net.ipv4.conf.default.send_redirects": "0", "net.ipv6.conf.all.disable_ipv6": "1"}}
+			spec := &rt.Spec{Name: e.Spec.Container(d.ID), Hostname: strings.ToLower(d.ID), Image: e.Spec.ImageFor(d), Command: []string{"sleep", "infinity"}, NetworkMode: "none", Capabilities: caps, CapDrop: []string{"ALL"}, CPUs: 2, Memory: "256Mi", PidsLimit: 128, Labels: map[string]string{"twinet.msc.lab": e.Spec.Name, "twinet.msc.state": e.Dir, "twinet.msc.spec": hash, "twinet.msc.image": imageID, "twinet.msc.device": d.ID}, Sysctls: map[string]string{"net.ipv4.ip_forward": "0", "net.ipv4.conf.all.rp_filter": "0", "net.ipv4.conf.default.rp_filter": "0", "net.ipv4.conf.all.send_redirects": "0", "net.ipv4.conf.default.send_redirects": "0", "net.ipv6.conf.all.disable_ipv6": "1"}}
 			if d.Tunnel != nil {
 				spec.Binds = append(spec.Binds, rt.Bind{Source: e.tunnelDir(d), Target: "/etc/swanctl", ReadOnly: true})
 			}
 			if d.Interface("mgmt") != nil {
 				spec.Binds = append(spec.Binds, rt.Bind{Source: e.tlsDir(d), Target: "/run/msc-tls", ReadOnly: true})
+			}
+			if e.Spec.IsFRR(d) || e.Spec.IsOVS(d) {
+				spec, err = e.nativeRuntimeSpec(ctx, d, imageID)
+				if err != nil {
+					return err
+				}
 			}
 			if _, err = e.Runtime.Create(ctx, spec); err != nil {
 				return err
@@ -187,7 +204,7 @@ func (e *Engine) Up(ctx context.Context, recoverFault bool) error {
 	// Filters are installed before new links or forwarding can carry data.
 	for i := range e.Spec.Devices {
 		d := &e.Spec.Devices[i]
-		if err = e.Runtime.CopyTo(ctx, e.Spec.Container(d.ID), "/tmp/msc-filter.rules", 0600, []byte(filterRules(e.Spec, d))); err != nil {
+		if err = e.copyFile(ctx, e.Spec.Container(d.ID), "/tmp/msc-filter.rules", 0600, []byte(filterRules(e.Spec, d))); err != nil {
 			return err
 		}
 		if err = e.shell(ctx, d.ID, "iptables-restore < /tmp/msc-filter.rules"); err != nil {
@@ -228,7 +245,11 @@ func (e *Engine) Up(ctx context.Context, recoverFault bool) error {
 		if _, err = e.exec(ctx, d.ID, "ip", "neigh", "flush", "all"); err != nil {
 			return err
 		}
-		if d.Role == "switch" {
+		if e.Spec.IsOVS(d) {
+			if err = e.configureOVS(ctx, d); err != nil {
+				return err
+			}
+		} else if d.Role == "switch" {
 			if err = e.shell(ctx, d.ID, "ip link show br0 >/dev/null 2>&1 || ip link add br0 type bridge; ip link set br0 up"); err != nil {
 				return err
 			}
@@ -238,13 +259,21 @@ func (e *Engine) Up(ctx context.Context, recoverFault bool) error {
 				}
 			}
 		}
+		if e.Spec.IsFRR(d) {
+			if err = e.configureFRR(ctx, d, images[e.Spec.ImageFor(d)]); err != nil {
+				return err
+			}
+		}
 		for _, r := range d.Routes {
+			if e.Spec.IsFRR(d) {
+				continue
+			}
 			if _, err = e.exec(ctx, d.ID, "ip", "route", "replace", r.Prefix, "via", r.Via, "proto", "static"); err != nil {
 				return err
 			}
 		}
 		if d.Admin != "" {
-			if err = e.Runtime.CopyTo(ctx, e.Spec.Container(d.ID), "/tmp/msc-admin.py", 0600, []byte(adminServer)); err != nil {
+			if err = e.copyFile(ctx, e.Spec.Container(d.ID), "/tmp/msc-admin.py", 0600, []byte(adminServer)); err != nil {
 				return err
 			}
 			if err = e.background(ctx, d.ID, "pkill -f '^python3 /tmp/msc-admin.py$' || true; exec python3 /tmp/msc-admin.py >/tmp/msc-admin.log 2>&1"); err != nil {
@@ -279,10 +308,15 @@ func (e *Engine) Up(ctx context.Context, recoverFault bool) error {
 			}
 		}
 	}
+	if e.Spec.Version == 2 {
+		if err = e.waitOSPF(ctx); err != nil {
+			return err
+		}
+	}
 	// Outer tunnels must exist before their payload can carry inner IKE.
 	for _, role := range []string{"outer", "inner"} {
 		for _, d := range e.Spec.Devices {
-			if d.Role != role || d.Site != "A" {
+			if d.Role != role || d.ID > d.Tunnel.Peer {
 				continue
 			}
 			localSA, _ := e.exec(ctx, d.ID, "swanctl", "--list-sas")
@@ -321,7 +355,7 @@ func (e *Engine) Up(ctx context.Context, recoverFault bool) error {
 	if err = writePrivate(filepath.Join(e.Dir, "spec.json"), body); err != nil {
 		return err
 	}
-	e.log("MSC lab %s: %d devices, %d links, image %s", e.Spec.Name, len(e.Spec.Devices), len(e.Spec.Links), imageID)
+	e.log("MSC lab %s: %d devices, %d links, image %s", e.Spec.Name, len(e.Spec.Devices), len(e.Spec.Links), e.Spec.Image)
 	return nil
 }
 func (e *Engine) startIPsec(ctx context.Context, d *Device) error {
@@ -344,6 +378,9 @@ func (e *Engine) startIPsec(ctx context.Context, d *Device) error {
 	return fmt.Errorf("%s: strongSwan not ready; inspect /tmp/charon.log", d.ID)
 }
 func (e *Engine) Down(ctx context.Context) error {
+	if err := e.removeNativeControls(ctx); err != nil {
+		return err
+	}
 	var failures []string
 	for i := range e.Spec.Devices {
 		d := &e.Spec.Devices[i]
@@ -452,4 +489,15 @@ func pairedSAs(a, b string) bool {
 func interfaceMAC(lab, device, iface string) string {
 	hash := sha256.Sum256([]byte(lab + "\x00" + device + "\x00" + iface))
 	return fmt.Sprintf("02:%02x:%02x:%02x:%02x:%02x", hash[0], hash[1], hash[2], hash[3], hash[4])
+}
+
+// copyFile writes through the running process so Docker can reach writable
+// tmpfs mounts under a read-only root. Only controller-authored paths enter here.
+func (e *Engine) copyFile(ctx context.Context, container, path string, mode int64, data []byte) error {
+	body := fmt.Sprintf("printf '%%s' '%s' | base64 -d > '%s' && chmod %o '%s'", base64.StdEncoding.EncodeToString(data), path, mode, path)
+	r, err := e.Runtime.Exec(ctx, container, rt.ExecCmd{Cmd: []string{"sh", "-ec", body}})
+	if err != nil {
+		return err
+	}
+	return r.Err()
 }

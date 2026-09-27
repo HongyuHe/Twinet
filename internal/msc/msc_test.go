@@ -1,7 +1,10 @@
 package msc
 
 import (
+	"context"
+	"crypto/sha256"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -220,5 +223,164 @@ func TestInterfaceMACsSurviveRecreation(t *testing.T) {
 			}
 			seen[mac] = true
 		}
+	}
+}
+
+func TestConfigurableLayouts(t *testing.T) {
+	for levels := 1; levels <= 4; levels++ {
+		for outer := 1; outer <= levels; outer++ {
+			for gray := 1; gray <= levels; gray++ {
+				for _, shared := range []bool{false, true} {
+					s, err := Generate(Layout{Name: "variant", Levels: levels, OuterFirewalls: outer, GrayFirewalls: gray, SharedGray: shared})
+					if err != nil {
+						t.Fatal(err)
+					}
+					if len(s.Role("firewall")) != 2*outer || len(s.Role("gray-firewall")) != 2*gray {
+						t.Fatal("wrong firewall count")
+					}
+					wantSwitches := 2 * levels
+					if shared {
+						wantSwitches = 2
+					}
+					got := 0
+					for _, d := range s.Role("switch") {
+						if d.Level != "management" {
+							got++
+						}
+					}
+					if got != wantSwitches {
+						t.Fatal("wrong Gray switch count")
+					}
+					for _, a := range s.Role("inner") {
+						for _, b := range s.Role("inner") {
+							if a.Site == b.Site && a.Level != b.Level && !graySeparated(s, a.ID, b.ID) {
+								t.Fatalf("Gray bypass %s/%s in %+v", a.ID, b.ID, s)
+							}
+						}
+					}
+					for _, of := range s.Role("firewall") {
+						rules := filterRules(s, of)
+						config := frrConfig(s, of)
+						if strings.Contains(config, "ip route ") || !strings.Contains(config, "router ospf") {
+							t.Fatal("Black underlay did not use OSPF exclusively")
+						}
+						for _, port := range of.Interfaces {
+							peer, _ := s.Peer(of.ID, port.Name)
+							if peer.Role == "outer" {
+								expected := "-i " + port.Name + " -o outside -s " + peer.Tunnel.Local + " -d " + peer.Tunnel.Remote
+								if !strings.Contains(rules, expected) {
+									t.Fatalf("shared Outer Firewall omitted %s", peer.ID)
+								}
+							}
+						}
+					}
+					for _, gf := range s.Role("gray-firewall") {
+						if strings.Contains(frrConfig(s, gf), "router ospf") {
+							t.Fatal("OSPF leaked into Gray")
+						}
+					}
+				}
+			}
+		}
+	}
+	for _, bad := range []Layout{{Name: "msc", Levels: 2, OuterFirewalls: 0, GrayFirewalls: 1}, {Name: "msc", Levels: 2, OuterFirewalls: 1, GrayFirewalls: 0}, {Name: "msc", Levels: 2, OuterFirewalls: 3, GrayFirewalls: 1}, {Name: "msc", Levels: 9, OuterFirewalls: 1, GrayFirewalls: 1}} {
+		if _, err := Generate(bad); err == nil {
+			t.Fatal("invalid layout accepted")
+		}
+	}
+}
+
+func TestNativeContainerNamesAndLegacyCompatibility(t *testing.T) {
+	s := Example()
+	if s.Container("OF_A1") != "OF_A1" {
+		t.Fatal("native name has a prefix")
+	}
+	legacy, err := Load("../../examples/msc/legacy.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacy.Container("OF_A1") != "twinet-msc-of_a1" || legacy.IsFRR(legacy.Device("OF_A1")) {
+		t.Fatal("legacy runtime changed")
+	}
+}
+
+func TestNativePolicyObservations(t *testing.T) {
+	if fullNeighbors(`{"neighbors":{"172.21.11.1":[{"nbrState":"Full/DROther"}]}}`) != 1 || fullNeighbors(`{"neighbors":{"172.21.11.1":[{"nbrState":"Init/DROther"}]}}`) != 0 || fullNeighbors("bad") != -1 {
+		t.Fatal("OSPF observation accepted an unconverged adjacency")
+	}
+}
+
+func TestNativeRuntimeCapabilities(t *testing.T) {
+	e := &Engine{Spec: Example(), Dir: t.TempDir()}
+	top := e.nativeTopology()
+	de := e.deployEngine()
+	for _, id := range []string{"BLACK", "GF_A", "G_A1"} {
+		spec, err := de.RuntimeSpec(context.Background(), top, top.Devices[id])
+		if err != nil {
+			t.Fatal(err)
+		}
+		caps := strings.Join(spec.Capabilities, ",")
+		if !strings.Contains(caps, "NET_ADMIN") || !strings.Contains(caps, "NET_RAW") || strings.Contains(caps, "SYS_ADMIN") || !spec.ReadOnlyRootfs {
+			t.Fatalf("incorrect native hardening on %s: %+v", id, spec)
+		}
+	}
+}
+
+type absentExportRuntime struct{ rt.Runtime }
+
+func (absentExportRuntime) Inspect(context.Context, string) (rt.Container, error) {
+	return rt.Container{State: rt.StateAbsent}, nil
+}
+
+func TestExportAllowlistAndHashes(t *testing.T) {
+	root := t.TempDir()
+	private := filepath.Join(root, "private")
+	if err := os.Mkdir(private, 0700); err != nil {
+		t.Fatal(err)
+	}
+	marker := "PRIVATE-MATERIAL-MUST-NOT-ESCAPE"
+	if err := os.WriteFile(filepath.Join(private, "key.pem"), []byte(marker), 0600); err != nil {
+		t.Fatal(err)
+	}
+	e := &Engine{Spec: Example(), Dir: private, Runtime: absentExportRuntime{}}
+	destination := filepath.Join(root, "export")
+	if err := e.Export(context.Background(), destination); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Export(context.Background(), destination); err == nil {
+		t.Fatal("overwrote an export")
+	}
+	raw, err := os.ReadFile(filepath.Join(destination, "manifest.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest struct {
+		Schema int               `json:"schema_version"`
+		Hashes map[string]string `json:"sha256"`
+	}
+	if err = json.Unmarshal(raw, &manifest); err != nil || manifest.Schema != 1 || len(manifest.Hashes) == 0 {
+		t.Fatalf("bad manifest: %v", err)
+	}
+	for name, expected := range manifest.Hashes {
+		b, err := os.ReadFile(filepath.Join(destination, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		hash := sha256.Sum256(b)
+		if hex.EncodeToString(hash[:]) != expected {
+			t.Fatalf("bad digest for %s", name)
+		}
+		if strings.Contains(string(b), marker) {
+			t.Fatalf("export leaked private state through %s", name)
+		}
+	}
+	if _, ok := manifest.Hashes["facts.json"]; !ok {
+		t.Fatal("no machine-readable facts")
+	}
+	if _, ok := manifest.Hashes["devices/BLACK/intended.frr.conf"]; !ok {
+		t.Fatal("no intended FRR config")
+	}
+	if _, ok := manifest.Hashes["devices/BLACK/observed.frr.conf"]; ok {
+		t.Fatal("invented observations for an absent router")
 	}
 }

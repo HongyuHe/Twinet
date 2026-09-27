@@ -12,12 +12,13 @@ import (
 )
 
 type Observation struct {
-	Device string            `json:"device"`
-	Role   string            `json:"role"`
-	State  rt.State          `json:"state"`
-	Image  string            `json:"image"`
-	Facts  map[string]string `json:"facts"`
-	Errors map[string]string `json:"errors,omitempty"`
+	Device     string            `json:"device"`
+	ObservedAt time.Time         `json:"observed_at"`
+	Role       string            `json:"role"`
+	State      rt.State          `json:"state"`
+	Image      string            `json:"image"`
+	Facts      map[string]string `json:"facts"`
+	Errors     map[string]string `json:"errors,omitempty"`
 }
 type Status struct {
 	Lab      string          `json:"lab"`
@@ -42,7 +43,7 @@ func (e *Engine) Status(ctx context.Context) (Status, error) {
 		if err != nil {
 			return out, err
 		}
-		o := Observation{Device: d.ID, Role: d.Role, State: c.State, Image: c.ImageID, Facts: map[string]string{}, Errors: map[string]string{}}
+		o := Observation{ObservedAt: time.Now().UTC(), Device: d.ID, Role: d.Role, State: c.State, Image: c.ImageID, Facts: map[string]string{}, Errors: map[string]string{}}
 		if c.State == rt.StateRunning {
 			commands := map[string][]string{"interfaces": {"ip", "-j", "address", "show"}, "routes": {"ip", "-j", "route", "show", "table", "all"}, "rules": {"ip", "-j", "rule", "show"}, "filter": {"iptables-save", "-t", "filter"}, "forwarding": {"sysctl", "-n", "net.ipv4.ip_forward"}, "processes": {"ps", "-eo", "comm="}}
 			if d.Tunnel != nil {
@@ -51,6 +52,21 @@ func (e *Engine) Status(ctx context.Context) (Status, error) {
 				commands["policies"] = []string{"ip", "xfrm", "policy", "list"}
 				commands["xfrm"] = []string{"ip", "-s", "xfrm", "state", "list", "nokeys"}
 			}
+			if e.Spec.IsFRR(d) {
+				commands["frr-version"] = []string{"vtysh", "-c", "show version"}
+				commands["frr-config"] = []string{"vtysh", "-c", "show running-config"}
+			}
+			if e.Spec.IsOSPF(d) {
+				commands["ospf"] = []string{"vtysh", "-c", "show ip ospf neighbor json"}
+				commands["ospf-routes"] = []string{"vtysh", "-c", "show ip route ospf json"}
+			}
+			if e.Spec.IsOVS(d) {
+				commands["ovs-version"] = []string{"ovs-vswitchd", "--version"}
+				commands["ovs-ports"] = []string{"ovs-vsctl", "--format=json", "--columns=name,tag,trunks,vlan_mode", "list", "Port"}
+				commands["ovs"] = []string{"ovs-vsctl", "show"}
+				commands["openflow"] = []string{"ovs-ofctl", "dump-flows", "br0"}
+			}
+
 			for k, args := range commands {
 				v, er := e.exec(ctx, d.ID, args...)
 				if er != nil {
@@ -137,19 +153,24 @@ func (e *Engine) Check(ctx context.Context) (Report, error) {
 		// the kernel's normalization of the expected rules with the observed rules.
 		expected, err := os.ReadFile(filepath.Join(e.Dir, "devices", d.ID, "filter.expected"))
 		r.add("filter/"+d.ID, err == nil && canonicalFilter(string(expected)) == canonicalFilter(o.Facts["filter"]), "kernel-normalized baseline comparison")
+		e.checkNative(ctx, &r, d, o)
 		if d.Tunnel != nil {
 			r.add("ipsec/"+d.ID, strings.Contains(o.Facts["sas"], "ESTABLISHED") && strings.Contains(o.Facts["sas"], "INSTALLED") && strings.Contains(o.Facts["sas"], "TUNNEL"), o.Facts["sas"])
 		}
 	}
 	// Confirm source traffic and encrypted carriage with live, ready captures.
-	if err = e.beginCapture(ctx, "BLACK", "black"); err != nil {
+	black, gray, err := e.captureDevices()
+	if err != nil {
 		return r, err
 	}
-	defer e.abortCapture("BLACK", "black")
-	if err = e.beginCapture(ctx, "G_A1", "gray"); err != nil {
+	if err = e.beginCapture(ctx, black, "black"); err != nil {
 		return r, err
 	}
-	defer e.abortCapture("G_A1", "gray")
+	defer e.abortCapture(black, "black")
+	if err = e.beginCapture(ctx, gray, "gray"); err != nil {
+		return r, err
+	}
+	defer e.abortCapture(gray, "gray")
 	hosts := []*Device{}
 	for i := range e.Spec.Devices {
 		if e.Spec.Devices[i].Role == "host" {
@@ -170,34 +191,50 @@ func (e *Engine) Check(ctx context.Context) (Report, error) {
 			r.add("reachability/"+a.ID+"/"+b.ID, ok == want, fmt.Sprintf("want delivery=%v; %s", want, detail))
 		}
 	}
-	for _, p := range []struct{ device, name, peerFilter string }{{"BLACK", "black", "esp"}, {"G_A1", "gray", "esp"}} {
+	for _, p := range []struct{ device, name, peerFilter string }{{black, "black", "esp"}, {gray, "gray", "esp"}} {
 		if err = e.finishCapture(ctx, p.device, p.name); err != nil {
 			return r, err
 		}
-		count, err := e.exec(ctx, p.device, "sh", "-ec", "tcpdump -Z root -nn -r /tmp/msc-"+p.name+".pcap '"+p.peerFilter+"' 2>/dev/null | wc -l")
+		count, err := e.exec(ctx, p.device, "sh", "-ec", e.captureCommand(p.device)+" -nn -r /tmp/msc-"+p.name+".pcap '"+p.peerFilter+"' 2>/dev/null | wc -l")
 		r.add("capture/"+p.name+"/esp", err == nil && strings.TrimSpace(count) != "0", strings.TrimSpace(count)+" ESP observations")
-		plain, err := e.exec(ctx, p.device, "tcpdump", "-Z", "root", "-nn", "-r", "/tmp/msc-"+p.name+".pcap", "net 10.1.0.0/16 or net 10.2.0.0/16")
+		plain, err := e.readCapture(ctx, p.device, "-nn", "-r", "/tmp/msc-"+p.name+".pcap", e.redCaptureFilter())
 		r.add("capture/"+p.name+"/no-red-plaintext", err == nil && strings.TrimSpace(plain) == "", plain)
 	}
-	for _, site := range []string{"A", "B"} {
-		r.add("gray-firewall-cut/"+site, graySeparated(e.Spec, "I_"+site+"1", "I_"+site+"2"), "all modeled Gray paths cross a Gray Firewall")
 
-		// Give a local cross-level packet a real route to the Gray Firewall, then
-		// require that its explicit default-deny forwarding policy blocks it.
-		from := e.Spec.Device("I_" + site + "1")
-		target := e.Spec.Device("I_" + site + "2")
-		ip := strings.Split(target.Interface("gray").Address, "/")[0]
-		before, er := e.exec(ctx, "GF_"+site, "iptables", "-nvx", "-L", "FORWARD")
-		if er != nil {
-			return r, er
+	for _, from := range e.Spec.Role("inner") {
+		for _, target := range e.Spec.Role("inner") {
+			if from.Site != target.Site || from.Level == target.Level || from.ID >= target.ID {
+				continue
+			}
+			name := from.ID + "/" + target.ID
+			r.add("gray-firewall-cut/"+name, graySeparated(e.Spec, from.ID, target.ID), "all modeled physical Gray paths cross a Gray Firewall")
+			counters := func() (string, error) {
+				var out strings.Builder
+				for _, gf := range e.Spec.Role("gray-firewall") {
+					if gf.Site != from.Site {
+						continue
+					}
+					v, er := e.exec(ctx, gf.ID, "iptables", "-nvx", "-L", "FORWARD")
+					if er != nil {
+						return "", er
+					}
+					out.WriteString(v)
+				}
+				return out.String(), nil
+			}
+			before, er := counters()
+			if er != nil {
+				return r, er
+			}
+			ok, _, probeErr := e.ping(ctx, from.ID, target.Tunnel.Local)
+			if probeErr != nil {
+				return r, probeErr
+			}
+			after, er := counters()
+			r.add("gray-cross-level/"+name, !ok && er == nil && before != after, "probe blocked and firewall counters changed")
 		}
-		ok, _, probeErr := e.ping(ctx, from.ID, ip)
-		if probeErr != nil {
-			return r, probeErr
-		}
-		after, er := e.exec(ctx, "GF_"+site, "iptables", "-nvx", "-L", "FORWARD")
-		r.add("gray-cross-level/"+site, !ok && er == nil && before != after, "probe blocked and firewall counters changed")
 	}
+
 	for _, d := range e.Spec.Devices {
 		if d.Admin == "" {
 			continue
@@ -212,7 +249,8 @@ func (e *Engine) Check(ctx context.Context) (Report, error) {
 }
 func (e *Engine) beginCapture(ctx context.Context, id, name string) error {
 	prefix := "/tmp/msc-" + name
-	body := "rm -f " + prefix + ".pcap " + prefix + ".log " + prefix + ".done; timeout --signal=INT --kill-after=2 120 tcpdump -Z root -U -nn -i any -w " + prefix + ".pcap >/dev/null 2>" + prefix + ".log & cap_pid=$!; echo $cap_pid >" + prefix + ".pid; set +e; wait $cap_pid; echo $? >" + prefix + ".done"
+	captureSeconds := 120 + len(e.Spec.Role("host"))*len(e.Spec.Role("host"))*3
+	body := "rm -f " + prefix + ".pcap " + prefix + ".log " + prefix + ".done; timeout --signal=INT --kill-after=2 " + fmt.Sprint(captureSeconds) + " " + e.captureCommand(id) + " -U -nn -i any -w " + prefix + ".pcap >/dev/null 2>" + prefix + ".log & cap_pid=$!; echo $cap_pid >" + prefix + ".pid; set +e; wait $cap_pid; echo $? >" + prefix + ".done"
 
 	if err := e.background(ctx, id, body); err != nil {
 		return err
@@ -293,4 +331,49 @@ func (e *Engine) managementProbe(ctx context.Context, d *Device) error {
 	}
 	_, err := e.exec(ctx, aw, "python3", "-c", `import ssl,urllib.request,sys;c=ssl.create_default_context(cafile='/run/msc-tls/x509ca/ca.pem');c.load_cert_chain('/run/msc-tls/x509/cert.pem','/run/msc-tls/private/key.pem');print(urllib.request.urlopen('https://'+sys.argv[1]+':8443',context=c,timeout=3).read().decode())`, ip)
 	return err
+}
+
+func (e *Engine) captureDevices() (string, string, error) {
+	black, gray := "", ""
+	for _, d := range e.Spec.Devices {
+		if d.Role == "transport" && black == "" {
+			black = d.ID
+		}
+		if d.Role == "switch" && gray == "" {
+			for _, p := range d.Interfaces {
+				if p.Zone == "gray" {
+					gray = d.ID
+					break
+				}
+			}
+		}
+	}
+	if black == "" || gray == "" {
+		return "", "", fmt.Errorf("capture requires a Black transport and a Gray switch")
+	}
+	return black, gray, nil
+}
+func (e *Engine) redCaptureFilter() string {
+	var prefixes []string
+	seen := map[string]bool{}
+	for _, d := range e.Spec.Role("inner") {
+		for _, p := range []string{d.Tunnel.LocalTS, d.Tunnel.RemoteTS} {
+			if !seen[p] {
+				prefixes = append(prefixes, "net "+p)
+				seen[p] = true
+			}
+		}
+	}
+	return strings.Join(prefixes, " or ")
+}
+
+func (e *Engine) captureCommand(id string) string {
+	d := e.Spec.Device(id)
+	if e.Spec.IsFRR(d) || e.Spec.IsOVS(d) {
+		return "tcpdump"
+	}
+	return "tcpdump -Z root"
+}
+func (e *Engine) readCapture(ctx context.Context, id string, args ...string) (string, error) {
+	return e.exec(ctx, id, append(strings.Fields(e.captureCommand(id)), args...)...)
 }

@@ -1,0 +1,7 @@
+{
+  "name": "msc",
+  "levels": 2,
+  "outer_firewalls": 1,
+  "gray_firewalls": 2,
+  "shared_gray": true
+}

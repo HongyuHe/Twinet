@@ -1,9 +1,7 @@
 {
-  "version": 2,
+  "version": 1,
   "name": "msc",
   "image": "hyhe/twinet-msc@sha256:6cfc920ac8df78b10746e78d730366781d3db2ab957dd13d9368cb7ca63264fa",
-  "router_image": "hyhe/twinet-msc-router@sha256:ea7ba8412a19340a843abe7e3b9ea12fafbc3ba966fb103290a8660e7d731920",
-  "switch_image": "hyhe/twinet-msc-switch@sha256:7d112ada3368efd46b649927bf09e38875a582fb575ef6c443b532a6c093b83d",
   "mtu": 1400,
   "devices": [
     {
@@ -30,6 +28,24 @@
           "address": "172.21.22.2/30",
           "zone": "black"
         }
+      ],
+      "routes": [
+        {
+          "prefix": "172.20.11.0/30",
+          "via": "172.21.11.1"
+        },
+        {
+          "prefix": "172.20.12.0/30",
+          "via": "172.21.12.1"
+        },
+        {
+          "prefix": "172.20.21.0/30",
+          "via": "172.21.21.1"
+        },
+        {
+          "prefix": "172.20.22.0/30",
+          "via": "172.21.22.1"
+        }
       ]
     },
     {
@@ -50,52 +66,6 @@
         {
           "name": "mgmt",
           "address": "172.30.109.20/24",
-          "zone": "management"
-        }
-      ],
-      "admin": "172.30.109.10"
-    },
-    {
-      "id": "OF_A1",
-      "role": "firewall",
-      "site": "A",
-      "interfaces": [
-        {
-          "name": "outside",
-          "address": "172.21.11.1/30",
-          "zone": "black"
-        },
-        {
-          "name": "inside",
-          "address": "172.20.11.2/30",
-          "zone": "black"
-        },
-        {
-          "name": "mgmt",
-          "address": "172.30.109.23/24",
-          "zone": "management"
-        }
-      ],
-      "admin": "172.30.109.10"
-    },
-    {
-      "id": "OF_A2",
-      "role": "firewall",
-      "site": "A",
-      "interfaces": [
-        {
-          "name": "outside",
-          "address": "172.21.12.1/30",
-          "zone": "black"
-        },
-        {
-          "name": "inside",
-          "address": "172.20.12.2/30",
-          "zone": "black"
-        },
-        {
-          "name": "mgmt",
-          "address": "172.30.109.24/24",
           "zone": "management"
         }
       ],
@@ -170,6 +140,29 @@
       "admin": "172.30.11.10"
     },
     {
+      "id": "G_A1",
+      "role": "switch",
+      "site": "A",
+      "level": "S1",
+      "interfaces": [
+        {
+          "name": "inner",
+          "zone": "gray",
+          "bridge": true
+        },
+        {
+          "name": "outer",
+          "zone": "gray",
+          "bridge": true
+        },
+        {
+          "name": "filter",
+          "zone": "gray",
+          "bridge": true
+        }
+      ]
+    },
+    {
       "id": "O_A1",
       "role": "outer",
       "site": "A",
@@ -215,27 +208,34 @@
       "admin": "172.30.109.10"
     },
     {
-      "id": "G_A1",
-      "role": "switch",
+      "id": "OF_A1",
+      "role": "firewall",
       "site": "A",
       "level": "S1",
       "interfaces": [
         {
-          "name": "inner",
-          "zone": "gray",
-          "bridge": true
+          "name": "inside",
+          "address": "172.20.11.2/30",
+          "zone": "black"
         },
         {
-          "name": "outer",
-          "zone": "gray",
-          "bridge": true
+          "name": "outside",
+          "address": "172.21.11.1/30",
+          "zone": "black"
         },
         {
-          "name": "filter",
-          "zone": "gray",
-          "bridge": true
+          "name": "mgmt",
+          "address": "172.30.109.23/24",
+          "zone": "management"
         }
-      ]
+      ],
+      "routes": [
+        {
+          "prefix": "0.0.0.0/0",
+          "via": "172.21.11.2"
+        }
+      ],
+      "admin": "172.30.109.10"
     },
     {
       "id": "R_A2",
@@ -306,6 +306,29 @@
       "admin": "172.30.12.10"
     },
     {
+      "id": "G_A2",
+      "role": "switch",
+      "site": "A",
+      "level": "S2",
+      "interfaces": [
+        {
+          "name": "inner",
+          "zone": "gray",
+          "bridge": true
+        },
+        {
+          "name": "outer",
+          "zone": "gray",
+          "bridge": true
+        },
+        {
+          "name": "filter",
+          "zone": "gray",
+          "bridge": true
+        }
+      ]
+    },
+    {
       "id": "O_A2",
       "role": "outer",
       "site": "A",
@@ -351,27 +374,34 @@
       "admin": "172.30.109.10"
     },
     {
-      "id": "G_A2",
-      "role": "switch",
+      "id": "OF_A2",
+      "role": "firewall",
       "site": "A",
       "level": "S2",
       "interfaces": [
         {
-          "name": "inner",
-          "zone": "gray",
-          "bridge": true
+          "name": "inside",
+          "address": "172.20.12.2/30",
+          "zone": "black"
         },
         {
-          "name": "outer",
-          "zone": "gray",
-          "bridge": true
+          "name": "outside",
+          "address": "172.21.12.1/30",
+          "zone": "black"
         },
         {
-          "name": "filter",
-          "zone": "gray",
-          "bridge": true
+          "name": "mgmt",
+          "address": "172.30.109.24/24",
+          "zone": "management"
         }
-      ]
+      ],
+      "routes": [
+        {
+          "prefix": "0.0.0.0/0",
+          "via": "172.21.12.2"
+        }
+      ],
+      "admin": "172.30.109.10"
     },
     {
       "id": "M_A1",
@@ -510,52 +540,6 @@
       "admin": "172.30.119.10"
     },
     {
-      "id": "OF_B1",
-      "role": "firewall",
-      "site": "B",
-      "interfaces": [
-        {
-          "name": "outside",
-          "address": "172.21.21.1/30",
-          "zone": "black"
-        },
-        {
-          "name": "inside",
-          "address": "172.20.21.2/30",
-          "zone": "black"
-        },
-        {
-          "name": "mgmt",
-          "address": "172.30.119.23/24",
-          "zone": "management"
-        }
-      ],
-      "admin": "172.30.119.10"
-    },
-    {
-      "id": "OF_B2",
-      "role": "firewall",
-      "site": "B",
-      "interfaces": [
-        {
-          "name": "outside",
-          "address": "172.21.22.1/30",
-          "zone": "black"
-        },
-        {
-          "name": "inside",
-          "address": "172.20.22.2/30",
-          "zone": "black"
-        },
-        {
-          "name": "mgmt",
-          "address": "172.30.119.24/24",
-          "zone": "management"
-        }
-      ],
-      "admin": "172.30.119.10"
-    },
-    {
       "id": "R_B1",
       "role": "host",
       "site": "B",
@@ -624,6 +608,29 @@
       "admin": "172.30.21.10"
     },
     {
+      "id": "G_B1",
+      "role": "switch",
+      "site": "B",
+      "level": "S1",
+      "interfaces": [
+        {
+          "name": "inner",
+          "zone": "gray",
+          "bridge": true
+        },
+        {
+          "name": "outer",
+          "zone": "gray",
+          "bridge": true
+        },
+        {
+          "name": "filter",
+          "zone": "gray",
+          "bridge": true
+        }
+      ]
+    },
+    {
       "id": "O_B1",
       "role": "outer",
       "site": "B",
@@ -669,27 +676,34 @@
       "admin": "172.30.119.10"
     },
     {
-      "id": "G_B1",
-      "role": "switch",
+      "id": "OF_B1",
+      "role": "firewall",
       "site": "B",
       "level": "S1",
       "interfaces": [
         {
-          "name": "inner",
-          "zone": "gray",
-          "bridge": true
+          "name": "inside",
+          "address": "172.20.21.2/30",
+          "zone": "black"
         },
         {
-          "name": "outer",
-          "zone": "gray",
-          "bridge": true
+          "name": "outside",
+          "address": "172.21.21.1/30",
+          "zone": "black"
         },
         {
-          "name": "filter",
-          "zone": "gray",
-          "bridge": true
+          "name": "mgmt",
+          "address": "172.30.119.23/24",
+          "zone": "management"
         }
-      ]
+      ],
+      "routes": [
+        {
+          "prefix": "0.0.0.0/0",
+          "via": "172.21.21.2"
+        }
+      ],
+      "admin": "172.30.119.10"
     },
     {
       "id": "R_B2",
@@ -760,6 +774,29 @@
       "admin": "172.30.22.10"
     },
     {
+      "id": "G_B2",
+      "role": "switch",
+      "site": "B",
+      "level": "S2",
+      "interfaces": [
+        {
+          "name": "inner",
+          "zone": "gray",
+          "bridge": true
+        },
+        {
+          "name": "outer",
+          "zone": "gray",
+          "bridge": true
+        },
+        {
+          "name": "filter",
+          "zone": "gray",
+          "bridge": true
+        }
+      ]
+    },
+    {
       "id": "O_B2",
       "role": "outer",
       "site": "B",
@@ -805,27 +842,34 @@
       "admin": "172.30.119.10"
     },
     {
-      "id": "G_B2",
-      "role": "switch",
+      "id": "OF_B2",
+      "role": "firewall",
       "site": "B",
       "level": "S2",
       "interfaces": [
         {
-          "name": "inner",
-          "zone": "gray",
-          "bridge": true
+          "name": "inside",
+          "address": "172.20.22.2/30",
+          "zone": "black"
         },
         {
-          "name": "outer",
-          "zone": "gray",
-          "bridge": true
+          "name": "outside",
+          "address": "172.21.22.1/30",
+          "zone": "black"
         },
         {
-          "name": "filter",
-          "zone": "gray",
-          "bridge": true
+          "name": "mgmt",
+          "address": "172.30.119.24/24",
+          "zone": "management"
         }
-      ]
+      ],
+      "routes": [
+        {
+          "prefix": "0.0.0.0/0",
+          "via": "172.21.22.2"
+        }
+      ],
+      "admin": "172.30.119.10"
     },
     {
       "id": "M_B1",
@@ -944,26 +988,6 @@
   "links": [
     {
       "a": {
-        "device": "OF_A1",
-        "interface": "outside"
-      },
-      "b": {
-        "device": "BLACK",
-        "interface": "p11"
-      }
-    },
-    {
-      "a": {
-        "device": "OF_A2",
-        "interface": "outside"
-      },
-      "b": {
-        "device": "BLACK",
-        "interface": "p12"
-      }
-    },
-    {
-      "a": {
         "device": "R_A1",
         "interface": "red"
       },
@@ -1014,6 +1038,16 @@
     },
     {
       "a": {
+        "device": "OF_A1",
+        "interface": "outside"
+      },
+      "b": {
+        "device": "BLACK",
+        "interface": "p11"
+      }
+    },
+    {
+      "a": {
         "device": "R_A2",
         "interface": "red"
       },
@@ -1060,6 +1094,16 @@
       "b": {
         "device": "OF_A2",
         "interface": "inside"
+      }
+    },
+    {
+      "a": {
+        "device": "OF_A2",
+        "interface": "outside"
+      },
+      "b": {
+        "device": "BLACK",
+        "interface": "p12"
       }
     },
     {
@@ -1164,26 +1208,6 @@
     },
     {
       "a": {
-        "device": "OF_B1",
-        "interface": "outside"
-      },
-      "b": {
-        "device": "BLACK",
-        "interface": "p21"
-      }
-    },
-    {
-      "a": {
-        "device": "OF_B2",
-        "interface": "outside"
-      },
-      "b": {
-        "device": "BLACK",
-        "interface": "p22"
-      }
-    },
-    {
-      "a": {
         "device": "R_B1",
         "interface": "red"
       },
@@ -1234,6 +1258,16 @@
     },
     {
       "a": {
+        "device": "OF_B1",
+        "interface": "outside"
+      },
+      "b": {
+        "device": "BLACK",
+        "interface": "p21"
+      }
+    },
+    {
+      "a": {
         "device": "R_B2",
         "interface": "red"
       },
@@ -1280,6 +1314,16 @@
       "b": {
         "device": "OF_B2",
         "interface": "inside"
+      }
+    },
+    {
+      "a": {
+        "device": "OF_B2",
+        "interface": "outside"
+      },
+      "b": {
+        "device": "BLACK",
+        "interface": "p22"
       }
     },
     {
