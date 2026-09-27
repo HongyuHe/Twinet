@@ -85,14 +85,23 @@ func (r *Report) add(name string, passed bool, detail string) {
 		r.Passed = false
 	}
 }
-func (e *Engine) ping(ctx context.Context, from, to string) (bool, string) {
-	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+func (e *Engine) ping(ctx context.Context, from, to string) (bool, string, error) {
+	cctx, cancel := context.WithTimeout(ctx, 6*time.Second)
 	defer cancel()
-	out, err := e.exec(cctx, from, "ping", "-n", "-c", "2", "-W", "1", to)
+	result, err := e.Runtime.Exec(cctx, e.Spec.Container(from), rt.ExecCmd{Cmd: []string{"timeout", "5", "ping", "-n", "-c", "2", "-W", "1", to}})
+	return pingOutcome(result, err)
+}
+
+// Only ping's normal no-reply status is evidence of blocked delivery. Docker
+// errors, command failures, and timeouts must fail the observation itself.
+func pingOutcome(result rt.ExecResult, err error) (bool, string, error) {
 	if err != nil {
-		return false, err.Error()
+		return false, "", fmt.Errorf("ping observation: %w", err)
 	}
-	return true, strings.TrimSpace(out)
+	if result.ExitCode != 0 && result.ExitCode != 1 {
+		return false, "", fmt.Errorf("ping observation: %w", result.Err())
+	}
+	return result.ExitCode == 0, strings.TrimSpace(result.Stdout + result.Stderr), nil
 }
 func (e *Engine) Check(ctx context.Context) (Report, error) {
 	r := Report{Lab: e.Spec.Name, At: time.Now().UTC(), SpecHash: e.Spec.Hash(), Passed: true}
@@ -136,9 +145,11 @@ func (e *Engine) Check(ctx context.Context) (Report, error) {
 	if err = e.beginCapture(ctx, "BLACK", "black"); err != nil {
 		return r, err
 	}
+	defer e.abortCapture("BLACK", "black")
 	if err = e.beginCapture(ctx, "G_A1", "gray"); err != nil {
 		return r, err
 	}
+	defer e.abortCapture("G_A1", "gray")
 	hosts := []*Device{}
 	for i := range e.Spec.Devices {
 		if e.Spec.Devices[i].Role == "host" {
@@ -151,7 +162,10 @@ func (e *Engine) Check(ctx context.Context) (Report, error) {
 				continue
 			}
 			ip := strings.Split(b.Interface("red").Address, "/")[0]
-			ok, detail := e.ping(ctx, a.ID, ip)
+			ok, detail, probeErr := e.ping(ctx, a.ID, ip)
+			if probeErr != nil {
+				return r, probeErr
+			}
 			want := a.Level == b.Level
 			r.add("reachability/"+a.ID+"/"+b.ID, ok == want, fmt.Sprintf("want delivery=%v; %s", want, detail))
 		}
@@ -177,7 +191,10 @@ func (e *Engine) Check(ctx context.Context) (Report, error) {
 		if er != nil {
 			return r, er
 		}
-		ok, _ := e.ping(ctx, from.ID, ip)
+		ok, _, probeErr := e.ping(ctx, from.ID, ip)
+		if probeErr != nil {
+			return r, probeErr
+		}
 		after, er := e.exec(ctx, "GF_"+site, "iptables", "-nvx", "-L", "FORWARD")
 		r.add("gray-cross-level/"+site, !ok && er == nil && before != after, "probe blocked and firewall counters changed")
 	}
@@ -201,7 +218,7 @@ func (e *Engine) Check(ctx context.Context) (Report, error) {
 }
 func (e *Engine) beginCapture(ctx context.Context, id, name string) error {
 	prefix := "/tmp/msc-" + name
-	body := "rm -f " + prefix + ".pcap " + prefix + ".log " + prefix + ".done; tcpdump -Z root -U -nn -i any -w " + prefix + ".pcap >/dev/null 2>" + prefix + ".log & cap_pid=$!; echo $cap_pid >" + prefix + ".pid; set +e; wait $cap_pid; echo $? >" + prefix + ".done"
+	body := "rm -f " + prefix + ".pcap " + prefix + ".log " + prefix + ".done; timeout --signal=INT --kill-after=2 120 tcpdump -Z root -U -nn -i any -w " + prefix + ".pcap >/dev/null 2>" + prefix + ".log & cap_pid=$!; echo $cap_pid >" + prefix + ".pid; set +e; wait $cap_pid; echo $? >" + prefix + ".done"
 
 	if err := e.background(ctx, id, body); err != nil {
 		return err
@@ -257,4 +274,11 @@ func (e *Engine) finishCapture(ctx context.Context, id, name string) error {
 		return fmt.Errorf("capture %s/%s did not finish cleanly: %w", id, name, err)
 	}
 	return nil
+}
+
+func (e *Engine) abortCapture(id, name string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	prefix := "/tmp/msc-" + name
+	_ = e.shell(ctx, id, "if ! test -f "+prefix+".done; then kill -INT $(cat "+prefix+".pid) 2>/dev/null || true; fi")
 }

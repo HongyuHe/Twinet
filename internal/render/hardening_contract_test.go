@@ -14,14 +14,15 @@ import (
 // database, or provider path before a no-change redeploy discovers Docker's
 // read-only-rootfs rule in a live course.
 func TestBundledRendererWritesHaveHardenedTargets(t *testing.T) {
-	manifests, err := filepath.Glob("../../examples/*")
+	manifests, err := filepath.Glob("../../examples/*/twinet.yaml")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(manifests) == 0 {
 		t.Fatal("no bundled manifests found")
 	}
-	for _, path := range manifests {
+	for _, manifestPath := range manifests {
+		path := filepath.Dir(manifestPath)
 		loaded, err := manifest.Load(path)
 		if err != nil {
 			t.Fatalf("%s: %v", path, err)

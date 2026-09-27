@@ -133,6 +133,9 @@ func (s *Spec) Validate() error {
 				}
 				addresses[p.Addr().String()] = true
 			}
+			if i.Name == "mgmt" && i.Address == "" {
+				return fmt.Errorf("management interface requires an address on %s", d.ID)
+			}
 			if i.Bridge && d.Role != "switch" {
 				return fmt.Errorf("bridge port on non-switch %s", d.ID)
 			}
@@ -151,6 +154,9 @@ func (s *Spec) Validate() error {
 			return fmt.Errorf("encryptor %s must have exactly one tunnel", d.ID)
 		}
 		if d.Admin != "" {
+			if d.Interface("mgmt") == nil {
+				return fmt.Errorf("managed device %s requires a management interface", d.ID)
+			}
 			if a, e := netip.ParseAddr(d.Admin); e != nil || !a.Is4() {
 				return fmt.Errorf("bad admin on %s", d.ID)
 			}
@@ -204,8 +210,26 @@ func (s *Spec) Validate() error {
 		if d == nil || d.Role != required.Role || d.Site != required.Site || d.Level != required.Level {
 			return fmt.Errorf("MSC profile requires %s with role/site/level %s/%s/%s", required.ID, required.Role, required.Site, required.Level)
 		}
+
+		for _, expected := range required.Interfaces {
+			actual := d.Interface(expected.Name)
+			if actual == nil || actual.Zone != expected.Zone || (actual.Address == "") != (expected.Address == "") {
+				return fmt.Errorf("MSC profile requires %s/%s in zone %s with its declared addressing role", d.ID, expected.Name, expected.Zone)
+			}
+		}
 	}
 	for _, d := range s.Devices {
+		if d.Admin != "" {
+			found := false
+			for _, admin := range s.Devices {
+				if admin.Role == "admin" && admin.Interface("mgmt") != nil && strings.Split(admin.Interface("mgmt").Address, "/")[0] == d.Admin {
+					found = true
+				}
+			}
+			if !found {
+				return fmt.Errorf("no administrative workstation for %s", d.ID)
+			}
+		}
 		if d.Role == "host" && (d.Interface("red") == nil || d.Interface("red").Address == "") {
 			return fmt.Errorf("host requires addressed red interface")
 		}

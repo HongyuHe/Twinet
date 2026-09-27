@@ -106,14 +106,20 @@ func (e *Engine) TestFailures(ctx context.Context) (Report, error) {
 			if err := e.beginCapture(ctx, "BLACK", "failure"); err != nil {
 				return err
 			}
-			defer e.shell(ctx, "BLACK", "kill -INT $(cat /tmp/msc-failure.pid) 2>/dev/null || true")
+			defer e.abortCapture("BLACK", "failure")
 			if err := e.beginCapture(ctx, "G_A1", "failure"); err != nil {
 				return err
 			}
-			defer e.shell(ctx, "G_A1", "kill -INT $(cat /tmp/msc-failure.pid) 2>/dev/null || true")
-			ok, detail := e.ping(ctx, "R_A1", "10.2.1.10")
+			defer e.abortCapture("G_A1", "failure")
+			ok, detail, probeErr := e.ping(ctx, "R_A1", "10.2.1.10")
+			if probeErr != nil {
+				return probeErr
+			}
 			r.add(test.kind+"/"+test.id+"/blocks-S1", !ok, detail)
-			ok, detail = e.ping(ctx, "R_A2", "10.2.2.10")
+			ok, detail, probeErr = e.ping(ctx, "R_A2", "10.2.2.10")
+			if probeErr != nil {
+				return probeErr
+			}
 			r.add(test.kind+"/"+test.id+"/S2-unaffected", ok, detail)
 			if test.kind == "ipsec-down" {
 				states, er := e.exec(ctx, test.id, "ip", "xfrm", "state", "list", "nokeys")
@@ -144,7 +150,10 @@ func (e *Engine) TestFailures(ctx context.Context) (Report, error) {
 		if observeErr != nil {
 			return r, observeErr
 		}
-		ok, detail := e.ping(ctx, "R_A1", "10.2.1.10")
+		ok, detail, probeErr := e.ping(ctx, "R_A1", "10.2.1.10")
+		if probeErr != nil {
+			return r, probeErr
+		}
 		r.add(test.kind+"/"+test.id+"/recovered", ok, detail)
 	}
 	for _, id := range []string{"I_A1", "O_B2"} {
@@ -152,7 +161,10 @@ func (e *Engine) TestFailures(ctx context.Context) (Report, error) {
 			return r, err
 		}
 		for _, level := range []int{1, 2} {
-			ok, detail := e.ping(ctx, fmt.Sprintf("R_A%d", level), fmt.Sprintf("10.2.%d.10", level))
+			ok, detail, probeErr := e.ping(ctx, fmt.Sprintf("R_A%d", level), fmt.Sprintf("10.2.%d.10", level))
+			if probeErr != nil {
+				return r, probeErr
+			}
 			r.add("restart/"+id+fmt.Sprintf("/S%d", level), ok, detail)
 		}
 	}

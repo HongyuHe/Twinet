@@ -137,7 +137,7 @@ func (e *Engine) Up(ctx context.Context, recoverFault bool) error {
 		return err
 	}
 	if !exists {
-		return fmt.Errorf("build image %s first (images/msc/Dockerfile)", e.Spec.Image)
+		return fmt.Errorf("pull image %s first (or build a custom image from images/msc/Dockerfile)", e.Spec.Image)
 	}
 	imageID, err := e.Runtime.ImageDigest(ctx, e.Spec.Image)
 	if err != nil {
@@ -281,6 +281,24 @@ func (e *Engine) Up(ctx context.Context, recoverFault bool) error {
 			if d.Role != role || d.Site != "A" {
 				continue
 			}
+			localSA, _ := e.exec(ctx, d.ID, "swanctl", "--list-sas")
+			remoteSA, _ := e.exec(ctx, d.Tunnel.Peer, "swanctl", "--list-sas")
+			if pairedSAs(localSA, remoteSA) {
+				e.log("ready %s <-> %s (existing)", d.ID, d.Tunnel.Peer)
+				continue
+			}
+			// A restarted endpoint has lost its SAs while its peer may still
+			// advertise the old ones. Reset both ends before negotiating.
+			if strings.TrimSpace(localSA+remoteSA) != "" {
+				for _, id := range []string{d.ID, d.Tunnel.Peer} {
+					if err = e.stopIPsec(ctx, id); err != nil {
+						return err
+					}
+					if err = e.startIPsec(ctx, e.Spec.Device(id)); err != nil {
+						return err
+					}
+				}
+			}
 			cctx, cancel := context.WithTimeout(ctx, 40*time.Second)
 			_, err = e.exec(cctx, d.ID, "swanctl", "--initiate", "--child", "protected")
 			cancel()
@@ -303,6 +321,9 @@ func (e *Engine) Up(ctx context.Context, recoverFault bool) error {
 	return nil
 }
 func (e *Engine) startIPsec(ctx context.Context, d *Device) error {
+	cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	ctx = cctx
 	if err := e.background(ctx, d.ID, "pgrep -x charon >/dev/null || exec stdbuf -oL /usr/lib/ipsec/charon >/tmp/charon.log 2>&1"); err != nil {
 		return err
 	}
@@ -395,4 +416,30 @@ func (e *Engine) forwarding(ctx context.Context, id string, on bool) error {
 		}
 		return nil
 	})
+}
+
+// pairedSAs requires matching directional SPIs across both endpoints. Merely
+// finding ESTABLISHED at one end would accept stale state after a restart.
+func pairedSAs(a, b string) bool {
+	parse := func(s string) (string, string) {
+		if !strings.Contains(s, "ESTABLISHED") || !strings.Contains(s, "INSTALLED, TUNNEL") {
+			return "", ""
+		}
+		in, out := "", ""
+		for _, line := range strings.Split(s, "\n") {
+			f := strings.Fields(line)
+			if len(f) > 1 {
+				if f[0] == "in" {
+					in = strings.TrimSuffix(f[1], ",")
+				}
+				if f[0] == "out" {
+					out = strings.TrimSuffix(f[1], ",")
+				}
+			}
+		}
+		return in, out
+	}
+	ai, ao := parse(a)
+	bi, bo := parse(b)
+	return ai != "" && ao != "" && ai == bo && ao == bi
 }

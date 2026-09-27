@@ -59,14 +59,15 @@ func TestMixedSubstrateExpansionCarriesTypedContracts(t *testing.T) {
 // this scans every bundled manifest after inheritance/expansion rather than
 // trusting a handful of literal kinds.router declarations.
 func TestBundledRouterShellsNeverReceiveSysAdmin(t *testing.T) {
-	manifests, err := filepath.Glob("../../examples/*")
+	manifests, err := filepath.Glob("../../examples/*/twinet.yaml")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(manifests) == 0 {
 		t.Fatal("no bundled example manifests found")
 	}
-	for _, path := range manifests {
+	for _, manifestPath := range manifests {
+		path := filepath.Dir(manifestPath)
 		loaded, err := manifest.Load(path)
 		if err != nil {
 			t.Fatalf("%s: %v", path, err)
@@ -94,11 +95,12 @@ func TestBundledRouterShellsNeverReceiveSysAdmin(t *testing.T) {
 // surface. Scan fully inherited bundled devices rather than only literal YAML
 // kind defaults.
 func TestBundledExpandedDevicesUseOnlyMinimalCapabilities(t *testing.T) {
-	manifests, err := filepath.Glob("../../examples/*")
+	manifests, err := filepath.Glob("../../examples/*/twinet.yaml")
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, path := range manifests {
+	for _, manifestPath := range manifests {
+		path := filepath.Dir(manifestPath)
 		loaded, err := manifest.Load(path)
 		if err != nil {
 			t.Fatalf("%s: %v", path, err)

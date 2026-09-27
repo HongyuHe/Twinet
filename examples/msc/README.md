@@ -9,5 +9,6 @@ bin/twinet msc init --spec /tmp/my-msc.json
 bin/twinet msc plan --spec /tmp/my-msc.json
 ```
 
-The runtime requires root on Linux, Docker, and the image built from
-`images/msc/Dockerfile`. The default commands operate on one worker.
+The runtime requires root on Linux, Docker, and the published
+[`hyhe/twinet-msc`](https://hub.docker.com/r/hyhe/twinet-msc) image. The spec pins
+the tested registry digest. Its build source is `images/msc/Dockerfile`. The default commands operate on one worker.

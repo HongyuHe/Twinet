@@ -4,6 +4,8 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
+	rt "github.com/HongyuHe/twinet/internal/runtime"
 	"os"
 	"path/filepath"
 	"strings"
@@ -36,13 +38,15 @@ func TestExampleHasSeparateAppliancesAndManagement(t *testing.T) {
 }
 func TestRejectBrokenTopology(t *testing.T) {
 	cases := map[string]func(*Spec){
-		"peer-label":     func(s *Spec) { s.Device("I_B1").Level = "S2" },
-		"missing-link":   func(s *Spec) { s.Links = s.Links[1:] },
-		"duplicate-port": func(s *Spec) { s.Links = append(s.Links, s.Links[0]) },
-		"local-address":  func(s *Spec) { s.Device("I_A1").Tunnel.Local = "10.99.1.1" },
-		"shell-device":   func(s *Spec) { s.Devices[0].ID = "bad;id" },
-		"shell-route":    func(s *Spec) { s.Device("R_A1").Routes[0].Via = "1.2.3.4;id" },
-		"wrong-layer":    func(s *Spec) { s.Device("I_A1").Tunnel.Peer = "O_B1" },
+		"missing-management-address": func(s *Spec) { s.Device("I_A1").Interface("mgmt").Address = "" },
+		"missing-admin":              func(s *Spec) { s.Device("I_A1").Admin = "192.0.2.20" },
+		"peer-label":                 func(s *Spec) { s.Device("I_B1").Level = "S2" },
+		"missing-link":               func(s *Spec) { s.Links = s.Links[1:] },
+		"duplicate-port":             func(s *Spec) { s.Links = append(s.Links, s.Links[0]) },
+		"local-address":              func(s *Spec) { s.Device("I_A1").Tunnel.Local = "10.99.1.1" },
+		"shell-device":               func(s *Spec) { s.Devices[0].ID = "bad;id" },
+		"shell-route":                func(s *Spec) { s.Device("R_A1").Routes[0].Via = "1.2.3.4;id" },
+		"wrong-layer":                func(s *Spec) { s.Device("I_A1").Tunnel.Peer = "O_B1" },
 	}
 	for name, mutate := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -139,6 +143,15 @@ func TestPersistentSeparatePKIAndRevocation(t *testing.T) {
 	if len(crl.RevokedCertificateEntries) != 1 || crl.RevokedCertificateEntries[0].SerialNumber.Cmp(cert.SerialNumber) != 0 {
 		t.Fatal("incorrect revocation")
 	}
+	if err = e.crl(a.Tunnel.Trust, e.tunnelDir(b), nil); err != nil {
+		t.Fatal(err)
+	}
+	freshBytes, _ := os.ReadFile(filepath.Join(e.tunnelDir(b), "x509crl", "ca.crl.pem"))
+	freshBlock, _ := pem.Decode(freshBytes)
+	fresh, _ := x509.ParseRevocationList(freshBlock.Bytes)
+	if fresh.Number.Cmp(crl.Number) <= 0 {
+		t.Fatal("CRL sequence did not increase")
+	}
 	key, err := os.Stat(filepath.Join(e.tunnelDir(a), "private", "key.pem"))
 	if err != nil || key.Mode().Perm() != 0600 {
 		t.Fatalf("key permissions: %v %v", key, err)
@@ -160,5 +173,34 @@ func TestGrayBypassIsDetected(t *testing.T) {
 	}
 	if graySeparated(s, "I_A1", "I_A2") {
 		t.Fatal("cross-level bypass escaped the graph check")
+	}
+}
+
+func TestPairedSAsRejectStalePeerState(t *testing.T) {
+	a := "msc ESTABLISHED\n protected INSTALLED, TUNNEL\n in aaaa, 42 packets\n out bbbb, 42 packets"
+	b := "msc ESTABLISHED\n protected INSTALLED, TUNNEL\n in bbbb, 42 packets\n out aaaa, 42 packets"
+	if !pairedSAs(a, b) {
+		t.Fatal("matching pair rejected")
+	}
+	for _, bad := range []string{"", a, strings.ReplaceAll(b, "bbbb", "cccc"), strings.ReplaceAll(b, "INSTALLED", "CONNECTING")} {
+		if pairedSAs(a, bad) {
+			t.Fatal("stale or missing peer accepted")
+		}
+	}
+}
+
+func TestPingObservationErrorsCannotPassIsolation(t *testing.T) {
+	for _, code := range []int{0, 1, 2, 124, 137} {
+		delivered, _, err := pingOutcome(rt.ExecResult{ExitCode: code}, nil)
+		if code < 2 {
+			if err != nil || delivered != (code == 0) {
+				t.Fatalf("normal ping outcome %d: %v %v", code, delivered, err)
+			}
+		} else if err == nil {
+			t.Fatalf("infrastructure status %d accepted as packet evidence", code)
+		}
+	}
+	if _, _, err := pingOutcome(rt.ExecResult{}, errors.New("container absent")); err == nil {
+		t.Fatal("runtime error accepted as packet evidence")
 	}
 }

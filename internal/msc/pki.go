@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -150,8 +151,22 @@ func (e *Engine) crl(trust, dir string, revoked []*x509.Certificate) error {
 	if err != nil {
 		return err
 	}
+	numberPath := filepath.Join(e.Dir, "ca", trust, "crl-number")
+	number := big.NewInt(time.Now().UnixNano())
+	if previous, readErr := os.ReadFile(numberPath); readErr == nil {
+		old, ok := new(big.Int).SetString(strings.TrimSpace(string(previous)), 10)
+		if !ok {
+			return fmt.Errorf("invalid CRL sequence for %s", trust)
+		}
+		number.Add(old, big.NewInt(1))
+	} else if !os.IsNotExist(readErr) {
+		return readErr
+	}
+	if err = writePrivate(numberPath, []byte(number.String()+"\n")); err != nil {
+		return err
+	}
 	now := time.Now()
-	tmpl := &x509.RevocationList{Number: serial(), ThisUpdate: now.Add(-time.Minute), NextUpdate: now.Add(7 * 24 * time.Hour)}
+	tmpl := &x509.RevocationList{Number: number, ThisUpdate: now.Add(-time.Minute), NextUpdate: now.Add(7 * 24 * time.Hour)}
 	for _, c := range revoked {
 		tmpl.RevokedCertificateEntries = append(tmpl.RevokedCertificateEntries, x509.RevocationListEntry{SerialNumber: c.SerialNumber, RevocationTime: now})
 	}

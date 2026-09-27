@@ -49,10 +49,28 @@ sudo modprobe xt_policy
 git clone --branch tdn https://github.com/HongyuHe/Twinet.git
 cd Twinet
 go build -o bin/twinet ./cmd/twinet
-sudo docker build -t twinet/msc:tdn images/msc
+sudo docker pull hyhe/twinet-msc@sha256:6cfc920ac8df78b10746e78d730366781d3db2ab957dd13d9368cb7ca63264fa
 bin/twinet msc plan > /tmp/msc-plan.json
 sudo bin/twinet msc up
 sudo bin/twinet msc check > /tmp/msc-check.json
+```
+
+The tested Linux/amd64 image is published as
+[`hyhe/twinet-msc:tdn`](https://hub.docker.com/r/hyhe/twinet-msc).
+The example pins its immutable registry digest, so deployment requires no image
+rebuild. The image contains the emulation tools; the Twinet CLI is built from
+this repository. Certificates and lab state are generated on the worker and
+are absent from the published image.
+
+To rebuild after changing the Dockerfile, use a separate spec with your local
+image reference. Stop any existing lab before replacing its image:
+
+```sh
+sudo bin/twinet msc down
+sudo docker build -t twinet/msc:local images/msc
+jq '.image = "twinet/msc:local"' examples/msc/msc.json > /tmp/msc-local.json
+sudo bin/twinet msc up --spec /tmp/msc-local.json
+sudo bin/twinet msc check --spec /tmp/msc-local.json
 ```
 
 The image starts from a pinned Ubuntu image digest. The deployed Docker image
@@ -90,8 +108,8 @@ The switches use Linux bridges. They emulate separate Ethernet segments.
 
 The complete addresses, roles, interfaces, static routes, links, peer identities,
 selectors, and trust domains are in `examples/msc/msc.json`. S1 and S2 are
-unordered security labels. The profile preserves the device IDs needed by its
-checks. Additional topology edits require validation and a down/up cycle.
+unordered security labels. The profile preserves the device IDs and interface roles needed by its
+checks. The bundled fault scenarios use the example addresses. Additional topology edits require validation and a down/up cycle.
 
 ## Inspect and interact
 
@@ -120,7 +138,9 @@ sudo bin/twinet msc exec BLACK -- timeout 15 tcpdump -Z root -nn -i any esp
 Generate traffic from `R_A1` while the capture runs. On Gray, the visible ESP
 endpoints are inner gateways; on Black, they are outer gateways. The profile's
 checks combine positive traffic, SA observations, and captures at both layers.
-Absence of cleartext during finite probes does not establish a universal theorem.
+Probe infrastructure errors fail the check and are never counted as successful
+isolation. Absence of cleartext during finite probes does not establish a
+universal theorem.
 
 ## Inject faults and recover
 
@@ -183,6 +203,9 @@ three hours and CHILD_SAs have a one-hour maximum lifetime. Separate management
 CAs support TLS 1.3 client-authenticated health endpoints on port 8443. Those
 endpoints demonstrate management reachability and authentication; they are not
 full administrative applications or the omitted CSfC management annexes.
+Certificates last one month, and generated CRLs last seven days. Reapply `up`
+before CRL expiry, or use `recover` if authentication has already stopped.
+The runner has no background credential refresh service.
 
 A host reboot stops the containers. Run `msc up` after Docker starts to restore
 links, filters, configuration, and fresh tunnel state. Live SA keys and replay

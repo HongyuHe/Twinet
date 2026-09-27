@@ -1,7 +1,7 @@
 {
   "version": 1,
   "name": "msc",
-  "image": "twinet/msc:tdn",
+  "image": "hyhe/twinet-msc@sha256:6cfc920ac8df78b10746e78d730366781d3db2ab957dd13d9368cb7ca63264fa",
   "mtu": 1400,
   "devices": [
     {

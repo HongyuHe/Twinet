@@ -95,10 +95,15 @@ func newMSCCmd(opts *Options) *cobra.Command {
 				report, err = e.TestFailures(cmd.Context())
 			}
 			if err != nil {
-				return err
+				report.Passed = false
+				report.Checks = append(report.Checks, msc.Check{Name: "infrastructure", Passed: false, Detail: err.Error()})
 			}
+			runErr := err
 			if err = output(cmd, report); err != nil {
 				return err
+			}
+			if runErr != nil {
+				return runErr
 			}
 			if !report.Passed {
 				return fmt.Errorf("MSC checks failed; inspect the JSON report")
