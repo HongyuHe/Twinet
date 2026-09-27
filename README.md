@@ -47,6 +47,16 @@ routers, and switches.
 The precise scope and evidence for these features are deliberately kept out of
 marketing language: see [Implementation status](docs/09_status.md).
 
+## MSC research emulation
+
+The `tdn` branch adds a single-worker MSC IPsec/IPsec appliance profile. It runs
+both sites, two security levels, independent inner and outer gateways, firewalls,
+and separated management networks. Use `twinet msc up`, `check`, `fault`,
+`recover`, and `test-failures` on the Linux worker. See the
+[MSC operator guide](docs/13_msc.md) and [example](examples/msc/README.md).
+The profile uses Docker directly and does not require the distributed AS agent
+path. A TDN/Lean adapter and full CSfC compliance are outside its scope.
+
 ## Evidence, not promises
 
 The current measured reference deployment is a 12-AS lab. Its timing range,

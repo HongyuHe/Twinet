@@ -77,6 +77,7 @@ across a cluster and graded automatically.`,
 		"endpoint for the overridden runtime (or set TWINET_RUNTIME_SOCKET)")
 
 	root.AddCommand(
+		newMSCCmd(opts),
 		newValidateCmd(opts),
 		newSchemaCmd(),
 		newInspectCmd(opts),
