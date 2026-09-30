@@ -40,6 +40,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
       - uses: actions/setup-go@v6
         with:
           go-version: ${{ env.GO_VERSION }}
@@ -117,6 +119,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
       - name: Build container images
         run: make images
 
@@ -125,6 +129,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
       - uses: actions/setup-go@v6
         with:
           go-version: ${{ env.GO_VERSION }}
@@ -132,7 +138,10 @@ jobs:
       - name: Prove router and FRR sidecar isolation
         env:
           TWINET_O12_INTEGRATION_ALLOW_DESTRUCTIVE: "1"
-        run: make o12-integration
+        run: |
+          sudo env "PATH=$PATH" \
+            "TWINET_O12_INTEGRATION_ALLOW_DESTRUCTIVE=$TWINET_O12_INTEGRATION_ALLOW_DESTRUCTIVE" \
+            make o12-integration
 
   shell:
     name: Shell scripts and conventions

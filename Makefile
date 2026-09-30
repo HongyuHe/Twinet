@@ -385,6 +385,8 @@ nos-images: images
 o12-integration:
 	@test "$${TWINET_O12_INTEGRATION_ALLOW_DESTRUCTIVE:-}" = "1" || \
 		{ echo "make o12-integration requires TWINET_O12_INTEGRATION_ALLOW_DESTRUCTIVE=1"; exit 2; }
+	@test "$$(id -u)" = "0" || \
+		{ echo "make o12-integration requires root for host runtime state and container namespace inspection"; exit 2; }
 	@$(DOCKER) info >/dev/null 2>&1 || \
 		{ echo "make o12-integration requires a reachable Docker daemon"; exit 2; }
 	@$(MAKE) --no-print-directory images
