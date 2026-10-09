@@ -322,6 +322,7 @@ e2e: build
 # daemon, or cluster. They make a missing destructive acknowledgement a
 # testable contract rather than a convention hidden in release instructions.
 script-tests:
+	python3 scripts/test_msc_portable.py
 	shellcheck scripts/*.sh
 	bash scripts/test_release_runners.sh
 	bash scripts/test_remote_image_digest.sh

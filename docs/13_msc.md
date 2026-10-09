@@ -489,27 +489,81 @@ interrupt forwarding during configuration. They deliberately replace native CLI
 experiments with the declared configuration. Export experiments before recovery
 if their state should be retained.
 
-## Install or rebuild
+## Deploy on another machine
 
-The worker needs Linux namespaces, veth, XFRM, iptables policy matching, the OVS
-kernel module, Docker, and the Go toolchain declared in `go.mod`:
+The portable installer recreates the node-1 topology, addresses, FRR/OVS devices, firewall rules, MTUs, and two IPsec layers from the committed manifest. Each machine generates fresh private keys and certificates. Live session identifiers, timestamps, and the resulting evidence snapshot will differ. The installer never copies node-1 private state.
+
+Use a dedicated x86-64 Linux machine or VM with root access, Docker support, systemd, and the OVS/XFRM kernel modules. Ubuntu 24.04 is the fresh-worker test target. Allow several CPU cores, about 8 GiB of RAM, and 10 GiB of free disk space for a comfortable development environment. The image downloads require internet access. A native macOS or Windows host needs a Linux VM because the deployment uses Linux network namespaces and kernel IPsec.
+
+### Deploy directly from the repository
+
+Run these commands on the destination worker. Python 3 and Git are the only prerequisites for starting the installer on Ubuntu:
 
 ```sh
 sudo apt-get update
-sudo apt-get install -y docker.io golang-go iproute2 jq tcpdump
-sudo systemctl enable --now docker
-sudo modprobe openvswitch
-sudo modprobe xfrm_user
-sudo modprobe af_key
-sudo modprobe xt_policy
-git clone --branch tdn https://github.com/HongyuHe/Twinet.git
+sudo apt-get install -y git python3
+git clone --branch tdn --single-branch https://github.com/HongyuHe/Twinet.git
 cd Twinet
-go build -o bin/twinet ./cmd/twinet
-for image in $(jq -r '.image,.router_image,.switch_image' examples/msc/msc.json); do
-  sudo docker pull "$image"
-done
-sudo bin/twinet msc up
+sudo python3 scripts/msc_portable.py deploy --install-deps
 ```
+
+The installer installs Docker and host tools, loads the required modules, builds a static CLI, pulls the three pinned images, creates the network, and runs `msc check`. If Go is absent, the CLI is built in a temporary Go container selected from `go.mod`. A prebuilt bundle skips that compilation step. Device images are pulled from Docker Hub without rebuilding them.
+
+The global `twinet-msc` launcher records absolute paths, so collaborators can use it from any directory:
+
+```sh
+sudo twinet-msc console BLACK
+sudo twinet-msc console G_A1
+sudo twinet-msc console R_A1
+sudo twinet-msc exec I_A1 -- swanctl --list-sas
+sudo twinet-msc check
+sudo twinet-msc export --output /tmp/msc-new-snapshot
+```
+
+The CLI and public manifest are installed under `/opt/twinet-msc`. Private state remains under `/var/lib/twinet/msc`. Deployment logs, the complete check report, the source identity, the specification hash, and elapsed times are stored under `/var/lib/twinet/msc-deploy/`. Add `--export` to the deploy command to capture a public snapshot after validation. Use `--spec PATH` for another expanded version-2 layout with pinned image digests.
+
+The installer refuses existing device names, private state, installation files, or a launcher. It never automatically removes an existing lab. For a deployed lab, use `sudo twinet-msc up` after a reboot or `sudo twinet-msc recover` to restore the declared baseline. Those commands intentionally reapply configuration. A failed initial deployment retains its logs and partial state for inspection.
+
+### Make a bundle for faster deployment
+
+Build the bundle once on a machine with Go or Docker. The bundle contains a static Linux CLI, the manifest, installer, documentation, and checksums. It contains no private keys, runtime state, Docker credentials, or device images.
+
+```sh
+python3 scripts/msc_portable.py bundle --output dist/twinet-msc-linux-amd64.tar.gz
+scp dist/twinet-msc-linux-amd64.tar.gz* user@destination:/tmp/
+```
+
+On the destination worker:
+
+```sh
+cd /tmp
+sha256sum -c twinet-msc-linux-amd64.tar.gz.sha256
+tar -xzf twinet-msc-linux-amd64.tar.gz
+sudo python3 twinet-msc/scripts/msc_portable.py deploy --install-deps
+```
+
+Python 3 must already be installed to start the bundle installer. No Go installation or source compilation is needed for bundle deployment. Checksums identify the transferred files; obtain the archive and checksum through a trusted channel. The installer checks each bundled payload before using the CLI.
+
+### Fresh-worker validation
+
+On October 9, 2026, the portable bundle deployed the network on `clnode179.clemson.cloudlab.us`, an Ubuntu 24.04 worker that initially had neither Docker nor Go. All device images were pulled anonymously by their pinned digests. The running network has 35 logical devices, 44 virtual links, and seven FRR sidecars.
+
+| Check | Observed result |
+| --- | --- |
+| Network ready, including dependency installation and image pulls | 177.79 seconds |
+| Complete run, including all checks and a public snapshot export | 316.25 seconds |
+| Deployment checks | 273 passed |
+| Expanded manifest compared with node-1 | Identical |
+| Intended device configuration files compared with node-1 | All 68 identical |
+| Declared interface MTUs compared with live interfaces | All 88 matched |
+| Public CA observations on the eight encryptors | Differed from node-1, confirming separate generated trust material |
+| Router, switch, and host consoles from another directory | Passed |
+| Installer rerun against the existing network | Refused; container IDs and saved specification unchanged |
+| Native Go build versus Docker build without host Go | Identical static CLI binaries |
+
+The tested specification hash is `f3afd9e161ed928699d24420775369ab0a0770574c35ac6b4dc0239bf7df94f1`. The emulator source-content hash is `402ab2d35cea8761987c69d89730ef702d8634ab3a8b789fddeb26bfcc4f0dde`. The seven portable-installer regression tests also passed. The elapsed times describe one measured run; downloads and worker resources affect deployment time. Node-0 and the running node-1 deployment were preserved.
+
+### Rebuild device images
 
 Published images are `hyhe/twinet-msc`, `hyhe/twinet-msc-router`, and
 `hyhe/twinet-msc-switch`. The manifests pin tested digests. Native image sources
