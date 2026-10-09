@@ -7,6 +7,7 @@ import (
 	rt "github.com/HongyuHe/twinet/internal/runtime"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -47,11 +48,20 @@ func (e *Engine) Status(ctx context.Context) (Status, error) {
 		o := Observation{DeployedSpecHash: c.Labels["twinet.msc.spec"], ObservedAt: time.Now().UTC(), Device: d.ID, Role: d.Role, State: c.State, Image: c.ImageID, Facts: map[string]string{}, Errors: map[string]string{}}
 		if c.State == rt.StateRunning {
 			commands := map[string][]string{"interfaces": {"ip", "-j", "address", "show"}, "routes": {"ip", "-j", "route", "show", "table", "all"}, "rules": {"ip", "-j", "rule", "show"}, "filter": {"iptables-save", "-t", "filter"}, "forwarding": {"sysctl", "-n", "net.ipv4.ip_forward"}, "processes": {"ps", "-eo", "comm="}}
+			commands["clock-epoch"] = []string{"date", "-u", "+%s"}
+			commands["resolver"] = []string{"cat", "/etc/resolv.conf"}
+			commands["name-service"] = []string{"cat", "/etc/nsswitch.conf"}
+			commands["startup"] = []string{"sh", "-ec", "tr '\\000' ' ' < /proc/1/cmdline; printf '\\n'"}
+			commands["policies"] = []string{"ip", "xfrm", "policy", "list"}
+			commands["xfrm"] = []string{"ip", "-s", "xfrm", "state", "list", "nokeys"}
 			if d.Tunnel != nil {
 				commands["sas"] = []string{"swanctl", "--list-sas"}
-				commands["certificates"] = []string{"swanctl", "--list-certs"}
-				commands["policies"] = []string{"ip", "xfrm", "policy", "list"}
-				commands["xfrm"] = []string{"ip", "-s", "xfrm", "state", "list", "nokeys"}
+				commands["connections"] = []string{"swanctl", "--list-conns"}
+				commands["connections-raw"] = []string{"swanctl", "--list-conns", "--raw"}
+				commands["authorities-raw"] = []string{"swanctl", "--list-authorities", "--raw"}
+				commands["certificates"] = []string{"swanctl", "--list-certs", "--utc"}
+				commands["certificate-pem"] = []string{"swanctl", "--list-certs", "--pem"}
+				commands["trusted-ca-pem"] = []string{"cat", "/etc/swanctl/x509ca/ca.pem"}
 			}
 			if e.Spec.IsFRR(d) {
 				commands["frr-version"] = []string{"vtysh", "-c", "show version"}
@@ -74,7 +84,43 @@ func (e *Engine) Status(ctx context.Context) (Status, error) {
 				if er != nil {
 					o.Errors[k] = er.Error()
 				} else {
+					if k == "certificate-pem" || k == "trusted-ca-pem" {
+						if _, _, publicErr := decodePublicPEM([]byte(v)); publicErr != nil {
+							o.Errors[k] = publicErr.Error()
+							continue
+						}
+					}
 					o.Facts[k] = v
+				}
+			}
+			appliance, applianceErr := e.observeAppliance(ctx, d)
+			if applianceErr != nil {
+				o.Errors["appliance"] = applianceErr.Error()
+			} else {
+				encoded, encodeErr := json.Marshal(appliance)
+				if encodeErr != nil {
+					o.Errors["appliance"] = encodeErr.Error()
+				} else {
+					o.Facts["appliance"] = string(encoded)
+				}
+			}
+			if d.Tunnel != nil {
+				loaded, haveLoaded := o.Facts["certificate-pem"]
+				trusted, haveTrusted := o.Facts["trusted-ca-pem"]
+				if haveLoaded && haveTrusted {
+					audit, auditErr := auditPublicCredentials([]byte(loaded), []byte(trusted), time.Now().UTC())
+					if auditErr != nil {
+						o.Errors["credential-audit"] = auditErr.Error()
+					} else {
+						encoded, encodeErr := json.Marshal(audit)
+						if encodeErr != nil {
+							o.Errors["credential-audit"] = encodeErr.Error()
+						} else {
+							o.Facts["credential-audit"] = string(encoded)
+						}
+					}
+				} else {
+					o.Errors["credential-audit"] = "public credential observation unavailable"
 				}
 			}
 		}
@@ -211,30 +257,16 @@ func (e *Engine) Check(ctx context.Context) (Report, error) {
 			}
 			name := from.ID + "/" + target.ID
 			r.add("gray-firewall-cut/"+name, graySeparated(e.Spec, from.ID, target.ID), "all modeled physical Gray paths cross a Gray Firewall")
-			counters := func() (string, error) {
-				var out strings.Builder
-				for _, gf := range e.Spec.Role("gray-firewall") {
-					if gf.Site != from.Site {
-						continue
-					}
-					v, er := e.exec(ctx, gf.ID, "iptables", "-nvx", "-L", "FORWARD")
-					if er != nil {
-						return "", er
-					}
-					out.WriteString(v)
-				}
-				return out.String(), nil
-			}
-			before, er := counters()
+			before, er := e.grayDropCounters(ctx, from.Site)
 			if er != nil {
 				return r, er
 			}
-			ok, _, probeErr := e.ping(ctx, from.ID, target.Tunnel.Local)
-			if probeErr != nil {
-				return r, probeErr
-			}
-			after, er := counters()
-			r.add("gray-cross-level/"+name, !ok && er == nil && before != after, "probe blocked and firewall counters changed")
+			// A link-layer probe reaches the Gray Firewall independently of
+			// the sender's intentionally restrictive local OUTPUT policy.
+			probeErr := e.injectGrayProbe(ctx, from, target)
+			after, er := e.grayDropCounters(ctx, from.Site)
+			r.add("gray-cross-level/"+name, probeErr == nil && er == nil && after > before,
+				fmt.Sprintf("Gray Firewall DROP counter %d -> %d; probe error=%v; read error=%v", before, after, probeErr, er))
 		}
 	}
 
@@ -380,3 +412,89 @@ func (e *Engine) captureCommand(id string) string {
 func (e *Engine) readCapture(ctx context.Context, id string, args ...string) (string, error) {
 	return e.exec(ctx, id, append(strings.Fields(e.captureCommand(id)), args...)...)
 }
+
+func forwardDefaultDrops(text string) (uint64, error) {
+	first := strings.SplitN(text, "\n", 2)[0]
+	words := strings.Fields(first)
+	if len(words) < 6 || words[0] != "Chain" || words[1] != "FORWARD" || words[3] != "DROP" {
+		return 0, fmt.Errorf("expected a DROP FORWARD policy, got %q", first)
+	}
+	return strconv.ParseUint(words[4], 10, 64)
+}
+
+func (e *Engine) grayDropCounters(ctx context.Context, site string) (uint64, error) {
+	var total uint64
+	for _, gf := range e.Spec.Role("gray-firewall") {
+		if gf.Site != site {
+			continue
+		}
+		text, err := e.exec(ctx, gf.ID, "iptables", "-nvx", "-L", "FORWARD")
+		if err != nil {
+			return 0, err
+		}
+		count, err := forwardDefaultDrops(text)
+		if err != nil {
+			return 0, err
+		}
+		total += count
+	}
+	return total, nil
+}
+
+// injectGrayProbe measures the firewall itself using one explicit IPv4/ICMP
+// frame. Raw Ethernet avoids treating a sender OUTPUT rejection as a firewall
+// rejection. The observed route chooses the interface and next-hop MAC.
+func (e *Engine) injectGrayProbe(ctx context.Context, from, target *Device) error {
+	raw, err := e.exec(ctx, from.ID, "ip", "-j", "route", "get", target.Tunnel.Local)
+	if err != nil {
+		return err
+	}
+	var routes []struct {
+		Gateway string `json:"gateway"`
+		Dev     string `json:"dev"`
+	}
+	if err = json.Unmarshal([]byte(raw), &routes); err != nil {
+		return err
+	}
+	if len(routes) != 1 || routes[0].Gateway == "" || routes[0].Dev != from.Tunnel.Outside {
+		return fmt.Errorf("no unambiguous Gray gateway for %s", from.ID)
+	}
+	var gateway *Device
+	var port string
+	for _, d := range e.Spec.Role("gray-firewall") {
+		for _, i := range d.Interfaces {
+			if strings.Split(i.Address, "/")[0] == routes[0].Gateway {
+				gateway, port = d, i.Name
+			}
+		}
+	}
+	if gateway == nil {
+		return fmt.Errorf("Gray probe next hop is not a declared firewall")
+	}
+	mac, err := e.exec(ctx, gateway.ID, "cat", "/sys/class/net/"+port+"/address")
+	if err != nil {
+		return err
+	}
+	_, err = e.exec(ctx, from.ID, "python3", "-c", grayProbePython,
+		routes[0].Dev, from.Tunnel.Local, target.Tunnel.Local, strings.TrimSpace(mac))
+	return err
+}
+
+const grayProbePython = `import socket,struct,sys
+iface,source,target,peer=sys.argv[1:]
+def checksum(data):
+    words=struct.unpack('!%dH'%(len(data)//2),data)
+    total=sum(words)
+    while total>>16: total=(total&65535)+(total>>16)
+    return (~total)&65535
+icmp=struct.pack('!BBHHH',8,0,0,19795,1)
+icmp=struct.pack('!BBHHH',8,0,checksum(icmp),19795,1)
+header=struct.pack('!BBHHHBBH4s4s',69,0,28,19795,0,64,1,0,socket.inet_aton(source),socket.inet_aton(target))
+header=header[:10]+struct.pack('!H',checksum(header))+header[12:]
+with open('/sys/class/net/'+iface+'/address') as stream: local=stream.read().strip()
+frame=bytes.fromhex(peer.replace(':',''))+bytes.fromhex(local.replace(':',''))+b'\x08\x00'+header+icmp
+sock=socket.socket(socket.AF_PACKET,socket.SOCK_RAW)
+sock.bind((iface,0))
+sock.send(frame)
+sock.close()
+`

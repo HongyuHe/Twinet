@@ -117,7 +117,7 @@ def check_inline_paths(paths: list[Path], problems: list[str]) -> None:
     for source in paths:
         body = source.read_text(encoding="utf-8")
         for code in INLINE_CODE.findall(body):
-            for token in PATH_TOKEN.findall(code):
+            for token in PATH_TOKEN.findall(re.sub(r"https?://\S+", "", code)):
                 token = token.rstrip(".,:;)")
                 if "*" in token or "$" in token:
                     continue

@@ -31,7 +31,7 @@ func Generate(o Layout) (*Spec, error) {
 	if !identifier.MatchString(o.Name) || o.Levels < 1 || o.Levels > 8 || o.OuterFirewalls < 1 || o.OuterFirewalls > o.Levels || o.GrayFirewalls < 1 || o.GrayFirewalls > o.Levels {
 		return nil, fmt.Errorf("name must be a safe identifier; levels=1..8; outer-firewalls and gray-firewalls=1..levels per site")
 	}
-	s := &Spec{Version: 2, RouterImage: "hyhe/twinet-msc-router@sha256:ea7ba8412a19340a843abe7e3b9ea12fafbc3ba966fb103290a8660e7d731920", SwitchImage: "hyhe/twinet-msc-switch@sha256:7d112ada3368efd46b649927bf09e38875a582fb575ef6c443b532a6c093b83d", Name: o.Name, Image: "hyhe/twinet-msc@sha256:6cfc920ac8df78b10746e78d730366781d3db2ab957dd13d9368cb7ca63264fa", MTU: 1400}
+	s := &Spec{Version: 2, RouterImage: "hyhe/twinet-msc-router@sha256:ea7ba8412a19340a843abe7e3b9ea12fafbc3ba966fb103290a8660e7d731920", SwitchImage: "hyhe/twinet-msc-switch@sha256:7d112ada3368efd46b649927bf09e38875a582fb575ef6c443b532a6c093b83d", Name: o.Name, Image: "hyhe/twinet-msc@sha256:6cfc920ac8df78b10746e78d730366781d3db2ab957dd13d9368cb7ca63264fa", MTU: 1500}
 	add := func(id, role, site, level string) {
 		s.Devices = append(s.Devices, Device{ID: id, Role: role, Site: site, Level: level})
 	}
@@ -154,6 +154,19 @@ func Generate(o Layout) (*Spec, error) {
 			for j, id := range targets {
 				cable(id, "mgmt", fmt.Sprintf("%s%d/24", net, j+20), "management", sw, fmt.Sprintf("d%d", j), "", "management")
 				s.Device(id).Admin = net + "10"
+			}
+		}
+	}
+	// Reserve 65 bytes for each IPv4 AES-GCM ESP layer, including optional
+	// UDP encapsulation and up to three padding bytes. Red packets fit both.
+	for di := range s.Devices {
+		for pi := range s.Devices[di].Interfaces {
+			port := &s.Devices[di].Interfaces[pi]
+			switch port.Zone {
+			case "red":
+				port.MTU = 1370
+			case "gray":
+				port.MTU = 1435
 			}
 		}
 	}

@@ -142,25 +142,17 @@ Twinet generates firewall rules from the manifest and loads them with
 the packet filters with `iptables`. OVS provides switching through `ovs-vsctl`
 and `ovs-ofctl`.
 
-Security appliances begin with `INPUT DROP` and `FORWARD DROP`, then permit
-specific traffic. Locally generated traffic uses `OUTPUT ACCEPT`. Twinet
-disables forwarding while it prepares devices and installs filters before
-enabling data forwarding. The rules come from
-[`filterRules`](../internal/msc/render.go); the deployment sequence is in
-[`engine.go`](../internal/msc/engine.go).
+Inner and outer encryptors, Outer Firewalls, and Gray Firewalls use default DROP policies for INPUT, FORWARD, and OUTPUT. Encryptors permit external local IKE on UDP ports 500/4500 and ESP between the declared tunnel endpoints. Their loopback allowances cover TCP, UDP, ESP, and ICMP on `lo`. Firewall loopback traffic is explicitly allowed. Optional administration replies are bound to the management interface and designated admin address. BLACK and switches retain their transport policies. Twinet installs the filters before enabling data forwarding. The rules come from [`filterRules`](../internal/msc/render.go), and [`engine.go`](../internal/msc/engine.go) controls deployment.
 
-Outer Firewalls permit only the declared outer-encryptor endpoint pairs on the
-expected interfaces. For example, `OF_A1` permits `172.20.11.1` to communicate
-with `172.20.21.1` using ESP or UDP destination ports 500 and 4500. Reverse rules
-permit the corresponding return traffic. Separate input rules admit OSPF from
-the adjacent BLACK router and management traffic from the designated admin.
-The firewall checks headers and protocols without decrypting ESP payloads.
+Outer Firewalls forward only the declared outer-encryptor endpoint pairs on the expected interfaces. For example, `OF_A1` permits `172.20.11.1` to communicate with `172.20.21.1` using ESP or UDP destination ports 500 and 4500. Reverse rules permit the corresponding return traffic. Local INPUT permits OSPF from the adjacent BLACK address to the firewall address or AllSPFRouters `224.0.0.5`. Local OUTPUT permits OSPF from the firewall address to that adjacent peer or AllSPFRouters. Every OSPF grant names the declared Black interface. The firewall checks headers and protocols without decrypting ESP payloads.
 
 Gray Firewalls block cross-level forwarding in the default layout. Each level
 has a separate OVS switch, so same-level inner-to-outer traffic stays within
 that segment. Routed attempts to reach another level pass through `GF_A` or
 `GF_B` and meet the default DROP policy. The default Gray Firewall has no
-forwarding accept rules.
+forwarding accept rules. Gray Firewalls also deny local data-interface INPUT and OUTPUT traffic; loopback and optional administration remain explicit exceptions.
+
+The Gray-isolation probe sends a diagnostic Ethernet/IPv4/ICMP frame toward the routed Gray Firewall and requires its FORWARD DROP counter to increase. The probe obtains the next hop and destination MAC from the actual route and firewall interface. It bypasses the source gateway's local OUTPUT chain for that diagnostic frame, so source-side rejection cannot be mistaken for Gray-firewall enforcement.
 
 Shared-Gray layouts place the Gray Firewall inline between each inner encryptor
 and the common OVS fabric. Generated rules permit only ESP and IKE traffic
@@ -174,6 +166,8 @@ on the management interface. The HTTPS health endpoint requires a trusted
 client certificate and TLS 1.3. The endpoint demonstrates management
 authentication; interactive device access uses worker SSH followed by
 `msc console` or `docker exec`.
+
+Outer encryptors reject IPv4 options on every accepting filter rule. The u32 match `0>>0x18&0xf=0x5` requires an IPv4 header length of five 32-bit words. Default DROP policies prevent unmatched packets from bypassing that check. Inner forwarding rules retain their peer selectors and direction-specific IPsec request IDs while limiting the carried protocol to TCP, UDP, ESP, or ICMP. Those guards address the PF-10 and PF-11 gaps found during the TDN proof review.
 
 ### Two layers of IPsec encryption
 
@@ -228,6 +222,14 @@ trust domain. Strict certificate-revocation checking is enabled. CA private
 keys stay in the worker's private state directory; each encryptor receives its
 own credentials, trust anchor, and CRL. Certificate generation and renewal are
 implemented in [`pki.go`](../internal/msc/pki.go).
+
+### Packet sizes and fragmentation
+
+The current node-1 profile uses per-interface MTUs of 1370 bytes on Red, 1435 on Gray, and 1500 on Black. An interface can override the specification-wide `mtu` through its own `mtu` field. A zero or omitted interface value inherits the specification value. Explicit overrides must lie between 1280 and that value.
+
+The 65-byte allowance per layer covers a 20-byte outer IPv4 header, 8-byte ESP header, 8-byte AES-GCM IV, up to 3 padding bytes, 2 trailer bytes, 16-byte integrity tag, and optional 8-byte UDP encapsulation. The calculation assumes no outer IPv4 options or extra traffic-flow-confidentiality padding. A complete Red IPv4 datagram of at most 1370 bytes therefore fits both subsequent MTUs under that encoding.
+
+Boundary tests on all four Red hosts delivered 1369- and 1370-byte DF datagrams to the same-level remote host. A 1371-byte DF datagram was rejected locally with `mtu=1370`. Those probes and the size bound cover the configured packet-size boundary. Input fragmentation and broader PMTU control behavior require separate checks.
 
 ### Requiring encryption before forwarding
 
@@ -430,6 +432,16 @@ The exporter never copies private keys, credential stores, or the private state
 directory. Intended and observed values remain separate, including during a
 misconfiguration. Missing or failed observations carry explicit errors and must
 be treated as unknown facts.
+
+XFRM policies and key-redacted SA state are collected on every device, including hosts, routers, and switches. An observed empty list records the absence of installed XFRM entries at collection time. A failed or missing command remains unknown.
+
+Encryptor observations also include every loaded public certificate and CRL in PEM form, the configured public CA file, both connection-list formats, the complete loaded authority inventory, and every IKE/CHILD session. The exporter records public certificate-path and CRL-signature verification results against the selected CA at the sampled worker time. It retains validity intervals, algorithms, usages, revocation serials, object fingerprints, CRL distribution points, OCSP servers, and issuer-certificate retrieval URLs. Empty retrieval lists record observed absence, and failed or missing observations remain unknown. PEM validation rejects private-key and unsupported blocks before storing any PEM observation. Certificate verification is a trusted library operation; the bundle records its inputs and results for later policy checks.
+
+Each encryptor's `intended.services.json` records its external IKE/ESP endpoint policy, local-CRL mechanism, and shared worker clock. The default layout uses permanent IPv4 addresses and local CRL files. Its inner peer exchanges follow the same-level switches and outer encryptors without a Gray Firewall hop. The loaded certificate and authority records let a consumer check whether a new retrieval endpoint introduces an additional required service. Shared-Gray layouts place their Gray Firewalls on the corresponding paths and require the generated positive allowances.
+
+Docker observations additionally record the configured startup entrypoint and command for every container sharing each device's network namespace. Known Twinet entrypoint scripts are captured verbatim. The record includes each participant's resolver and name-service configuration, so an FRR sidecar is visible even though the interactive router container has a separate process namespace. The namespace process scan reads executable paths and process names without collecting process arguments or environment variables. Worker and container clock samples are bracketed by collection times, and the worker's NTP synchronization flag is recorded. Unsupported runtimes or failed reads remain explicit observation errors.
+
+Those records support configuration checks for specified DNS servers, boot-time configuration, unused interfaces, and routing daemons. OVS startup must be interpreted together with the captured manager/controller configuration because its database option can enable remote configuration connections. The records describe the collection interval and configured startup; they do not reconstruct earlier boots or prove future behavior after operator changes.
 
 Each device records its deployed specification hash separately from the chosen
 manifest. Editing a manifest does not relabel the running deployment, and `check`

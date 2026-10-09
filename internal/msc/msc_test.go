@@ -88,12 +88,27 @@ func TestEncryptionFiltersNeverBypassPolicy(t *testing.T) {
 			t.Fatal("not fail closed")
 		}
 		for _, line := range strings.Split(text, "\n") {
+			if strings.HasPrefix(line, "-A ") && strings.HasSuffix(line, "-j ACCEPT") {
+				allowed := false
+				for _, proto := range []string{"tcp", "udp", "esp", "icmp"} {
+					allowed = allowed || strings.Contains(line, " -p "+proto+" ")
+				}
+				if !allowed {
+					t.Fatalf("gateway accepts an unrestricted IPv4 protocol: %s", line)
+				}
+				if d.Role == "outer" && !strings.Contains(line, "--u32 \"0>>0x18&0xf=0x5\"") {
+					t.Fatalf("outer accepts IPv4 options: %s", line)
+				}
+			}
 			if strings.HasPrefix(line, "-A FORWARD") && (!strings.Contains(line, "--pol ipsec") || !strings.Contains(line, "--reqid ")) {
 				t.Fatalf("unguarded forward rule: %s", line)
 			}
 			if strings.Contains(line, "-A FORWARD") && d.Role == "outer" && !strings.Contains(line, "-p esp") && !strings.Contains(line, "--dports 500,4500") {
 				t.Fatalf("outer can carry arbitrary Gray plaintext: %s", line)
 			}
+		}
+		if !strings.Contains(text, ":OUTPUT DROP") {
+			t.Fatal("gateway output bypasses protocol/options restrictions")
 		}
 	}
 }
@@ -479,5 +494,65 @@ func TestExportKeepsDeployedAndIntendedSpecsDistinct(t *testing.T) {
 		if d.Deployed != "previous-deployment" {
 			t.Fatal("relabelled old observations as the new specification")
 		}
+	}
+}
+
+func TestGatewayLocalOutputIsBoundToPeer(t *testing.T) {
+	s := Example()
+	for _, d := range s.Devices {
+		if d.Tunnel == nil {
+			continue
+		}
+		tunnel := d.Tunnel
+		dataRules := 0
+		for _, line := range strings.Split(filterRules(s, &d), "\n") {
+			if !strings.HasPrefix(line, "-A OUTPUT ") {
+				continue
+			}
+			if strings.Contains(line, " -o lo ") || strings.Contains(line, " -o mgmt ") {
+				continue
+			}
+			dataRules++
+			for _, required := range []string{" -o " + tunnel.Outside + " ", " -s " + tunnel.Local + " ", " -d " + tunnel.Remote + " "} {
+				if !strings.Contains(line, required) {
+					t.Fatalf("unbound data OUTPUT on %s: %s", d.ID, line)
+				}
+			}
+			if !strings.Contains(line, " -p esp ") && !(strings.Contains(line, " -p udp ") && strings.Contains(line, "--dports 500,4500")) {
+				t.Fatalf("unapproved local protocol on %s: %s", d.ID, line)
+			}
+		}
+		if dataRules != 2 {
+			t.Fatalf("%s has %d peer rules, expected IKE and ESP", d.ID, dataRules)
+		}
+	}
+}
+
+func TestDefaultTunnelMTUsReserveEncapsulationHeadroom(t *testing.T) {
+	s := Example()
+	for _, d := range s.Devices {
+		if d.Tunnel == nil {
+			continue
+		}
+		inside := s.InterfaceMTU(d.Interface(d.Tunnel.Inside))
+		outside := s.InterfaceMTU(d.Interface(d.Tunnel.Outside))
+		if inside+65 > outside {
+			t.Fatalf("%s: %d + 65 > %d", d.ID, inside, outside)
+		}
+	}
+	d := s.Device("I_A1")
+	d.Interface("red").MTU = s.MTU + 1
+	if s.Validate() == nil {
+		t.Fatal("oversized per-interface MTU accepted")
+	}
+}
+
+func TestGrayProbeRequiresDropCounter(t *testing.T) {
+	value, err := forwardDefaultDrops("Chain FORWARD (policy DROP 17 packets, 1428 bytes)\n")
+	if err != nil || value != 17 {
+		t.Fatalf("count=%d err=%v", value, err)
+	}
+	if _, err := forwardDefaultDrops("Chain FORWARD (policy ACCEPT 17 packets, 1428 bytes)\n"); err == nil {
+		t.Fatal("ACCEPT counter treated as DROP")
 	}
 }

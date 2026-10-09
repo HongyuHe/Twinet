@@ -36,6 +36,7 @@ type Device struct {
 	Admin      string      `json:"admin,omitempty"`
 }
 type Interface struct {
+	MTU     int    `json:"mtu,omitempty"`
 	Name    string `json:"name"`
 	Address string `json:"address,omitempty"`
 	Zone    string `json:"zone"`
@@ -102,6 +103,14 @@ func (d *Device) Interface(name string) *Interface {
 	}
 	return nil
 }
+
+// InterfaceMTU resolves an explicit per-port MTU or the common link default.
+func (s *Spec) InterfaceMTU(i *Interface) int {
+	if i.MTU != 0 {
+		return i.MTU
+	}
+	return s.MTU
+}
 func (s *Spec) Hash() string {
 	b, _ := json.Marshal(s)
 	h := sha256.Sum256(b)
@@ -139,6 +148,9 @@ func (s *Spec) Validate() error {
 				return fmt.Errorf("invalid/duplicate interface %s", k)
 			}
 			endpoints[k] = true
+			if i.MTU != 0 && (i.MTU < 1280 || i.MTU > s.MTU) {
+				return fmt.Errorf("interface MTU must be 1280..link MTU on %s", k)
+			}
 			if i.Address != "" {
 				p, e := netip.ParsePrefix(i.Address)
 				if e != nil || !p.Addr().Is4() || addresses[p.Addr().String()] {

@@ -227,7 +227,7 @@ func (e *Engine) Up(ctx context.Context, recoverFault bool) error {
 			if err != nil {
 				return err
 			}
-			p := netx.EndpointSpec{NSPath: ns, Name: i.Name, MAC: interfaceMAC(e.Spec.Name, d.ID, i.Name), MTU: e.Spec.MTU, OwnAddrs: true, Up: true, Altname: fmt.Sprintf("msc-%s-%d-%s", e.Spec.Name, n, d.ID)}
+			p := netx.EndpointSpec{NSPath: ns, Name: i.Name, MAC: interfaceMAC(e.Spec.Name, d.ID, i.Name), MTU: e.Spec.InterfaceMTU(i), OwnAddrs: true, Up: true, Altname: fmt.Sprintf("msc-%s-%d-%s", e.Spec.Name, n, d.ID)}
 			if i.Address != "" {
 				p.Addrs = []string{i.Address}
 			}

@@ -89,6 +89,15 @@ func (e *Engine) Export(ctx context.Context, dir string) error {
 		}
 		if d.Tunnel != nil {
 			files[base+"intended.swanctl.conf"] = []byte(swanConfig(d))
+			t := d.Tunnel
+			if err = putJSON(base+"intended.services.json", map[string]any{
+				"external_interface": t.Outside, "local_address": t.Local, "peer_address": t.Remote,
+				"external_local_protocols": []string{"esp", "udp/500", "udp/4500"},
+				"revocation_delivery":      "local CRL files", "clock": "shared worker kernel",
+				"management": "optional and excluded from retained proof scope",
+			}); err != nil {
+				return err
+			}
 		}
 	}
 	if err = putJSON("facts.json", map[string]any{"schema_version": 1, "spec_sha256": e.Spec.Hash(), "started": status.Started, "finished": status.Finished, "devices": normalized}); err != nil {

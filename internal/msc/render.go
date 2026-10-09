@@ -53,9 +53,26 @@ func swanConfig(d *Device) string {
 // Every forwarded payload must still match its IPsec policy after SA loss.
 func filterRules(s *Spec, d *Device) string {
 	var b strings.Builder
-	b.WriteString("*filter\n:INPUT DROP [0:0]\n:FORWARD DROP [0:0]\n:OUTPUT ACCEPT [0:0]\n-A INPUT -i lo -j ACCEPT\n")
+	b.WriteString("*filter\n:INPUT DROP [0:0]\n:FORWARD DROP [0:0]\n")
+	localDefaultDeny := d.Role == "inner" || d.Role == "outer" || d.Role == "firewall" || d.Role == "gray-firewall"
+	if d.Role == "inner" || d.Role == "outer" {
+		// PF-11 applies to every gateway. Keep loopback and locally generated
+		// traffic inside the same IPv4 protocol set as forwarded payloads.
+		// Data-facing OUTPUT allowances are bound to the tunnel peer below.
+		b.WriteString(":OUTPUT DROP [0:0]\n")
+		for _, proto := range []string{"tcp", "udp", "esp", "icmp"} {
+			fmt.Fprintf(&b, "-A INPUT -i lo -p %s -j ACCEPT\n-A OUTPUT -o lo -p %s -j ACCEPT\n", proto, proto)
+		}
+	} else if localDefaultDeny {
+		b.WriteString(":OUTPUT DROP [0:0]\n-A INPUT -i lo -j ACCEPT\n-A OUTPUT -o lo -j ACCEPT\n")
+	} else {
+		b.WriteString(":OUTPUT ACCEPT [0:0]\n-A INPUT -i lo -j ACCEPT\n")
+	}
 	if d.Admin != "" {
 		fmt.Fprintf(&b, "-A INPUT -i mgmt -s %s -p icmp -j ACCEPT\n-A INPUT -i mgmt -s %s -p tcp --dport 8443 -j ACCEPT\n", d.Admin, d.Admin)
+		if localDefaultDeny {
+			fmt.Fprintf(&b, "-A OUTPUT -o mgmt -d %s -p icmp -j ACCEPT\n-A OUTPUT -o mgmt -d %s -p tcp --sport 8443 -j ACCEPT\n", d.Admin, d.Admin)
+		}
 	}
 	switch d.Role {
 	case "host", "admin":
@@ -72,8 +89,11 @@ func filterRules(s *Spec, d *Device) string {
 		b.WriteString("-A INPUT -p icmp -j ACCEPT\n-A FORWARD -j ACCEPT\n")
 	case "inner", "outer":
 		t := d.Tunnel
+		// Only the declared peer may receive gateway-local IKE or ESP on
+		// the external data interface. Protected forwarding keeps its XFRM guard.
+		fmt.Fprintf(&b, "-A OUTPUT -o %s -s %s -d %s -p udp -m multiport --dports 500,4500 -j ACCEPT\n-A OUTPUT -o %s -s %s -d %s -p esp -j ACCEPT\n", t.Outside, t.Local, t.Remote, t.Outside, t.Local, t.Remote)
 		fmt.Fprintf(&b, "-A INPUT -i %s -s %s -d %s -p udp -m multiport --dports 500,4500 -j ACCEPT\n-A INPUT -i %s -s %s -d %s -p esp -j ACCEPT\n", t.Outside, t.Remote, t.Local, t.Outside, t.Remote, t.Local)
-		protocols := []string{""}
+		protocols := []string{" -p tcp", " -p udp", " -p esp", " -p icmp"}
 		if d.Role == "outer" {
 			protocols = []string{" -p esp", " -p udp -m multiport --dports 500,4500"}
 		}
@@ -88,7 +108,16 @@ func filterRules(s *Spec, d *Device) string {
 				continue
 			}
 			if s.IsOSPF(d) && s.IsOSPF(peer) {
-				fmt.Fprintf(&b, "-A INPUT -i %s -s %s -p ospf -j ACCEPT\n", port.Name, strings.Split(pi.Address, "/")[0])
+				local := strings.Split(port.Address, "/")[0]
+				remote := strings.Split(pi.Address, "/")[0]
+				// Native OSPF adjacencies use numbered point-to-point links.
+				// Bind both directions to that link and its actual neighbor.
+				for _, destination := range []string{local, "224.0.0.5"} {
+					fmt.Fprintf(&b, "-A INPUT -i %s -s %s -d %s -p ospf -j ACCEPT\n", port.Name, remote, destination)
+				}
+				for _, destination := range []string{remote, "224.0.0.5"} {
+					fmt.Fprintf(&b, "-A OUTPUT -o %s -s %s -d %s -p ospf -j ACCEPT\n", port.Name, local, destination)
+				}
 			}
 			if peer.Role != "outer" {
 				continue
@@ -112,7 +141,14 @@ func filterRules(s *Spec, d *Device) string {
 
 	}
 	b.WriteString("COMMIT\n")
-	return b.String()
+	rules := b.String()
+	if d.Role == "outer" {
+		// The low nibble of the first IPv4 byte is the header length in words.
+		// PF-10 selects IHL=5, excluding options on every ACCEPT path. Chain
+		// defaults remain DROP, including OUTPUT, so no broad path bypasses it.
+		rules = strings.ReplaceAll(rules, " -j ACCEPT", " -m u32 --u32 \"0>>0x18&0xf=0x5\" -j ACCEPT")
+	}
+	return rules
 }
 func canonicalFilter(in string) string {
 	var out []string

@@ -4,7 +4,7 @@
   "image": "hyhe/twinet-msc@sha256:6cfc920ac8df78b10746e78d730366781d3db2ab957dd13d9368cb7ca63264fa",
   "router_image": "hyhe/twinet-msc-router@sha256:ea7ba8412a19340a843abe7e3b9ea12fafbc3ba966fb103290a8660e7d731920",
   "switch_image": "hyhe/twinet-msc-switch@sha256:7d112ada3368efd46b649927bf09e38875a582fb575ef6c443b532a6c093b83d",
-  "mtu": 1400,
+  "mtu": 1500,
   "devices": [
     {
       "id": "BLACK",
@@ -40,12 +40,14 @@
         {
           "name": "s1",
           "address": "10.100.1.254/24",
-          "zone": "gray"
+          "zone": "gray",
+          "mtu": 1435
         },
         {
           "name": "s2",
           "address": "10.100.2.254/24",
-          "zone": "gray"
+          "zone": "gray",
+          "mtu": 1435
         },
         {
           "name": "mgmt",
@@ -110,7 +112,8 @@
         {
           "name": "red",
           "address": "10.1.1.10/24",
-          "zone": "red"
+          "zone": "red",
+          "mtu": 1370
         }
       ],
       "routes": [
@@ -129,12 +132,14 @@
         {
           "name": "red",
           "address": "10.1.1.1/24",
-          "zone": "red"
+          "zone": "red",
+          "mtu": 1370
         },
         {
           "name": "gray",
           "address": "10.100.1.2/24",
-          "zone": "gray"
+          "zone": "gray",
+          "mtu": 1435
         },
         {
           "name": "mgmt",
@@ -178,7 +183,8 @@
         {
           "name": "gray",
           "address": "10.100.1.1/24",
-          "zone": "gray"
+          "zone": "gray",
+          "mtu": 1435
         },
         {
           "name": "black",
@@ -223,17 +229,20 @@
         {
           "name": "inner",
           "zone": "gray",
-          "bridge": true
+          "bridge": true,
+          "mtu": 1435
         },
         {
           "name": "outer",
           "zone": "gray",
-          "bridge": true
+          "bridge": true,
+          "mtu": 1435
         },
         {
           "name": "filter",
           "zone": "gray",
-          "bridge": true
+          "bridge": true,
+          "mtu": 1435
         }
       ]
     },
@@ -246,7 +255,8 @@
         {
           "name": "red",
           "address": "10.1.2.10/24",
-          "zone": "red"
+          "zone": "red",
+          "mtu": 1370
         }
       ],
       "routes": [
@@ -265,12 +275,14 @@
         {
           "name": "red",
           "address": "10.1.2.1/24",
-          "zone": "red"
+          "zone": "red",
+          "mtu": 1370
         },
         {
           "name": "gray",
           "address": "10.100.2.2/24",
-          "zone": "gray"
+          "zone": "gray",
+          "mtu": 1435
         },
         {
           "name": "mgmt",
@@ -314,7 +326,8 @@
         {
           "name": "gray",
           "address": "10.100.2.1/24",
-          "zone": "gray"
+          "zone": "gray",
+          "mtu": 1435
         },
         {
           "name": "black",
@@ -359,17 +372,20 @@
         {
           "name": "inner",
           "zone": "gray",
-          "bridge": true
+          "bridge": true,
+          "mtu": 1435
         },
         {
           "name": "outer",
           "zone": "gray",
-          "bridge": true
+          "bridge": true,
+          "mtu": 1435
         },
         {
           "name": "filter",
           "zone": "gray",
-          "bridge": true
+          "bridge": true,
+          "mtu": 1435
         }
       ]
     },
@@ -494,12 +510,14 @@
         {
           "name": "s1",
           "address": "10.200.1.254/24",
-          "zone": "gray"
+          "zone": "gray",
+          "mtu": 1435
         },
         {
           "name": "s2",
           "address": "10.200.2.254/24",
-          "zone": "gray"
+          "zone": "gray",
+          "mtu": 1435
         },
         {
           "name": "mgmt",
@@ -564,7 +582,8 @@
         {
           "name": "red",
           "address": "10.2.1.10/24",
-          "zone": "red"
+          "zone": "red",
+          "mtu": 1370
         }
       ],
       "routes": [
@@ -583,12 +602,14 @@
         {
           "name": "red",
           "address": "10.2.1.1/24",
-          "zone": "red"
+          "zone": "red",
+          "mtu": 1370
         },
         {
           "name": "gray",
           "address": "10.200.1.2/24",
-          "zone": "gray"
+          "zone": "gray",
+          "mtu": 1435
         },
         {
           "name": "mgmt",
@@ -632,7 +653,8 @@
         {
           "name": "gray",
           "address": "10.200.1.1/24",
-          "zone": "gray"
+          "zone": "gray",
+          "mtu": 1435
         },
         {
           "name": "black",
@@ -677,17 +699,20 @@
         {
           "name": "inner",
           "zone": "gray",
-          "bridge": true
+          "bridge": true,
+          "mtu": 1435
         },
         {
           "name": "outer",
           "zone": "gray",
-          "bridge": true
+          "bridge": true,
+          "mtu": 1435
         },
         {
           "name": "filter",
           "zone": "gray",
-          "bridge": true
+          "bridge": true,
+          "mtu": 1435
         }
       ]
     },
@@ -700,7 +725,8 @@
         {
           "name": "red",
           "address": "10.2.2.10/24",
-          "zone": "red"
+          "zone": "red",
+          "mtu": 1370
         }
       ],
       "routes": [
@@ -719,12 +745,14 @@
         {
           "name": "red",
           "address": "10.2.2.1/24",
-          "zone": "red"
+          "zone": "red",
+          "mtu": 1370
         },
         {
           "name": "gray",
           "address": "10.200.2.2/24",
-          "zone": "gray"
+          "zone": "gray",
+          "mtu": 1435
         },
         {
           "name": "mgmt",
@@ -768,7 +796,8 @@
         {
           "name": "gray",
           "address": "10.200.2.1/24",
-          "zone": "gray"
+          "zone": "gray",
+          "mtu": 1435
         },
         {
           "name": "black",
@@ -813,17 +842,20 @@
         {
           "name": "inner",
           "zone": "gray",
-          "bridge": true
+          "bridge": true,
+          "mtu": 1435
         },
         {
           "name": "outer",
           "zone": "gray",
-          "bridge": true
+          "bridge": true,
+          "mtu": 1435
         },
         {
           "name": "filter",
           "zone": "gray",
-          "bridge": true
+          "bridge": true,
+          "mtu": 1435
         }
       ]
     },
