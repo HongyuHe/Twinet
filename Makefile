@@ -323,6 +323,7 @@ e2e: build
 # testable contract rather than a convention hidden in release instructions.
 script-tests:
 	shellcheck scripts/*.sh
+	bash scripts/test_cluster_ci_config.sh
 	bash scripts/test_release_runners.sh
 	bash scripts/test_remote_image_digest.sh
 	bash scripts/test_push_images.sh

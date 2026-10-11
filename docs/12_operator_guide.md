@@ -953,6 +953,24 @@ operator knowingly accepts the loss, and both are audited.
 
 ## 11. Benchmark and soak
 
+### GitHub Actions configuration
+
+The **Scale reliability evidence** workflow runs a hosted configuration check before it can queue a cluster job. Automatic cluster tests are opt-in because the benchmark, chaos, and soak commands require a dedicated cluster. An unset or `false` repository variable `TWINET_CLUSTER_CI_ENABLED` leaves the cluster job skipped on pushes and schedules. The run summary explicitly records that no cluster tests ran. A successful configuration check alone provides no scale or reliability evidence.
+
+Enable automatic cluster tests only after completing the following setup:
+
+1. Register an online self-hosted Linux runner with the `twinet-cluster` label. Give the runner access to a dedicated test cluster, its controller credentials, and the fault commands. Chaos tests reboot nodes and disrupt underlay links, so the target cluster must be reserved for destructive testing.
+2. Install the runner prerequisites used by `make script-tests` and the cluster commands, including Bash, Python 3, Make, and ShellCheck. The workflow installs Go 1.25. Configure the nodes, images, and controller credentials required by `examples/scale` and the migration manifest.
+3. Add the repository Actions secret `TWINET_TOKEN` for the target agents.
+4. Add the repository Actions variables `TWINET_CHAOS_AGENT_RESTART_CMD`, `TWINET_CHAOS_AGENT_STOP_CMD`, `TWINET_CHAOS_NODE_REBOOT_CMD`, `TWINET_CHAOS_UNDERLAY_DOWN_CMD`, `TWINET_CHAOS_UNDERLAY_UP_CMD`, and `TWINET_CHAOS_MIGRATION_MANIFEST`. The command variables must operate on the dedicated cluster. The migration manifest path must exist on the runner.
+5. Set the repository Actions variable `TWINET_CLUSTER_CI_ENABLED` to the exact string `true`.
+
+Once enabled, pushes to `main` run the benchmark, chaos tests, and short soak. The weekly scheduled run selects the 24-hour soak. Set the variable to `false` or remove it to disable future automatic cluster jobs. An already queued or running job must be cancelled separately.
+
+A manual **Run workflow** request on `main` explicitly requests cluster evidence even while automatic runs are disabled. The request can select a short or 24-hour soak. Missing credentials or fault settings fail the hosted check immediately, before a self-hosted job queues. The check validates the presence of settings; the cluster job verifies their operational behavior. The operator must also ensure that the registered runner is online. Manual requests from other branches are skipped.
+
+### Run the evidence commands directly
+
 The cluster evidence commands are deliberately destructive and deliberately
 explicit. They are never part of ordinary CI:
 
