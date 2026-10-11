@@ -469,7 +469,7 @@ func (e *Engine) injectGrayProbe(ctx context.Context, from, target *Device) erro
 		}
 	}
 	if gateway == nil {
-		return fmt.Errorf("Gray probe next hop is not a declared firewall")
+		return fmt.Errorf("gray probe next hop is not a declared firewall")
 	}
 	mac, err := e.exec(ctx, gateway.ID, "cat", "/sys/class/net/"+port+"/address")
 	if err != nil {

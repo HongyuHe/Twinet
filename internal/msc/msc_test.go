@@ -518,7 +518,7 @@ func TestGatewayLocalOutputIsBoundToPeer(t *testing.T) {
 					t.Fatalf("unbound data OUTPUT on %s: %s", d.ID, line)
 				}
 			}
-			if !strings.Contains(line, " -p esp ") && !(strings.Contains(line, " -p udp ") && strings.Contains(line, "--dports 500,4500")) {
+			if !strings.Contains(line, " -p esp ") && (!strings.Contains(line, " -p udp ") || !strings.Contains(line, "--dports 500,4500")) {
 				t.Fatalf("unapproved local protocol on %s: %s", d.ID, line)
 			}
 		}

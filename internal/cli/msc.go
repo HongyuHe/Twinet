@@ -30,7 +30,7 @@ func newMSCCmd(opts *Options) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			defer f.Close()
+			defer func() { _ = f.Close() }()
 			configured := msc.DefaultLayout()
 			decoder := json.NewDecoder(f)
 			decoder.DisallowUnknownFields()
@@ -72,7 +72,7 @@ func newMSCCmd(opts *Options) *cobra.Command {
 		if err != nil {
 			return err
 		}
-		defer f.Close()
+		defer func() { _ = f.Close() }()
 		enc := json.NewEncoder(f)
 		enc.SetIndent("", "  ")
 		return enc.Encode(s)
@@ -101,7 +101,7 @@ func newMSCCmd(opts *Options) *cobra.Command {
 				return fmt.Errorf("MSC profile currently supports the tested Docker backend only")
 			}
 			r := rt.NewDocker()
-			defer r.Close()
+			defer func() { _ = r.Close() }()
 			if err = rt.ConfigureEndpoint(r, opts.RuntimeSocket); err != nil {
 				return err
 			}
@@ -121,6 +121,7 @@ func newMSCCmd(opts *Options) *cobra.Command {
 			return fn(cmd, e, args)
 		}
 	}
+	root.AddCommand(newMSCCredentialsCmd(opts, &specPath, &stateDir))
 	for _, verb := range []string{"up", "recover", "down"} {
 		v := verb
 		root.AddCommand(&cobra.Command{Use: v, Short: map[string]string{"up": "Deploy or reconcile the declared MSC appliances", "recover": "Restore configuration, renew certificates and reestablish tunnels after a fault", "down": "Remove owned containers and links; retain private PKI state"}[v], Args: cobra.NoArgs, RunE: run(func(cmd *cobra.Command, e *msc.Engine, _ []string) error {

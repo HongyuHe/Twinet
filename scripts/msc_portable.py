@@ -242,6 +242,8 @@ def deploy(args):
         check = json.loads((report_dir / "check.json").read_text())
         if check.get("passed") is not True or not check.get("checks") or any(item.get("passed") is not True for item in check["checks"]):
             raise ValueError(f"Deployment checks failed; inspect {report_dir}")
+        stage("Installing hourly certificate and CRL renewal")
+        run([*command, "credentials", "install-timer"])
         if args.export:
             stage("Exporting a fresh public evidence snapshot")
             run([*command, "export", "--output", report_dir / "snapshot"])

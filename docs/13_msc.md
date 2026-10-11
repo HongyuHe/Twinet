@@ -219,9 +219,7 @@ Twinet generates ECDSA P-384 keys and certificates, and each connection names a
 specific remote identity such as `I_B1.msc.test`. S1 and S2 use separate inner
 trust domains, `inner-s1` and `inner-s2`. The outer layer uses its own `outer`
 trust domain. Strict certificate-revocation checking is enabled. CA private
-keys stay in the worker's private state directory; each encryptor receives its
-own credentials, trust anchor, and CRL. Certificate generation and renewal are
-implemented in [`pki.go`](../internal/msc/pki.go).
+keys stay in the credential authority's private state directory; each encryptor receives its own credentials, trust anchor, and CRL. The authority can provision encryptors on its own worker or on other workers. Certificate issuance is implemented in [`pki.go`](../internal/msc/pki.go), persistent revocation handling in [`crl.go`](../internal/msc/crl.go), and renewal and worker delivery in [`credentials.go`](../internal/msc/credentials.go).
 
 ### Packet sizes and fragmentation
 
@@ -593,7 +591,77 @@ A host reboot stops the lab. Run `msc up` after Docker starts to restore links,
 filters, native configuration, and tunnels. `down` removes owned devices and
 FRR control containers while retaining PKI state. Use `--spec` and `--state-dir`
 consistently for nondefault deployments. Certificates last one month and CRLs
-seven days; `up` refreshes CRLs and `recover` renews leaf certificates.
+seven days. Scheduled credential maintenance refreshes CRLs when fewer than 48 hours remain and renews leaf certificates when fewer than seven days remain. Ordinary renewal preserves the device's private key and CA. Explicit fault recovery replaces leaf credentials, while retaining revocation records for their previous serial numbers.
+
+### Automatic credential maintenance
+
+The credential authority maintains one canonical signed CRL for each trust domain. During an upgrade, it imports revocation entries from existing device CRLs, including expired lists. Renewal preserves those entries and advances the CRL number. The CA signing keys stay in the authority's private state directory. A separate CA service or emulated administrative workstation is not required.
+
+Run the following commands on the authority with the existing deployment's specification and state directory:
+
+```sh
+sudo twinet msc --spec /var/lib/twinet/msc/spec.json credentials renew
+sudo twinet msc --spec /var/lib/twinet/msc/spec.json credentials install-timer
+systemctl status twinet-msc-credentials-msc.timer
+sudo journalctl -u twinet-msc-credentials-msc.service
+```
+
+The timer runs hourly and after boot. The portable installer installs it automatically. The renewal command issues due credentials, reloads strongSwan, checks that the expected public certificate and CRL were loaded, and reconnects missing outer tunnels before inner tunnels. It preserves existing device configuration and network links. Management TLS services reload their certificates as part of local maintenance. `--force` refreshes CRLs immediately while preserving revocations; it does not replace CA keys or restore a revoked device's authorization.
+
+The authority writes a public-status report to `credential-renewal.json` in its private state directory. Failures produce a nonzero exit status and appear in the systemd journal. Inspect the service state and report when monitoring the deployment. An active injected fault prevents maintenance from silently undoing the experiment. CA expiration within 31 days also fails with a rollover warning; changing a CA requires an explicit coordinated trust-anchor update. Strict revocation checking remains enabled throughout renewal and failure handling.
+
+### Credentials and authentication across workers
+
+Credential maintenance supports a single authority and multiple Docker workers connected through authenticated SSH. A placement file assigns every credential-bearing device to exactly one worker. Each worker receives only its assigned device credentials, public CA certificates, and CRLs. CA private keys remain on the authority. The SSH account must be able to invoke the installed Twinet binary with noninteractive sudo, and the authority must have a verified host-key entry for each worker. Timers run as root, so configure persistent SSH credentials rather than relying on an interactive SSH agent.
+
+Each placement entry has the following fields:
+
+```json
+{
+  "workers": [
+    {
+      "name": "site-a",
+      "state_dir": "/var/lib/twinet/msc",
+      "devices": ["I_A1", "I_A2", "O_A1", "O_A2", "GF_A", "OF_A1", "OF_A2", "AW_A1", "AW_A2", "AW_A99"]
+    },
+    {
+      "name": "site-b",
+      "ssh": "hy@worker-b.example",
+      "identity_file": "/root/.ssh/msc-worker",
+      "known_hosts_file": "/root/.ssh/known_hosts",
+      "binary": "/usr/local/bin/twinet",
+      "state_dir": "/var/lib/twinet/msc",
+      "devices": ["I_B1", "I_B2", "O_B1", "O_B2", "GF_B", "OF_B1", "OF_B2", "AW_B1", "AW_B2", "AW_B99"]
+    }
+  ]
+}
+```
+
+The device lists above match the default two-level layout. Adjust them to the actual specification. An omitted `ssh` field selects the authority's local worker, which must use the authority's state directory. The remote `state_dir` is local to that remote worker; no shared filesystem is required. Install the same Twinet version on the authority and workers, then use the placement file for renewal and the timer:
+
+```sh
+sudo twinet msc --spec /var/lib/twinet/msc/spec.json credentials renew --targets /etc/twinet/msc-workers.json
+sudo twinet msc --spec /var/lib/twinet/msc/spec.json credentials install-timer --targets /etc/twinet/msc-workers.json
+```
+
+For a fresh distributed deployment, `credentials renew --targets ... --provision-only` provisions credentials and initial IPsec configurations before the appliance containers start. The topology provisioner must mount each device's worker-local `devices/DEVICE/swanctl` and optional `devices/DEVICE/tls` directories read-only and set the normal `twinet.msc.lab` and `twinet.msc.state` ownership labels. Once containers and links exist, run renewal without `--provision-only` to load credentials and establish tunnels. Remote workers retain `credential-worker.json` and `credential-receipt.json`; they refuse local CA generation, uncoordinated CA replacement, CRL rollback, and removal of known revocations.
+
+Cross-worker delivery can partially succeed when a worker is unavailable. The authority records each worker's result and returns failure. Subsequent timer runs retry delivery using the canonical CRL and the same device credentials. Workers continue to enforce their last accepted credentials, including CRL expiry, so an unreachable authority does not disable revocation checks. The worker SSH channel belongs to the host deployment infrastructure and does not pass through the emulated management network.
+
+The credential subsystem supports cross-worker authentication, but the MSC topology launcher still places the complete topology on one worker. Credential placement does not create cross-worker links or replace Twinet's distributed topology provisioner.
+
+The cross-worker integration test creates two isolated encryptors on separate machines and joins their test Docker networks with a temporary VXLAN link. It checks mutual authentication, encrypted traffic, stale-CRL rejection and recovery, retention of revoked serials, leaf-certificate renewal, revoked-certificate rejection, and execution from the authority's systemd service. It also checks that the remote worker receives neither CA private keys nor the other worker's device credentials. The test removes its containers, network links, private state, timer, and temporary SSH authorization afterward. Existing MSC deployments remain in place.
+
+Install the updated Twinet binary at the same path on both test machines, ensure the pinned MSC image is available, and install `python3-cryptography` on the authority. Run the test from a machine with SSH access to both workers:
+
+```sh
+python3 scripts/test_msc_credentials_multinode.py \
+  --authority hy@worker-a --worker hy@worker-b \
+  --authority-ip 10.0.1.2 --worker-ip 10.0.1.3 \
+  --underlay-interface eno2 \
+  --binary /usr/local/libexec/twinet-msc-credentials \
+  --output reports/msc-credentials-multinode.json
+```
 
 The profile runs on one worker. It shares the worker kernel and does not use
 Twinet's distributed AS placement or automatic HA. The prototype models network

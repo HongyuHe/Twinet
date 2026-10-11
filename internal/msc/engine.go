@@ -24,6 +24,14 @@ type Engine struct {
 	Dir     string
 	Runtime rt.Runtime
 	Log     io.Writer
+	Now     func() time.Time
+}
+
+func (e *Engine) now() time.Time {
+	if e.Now != nil {
+		return e.Now().UTC()
+	}
+	return time.Now().UTC()
 }
 
 func (e *Engine) Lock() (func(), error) {
@@ -46,10 +54,10 @@ func (e *Engine) Lock() (func(), error) {
 		return nil, err
 	}
 	if err = unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
-		f.Close()
+		_ = f.Close()
 		return nil, fmt.Errorf("another MSC operation holds %s", e.Dir)
 	}
-	return func() { unix.Flock(int(f.Fd()), unix.LOCK_UN); f.Close() }, nil
+	return func() { _ = unix.Flock(int(f.Fd()), unix.LOCK_UN); _ = f.Close() }, nil
 }
 func (e *Engine) log(format string, a ...any) {
 	if e.Log != nil {
@@ -93,6 +101,11 @@ func (e *Engine) owned(ctx context.Context, d *Device) (rt.Container, error) {
 func (e *Engine) tunnelDir(d *Device) string { return filepath.Join(e.Dir, "devices", d.ID, "swanctl") }
 func (e *Engine) tlsDir(d *Device) string    { return filepath.Join(e.Dir, "devices", d.ID, "tls") }
 func (e *Engine) prepare(d *Device, renew bool) error {
+	if _, err := os.Stat(filepath.Join(e.Dir, "credential-worker.json")); err == nil {
+		return fmt.Errorf("credentials are managed by a remote authority; use credentials renew at that authority")
+	} else if !os.IsNotExist(err) {
+		return err
+	}
 	if d.Tunnel != nil {
 		dir := e.tunnelDir(d)
 		if err := e.leaf(d, d.Tunnel.Trust, dir, "", renew); err != nil {
@@ -435,7 +448,7 @@ func (e *Engine) forwarding(ctx context.Context, id string, on bool) error {
 	if err != nil {
 		return err
 	}
-	defer ns.Close()
+	defer func() { _ = ns.Close() }()
 	value := "0"
 	if on {
 		value = "1"
