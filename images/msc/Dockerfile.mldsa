@@ -1,0 +1,4 @@
+FROM twinet-msc:pq-construction-v2
+RUN apt-get update && apt-get install -y --no-install-recommends autoconf automake libtool flex bison gperf && rm -rf /var/lib/apt/lists/*
+RUN curl -fL https://codeload.github.com/strongswan/strongswan/tar.gz/eb72966d2211141c73d4f66e4825c406a0811c3e -o /tmp/mldsa.tar.gz && sha256sum /tmp/mldsa.tar.gz && tar -xzf /tmp/mldsa.tar.gz -C /tmp && cd /tmp/strongswan-eb72966d2211141c73d4f66e4825c406a0811c3e && ./autogen.sh && ./configure --prefix=/usr --sysconfdir=/etc --enable-openssl --enable-ml --enable-swanctl --enable-vici --enable-kernel-netlink --enable-socket-default --disable-stroke && make -j8 && make install && ldconfig
+LABEL org.opencontainers.image.revision="eb72966d2211141c73d4f66e4825c406a0811c3e"

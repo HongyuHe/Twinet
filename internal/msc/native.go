@@ -244,7 +244,7 @@ func (e *Engine) configureOVS(ctx context.Context, d *Device) error {
 			return err
 		}
 	}
-	if err := e.shell(ctx, d.ID, "ovs-vsctl set-fail-mode br0 secure; ovs-ofctl del-flows br0; ovs-ofctl add-flow br0 'priority=0,actions=NORMAL'"); err != nil {
+	if err := e.shell(ctx, d.ID, "ovs-vsctl set bridge br0 protocols=OpenFlow10,OpenFlow13; ovs-vsctl set-fail-mode br0 secure; ovs-ofctl del-flows br0; ovs-ofctl add-flow br0 'priority=0,actions=NORMAL'"); err != nil {
 		return err
 	}
 	state, err := e.ovsState(ctx, d)

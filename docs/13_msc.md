@@ -1,5 +1,7 @@
 # Configurable MSC emulation for TDN experiments
 
+The additional five-network construction examples and replay tools are documented in [MSC construction experiments](14_msc_construction.md).
+
 The `tdn` branch extends `dev` with an explicit MSC appliance topology. Version 2
 uses Twinet's existing FRR router runtime, private FRR control containers, OVS
 switch renderer, and interactive access implementation. BLACK and Outer
@@ -600,8 +602,8 @@ The credential authority maintains one canonical signed CRL for each trust domai
 Run the following commands on the authority with the existing deployment's specification and state directory:
 
 ```sh
-sudo twinet msc --spec /var/lib/twinet/msc/spec.json credentials renew
-sudo twinet msc --spec /var/lib/twinet/msc/spec.json credentials install-timer
+sudo twinet msc credentials renew --spec /var/lib/twinet/msc/spec.json
+sudo twinet msc credentials install-timer --spec /var/lib/twinet/msc/spec.json
 systemctl status twinet-msc-credentials-msc.timer
 sudo journalctl -u twinet-msc-credentials-msc.service
 ```
@@ -640,8 +642,8 @@ Each placement entry has the following fields:
 The device lists above match the default two-level layout. Adjust them to the actual specification. An omitted `ssh` field selects the authority's local worker, which must use the authority's state directory. The remote `state_dir` is local to that remote worker; no shared filesystem is required. Install the same Twinet version on the authority and workers, then use the placement file for renewal and the timer:
 
 ```sh
-sudo twinet msc --spec /var/lib/twinet/msc/spec.json credentials renew --targets /etc/twinet/msc-workers.json
-sudo twinet msc --spec /var/lib/twinet/msc/spec.json credentials install-timer --targets /etc/twinet/msc-workers.json
+sudo twinet msc credentials renew --spec /var/lib/twinet/msc/spec.json --targets /etc/twinet/msc-workers.json
+sudo twinet msc credentials install-timer --spec /var/lib/twinet/msc/spec.json --targets /etc/twinet/msc-workers.json
 ```
 
 For a fresh distributed deployment, `credentials renew --targets ... --provision-only` provisions credentials and initial IPsec configurations before the appliance containers start. The topology provisioner must mount each device's worker-local `devices/DEVICE/swanctl` and optional `devices/DEVICE/tls` directories read-only and set the normal `twinet.msc.lab` and `twinet.msc.state` ownership labels. Once containers and links exist, run renewal without `--provision-only` to load credentials and establish tunnels. Remote workers retain `credential-worker.json` and `credential-receipt.json`; they refuse local CA generation, uncoordinated CA replacement, CRL rollback, and removal of known revocations.

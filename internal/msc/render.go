@@ -20,12 +20,12 @@ func swanConfig(d *Device) string {
   keyingtries = 0
   mobike = no
   local {
-   auth = pubkey
+   auth = ecdsa-384-sha384
    certs = cert.pem
    id = %s.msc.test
   }
   remote {
-   auth = pubkey
+   auth = ecdsa-384-sha384
    id = %s.msc.test
    cacerts = ca.pem
    revocation = strict
@@ -97,10 +97,17 @@ func filterRules(s *Spec, d *Device) string {
 		if d.Role == "outer" {
 			protocols = []string{" -p esp", " -p udp -m multiport --dports 500,4500"}
 		}
-		for _, proto := range protocols {
-			fmt.Fprintf(&b, "-A FORWARD -i %s -o %s -s %s -d %s%s -m policy --dir out --pol ipsec --mode tunnel --reqid %d -j ACCEPT\n", t.Inside, t.Outside, t.LocalTS, t.RemoteTS, proto, t.ReqID)
-			fmt.Fprintf(&b, "-A FORWARD -i %s -o %s -s %s -d %s%s -m policy --dir in --pol ipsec --mode tunnel --reqid %d -j ACCEPT\n", t.Outside, t.Inside, t.RemoteTS, t.LocalTS, proto, t.ReqID)
+		flows := t.Flows
+		if len(flows) == 0 {
+			flows = []ProtectedFlow{{Inside: t.Inside, Local: t.LocalTS, Remote: t.RemoteTS}}
 		}
+		for _, flow := range flows {
+			for _, proto := range protocols {
+				fmt.Fprintf(&b, "-A FORWARD -i %s -o %s -s %s -d %s%s -m policy --dir out --pol ipsec --mode tunnel --reqid %d -j ACCEPT\n", flow.Inside, t.Outside, flow.Local, flow.Remote, proto, t.ReqID)
+				fmt.Fprintf(&b, "-A FORWARD -i %s -o %s -s %s -d %s%s -m policy --dir in --pol ipsec --mode tunnel --reqid %d -j ACCEPT\n", t.Outside, flow.Inside, flow.Remote, flow.Local, proto, t.ReqID)
+			}
+		}
+
 	case "firewall":
 		for _, port := range d.Interfaces {
 			peer, pi := s.Peer(d.ID, port.Name)
@@ -128,6 +135,12 @@ func filterRules(s *Spec, d *Device) string {
 			}
 		}
 	case "gray-firewall":
+		if len(d.BoundaryFlows) > 0 {
+			for _, flow := range d.BoundaryFlows {
+				writePeerFilter(&b, flow.Ingress, flow.Egress, flow.Source, flow.Destination)
+			}
+			break
+		}
 		// Only inline shared-Gray paths carry authorized inner peer traffic.
 		for _, port := range d.Interfaces {
 			peer, _ := s.Peer(d.ID, port.Name)

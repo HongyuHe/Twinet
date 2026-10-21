@@ -1,0 +1,30 @@
+{
+  "source_profile": "ipsec-baseline",
+  "native_profile": "native-ipsec-baseline",
+  "device_id_mapping": {
+    "BLACK": "NB_BLACK",
+    "GF_A": "NB_GF_A",
+    "R_A1": "NB_R_A1",
+    "I_A1": "NB_I_A1",
+    "G_A1": "NB_G_A1",
+    "O_A1": "NB_O_A1",
+    "OF_A1": "NB_OF_A1",
+    "R_A2": "NB_R_A2",
+    "I_A2": "NB_I_A2",
+    "G_A2": "NB_G_A2",
+    "O_A2": "NB_O_A2",
+    "OF_A2": "NB_OF_A2",
+    "GF_B": "NB_GF_B",
+    "R_B1": "NB_R_B1",
+    "I_B1": "NB_I_B1",
+    "G_B1": "NB_G_B1",
+    "O_B1": "NB_O_B1",
+    "OF_B1": "NB_OF_B1",
+    "R_B2": "NB_R_B2",
+    "I_B2": "NB_I_B2",
+    "G_B2": "NB_G_B2",
+    "O_B2": "NB_O_B2",
+    "OF_B2": "NB_OF_B2"
+  },
+  "routing_change": "Black FRR routers and Outer Firewalls use OSPF; Gray FRR routers and Gray Firewalls retain explicit static forwarding routes; encryptors run no routing daemon"
+}

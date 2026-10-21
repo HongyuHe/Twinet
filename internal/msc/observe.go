@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	rt "github.com/HongyuHe/twinet/internal/runtime"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -236,7 +237,7 @@ func (e *Engine) Check(ctx context.Context) (Report, error) {
 			if probeErr != nil {
 				return r, probeErr
 			}
-			want := a.Level == b.Level
+			want := sameRedNetwork(a, b)
 			r.add("reachability/"+a.ID+"/"+b.ID, ok == want, fmt.Sprintf("want delivery=%v; %s", want, detail))
 		}
 	}
@@ -441,42 +442,56 @@ func (e *Engine) grayDropCounters(ctx context.Context, site string) (uint64, err
 	return total, nil
 }
 
-// injectGrayProbe measures the firewall itself using one explicit IPv4/ICMP
-// frame. Raw Ethernet avoids treating a sender OUTPUT rejection as a firewall
-// rejection. The observed route chooses the interface and next-hop MAC.
-func (e *Engine) injectGrayProbe(ctx context.Context, from, target *Device) error {
-	raw, err := e.exec(ctx, from.ID, "ip", "-j", "route", "get", target.Tunnel.Local)
+// grayProbeGateway selects the unique declared same-site Gray firewall on the
+// sender tunnel interface subnet. The runtime firewall port supplies the MAC.
+// injectGrayProbe sends a raw IPv4/ICMP frame directly to that firewall so the
+// check measures its forwarding filter, independent of sender routes and OUTPUT
+// policy. The injected frame does not establish ordinary end-to-end reachability.
+func (s *Spec) grayProbeGateway(from *Device) (*Device, string, error) {
+	if from == nil || from.Tunnel == nil {
+		return nil, "", fmt.Errorf("missing probe tunnel")
+	}
+	outside := from.Interface(from.Tunnel.Outside)
+	if outside == nil {
+		return nil, "", fmt.Errorf("missing Gray interface for %s", from.ID)
+	}
+	prefix, err := netip.ParsePrefix(outside.Address)
 	if err != nil {
-		return err
-	}
-	var routes []struct {
-		Gateway string `json:"gateway"`
-		Dev     string `json:"dev"`
-	}
-	if err = json.Unmarshal([]byte(raw), &routes); err != nil {
-		return err
-	}
-	if len(routes) != 1 || routes[0].Gateway == "" || routes[0].Dev != from.Tunnel.Outside {
-		return fmt.Errorf("no unambiguous Gray gateway for %s", from.ID)
+		return nil, "", err
 	}
 	var gateway *Device
 	var port string
-	for _, d := range e.Spec.Role("gray-firewall") {
+	for _, d := range s.Role("gray-firewall") {
+		if d.Site != from.Site {
+			continue
+		}
 		for _, i := range d.Interfaces {
-			if strings.Split(i.Address, "/")[0] == routes[0].Gateway {
+			addr, parseErr := netip.ParsePrefix(i.Address)
+			if parseErr == nil && i.Zone == "gray" && prefix.Contains(addr.Addr()) {
+				if gateway != nil {
+					return nil, "", fmt.Errorf("ambiguous on-link Gray firewall for %s", from.ID)
+				}
 				gateway, port = d, i.Name
 			}
 		}
 	}
 	if gateway == nil {
-		return fmt.Errorf("gray probe next hop is not a declared firewall")
+		return nil, "", fmt.Errorf("no on-link Gray firewall for %s", from.ID)
+	}
+	return gateway, port, nil
+}
+
+func (e *Engine) injectGrayProbe(ctx context.Context, from, target *Device) error {
+	gateway, port, err := e.Spec.grayProbeGateway(from)
+	if err != nil {
+		return err
 	}
 	mac, err := e.exec(ctx, gateway.ID, "cat", "/sys/class/net/"+port+"/address")
 	if err != nil {
 		return err
 	}
 	_, err = e.exec(ctx, from.ID, "python3", "-c", grayProbePython,
-		routes[0].Dev, from.Tunnel.Local, target.Tunnel.Local, strings.TrimSpace(mac))
+		from.Tunnel.Outside, from.Tunnel.Local, target.Tunnel.Local, strings.TrimSpace(mac))
 	return err
 }
 

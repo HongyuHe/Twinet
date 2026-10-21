@@ -40,7 +40,9 @@ func Generate(o Layout) (*Spec, error) {
 		s.Device(b).Interfaces = append(s.Device(b).Interfaces, Interface{Name: bi, Address: ba, Zone: bz, Bridge: s.Device(b).Role == "switch"})
 		s.Links = append(s.Links, Link{Endpoint{a, ai}, Endpoint{b, bi}})
 	}
-	route := func(id, prefix, via string) { s.Device(id).Routes = append(s.Device(id).Routes, Route{prefix, via}) }
+	route := func(id, prefix, via string) {
+		s.Device(id).Routes = append(s.Device(id).Routes, Route{Prefix: prefix, Via: via})
+	}
 	gfID := func(site string, k int) string {
 		if o.GrayFirewalls == 1 {
 			return "GF_" + site

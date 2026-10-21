@@ -25,15 +25,23 @@ type Spec struct {
 	Devices     []Device `json:"devices"`
 	Links       []Link   `json:"links"`
 }
+type BoundaryFlow struct {
+	Ingress     string `json:"ingress"`
+	Egress      string `json:"egress"`
+	Source      string `json:"source"`
+	Destination string `json:"destination"`
+}
 type Device struct {
-	ID         string      `json:"id"`
-	Role       string      `json:"role"`
-	Site       string      `json:"site,omitempty"`
-	Level      string      `json:"level,omitempty"`
-	Interfaces []Interface `json:"interfaces"`
-	Routes     []Route     `json:"routes,omitempty"`
-	Tunnel     *Tunnel     `json:"tunnel,omitempty"`
-	Admin      string      `json:"admin,omitempty"`
+	Network       string         `json:"network,omitempty"`
+	BoundaryFlows []BoundaryFlow `json:"boundary_flows,omitempty"`
+	ID            string         `json:"id"`
+	Role          string         `json:"role"`
+	Site          string         `json:"site,omitempty"`
+	Level         string         `json:"level,omitempty"`
+	Interfaces    []Interface    `json:"interfaces"`
+	Routes        []Route        `json:"routes,omitempty"`
+	Tunnel        *Tunnel        `json:"tunnel,omitempty"`
+	Admin         string         `json:"admin,omitempty"`
 }
 type Interface struct {
 	MTU     int    `json:"mtu,omitempty"`
@@ -43,19 +51,26 @@ type Interface struct {
 	Bridge  bool   `json:"bridge,omitempty"`
 }
 type Route struct {
+	Metric int    `json:"metric,omitempty"`
 	Prefix string `json:"prefix"`
 	Via    string `json:"via"`
 }
+type ProtectedFlow struct {
+	Inside string `json:"inside"`
+	Local  string `json:"local"`
+	Remote string `json:"remote"`
+}
 type Tunnel struct {
-	Peer     string `json:"peer"`
-	Local    string `json:"local"`
-	Remote   string `json:"remote"`
-	LocalTS  string `json:"local_ts"`
-	RemoteTS string `json:"remote_ts"`
-	Trust    string `json:"trust"`
-	ReqID    int    `json:"reqid"`
-	Inside   string `json:"inside"`
-	Outside  string `json:"outside"`
+	Flows    []ProtectedFlow `json:"flows,omitempty"`
+	Peer     string          `json:"peer"`
+	Local    string          `json:"local"`
+	Remote   string          `json:"remote"`
+	LocalTS  string          `json:"local_ts"`
+	RemoteTS string          `json:"remote_ts"`
+	Trust    string          `json:"trust"`
+	ReqID    int             `json:"reqid"`
+	Inside   string          `json:"inside"`
+	Outside  string          `json:"outside"`
 }
 type Endpoint struct {
 	Device    string `json:"device"`
@@ -137,6 +152,9 @@ func (s *Spec) Validate() error {
 		if s.IsOSPF(&d) && len(d.Routes) > 0 {
 			return fmt.Errorf("%s uses OSPF; static underlay routes are not allowed", d.ID)
 		}
+		if d.Network != "" && !identifier.MatchString(d.Network) {
+			return fmt.Errorf("invalid network identity on %s", d.ID)
+		}
 		key := strings.ToLower(d.ID)
 		if !identifier.MatchString(d.ID) || ids[key] || !roles[d.Role] {
 			return fmt.Errorf("invalid/duplicate device or role: %s", d.ID)
@@ -165,7 +183,26 @@ func (s *Spec) Validate() error {
 				return fmt.Errorf("bridge port on non-switch %s", d.ID)
 			}
 		}
+		if len(d.BoundaryFlows) > 0 && d.Role != "gray-firewall" {
+			return fmt.Errorf("boundary flows require a Gray firewall: %s", d.ID)
+		}
+		for _, flow := range d.BoundaryFlows {
+			if d.Interface(flow.Ingress) == nil || d.Interface(flow.Egress) == nil || flow.Ingress == flow.Egress {
+				return fmt.Errorf("invalid boundary flow ports on %s", d.ID)
+			}
+			for _, selector := range []string{flow.Source, flow.Destination} {
+				if prefix, err := netip.ParsePrefix(selector); err != nil || !prefix.Addr().Is4() {
+					return fmt.Errorf("invalid boundary flow selector on %s", d.ID)
+				}
+			}
+		}
 		for _, r := range d.Routes {
+			if s.IsFRR(&d) && r.Metric != 0 {
+				return fmt.Errorf("Linux route metrics are unsupported for native FRR routes on %s", d.ID)
+			}
+			if r.Metric < 0 || int64(r.Metric) > 4294967295 {
+				return fmt.Errorf("invalid route metric on %s", d.ID)
+			}
 			p, e := netip.ParsePrefix(r.Prefix)
 			if e != nil || !p.Addr().Is4() {
 				return fmt.Errorf("bad route on %s", d.ID)
@@ -203,11 +240,24 @@ func (s *Spec) Validate() error {
 	for _, d := range s.Devices {
 		if t := d.Tunnel; t != nil {
 			p := s.Device(t.Peer)
-			if p == nil || p.Tunnel == nil || p.Tunnel.Peer != d.ID || p.Role != d.Role || p.Level != d.Level || p.Site == d.Site {
+			if p == nil || p.Tunnel == nil || p.Tunnel.Peer != d.ID || p.Role != d.Role || p.Level != d.Level || p.Network != d.Network || p.Site == d.Site {
 				return fmt.Errorf("invalid peer for %s", d.ID)
 			}
 			if !identifier.MatchString(t.Trust) || t.Trust != p.Tunnel.Trust || t.Local != p.Tunnel.Remote || t.Remote != p.Tunnel.Local || t.LocalTS != p.Tunnel.RemoteTS || t.RemoteTS != p.Tunnel.LocalTS || t.ReqID < 1 {
 				return fmt.Errorf("inconsistent tunnel %s", d.ID)
+			}
+			for _, flow := range t.Flows {
+				if d.Interface(flow.Inside) == nil || flow.Inside == t.Outside {
+					return fmt.Errorf("invalid protected flow interface on %s", d.ID)
+				}
+				if !selectorWithin(flow.Local, t.LocalTS) || !selectorWithin(flow.Remote, t.RemoteTS) {
+					return fmt.Errorf("protected flow exceeds tunnel selector on %s", d.ID)
+				}
+				for _, selector := range []string{flow.Local, flow.Remote} {
+					if prefix, err := netip.ParsePrefix(selector); err != nil || !prefix.Addr().Is4() {
+						return fmt.Errorf("invalid protected flow selector on %s", d.ID)
+					}
+				}
 			}
 			if d.Interface(t.Inside) == nil || d.Interface(t.Outside) == nil || t.Inside == t.Outside {
 				return fmt.Errorf("invalid tunnel ports on %s", d.ID)
@@ -284,7 +334,15 @@ func (s *Spec) ImageFor(d *Device) string {
 }
 
 func (s *Spec) IsOSPF(d *Device) bool {
-	return s.Version == 2 && (d.Role == "transport" || d.Role == "firewall")
+	if s.Version != 2 || (d.Role != "transport" && d.Role != "firewall") {
+		return false
+	}
+	for _, port := range d.Interfaces {
+		if port.Zone == "black" {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Spec) Peer(id, iface string) (*Device, *Interface) {
@@ -306,4 +364,20 @@ func (s *Spec) Role(role string) []*Device {
 		}
 	}
 	return out
+}
+
+func selectorWithin(child, parent string) bool {
+	c, ce := netip.ParsePrefix(child)
+	p, pe := netip.ParsePrefix(parent)
+	return ce == nil && pe == nil && c.Addr().Is4() && p.Addr().Is4() && c.Bits() >= p.Bits() && p.Contains(c.Addr())
+}
+
+func sameRedNetwork(a, b *Device) bool {
+	if a.Level != b.Level {
+		return false
+	}
+	if a.Network != "" || b.Network != "" {
+		return a.Network != "" && a.Network == b.Network
+	}
+	return true
 }

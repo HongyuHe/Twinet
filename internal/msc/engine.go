@@ -281,7 +281,8 @@ func (e *Engine) Up(ctx context.Context, recoverFault bool) error {
 			if e.Spec.IsFRR(d) {
 				continue
 			}
-			if _, err = e.exec(ctx, d.ID, "ip", "route", "replace", r.Prefix, "via", r.Via, "proto", "static"); err != nil {
+			args := routeCommand(r)
+			if _, err = e.exec(ctx, d.ID, args...); err != nil {
 				return err
 			}
 		}
@@ -513,4 +514,12 @@ func (e *Engine) copyFile(ctx context.Context, container, path string, mode int6
 		return err
 	}
 	return r.Err()
+}
+
+func routeCommand(r Route) []string {
+	args := []string{"ip", "route", "replace", r.Prefix, "via", r.Via, "proto", "static"}
+	if r.Metric > 0 {
+		args = append(args, "metric", fmt.Sprint(r.Metric))
+	}
+	return args
 }

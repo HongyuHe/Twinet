@@ -1,0 +1,28 @@
+{
+  "case_id": "NET-005-C01",
+  "source_basis": "Figure5 Network1 and Network2 share the same security level and have separate Inner authentication domains. p016:u002.s009 and p016:u004.s001 describe isolation of unintended cross-network traffic.",
+  "network_ids": {
+    "R_A1": "NETWORK-1",
+    "R_A2": "NETWORK-2",
+    "R_B1": "NETWORK-1",
+    "R_B2": "NETWORK-2",
+    "I_A1": "NETWORK-1",
+    "I_A2": "NETWORK-2",
+    "I_B1": "NETWORK-1",
+    "I_B2": "NETWORK-2"
+  },
+  "outcomes": {
+    "R_A1/R_A2": "no_reply",
+    "R_A1/R_B1": "delivered",
+    "R_A1/R_B2": "no_reply",
+    "R_A2/R_A1": "no_reply",
+    "R_A2/R_B1": "no_reply",
+    "R_A2/R_B2": "delivered",
+    "R_B1/R_A1": "delivered",
+    "R_B1/R_A2": "no_reply",
+    "R_B1/R_B2": "no_reply",
+    "R_B2/R_A1": "no_reply",
+    "R_B2/R_A2": "delivered",
+    "R_B2/R_B1": "no_reply"
+  }
+}
