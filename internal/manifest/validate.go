@@ -1454,6 +1454,32 @@ func validateBudget(d *Diagnostics, file, path string, b model.Budget, node *yam
 func (l *Loaded) validateAccess(d *Diagnostics, file string) {
 	root := l.Nodes[file]
 	a := l.Lab.Access
+	if c := a.Collection; c != nil {
+		if c.Enabled && a.Mode == "none" {
+			d.Addf(file, "access.collection", nodeAt(root, "access"), "collection requires gateway access")
+		}
+		if c.MaxSessionBytes != 0 && c.MaxSessionBytes < 4096 {
+			d.Addf(file, "access.collection.max_session_bytes", nodeAt(root, "access"), "must be at least 4096")
+		}
+		sessionLimit := c.MaxSessionBytes
+		if sessionLimit == 0 {
+			sessionLimit = 256 << 20
+		}
+		if c.MaxTotalBytes != 0 && c.MaxTotalBytes < sessionLimit {
+			d.Addf(file, "access.collection.max_total_bytes", nodeAt(root, "access"), "must be at least max_session_bytes")
+		}
+		for name, value := range map[string]string{"sync_interval": c.SyncInterval, "upload_interval": c.UploadInterval} {
+			if value != "" {
+				duration, err := time.ParseDuration(value)
+				if err != nil || duration <= 0 {
+					d.Addf(file, "access.collection."+name, nodeAt(root, "access"), "must be a positive duration")
+				}
+			}
+		}
+		if c.CollectorURL != "" && c.TokenFile == "" {
+			d.Addf(file, "access.collection.token_file", nodeAt(root, "access"), "collector_url requires token_file")
+		}
+	}
 	switch a.Mode {
 	case "", "gateway", "none":
 	default:

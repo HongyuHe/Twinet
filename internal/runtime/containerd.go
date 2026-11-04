@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/HongyuHe/twinet/internal/terminal"
 	"io"
 	"net"
 	"os"
@@ -1562,6 +1563,11 @@ func (c *Containerd) StreamExec(ctx context.Context, name string, cmd ExecCmd,
 	process := *spec.Process
 	process.Args = append([]string(nil), cmd.Cmd...)
 	process.Env = mergeEnv(process.Env, cmd.Env)
+	executionID, err := terminal.ExecutionID(ctx)
+	if err != nil {
+		return 1, err
+	}
+	process.Env = mergeEnv(process.Env, map[string]string{terminal.ExecutionEnv: executionID})
 	process.Terminal = cmd.TTY
 	if cmd.WorkDir != "" {
 		process.Cwd = cmd.WorkDir
@@ -1616,6 +1622,23 @@ func (c *Containerd) StreamExec(ctx context.Context, name string, cmd ExecCmd,
 		}
 	}
 	finished := make(chan struct{})
+	if control := terminal.From(ctx); control != nil && cmd.TTY {
+		changes, unsubscribe := control.Subscribe()
+		defer unsubscribe()
+		go func() {
+			for {
+				select {
+				case size := <-changes:
+					_ = processHandle.Resize(ctx, size.Cols, size.Rows)
+				case <-finished:
+					return
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+	}
+
 	if stdinEOF != nil {
 		go func() {
 			select {

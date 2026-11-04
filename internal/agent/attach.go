@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/HongyuHe/twinet/internal/deploy"
 	rt "github.com/HongyuHe/twinet/internal/runtime"
+	"github.com/HongyuHe/twinet/internal/terminal"
 )
 
 // handleAttach gives the caller a bidirectional stream into a container.
@@ -117,11 +119,40 @@ func (s *Server) handleAttach(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer func() { _ = conn.Close() }()
-	if _, err := buf.WriteString("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\r\n"); err != nil {
+	headers := "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n"
+	frames := q.Get("frames")
+	if frames == "1" || frames == "2" {
+		headers += "X-Twinet-Frames: " + frames + "\r\n"
+	}
+	if _, err := buf.WriteString(headers + "\r\n"); err != nil {
 		return
 	}
 	if err := buf.Flush(); err != nil {
 		return
+	}
+
+	ctx, cancel := context.WithCancel(r.Context())
+	ctx = terminal.WithExecutionID(ctx, q.Get("execution"))
+	defer cancel()
+	input := io.Reader(buf.Reader)
+	if frames == "1" || frames == "2" {
+		control := terminal.New(uint32(rows), uint32(cols))
+		ctx = terminal.With(ctx, control)
+		reader, writer := io.Pipe()
+		defer func() { _ = reader.Close() }()
+		input = reader
+		go func() { err := terminal.Receive(buf.Reader, control, writer); _ = writer.CloseWithError(err); cancel() }()
+	}
+	var stdout, stderr io.Writer = conn, conn
+	status := func(code int) {
+		if q.Get("status") == "1" {
+			fmt.Fprintf(conn, "%s%d\n", attachExitTrailer, code)
+		}
+	}
+	if frames == "2" {
+		output := &terminal.OutputFrames{FrameWriter: terminal.FrameWriter{Writer: conn}}
+		stdout, stderr = output.Stdout(), output.Stderr()
+		status = func(code int) { _ = output.Exit(code) }
 	}
 
 	if nativeStream {
@@ -132,20 +163,18 @@ func (s *Server) handleAttach(w http.ResponseWriter, r *http.Request) {
 				"TERM": "xterm-256color",
 			}
 		}
-		code, streamErr := stream.StreamExec(r.Context(), container, rt.ExecCmd{
-			Cmd: cmd, Env: env, Stdin: buf.Reader, TTY: tty,
-		}, uint32(rows), uint32(cols), conn, conn)
+		code, streamErr := stream.StreamExec(ctx, container, rt.ExecCmd{
+			Cmd: cmd, Env: env, Stdin: input, TTY: tty,
+		}, uint32(rows), uint32(cols), stdout, stderr)
 		if streamErr != nil {
-			fmt.Fprintf(conn, "twinet: %v\r\n", streamErr)
+			fmt.Fprintf(stderr, "twinet: %v\r\n", streamErr)
 			code = 1
 		}
-		if q.Get("status") == "1" {
-			fmt.Fprintf(conn, "%s%d\n", attachExitTrailer, code)
-		}
+		status(code)
 		return
 	}
 
-	proc := exec.CommandContext(r.Context(), cli, cliArgs...)
+	proc := exec.CommandContext(ctx, cli, cliArgs...)
 	if len(cliEnv) > 0 {
 		proc.Env = append(os.Environ(), cliEnv...)
 	}
@@ -153,29 +182,14 @@ func (s *Server) handleAttach(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	proc.Stdout, proc.Stderr = conn, conn
+	proc.Stdout, proc.Stderr = stdout, stderr
 	if err := proc.Start(); err != nil {
-		fmt.Fprintf(conn, "twinet: %v\r\n", err)
+		fmt.Fprintf(stderr, "twinet: %v\r\n", err)
+		status(1)
 		return
 	}
-	go func() {
-		// Anything the client buffered during the handshake belongs to the
-		// session, not to the HTTP request, so it is forwarded before the raw
-		// connection: dropping it loses the first keystrokes of every login.
-		// The Reader is named explicitly because bufio.ReadWriter embeds both a
-		// Reader and a Writer, and both have these methods: dropping the
-		// qualifier does not compile. staticcheck's QF1008 suggests otherwise
-		// and is wrong here.
-		//nolint:staticcheck // QF1008: the selector is ambiguous without it
-		if n := buf.Reader.Buffered(); n > 0 {
-			if b, err := buf.Reader.Peek(n); err == nil { //nolint:staticcheck // QF1008: as above
-				_, _ = stdin.Write(b)
-				_, _ = buf.Reader.Discard(n) //nolint:staticcheck // QF1008: as above
-			}
-		}
-		_, _ = io.Copy(stdin, conn)
-		_ = stdin.Close()
-	}()
+	go func() { _, _ = io.Copy(stdin, input); _ = stdin.Close() }()
+
 	// The exit status is sent back as a trailer, because a hijacked connection
 	// carries bytes and nothing else: there is no header left to put it in.
 	//
@@ -196,9 +210,7 @@ func (s *Server) handleAttach(w http.ResponseWriter, r *http.Request) {
 			code = 1
 		}
 	}
-	if q.Get("status") == "1" {
-		fmt.Fprintf(conn, "%s%d\n", attachExitTrailer, code)
-	}
+	status(code)
 }
 
 func (s *Server) attachCLI(args []string) (string, []string, []string, error) {

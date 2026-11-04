@@ -1,0 +1,6 @@
+twinet_runtime_calls_total{method="stream_exec",result="canceled"} 2
+twinet_runtime_call_duration_seconds_count{method="stream_exec",result="canceled"} 2
+twinet_runtime_call_duration_seconds_sum{method="stream_exec",result="canceled"} 0.47161457
+twinet_runtime_calls_total{method="stream_exec",result="success"} 260
+twinet_runtime_call_duration_seconds_count{method="stream_exec",result="success"} 260
+twinet_runtime_call_duration_seconds_sum{method="stream_exec",result="success"} 29.247778175999997

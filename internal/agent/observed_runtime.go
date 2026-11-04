@@ -2,6 +2,8 @@ package agent
 
 import (
 	"context"
+	"fmt"
+	"io"
 	"time"
 
 	"github.com/HongyuHe/twinet/internal/limiter"
@@ -153,3 +155,13 @@ var _ rt.Runtime = (*observedRuntime)(nil)
 var _ rt.EndpointRuntime = (*observedRuntime)(nil)
 var _ rt.NamespaceRuntime = (*observedRuntime)(nil)
 var _ rt.NetnsIdentityRuntime = (*observedRuntime)(nil)
+
+// StreamExec preserves interactive streaming through the accounting wrapper.
+// Interactive sessions do not consume the bounded short-probe worker pool.
+func (r *observedRuntime) StreamExec(ctx context.Context, name string, cmd rt.ExecCmd, rows, cols uint32, stdout, stderr io.Writer) (int, error) {
+	stream, ok := r.runtime.(rt.StreamExecRuntime)
+	if !ok {
+		return 1, fmt.Errorf("%w: runtime %s has no interactive stream", rt.ErrUnsupported, r.runtime.Name())
+	}
+	return observeRuntimeCall(r.metrics, "stream_exec", func() (int, error) { return stream.StreamExec(ctx, name, cmd, rows, cols, stdout, stderr) })
+}

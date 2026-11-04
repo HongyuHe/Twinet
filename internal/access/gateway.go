@@ -21,6 +21,7 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
@@ -33,17 +34,21 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"golang.org/x/crypto/ssh"
 
+	"github.com/HongyuHe/twinet/internal/collection"
 	"github.com/HongyuHe/twinet/internal/model"
+	"github.com/HongyuHe/twinet/internal/terminal"
 )
 
 // Session is one student's connection, after authentication.
 type Session struct {
-	Group  string
-	AS     int
-	Device string
+	Group                                            string
+	AS                                               int
+	Device                                           string
+	Actor, AuthMethod, KeyFingerprint, RemoteAddress string
 }
 
 // Execer runs a command inside a device, wherever it lives in the cluster.
@@ -67,7 +72,8 @@ type Group struct {
 	PasswordHash string `json:"password_hash,omitempty"`
 	Salt         string `json:"salt,omitempty"`
 	// AuthorizedKeys are SSH public keys in authorized_keys format.
-	AuthorizedKeys []string `json:"authorized_keys,omitempty"`
+	AuthorizedKeys []string          `json:"authorized_keys,omitempty"`
+	KeyActors      map[string]string `json:"key_actors,omitempty"`
 }
 
 // Config configures the gateway.
@@ -82,8 +88,11 @@ type Config struct {
 	Listen  string
 	// LegacyBase, when non-zero, additionally listens on base+ASN for each AS,
 	// reproducing the "ssh -p 2003" entry point students may already know.
-	LegacyBase int
-	Logger     *slog.Logger
+	LegacyBase   int
+	Logger       *slog.Logger
+	Collection   *collection.Store
+	CaptureInput bool
+	ShellEvents  bool
 }
 
 // Server is the SSH gateway.
@@ -94,7 +103,8 @@ type Server struct {
 	mu       sync.Mutex
 	sessions int
 
-	listeners []net.Listener
+	listeners   []net.Listener
+	connections sync.WaitGroup
 }
 
 // New builds a gateway.
@@ -145,7 +155,10 @@ func (s *Server) authPassword(c ssh.ConnMetadata, pass []byte) (*ssh.Permissions
 	if subtle.ConstantTimeCompare(want, got) != 1 {
 		return nil, fmt.Errorf("authentication failed")
 	}
-	return permissionsFor(c.User(), g.AS), nil
+	p := permissionsFor(c.User(), g.AS)
+	p.Extensions["auth_method"] = "password"
+	p.Extensions["actor"] = c.User()
+	return p, nil
 }
 
 func (s *Server) authPublicKey(c ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
@@ -160,7 +173,14 @@ func (s *Server) authPublicKey(c ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Perm
 			continue
 		}
 		if subtle.ConstantTimeCompare(pk.Marshal(), offered) == 1 {
-			return permissionsFor(c.User(), g.AS), nil
+			p := permissionsFor(c.User(), g.AS)
+			p.Extensions["auth_method"] = "publickey"
+			p.Extensions["fingerprint"] = ssh.FingerprintSHA256(key)
+			p.Extensions["actor"] = g.KeyActors[ssh.FingerprintSHA256(key)]
+			if p.Extensions["actor"] == "" {
+				p.Extensions["actor"] = c.User()
+			}
+			return p, nil
 		}
 	}
 	return nil, fmt.Errorf("authentication failed")
@@ -214,6 +234,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	}()
 
 	s.accept(ctx, ln)
+	s.connections.Wait()
 	return nil
 }
 
@@ -227,12 +248,16 @@ func (s *Server) accept(ctx context.Context, ln net.Listener) {
 			s.cfg.Logger.Warn("accept", "err", err)
 			continue
 		}
-		go s.handleConn(ctx, c)
+		s.connections.Add(1)
+		go func() { defer s.connections.Done(); s.handleConn(ctx, c) }()
 	}
 }
 
 func (s *Server) handleConn(ctx context.Context, nc net.Conn) {
 	defer func() { _ = nc.Close() }()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() { <-ctx.Done(); _ = nc.Close() }()
 	_ = nc.SetDeadline(time.Now().Add(30 * time.Second))
 
 	conn, chans, reqs, err := ssh.NewServerConn(nc, s.cfgSSH)
@@ -259,6 +284,9 @@ func (s *Server) handleConn(ctx context.Context, nc net.Conn) {
 		s.mu.Unlock()
 	}()
 
+	var sessions sync.WaitGroup
+	defer sessions.Wait()
+	defer cancel()
 	for ch := range chans {
 		if ch.ChannelType() != "session" {
 			_ = ch.Reject(ssh.UnknownChannelType, "only session channels are supported")
@@ -268,43 +296,105 @@ func (s *Server) handleConn(ctx context.Context, nc net.Conn) {
 		if err != nil {
 			continue
 		}
-		go s.handleSession(ctx, c, chReqs, Session{Group: group, AS: asn})
+		sessions.Add(1)
+		go func() {
+			defer sessions.Done()
+			s.handleSession(ctx, c, chReqs, Session{Group: group, AS: asn, Actor: conn.Permissions.Extensions["actor"], AuthMethod: conn.Permissions.Extensions["auth_method"], KeyFingerprint: conn.Permissions.Extensions["fingerprint"], RemoteAddress: nc.RemoteAddr().String()})
+		}()
 	}
 }
 
 func (s *Server) handleSession(ctx context.Context, ch ssh.Channel, reqs <-chan *ssh.Request, sess Session) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	defer func() { _ = ch.Close() }()
-
-	var (
-		rows, cols = 24, 80
-		wantTTY    bool
-	)
-	for req := range reqs {
-		switch req.Type {
-		case "pty-req":
-			wantTTY = true
-			if w, h, ok := parsePTY(req.Payload); ok {
-				cols, rows = w, h
+	ch = newSessionChannel(ctx, ch)
+	rows, cols, tty := 24, 80, false
+	control := terminal.New(24, 80)
+	ctx = terminal.With(ctx, control)
+	var recording *collection.Recording
+	var done chan int
+	for {
+		select {
+		case <-ctx.Done():
+			_ = ch.Close()
+			if done != nil {
+				<-done
 			}
-			_ = req.Reply(true, nil)
-
-		case "shell", "exec":
-			var cmd []string
-			if req.Type == "exec" {
-				cmd = []string{"sh", "-c", parseExec(req.Payload)}
+			if recording != nil {
+				_ = recording.Close("incomplete", "connection interrupted", -1)
 			}
-			_ = req.Reply(true, nil)
-			code := s.run(ctx, ch, sess, cmd, wantTTY, rows, cols)
+			return
+		case code := <-done:
+			if recording != nil {
+				if err := recording.Close("complete", "", code); err != nil {
+					code = 1
+					s.cfg.Logger.Error("finalizing recording", "error", err)
+				}
+			}
 			_, _ = ch.SendRequest("exit-status", false, exitStatus(code))
 			return
-
-		case "window-change":
-			if w, h, ok := parsePTY(append(make([]byte, 0, len(req.Payload)+4), req.Payload...)); ok {
-				cols, rows = w, h
+		case req, ok := <-reqs:
+			if !ok {
+				cancel()
+				continue
 			}
-
-		default:
-			_ = req.Reply(false, nil)
+			switch req.Type {
+			case "pty-req":
+				if done != nil {
+					_ = req.Reply(false, nil)
+					continue
+				}
+				w, h, ok := parsePTY(req.Payload)
+				if !ok || w < 1 || h < 1 || w > 65535 || h > 65535 {
+					_ = req.Reply(false, nil)
+					continue
+				}
+				cols, rows, tty = w, h, true
+				control.Resize(uint32(rows), uint32(cols))
+				_ = req.Reply(true, nil)
+			case "window-change":
+				if len(req.Payload) < 8 {
+					_ = req.Reply(false, nil)
+					continue
+				}
+				w, h := int(binary.BigEndian.Uint32(req.Payload[:4])), int(binary.BigEndian.Uint32(req.Payload[4:8]))
+				if w < 1 || h < 1 || w > 65535 || h > 65535 {
+					_ = req.Reply(false, nil)
+					continue
+				}
+				cols, rows = w, h
+				control.Resize(uint32(rows), uint32(cols))
+				if recording != nil {
+					if err := recording.Add("resize", nil, map[string]any{"rows": rows, "cols": cols}); err != nil {
+						cancel()
+					}
+				}
+				_ = req.Reply(true, nil)
+			case "shell", "exec":
+				if done != nil {
+					_ = req.Reply(false, nil)
+					continue
+				}
+				var command []string
+				if req.Type == "exec" {
+					command = []string{"sh", "-c", parseExec(req.Payload)}
+				}
+				wrapped, r, err := s.startRecording(ch, sess, tty, rows, cols, cancel)
+				if err != nil {
+					fmt.Fprintln(ch.Stderr(), err)
+					_ = req.Reply(false, nil)
+					return
+				}
+				recording = r
+				_ = req.Reply(true, nil)
+				done = make(chan int, 1)
+				runDone := done
+				runRows, runCols, runTTY := rows, cols, tty
+				go func() { runDone <- s.run(ctx, wrapped, sess, command, runTTY, runRows, runCols) }()
+			default:
+				_ = req.Reply(false, nil)
+			}
 		}
 	}
 }
@@ -333,9 +423,9 @@ func (s *Server) run(ctx context.Context, ch ssh.Channel, sess Session, cmd []st
 			if err != nil {
 				return 0
 			}
-			code, err := s.cfg.Exec.Shell(ctx, chosen,
+			code, err := s.executeSession(ctx, ch, sess, chosen,
 				[]string{"/bin/sh", "-lc", "exec /bin/bash 2>/dev/null || exec /bin/sh"},
-				ch, ch, ch.Stderr(), tty, rows, cols)
+				tty, rows, cols, true)
 			if err != nil {
 				fmt.Fprintf(ch.Stderr(), "twinet: %v\r\n", err)
 				return 1
@@ -356,7 +446,7 @@ func (s *Server) run(ctx context.Context, ch ssh.Channel, sess Session, cmd []st
 		}
 	}
 
-	code, err := s.cfg.Exec.Shell(ctx, device, cmd, ch, ch, ch.Stderr(), tty, rows, cols)
+	code, err := s.executeSession(ctx, ch, sess, device, cmd, tty, rows, cols, false)
 	if err != nil {
 		fmt.Fprintf(ch.Stderr(), "twinet: %v\r\n", err)
 		return 1
@@ -524,16 +614,17 @@ func splitDevicePrefix(cmd []string) (string, []string, bool) {
 	if len(cmd) != 3 || cmd[0] != "sh" {
 		return "", nil, false
 	}
-	fields := strings.Fields(cmd[2])
-	if len(fields) < 2 {
+	body := strings.TrimLeftFunc(cmd[2], unicode.IsSpace)
+	i := strings.IndexFunc(body, unicode.IsSpace)
+	if i < 1 {
 		return "", nil, false
 	}
-	// Anything holding a path separator, a redirection or a separator is a
-	// command, not a name, whatever it resolves to.
-	if strings.ContainsAny(fields[0], "/.=|&;$<>`\"'") {
+	name := body[:i]
+	rest := strings.TrimLeftFunc(body[i:], unicode.IsSpace)
+	if rest == "" || strings.ContainsAny(name, "/.=|&;$<>`\"'") {
 		return "", nil, false
 	}
-	return fields[0], []string{"sh", "-c", strings.Join(fields[1:], " ")}, true
+	return name, []string{"sh", "-c", rest}, true
 }
 
 func parsePTY(payload []byte) (cols, rows int, ok bool) {

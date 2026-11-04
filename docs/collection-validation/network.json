@@ -1,0 +1,198 @@
+{
+  "ases": [
+    {
+      "as": 1,
+      "peers": 62,
+      "established": 62,
+      "rib_paths": 63
+    },
+    {
+      "as": 2,
+      "peers": 3,
+      "established": 3,
+      "rib_paths": 63
+    },
+    {
+      "as": 3,
+      "peers": 3,
+      "established": 3,
+      "rib_paths": 63
+    },
+    {
+      "as": 4,
+      "peers": 3,
+      "established": 3,
+      "rib_paths": 63
+    },
+    {
+      "as": 5,
+      "peers": 3,
+      "established": 3,
+      "rib_paths": 63
+    },
+    {
+      "as": 6,
+      "peers": 3,
+      "established": 3,
+      "rib_paths": 63
+    },
+    {
+      "as": 7,
+      "peers": 3,
+      "established": 3,
+      "rib_paths": 63
+    },
+    {
+      "as": 8,
+      "peers": 3,
+      "established": 3,
+      "rib_paths": 63
+    },
+    {
+      "as": 9,
+      "peers": 3,
+      "established": 3,
+      "rib_paths": 63
+    },
+    {
+      "as": 10,
+      "peers": 3,
+      "established": 3,
+      "rib_paths": 63
+    },
+    {
+      "as": 11,
+      "peers": 3,
+      "established": 3,
+      "rib_paths": 63
+    },
+    {
+      "as": 12,
+      "peers": 3,
+      "established": 3,
+      "rib_paths": 63
+    },
+    {
+      "as": 13,
+      "peers": 3,
+      "established": 3,
+      "rib_paths": 63
+    },
+    {
+      "as": 14,
+      "peers": 3,
+      "established": 3,
+      "rib_paths": 63
+    },
+    {
+      "as": 15,
+      "peers": 3,
+      "established": 3,
+      "rib_paths": 63
+    },
+    {
+      "as": 16,
+      "peers": 3,
+      "established": 3,
+      "rib_paths": 63
+    },
+    {
+      "as": 17,
+      "peers": 3,
+      "established": 3,
+      "rib_paths": 63
+    },
+    {
+      "as": 18,
+      "peers": 3,
+      "established": 3,
+      "rib_paths": 63
+    },
+    {
+      "as": 19,
+      "peers": 3,
+      "established": 3,
+      "rib_paths": 63
+    },
+    {
+      "as": 20,
+      "peers": 3,
+      "established": 3,
+      "rib_paths": 63
+    },
+    {
+      "as": 21,
+      "peers": 3,
+      "established": 3,
+      "rib_paths": 63
+    },
+    {
+      "as": 22,
+      "peers": 3,
+      "established": 3,
+      "rib_paths": 63
+    },
+    {
+      "as": 23,
+      "peers": 3,
+      "established": 3,
+      "rib_paths": 63
+    },
+    {
+      "as": 24,
+      "peers": 3,
+      "established": 3,
+      "rib_paths": 63
+    },
+    {
+      "as": 25,
+      "peers": 3,
+      "established": 3,
+      "rib_paths": 63
+    },
+    {
+      "as": 26,
+      "peers": 3,
+      "established": 3,
+      "rib_paths": 63
+    },
+    {
+      "as": 27,
+      "peers": 3,
+      "established": 3,
+      "rib_paths": 63
+    },
+    {
+      "as": 28,
+      "peers": 3,
+      "established": 3,
+      "rib_paths": 63
+    },
+    {
+      "as": 29,
+      "peers": 3,
+      "established": 3,
+      "rib_paths": 63
+    },
+    {
+      "as": 30,
+      "peers": 3,
+      "established": 3,
+      "rib_paths": 63
+    },
+    {
+      "as": 31,
+      "peers": 3,
+      "established": 3,
+      "rib_paths": 63
+    },
+    {
+      "as": 32,
+      "peers": 2,
+      "established": 2,
+      "rib_paths": 63
+    }
+  ],
+  "total_peers": 154,
+  "all_established": true
+}

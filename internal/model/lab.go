@@ -1225,8 +1225,23 @@ type EndpointPolicy struct {
 	VIP   string       `yaml:"vip,omitempty" json:"vip,omitempty"`
 }
 
+// Collection configures optional terminal recording at the SSH gateway.
+type Collection struct {
+	Enabled         bool   `yaml:"enabled" json:"enabled"`
+	Directory       string `yaml:"directory,omitempty" json:"directory,omitempty"`
+	CaptureInput    *bool  `yaml:"capture_input,omitempty" json:"capture_input,omitempty"`
+	ShellEvents     *bool  `yaml:"shell_events,omitempty" json:"shell_events,omitempty"`
+	SyncInterval    string `yaml:"sync_interval,omitempty" json:"sync_interval,omitempty"`
+	MaxTotalBytes   int64  `yaml:"max_total_bytes,omitempty" json:"max_total_bytes,omitempty"`
+	MaxSessionBytes int64  `yaml:"max_session_bytes,omitempty" json:"max_session_bytes,omitempty"`
+	CollectorURL    string `yaml:"collector_url,omitempty" json:"collector_url,omitempty"`
+	TokenFile       string `yaml:"token_file,omitempty" json:"token_file,omitempty"`
+	UploadInterval  string `yaml:"upload_interval,omitempty" json:"upload_interval,omitempty"`
+}
+
 // Access configures student access to the lab.
 type Access struct {
+	Collection  *Collection    `yaml:"collection,omitempty" json:"collection,omitempty"`
 	Mode        string         `yaml:"mode,omitempty" json:"mode,omitempty" jsonschema:"enum=gateway,enum=none"`
 	Listen      string         `yaml:"listen,omitempty" json:"listen,omitempty"`
 	LegacyPorts *LegacyPorts   `yaml:"legacy_ports,omitempty" json:"legacy_ports,omitempty"`
