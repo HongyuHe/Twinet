@@ -156,12 +156,18 @@ func newGatewayRunCmd(opts *Options) *cobra.Command {
 			if collectionTokenFile != "" {
 				policy.TokenFile = collectionTokenFile
 			}
-			input, shell := true, true
+			input, shell, applications := true, true, true
 			if policy.CaptureInput != nil {
 				input = *policy.CaptureInput
 			}
 			if policy.ShellEvents != nil {
 				shell = *policy.ShellEvents
+			}
+			if policy.ApplicationEvents != nil {
+				applications = *policy.ApplicationEvents
+			}
+			if cmd.Flags().Changed("application-events") {
+				applications, _ = cmd.Flags().GetBool("application-events")
 			}
 			if cmd.Flags().Changed("record-input") {
 				input = recordInput
@@ -216,7 +222,7 @@ func newGatewayRunCmd(opts *Options) *cobra.Command {
 
 			srv, err := access.New(access.Config{
 				Topology: top, Roster: roster, Exec: ex, HostKey: key,
-				Listen: listen, LegacyBase: legacyBase, Collection: store, CaptureInput: input, ShellEvents: shell,
+				Listen: listen, LegacyBase: legacyBase, Collection: store, CaptureInput: input, ShellEvents: shell, ApplicationEvents: applications,
 			})
 			if err != nil {
 				return err
@@ -249,6 +255,7 @@ func newGatewayRunCmd(opts *Options) *cobra.Command {
 	cmd.Flags().StringVar(&recordDir, "record-dir", "", "recording directory; relative paths are resolved under the lab")
 	cmd.Flags().BoolVar(&recordInput, "record-input", true, "record raw terminal input when collection is enabled")
 	cmd.Flags().BoolVar(&shellEvents, "shell-events", true, "collect Bash command events when collection is enabled")
+	cmd.Flags().Bool("application-events", true, "collect supported application commands when collection is enabled")
 	cmd.Flags().StringVar(&collectorURL, "collector-url", "", "automatically upload recordings to this collector URL")
 	cmd.Flags().StringVar(&collectionTokenFile, "collection-token-file", "", "file containing the collector bearer token")
 	cmd.Flags().StringVar(&listen, "listen", "", "address to listen on")

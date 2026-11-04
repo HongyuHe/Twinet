@@ -97,7 +97,7 @@ func Handler(root, token string, receive bool) (http.Handler, error) {
 				_ = json.NewEncoder(w).Encode(m)
 				return
 			}
-			format := map[string]string{"events.jsonl": "events", "commands.jsonl": "commands", "activity.jsonl": "activity", "activity.csv": "csv", "replay.cast": "cast"}[resource]
+			format := map[string]string{"events.jsonl": "events", "commands.jsonl": "commands", "activity.jsonl": "activity", "activity.csv": "csv", "coverage.jsonl": "coverage", "replay.cast": "cast"}[resource]
 			if format == "" {
 				http.NotFound(w, r)
 				return

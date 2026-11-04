@@ -88,11 +88,12 @@ type Config struct {
 	Listen  string
 	// LegacyBase, when non-zero, additionally listens on base+ASN for each AS,
 	// reproducing the "ssh -p 2003" entry point students may already know.
-	LegacyBase   int
-	Logger       *slog.Logger
-	Collection   *collection.Store
-	CaptureInput bool
-	ShellEvents  bool
+	LegacyBase        int
+	Logger            *slog.Logger
+	Collection        *collection.Store
+	CaptureInput      bool
+	ShellEvents       bool
+	ApplicationEvents bool
 }
 
 // Server is the SSH gateway.

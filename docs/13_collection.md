@@ -23,6 +23,7 @@ access:
     directory: .twinet/recordings
     capture_input: true
     shell_events: true
+    application_events: true
     sync_interval: 1s
     max_session_bytes: 268435456
     max_total_bytes: 10737418240
@@ -44,8 +45,8 @@ twinet -m /path/to/lab gateway run --record --record-dir .twinet/recordings
 alone does not enable collection. Relative recording directories and token-file
 paths are resolved under the lab directory.
 
-The defaults, once collection is enabled, are input capture and Bash command
-events enabled, a one-second sync interval, a 256 MiB session limit, and a 10 GiB
+The defaults, once collection is enabled, are input capture, Bash command
+events, and supported application events enabled, a one-second sync interval, a 256 MiB session limit, and a 10 GiB
 limit on local journal bytes. The total limit includes retained sessions from
 previous gateway runs. The gateway refuses new recorded work when storage cannot
 accept it. It closes an active session if recording writes fail or a limit is
@@ -54,7 +55,9 @@ reached. It does not continue the session without recording.
 Raw input includes characters typed at hidden password prompts. Set
 `capture_input: false` or `--record-input=false` to omit raw input. Bash command
 text is controlled separately by `shell_events` or `--shell-events=false`.
-Output still contains whatever the application displays, including echoed commands.
+Application commands are controlled by `application_events` or
+`--application-events=false`. Output still contains whatever the application
+displays, including echoed commands.
 
 ## Identify users
 
@@ -175,9 +178,11 @@ Use the session's UTC `started` timestamp when comparing separate sessions.
 | `input`, `output`, `stderr` | Exact bytes in the base64-encoded `data` field |
 | `resize` | New `rows` and `cols` in `fields` |
 | `device_start`, `device_end` | Selected device, execution ID, and result |
+| `application_capability`, `application_start`, `application_end` | Native hook support and invocation boundaries |
+| `application_warning` | An application report ended before all fragments arrived |
 | `shell_ready` | Bash command collection initialized in this device shell |
 | `command_start`, `command_end` | Command fields and a shared `command_id` |
-| `command_incomplete` | The shell ended without reporting another prompt |
+| `command_incomplete` | The shell or application ended before reporting a result |
 
 Export commands directly for analysis:
 
@@ -211,11 +216,10 @@ duration from `time_ns`. They do not need to infer shell prompts from screen tex
 
 Bash reports are supplementary evidence. Users can replace the shell, change its
 hooks, or forge its reports. A `shell_ready` event confirms initialization, not
-permanent coverage. Commands inside an interactive application such as `vtysh`
-remain available in terminal playback; they do not become individual Bash
-command events. Application-specific collectors can add new event types without
-changing the raw recording format. No command log alone proves the resulting
-network configuration.
+permanent coverage. Instrumented `vtysh` supplies separate application command
+records as described below. Other applications retain terminal playback and can
+add their own command reports without changing the raw recording format. No
+command log alone proves the resulting network configuration.
 
 Asciicast v2 export is compatible with Asciinema playback tools. The exporter
 handles UTF-8 characters split across output events. Invalid terminal encodings
@@ -223,6 +227,80 @@ are replaced in replay strings; the original bytes remain in `events.jsonl`.
 Input, output, stderr, timing, device markers, and terminal resizing are retained.
 Shell collection control messages become structured events and are removed from
 the displayed output.
+
+## FRR and vtysh commands
+
+The Twinet router image includes a small native hook in FRR 10.0's `vtysh`.
+When application collection is enabled, the hook reports accepted interactive
+commands after line editing, completion, and history recall. It also reports
+each command passed with `-c`, including multiple commands in one invocation.
+The gateway assigns those records to the authenticated session and selected device.
+
+Each command has `source: vtysh_reported`, a unique `command_id`, an invocation
+ID and `mode_before` / `mode_after`. An explicit SSH exec request also supplies
+its parent gateway command ID. Interactive reports use the invocation ID to group
+commands; the collector does not guess which Bash command launched a background
+process from the timing of its first report.
+The native hook reports FRR's `result_code` and the gateway supplies a readable
+`result_name`. Examples include `success`, `unknown_command`,
+`ambiguous_command`, `incomplete_command`, and `daemon_unavailable`.
+These FRR command results are distinct from a shell process's `exit_code`.
+The JSONL/CSV activity exports join each command with its result and duration.
+The browser displays the command's mode transition and result. Durations use
+gateway receipt times, so transport and reporting latency are included.
+
+The hook reports the return value after FRR finishes dispatching a command.
+A top-level `exit` or `quit` reports success before FRR exits. If the gateway
+loses the process during a command, the record remains incomplete with an
+unknown result. FRR success means FRR accepted the operation; use network-state
+queries to assess routing convergence and the resulting configuration.
+
+Reports use an inherited descriptor separate from normal stdout/stderr
+redirection. Nested shells and simultaneous `vtysh` invocations retain separate
+invocation IDs. Reports are encoded in bounded fragments and removed from
+terminal playback. Each native report is limited to 32 KiB. Oversized or
+unwritable reports abort `vtysh` with process status 125. Commands entered at the
+prompt and `-c` arguments are the native hook's collection boundary.
+Configuration files passed with `-f` retain
+the outer command and terminal recording; the hook does not report a separate
+result for each imported configuration line. Completion/help keystrokes that do
+not execute a command remain terminal input/output only.
+
+Build the updated router image on the Linux build host with:
+
+```sh
+make images IMAGES=router REGISTRY=local TAG=vtysh-collection
+```
+
+Select `local/twinet-router:vtysh-collection` in the lab's router kind and deploy
+normally. An existing stock FRR image does not gain the native hook from a
+gateway upgrade alone. The gateway records `application_capability` for each
+device, and the browser shows a warning for an unsupported `vtysh` image.
+The capability can also be checked directly:
+
+```sh
+vtysh --twinet-collection-version
+```
+
+The instrumented binary returns `1`. Export capability and application lifecycle
+records with:
+
+```sh
+twinet collection export SESSION_ID --dir /srv/twinet/spool --format coverage
+```
+
+Collection remains off by default. The native hook emits nothing without the
+gateway's collection environment. Application collection can be disabled while
+retaining Bash events and terminal playback. Application reports remain
+supplementary evidence: a user with device-root access can replace a binary,
+remove the environment, close the reporting descriptor, or forge reports.
+
+The [router build](../images/router/Dockerfile) verifies the FRR source archive's
+checksum and applies [a small checked patch](../images/router/collection/patch.py).
+Only `vtysh` uses the private FRR library; the packaged routing daemons retain
+their libraries. Updating FRR requires explicitly porting and retesting the patch.
+The integration follows FRR's [command loop](https://github.com/FRRouting/frr/blob/frr-10.0/vtysh/vtysh_main.c)
+and [command result definitions](https://github.com/FRRouting/frr/blob/frr-10.0/lib/command.h).
 
 ## Recovery and storage management
 
@@ -271,9 +349,12 @@ The main implementation files are:
 
 The collector API provides authenticated `GET /api/sessions` with optional `lab`,
 `group`, and `as` filters. Per-session GET resources are `session.json`,
-`events.jsonl`, `commands.jsonl`, `activity.jsonl`, `activity.csv`, and `replay.cast` under `/api/sessions/<id>/`.
+`events.jsonl`, `commands.jsonl`, `activity.jsonl`, `activity.csv`, `coverage.jsonl`, and `replay.cast` under `/api/sessions/<id>/`.
 Receiving collectors also accept PUT metadata and journal chunks. Journal PUTs
 supply a byte `offset`; clients finalize metadata only after all bytes are present.
 
 [CloudLab validation results](14_collection_validation.md) record the tested
 configuration, workload, measurements, and remaining validation limits.
+
+[Native vtysh validation](15_vtysh_collection_validation.md) covers application
+commands, concurrent invocations, and the upgraded router image.

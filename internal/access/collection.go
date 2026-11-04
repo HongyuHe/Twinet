@@ -22,7 +22,12 @@ import (
 // recordedChannel records before forwarding. A storage error closes the
 // channel and cancels execution instead of continuing an unrecorded session.
 type recordedChannel struct {
-	streamMu sync.Mutex
+	streamMu          sync.Mutex
+	appMu             sync.Mutex
+	applications      map[string]*applicationState
+	fragments         map[string]*applicationFragment
+	parentCommand     string
+	applicationEvents bool
 	ssh.Channel
 	recording    *collection.Recording
 	captureInput bool
@@ -148,6 +153,9 @@ func (o *recordedOutput) Write(p []byte) (int, error) {
 var historyPrefix = regexp.MustCompile(`^\s*[0-9]+\s{2}`)
 
 func (o *recordedOutput) shellEvent(message string) bool {
+	if strings.HasPrefix(message, "app;") || strings.HasPrefix(message, "capability;") {
+		return o.channel.applicationEvent(message)
+	}
 	fields := strings.Split(message, ";")
 	if len(fields) != 4 {
 		return false
@@ -205,9 +213,9 @@ func (o *recordedOutput) finish() error {
 	return err
 }
 
-// instrumentedShell uses a temporary rcfile only for this shell. The outer
-// gateway recording remains active if the student replaces or changes Bash.
-func instrumentedShell(ch *recordedChannel) []string {
+// prepareCollectionCommand enables reports only inside the recorded execution.
+func prepareCollectionCommand(ch *recordedChannel, cmd []string, shell, applications bool) []string {
+	ch.applicationEvents = applications
 	nonce, _ := collection.NewID()
 	prefix := []byte("\x1b]777;twinet=" + nonce + ";")
 	ch.out.mu.Lock()
@@ -216,6 +224,28 @@ func instrumentedShell(ch *recordedChannel) []string {
 	ch.errOut.mu.Lock()
 	ch.errOut.prefix = prefix
 	ch.errOut.mu.Unlock()
+	if shell {
+		cmd = instrumentedShell(nonce)
+	}
+	if applications {
+		setup := `exec 9>&2
+cap=absent
+if command -v vtysh >/dev/null 2>&1; then
+  cap=$(vtysh --twinet-collection-version 2>/dev/null) || cap=unsupported
+  [ "$cap" = 1 ] || cap=unsupported
+fi
+printf '\033]777;twinet=__TWINET_NONCE_VALUE__;capability;vtysh;%s\007' "$cap" >&9
+export TWINET_COLLECTION_NONCE=__TWINET_NONCE_VALUE__ TWINET_COLLECTION_FD=9
+exec "$@"`
+		setup = strings.ReplaceAll(setup, "__TWINET_NONCE_VALUE__", nonce)
+		cmd = append([]string{"/bin/sh", "-c", setup, "twinet-collection"}, cmd...)
+	}
+	return cmd
+}
+
+// instrumentedShell uses a temporary rcfile only for this shell. The outer
+// gateway recording remains active if the student replaces or changes Bash.
+func instrumentedShell(nonce string) []string {
 	script := `rm -f -- "${BASH_SOURCE[0]}"
 [[ -f /etc/bash.bashrc ]] && source /etc/bash.bashrc
 [[ -f ~/.bashrc ]] && source ~/.bashrc
@@ -262,19 +292,24 @@ func (s *Server) executeSession(ctx context.Context, ch ssh.Channel, sess Sessio
 	if err := c.recording.Add("device_start", nil, fields); err != nil {
 		return 1, c.fail(err)
 	}
-	if interactive && s.cfg.ShellEvents && tty {
-		cmd = instrumentedShell(c)
-	}
 	if !interactive {
 		if err := c.recording.Add("command_start", nil, map[string]any{"source": "gateway", "argv": cmd, "command_id": segment}); err != nil {
 			return 1, c.fail(err)
 		}
+		c.parentCommand = segment
+	}
+	shell := interactive && s.cfg.ShellEvents && tty
+	if shell || s.cfg.ApplicationEvents {
+		cmd = prepareCollectionCommand(c, cmd, shell, s.cfg.ApplicationEvents)
 	}
 	code, runErr := s.cfg.Exec.Shell(ctx, device, cmd, stdin, ch, ch.Stderr(), tty, rows, cols)
 	if err := c.out.finish(); err != nil && runErr == nil {
 		runErr = err
 	}
 	if err := c.errOut.finish(); err != nil && runErr == nil {
+		runErr = err
+	}
+	if err := c.finishApplications(); err != nil && runErr == nil {
 		runErr = err
 	}
 	if !interactive {
@@ -296,7 +331,7 @@ func (s *Server) startRecording(ch ssh.Channel, sess Session, tty bool, rows, co
 		return ch, nil, nil
 	}
 	host, _ := os.Hostname()
-	m := collection.Metadata{Lab: s.cfg.Topology.Name, Group: sess.Group, AS: sess.AS, Actor: sess.Actor, AuthMethod: sess.AuthMethod, KeyFingerprint: sess.KeyFingerprint, RemoteAddress: sess.RemoteAddress, Gateway: host, CaptureInput: s.cfg.CaptureInput, ShellEvents: s.cfg.ShellEvents, TTY: tty, Rows: rows, Cols: cols}
+	m := collection.Metadata{Lab: s.cfg.Topology.Name, Group: sess.Group, AS: sess.AS, Actor: sess.Actor, AuthMethod: sess.AuthMethod, KeyFingerprint: sess.KeyFingerprint, RemoteAddress: sess.RemoteAddress, Gateway: host, CaptureInput: s.cfg.CaptureInput, ShellEvents: s.cfg.ShellEvents, ApplicationEvents: s.cfg.ApplicationEvents, TTY: tty, Rows: rows, Cols: cols}
 	r, err := s.cfg.Collection.Start(m)
 	if err != nil {
 		return ch, nil, fmt.Errorf("cannot start collection: %w", err)

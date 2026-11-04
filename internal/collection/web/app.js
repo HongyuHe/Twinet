@@ -43,6 +43,10 @@ async function openSession(id) {
   const meta = await (await request(base+'session.json')).json();
   byId('title').textContent = `${meta.lab} / ${meta.group} / ${id.slice(0,12)}`;
   byId('status').textContent = `${meta.status}${meta.reason ? ': '+meta.reason : ''}. ${meta.capture_input ? 'Input and output recorded.' : 'Output recorded; raw input disabled.'}`;
+  const coverageText = await (await request(base+'coverage.jsonl')).text();
+  const coverage = coverageText.trim() ? coverageText.trim().split('\n').map(JSON.parse) : [];
+  const unsupported = [...new Set(coverage.filter(e=>e.type==='application_capability' && e.fields.protocol==='unsupported').map(e=>e.device))];
+  byId('coverage').textContent = unsupported.length ? `The router image lacks vtysh command collection on: ${unsupported.join(', ')}. Terminal playback is available.` : '';
   const blob = await (await request(base+'replay.cast')).blob();
   if (player) player.dispose();
   if (replayURL) URL.revokeObjectURL(replayURL);
@@ -56,7 +60,8 @@ async function openSession(id) {
   for (const event of events) {
     const row = document.createElement('tr');
     const duration = event.duration_ns === undefined ? '—' : `${(event.duration_ns/1e9).toFixed(3)}s`;
-    for (const value of [(event.start_ns/1e9).toFixed(3)+'s',event.device,event.command || JSON.stringify(event.argv),event.cwd || '—',event.exit_code ?? event.status,duration,event.source]) {
+    const mode = event.mode_before ? `${event.mode_before} → ${event.mode_after || '?'}` : '—';
+    for (const value of [(event.start_ns/1e9).toFixed(3)+'s',event.device,event.command || JSON.stringify(event.argv),event.cwd || '—',mode,event.result_name ?? event.exit_code ?? event.status,duration,event.source]) {
       const cell = document.createElement('td');cell.textContent=value;row.append(cell);
     }
     byId('commands').append(row);

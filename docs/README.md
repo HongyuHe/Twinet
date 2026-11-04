@@ -49,3 +49,5 @@ referenced paths, and benchmark labels.
 
 - [Session collection](13_collection.md): optional recording and post-processing.
 - [Collection validation](14_collection_validation.md): measured 32-AS CloudLab run.
+
+- [Native vtysh collection validation](15_vtysh_collection_validation.md)

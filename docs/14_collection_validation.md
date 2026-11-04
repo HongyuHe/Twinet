@@ -156,7 +156,8 @@ browser reads session metadata files when listing recordings; course-scale
 historical listing performance was not benchmarked. Use separate recording
 directories and collectors for independent courses or terms.
 
-Bash command records are shell reports. Commands entered inside `vtysh` have
-terminal recordings but no individual structured application command events.
+The original run recorded Bash command reports and raw `vtysh` playback.
+[The subsequent native vtysh integration](15_vtysh_collection_validation.md)
+adds individual application command records and has its own retained validation.
 Recorded commands and network state must be interpreted separately when studying
 whether a student's changes achieved the intended routing behavior.

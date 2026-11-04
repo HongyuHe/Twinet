@@ -49,7 +49,7 @@ func newCollectionCmd() *cobra.Command {
 	export := &cobra.Command{Use: "export <session-id>", Short: "Export a session to stdout", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
 		return collection.Export(dir, args[0], format, cmd.OutOrStdout())
 	}}
-	export.Flags().StringVar(&format, "format", "events", "events, commands, activity, csv, or cast")
+	export.Flags().StringVar(&format, "format", "events", "events, commands, activity, csv, coverage, or cast")
 	var url, tokenFile string
 	syncCmd := &cobra.Command{Use: "sync", Short: "Upload pending session data and verify completed recordings", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, _ []string) error {
 		token, err := collectionToken(tokenFile)

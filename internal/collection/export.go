@@ -31,8 +31,8 @@ func Export(root, id, format string, out io.Writer) error {
 		if err := enc.Encode(map[string]any{"version": 2, "width": cols, "height": rows, "timestamp": m.Started.Unix(), "title": m.Lab + " / " + m.Group + " / " + m.ID}); err != nil {
 			return err
 		}
-	} else if format != "events" && format != "commands" {
-		return fmt.Errorf("unknown format %q; use events, commands, activity, csv, or cast", format)
+	} else if format != "events" && format != "commands" && format != "coverage" {
+		return fmt.Errorf("unknown format %q; use events, commands, activity, csv, coverage, or cast", format)
 	}
 	var pending []byte
 	var lastTime float64
@@ -61,6 +61,11 @@ func Export(root, id, format string, out io.Writer) error {
 			return enc.Encode(e)
 		case "commands":
 			if strings.HasPrefix(e.Type, "command_") {
+				return enc.Encode(e)
+			}
+			return nil
+		case "coverage":
+			if strings.HasPrefix(e.Type, "application_") {
 				return enc.Encode(e)
 			}
 			return nil

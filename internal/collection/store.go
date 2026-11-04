@@ -29,28 +29,29 @@ var validID = regexp.MustCompile(`^[a-f0-9]{32}$`)
 
 // Metadata is the searchable, small summary of one SSH channel.
 type Metadata struct {
-	Schema         int        `json:"schema"`
-	ID             string     `json:"id"`
-	Lab            string     `json:"lab"`
-	Group          string     `json:"group"`
-	AS             int        `json:"as"`
-	Actor          string     `json:"actor"`
-	AuthMethod     string     `json:"auth_method"`
-	KeyFingerprint string     `json:"key_fingerprint,omitempty"`
-	RemoteAddress  string     `json:"remote_address,omitempty"`
-	Gateway        string     `json:"gateway"`
-	Started        time.Time  `json:"started"`
-	Ended          *time.Time `json:"ended,omitempty"`
-	Status         string     `json:"status"`
-	Reason         string     `json:"reason,omitempty"`
-	CaptureInput   bool       `json:"capture_input"`
-	ShellEvents    bool       `json:"shell_events"`
-	TTY            bool       `json:"tty"`
-	Rows           int        `json:"rows"`
-	Cols           int        `json:"cols"`
-	Events         uint64     `json:"events"`
-	Bytes          int64      `json:"bytes"`
-	SHA256         string     `json:"sha256,omitempty"`
+	Schema            int        `json:"schema"`
+	ID                string     `json:"id"`
+	Lab               string     `json:"lab"`
+	Group             string     `json:"group"`
+	AS                int        `json:"as"`
+	Actor             string     `json:"actor"`
+	AuthMethod        string     `json:"auth_method"`
+	KeyFingerprint    string     `json:"key_fingerprint,omitempty"`
+	RemoteAddress     string     `json:"remote_address,omitempty"`
+	Gateway           string     `json:"gateway"`
+	Started           time.Time  `json:"started"`
+	Ended             *time.Time `json:"ended,omitempty"`
+	Status            string     `json:"status"`
+	Reason            string     `json:"reason,omitempty"`
+	CaptureInput      bool       `json:"capture_input"`
+	ShellEvents       bool       `json:"shell_events"`
+	ApplicationEvents bool       `json:"application_events"`
+	TTY               bool       `json:"tty"`
+	Rows              int        `json:"rows"`
+	Cols              int        `json:"cols"`
+	Events            uint64     `json:"events"`
+	Bytes             int64      `json:"bytes"`
+	SHA256            string     `json:"sha256,omitempty"`
 }
 
 // Event preserves exact stream bytes as base64 through encoding/json's []byte

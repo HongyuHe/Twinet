@@ -1,0 +1,137 @@
+apiVersion: twinet.dev/v1
+kind: Lab
+metadata:
+  name: collection32
+  description: 32 ASes for session collection validation
+  course: COS 461 - Computer Networks, Princeton
+  term: fall25
+images:
+  mode: development
+defaults:
+  cpus: 2
+  memory: 512Mi
+  pids: 256
+  restart: unless-stopped
+kinds:
+  router:
+    image: twinet-router:collection-vtysh-final
+    requests:
+      cpus: 0.04
+      memory: 128Mi
+      pids: 64
+      ephemeral_storage: 256Mi
+      file_descriptors: 1024
+      netdevs: 8
+    capabilities:
+    - NET_ADMIN
+    - NET_RAW
+    sysctls:
+      net.ipv4.ip_forward: '1'
+      net.ipv6.conf.all.forwarding: '1'
+      net.ipv6.conf.all.disable_ipv6: '0'
+      net.ipv4.fib_multipath_hash_policy: '1'
+      net.ipv4.conf.all.rp_filter: '0'
+      net.ipv4.conf.default.rp_filter: '0'
+      net.ipv4.icmp_ratelimit: '0'
+  host:
+    image: hyhe/twinet-host:0.1@sha256:f954a5aaca95fd4b44deadb8b4a4cf6178f0a672cc09e517cc63134224c4b3d7
+    requests:
+      cpus: 0.02
+      memory: 64Mi
+      pids: 32
+      ephemeral_storage: 64Mi
+      file_descriptors: 256
+      netdevs: 2
+    capabilities:
+    - NET_ADMIN
+    - NET_RAW
+    pids: 128
+    sysctls:
+      net.ipv6.conf.all.disable_ipv6: '0'
+link_defaults:
+  bandwidth: 10mbit
+  delay: 10ms
+  queue: 50ms
+  mtu: 1500
+addressing:
+  as_block: '{{ .AS }}.0.0.0/8'
+  as_block_v6: '{{ printf "%x" .AS }}::/32'
+  router_loopback: '{{ .AS }}.{{ add 150 .RouterID }}.0.1/24'
+  router_router: '{{ .AS }}.0.{{ add 1 .LinkIndex }}.0/24'
+  router_host: '{{ .AS }}.{{ add 100 .RouterID }}.0.0/24'
+  l2_domain: '{{ .AS }}.{{ add 199 .L2ID }}.0.0/23'
+  l2_vlan: '{{ cidrSubnet (printf "%d.%d.0.0/23" .AS (add 199 .L2ID)) .VLANIndex 24
+    }}'
+  l2_domain_v6: '{{ .AS }}:{{ add 199 .L2ID }}::/32'
+  l2_vlan_v6: '{{ cidrSubnet (printf "%d:%d::/32" .AS (add 199 .L2ID)) .VLANIndex
+    48 }}'
+  inter_as: '{{ cidrSubnet "179.0.0.0/8" .LinkIndex 24 }}'
+  ixp_peering: 180.{{ .IXP }}.0.0/24
+  services:
+    dns: 198.{{ .AS }}.0.0/24
+    matrix: '{{ .AS }}.0.198.0/24'
+    measurement: '{{ .AS }}.0.199.0/24'
+as_defaults:
+  template: compact
+  role: student
+autonomous_systems:
+- range:
+  - 1
+  - 32
+  template: compact
+  role: student
+peerings:
+  generator:
+    kind: tiered-internet
+    tiers:
+    - - 1
+    - - 2
+      - 3
+      - 4
+      - 5
+      - 6
+      - 7
+      - 8
+      - 9
+      - 10
+      - 11
+      - 12
+      - 13
+      - 14
+      - 15
+      - 16
+      - 17
+      - 18
+      - 19
+      - 20
+      - 21
+      - 22
+      - 23
+      - 24
+      - 25
+      - 26
+      - 27
+      - 28
+      - 29
+      - 30
+      - 31
+      - 32
+services: {}
+access:
+  mode: gateway
+  listen: 127.0.0.1:2022
+  collection:
+    enabled: true
+    directory: /users/hy/collection-spool
+    collector_url: http://127.0.0.1:7330
+    token_file: /users/hy/collection-token
+    sync_interval: 1s
+    upload_interval: 2s
+    application_events: true
+placement:
+  strategy: single-node
+  runtime: docker
+  nodes:
+  - name: node-0
+    underlay_ip: 10.0.1.1
+    front: true
