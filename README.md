@@ -75,6 +75,8 @@ in the status ledger.
 | [Implementation status](docs/09_status.md) | Canonical shipped/target/measured ledger |
 | [Fault injection and RCA](docs/10_fault_injection.md) | NIKA fault work (maintained separately) |
 | [Scalability and reliability objectives](docs/11_scalability_and_reliability_objectives.md) | Objectives and review gate (maintained separately) |
+| [Session collection](docs/13_collection.md) | Optional terminal recording, command events, uploads, and playback |
+| [Collection validation](docs/14_collection_validation.md) | 32-AS CloudLab recording and recovery measurements |
 | [Operator guide](docs/12_operator_guide.md) | Runbook from three clean machines to a deployed, graded, and safely removed lab |
 
 ## Validation

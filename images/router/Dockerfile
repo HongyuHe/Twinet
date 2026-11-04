@@ -18,6 +18,36 @@
 # A rebuild months later can move FRR by a minor version, change a JSON field a
 # check parses, and silently regrade a class differently from the first run --
 # with the image tag, the manifest and the rubric all unchanged.
+FROM alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc AS vtysh-build
+
+# Only vtysh uses the private FRR library; the packaged routing daemons retain
+# their original libraries. The source archive matches Alpine's FRR package.
+RUN apk add --no-cache build-base autoconf automake bison flex libtool \
+        json-c-dev readline-dev libcap-dev 'libyang-dev<2.2' c-ares-dev \
+        python3-dev elfutils-dev bsd-compat-headers linux-headers \
+        net-snmp-dev rtrlib-dev protobuf-c-dev texinfo curl patchelf
+WORKDIR /src
+RUN curl -fsSL https://github.com/FRRouting/frr/archive/refs/tags/frr-10.0.tar.gz -o frr.tar.gz \
+    && echo 'f02fe672d3ab7382752f83a8ae1e6198e6b906b4ad31063aad18b803c8756b40fa1f280c5dafe872dea505bcc882fbb8392802411f9fac0ab0bd45dac8b3ed28  frr.tar.gz' | sha512sum -c - \
+    && tar xzf frr.tar.gz
+WORKDIR /src/frr-frr-10.0
+COPY collection/vtysh_collection.h vtysh/twinet_collection.h
+COPY collection/patch.py /src/patch.py
+RUN python3 /src/patch.py && ./bootstrap.sh \
+    && ./configure --prefix=/usr --localstatedir=/run/frr --sbindir=/usr/lib/frr \
+        --sysconfdir=/etc/frr --libdir=/usr/lib/twinet/frr --with-moduledir=/usr/lib/frr/modules \
+        --disable-dependency-tracking --enable-rpki --with-libpam --disable-doc \
+        --enable-snmp --enable-fpm --disable-protobuf --disable-zeromq \
+        --enable-ospfapi --enable-bgp-vnc --enable-multipath=256 \
+        --enable-user=frr --enable-group=frr --enable-vty-group=frrvty \
+        --enable-configfile-mask=0640 --enable-logfile-mask=0640 \
+    && make -j8 vtysh/vtysh \
+    && patchelf --set-rpath /usr/lib/twinet/frr vtysh/.libs/vtysh \
+    && mkdir -p /out/lib \
+    && cp vtysh/.libs/vtysh /out/vtysh \
+    && cp -a lib/.libs/libfrr.so.0* /out/lib/ \
+    && strip /out/vtysh /out/lib/libfrr.so.0.0.0
+
 FROM alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
 
 RUN apk add --no-cache \
@@ -32,6 +62,9 @@ RUN apk add --no-cache \
     && install -m 0640 -o frr -g frrvty /dev/null /etc/frr/vtysh.conf \
     && install -m 0640 -o frr -g frr /dev/null /etc/frr/frr.conf \
     && mkdir -p /etc/twinet
+
+COPY --from=vtysh-build /out/vtysh /usr/bin/vtysh
+COPY --from=vtysh-build /out/lib/ /usr/lib/twinet/frr/
 
 # vtysh reads this to know which daemons to talk to.
 RUN printf 'service integrated-vtysh-config\n' > /etc/frr/vtysh.conf \

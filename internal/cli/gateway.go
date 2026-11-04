@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"github.com/HongyuHe/twinet/internal/collection"
 	"io"
 	"os"
 	"os/signal"
@@ -10,8 +11,10 @@ import (
 	"sort"
 	"syscall"
 	"text/tabwriter"
+	"time"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/crypto/ssh"
 
 	"github.com/HongyuHe/twinet/internal/access"
 	"github.com/HongyuHe/twinet/internal/client"
@@ -68,6 +71,8 @@ func newGatewayEndpointsCmd(opts *Options) *cobra.Command {
 }
 
 func newGatewayRunCmd(opts *Options) *cobra.Command {
+	var record, recordInput, shellEvents bool
+	var recordDir, collectorURL, collectionTokenFile string
 	var (
 		listen     string
 		rosterPath string
@@ -120,12 +125,12 @@ func newGatewayRunCmd(opts *Options) *cobra.Command {
 				cl := client.NewCluster(top.Lab, tok)
 				ex = &access.ClusterExec{Topology: top, Attach: func(ctx context.Context,
 					node, container string, cmd []string, tty bool, rows, cols int,
-					stdin io.Reader, stdout io.Writer) (int, error) {
+					stdin io.Reader, stdout, stderr io.Writer) (int, error) {
 					n, ok := cl.Node(node)
 					if !ok {
 						return 1, fmt.Errorf("unknown node %q", node)
 					}
-					return n.Attach(ctx, container, cmd, tty, rows, cols, stdin, stdout)
+					return n.AttachStreams(ctx, container, cmd, tty, rows, cols, stdin, stdout, stderr)
 				}}
 			} else {
 				selected, err := localRuntime(top)
@@ -135,14 +140,99 @@ func newGatewayRunCmd(opts *Options) *cobra.Command {
 				ex = &access.LocalExec{Topology: top, Runtime: selected}
 			}
 
+			policy := model.Collection{}
+			if top.Lab.Access.Collection != nil {
+				policy = *top.Lab.Access.Collection
+			}
+			if cmd.Flags().Changed("record") {
+				policy.Enabled = record
+			}
+			if recordDir != "" {
+				policy.Directory = recordDir
+			}
+			if collectorURL != "" {
+				policy.CollectorURL = collectorURL
+			}
+			if collectionTokenFile != "" {
+				policy.TokenFile = collectionTokenFile
+			}
+			input, shell, applications := true, true, true
+			if policy.CaptureInput != nil {
+				input = *policy.CaptureInput
+			}
+			if policy.ShellEvents != nil {
+				shell = *policy.ShellEvents
+			}
+			if policy.ApplicationEvents != nil {
+				applications = *policy.ApplicationEvents
+			}
+			if cmd.Flags().Changed("application-events") {
+				applications, _ = cmd.Flags().GetBool("application-events")
+			}
+			if cmd.Flags().Changed("record-input") {
+				input = recordInput
+			}
+			if cmd.Flags().Changed("shell-events") {
+				shell = shellEvents
+			}
+			var store *collection.Store
+			var uploader *collection.Uploader
+			interval := 2 * time.Second
+			if policy.Enabled {
+				dir := policy.Directory
+				if dir == "" {
+					dir = filepath.Join(".twinet", "recordings")
+				}
+				if !filepath.IsAbs(dir) {
+					dir = filepath.Join(top.Lab.Dir, dir)
+				}
+				syncInterval := time.Second
+				if policy.SyncInterval != "" {
+					syncInterval, err = time.ParseDuration(policy.SyncInterval)
+					if err != nil {
+						return err
+					}
+				}
+				if policy.UploadInterval != "" {
+					interval, err = time.ParseDuration(policy.UploadInterval)
+					if err != nil || interval <= 0 {
+						return fmt.Errorf("invalid collection upload interval")
+					}
+				}
+				if policy.CollectorURL != "" {
+					tokenPath := policy.TokenFile
+					if tokenPath != "" && !filepath.IsAbs(tokenPath) {
+						tokenPath = filepath.Join(top.Lab.Dir, tokenPath)
+					}
+					token, err := collectionToken(tokenPath)
+					if err != nil {
+						return err
+					}
+					uploader = &collection.Uploader{Root: dir, URL: policy.CollectorURL, Token: token}
+					if err := uploader.Validate(); err != nil {
+						return err
+					}
+				}
+				store, err = collection.Open(collection.Options{Dir: dir, SyncInterval: syncInterval, MaxSessionBytes: policy.MaxSessionBytes, MaxTotalBytes: policy.MaxTotalBytes})
+				if err != nil {
+					return err
+				}
+				defer func() { _ = store.Close() }()
+			}
+
 			srv, err := access.New(access.Config{
 				Topology: top, Roster: roster, Exec: ex, HostKey: key,
-				Listen: listen, LegacyBase: legacyBase,
+				Listen: listen, LegacyBase: legacyBase, Collection: store, CaptureInput: input, ShellEvents: shell, ApplicationEvents: applications,
 			})
 			if err != nil {
 				return err
 			}
 
+			if store != nil {
+				if err := srv.RecoverExecutions(store.Directory()); err != nil {
+					return err
+				}
+			}
 			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
 
@@ -152,9 +242,22 @@ func newGatewayRunCmd(opts *Options) *cobra.Command {
 				fmt.Fprintf(cmd.OutOrStdout(),
 					"legacy per-AS ports from %d; the port implies the AS but does not authorise it\n", legacyBase)
 			}
+			if uploader != nil {
+				uploadCtx, cancel := context.WithCancel(ctx)
+				done := make(chan struct{})
+				go uploadRecordings(uploadCtx, uploader, interval, done)
+				defer func() { cancel(); <-done }()
+			}
 			return srv.Serve(ctx)
 		},
 	}
+	cmd.Flags().BoolVar(&record, "record", false, "enable terminal session collection")
+	cmd.Flags().StringVar(&recordDir, "record-dir", "", "recording directory; relative paths are resolved under the lab")
+	cmd.Flags().BoolVar(&recordInput, "record-input", true, "record raw terminal input when collection is enabled")
+	cmd.Flags().BoolVar(&shellEvents, "shell-events", true, "collect Bash command events when collection is enabled")
+	cmd.Flags().Bool("application-events", true, "collect supported application commands when collection is enabled")
+	cmd.Flags().StringVar(&collectorURL, "collector-url", "", "automatically upload recordings to this collector URL")
+	cmd.Flags().StringVar(&collectionTokenFile, "collection-token-file", "", "file containing the collector bearer token")
 	cmd.Flags().StringVar(&listen, "listen", "", "address to listen on")
 	cmd.Flags().StringVar(&rosterPath, "roster", "", "path to the roster")
 	cmd.Flags().StringVar(&hostKey, "host-key", "", "path to the gateway's host key")
@@ -295,7 +398,7 @@ func newRosterListCmd(opts *Options) *cobra.Command {
 }
 
 func newRosterKeyCmd(opts *Options) *cobra.Command {
-	var rosterPath string
+	var rosterPath, actor string
 	cmd := &cobra.Command{
 		Use:   "add-key <group> <public-key-file>",
 		Short: "Authorise an SSH public key for a group",
@@ -320,7 +423,17 @@ func newRosterKeyCmd(opts *Options) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			public, _, _, _, err := ssh.ParseAuthorizedKey(raw)
+			if err != nil {
+				return fmt.Errorf("invalid SSH public key: %w", err)
+			}
 			g.AuthorizedKeys = append(g.AuthorizedKeys, string(raw))
+			if actor != "" {
+				if g.KeyActors == nil {
+					g.KeyActors = map[string]string{}
+				}
+				g.KeyActors[ssh.FingerprintSHA256(public)] = actor
+			}
 			if err := roster.Save(rosterPath); err != nil {
 				return err
 			}
@@ -329,6 +442,7 @@ func newRosterKeyCmd(opts *Options) *cobra.Command {
 			return nil
 		},
 	}
+	cmd.Flags().StringVar(&actor, "actor", "", "person associated with this SSH public key")
 	cmd.Flags().StringVar(&rosterPath, "roster", "", "path to the roster")
 	return cmd
 }

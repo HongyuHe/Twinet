@@ -12,6 +12,8 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+
+	"github.com/HongyuHe/twinet/internal/terminal"
 )
 
 // dialStream opens the transport an attach runs over, matching whatever the
@@ -47,6 +49,12 @@ func (n *Node) dialStream(ctx context.Context, host string) (net.Conn, error) {
 // attribute later.
 func (n *Node) Attach(ctx context.Context, container string, cmd []string,
 	tty bool, rows, cols int, stdin io.Reader, stdout io.Writer) (int, error) {
+	return n.AttachStreams(ctx, container, cmd, tty, rows, cols, stdin, stdout, stdout)
+}
+
+// AttachStreams preserves stdout and stderr separately on current agents.
+func (n *Node) AttachStreams(ctx context.Context, container string, cmd []string,
+	tty bool, rows, cols int, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
 
 	raw, err := json.Marshal(cmd)
 	if err != nil {
@@ -55,9 +63,20 @@ func (n *Node) Attach(ctx context.Context, container string, cmd []string,
 	q := url.Values{}
 	q.Set("container", container)
 	q.Set("cmd", string(raw))
+	executionID, err := terminal.ExecutionID(ctx)
+	if err != nil {
+		return 1, err
+	}
+	q.Set("execution", executionID)
 	// Ask for the exit status. Without it this function returned 0 whatever
 	// the command did.
 	q.Set("status", "1")
+	control := terminal.From(ctx)
+	requireFrames := control != nil
+	if control == nil {
+		control = terminal.New(uint32(rows), uint32(cols))
+	}
+	q.Set("frames", "2")
 	if tty {
 		q.Set("tty", "1")
 		q.Set("rows", fmt.Sprint(rows))
@@ -93,36 +112,85 @@ func (n *Node) Attach(ctx context.Context, container string, cmd []string,
 	if !strings.Contains(status, " 200 ") {
 		return 1, fmt.Errorf("attach refused: %s", strings.TrimSpace(status))
 	}
+	framed := ""
 	for {
 		line, err := br.ReadString('\n')
 		if err != nil {
 			return 1, err
+		}
+		if strings.EqualFold(strings.TrimSpace(line), "X-Twinet-Frames: 1") {
+			framed = "1"
+		}
+		if strings.EqualFold(strings.TrimSpace(line), "X-Twinet-Frames: 2") {
+			framed = "2"
 		}
 		if strings.TrimSpace(line) == "" {
 			break
 		}
 	}
 
+	finished := make(chan struct{})
+	defer close(finished)
 	go func() {
-		_, _ = io.Copy(conn, stdin)
-		// Half-close so the far side sees EOF on stdin and a piped command can
-		// finish, rather than waiting forever for input that never comes.
-		type halfCloser interface{ CloseWrite() error }
-		if hc, ok := conn.(halfCloser); ok {
-			_ = hc.CloseWrite()
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-finished:
 		}
 	}()
+	if requireFrames && framed != "2" {
+		return 1, fmt.Errorf("agent does not support terminal resize frames; update the agent")
+	}
+	if stdin == nil {
+		stdin = strings.NewReader("")
+	}
+	if framed != "" {
+		writer := &terminal.FrameWriter{Writer: conn}
+		changes, unsubscribe := control.Subscribe()
+		defer unsubscribe()
+		go func() {
+			for {
+				select {
+				case size := <-changes:
+					if writer.Resize(size) != nil {
+						return
+					}
+				case <-finished:
+					return
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+		go func() { _, _ = io.Copy(writer, stdin); _ = writer.EOF() }()
+	} else {
+		go func() {
+			_, _ = io.Copy(conn, stdin)
+			type halfCloser interface{ CloseWrite() error }
+			if hc, ok := conn.(halfCloser); ok {
+				_ = hc.CloseWrite()
+			}
+		}()
+	}
+
+	if framed == "2" {
+		code, err := terminal.ReadOutput(br, stdout, stderr)
+		if ctx.Err() != nil {
+			return code, ctx.Err()
+		}
+		return code, err
+	}
 	tw := &exitTrailerWriter{w: stdout}
-	_, _ = io.Copy(tw, br)
-	return tw.finish(), nil
+	_, copyErr := io.Copy(tw, br)
+	code := tw.finish()
+	if ctx.Err() != nil {
+		return code, ctx.Err()
+	}
+	return code, copyErr
 }
 
-// exitTrailerWriter passes a stream through while holding back just enough of
-// the tail to recognise the exit-status trailer the agent appends.
-//
-// Holding back a few bytes is safe for an interactive session because the
-// trailer is only ever the last thing on the stream, and the amount retained is
-// smaller than a single line: a terminal cannot notice.
+// exitTrailerWriter forwards ordinary output immediately. Only a possible
+// trailer beginning with NUL is held until the stream finishes.
 type exitTrailerWriter struct {
 	w    io.Writer
 	tail []byte
@@ -135,13 +203,18 @@ const keep = len(attachExitTrailer) + 8
 func (e *exitTrailerWriter) Write(p []byte) (int, error) {
 	n := len(p)
 	e.tail = append(e.tail, p...)
-	if len(e.tail) > keep {
-		flush := e.tail[:len(e.tail)-keep]
-		if _, err := e.w.Write(flush); err != nil {
+
+	hold := len(e.tail)
+	if i := bytes.LastIndexByte(e.tail, 0); i >= 0 && len(e.tail)-i <= keep {
+		hold = i
+	}
+	if hold > 0 {
+		if _, err := e.w.Write(e.tail[:hold]); err != nil {
 			return 0, err
 		}
-		e.tail = append([]byte{}, e.tail[len(e.tail)-keep:]...)
+		e.tail = append([]byte(nil), e.tail[hold:]...)
 	}
+
 	return n, nil
 }
 

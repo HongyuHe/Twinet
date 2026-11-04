@@ -23,12 +23,8 @@ type LocalExec struct {
 
 // Shell attaches a student's terminal to a device.
 //
-// It shells out to the container engine rather than going through the runtime
-// interface, because an interactive session is a stream in both directions for
-// as long as the student wants it, and the batch Exec used everywhere else
-// collects output and returns. Conflating the two would either give the batch
-// path a streaming interface it never needs or give the shell a buffered one
-// that shows nothing until the student disconnects.
+// Streaming runtimes carry bytes and terminal resizes directly. The CLI path
+// remains available for older runtime adapters without streaming support.
 func (l *LocalExec) Shell(ctx context.Context, deviceID string, cmd []string,
 	stdin io.Reader, stdout, stderr io.Writer, tty bool, rows, cols int) (int, error) {
 
@@ -124,7 +120,7 @@ func asExitError(err error, target **exec.ExitError) bool {
 type ClusterExec struct {
 	Topology *model.Topology
 	Attach   func(ctx context.Context, node, container string, cmd []string,
-		tty bool, rows, cols int, stdin io.Reader, stdout io.Writer) (int, error)
+		tty bool, rows, cols int, stdin io.Reader, stdout, stderr io.Writer) (int, error)
 }
 
 // Shell attaches a student's terminal to a device on any node.
@@ -138,5 +134,5 @@ func (r *ClusterExec) Shell(ctx context.Context, deviceID string, cmd []string,
 	if r.Attach == nil {
 		return 1, fmt.Errorf("no way to reach node %s", d.Node)
 	}
-	return r.Attach(ctx, d.Node, d.Container, cmd, tty, rows, cols, stdin, stdout)
+	return r.Attach(ctx, d.Node, d.Container, cmd, tty, rows, cols, stdin, stdout, stderr)
 }

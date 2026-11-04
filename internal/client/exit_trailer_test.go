@@ -70,3 +70,14 @@ func TestOutputWithNoTrailerIsPassedThroughWhole(t *testing.T) {
 		t.Errorf("output was truncated: got %q, want %q", out.String(), body)
 	}
 }
+
+func TestInteractivePromptIsDeliveredBeforeExit(t *testing.T) {
+	var out bytes.Buffer
+	w := &exitTrailerWriter{w: &out}
+	if _, err := w.Write([]byte("router# ")); err != nil {
+		t.Fatal(err)
+	}
+	if out.String() != "router# " {
+		t.Fatalf("prompt buffered until more output: %q", out.String())
+	}
+}

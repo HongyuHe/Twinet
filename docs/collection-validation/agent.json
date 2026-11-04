@@ -1,0 +1,113 @@
+{
+  "run_id": "6730e1bb97ce44a3a605a2b2b664ede2",
+  "started_utc": "2026-11-04T06:14:21Z",
+  "ases": 32,
+  "checks": {
+    "binary_streams_and_exit_status": "4e32bd16ad6338b3d45a1d18a5665dbd",
+    "interactive": {
+      "session": "528f1c27f31c1ecec6b3d219c1ee8b57",
+      "commands": 11,
+      "passed": true
+    },
+    "shell_replacement_and_disconnect": "3bad2272f5fcf184ca628b0a6e3f4221",
+    "disconnect_process_cleanup": true,
+    "collector_outage": true,
+    "gateway_crash": "4b98ef743e697cf4b6c438f3cebd4fb0",
+    "crash_process_cleanup": true,
+    "all_uploads_byte_identical": true
+  },
+  "batches": [
+    {
+      "concurrency": 32,
+      "recording": false,
+      "iteration": 0,
+      "wall_seconds": 0.48405644000013126,
+      "latency_median_seconds": 0.3516920575000313,
+      "latency_p95_seconds": 0.4469432850000885,
+      "output_bytes": 4194304
+    },
+    {
+      "concurrency": 32,
+      "recording": true,
+      "iteration": 0,
+      "wall_seconds": 1.2726717599998665,
+      "latency_median_seconds": 1.2375829674997476,
+      "latency_p95_seconds": 1.2479600930000743,
+      "output_bytes": 4194304,
+      "verified_recordings": 32
+    },
+    {
+      "concurrency": 32,
+      "recording": true,
+      "iteration": 1,
+      "wall_seconds": 1.072026041999834,
+      "latency_median_seconds": 1.0387185994998163,
+      "latency_p95_seconds": 1.0503762270000152,
+      "output_bytes": 4194304,
+      "verified_recordings": 32
+    },
+    {
+      "concurrency": 32,
+      "recording": false,
+      "iteration": 1,
+      "wall_seconds": 0.452991079000185,
+      "latency_median_seconds": 0.299106762500287,
+      "latency_p95_seconds": 0.42924470800016934,
+      "output_bytes": 4194304
+    },
+    {
+      "concurrency": 32,
+      "recording": false,
+      "iteration": 2,
+      "wall_seconds": 0.4641701479999938,
+      "latency_median_seconds": 0.33135988300000463,
+      "latency_p95_seconds": 0.4344604589996379,
+      "output_bytes": 4194304
+    },
+    {
+      "concurrency": 32,
+      "recording": true,
+      "iteration": 2,
+      "wall_seconds": 1.0669418499996937,
+      "latency_median_seconds": 1.0274341135000213,
+      "latency_p95_seconds": 1.0399817149996124,
+      "output_bytes": 4194304,
+      "verified_recordings": 32
+    },
+    {
+      "concurrency": 64,
+      "recording": true,
+      "iteration": 10,
+      "wall_seconds": 1.6395288409999011,
+      "latency_median_seconds": 1.5690043179999975,
+      "latency_p95_seconds": 1.5910813469999994,
+      "output_bytes": 8388608,
+      "verified_recordings": 64
+    },
+    {
+      "concurrency": 64,
+      "recording": true,
+      "iteration": 11,
+      "wall_seconds": 1.7581712599999264,
+      "latency_median_seconds": 1.6898804654999822,
+      "latency_p95_seconds": 1.7086321659999157,
+      "output_bytes": 8388608,
+      "verified_recordings": 64
+    },
+    {
+      "concurrency": 32,
+      "recording": true,
+      "iteration": 20,
+      "wall_seconds": 1.0053249849997883,
+      "latency_median_seconds": 0.9697430990001976,
+      "latency_p95_seconds": 0.9804626469999675,
+      "output_bytes": 4194304,
+      "verified_recordings": 32
+    }
+  ],
+  "version": "twinet dev (commit none, source 0e91d927ff29757a3192ecdf2a9c23ddbb3853a5c3703b5c299bd7f1d01165ed, source date 1970-01-01T00:00:00Z)",
+  "gateway_port": 2024,
+  "total_sessions": 524,
+  "journal_bytes": 91802576,
+  "ended_utc": "2026-11-04T06:14:59Z"
+}

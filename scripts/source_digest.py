@@ -21,6 +21,10 @@ def build_inputs(root: Path) -> list[Path]:
         if not base.is_dir():
             raise ValueError(f"missing build input directory: {directory}")
         paths.extend(path.relative_to(root) for path in base.rglob("*.go") if path.is_file())
+    #* Include assets compiled into the collection browser by go:embed.
+    collection_web = root / "internal" / "collection" / "web"
+    if collection_web.is_dir():
+        paths.extend(path.relative_to(root) for path in collection_web.rglob("*") if path.is_file())
     for name in ROOT_FILES:
         path = root / name
         if not path.is_file():

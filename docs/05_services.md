@@ -69,3 +69,9 @@ The measured web/matrix and course-service results, if any, are stated in
 [09](09_status.md). They are specific observations. The source model's service
 replication and endpoint support are not a claim that failover, VIP behavior,
 or every service replica has completed a live acceptance run.
+
+## Optional session collection
+
+The SSH gateway can record sessions and collect structured command events.
+Collection is off by default. See [Session collection](13_collection.md) for
+configuration, playback, exports, and recovery.

@@ -46,3 +46,8 @@ python3 scripts/check_docs.py
 The Go test rejects stale command names, flags no command accepts, and stale
 generated capability facts. The Python checker validates local Markdown links,
 referenced paths, and benchmark labels.
+
+- [Session collection](13_collection.md): optional recording and post-processing.
+- [Collection validation](14_collection_validation.md): measured 32-AS CloudLab run.
+
+- [Native vtysh collection validation](15_vtysh_collection_validation.md)
