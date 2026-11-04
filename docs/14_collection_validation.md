@@ -85,9 +85,9 @@ source tree without Git metadata.
 ## Agent transport check
 
 A second run used the gateway-to-agent connection on loopback. The
-[agent manifest](collection-validation/agent-twinet.yaml) names two logical nodes
+[agent manifest](collection-validation/agent_twinet.yaml) names two logical nodes
 and pins every AS to `node-0`. The unused node selects Twinet's clustered access
-path without moving any device. The [agent counters](collection-validation/agent-metrics.txt) confirmed
+path without moving any device. The [agent counters](collection-validation/agent_metrics.txt) confirmed
 260 successful and two canceled streaming executions through the agent API.
 
 The [agent report](collection-validation/agent.json) passed the same byte,

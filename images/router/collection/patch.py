@@ -11,7 +11,7 @@ def replace(path, old, new, count=1):
 
 
 main = Path('vtysh/vtysh_main.c')
-replace(main, '#include "vtysh/vtysh_user.h"', '#include "vtysh/vtysh_user.h"\n#include "vtysh/twinet-collection.h"')
+replace(main, '#include "vtysh/vtysh_user.h"', '#include "vtysh/vtysh_user.h"\n#include "vtysh/twinet_collection.h"')
 replace(main, 'vtysh_execute(line_read);', 'collected_execute(line_read, 1, "interactive");')
 replace(main, 'vtysh_execute_no_pager(cmd->line)', 'collected_execute(cmd->line, 0, "argument")', 2)
 replace(main, 'vtysh_execute_no_pager(cmdnow)', 'collected_execute(cmdnow, 0, "argument")')

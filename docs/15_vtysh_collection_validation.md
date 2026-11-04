@@ -22,9 +22,9 @@ The final check confirmed all 154 BGP neighbor relationships were established.
 - [Router image and binary identity](collection-validation/vtysh/image.json)
 - [Per-AS BGP checks](collection-validation/vtysh/network.json)
 - [Deployed manifest](collection-validation/vtysh/twinet.yaml)
-- [Agent validation manifest](collection-validation/vtysh/agent-twinet.yaml)
-- [Sample command records](collection-validation/vtysh/sample-activity.jsonl)
-- [Sample CSV export](collection-validation/vtysh/sample-activity.csv)
+- [Agent validation manifest](collection-validation/vtysh/agent_twinet.yaml)
+- [Sample command records](collection-validation/vtysh/sample_activity.jsonl)
+- [Sample CSV export](collection-validation/vtysh/sample_activity.csv)
 - [Browser command table](collection-validation/vtysh/browser.png)
 
 Both manifests use the retained

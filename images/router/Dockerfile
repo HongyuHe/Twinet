@@ -31,7 +31,7 @@ RUN curl -fsSL https://github.com/FRRouting/frr/archive/refs/tags/frr-10.0.tar.g
     && echo 'f02fe672d3ab7382752f83a8ae1e6198e6b906b4ad31063aad18b803c8756b40fa1f280c5dafe872dea505bcc882fbb8392802411f9fac0ab0bd45dac8b3ed28  frr.tar.gz' | sha512sum -c - \
     && tar xzf frr.tar.gz
 WORKDIR /src/frr-frr-10.0
-COPY collection/vtysh-collection.h vtysh/twinet-collection.h
+COPY collection/vtysh_collection.h vtysh/twinet_collection.h
 COPY collection/patch.py /src/patch.py
 RUN python3 /src/patch.py && ./bootstrap.sh \
     && ./configure --prefix=/usr --localstatedir=/run/frr --sbindir=/usr/lib/frr \
